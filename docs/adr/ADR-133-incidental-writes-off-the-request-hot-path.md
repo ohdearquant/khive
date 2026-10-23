@@ -7,6 +7,10 @@
 
 ## Context
 
+The measurement and unamended comparisons below describe the pre-batching baseline. References to "today" or the
+"current implementation" in those comparisons refer to that baseline, not revision `7d6ff8fd` (corrected by
+Amendment 11). The release table and amendment-specific source notes state the revised contract and implementation.
+
 ### The measurement
 
 Every verb registered by the packs was classified against source for whether it acquires the
@@ -23,9 +27,7 @@ classify as a writer, since it ends in `update_note_properties`; a method that m
 | **Total inventoried** | **100** |
 
 No verb was established as read-only. The 45 conditional entries are conditional on one fact:
-whether an `EventStore` is configured. The served daemon wires one whenever `runtime.authorize`
-and `runtime.events` succeed, which is the normal path
-(`crates/khive-mcp/src/server.rs:433-438`).
+whether an `EventStore` is configured. A writable served runtime configures its event store through `with_runtime_event_store`; a read-only runtime retains no event-store handle (`crates/khive-mcp/src/server/pack_setup.rs:30-41`, corrected by Amendment 11).
 
 **In a deployed daemon, every verb dispatch acquires the writer at least once.**
 
@@ -58,22 +60,17 @@ An _incidental_ write is one the caller did not ask for: bookkeeping attached to
 whose own semantics are read-only.
 
 1. **Per-dispatch audit row.** Appended on the verb-dispatch path
-   (`crates/khive-runtime/src/pack.rs`, via `append_audit_event_best_effort`).
+   (`crates/khive-runtime/src/pack/audit.rs:572`, corrected by Amendment 11).
 2. **Read-flag mutation.** `comm.read` performs a real `UPDATE` of the message row
-   (`crates/khive-pack-comm/src/handlers.rs::handle_read`), so a sweep of N messages is N
+   (`crates/khive-pack-comm/src/handlers.rs:268`, corrected by Amendment 11), so a sweep of N messages is N
    acquisitions.
 3. **Recall telemetry.** `memory.recall` persists a `RecallExecuted` event per call
    (`crates/khive-pack-memory/src/handlers/recall.rs`).
 4. **Serve ledger.** `memory.recall` also dispatches `brain.record_serve` from a background task
-   (`crates/khive-pack-memory/src/handlers/recall.rs:900-936`), and that handler acquires
-   `sql.writer()` and inserts into `brain_serve_ledger` **once per returned target**
-   (`crates/khive-pack-brain/src/handlers.rs:1942-1970`,
-   `crates/khive-pack-brain/src/serve_ledger.rs:85-124`).
+   (`crates/khive-pack-memory/src/handlers/recall.rs:1439-1457`, corrected by Amendment 11), and that handler acquires
+   `sql.writer()` once for the nonempty target batch and inserts into `brain_serve_ledger` (`crates/khive-pack-brain/src/handlers/brain_handlers.rs:1460-1473`, `crates/khive-pack-brain/src/serve_ledger.rs:121-139`, corrected by Amendment 11).
 
-Item 4 scales with _result count_, not call count, and is therefore the largest of the four for a
-recall returning many targets. It is listed last because it was found last — by review, after the
-first draft of this record asserted the list was complete. The list is now believed complete for
-the read path and is not assumed to be.
+Item 4 now scales with nonempty recall calls, as D7 requires. A recall can still reach additional writers through its nested dispatch, so the census must trace that path (corrected by Amendment 11).
 
 ### The distinction this record turns on
 
@@ -92,8 +89,8 @@ that traded durability for a benefit that durable batching already provides.
 
 ADR-103 establishes that **accounting rides the per-dispatch audit row**: _"Accounting rides the
 audit row ADR-094 already established as the daemon's default construction"_
-(`ADR-103:405-410`), and the usage object _"lands under the existing per-dispatch audit row's
-`resource` payload"_ (`ADR-103:814-822`), read by four consumers including accounting and Gate
+(`docs/adr/ADR-103-resource-attribution-model.md:406-410` (corrected by Amendment 11)), and the usage object _"lands under the existing per-dispatch audit row's
+`resource` payload"_ (`docs/adr/ADR-103-resource-attribution-model.md:863-870` (corrected by Amendment 11)), read by four consumers including accounting and Gate
 quota.
 
 So the per-dispatch audit row **is** the accounting record. Any decision that makes that row lossy
@@ -109,24 +106,24 @@ payload) lives at the payload level, not the kind level.
 Audit appends are accumulated and written as a **single transaction**. The flush is a real
 committed (store-visible) transaction, not an in-memory retention with best-effort persistence.
 
-**A dispatch does not return before the batch carrying its audit row has committed.** This is the
+**A dispatch does not return before the batch carrying its audit row has committed.** (superseded by Amendment 11, Decision 1) This is the
 load-bearing clause of the whole record and an earlier draft left it unstated, which made the
 draft readable two incompatible ways.
 
 **Scope of that clause, which an earlier draft got wrong by stating it without qualification.** It
 binds unconditionally for **obligation-bearing rows** (accounting, authorization, security audit):
 such a dispatch never returns success without its row committed, and a persistent commit failure
-fails it. Amendment 1 below carves out one narrow, named exception to this binding: for the
+fails it. (superseded by Amendment 11, Decision 1) Amendment 1 below carves out one narrow, named exception to this binding: for the
 `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` read set, and only when the row's own commit did not
 happen because the audit lane's admission was transiently exhausted or the caller's bounded wait
 for it elapsed (never a persistent commit failure), the dispatch reports its already-computed
 result without waiting on that row. Amendment 10 carves out a second: the success rows ADR-103
-Amendment 7 omits or does not select are never produced, so those dispatches return without one.
+Amendment 7 omits or does not select are never produced, so those dispatches return without one. (superseded by Amendment 11, Decision 1)
 
 For **pure observability rows** it binds on the success path only. The dispatch waits for the batch
 in the normal case — so observability rows are batched, share the acquisition reduction, and are
 committed (store-visible) at return whenever the commit succeeds — but a **persistent** commit
-failure releases the dispatch successfully and routes the failure to instrumentation.
+failure releases the dispatch successfully and routes the failure to instrumentation. (superseded by Amendment 11, Decision 1)
 
 That carve-out is not a durability regression, and the reason is worth stating because it is the
 only thing that makes the carve-out legitimate. The current implementation already swallows a failed
@@ -149,7 +146,7 @@ The consequences of the waiting clause, all of which follow from it directly:
   exception: the success rows ADR-103 Amendment 7 no longer produces). INV-4 holds by construction
   rather than by assertion. "Committed" here is write-path store visibility under the store's
   configured posture; whether a committed row survives an OS crash is the store's durability
-  posture, which is ADR-134's subject, not this clause's.
+  posture, which is ADR-134's subject, not this clause's. (superseded by Amendment 11, Decision 1)
 - **Acquisitions stop scaling with request rate.** Under concurrency the acquisition rate is
   bounded by one per commit cycle instead of one per dispatch. This is the entire objective.
 - **Under contention this reduces latency rather than adding it.** Today each dispatch queues for
@@ -161,6 +158,61 @@ The consequences of the waiting clause, all of which follow from it directly:
   idle commits immediately and waits approximately nothing. A dispatch arriving mid-commit waits the
   **tail of the in-flight commit plus its own batch's commit**, so the worst case is up to **two**
   commit durations, not one.
+
+**Release table (Amendment 11, Decision 1).** This table supersedes the preceding unqualified waiting clauses.
+It governs a produced row on the configured `AuditBatch` path. A return without confirmed commit is permitted
+only with the result stated here. `Error` fails a would-be success or preserves an existing denial or handler error;
+`Preserve` keeps the domain result, including an existing error. Neither result authorizes replay of a domain effect.
+
+`Obligation` includes `GateDenied`, `DispatchSucceeded`, `DispatchFailed`, `EffectiveTargetCheck`, `UnknownVerb`
+and `GitDigestReceipt`. `Eligible read` is only a successful `DispatchSucceeded` admitted by
+`admission_degrade_safe`. `Pure` includes `ConfigLocked`, `RecallExecuted` and `GateUnavailable`. The exhaustive
+classification is at `crates/khive-runtime/src/audit_batch.rs:74-86`; eligibility is checked at
+`crates/khive-runtime/src/pack/audit.rs:584-586`.
+
+| Result or terminal reason                | Obligation                                          | Eligible read                        | Pure                              |
+| ---------------------------------------- | --------------------------------------------------- | ------------------------------------ | --------------------------------- |
+| `Committed` or `AlreadyPresentIdentical` | Preserve, commit confirmed                          | Preserve, commit confirmed           | Preserve, commit confirmed        |
+| `PreflightRejected`                      | Error                                               | Error                                | Preserve                          |
+| `AdmissionClosed`                        | Error                                               | Error                                | Preserve                          |
+| `QueueAdmissionExhausted`                | Error                                               | Success, row never enqueued          | Preserve                          |
+| `AdmissionDeadlineExpired`               | Error on bounded paths; resolved paths keep waiting | Success, commit unresolved           | Preserve, commit unresolved       |
+| `ResolutionDeadlineExpired`              | Error on resolved paths                             | Not reached by bounded submission    | Not reached by bounded submission |
+| `IdentityConflict`                       | Error                                               | Error                                | Preserve                          |
+| `StoreFailure`                           | Error                                               | Error                                | Preserve                          |
+| `RetryExhausted`                         | Error                                               | Error; implementation differs below  | Preserve                          |
+| `IdempotencyUnsupported`                 | Error                                               | Error                                | Preserve                          |
+| `DriverPanicked`                         | Error                                               | Error                                | Preserve                          |
+| `DriverCancelled`                        | Error                                               | Error                                | Preserve                          |
+| `DriverJoinLost`                         | Error                                               | Error                                | Preserve                          |
+| `DriverExitedInconsistent`               | Error                                               | Error                                | Preserve                          |
+| `DriverAppendAbandoned`                  | Error if still awaiting notification                | Error if still awaiting notification | Preserve                          |
+| `StoreWedged`                            | Error                                               | Error                                | Preserve                          |
+
+Every terminal-reason row permits release without a confirmed commit; the success outcomes require a confirmed
+insert or identical prior record. Refusal and expiry differ: `QueueAdmissionExhausted` never enqueues the row;
+`AdmissionDeadlineExpired` and `ResolutionDeadlineExpired` leave it with the driver. An identity conflict does not
+prove that the submitted logical record exists. A failed or interrupted append can leave the commit outcome unknown.
+The terminal variants are defined at `crates/khive-runtime/src/audit_batch.rs:93-219`; idempotent equality is checked
+at `crates/khive-db/src/stores/event.rs:521-533`.
+
+Successful non-allowlisted dispatches and `GitDigestReceipt` use resolved waiting. Other producers use bounded
+submission. The default admission wait is 5 s. Resolved waiting adds up to 30 s after that threshold, for a total
+of 35 s, while the driver has its own 90 s bound. A caller can therefore finish before an abandoned generation's
+notification, which does not change that caller's earlier result. These are audit-wait bounds, not end-to-end
+request latency guarantees (`crates/khive-runtime/src/pack/audit.rs:483-491`,
+`crates/khive-runtime/src/pack/audit.rs:604-609`, `crates/khive-runtime/src/audit_batch.rs:305-315`,
+`crates/khive-runtime/src/audit_batch.rs:881-920`, `crates/khive-runtime/src/audit_batch.rs:671-672`).
+
+A pure-observability submission waits at most the admission bound, including when the append has not failed.
+Its audit outcome does not fail an otherwise successful dispatch. A `GateUnavailable` dispatch remains failed
+closed. Background `RecallExecuted` submission does not delay the already-computed recall response
+(`crates/khive-runtime/src/pack/audit.rs:681-688`, `crates/khive-runtime/src/pack/dispatch.rs:603-633`,
+`crates/khive-pack-memory/src/handlers/recall.rs:1435-1483`).
+
+**Implementation discrepancy.** At `7d6ff8fd`, an eligible read also succeeds on `RetryExhausted`
+(`crates/khive-runtime/src/pack/audit.rs:661-671`). Amendment 1 names only `QueueAdmissionExhausted` and
+`AdmissionDeadlineExpired`. This table retains that two-reason boundary; it does not authorize the extra release.
 
 ### D1a — A malformed row must not discard its batch
 
@@ -296,7 +348,7 @@ classification selects the **lane**, and with it the committing connection, at e
 writer). Within a lane there is still nothing to route away from: every row in the lane rides
 that lane's committed (store-visible) batch, and on the success path every dispatch waits for
 it. D1's carve-out — a pure-observability row whose commit fails persistently — remains a
-failure outcome rather than a routing choice.
+failure outcome rather than a routing choice. (superseded by Amendment 11, Decision 1)
 
 The classifier therefore has exactly two jobs, decided at the same seam: lane selection
 (ADR-134 D2a) and **what a failed commit does to the caller**:
@@ -364,13 +416,13 @@ property by
 excluding accounting rows from batching altogether, which would have removed the acquisition
 reduction in exactly the high-concurrency deployment that motivates this record, since under
 ADR-103 the usage object rides _every_ per-dispatch audit row. Stating the obligation instead of
-the exemption keeps the guarantee and keeps the benefit.
+the exemption keeps the guarantee and keeps the benefit. (superseded by Amendment 11, Decision 1)
 
 What remains specific to this class is failure handling, which is D2's subject, and the store's own
 durability posture, which is neither.
 
 ADR-103 already freezes the usage object _before_ the enclosing audit row is written
-(`ADR-103:814-822`), so this is compatible with its stated ordering and requires no amendment to
+(`docs/adr/ADR-103-resource-attribution-model.md:863-870` (corrected by Amendment 11)), so this is compatible with its stated ordering and requires no amendment to
 it. This record does not change what accounting means, where it lands, or who reads it.
 
 ### D4 — INV-1: accounting, authorization, and security-audit records are never lossy
@@ -382,7 +434,7 @@ are listed rather than summarised because each needs its own check:
 1. **Dropped** — written through a path that can discard it.
 2. **Deferred** — still volatile when its operation returns.
 3. **Falsely acknowledged** — the operation reports success when the record did not commit.
-4. **Duplicated** — written more than once, so the obligation is counted twice.
+4. **Duplicated** — written more than once, so the obligation is counted twice. (superseded by Amendment 11, Decision 1)
 
 Not revisable by configuration, environment, or feature flag.
 
@@ -415,7 +467,7 @@ successful patch returns `read: true`. Writer contention, a storage error, or a 
 between fetch and patch does not discard the successful fetch: the response instead returns
 `read: false` plus `mark_error`, and the message remains unread. This is the contract established by
 ADR-040's 2026-08-01 `comm.read` amendment and implemented by
-`crates/khive-pack-comm/src/handlers.rs::read_response`; batching does not strengthen that
+`crates/khive-pack-comm/src/handlers/read_marking.rs:520` (corrected by Amendment 11); batching does not strengthen that
 acknowledgement into an unconditional durability guarantee.
 
 The unread surface remains load-bearing for the inbox monitor's stale check. Consequently, an inbox
@@ -449,7 +501,7 @@ instrumentation cannot see the population this record shrinks.
   proposed for a lossy plane, a usage meter dropping accounting events at a bounded channel and
   again at its store write in the serving layer, a commit failure reported to the caller as
   success, and a retry able to write the same accounting payload twice. A property that
-  four independent mechanisms can break is not local to any of them.
+  four independent mechanisms can break is not local to any of them. (superseded by Amendment 11, Decision 1)
 
   **Note on scope.** INV-1 governs how the _write path_ handles a record — whether it can be
   dropped, deferred past its operation's return, or reported as successful without committing. It
@@ -459,7 +511,7 @@ instrumentation cannot see the population this record shrinks.
   exposed. Both halves have to hold, and satisfying one says nothing about the other.
 
   **Named exceptions.** Three bounded exceptions to INV-1 are recorded in this document, and there
-  are no others. Amendment 1 scopes an admission-pressure undercount to allowlisted read verbs.
+  are no others (superseded by Amendment 11, Decision 1). Amendment 1 scopes an admission-pressure undercount to allowlisted read verbs.
   Amendment 10 omits or samples the success rows of six named verbs (ADR-103 Amendment 7).
   Amendment 6 adds a wedged-store path that applies to every producer class: when a generation's
   append does not return within `driver_append_deadline` (3x `resolution_deadline`), the driver
@@ -474,7 +526,7 @@ instrumentation cannot see the population this record shrinks.
   outstanding, a further generation is shed without an append ever being attempted, so its rows are
   lost with certainty rather than merely possibly, upon the same non-silent surfacing —
   `terminal_reason = StoreWedged`, `flush_failures` increments, and pure producers record
-  degradation exactly as they do for `DriverAppendAbandoned`.
+  degradation exactly as they do for `DriverAppendAbandoned`. (superseded by Amendment 11, Decision 1)
 - **INV-2 (D5).** An unclassified input resolves to the stricter handling — commit failure fails
   the dispatch — enforced by exhaustive matching without a wildcard.
 - **INV-3.** Batch accumulation is bounded and never blocks dispatch indefinitely; a full batch
@@ -484,9 +536,9 @@ instrumentation cannot see the population this record shrinks.
   situation**. That comparison basis is the whole content of the invariant and was previously left
   implicit. Batching changes _when_ the writer is acquired and _how many rows share one
   acquisition_, never whether a row survives a case the current implementation would have survived.
-  Amendment 10 records one deliberate exception: the success rows ADR-103 Amendment 7 omits or does
+  Amendment 10 records one deliberate exception (superseded by Amendment 11, Decision 1): the success rows ADR-103 Amendment 7 omits or does
   not select are no longer produced, so for those dispatches a row the current implementation
-  commits is not written at all.
+  commits is not written at all. (superseded by Amendment 11, Decision 1)
 
   Read against D1's scope: for an obligation-bearing row this is strictly stronger than today, since
   a dispatch returns only after its row commits and a persistent failure fails it, where today it
@@ -494,7 +546,7 @@ instrumentation cannot see the population this record shrinks.
   **identical** to today — the current code swallows a failed append and returns success — so
   nothing became weaker there either. An invariant phrased as "never lossy" rather than "never
   weaker than today" would forbid the current implementation's own behaviour, which is how the
-  earlier universal wording of D1 became unsatisfiable.
+  earlier universal wording of D1 became unsatisfiable. (superseded by Amendment 11, Decision 1)
 
 ## Consequences
 
@@ -527,7 +579,7 @@ transactional appends with surfaced failures.
 
 **No longer claimed.** An earlier draft accepted "audit rows become visible to queries slightly
 later than the operation that produced them." Under D1's waiting clause that is not a consequence
-of this record, and the read-your-own-audit caveat it carried is withdrawn.
+of this record, and the read-your-own-audit caveat it carried is withdrawn. (superseded by Amendment 11, Decision 1)
 
 **Explicitly not claimed.** This record does **not** claim interactive traffic becomes read-only.
 It claims writer _acquisitions_ fall. Whether any verb reaches zero writes is a question the
@@ -551,7 +603,7 @@ designed against the post-change profile.
 3. A test that **no dispatch returns before its audit row is committed, on every path where D1's
    scope requires it** (D1, INV-4) — unconditionally for obligation-bearing rows, and on the
    success path for observability rows. Exercised under concurrency so the batch actually forms,
-   and shipped with a fixture that returns early on purpose and must make the test fail.
+   and shipped with a fixture that returns early on purpose and must make the test fail. (superseded by Amendment 11, Decision 1)
 4. A test that a dispatch carrying an accounting payload does not report success when its row's
    commit fails, and that an observability-only row's **persistent** commit failure does **not**
    fail its dispatch (D2, D3, INV-1). The two halves must be asserted separately; a test that only
@@ -560,7 +612,7 @@ designed against the post-change profile.
    The observability half asserts the D1 carve-out and nothing wider: on the **success** path that
    dispatch must still not return before its row commits. Assert both, or the criterion licenses an
    implementation that never waits for observability rows at all — which is the batching-without-
-   waiting design this record rejects, reached through a test rather than through a decision.
+   waiting design this record rejects, reached through a test rather than through a decision. (superseded by Amendment 11, Decision 1)
 
 5. **Two independently produced obligation-bearing rows presenting the same identity cannot silently
    acknowledge one as the other** (D1c). Inject the collision. Assert that the conflict is either
@@ -592,7 +644,7 @@ designed against the post-change profile.
     because D1's carve-out permits a persistently-failed observability row to be absent after its
     dispatch returned successfully, so an unscoped version of this criterion would forbid an outcome
     the record explicitly allows, and an implementer would resolve the conflict by quietly choosing
-    a fixture rather than by reading a decision.
+    a fixture rather than by reading a decision. (superseded by Amendment 11, Decision 1)
 
     Ship the companion fixture that makes the permitted case explicit: an observability row whose
     commit fails persistently is **intentionally absent**, its dispatch succeeded, and the failure
@@ -647,14 +699,14 @@ success rows of two channel-maintenance subhandlers, each kept row marked with i
 cross-pack Assertive surface for khive#2217 (khive#2147/khive#2208).
 
 D2 states: _"A dispatch must not report success when the record that accounts for, authorizes, or
-audits it did not commit"_ (`ADR-133:297-298`), and D4/INV-1 states the same as a system-wide
+audits it did not commit"_ (`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:356-357` (corrected by Amendment 11)), and D4/INV-1 states the same as a system-wide
 invariant: _"Accounting-, authorization-, and security-audit-bearing records are written exactly
 once: never dropped, never volatile at return, never falsely acknowledged, never duplicated"_
-(`ADR-133:436-438`), with failure mode 3 named explicitly as _"**Falsely acknowledged** — the
-operation reports success when the record did not commit"_ (`ADR-133:375`).
+(`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:497-499` (corrected by Amendment 11)), with failure mode 3 named explicitly as _"**Falsely acknowledged** — the
+operation reports success when the record did not commit"_ (`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:436` (corrected by Amendment 11)).
 
-This amendment qualifies both sentences for one narrow, named case: the 39 reviewed read verbs on
-`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack.rs`; the full list and
+This amendment qualifies both sentences for one narrow, named case: the 70 read-verb pairs at `7d6ff8fd` (corrected by Amendment 11) on
+`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack/registry_access.rs:456-553`; the full list and
 rationale are in ADR-103 Amendment 3), and only when the row's own commit did not resolve before
 the dispatch returned because the audit lane's admission was transiently exhausted or the caller's
 bounded wait for it elapsed — `AuditTerminalReason::QueueAdmissionExhausted` or
@@ -696,13 +748,13 @@ loss from an unresolved one — see ADR-103 Amendment 3.
   handling" posture for everything not on the list.
 - The resulting loss is counted, not silent — see ADR-103 Amendment 3's diagnostics requirement.
 
-**What does not change:** D4/INV-1 continues to hold without qualification for every write, every
+**What does not change:** D4/INV-1 continues to hold without qualification (superseded by Amendment 11, Decision 1) for every write, every
 non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
 (Amendment 10 later qualifies both clauses for the success rows of ADR-103 Amendment 7's six verbs:
 "every write" for the two channel-maintenance subhandlers, and "every non-allowlisted Assertive
 handler" for `comm.cursor_get`, an Assertive handler off the allowlist whose success row it omits.)
 D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
-including the 39 allowlisted verbs — the exception is admission pressure specifically, not
+including the 70 allowlisted pairs at `7d6ff8fd` (corrected by Amendment 11), the exception is admission pressure specifically, not
 store failure generally.
 
 This amendment does not revisit "Split the audit row so accounting lives in its own record" from
@@ -714,7 +766,7 @@ measured undercount over that redesign.
 
 **Status**: Accepted (2026-09-28).
 
-Amendment 1's exception to D2 and D4/INV-1 was scoped to the eleven verbs on
+Amendment 1's exception to D2 and D4/INV-1 is scoped to the enumerated pairs (corrected by Amendment 11) on
 `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`. ADR-103 Amendment 4 extends that list with eight
 operational read verbs (`gtd.tasks`, `gtd.next`, `comm.inbox`, `comm.unread`, `comm.thread`,
 `comm.delivered`, `comm.probe`, `comm.health`), each individually reviewed against the same
@@ -731,7 +783,7 @@ Nothing else in Amendment 1 changes. The exception remains:
   are deliberate review products, not a loosening of the default posture;
 - counted on the same two disjoint diagnostics counters, so the undercount stays measurable.
 
-D4/INV-1 continues to hold without qualification for every write, every non-allowlisted Assertive
+D4/INV-1 continues to hold without qualification (superseded by Amendment 11, Decision 1) for every write, every non-allowlisted Assertive
 handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts — the sentence is
 unchanged; only the enumerated verb set it excepts has grown, by review. (Amendment 10 later
 qualifies both clauses for the success rows of ADR-103 Amendment 7's six verbs: "every write" for
@@ -748,17 +800,16 @@ recorded in ADR-103 Amendment 4, and all eight remain eligible. The list-to-enum
 this paragraph relies on is superseded: the allowlist is the census-tested set of
 `(owning pack, verb)` pairs, 61 entries at `fe272269`, guarded by
 `admission_degrade_safe_assertive_census_matches_live_pack_sources`
-(`crates/khive-runtime/src/pack.rs:6064`). The exception's rules above are unchanged.
+(`crates/khive-runtime/src/pack_tests.rs:382`, corrected by Amendment 11). The exception's rules above are unchanged.
 
 ## Amendment 3 (2026-09-08): The obligation error carries the domain disposition, and a post-dispatch obligation error is never retry permission
 
-**Status**: Proposed.
+**Status**: Accepted (corrected by Amendment 11).
 
 ### The gap
 
 D2 fails a would-be-success dispatch when its obligation row does not commit. The fold that applies
-D2 (`fold_audit_obligation`, `crates/khive-runtime/src/pack.rs`) has the domain result in hand in
-that arm and discards it:
+D2's pre-Amendment-3 fold discarded the domain result in that arm. The implemented fold preserves it (`crates/khive-runtime/src/pack/audit.rs:718-729`, corrected by Amendment 11). The earlier shape was:
 
 ```rust
 (Ok(value), Ok(())) => Ok(value),
@@ -767,7 +818,7 @@ that arm and discards it:
 ```
 
 The domain verb is dispatched before the audit append, so in the middle arm the domain effect has
-usually already committed. The error the caller receives says nothing about that effect. Two
+usually already committed. The pre-Amendment-3 error said nothing about that effect (corrected by Amendment 11). Two
 observations of this one class are on file: an `AdmissionDeadlineExpired` after a comm write had
 committed (#2399) and a `StoreFailure` after a domain write had committed (#2256). The class is
 defined by where the error is raised, after the dispatch, not by the reason it names.
@@ -826,10 +877,10 @@ receipt path's setup branches: no event store, no deferred audit, a malformed re
 renders the same object with `code` set to that path's own failure code in snake case
 (`git_digest_receipt_failure`) and the branch named in `message`; it is `committed` because the
 digest report exists, and `domain_result` carries it. Any handler-owned receipt path that bypasses
-the fold is in scope of this amendment and renders through the same serializer. Errors that today serialize as a bare string keep their message and gain the field
-by becoming an object of the shape `{"kind": "...", "message": "...", "domain_disposition": "..."}`.
+the fold is in scope of this amendment and renders through the same serializer. Errors serialized as a bare string before Amendment 3 keep their message and gain the field
+(corrected by Amendment 11) by becoming an object of the shape `{"kind": "...", "message": "...", "domain_disposition": "..."}`.
 
-Wire rule. Today `error` is a string at some sites (dispatch failures, the conflict and `$prev`
+Wire rule. Before Amendment 3, `error` was a string at some sites (corrected by Amendment 11) (dispatch failures, the conflict and `$prev`
 refusals, the internal-subhandler permission refusal, the batch byte budget) and an object at others
 (the storage and unavailable contexts, the depth guard). String to object is a shape change for
 every consumer that reads `error` as text; the message stays at `error.message`. Presentation is
@@ -895,8 +946,7 @@ before the fold and every `unknown` disposition stay genuinely unknown until it 
 - `fold_audit_obligation` keeps the value in the obligation arm and returns an error that owns it:
   a `RuntimeError` variant wrapping the audit reason and the domain value (name is implementation
   freedom; the wire fields are not).
-- `runtime_error_value` in `crates/khive-mcp/src/server.rs` sets `domain_disposition` for every
-  variant through an exhaustive match; `not_committed` is assigned at the envelope-layer raise
+- `runtime_error_value` in `crates/khive-mcp/src/server/dispatch_helpers.rs:392-397` delegates to the shared projection in `crates/khive-runtime/src/error_projection.rs:17` (corrected by Amendment 11); `not_committed` is assigned at the envelope-layer raise
   sites and in the aborted-entry constructor, never by matching a variant (`SecretDetected` maps to
   `unknown`); the daemon response path uses the same serializer.
 - `python/khive/envelope.py`: `_validate_op_errors` admits the two keys and exposes them; no
@@ -935,7 +985,7 @@ The distinction at the two admission boundaries remains exact:
 
 Gate-denial, unknown-verb, failed-dispatch, and pure-observability rows retain bounded submission:
 their caller-visible operation outcome is already fixed, or their contract is explicitly
-best-effort. The eleven admission-degrade-safe reads remain governed by Amendment 1 unchanged.
+best-effort. The 70 admission-degrade-safe pairs at `7d6ff8fd` remain governed by Amendment 1 (corrected by Amendment 11).
 
 ## Amendment 5 (2026-09-03): Bound the Resolved Wait Itself
 
@@ -1105,16 +1155,19 @@ generation snapshot is not the instrument for this bound in an ordinary build.
 
 ## Amendment 10 (2026-10-20): Success Rows of Six Named Verbs
 
-**Status**: Proposed
+**Status**: Accepted (corrected by Amendment 11).
 
 ADR-103 Amendment 7 stops writing the audit rows of most successful dispatches of six named verbs.
 `comm.inbox`, `comm.probe`, `comm.cursor_get` and `whoami` write none. `comm.heartbeat` and
 `comm.cleanup_expired_quarantine` write the rows of a hash-selected one in ten, plus the row of
 every call whose result reports a state change or a failed poll. Each of those rows carries
 `cost_unit`, so under D3 and D4/INV-1 it is an accounting-bearing record, and for the two
-subhandlers it is a write's dispatch audit. This amendment records the change as the third named
-exception to INV-1, and as an exception to INV-4: for these dispatches a row today's implementation
-commits is no longer produced.
+subhandlers it is a write's dispatch audit. This amendment records the change as a named
+exception to INV-1 (corrected by Amendment 11), and as an exception to INV-4: for these dispatches a row today's
+implementation commits is no longer produced. At `7d6ff8fd` the omission and sampling are in
+`crates/khive-runtime/src/pack/audit_success_rows.rs:217-241` and row construction is skipped at
+`crates/khive-runtime/src/pack/dispatch.rs:1044-1052` (corrected by Amendment 11). Amendment 11, Decision 1 gives the
+complete exception scope.
 
 **The exception.** It covers a dispatch whose outcome is `Success`, of a verb on ADR-103
 Amendment 7's omitted or sampled constant, served by a pack registered through the trusted path,
@@ -1131,7 +1184,7 @@ amendment's per-verb counters, so the omission is counted, not silent.
   committed before the dispatch returns, and a persistent commit failure fails the dispatch. A
   refused admission, a failed append and an elapsed resolution deadline end such a dispatch as they
   end it today, under Amendments 3 to 6, and the row keeps the sequence number and `sampling` object
-  it was given at the cut, including when the driver commits it after the caller stopped waiting.
+  it was given at the cut, including when the driver commits it after the caller stopped waiting. (superseded by Amendment 11, Decision 1)
 - Error, denial and unknown-verb rows of the six verbs are written as today. For the four omitted
   verbs the omission covers `Success` dispatches only: every non-`Success` dispatch of `comm.inbox`,
   `comm.probe`, `comm.cursor_get` and `whoami` writes its row, unsampled.
@@ -1148,7 +1201,7 @@ rows, and ADR-103 Amendment 7 item 5 says which totals become sampled.
 
 **Accounting.** D3 is unchanged for every row that is written. Each omitted or skipped dispatch
 would have carried a `cost_unit` of 1, since none of the six verbs is embedding-bearing
-(`crates/khive-runtime/src/cost_unit.rs:29` and `:40`); stored-row sums leave those units out. A
+(`crates/khive-runtime/src/cost_unit.rs:29` and `crates/khive-runtime/src/cost_unit.rs:40`, corrected by Amendment 11); stored-row sums leave those units out. A
 deployment that bills from `cost_unit` runs `all`, and ADR-168's aggregate rule for classes serving
 quota or admission accounting is unchanged.
 
@@ -1156,3 +1209,164 @@ quota or admission accounting is unchanged.
 and unknown-verb rows written as today; a selected or forced row's refused admission or failed
 append failing its dispatch, with its sequence number kept; the operational-read admission tests
 passing in `all` mode; and the response's `usage` unchanged.
+
+## Amendment 11 (2026-10-23) -- Audit release by producer class and terminal reason
+
+**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
+does not change the status of the base ADR. The in-place status corrections record the existing acceptance of
+Amendment 3, Amendment 10 and ADR-103 Amendment 7.
+
+**Addresses**: [#3730](https://github.com/ohdearquant/khive/issues/3730).
+
+**Trigger.** D1's unconditional waiting clause conflicts with bounded observability submission, while INV-1 and INV-4
+name different exceptions. Base acceptance 4 requires observability to wait for a successful commit even after its
+admission bound (`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:109-126`,
+`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:513-541`,
+`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:607-615`). The bounded submit path returns on deadline
+without removing the row (`crates/khive-runtime/src/audit_batch.rs:911-920`). The release rule must distinguish
+an unconfirmed audit write from a failed domain operation, and explain the retained read wait in #3730.
+
+Source line references in this amendment and the in-place citation corrections refer to repository revision
+`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`, except line references to this record itself, which refer to this file as
+amended here. Section and decision references identify the amended text independently of line movement.
+
+### Decision 1 -- One release table for D1, INV-1 and INV-4
+
+D1's release table above is the rule for each producer class and every `AuditTerminalReason`. It supersedes the
+unqualified wait statements in D1, D2, D3, D4, INV-1, INV-4 and base acceptances 3, 4 and 11. A successful obligation
+waits for confirmed commit unless a named exception applies. An error may return without commit. An obligation error
+after handler success carries the domain result; it does not authorize retry of that effect
+(`crates/khive-runtime/src/pack/audit.rs:718-729`, `crates/khive-runtime/src/error.rs:644-651`).
+
+Pure-observability audit submission waits at most `admission_deadline`, 5 s by default, and releases an otherwise
+successful operation whether or not its row has committed or the append has failed. Earlier commit or terminal
+failure resolves the wait earlier. There is no obligation carried by this class, so the writer lock must not retain
+a successful operation beyond that bound. This preserves bounded submission instead of extending the wait until
+commit, and preserves an actual wait instead of making all submissions return immediately
+(`crates/khive-runtime/src/audit_batch.rs:305-315`, `crates/khive-runtime/src/audit_batch.rs:911-920`,
+`crates/khive-runtime/src/pack/audit.rs:681-688`).
+
+**INV-1 exception list.** For obligation-bearing rows, the exceptions and terminal departures are:
+
+- `QueueAdmissionExhausted`: Amendment 1 permits an eligible successful read to return with no enqueued row.
+  Other obligation producers return an error.
+- `AdmissionDeadlineExpired`: Amendment 1 permits an eligible successful read to return while its row is unresolved.
+  Other bounded obligation paths return an error; resolved paths continue waiting.
+- `ResolutionDeadlineExpired`: Amendment 5 ends resolved waiting with an error and leaves the row with the driver.
+- `DriverAppendAbandoned`: Amendment 6 detaches the append; its result may later be commit or failure. No domain
+  effect is retried and no row is re-enqueued.
+- `StoreWedged`: Amendment 6 sheds the generation without a store call. Amendment 9 identifies this as certain loss
+  and specifies the production diagnostics. This is distinct from an abandoned append's unknown outcome.
+- `PreflightRejected`, `AdmissionClosed`, `IdentityConflict`, `StoreFailure`, `RetryExhausted`,
+  `IdempotencyUnsupported`, `DriverPanicked`, `DriverCancelled`, `DriverJoinLost` and
+  `DriverExitedInconsistent`: an obligation error permits return without confirmed commit, never a new success.
+- Amendment 10 omits or samples success rows of six named verbs. Omitted rows never enter the batch and
+  have no `AuditTerminalReason`. That omission remains separate from terminal-reason degradation.
+
+**INV-4 exception list.** The obligation-bearing departures are exactly the same list: `QueueAdmissionExhausted`,
+`AdmissionDeadlineExpired`, `ResolutionDeadlineExpired`, `DriverAppendAbandoned`, `StoreWedged`, `PreflightRejected`,
+`AdmissionClosed`, `IdentityConflict`, `StoreFailure`, `RetryExhausted`, `IdempotencyUnsupported`, `DriverPanicked`,
+`DriverCancelled`, `DriverJoinLost`, `DriverExitedInconsistent`, and Amendment 10's omission or sampling.
+Pure observability is outside INV-1. For INV-4 it additionally permits a successful return before commit at the
+admission bound, or on an earlier terminal failure, as the same table states. These limits replace the claim that
+batching can never weaken visibility at return or retention in the same situation. Identity uniqueness and exact
+payload comparison still prevent duplicate accounting; none of these exceptions permits a second copy of a row.
+
+The reason for enumerating errors as well as successful degradation is that "never volatile at return" is stronger
+than "never falsely reports success". The table states the latter precisely without hiding error exits from the
+former. The implementation supplies the enum, refusal, timeout and result-fold evidence at
+`crates/khive-runtime/src/audit_batch.rs:93-219`, `crates/khive-runtime/src/audit_batch.rs:842-920` and
+`crates/khive-runtime/src/pack/audit.rs:718-729`. The abandoned and shed paths are at
+`crates/khive-runtime/src/audit_batch.rs:954-985` and `crates/khive-runtime/src/audit_batch.rs:1026-1077`.
+Amendment 9's production diagnostics replace the earlier snapshot instruction: generation retention is conditional
+on `test` or `test-internals` (`crates/khive-runtime/src/audit_batch.rs:403-408`).
+
+Base acceptance 3 now requires commit before success only on the table's commit-required paths, with concurrent
+batch formation and an early-return negative fixture. Base acceptance 4 separately requires obligation failure on
+persistent commit failure, preservation of successful pure-observability results on failure, and an observability
+wait of at most the admission bound even when the append remains pending. Base acceptance 11 checks crash survival
+for confirmed commits under the store's stated posture; the table's unconfirmed and omitted rows are not claimed
+as committed. Existing identity and ambiguity acceptance remains in force.
+
+The extra `RetryExhausted` success arm at `crates/khive-runtime/src/pack/audit.rs:661-671` disagrees with the two-reason
+read exception retained here. The source test `read_survives_lease_retry_exhaustion_but_write_stays_strict` explicitly
+expects that extra success (`crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:179-209`). This amendment does
+not expand the exception to reconcile that discrepancy.
+
+### Decision 2 -- Retain the bounded read audit wait requested in #3730
+
+The 0-5 s audit wait for an eligible read stays. A successful read's produced dispatch row carries `cost_unit >= 1`:
+`base_weight` is 1 and successful dispatches build the accounting payload before submission
+(`crates/khive-runtime/src/cost_unit.rs:40-42`, `crates/khive-runtime/src/cost_unit.rs:143-155`,
+`crates/khive-runtime/src/pack/dispatch.rs:1143-1167`). Thus a read is not pure observability merely because it performs
+no domain mutation. Returning immediately would permit a metered read without its accounting row even while the
+normal commit path remains available.
+
+The wait ends on commit or terminal failure, or at the admission bound under Amendment 1. `kg.get` is an allowlisted
+pair (`crates/khive-runtime/src/pack/registry_access.rs:505`); its produced success row uses bounded submission
+(`crates/khive-runtime/src/pack/audit.rs:584-609`). Queue refusal and deadline expiry remain the two named exceptions;
+they do not remove the normal wait. Amendment 10's omissions remain separately scoped and do not include
+`kg.get` (`crates/khive-runtime/src/pack/audit_success_rows.rs:55-81`). Failed dispatches are not assigned a successful
+read's cost: their resource payload omits `cost_unit` (`crates/khive-runtime/src/cost_unit.rs:137-142`).
+
+Removing the wait would need audit rows to commit off the shared writer, for example in a separate audit store. No
+accepted record specifies one. ADR-134, which is not accepted, describes a distinct connection whose writer still
+shares SQLite's write lock, which would not remove the contention (`docs/adr/ADR-134-store-durability-posture.md:118-132`).
+The base text's references to ADR-134's D2a lane and durability posture point to that record; no rule in this
+amendment depends on them.
+This amendment selects neither a new store topology nor new durability settings. It answers #3730 by retaining the
+bounded wait. The issue closes when this amendment merges.
+
+### Decision 3 -- GateUnavailable is pure observability
+
+`AuditProducer::GateUnavailable` is explicitly `PureObservability`. The dispatch has already failed closed; the row
+records a gate outage, not a completed effect or authorization grant. A failed audit append must not turn that
+refusal into success, or replace the gate error with a new domain outcome. `GateDenied` remains
+`DispatchObligation`. The two producers are distinct in the exhaustive classifier
+(`crates/khive-runtime/src/audit_batch.rs:49-54`, `crates/khive-runtime/src/audit_batch.rs:74-86`).
+
+The outage path constructs `RuntimeError::GateUnavailable`, submits the observability row, then returns that error
+(`crates/khive-runtime/src/pack/dispatch.rs:603-633`). This selects best-effort outage recording over an additional
+obligation on an operation already refused, without weakening the gate's fail-closed result.
+
+### Decision 4 -- Correct factual references and keep acceptance evidence explicit
+
+The admission-degrade allowlist contains 70 `(owning pack, verb)` pairs at `7d6ff8fd`
+(`crates/khive-runtime/src/pack/registry_access.rs:456-553`). Present-tense counts of 39 or eleven are corrected in
+place; Amendment 2's explicitly dated 61-entry observation at `fe272269` remains historical. The census assertion is
+`admission_degrade_safe_assertive_census_matches_live_pack_sources` at `crates/khive-runtime/src/pack_tests.rs:382`,
+with equality and ownership assertions at `crates/khive-runtime/src/pack_tests.rs:526-565`.
+
+Amendment 3's status is corrected to Accepted, consistent with the existing acceptance note
+(`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:955-957`) and the implemented result-preserving fold
+(`crates/khive-runtime/src/pack/audit.rs:725-729`). Amendment 10's status, and that of ADR-103 Amendment 7, is
+corrected to Accepted: both were approved together and merged in #5832, and the omission and sampling are implemented
+(`crates/khive-runtime/src/pack/audit_success_rows.rs:217-241`). Source locations for event-store setup, the audit fold,
+recall dispatch, serve-ledger batching, error projection, the census and ADR-103's audit payload are corrected in place.
+
+**Base acceptance 1: unexecuted.** No two-revision census comparison is established by this amendment. The committed
+manifest pins one source revision and a 12-pack inventory with 91 entries
+(`scripts/data/writer-census-v1.json:3-133`). The runtime fixture has 14 packs, two entries and `final_revision: null`
+(`crates/khive-runtime/tests/data/adr133-writer-census.json:3-37`). Those files do not constitute matched manifests at
+two revisions. The historical aggregate of 100 verbs is not a substitute for that comparison. Acceptance 1 remains
+required and is not waived.
+
+### Acceptance
+
+The statements below are verification requirements. Source inspection does not establish a passing execution result.
+Test names identify existing coverage or explicitly identify coverage to add.
+
+| ID     | Statement                                                                                                                                                             | Evidence                                                                                                                                                                                                                                                                                                 |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A11-1  | Every producer and terminal enum variant has the D1 table outcome; no default classification arm exists.                                                              | `crates/khive-runtime/src/audit_batch.rs:74-219`; compare all variants with D1's table.                                                                                                                                                                                                                  |
+| A11-2  | A pending pure-observability append waits until commit, earlier failure or the admission bound; deadline release preserves success without requiring a failed commit. | Add a blocked-append dispatch case to `crates/khive-runtime/tests/adr133_audit_batch.rs`; exercise `crates/khive-runtime/src/pack/audit.rs:681-688` through a producer call site. `crates/khive-runtime/tests/adr133_audit_batch.rs:888-901` covers a panic, not this case.                              |
+| A11-3  | A successful strict dispatch stays pending past the admission threshold, succeeds after commit and executes its handler once.                                         | `write_verb_waits_past_audit_deadline_until_row_commits`, `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:592-648`.                                                                                                                                                                        |
+| A11-4  | Resolution expiry returns an obligation error and leaves the row owned by the driver without rerunning the handler.                                                   | `write_verb_gives_up_after_resolution_deadline_when_store_never_returns`, `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:664-725`.                                                                                                                                                        |
+| A11-5  | Queue refusal and admission expiry preserve an eligible read result and increment distinct counters.                                                                  | `read_verb_dispatch_survives_audit_lane_admission_exhaustion_disposition` at `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:1223`; `read_verb_dispatch_survives_audit_lane_admission_deadline_expiry_disposition` at `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:1721`. |
+| A11-6  | No additional successful obligation release is introduced for `RetryExhausted`.                                                                                       | Unmet by source: `crates/khive-runtime/src/pack/audit.rs:661-671` and `read_survives_lease_retry_exhaustion_but_write_stays_strict` at `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:162`.                                                                                               |
+| A11-7  | Driver abandonment frees admission capacity; shedding at the cap makes no store call and increments flush failures.                                                   | `driver_deadline_recovers_admission_capacity_from_a_stalled_generation` at `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:820`; `driver_sheds_generations_once_the_abandoned_append_cap_is_reached` at `crates/khive-runtime/tests/read_verb_admission_exhaustion.rs:1008`.               |
+| A11-8  | Gate unavailability remains a typed failed dispatch while its audit producer is pure observability.                                                                   | `git_digest_gate_unavailable_precedes_the_receipt_contract`, `crates/khive-runtime/src/pack_tests.rs:4612-4646`; classifier at `crates/khive-runtime/src/audit_batch.rs:82-84`. Add outage-row append-failure and deadline cases.                                                                        |
+| A11-9  | A shared identity is accepted only for an identical record, and an ambiguous acknowledgement retry accounts for exactly one row.                                      | `crates/khive-db/src/stores/event.rs:526-533`; `d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row`, `crates/khive-runtime/tests/adr133_audit_batch.rs:1003-1042`.                                                                                                                              |
+| A11-10 | The 70-pair allowlist resolves to the named owners and covers the classified Assertive surface.                                                                       | `admission_degrade_safe_assertive_census_matches_live_pack_sources`, `crates/khive-runtime/src/pack_tests.rs:382-567`; count entries at `crates/khive-runtime/src/pack/registry_access.rs:456-553`.                                                                                                      |
+| A11-11 | Base acceptance 1 compares source-pinned inventories for the same pack population at two revisions.                                                                   | Unexecuted. `scripts/data/writer-census-v1.json:3-133` and `crates/khive-runtime/tests/data/adr133-writer-census.json:3-37` expose the unmatched populations and missing final revision.                                                                                                                 |
+| A11-12 | The amended text retains the 5 s read wait, records Amendment 10 as Accepted, and both invariants name the same obligation departures.                                | D1's release table and Amendment 11, Decisions 1, 2 and 4 in this file; `crates/khive-runtime/src/audit_batch.rs:307`.                                                                                                                                                                                   |
