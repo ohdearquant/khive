@@ -198,6 +198,7 @@ async fn store_mailbox_scope_matches_row_level_rule() {
         let view = MailboxView {
             actor_id: actor_id.to_string(),
             delegated,
+            maintainer_actor: None,
         };
         let filter = NoteFilter {
             mailbox: Some(view.note_scope(&token)),
@@ -208,6 +209,7 @@ async fn store_mailbox_scope_matches_row_level_rule() {
             Some(NoteMailboxScope {
                 actor_id: actor_id.to_string(),
                 legacy_local: !delegated,
+                maintainer_actor: None,
             })
         );
         let mut from_store: Vec<String> = rt
@@ -368,4 +370,96 @@ async fn hidden_anchor_answers_as_a_missing_one() {
     reg.dispatch("list", keyed("hidden/00000"))
         .await
         .expect("a key shared with a hidden message resolves to the visible row");
+}
+
+#[tokio::test]
+async fn am6_generic_quarantine_id_and_key_anchors_answer_as_missing() {
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        actor_id: Some("lambda:maintainer".into()),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("fixed maintainer runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.with_actor_id(Some("lambda:landing".into()));
+    let reg = builder.build().unwrap();
+    // Read fixtures represent already-stored transport-owned properties, not a
+    // public runtime write attempting to set the quarantine field.
+    let store = rt
+        .backend()
+        .notes()
+        .expect("trusted preexisting notes fixture");
+    let mut bool_note =
+        Note::new("local", "message", "private bool Q body").with_properties(json!({
+            "direction":"inbound","to_actor":"lambda:landing","quarantined":true,
+            "quarantine_content_ref":"private bool Q ref",
+        }));
+    bool_note.key = Some("am6/q-bool".into());
+    let mut string_note =
+        Note::new("local", "message", "private string Q body").with_properties(json!({
+            "direction":"inbound","to_actor":"lambda:landing","quarantined":"true",
+            "quarantine_content_ref":"private string Q ref",
+        }));
+    string_note.key = Some("am6/q-string".into());
+    let mut ordinary = Note::new("local", "message", "ordinary landing").with_properties(json!({
+        "direction":"inbound","to_actor":"lambda:landing","quarantined":1,
+    }));
+    ordinary.key = Some("am6/ordinary".into());
+    let mut twin = Note::new("local", "observation", "visible same-key observation");
+    twin.key = bool_note.key.clone();
+    store
+        .upsert_notes(vec![
+            bool_note.clone(),
+            string_note.clone(),
+            ordinary.clone(),
+            twin,
+        ])
+        .await
+        .unwrap();
+    let missing_id = Note::new("local", "message", "never stored").id.to_string();
+    for hidden in [&bool_note, &string_note] {
+        let hidden_id = hidden.id.to_string();
+        let hidden_error =
+            list_refusal(&reg, json!({"kind":"note","after":hidden_id,"limit":5})).await;
+        let missing_error =
+            list_refusal(&reg, json!({"kind":"note","after":missing_id,"limit":5})).await;
+        assert_eq!(
+            hidden_error.replace(&hidden_id, "<id>"),
+            missing_error.replace(&missing_id, "<id>")
+        );
+        for private in ["quarantin", "private", "Q ref"] {
+            assert!(!hidden_error.contains(private), "{hidden_error}");
+        }
+        reg.dispatch_as(
+            "list",
+            json!({"kind":"note","after":hidden_id,"limit":5}),
+            khive_runtime::VerifiedActor::new("lambda:maintainer").unwrap(),
+        )
+        .await
+        .expect("maintainer's Q ID is a valid generic anchor");
+    }
+    let key_args = |key: &str| json!({"kind":"note","key_prefix":"","after_key":key,"limit":5});
+    let hidden_key_error = list_refusal(&reg, key_args("am6/q-string")).await;
+    let missing_key_error = list_refusal(&reg, key_args("am6/no-such-key")).await;
+    assert_eq!(
+        hidden_key_error.replace("am6/q-string", "<key>"),
+        missing_key_error.replace("am6/no-such-key", "<key>")
+    );
+    reg.dispatch("list", key_args("am6/q-bool"))
+        .await
+        .expect("hidden Q does not make visible non-message same-key anchor ambiguous");
+    reg.dispatch(
+        "list",
+        json!({"kind":"note","after":ordinary.id.to_string(),"limit":5}),
+    )
+    .await
+    .expect("numeric1 keeps the ordinary stored-recipient anchor");
+    reg.dispatch_as(
+        "list",
+        key_args("am6/q-string"),
+        khive_runtime::VerifiedActor::new("lambda:maintainer").unwrap(),
+    )
+    .await
+    .expect("maintainer Q key anchor remains admitted");
 }

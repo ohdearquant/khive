@@ -11,7 +11,7 @@ As defense in depth, the final statement must begin with `SELECT` or `WITH`. Par
 ## `compile_with_mailbox`
 
 `compile_with_mailbox(query, options, mailbox)` additionally applies a
-`QueryMailboxScope { actor_id, legacy_local }` supplied by the runtime. This is a
+`QueryMailboxScope { actor_id, legacy_local, maintainer_actor }` supplied by the runtime. This is a
 pure compilation API: it does not authenticate callers or authorize delegation.
 The runtime derives the partition from its caller identity; query text cannot
 select another mailbox. The original `compile` entry remains available for
@@ -26,6 +26,16 @@ anonymous, non-delegated local caller receives the existing legacy partition:
 missing/null routing for the relevant direction, or missing/null direction with
 neither actor field holding text. A named actor whose label is `local` does not
 receive that legacy access.
+
+A nonempty `maintainer_actor` changes ownership only for message rows whose
+`quarantined` property is JSON `true` or the exact JSON string `"true"`. Those
+messages belong to the configured maintainer, independent of their stored sender,
+recipient or direction. Every other message keeps the ordinary partition above;
+non-message notes are unchanged. Numeric `1`, `1.0`, other strings, arrays, objects,
+JSON null and a missing property are ordinary values. `None` and an empty
+maintainer label preserve the previous partition exactly. The runtime supplies
+this trusted configuration separately from the caller; query text cannot appoint
+a maintainer. Visibility does not rewrite stored routing or quarantine values.
 
 Canonical edges are filtered at every source: edge rows projected as nodes,
 fixed joins, and both the seed and step of recursive traversal. For each endpoint,
@@ -42,6 +52,9 @@ entity referent cannot expose the equal-ID hidden note. Event payloads are not
 recursively inspected or redacted by this partition.
 
 The actor is bound once as a text parameter and reused across source predicates.
+A nonempty configured maintainer is bound once as a second text parameter; neither
+label is interpolated into SQL. The quarantine branch and its ordinary fallback
+produce a total boolean even when JSON fields are missing or null.
 Visibility filtering precedes matching, ordering, `DISTINCT`, `LIMIT` and `OFFSET`,
 including intermediate recursive nodes. Paging and sentinel counts therefore
 range over the filtered result. Namespace options and query limits are unchanged.

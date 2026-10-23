@@ -290,6 +290,7 @@ async fn query_mailbox_matches_rust_and_note_store_for_json_routing_shapes() {
         let scope = MailboxView {
             actor_id: token.actor().id.clone(),
             delegated: false,
+            maintainer_actor: rt.config().actor_id.clone().filter(|id| !id.is_empty()),
         }
         .note_scope(&token);
         let mut expected: Vec<_> = notes
@@ -749,4 +750,109 @@ async fn runtime_query_cannot_override_mailbox_or_namespace_scopes() {
             .unwrap();
         assert_eq!(raw_ids(&page.rows, "n_id"), expected);
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn am6_runtime_query_binds_fixed_maintainer_for_every_actual_caller() {
+    let rt = runtime(Some("lambda:maintainer"));
+    let registry = registry(&rt);
+    let fixtures = vec![
+        note(
+            900,
+            "message",
+            Some(json!({"direction":"inbound","to_actor":"lambda:landing",
+            "quarantined":true,"quarantine_content_ref":"am6-bool-private"})),
+        ),
+        note(
+            901,
+            "message",
+            Some(json!({"direction":"outbound","from_actor":"lambda:landing",
+            "quarantined":"true","quarantine_content_ref":"am6-string-private"})),
+        ),
+        note(
+            902,
+            "message",
+            Some(json!({"to_actor":17,"from_actor":false,
+            "quarantined":true,"quarantine_content_ref":"am6-unrouted-private"})),
+        ),
+        note(
+            903,
+            "message",
+            Some(json!({"direction":"inbound","to_actor":"lambda:landing",
+            "quarantined":1})),
+        ),
+        note(904, "observation", Some(json!({"quarantined":true}))),
+        note(
+            905,
+            "message",
+            Some(json!({"direction":"inbound","to_actor":"lambda:maintainer"})),
+        ),
+    ];
+    // These rows predate read admission, including transport-owned quarantine
+    // properties that the public runtime write API correctly refuses to seed.
+    rt.backend()
+        .notes()
+        .expect("trusted preexisting notes fixture")
+        .upsert_notes(fixtures.clone())
+        .await
+        .expect("seed actual stored quarantine rows");
+    seed_query_observations(
+        &rt,
+        &fixtures.iter().map(|note| note.id).collect::<Vec<_>>(),
+    )
+    .await;
+    for actor in [
+        Some("lambda:maintainer"),
+        Some("lambda:landing"),
+        Some("lambda:other"),
+        None,
+    ] {
+        let indexes: &[usize] = match actor {
+            Some("lambda:maintainer") => &[0, 1, 2, 4, 5],
+            Some("lambda:landing") => &[3, 4],
+            _ => &[4],
+        };
+        let mut expected: Vec<_> = indexes
+            .iter()
+            .map(|index| fixtures[*index].id.to_string())
+            .collect();
+        expected.sort();
+        for source in [
+            "MATCH (n:note) RETURN n.id, n.properties",
+            "MATCH (ev:event)-[:observed_as_selected]->(n:note) RETURN n.id, n.content, n.properties",
+            "SELECT ?n WHERE { ?ev a :event . ?ev :observed_as_selected ?n . ?n a :note }",
+        ] {
+            let response = registry.dispatch_with_identity("query", json!({"query":source,"page_size":100}),
+                Some(khive_runtime::RequestIdentity {
+                    namespace:"local".into(), actor_id:actor.map(str::to_owned), ..Default::default()
+                }),
+            ).await.unwrap_or_else(|error| panic!("query {actor:?}: {source}: {error}"));
+            let mut actual = page_ids(&response, "n_id");
+            actual.sort();
+            assert_eq!(actual, expected, "fixed M, actor={actor:?}, source={source}");
+            if actor != Some("lambda:maintainer") {
+                assert!(!response.to_string().contains("am6-bool-private"));
+                assert!(!response.to_string().contains("am6-string-private"));
+                assert!(!response.to_string().contains("am6-unrouted-private"));
+            }
+        }
+    }
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let mut direct = raw_ids(
+        &rt.query(&token, "MATCH (n:note) RETURN n.id")
+            .await
+            .unwrap(),
+        "n_id",
+    );
+    direct.sort();
+    let mut expected: Vec<_> = [0, 1, 2, 4, 5]
+        .iter()
+        .map(|index| fixtures[*index].id.to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        direct, expected,
+        "direct runtime query also carries configured M"
+    );
 }

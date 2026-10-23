@@ -1,6 +1,7 @@
 use super::{
     deser, json, validate_actor_label, CursorCommitParams, CursorGetParams, DateTime, KhiveRuntime,
-    NamespaceToken, ProbeMessage, ProbeParams, ProbeResponse, RuntimeError, SqlValue, Utc, Value,
+    MailboxView, NamespaceToken, ProbeMessage, ProbeParams, ProbeResponse, RuntimeError, SqlValue,
+    Utc, Value,
 };
 
 /// The page and bounded stale count share one SQL snapshot (ADR-D5). The
@@ -15,6 +16,8 @@ use super::{
 #[doc(hidden)]
 pub const PROBE_SQL: &str = khive_runtime::sql!("probe_messages_select");
 
+const QUARANTINE_PROBE_SQL: &str = khive_runtime::sql!("probe_messages_quarantine_select");
+
 /// `probe` — strictly read-only poll for new inbound message metadata and a
 /// stale-unread count capped at 1000 (ADR-D5). No read-flag mutation, no writes:
 /// the earliest unseen sequence page and stale count share one indexed statement.
@@ -25,7 +28,7 @@ pub(crate) async fn handle_probe(
 ) -> Result<Value, RuntimeError> {
     let p: ProbeParams = deser(params.clone())?;
     validate_actor_label("probe", &p.actor, "actor")?;
-    runtime.authorize_mailbox_view(token, "comm.probe", Some(&p.actor), &params)?;
+    let view = runtime.authorize_mailbox_view(token, "comm.probe", Some(&p.actor), &params)?;
     if p.stale_minutes <= 0 {
         return Err(RuntimeError::InvalidInput(
             "probe: `stale_minutes` must be positive".into(),
@@ -38,7 +41,7 @@ pub(crate) async fn handle_probe(
     let response = query_probe(
         runtime,
         token.namespace().as_str(),
-        &p.actor,
+        &view,
         p.since_us,
         stale_cutoff_us,
     )
@@ -73,10 +76,11 @@ async fn notes_seq_high_water_mark(
 async fn query_probe(
     runtime: &KhiveRuntime,
     namespace: &str,
-    actor: &str,
+    view: &MailboxView,
     since_us: Option<i64>,
     stale_cutoff_us: i64,
 ) -> Result<ProbeResponse, RuntimeError> {
+    let actor = view.actor_id.as_str();
     let sql = runtime.sql();
     let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
 
@@ -105,14 +109,21 @@ async fn query_probe(
         None => SqlValue::Null,
     };
 
+    let mut params = vec![
+        SqlValue::Text(namespace.to_string()),
+        SqlValue::Text(actor.to_string()),
+        since_param,
+        SqlValue::Integer(stale_cutoff_us),
+    ];
+    let statement_sql = if let Some(maintainer) = &view.maintainer_actor {
+        params.push(SqlValue::Text(maintainer.clone()));
+        QUARANTINE_PROBE_SQL
+    } else {
+        PROBE_SQL
+    };
     let statement = khive_storage::types::SqlStatement {
-        sql: PROBE_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(actor.to_string()),
-            since_param,
-            SqlValue::Integer(stale_cutoff_us),
-        ],
+        sql: statement_sql.to_string(),
+        params,
         label: Some("comm_probe".into()),
     };
 
