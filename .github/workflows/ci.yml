@@ -879,6 +879,30 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
       - name: Install browser for repository dogfood
         run: timeout 120 npx playwright install chromium || timeout 120 npx playwright install chromium
+      # The OS dependency install downloads about 26 MB of archives from the
+      # Ubuntu mirror on every run, and a slow mirror can spend the whole step
+      # bound on that download while still making progress. Keep the archives
+      # between runs. apt checks every restored file against the current index
+      # and downloads only what is missing or changed, so a stale entry costs a
+      # download, never a wrong package. The key carries the runner image,
+      # whose preinstalled packages decide which archives are needed, and the
+      # lock file, which pins the Playwright version that names them.
+      - name: Resolve the browser OS dependency cache key
+        id: apt-cache-key
+        run: echo "image=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore browser OS dependency archives
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: playwright-apt-${{ runner.os }}-${{ steps.apt-cache-key.outputs.image }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
+          restore-keys: |
+            playwright-apt-${{ runner.os }}-
+      - name: Stage restored archives for apt
+        run: |
+          mkdir -p ~/.cache/playwright-apt-archives
+          find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' -exec sudo cp -t /var/cache/apt/archives/ {} +
+          echo "apt archive cache: $(find /var/cache/apt/archives -maxdepth 1 -name '*.deb' | wc -l)"
       - name: Install browser OS dependencies
         # Deliberately NO timeout(1) wrapper: killing the wrapper mid-install
         # orphans apt-get with the dpkg lock held (the unsound pattern the
@@ -891,6 +915,23 @@ jobs:
         # package downloads can exceed the former four-minute backstop.
         timeout-minutes: 8
         run: npx playwright install-deps chromium || npx playwright install-deps chromium
+      # Save only after a successful install and only on an exact-key miss, so
+      # a cache entry always holds a complete set. An empty set is never saved:
+      # it would occupy the exact key and stop the next run from filling it.
+      - name: Collect browser OS dependency archives
+        id: apt-archives
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        run: |
+          find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp -t ~/.cache/playwright-apt-archives/ {} +
+          count=$(find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' | wc -l)
+          echo "collected archives: $count"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Save browser OS dependency archives
+        if: steps.apt-cache.outputs.cache-hit != 'true' && steps.apt-archives.outputs.count != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: Repository showcase dogfood
         run: npx playwright test
 
