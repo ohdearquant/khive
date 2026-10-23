@@ -267,3 +267,30 @@ impl VerbRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod verb_table_pin_tests {
+    use super::*;
+
+    fn names(table: &[(&'static str, AtomicU64)]) -> Vec<&'static str> {
+        table.iter().map(|(name, _)| *name).collect()
+    }
+
+    // The counter and sequence tables repeat the policy verbs as literals; a verb added to or
+    // removed from a policy table without its counter row would count nothing or sample nothing.
+    #[test]
+    fn counter_and_sequence_tables_name_exactly_the_policy_verbs() {
+        let omitted: Vec<_> = VerbRegistry::AUDIT_SUCCESS_ROW_OMITTED_VERBS
+            .iter()
+            .map(|(_, verb)| *verb)
+            .collect();
+        let sampled: Vec<_> = VerbRegistry::AUDIT_SUCCESS_ROW_SAMPLED_VERBS
+            .iter()
+            .map(|(_, verb, _, _)| *verb)
+            .collect();
+        assert_eq!(names(&OMITTED_COUNTS), omitted);
+        assert_eq!(names(&SAMPLED_OUT_COUNTS), sampled);
+        assert_eq!(names(&FORCED_COUNTS), sampled);
+        assert_eq!(names(&SAMPLED_SEQUENCES), sampled);
+    }
+}
