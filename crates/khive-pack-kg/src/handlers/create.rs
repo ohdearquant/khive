@@ -993,6 +993,14 @@ impl KgPack {
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
         let mut fields: CreateParams = deser(params.clone())?;
+        // Keep malformed shared-field errors at the existing typed boundary,
+        // then refuse a note-only field before hooks or any entity write.
+        // The bulk path has already returned above.
+        if matches!(&spec, KindSpec::Entity { .. }) && params.get("content").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "create: `content` is a note-only field; use `description` for an entity".into(),
+            ));
+        }
         let required_entity_type = match &spec {
             KindSpec::Entity { entity_type, .. } => entity_type.as_deref(),
             _ => None,
