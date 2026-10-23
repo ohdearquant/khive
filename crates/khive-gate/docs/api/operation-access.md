@@ -86,6 +86,11 @@ reader connection and store nothing. `charter.publish`, `charter.vocabulary`, `c
 stores a definition, a run, an observation or a state change. `charter.claim` stays `Write`
 even where claims are not yet admitted and it refuses without writing.
 
+Revision `domain-effects-v24` classifies `schedule.occurrences` and `schedule.receipts`
+as `Read`: they page existing occurrence history and terminal or reconciliation
+receipts in the original namespace through reader connections. Ordinary Gate
+admission and configured dispatch audit behavior still apply.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -253,6 +258,8 @@ even where claims are not yet admitted and it refuses without writing.
 | `scan`                            | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1401)                   |
 | `schedule.agenda`                 | Read   | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L106)                      |
 | `schedule.cancel`                 | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L135)                      |
+| `schedule.occurrences`            | Read   | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L169)                      |
+| `schedule.receipts`               | Read   | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L183)                      |
 | `schedule.remind`                 | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L25)                       |
 | `schedule.schedule`               | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L54)                       |
 | `schema`                          | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |

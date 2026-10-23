@@ -1,5 +1,4 @@
-UPDATE notes SET
- properties=json_set(COALESCE(properties,'{}'), '$.status',
+UPDATE notes SET properties=json_set(COALESCE(properties,'{}'), '$.status',
   (SELECT CASE
    WHEN state='cancelled' THEN 'cancelled'
    WHEN next_seconds IS NOT NULL OR selected_seconds IS NOT NULL THEN 'pending'

@@ -277,6 +277,101 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn projection_refuses_carried_reserved_properties_and_rolls_back_complete_state() {
+    let Some(root) =
+        isolate("projection_refuses_carried_reserved_properties_and_rolls_back_complete_state")
+    else {
+        return;
+    };
+    async fn complete_state(f: &Fixture) -> Value {
+        let mut reader = f.rt.sql().reader().await.expect("complete state reader");
+        let mut all = serde_json::Map::new();
+        for table in TABLES.into_iter().chain(["notes", "events"]) {
+            let rows = reader
+                .query_all(SqlStatement::new(
+                    format!("SELECT * FROM {table} ORDER BY rowid"),
+                    vec![],
+                ))
+                .await
+                .expect("complete stored state");
+            all.insert(table.into(), serde_json::to_value(rows).unwrap());
+        }
+        Value::Object(all)
+    }
+    for (case, key, value) in [
+        ("secret-null", "khive:secret_gate", "null"),
+        ("secret-object", "khive:secret_gate", r#"{"policy":"held"}"#),
+        ("web-null", "khive:web_receipt", "null"),
+        ("web-object", "khive:web_receipt", r#"{"receipt":"held"}"#),
+    ] {
+        let case_root = root.join(case);
+        std::fs::create_dir_all(&case_root).unwrap();
+        let f = Fixture::open(&case_root);
+        let (id, first) = f.declare(None, false).await;
+        let _clock = TestClock::fixed(f.store.store_id(), first);
+        let path = format!("$.\"{key}\"");
+        assert_eq!(
+            f.sql(
+                "UPDATE notes SET properties=json_set(properties,?1,json(?2)) WHERE id=?3",
+                vec![
+                    SqlValue::Text(path.clone()),
+                    SqlValue::Text(value.into()),
+                    SqlValue::Text(id.to_string()),
+                ],
+            )
+            .await
+            .expect("install carried reserved property"),
+            1
+        );
+        let snapshot = f.store.series(id).await.unwrap().unwrap();
+        let definition = f.store.definition(&snapshot).await.unwrap();
+        let prepared = f
+            .store
+            .prepare_page(&snapshot, &definition, first, 300, 200)
+            .expect("prepare a real occurrence");
+        let before = complete_state(&f).await;
+        let error = f
+            .store
+            .commit_page(prepared)
+            .await
+            .expect_err("carried provenance must refuse projection");
+        assert!(
+            error
+                .to_string()
+                .contains("schedule display projection refused reserved properties"),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            complete_state(&f).await,
+            before,
+            "{case}: the entire occurrence unit and source row must roll back"
+        );
+        assert!(f.inventory(id).await.is_empty());
+        assert_eq!(
+            f.sql(
+                "UPDATE notes SET properties=json_remove(properties,?1) WHERE id=?2",
+                vec![SqlValue::Text(path), SqlValue::Text(id.to_string())],
+            )
+            .await
+            .expect("remove only the carried reserved property"),
+            1
+        );
+        let retry = f.page(id, first, 200).await;
+        assert_eq!(
+            retry.created, 1,
+            "{case}: real projection route must recover"
+        );
+        assert!(retry.selected_occurrence_id.is_some());
+        assert_eq!(f.inventory(id).await.len(), 1);
+        assert_eq!(
+            f.store.series(id).await.unwrap().unwrap().revision,
+            snapshot.revision + 1,
+            "{case}: refused series CAS must not survive rollback"
+        );
+    }
+}
+
+#[tokio::test]
 async fn canonical_definition_and_complete_occurrence_key_are_bound() {
     let Some(root) = isolate("canonical_definition_and_complete_occurrence_key_are_bound") else {
         return;

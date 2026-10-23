@@ -157,6 +157,38 @@ fn bytes(row: &SqlRow, name: &str) -> StorageResult<Vec<u8>> {
     }
 }
 
+async fn reject_reserved_projection_properties(
+    writer: &mut dyn SqlWriter,
+    series: &SeriesSnapshot,
+) -> StorageResult<()> {
+    let row = writer
+        .query_row(SqlStatement::new(
+            "SELECT json_type(properties, '$.\"khive:secret_gate\"') AS secret_gate_kind, \
+             json_type(properties, '$.\"khive:web_receipt\"') AS web_receipt_kind \
+             FROM notes WHERE id=?1 AND namespace=?2 \
+             AND kind='scheduled_event' AND deleted_at IS NULL",
+            vec![text(series.schedule_id), text(&series.namespace)],
+        ))
+        .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row
+        .opt_text("secret_gate_kind")
+        .map_err(internal)?
+        .is_some()
+        || row
+            .opt_text("web_receipt_kind")
+            .map_err(internal)?
+            .is_some()
+    {
+        return Err(internal(
+            "schedule display projection refused reserved properties or an unadvanceable revision",
+        ));
+    }
+    Ok(())
+}
+
 /// Publish only derived schedule fields. Existing runtime/web provenance keys
 /// refuse this generic projection; a refusal rolls back the entire owned unit.
 async fn project_note(
@@ -165,6 +197,7 @@ async fn project_note(
     next_text: Option<&str>,
     now: i64,
 ) -> StorageResult<()> {
+    reject_reserved_projection_properties(writer, series).await?;
     let changed = writer
         .execute(SqlStatement::new(
             include_str!("../sql/occurrence-note-projection.sql"),
