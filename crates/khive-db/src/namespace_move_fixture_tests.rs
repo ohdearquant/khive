@@ -1383,12 +1383,35 @@ fn atom_weight_collisions_name_only_the_routed_target_and_leave_every_row_unchan
 }
 
 fn seed_pending_move_entity(conn: &Connection, id: uuid::Uuid, namespace: &str, kind: &str) {
+    seed_pending_move_entity_at(conn, id, namespace, kind, 9);
+}
+
+fn seed_pending_move_entity_at(
+    conn: &Connection,
+    id: uuid::Uuid,
+    namespace: &str,
+    kind: &str,
+    version: i64,
+) {
+    // Seed an advanced revision without changing the update guard, then restore the
+    // production insertion guard from its own stored definition before use.
+    let insert_guard: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND name = 'entities_version_insert_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute_batch("DROP TRIGGER entities_version_insert_guard")
+        .unwrap();
     conn.execute(
         "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at, version) \
-         VALUES (?1, ?2, ?3, ?1, 1, 42, 9)",
-        rusqlite::params![id.to_string(), namespace, kind],
+         VALUES (?1, ?2, ?3, ?1, 1, 42, ?4)",
+        rusqlite::params![id.to_string(), namespace, kind, version],
     )
     .unwrap();
+    conn.execute_batch(&insert_guard).unwrap();
 }
 
 fn seed_pending_move_record(
@@ -1694,13 +1717,8 @@ fn pending_index_refresh_failure_rolls_back_prior_routes_and_generations() {
 fn pending_namespace_move_version_overflow_rolls_back_without_consuming_work() {
     let conn = migrated();
     let id = uuid::Uuid::from_u128(1);
-    seed_pending_move_entity(&conn, id, "source", "concept");
+    seed_pending_move_entity_at(&conn, id, "source", "concept", i64::MAX);
     seed_pending_move_record(&conn, id, "stale");
-    conn.execute(
-        "UPDATE entities SET version = ?1 WHERE id = ?2",
-        rusqlite::params![i64::MAX, id.to_string()],
-    )
-    .unwrap();
     let entities = weight_table_rows(&conn, "entities");
     let pending = weight_table_rows(&conn, "pending_entity_indexes");
     let request = MoveRequest::new(
