@@ -692,8 +692,7 @@ This alternative is rejected because this ADR does not define public-network aut
 
 ## Amendment 2 (2026-10-23) -- Conformance gate, mounted dispatch, and TCP translation
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR or of earlier amendments.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 **Addresses**: [#5579](https://github.com/ohdearquant/khive/issues/5579).
 

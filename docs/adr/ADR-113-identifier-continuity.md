@@ -207,8 +207,8 @@ exposing the primitive; final call is the reviewer's.
 
 ## Amendment 1 (2026-10-23) -- part (a) as implemented, and the part (b) collision rule
 
-**Status**: Proposed 2026-10-23. This amendment requires specification approval. It records part (a) as implemented
-and leaves part (b) Proposed.
+**Status**: Accepted 2026-10-23. It records part (a) as implemented and leaves part (b) Proposed. It does not change
+the status of the base ADR.
 
 **Addresses**: [#5570](https://github.com/ohdearquant/khive/issues/5570).
 

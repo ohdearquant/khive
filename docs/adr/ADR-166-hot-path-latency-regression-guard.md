@@ -231,7 +231,8 @@ The repository does not yet match ADR-206's text on where these values live. ADR
 "delivered with ADR-166 D3", as the single source, keyed by guarantee ID and comparison class
 (docs/adr/ADR-206-crate-performance-guarantees.md:152-156). No such file is tracked. The 18
 `crates/*/perf/reference.json` files each carry `noise_ceiling` inside their `reduction` object (for example
-crates/khive-fold/perf/reference.json:1137-1147), and none carries a guarantee ID or comparison class key. Where the
+crates/khive-fold/perf/reference.json:1137-1147). Each carries the comparison class as its top-level `class` object
+(crates/khive-fold/perf/reference.json:1093; ADR-206:674), and none carries a guarantee ID. Where the
 values live and how they are keyed is ADR-206's decision; this amendment only withdraws ADR-166's claim on them.
 
 ### Decision 2 -- G2 covers the store reads its test exercises

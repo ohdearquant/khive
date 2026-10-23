@@ -261,9 +261,8 @@ though their algorithms do not change.
 
 ## Amendment 1 (2026-10-23) -- implementation base and packaging
 
-**Status**: Proposed 2026-10-23. This amendment requires specification approval. It settles the packaging that the
-base text leaves to review ("Review of this ADR must explicitly settle that packaging before those follow-ups
-proceed") and moves the implementation base forward.
+**Status**: Accepted 2026-10-23. It settles the packaging that the base text leaves to review ("Review of this ADR must
+explicitly settle that packaging before those follow-ups proceed") and moves the implementation base forward.
 
 **Addresses**: [#4510](https://github.com/ohdearquant/khive/issues/4510),
 [#4554](https://github.com/ohdearquant/khive/issues/4554).
