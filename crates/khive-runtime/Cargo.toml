@@ -12,6 +12,11 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [features]
+pack-git = []
+pack-code = []
+pack-tool = []
+pack-exec = []
+pack-workspace = []
 blob-s3 = ["khive-db/blob-s3"]
 contract-faults = []
 fault-injection = []

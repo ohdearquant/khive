@@ -9,15 +9,20 @@ mod atomic_apply;
 pub mod blob;
 pub mod cli;
 pub mod code_audit;
+#[cfg(feature = "pack-code")]
 pub mod code_ingest;
 pub mod compose;
 pub mod coordinator;
+mod db_snapshot;
 pub mod dbpath;
 pub mod engine;
 pub mod entity_type_backfill;
 pub mod exec;
+#[cfg(feature = "pack-git")]
 pub mod git_annotation_repair;
+#[cfg(feature = "pack-git")]
 pub mod git_dedup;
+#[cfg(feature = "pack-git")]
 pub mod git_ingest;
 pub mod kg;
 pub mod mount;
@@ -55,11 +60,14 @@ mod _pack_links {
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_charter::CharterPack as _;
+    #[cfg(feature = "pack-code")]
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    #[cfg(feature = "pack-exec")]
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
+    #[cfg(feature = "pack-git")]
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
@@ -71,8 +79,10 @@ mod _pack_links {
     use khive_pack_session::SessionPack as _;
     #[cfg(feature = "pack-telemetry")]
     use khive_pack_telemetry::TelemetryPack as _;
+    #[cfg(feature = "pack-tool")]
     use khive_pack_tool::ToolPack as _;
     #[cfg(feature = "pack-web")]
     use khive_pack_web::WebPack as _;
+    #[cfg(feature = "pack-workspace")]
     use khive_pack_workspace::WorkspacePack as _;
 }

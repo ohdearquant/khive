@@ -8,8 +8,8 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 
 // Force-link pack crates so their `inventory::submit!` constructors are
 // included by the linker. These are the only direct references to the pack
-// crate types inside `khive-mcp`. A pack that is an optional feature (agent,
-// telemetry, web, moodboard) takes a `#[cfg(feature = ...)]` on its line.
+// crate types inside `khive-mcp`. Each optional pack takes a matching
+// `#[cfg(feature = ...)]` on its line.
 #[cfg(feature = "pack-agent")]
 #[doc(hidden)]
 pub use khive_pack_agent::AgentPack as _AgentPack;
@@ -19,12 +19,15 @@ pub use khive_pack_blob::BlobPack as _BlobPack;
 pub use khive_pack_brain::BrainPack as _BrainPack;
 #[doc(hidden)]
 pub use khive_pack_charter::CharterPack as _CharterPack;
+#[cfg(feature = "pack-code")]
 #[doc(hidden)]
 pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
 pub use khive_pack_comm::CommPack as _CommPack;
+#[cfg(feature = "pack-exec")]
 #[doc(hidden)]
 pub use khive_pack_exec::ExecPack as _ExecPack;
+#[cfg(feature = "pack-git")]
 #[doc(hidden)]
 pub use khive_pack_git::GitPack as _GitPack;
 #[doc(hidden)]
@@ -45,10 +48,12 @@ pub use khive_pack_session::SessionPack as _SessionPack;
 #[cfg(feature = "pack-telemetry")]
 #[doc(hidden)]
 pub use khive_pack_telemetry::TelemetryPack as _TelemetryPack;
+#[cfg(feature = "pack-tool")]
 #[doc(hidden)]
 pub use khive_pack_tool::ToolPack as _ToolPack;
 #[cfg(feature = "pack-web")]
 #[doc(hidden)]
 pub use khive_pack_web::WebPack as _WebPack;
+#[cfg(feature = "pack-workspace")]
 #[doc(hidden)]
 pub use khive_pack_workspace::WorkspacePack as _WorkspacePack;

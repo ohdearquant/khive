@@ -764,7 +764,7 @@ impl RuntimeConfig {
         self
     }
 
-    /// Return the shipped pack set used when no CLI, environment, or
+    /// Return the compiled automatic pack selection used when no CLI, environment, or
     /// configuration-file selection is present.
     pub fn built_in_packs() -> Vec<String> {
         [
@@ -776,10 +776,15 @@ impl RuntimeConfig {
             "schedule",
             "knowledge",
             "session",
+            #[cfg(feature = "pack-tool")]
             "tool",
+            #[cfg(feature = "pack-exec")]
             "exec",
+            #[cfg(feature = "pack-git")]
             "git",
+            #[cfg(feature = "pack-code")]
             "code",
+            #[cfg(feature = "pack-workspace")]
             "workspace",
             "blob",
         ]

@@ -34,17 +34,17 @@ khive-pack-brain = { version = "0.14.0", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.14.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.14.0", path = "../khive-pack-schedule" }
 khive-pack-formal = { version = "0.14.0", path = "../khive-pack-formal", optional = true }
-khive-pack-code = { version = "0.14.0", path = "../khive-pack-code" }
+khive-pack-code = { version = "0.14.0", path = "../khive-pack-code", optional = true }
 khive-pack-web = { version = "0.14.0", path = "../khive-pack-web", optional = true }
 khive-pack-telemetry = { version = "0.14.0", path = "../khive-pack-telemetry", optional = true }
 khive-pack-knowledge = { version = "0.14.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.14.0", path = "../khive-pack-session" }
-khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool" }
-khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
-khive-pack-git = { version = "0.14.0", path = "../khive-pack-git" }
+khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool", optional = true }
+khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec", optional = true }
+khive-pack-git = { version = "0.14.0", path = "../khive-pack-git", optional = true }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.14.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace" }
+khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace", optional = true }
 khive-pack-charter = { version = "0.14.0", path = "../khive-pack-charter" }
 khive-request = { version = "0.14.0", path = "../khive-request" }
 khive-changeset = { version = "0.14.0", path = "../khive-changeset" }
@@ -96,10 +96,18 @@ blake3 = { workspace = true, features = ["std"] }
 
 [features]
 blob-s3 = ["khive-runtime/blob-s3", "khive-mcp/blob-s3"]
-# The default set links only the core packs. The agent, telemetry and web packs
+# Git and Code are optional and enabled by default. Agent, telemetry and web
 # are optional and off by default, like formal and moodboard; the operator build
 # (`make build-local`) enables all three.
-default = []
+default = ["pack-git", "pack-code"]
+pack-git = ["dep:khive-pack-git", "khive-mcp/pack-git"]
+pack-code = ["dep:khive-pack-code", "khive-mcp/pack-code"]
+# Tool is optional and off by default.
+pack-tool = ["dep:khive-pack-tool", "khive-mcp/pack-tool"]
+# Exec is optional and also links its Tool prerequisite.
+pack-exec = ["dep:khive-pack-exec", "khive-mcp/pack-exec", "pack-tool"]
+# Workspace is optional and also links its Git prerequisite.
+pack-workspace = ["dep:khive-pack-workspace", "khive-mcp/pack-workspace", "pack-git"]
 # Pass-through, plus links kkernel's own force-link reference: enables the agent
 # pack. A build without it does not link or register the pack, so it is absent
 # from the pack list the server reports and `--pack agent` is an unknown pack.
@@ -116,7 +124,7 @@ pack-web = ["khive-mcp/pack-web", "khive-pack-web"]
 kg-adapters = ["dep:khive-vcs-adapters"]
 # Adds the `repo export` and `repo build` commands, which link the repository
 # showcase bundle exporter. Off by default; the operator build enables it.
-repo-showcase = ["khive-repo-showcase/export"]
+repo-showcase = ["khive-repo-showcase/export", "pack-git", "pack-code"]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
 # Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
@@ -170,3 +178,11 @@ required-features = ["kg-adapters"]
 
 [[test]]
 name = "kg_import_schema"
+
+[[test]]
+name = "code_ingest_cli"
+required-features = ["pack-code"]
+
+[[test]]
+name = "finding_null_clear_atomic"
+required-features = ["pack-code"]

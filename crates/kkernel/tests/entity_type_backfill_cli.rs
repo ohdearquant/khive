@@ -1,4 +1,8 @@
 //! Exercise the admin boundary against private legacy-entity fixtures.
+//!
+//! The fixtures compose the optional git pack beside kg to show the backfill
+//! routes only to the kg backend, so the file needs `pack-git`.
+#![cfg(feature = "pack-git")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

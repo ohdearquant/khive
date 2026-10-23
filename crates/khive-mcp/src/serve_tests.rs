@@ -3772,6 +3772,7 @@ fn sqlite_multi_backend_config(main_path: PathBuf, secondary_path: PathBuf) -> K
     }
 }
 
+#[cfg(feature = "pack-code")]
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
@@ -13185,19 +13186,23 @@ async fn channel_poll_loop_leaves_on_its_own_token_not_a_process_global() {
         .expect("the loop task must not panic");
 }
 
+#[cfg(feature = "pack-tool")]
 const ISSUE2768_LEGACY_GRANTS: &str = "CREATE TABLE tool_grants (
         id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL,
         tool TEXT NOT NULL, scope TEXT, reason TEXT, status TEXT NOT NULL,
         requested_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
         expires_at INTEGER, decision_note TEXT)";
 
+#[cfg(feature = "pack-tool")]
 const ISSUE2768_LEGACY_POLICY: &str = "CREATE TABLE tool_policy (
         id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL,
         tool TEXT NOT NULL, decision TEXT NOT NULL, note TEXT,
         created_at INTEGER NOT NULL, created_by TEXT)";
 
+#[cfg(feature = "pack-tool")]
 type Issue2768TableShape = Vec<(String, String, i64, Option<String>, i64, i64)>;
 
+#[cfg(feature = "pack-tool")]
 fn issue2768_runtime_config() -> RuntimeConfig {
     RuntimeConfig {
         db_path: None,
@@ -13209,6 +13214,7 @@ fn issue2768_runtime_config() -> RuntimeConfig {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 fn issue2768_tool_shape(
     backend: &StorageBackend,
 ) -> std::collections::BTreeMap<String, Issue2768TableShape> {
@@ -13235,6 +13241,7 @@ fn issue2768_tool_shape(
     shape
 }
 
+#[cfg(feature = "pack-tool")]
 fn issue2768_seed_tool_database(path: &std::path::Path, upgraded: bool) {
     let backend = StorageBackend::sqlite_for_test(path).unwrap();
     backend.prepare_core_schema().unwrap();
@@ -13251,6 +13258,7 @@ fn issue2768_seed_tool_database(path: &std::path::Path, upgraded: bool) {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 fn issue2768_multi_config(
     main_path: &std::path::Path,
     tool_path: &std::path::Path,
@@ -13295,6 +13303,7 @@ fn issue2768_multi_config(
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[test]
 #[serial_test::serial(config_ledger)]
 fn issue2768_single_backend_refuses_failed_pack_plan_and_rolls_back() {
@@ -13334,6 +13343,7 @@ fn issue2768_single_backend_refuses_failed_pack_plan_and_rolls_back() {
     );
 }
 
+#[cfg(feature = "pack-tool")]
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue2768_successful_single_and_multi_boot_have_the_same_upgraded_shape() {
@@ -13407,6 +13417,7 @@ async fn issue2768_successful_single_and_multi_boot_have_the_same_upgraded_shape
     );
 }
 
+#[cfg(feature = "pack-tool")]
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue2768_read_only_boot_refuses_missing_columns_and_accepts_current_schema() {

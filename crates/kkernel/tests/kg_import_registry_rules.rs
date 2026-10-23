@@ -1,6 +1,10 @@
 //! Archive import preserves registry ownership and loaded pack edge rules.
 
-use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
+#![cfg(any(feature = "pack-code", feature = "pack-tool"))]
+
+#[cfg(feature = "pack-tool")]
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -8,8 +12,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const CREATED: &str = "2025-01-02T03:04:05.123456Z";
+#[cfg(feature = "pack-code")]
 const CREATED_MICROS: i64 = 1_735_787_045_123_456;
 const EXPORTED: &str = "2026-01-02T03:04:05.654321Z";
+#[cfg(feature = "pack-tool")]
 const TOOL_NAME: &str = "ImportOwnershipFixture";
 
 fn uuid(number: u128) -> Uuid {
@@ -18,10 +24,18 @@ fn uuid(number: u128) -> Uuid {
 
 fn entity(id: u128, name: &str) -> Value {
     json!({
-        "id": uuid(id), "kind": "concept", "entity_type": "function", "name": name,
-        "description": "code endpoint", "properties": {"fixture": "pack-rule"},
+        "id": uuid(id), "kind": "concept", "entity_type": "algorithm", "name": name,
+        "description": "import endpoint", "properties": {"fixture": "pack-rule"},
         "tags": ["import-fixture"], "created_at": CREATED, "updated_at": CREATED
     })
+}
+
+#[cfg(feature = "pack-code")]
+fn code_entity(id: u128, name: &str) -> Value {
+    let mut value = entity(id, name);
+    value["entity_type"] = json!("function");
+    value["description"] = json!("code endpoint");
+    value
 }
 
 fn archive(entities: Vec<Value>, edges: Vec<Value>) -> Value {
@@ -60,6 +74,7 @@ fn assert_insert_counts(report: &Value, entities: u64, edges: u64) {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[derive(Debug, PartialEq)]
 struct RowImage {
     table: &'static str,
@@ -73,12 +88,12 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(packs: &[&str]) -> Self {
         let directory = TempDir::new().unwrap();
         let config = directory.path().join("strict.toml");
         std::fs::write(
             &config,
-            "[runtime]\npacks = ['kg', 'tool', 'code']\n[schema]\nstrict = true\n",
+            format!("[runtime]\npacks = {packs:?}\n[schema]\nstrict = true\n"),
         )
         .unwrap();
         let db = directory.path().join("target/import.db");
@@ -126,6 +141,7 @@ impl Fixture {
             .unwrap()
     }
 
+    #[cfg(feature = "pack-tool")]
     fn register_tool(&self) -> String {
         std::fs::create_dir_all(self.db.parent().unwrap()).unwrap();
         let seed_config = self.directory.path().join("seed.toml");
@@ -198,6 +214,7 @@ impl Fixture {
             .unwrap()
     }
 
+    #[cfg(feature = "pack-tool")]
     fn rows(&self) -> Vec<RowImage> {
         let connection = self.connection();
         ["entities", "graph_edges", "events"]
@@ -223,10 +240,11 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[test]
 fn import_update_refuses_registered_tools_before_any_row_write() {
     for tags in [json!([]), json!(["ordinary-import-tag"])] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new(&["kg", "tool"]);
         let id = fixture.register_tool();
         let registered = fixture.entity(&id);
         assert_eq!(registered["kind"], "project");
@@ -289,13 +307,16 @@ fn import_update_refuses_registered_tools_before_any_row_write() {
     }
 }
 
+#[cfg(feature = "pack-code")]
 #[test]
 fn import_accepts_code_pack_function_dependency_without_flags() {
     for existing_destination in [false, true] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new(&["kg", "code"]);
         let resident = if existing_destination {
-            let seeded =
-                report(&fixture.import(&archive(vec![entity(5_767_010, "Resident")], vec![]), &[]));
+            let seeded = report(&fixture.import(
+                &archive(vec![code_entity(5_767_010, "Resident")], vec![]),
+                &[],
+            ));
             assert_insert_counts(&seeded, 1, 0);
             Some(fixture.entity(&uuid(5_767_010).to_string()))
         } else {
@@ -303,7 +324,10 @@ fn import_accepts_code_pack_function_dependency_without_flags() {
             None
         };
         let input = archive(
-            vec![entity(5_767_011, "Caller"), entity(5_767_012, "Callee")],
+            vec![
+                code_entity(5_767_011, "Caller"),
+                code_entity(5_767_012, "Callee"),
+            ],
             vec![json!({
                 "edge_id": uuid(5_767_013), "source": uuid(5_767_011),
                 "target": uuid(5_767_012), "relation": "depends_on", "weight": 0.5,
@@ -377,6 +401,7 @@ fn import_accepts_code_pack_function_dependency_without_flags() {
 }
 
 impl Fixture {
+    #[cfg(feature = "pack-tool")]
     fn export(&self) -> Value {
         let target = self.directory.path().join("export.json");
         let output = self
@@ -391,9 +416,10 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[test]
 fn exported_registry_rows_and_incident_edges_are_skipped_in_every_import_mode() {
-    let source = Fixture::new();
+    let source = Fixture::new(&["kg", "tool"]);
     let tool_id = source.register_tool();
     let ordinary = archive(
         vec![
@@ -432,7 +458,7 @@ fn exported_registry_rows_and_incident_edges_are_skipped_in_every_import_mode() 
         &["--on-conflict", "skip"][..],
         &["--on-conflict", "update"][..],
     ] {
-        let destination = Fixture::new();
+        let destination = Fixture::new(&["kg", "tool"]);
         let mut preview_flags = flags.to_vec();
         preview_flags.push("--dry-run");
         let preview = report(&destination.import(&input, &preview_flags));

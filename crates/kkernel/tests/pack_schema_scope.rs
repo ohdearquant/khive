@@ -35,9 +35,12 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_blob::BlobPack>(),
         declared::<khive_pack_brain::BrainPack>(),
         declared::<khive_pack_charter::CharterPack>(),
+        #[cfg(feature = "pack-code")]
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
+        #[cfg(feature = "pack-exec")]
         declared::<khive_pack_exec::ExecPack>(),
+        #[cfg(feature = "pack-git")]
         declared::<khive_pack_git::GitPack>(),
         declared::<khive_pack_gtd::GtdPack>(),
         declared::<khive_pack_kg::KgPack>(),
@@ -46,7 +49,9 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_schedule::SchedulePack>(),
         declared::<khive_pack_session::SessionPack>(),
         declared::<khive_pack_template::TemplatePack>(),
+        #[cfg(feature = "pack-tool")]
         declared::<khive_pack_tool::ToolPack>(),
+        #[cfg(feature = "pack-workspace")]
         declared::<khive_pack_workspace::WorkspacePack>(),
     ];
     #[cfg(feature = "pack-agent")]
@@ -418,8 +423,14 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 16
+    // Nine core packs plus the schema-only Charter and test Template factories.
+    let expected_count = 11
         + [
+            cfg!(feature = "pack-git"),
+            cfg!(feature = "pack-code"),
+            cfg!(feature = "pack-tool"),
+            cfg!(feature = "pack-exec"),
+            cfg!(feature = "pack-workspace"),
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),
             cfg!(feature = "pack-web"),
