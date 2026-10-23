@@ -238,7 +238,7 @@ impl VerbRegistry {
         let seq = sequence.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         super::audit_success_rows_cut_tests::observe_allocation(verb, seq);
-        let selected = mix64(seq) % every == 0;
+        let selected = mix64(seq).is_multiple_of(every);
         let forced = match forcing {
             AuditSuccessRowForcingRule::PollNotSuccessful => {
                 result.get("outcome").and_then(Value::as_str) != Some("success")

@@ -203,7 +203,7 @@ fn args(verb: &str) -> Value {
             json!({"channel_kind":"email","channel_slug":"acceptance","outcome":"success"})
         }
         CLEANUP => json!({"channel_kind":"email","channel_slug":"acceptance"}),
-        "comm.probe" => json!({"actor":"audit-reader"}),
+        "comm.probe" => json!({"actor":"local"}),
         "comm.cursor_get" => json!({"channel_kind":"email","channel_slug":"acceptance"}),
         _ => json!({}),
     }
@@ -324,7 +324,8 @@ fn real_poll_state_changes_force_audit_rows() {
         note.expires_at = Some(1);
         let id = note.id;
         f.runtime
-            .notes(&token)
+            .backend()
+            .notes()
             .unwrap()
             .upsert_note(note)
             .await
@@ -468,14 +469,14 @@ fn audit_success_rows_diagnostics_count_decisions() {
             92
         );
         // Cleanup has an independent sequence: failure-shaped success at selected0 wins the sample label.
-        let token = f.runtime.authorize(Namespace::local()).unwrap();
         for seq in 0..3 {
             let mut note = Note::new("local", "message", format!("expired {seq}")).with_properties(
                 json!({"channel_kind":"email","channel_slug":"acceptance","quarantined":true}),
             );
             note.expires_at = Some(1);
             f.runtime
-                .notes(&token)
+                .backend()
+                .notes()
                 .unwrap()
                 .upsert_note(note)
                 .await
@@ -513,7 +514,8 @@ fn audit_success_rows_diagnostics_count_decisions() {
         );
         note.expires_at = Some(1);
         f.runtime
-            .notes(&token)
+            .backend()
+            .notes()
             .unwrap()
             .upsert_note(note)
             .await
@@ -616,9 +618,9 @@ fn sampled_audit_readers_preserve_rows_and_ids() {
         let db = directory.join("events.db");
         let daemon = if split {
             let db = db.clone();
-            let socket = socket.clone();
+            let daemon_socket = socket.clone();
             let task = tokio::spawn(async move {
-                khive_runtime::events_split::run_events_daemon(&db, &socket)
+                khive_runtime::events_split::run_events_daemon(&db, &daemon_socket)
                     .await
                     .unwrap()
             });

@@ -1,4 +1,5 @@
 use crate::CommPack;
+use khive_pack_kg::KgPack;
 use khive_runtime::pack::AuditSuccessRowsMode;
 use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 use serde_json::{json, Value};
@@ -17,7 +18,9 @@ async fn poll_handler_result_shapes_require_sampling_review() {
     let runtime = KhiveRuntime::memory().unwrap();
     let mut builder = VerbRegistryBuilder::new();
     builder.with_audit_success_rows_mode(AuditSuccessRowsMode::All);
-    builder.register_trusted(CommPack::new(runtime.clone()));
+    builder
+        .register_trusted(KgPack::new(runtime.clone()))
+        .register_trusted(CommPack::new(runtime.clone()));
     let registry = builder.build().unwrap();
     registry
         .apply_schema_plans_with_map(&HashMap::new(), runtime.backend())

@@ -630,6 +630,7 @@ async fn audit_success_rows_two_registries_share_sequences_not_mode() {
     finish(&later).await;
 }
 
+#[derive(Debug)]
 struct DenyGate;
 impl khive_gate::Gate for DenyGate {
     fn check(

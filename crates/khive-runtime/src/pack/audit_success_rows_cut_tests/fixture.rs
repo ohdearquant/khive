@@ -341,13 +341,8 @@ pub async fn call_in(
         })
         .await
 }
-pub fn counts(
-    registry: &VerbRegistry,
-) -> (
-    Vec<(&'static str, u64)>,
-    Vec<(&'static str, u64)>,
-    Vec<(&'static str, u64)>,
-) {
+pub type VerbCounts = Vec<(&'static str, u64)>;
+pub fn counts(registry: &VerbRegistry) -> (VerbCounts, VerbCounts, VerbCounts) {
     (
         registry.audit_success_rows_omitted_counts().to_vec(),
         registry.audit_success_rows_sampled_out_counts().to_vec(),
