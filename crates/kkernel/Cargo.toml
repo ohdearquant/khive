@@ -170,4 +170,3 @@ required-features = ["kg-adapters"]
 
 [[test]]
 name = "kg_import_schema"
-required-features = ["kg-adapters"]
