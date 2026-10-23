@@ -1,6 +1,6 @@
 # ADR-112: Outbound GitHub Publish Verbs with a Publication-Hygiene Scan
 
-**Status**: Proposed\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-07-13\
 **Authors**: khive maintainers\
 **Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendments 1-2 (`git.digest`), ADR-108

@@ -1,6 +1,6 @@
 # ADR-075: OWL/RDF Interoperability -- Publishing the khive Vocabulary and Aligning with External Ontologies
 
-**Status**: Draft\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-06-26\
 **Authors**: khive maintainers
 **Depends on**: ADR-002 (Edge Ontology), ADR-008 (Query Layer Separation -- SPARQL subset),

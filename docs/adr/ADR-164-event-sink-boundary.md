@@ -1,6 +1,6 @@
 # ADR-164: Event Sink Boundary
 
-- **Status:** Proposed
+- **Status:** withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
 - **Date:** 2026-08-17
 - **Extends:** ADR-162 (adds a per-class contract dimension in the sense of its §4; ADR-162 is not
   replaced; takes a scoped, declared exception to §1's single-plane claim — see Consequences)

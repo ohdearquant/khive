@@ -1,6 +1,6 @@
 # ADR-151: kg-editor Design Language and Token Contract
 
-**Status**: Proposed\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-08-10\
 **Authors**: khive maintainers\
 **Related**: [ADR-145](ADR-145-local-first-kg-workbench.md),
