@@ -48,3 +48,26 @@ The existing hard-cap exception is unchanged: if a worker ignores interruption,
 it can remain unrecovered and retain admission; a timeout alone does not prove
 that its pool recovered. The events protocol is version 6, so clients and daemons
 must be upgraded together; version skew is refused without replay or downgrade.
+
+## Failed audit classes
+
+Non-success `audit` events (`error` or `denied`) contribute to
+`counts_by_error_class`, a map keyed by the exact known `payload.error_class`
+token. The vocabulary is `policy_refusal`, `gate_refusal`, `invalid_params`,
+`not_found_or_not_addressed`, `deadline_exceeded`, `admission_exhausted`,
+`conflict`, `unsupported`, `configuration`, `storage`, `unavailable`, and
+`internal`. The classification is informational; it does not change retry or
+domain-disposition policy.
+
+Historical rows without that field, malformed values, and unknown future tokens
+contribute only to `unclassified_error_count`. They are not relabeled `internal`,
+and their stored payloads are not changed. Successful audit events and all
+non-audit events contribute to neither field, even if their payload contains an
+`error_class` field.
+
+Both fields are omitted when the fetched rows contain no failed audit event.
+Otherwise the map may be empty and the unclassified count may be zero. If the
+window is truncated, only `counts_by_error_class_page_scoped` and
+`unclassified_error_count_page_scoped` are emitted. They cover the same fetched
+rows and retain the same namespace, actor, kind, time, and request-budget scope
+as the other aggregates; `window_event_total` is not a failed-audit total.
