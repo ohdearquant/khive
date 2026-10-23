@@ -15,7 +15,7 @@ description = "Deterministic khive.repo.v1 repository showcase bundle exporter"
 khive-types = { version = "0.14.0", path = "../khive-types", default-features = false, optional = true }
 chrono = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, features = ["bundled"], optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
