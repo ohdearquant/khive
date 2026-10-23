@@ -6,6 +6,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use khive_runtime::daemon::MAX_FRAME_BYTES;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::blob::ContentRef;
 use khive_storage::UploadId;
@@ -80,8 +81,10 @@ struct RangeParams {
 
 fn range_integer<E: serde::de::Error>(value: Value, field: &str) -> Result<u64, E> {
     value.as_u64().ok_or_else(|| {
+        let serialized = value.to_string();
+        let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
         E::custom(format!(
-            "range.{field} must be a non-negative integer, got {value}"
+            "range.{field} must be a non-negative integer, got {shown}"
         ))
     })
 }
@@ -109,9 +112,11 @@ fn deserialize_range<'de, D: serde::Deserializer<'de>>(
     value
         .map(|value| {
             if !value.is_object() {
-                return Err(serde::de::Error::custom(
-                    "range must be a JSON object with optional offset/length",
-                ));
+                let serialized = value.to_string();
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+                return Err(serde::de::Error::custom(format!(
+                    "range must be a JSON object with optional offset/length; got {shown}"
+                )));
             }
             serde_json::from_value(value).map_err(serde::de::Error::custom)
         })

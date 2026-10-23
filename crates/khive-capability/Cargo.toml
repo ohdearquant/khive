@@ -1,0 +1,19 @@
+[package]
+name = "khive-capability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Process-local sealed grants, attenuating delegation, and namespace-scoped capability validation."
+
+[dependencies]
+lion-core = { package = "khive-lion-core", version = "0.4.0", path = "../khive-lion-core" }
+khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
+blake3 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

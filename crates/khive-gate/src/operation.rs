@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v20";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v23";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
     ("apply_changeset", OperationAccess::Write),
+    ("attach", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
@@ -59,6 +60,18 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("brain.resolve", OperationAccess::Read),
     ("brain.state", OperationAccess::Read),
     ("brain.unbind", OperationAccess::Write),
+    ("charter.cancel", OperationAccess::Write),
+    ("charter.claim", OperationAccess::Write),
+    ("charter.compile", OperationAccess::Read),
+    ("charter.get", OperationAccess::Read),
+    ("charter.list", OperationAccess::Read),
+    ("charter.observe", OperationAccess::Write),
+    ("charter.publish", OperationAccess::Write),
+    ("charter.runs", OperationAccess::Read),
+    ("charter.sample", OperationAccess::Write),
+    ("charter.start", OperationAccess::Write),
+    ("charter.vocabulary", OperationAccess::Write),
+    ("charter.waiting", OperationAccess::Read),
     ("code.deps", OperationAccess::Read),
     ("code.ingest", OperationAccess::Write),
     ("code.list", OperationAccess::Read),
@@ -190,6 +203,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("stream.batch", OperationAccess::Write),
     ("stream.read", OperationAccess::Read),
     ("stream.stat", OperationAccess::Read),
+    ("stream.truncate", OperationAccess::Write),
     ("telemetry.channels", OperationAccess::Read),
     ("telemetry.counts", OperationAccess::Read),
     ("telemetry.emit", OperationAccess::Write),

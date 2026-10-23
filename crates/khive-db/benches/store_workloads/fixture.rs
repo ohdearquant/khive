@@ -7,7 +7,7 @@ use khive_storage::{
     BatchWriteSummary, Edge, Entity, EntityStore, Event, EventStore, GraphStore, Note, NoteStore,
 };
 use khive_types::{EdgeRelation, EventKind, EventOutcome, SubstrateKind};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -118,7 +118,7 @@ pub fn entities(count: usize) -> Vec<Entity> {
                 EPOCH + i as i64,
                 EPOCH + i as i64,
             )
-            .with_description(format!("seeded payload {:016x}", rng.gen::<u64>()))
+            .with_description(format!("seeded payload {:016x}", rng.random::<u64>()))
         })
         .collect()
 }
@@ -152,7 +152,7 @@ pub fn notes(count: usize) -> Vec<Note> {
             kind: "observation".into(),
             status: "active".into(),
             name: Some(format!("note_{i}")),
-            content: format!("seeded payload {:016x}", rng.gen::<u64>()),
+            content: format!("seeded payload {:016x}", rng.random::<u64>()),
             salience: None,
             decay_factor: None,
             expires_at: None,

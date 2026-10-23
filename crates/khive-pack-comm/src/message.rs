@@ -1,5 +1,6 @@
 //! Core message primitives: ID helpers and the dual-write delivery function.
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -77,6 +78,7 @@ pub(crate) fn validate_message_projection_fields(
         .iter()
         .find(|field| !MESSAGE_PROJECTION_FIELDS.contains(&field.as_str()))
     {
+        let unknown = mask_for_redaction_surface(RedactionSurface::GateProbe, unknown);
         return Err(RuntimeError::InvalidInput(format!(
             "{verb}: unknown projection field {unknown:?}; expected one of: {}",
             MESSAGE_PROJECTION_FIELDS.join(", ")
@@ -147,6 +149,8 @@ fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError)
 }
 
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
+    #[cfg(test)]
+    crate::handlers::read_cluster_tests::observe_message_render();
     let props = note.properties.as_ref();
     let full_id = note.id.as_hyphenated().to_string();
 

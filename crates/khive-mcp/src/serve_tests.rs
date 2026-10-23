@@ -2565,6 +2565,7 @@ async fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
 // themselves, proving the boot path resolves and installs the configured
 // `S3BlobStore` rather than silently keeping the default `FsBlobStore`.
 
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
@@ -2622,6 +2623,7 @@ region = "us-east-1"
     );
 }
 
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
@@ -2696,7 +2698,9 @@ async fn multi_backend_boot_wires_configured_s3_blob_store() {
 /// `AmazonS3` client (`object_store`'s `AmazonS3Builder::build`); it
 /// performs no network I/O, so a syntactically-valid dummy key pair is
 /// enough to reach a successful `Ok` construction.
+#[cfg(feature = "blob-s3")]
 const DUMMY_AWS_ACCESS_KEY_ID: &str = "AKIADUMMYWITNESSKEY00";
+#[cfg(feature = "blob-s3")]
 const DUMMY_AWS_SECRET_ACCESS_KEY: &str = "dummy-witness-secret-access-key-never-real";
 
 /// RAII guard: sets the two AWS credential env vars to isolated dummy
@@ -2704,11 +2708,13 @@ const DUMMY_AWS_SECRET_ACCESS_KEY: &str = "dummy-witness-secret-access-key-never
 /// previously present (usually nothing) on drop. Paired with `#[serial]`
 /// on every test that uses it, matching the convention the two boot
 /// tests above already established for this same pair of env vars.
+#[cfg(feature = "blob-s3")]
 struct DummyAwsCredsGuard {
     prev_access_key: Option<String>,
     prev_secret_key: Option<String>,
 }
 
+#[cfg(feature = "blob-s3")]
 impl DummyAwsCredsGuard {
     fn set() -> Self {
         let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
@@ -2722,6 +2728,7 @@ impl DummyAwsCredsGuard {
     }
 }
 
+#[cfg(feature = "blob-s3")]
 impl Drop for DummyAwsCredsGuard {
     fn drop(&mut self) {
         match self.prev_access_key.take() {
@@ -2777,6 +2784,7 @@ impl Drop for ClearedKhiveEnvGuard {
     }
 }
 
+#[cfg(feature = "blob-s3")]
 fn s3_blob_config() -> BlobConfig {
     BlobConfig::S3 {
         bucket: "khive-blobs".to_string(),
@@ -2796,6 +2804,7 @@ fn s3_blob_config() -> BlobConfig {
 /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
 /// pack so its already-installed runtime (`:1847`) is returned for
 /// inspection.
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
@@ -2907,6 +2916,7 @@ async fn install_resolved_blob_store_read_only_runtime_gets_bounded_reads() {
 /// with valid (dummy) AWS credentials present, the multi-backend startup
 /// path must resolve the configured `S3BlobStore` once (`:1567`) and
 /// install it on every per-pack runtime this boot produces.
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]

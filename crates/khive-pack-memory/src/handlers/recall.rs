@@ -144,16 +144,17 @@ async fn load_brain_profile(
     token: &NamespaceToken,
     profile_id: &str,
 ) -> Result<Value, RuntimeError> {
-    registry
-        .dispatch_with_identity(
-            "brain.profile",
-            json!({
-                "namespace": token.namespace().as_str(),
-                "profile_id": profile_id,
-            }),
-            Some(RequestIdentity::from_token(token)),
-        )
-        .await
+    // Boxed so the recall future holds a pointer rather than the whole
+    // dispatch future, which grows with the runtime.
+    Box::pin(registry.dispatch_with_identity(
+        "brain.profile",
+        json!({
+            "namespace": token.namespace().as_str(),
+            "profile_id": profile_id,
+        }),
+        Some(RequestIdentity::from_token(token)),
+    ))
+    .await
 }
 
 fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(), RuntimeError> {

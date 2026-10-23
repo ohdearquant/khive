@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use khive_pack_tool::policy;
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::EventOutcome;
 use serde_json::{json, Value};
@@ -270,7 +269,7 @@ pub(crate) async fn checked_policy(
     token: &NamespaceToken,
     verb: &str,
 ) -> Result<Value, RuntimeError> {
-    let actor = policy::actor_label(token);
+    let actor = token.actor().label();
     #[cfg(test)]
     record_policy_check(&actor);
     // The registry routes this call to ToolPack's assigned backend. The identity
@@ -359,7 +358,7 @@ impl GitPack {
         verb: &str,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let actor = policy::actor_label(token);
+        let actor = token.actor().label();
         let namespace = token.namespace().as_str();
         let mut receipt = Receipt::new(
             namespace,
@@ -936,7 +935,7 @@ impl GitPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let params = crate::params::parse("git.receipts", params)?;
-        let actor = policy::actor_label(token);
+        let actor = token.actor().label();
         let invalid = || RuntimeError::InvalidInput("invalid_params".into());
         validate_keys(&params, &["repo", "actor", "session_id", "limit", "offset"])
             .map_err(|_| invalid())?;

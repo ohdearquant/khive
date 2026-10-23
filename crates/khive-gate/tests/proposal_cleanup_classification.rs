@@ -1,9 +1,9 @@
-//! Pin every classification while adding the operator cleanup name.
+//! Pin every classification while adding the stream truncation write.
 use khive_gate::{
     classify_operation, OperationAccess, CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION,
 };
 
-// Frozen v19 inventory plus the single reviewed v20 addition. Independent of the
+// Frozen v19 inventory plus the reviewed v20 cleanup and v21 stream additions. Independent of the
 // production lookup table so changing an existing effect is a contract regression.
 const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.kill", OperationAccess::Write),
@@ -12,6 +12,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
     ("apply_changeset", OperationAccess::Write),
+    ("attach", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
@@ -45,6 +46,18 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("brain.resolve", OperationAccess::Read),
     ("brain.state", OperationAccess::Read),
     ("brain.unbind", OperationAccess::Write),
+    ("charter.cancel", OperationAccess::Write),
+    ("charter.claim", OperationAccess::Write),
+    ("charter.compile", OperationAccess::Read),
+    ("charter.get", OperationAccess::Read),
+    ("charter.list", OperationAccess::Read),
+    ("charter.observe", OperationAccess::Write),
+    ("charter.publish", OperationAccess::Write),
+    ("charter.runs", OperationAccess::Read),
+    ("charter.sample", OperationAccess::Write),
+    ("charter.start", OperationAccess::Write),
+    ("charter.vocabulary", OperationAccess::Write),
+    ("charter.waiting", OperationAccess::Read),
     ("code.deps", OperationAccess::Read),
     ("code.ingest", OperationAccess::Write),
     ("code.list", OperationAccess::Read),
@@ -176,6 +189,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("stream.batch", OperationAccess::Write),
     ("stream.read", OperationAccess::Read),
     ("stream.stat", OperationAccess::Read),
+    ("stream.truncate", OperationAccess::Write),
     ("telemetry.channels", OperationAccess::Read),
     ("telemetry.counts", OperationAccess::Read),
     ("telemetry.emit", OperationAccess::Write),
@@ -208,7 +222,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v20");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v23");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

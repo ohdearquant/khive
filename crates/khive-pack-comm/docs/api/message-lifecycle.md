@@ -671,10 +671,9 @@ silently coerced or treated as "no cursor". Two rows sharing a microsecond
 deterministically by `full_id`. Sorting on the `(created_at, full_id)` tuple
 (rather than timestamp alone) keeps ties stable across pages/backends.
 
-`ThreadRow` carries the sort/cursor key `(created_at, full_id)` alongside the
-already-rendered message JSON, so the total-order sort and cursor filter
-compare exact `(i64, Uuid)` tuples instead of re-parsing the ISO string
-embedded in the JSON. `AfterCursor::Id` carries the full tuple for
+The captured owner note carries the sort/cursor key `(created_at, full_id)`,
+so the total-order sort and cursor filter compare exact `(i64, Uuid)` tuples
+without rendering message JSON or parsing ISO strings. `AfterCursor::Id` carries the full tuple for
 tie-breaking; `AfterCursor::Timestamp` carries only the parsed microsecond
 value since there is no specific row to break ties against.
 
@@ -688,6 +687,23 @@ OFFSET rescans while keeping the logical response limit after the complete physi
 inbox, this is a live window walk: deletion of an already-fetched row does not skip an older row;
 a new row inserted before a cursor already passed may not be observed. It does not create a
 snapshot, bound total thread memory/work, or change the public chronological cursor contract.
+
+Visibility filtering and twin folding run as each physical window arrives. The
+handler retains one captured owner note and the folded display-read value per
+visible logical group; hidden rows and discarded twins leave that collection
+immediately. The originally selected note is folded last only if its physical
+id was absent from the scan. This preserves the physical traversal order,
+one-hop twin references and the fetched row image even if storage changes later.
+The owner's properties remain unchanged: only the top-level display-read field
+uses the folded value.
+
+Message JSON and content previews are generated only after cursor filtering,
+ordering and truncation, once per returned owner. At most the effective response
+limit (500) is rendered. The full physical scan and physical-id set still scale
+with the thread, retained owner notes with visible logical groups, and sorting
+with eligible groups. This is a rendering and retention reduction, not a bound
+on SQLite work or total request memory. Attachment enrichment and optional field
+projection still run only on the final owners.
 
 ## `handlers.rs::handle_ingest`
 
@@ -872,6 +888,15 @@ the scoped legacy IMAP lookup. It attaches nothing and leaves the stored duplica
 note unchanged; that receipt does not prove possession of the original or that
 changed replay content, sender, or metadata was stored. Delivered withheld retries
 retain their stricter original-custody requirements described above.
+
+This includes an attachment-free replay marked quarantined when the stored row is
+an ordinary delivered message. The duplicate acknowledgement preserves that
+original delivery: it does not record or disclose the replay's quarantine verdict,
+replace the body, install quarantine expiry, or attach original bytes. Its
+`deduplicated: true` receipt reports the existing identity and thread, not a new
+screening decision. A new identity with the same quarantined input still creates
+a quarantine record and reports its original-retention outcome. Delivered withheld
+replays and attachment-bearing replays remain subject to their custody checks.
 
 When a replay supplies an original attachment, a duplicate transport id repairs a
 missing attachment only when its stored reference matches the replayed bytes and

@@ -1,0 +1,47 @@
+charter pr_review_verdict_escalation v1
+title "Verify and relay a pull request verdict"
+subject pull_request
+
+roles:
+    checker "checks the pull request and its findings"
+    maintainer "receives the verdict and decides the next step"
+
+triggers:
+    review.requested
+    review.posted
+    fix.pushed
+    checks.concluded
+    message.arrived
+    schedule.fired
+    prompt.received
+    pull_request.head_moved
+
+workflow:
+    phase intake by checker:
+        await review.requested or review.posted or fix.pushed or checks.concluded or message.arrived or schedule.fired or prompt.received or pull_request.head_moved
+        require pull_request.open hard
+        action review.read_diff by checker
+        action review.write_verdict by checker
+        goto route
+
+    phase route by checker:
+        require review.verdict_present hard
+        when review.decision is approve: goto green
+        when review.decision is request_changes: goto changes
+        when review.decision is blocked: goto hold
+
+    phase green by checker:
+        require checks.required_green(event=pull_request) hard
+        action review.return_verdict by checker
+        require loop.log_written advisory
+        complete
+
+    phase changes by checker:
+        action review.return_verdict by checker
+        require loop.log_written advisory
+        complete
+
+    phase hold by checker:
+        action review.return_verdict by checker
+        require loop.log_written advisory
+        terminate "the current evidence does not support an approval"

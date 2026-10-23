@@ -32,6 +32,7 @@ use identity::initialize_database_id;
 pub(crate) use identity::opened_sqlite_file_identity;
 use identity::{initialize_database_id_with_admission, mint_db_identity, read_database_id};
 
+pub use crate::timeout_sink::{TimeoutSinkCloseError, TimeoutSinkCloseHandle};
 use guards::{PooledReader, ReaderLease};
 pub(crate) use guards::{ReaderAdmission, SharedReaderTransactionGuard};
 pub use guards::{ReaderGuard, ReaderRow};
@@ -371,6 +372,8 @@ pub struct ConnectionPool {
     /// Registered only after every connection opens successfully. RAII removes
     /// the path when the last pool for it drops, including failed construction.
     identity_registration: Option<PoolIdentityRegistration>,
+    /// Releases pool ownership without implicitly shutting down diagnostics.
+    timeout_sink_registration: Option<crate::timeout_sink::Registration>,
     /// Test-only instrumentation: counts how many times the writer-task
     /// init closure actually ran. Must never exceed 1 per pool no matter how
     /// many stores are constructed over it — that is the invariant

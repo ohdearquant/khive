@@ -973,6 +973,12 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Ok((_late, Some(phase_snapshot))) => {
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "completed_after_deadline",
+                            "deadline_capture",
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
@@ -992,15 +998,21 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Err(_elapsed) => {
-                        let phase_snapshot = deadline_snapshot_store
-                            .get()
-                            .cloned()
-                            .unwrap_or_else(|| phase_trace.snapshot());
+                        let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        );
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
                         )
                         .await;
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "timed_out",
+                            snapshot_origin,
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
@@ -1098,6 +1110,12 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Ok((_late, Some(phase_snapshot))) => {
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "completed_after_deadline",
+                            "deadline_capture",
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
@@ -1117,15 +1135,21 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Err(_elapsed) => {
-                        let phase_snapshot = deadline_snapshot_store
-                            .get()
-                            .cloned()
-                            .unwrap_or_else(|| phase_trace.snapshot());
+                        let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        );
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
                         )
                         .await;
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "timed_out",
+                            snapshot_origin,
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
@@ -1380,8 +1404,10 @@ impl SubstrateCoordinator {
                 let result = search.await;
                 (result, tokio::time::Instant::now(), deadline_snapshot)
             };
-            let handle = tokio::spawn(khive_storage::inherit_request_read_context(
-                khive_storage::scope_request_read_deadline_at(request_deadline, search),
+            let handle = tokio::spawn(khive_runtime::search_audit::inherit(
+                khive_storage::inherit_request_read_context(
+                    khive_storage::scope_request_read_deadline_at(request_deadline, search),
+                ),
             ));
             handles.push((
                 joined_backend_id,
@@ -1404,12 +1430,10 @@ impl SubstrateCoordinator {
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut handle).await {
                     Ok(result) => Ok(result),
                     Err(elapsed) => {
-                        deadline_snapshot = Some(
-                            deadline_snapshot_store
-                                .get()
-                                .cloned()
-                                .unwrap_or_else(|| phase_trace.snapshot()),
-                        );
+                        deadline_snapshot = Some(deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        ));
                         let settled =
                             tokio::time::timeout_at(interrupt_settlement_deadline, &mut handle)
                                 .await;
@@ -1476,10 +1500,17 @@ impl SubstrateCoordinator {
                     });
                 }
                 Ok(Ok((_late_result, _completed_at, worker_deadline_snapshot))) => {
-                    let phase_snapshot = worker_deadline_snapshot
+                    let (phase_snapshot, snapshot_origin) = worker_deadline_snapshot
                         .or_else(|| deadline_snapshot_store.get().cloned())
+                        .map(|snapshot| (snapshot, "deadline_capture"))
                         .or(deadline_snapshot)
-                        .unwrap_or_else(|| phase_trace.snapshot());
+                        .unwrap_or_else(|| deadline_snapshot_with_origin(None, &phase_trace));
+                    search_profile::backend_deadline(
+                        joined_backend_id.as_str(),
+                        "completed_after_deadline",
+                        snapshot_origin,
+                        &phase_snapshot,
+                    );
                     tracing::warn!(
                         backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
@@ -1498,9 +1529,20 @@ impl SubstrateCoordinator {
                     });
                 }
                 Err(_elapsed) => {
-                    let phase_snapshot = deadline_snapshot
-                        .or_else(|| deadline_snapshot_store.get().cloned())
-                        .unwrap_or_else(|| phase_trace.snapshot());
+                    let (phase_snapshot, snapshot_origin) = deadline_snapshot
+                        .or_else(|| {
+                            deadline_snapshot_store
+                                .get()
+                                .cloned()
+                                .map(|snapshot| (snapshot, "deadline_capture"))
+                        })
+                        .unwrap_or_else(|| deadline_snapshot_with_origin(None, &phase_trace));
+                    search_profile::backend_deadline(
+                        joined_backend_id.as_str(),
+                        "timed_out",
+                        snapshot_origin,
+                        &phase_snapshot,
+                    );
                     tracing::warn!(
                         backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
@@ -1533,6 +1575,21 @@ impl SubstrateCoordinator {
             rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
         search_profile::stage("merge", started, &[]);
         (merged_entities, merged_notes, per_backend)
+    }
+}
+
+/// Retain whether the existing warning selected a timer capture or a fallback
+/// observation. A fallback remains a fallback even if cleanup later fills the store.
+fn deadline_snapshot_with_origin(
+    captured: Option<khive_storage::request_context::SearchPhaseSnapshot>,
+    trace: &khive_storage::request_context::SearchPhaseTrace,
+) -> (
+    khive_storage::request_context::SearchPhaseSnapshot,
+    &'static str,
+) {
+    match captured {
+        Some(snapshot) => (snapshot, "deadline_capture"),
+        None => (trace.snapshot(), "fallback_observation"),
     }
 }
 
@@ -1596,7 +1653,7 @@ mod search_phase_trace_tests {
     use khive_storage::request_context::SearchPhase;
     use khive_types::namespace::Namespace;
 
-    use super::{BackendRegistry, SubstrateCoordinator};
+    use super::{search_profile, BackendRegistry, SubstrateCoordinator};
 
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -1676,6 +1733,218 @@ mod search_phase_trace_tests {
             Some(phase) => coordinator.with_phase_hold_backend("held", phase),
             None => coordinator.with_hanging_backend("held"),
         }
+    }
+
+    fn profile_records(lines: &[String]) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("profile JSON"))
+            .collect()
+    }
+
+    fn assert_deadline_correlation(records: &[serde_json::Value], backend: &str) {
+        let deadline = records
+            .iter()
+            .find(|record| record["s"] == "backend_deadline" && record["b"] == backend)
+            .expect("backend deadline record");
+        let backend_record = records
+            .iter()
+            .find(|record| record["s"] == "backend" && record["b"] == backend)
+            .expect("backend timing record");
+        let search = records
+            .iter()
+            .find(|record| record["s"] == "search")
+            .expect("search timing record");
+        assert!(deadline["c"].as_u64().is_some_and(|id| id > 0));
+        assert_eq!(deadline["c"], backend_record["c"]);
+        assert_eq!(deadline["c"], search["c"]);
+        assert_eq!(deadline["o"], "timeout");
+        assert_eq!(backend_record["o"], "timeout");
+        assert!(deadline.get("us").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn timeout_profile_correlates_the_held_backend_and_preserves_its_sibling() {
+        let coordinator = multi_backend_coordinator(Some(SearchPhase::VectorEmbedding));
+        let request = search_request("profile held embedding");
+        let ((_, _, per_backend), lines) = search_profile::capture(search_profile::profiled(
+            coordinator.fan_out_search(&request, &Namespace::local()),
+        ))
+        .await;
+        let records = profile_records(&lines);
+        assert_deadline_correlation(&records, "held");
+        let deadlines: Vec<_> = records
+            .iter()
+            .filter(|record| record["s"] == "backend_deadline")
+            .collect();
+        assert_eq!(deadlines.len(), 1, "{records:?}");
+        assert_eq!(deadlines[0]["observation"], "timed_out");
+        assert_eq!(deadlines[0]["in_flight_phase"], "vector_embedding");
+        assert!(deadlines[0]["active_phases"]
+            .as_str()
+            .expect("active phases")
+            .contains("vector_embedding="));
+        assert_eq!(per_backend.len(), 2);
+        let healthy = per_backend
+            .iter()
+            .find(|result| result.backend_id.as_str() == "healthy")
+            .expect("healthy sibling retained");
+        assert!(healthy.error.is_none());
+        let held = per_backend
+            .iter()
+            .find(|result| result.backend_id.as_str() == "held")
+            .expect("held backend retained");
+        assert_eq!(
+            held.error.as_ref().expect("timeout").kind,
+            super::BackendSearchFailureKind::Timeout
+        );
+        assert!(held.hits.is_empty() && held.note_hits.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_late_profiles_cover_entities_and_notes() {
+        for (kind, phase, expected) in [
+            (
+                "entity",
+                SearchPhase::EntityReaderAdmission,
+                "entity_reader_admission",
+            ),
+            (
+                "note",
+                SearchPhase::NoteReaderAdmission,
+                "note_reader_admission",
+            ),
+        ] {
+            let coordinator = SubstrateCoordinator::single(runtime())
+                .with_phase_deadline_error_backend("main", phase);
+            let request = search_request_of_kind(kind, "profile late admission");
+            let ((hits, notes, per_backend), lines) = search_profile::capture(
+                search_profile::profiled(coordinator.fan_out_search(&request, &Namespace::local())),
+            )
+            .await;
+            let records = profile_records(&lines);
+            assert_deadline_correlation(&records, "main");
+            let deadlines: Vec<_> = records
+                .iter()
+                .filter(|record| record["s"] == "backend_deadline")
+                .collect();
+            assert_eq!(deadlines.len(), 1, "{kind}: {records:?}");
+            assert_eq!(deadlines[0]["observation"], "completed_after_deadline");
+            assert_eq!(deadlines[0]["snapshot_origin"], "deadline_capture");
+            assert_eq!(deadlines[0]["in_flight_phase"], expected);
+            assert!(hits.is_empty() && notes.is_empty());
+            assert_eq!(per_backend.len(), 1);
+            assert!(per_backend[0].hits.is_empty() && per_backend[0].note_hits.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_timeout_profiles_cover_entities_and_notes() {
+        for kind in ["entity", "note"] {
+            let coordinator = SubstrateCoordinator::single(runtime()).with_hanging_backend("main");
+            let request = search_request_of_kind(kind, "profile unentered timeout");
+            let (_, lines) = search_profile::capture(search_profile::profiled(
+                coordinator.fan_out_search(&request, &Namespace::local()),
+            ))
+            .await;
+            let records = profile_records(&lines);
+            assert_deadline_correlation(&records, "main");
+            let deadline = records
+                .iter()
+                .find(|record| record["s"] == "backend_deadline")
+                .expect("single backend timeout profile");
+            assert_eq!(deadline["observation"], "timed_out");
+            assert_eq!(deadline["active_phases"], "none");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn fanout_late_completion_keeps_its_deadline_profile() {
+        let mut registry = BackendRegistry::new();
+        for name in ["first", "second"] {
+            registry.register(
+                khive_runtime::BackendId::parse(name).expect("backend id"),
+                runtime(),
+            );
+        }
+        let mut coordinator = SubstrateCoordinator::new(registry);
+        // Derive collection order from the registry itself. The first task holds
+        // settlement open while the second finishes after the result deadline.
+        let ids: Vec<_> = coordinator
+            .registry
+            .iter()
+            .map(|entry| entry.id.as_str().to_string())
+            .collect();
+        let first = &ids[0];
+        let late = &ids[1];
+        let delay = std::time::Duration::from_millis(super::backend_search_timeout_ms())
+            + khive_db::sqlite_interrupt_grace_from_env() / 2;
+        coordinator = coordinator
+            .with_hanging_backend(first)
+            .with_delayed_backend(late, delay);
+        coordinator.entity_hits_override = Some(std::collections::HashMap::from([(
+            late.clone(),
+            Vec::new(),
+        )]));
+        let request = search_request("profile late fanout");
+        let ((hits, notes, per_backend), lines) = search_profile::capture(
+            search_profile::profiled(coordinator.fan_out_search(&request, &Namespace::local())),
+        )
+        .await;
+        let records = profile_records(&lines);
+        assert_deadline_correlation(&records, late);
+        let deadline = records
+            .iter()
+            .find(|record| record["s"] == "backend_deadline" && record["b"] == late.as_str())
+            .expect("late fanout deadline record");
+        assert_eq!(deadline["observation"], "completed_after_deadline");
+        assert_eq!(deadline["snapshot_origin"], "deadline_capture");
+        assert_eq!(deadline["in_flight_phase"], "not_entered");
+        assert!(hits.is_empty() && notes.is_empty());
+        assert_eq!(per_backend.len(), 2);
+        assert!(per_backend.iter().all(|result| {
+            result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == super::BackendSearchFailureKind::Timeout)
+                && result.hits.is_empty()
+                && result.note_hits.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn deadline_profile_preserves_frozen_phases_and_labels_fallbacks() {
+        let trace = khive_storage::request_context::SearchPhaseTrace::new();
+        let held = trace.enter(SearchPhase::VectorEmbedding);
+        let frozen = trace.snapshot();
+        drop(held);
+        let (captured, captured_origin) =
+            super::deadline_snapshot_with_origin(Some(frozen), &trace);
+        let (fallback, fallback_origin) = super::deadline_snapshot_with_origin(None, &trace);
+        let ((), lines) = search_profile::capture(search_profile::profiled(async {
+            search_profile::backend_deadline("held", "timed_out", captured_origin, &captured);
+            search_profile::backend_deadline("held", "timed_out", fallback_origin, &fallback);
+        }))
+        .await;
+        let records = profile_records(&lines);
+        assert_eq!(records[0]["snapshot_origin"], "deadline_capture");
+        assert_eq!(records[0]["in_flight_phase"], "vector_embedding");
+        assert!(records[0]["active_phases"]
+            .as_str()
+            .unwrap()
+            .contains("vector_embedding="));
+        assert_eq!(records[1]["snapshot_origin"], "fallback_observation");
+        assert_eq!(records[1]["in_flight_phase"], "between_phases");
+        assert_eq!(records[1]["active_phases"], "none");
+        assert!(records[1]["completed_phases"]
+            .as_str()
+            .unwrap()
+            .contains("vector_embedding="));
     }
 
     #[tokio::test(start_paused = true)]
