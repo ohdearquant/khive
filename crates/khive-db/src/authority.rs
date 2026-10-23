@@ -341,7 +341,11 @@ impl AuthorityTransaction<'_> {
         event_id: Uuid,
     ) -> StorageResult<Option<(AuthorityChange, Event)>> {
         self.writer
-            .query_row(statement!("change-event", vec![id(epoch_id), id(event_id)]))
+            .query_row(statement(
+                "authority.change-event",
+                include_str!("../sql/authority-change-event.sql"),
+                vec![id(epoch_id), id(event_id)],
+            ))
             .await?
             .map(rows::change_event)
             .transpose()
