@@ -110,6 +110,7 @@ impl EventStore for MemoryEventStore {
 
 fn build_real_registry(runtime: &KhiveRuntime) -> VerbRegistryBuilder {
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_audit_success_rows_mode(khive_runtime::pack::AuditSuccessRowsMode::All);
     builder.register_trusted(KgPack::new(runtime.clone()));
     builder.register_trusted(GtdPack::new(runtime.clone()));
     builder.register_trusted(CommPack::new(runtime.clone()));
