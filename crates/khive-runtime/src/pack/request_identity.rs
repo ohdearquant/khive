@@ -10,8 +10,8 @@ use crate::error::RuntimeError;
 use crate::runtime::NamespaceToken;
 
 use super::{
-    DispatchHook, EdgeEndpointRule, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime,
-    SPECIAL_RELATIONS,
+    AuditSuccessRowForcingRule, AuditSuccessRowsMode, DispatchHook, EdgeEndpointRule, EndpointKind,
+    HandlerDef, PackByIdResolver, PackRuntime, SPECIAL_RELATIONS,
 };
 
 /// Immutable registry that dispatches verb calls to registered packs.
@@ -64,6 +64,18 @@ pub struct VerbRegistry {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
     /// [`VerbRegistry::admission_degrade_safe`].
     pub(super) degrade_safe_verbs: Arc<HashSet<&'static str>>,
+    pub(super) audit_success_rows_mode: AuditSuccessRowsMode,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Consumed by the deferred success-row cut")
+    )]
+    pub(super) audit_success_row_omitted_verbs: Arc<HashSet<&'static str>>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Consumed by the deferred success-row cut")
+    )]
+    pub(super) audit_success_row_sampled_verbs:
+        Arc<HashMap<&'static str, (u64, AuditSuccessRowForcingRule)>>,
     /// Trusted canonical public handlers classified Read by the shared effects table.
     pub(super) read_replay_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,

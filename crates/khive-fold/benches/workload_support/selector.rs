@@ -108,7 +108,7 @@ impl Fixture {
             8
         );
         let visits = k * (2 * count - k + 1) / 2 + count.saturating_sub(k);
-        eprintln!("selector/diversity/{count}: selected={k}, total_size={}, budget={}, source_derived_remaining_item_visits={visits}, worst_case_visits={}", actual.total_size, actual.budget, count * (count + 1) / 2);
+        eprintln!("selector/diversity/{count}: selected={k}, total_size={}, budget={}, reference_loop_remaining_item_visits={visits}, reference_loop_worst_case_visits={}", actual.total_size, actual.budget, count * (count + 1) / 2);
         fixture
     }
     pub fn validate(&self, actual: &SelectorOutput<usize>) {
