@@ -431,14 +431,23 @@ const DEFAULT_FIRE_GRACE_SECS: i64 = 300;
 
 /// Resolve the missed-event grace window from `KHIVE_FIRE_GRACE_SECS`,
 /// falling back to [`DEFAULT_FIRE_GRACE_SECS`] when unset or unparseable as a
-/// non-negative integer.
-fn fire_grace_from_env() -> Duration {
-    let secs = std::env::var("KHIVE_FIRE_GRACE_SECS")
-        .ok()
+/// non-negative integer. A parsed nonnegative value outside the supported
+/// duration range refuses instead of selecting a different bound.
+fn fire_grace_from_env() -> Result<Duration> {
+    let value = std::env::var("KHIVE_FIRE_GRACE_SECS").ok();
+    fire_grace_from_value(value.as_deref())
+}
+
+fn fire_grace_from_value(value: Option<&str>) -> Result<Duration> {
+    let secs = value
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|&s| s >= 0)
         .unwrap_or(DEFAULT_FIRE_GRACE_SECS);
-    Duration::seconds(secs)
+    Duration::try_seconds(secs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid_fire_grace: KHIVE_FIRE_GRACE_SECS exceeds the supported duration range"
+        )
+    })
 }
 
 /// Summary of a single drain run.

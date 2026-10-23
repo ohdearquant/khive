@@ -169,6 +169,15 @@ impl Fixture {
         horizon: i64,
         allowance: usize,
     ) -> crate::occurrence_store::AccountingPage {
+        self.page_with_global(id, horizon, 300, allowance).await
+    }
+    async fn page_with_global(
+        &self,
+        id: Uuid,
+        horizon: i64,
+        global: i64,
+        allowance: usize,
+    ) -> crate::occurrence_store::AccountingPage {
         let snapshot = self
             .store
             .series(id)
@@ -178,7 +187,7 @@ impl Fixture {
         let definition = self.store.definition(&snapshot).await.expect("definition");
         let prepared = self
             .store
-            .prepare_page(&snapshot, &definition, horizon, 300, allowance)
+            .prepare_page(&snapshot, &definition, horizon, global, allowance)
             .expect("prepare page");
         self.store
             .commit_page(prepared)
@@ -218,6 +227,38 @@ impl Fixture {
                 table.into(),
                 serde_json::to_value(rows).expect("row encoding"),
             );
+        }
+        Value::Object(all)
+    }
+    async fn declaration(
+        &self,
+        verb: &str,
+        params: Value,
+    ) -> Result<Value, khive_runtime::RuntimeError> {
+        match verb {
+            "schedule" => {
+                crate::handlers::handle_schedule(&self.rt, &self.token(), &self.registry, params)
+                    .await
+            }
+            "remind" => {
+                crate::handlers::handle_remind(&self.rt, &self.token(), &self.registry, params)
+                    .await
+            }
+            _ => panic!("closed declaration fixture"),
+        }
+    }
+    async fn complete_rows(&self) -> Value {
+        let mut reader = self.rt.sql().reader().await.unwrap();
+        let mut all = serde_json::Map::new();
+        for table in TABLES.into_iter().chain(["notes", "events"]) {
+            let rows = reader
+                .query_all(SqlStatement::new(
+                    format!("SELECT * FROM {table} ORDER BY rowid"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            all.insert(table.into(), serde_json::to_value(rows).unwrap());
         }
         Value::Object(all)
     }
@@ -1156,6 +1197,31 @@ fn canonical_bytes_and_binary_occurrence_identity_have_independent_goldens() {
         scheduled_for: instant,
     };
     assert_eq!(key.id().to_string(), "09838e54-156e-51d5-9ddc-0e58b64fa97a");
+    assert_eq!(
+        DefinitionV3::authenticate(EXPECTED, &definition.digest().unwrap()).unwrap(),
+        definition
+    );
+    let mut zero = definition.clone();
+    zero.requested_max_lateness_s = Some(0);
+    let bytes = zero.canonical_bytes().unwrap();
+    let expected_zero = String::from_utf8(EXPECTED.to_vec()).unwrap().replace(
+        "\"requested_max_lateness_s\":null",
+        "\"requested_max_lateness_s\":0",
+    );
+    assert_eq!(bytes, expected_zero.as_bytes());
+    assert_ne!(
+        zero.digest().unwrap(),
+        definition.digest().unwrap(),
+        "bound-only digest variation"
+    );
+    assert_eq!(
+        DefinitionV3::authenticate(&bytes, &zero.digest().unwrap()).unwrap(),
+        zero
+    );
+    assert!(matches!(
+        zero.policy().unwrap(),
+        crate::misfire::MisfirePolicy::Skip
+    ));
 }
 
 #[test]
@@ -1239,4 +1305,473 @@ async fn skip_selects_only_original_source_and_overlap_accounts_every_new_instan
         .await
         .unwrap()
         .unwrap();
+}
+
+fn d7_params(verb: &str, additions: Value) -> (Value, i64) {
+    let at = (Utc::now() + chrono::Duration::hours(1))
+        .with_nanosecond(0)
+        .unwrap();
+    let mut params = match verb {
+        "schedule" => json!({"action":"stats()","at":at.to_rfc3339(),"receipt_version":3}),
+        "remind" => json!({"content":"bounded reminder","at":at.to_rfc3339(),"receipt_version":3}),
+        _ => panic!("closed declaration fixture"),
+    };
+    for (key, value) in additions.as_object().unwrap() {
+        params[key] = value.clone();
+    }
+    (params, at.timestamp_micros())
+}
+async fn d7_declare(f: &Fixture, verb: &str, additions: Value) -> (Uuid, i64) {
+    let (params, first) = d7_params(verb, additions);
+    let value = f
+        .declaration(verb, params)
+        .await
+        .expect("real bounded declaration");
+    (value["full_id"].as_str().unwrap().parse().unwrap(), first)
+}
+
+#[test]
+fn v3_skip_raw_bounds_are_strict_without_changing_legacy_policy() {
+    use crate::misfire::{parse_misfire_policy, parse_v3_misfire_policy, MisfirePolicy};
+    for (value, kind, bound) in [
+        (json!({}), MisfirePolicy::Skip, None),
+        (json!({"misfire_policy":"skip"}), MisfirePolicy::Skip, None),
+        (json!({"max_lateness":0}), MisfirePolicy::Skip, Some(0)),
+        (
+            json!({"misfire_policy":"skip","max_lateness":0}),
+            MisfirePolicy::Skip,
+            Some(0),
+        ),
+        (json!({"max_lateness":7}), MisfirePolicy::Skip, Some(7)),
+        (
+            json!({"max_lateness":i64::MAX / 1000}),
+            MisfirePolicy::Skip,
+            Some(i64::MAX / 1000),
+        ),
+        (
+            json!({"misfire_policy":"catch_up_once","max_lateness":i64::MAX / 1000}),
+            MisfirePolicy::CatchUpOnce {
+                max_lateness: i64::MAX / 1000,
+            },
+            Some(i64::MAX / 1000),
+        ),
+        (
+            json!({"misfire_policy":"catch_up_once","max_lateness":7}),
+            MisfirePolicy::CatchUpOnce { max_lateness: 7 },
+            Some(7),
+        ),
+    ] {
+        let policy = parse_v3_misfire_policy(&value).unwrap();
+        assert_eq!(policy.kind(), kind);
+        assert_eq!(policy.requested_max_lateness_s(), bound);
+    }
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!("0"),
+        json!(1.0),
+        json!(-1),
+        json!(u64::MAX),
+        json!(i64::MAX),
+    ] {
+        assert!(parse_v3_misfire_policy(&json!({"max_lateness":invalid})).is_err());
+    }
+    for invalid in [
+        json!({"misfire_policy":null}),
+        json!({"misfire_policy":true}),
+        json!({"misfire_policy":"unknown"}),
+        json!({"misfire_policy":"catch_up_once"}),
+        json!({"misfire_policy":"catch_up_once","max_lateness":0}),
+    ] {
+        assert!(parse_v3_misfire_policy(&invalid).is_err());
+    }
+    assert_eq!(
+        parse_misfire_policy(&json!({})).unwrap(),
+        MisfirePolicy::Skip
+    );
+    assert_eq!(
+        parse_misfire_policy(&json!({"max_lateness":0})).unwrap_err(),
+        "max_lateness must be a representable positive integer number of seconds"
+    );
+    assert_eq!(
+        parse_misfire_policy(&json!({"max_lateness":7})).unwrap_err(),
+        "max_lateness is only allowed with catch_up_once"
+    );
+    assert!(
+        parse_misfire_policy(&json!({"misfire_policy":"catch_up_once","max_lateness":0})).is_err()
+    );
+}
+
+#[tokio::test]
+async fn v3_skip_bounds_survive_both_declarations_and_refusals_write_nothing() {
+    let Some(root) = isolate("v3_skip_bounds_survive_both_declarations_and_refusals_write_nothing")
+    else {
+        return;
+    };
+    let f = Fixture::open(&root);
+    for verb in ["schedule", "remind"] {
+        for repeat in [None, Some("every:1s")] {
+            for explicit_skip in [false, true] {
+                for bound in [None, Some(0), Some(7)] {
+                    let mut extra = json!({});
+                    if explicit_skip {
+                        extra["misfire_policy"] = json!("skip");
+                    }
+                    if let Some(bound) = bound {
+                        extra["max_lateness"] = json!(bound);
+                    }
+                    if let Some(repeat) = repeat {
+                        extra["repeat"] = json!(repeat);
+                    }
+                    let (id, _) = d7_declare(&f, verb, extra).await;
+                    let snapshot = f.store.series(id).await.unwrap().unwrap();
+                    let definition = f.store.definition(&snapshot).await.unwrap();
+                    assert_eq!(definition.requested_max_lateness_s, bound);
+                    assert_eq!(definition.repeat.as_deref(), repeat);
+                    assert!(matches!(
+                        definition.policy().unwrap(),
+                        crate::misfire::MisfirePolicy::Skip
+                    ));
+                    let note =
+                        f.rt.notes(&f.token())
+                            .unwrap()
+                            .get_note(id)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let properties = note.properties.unwrap();
+                    assert_eq!(
+                        properties.get("max_lateness"),
+                        bound.map(|v| json!(v)).as_ref()
+                    );
+                }
+            }
+        }
+        let before = f.complete_rows().await;
+        for extra in [
+            json!({"max_lateness":null}),
+            json!({"max_lateness":true}),
+            json!({"max_lateness":"0"}),
+            json!({"max_lateness":1.0}),
+            json!({"max_lateness":-1}),
+            json!({"max_lateness":u64::MAX}),
+            json!({"max_lateness":i64::MAX}),
+            json!({"misfire_policy":"catch_up_once"}),
+            json!({"misfire_policy":"catch_up_once","max_lateness":0}),
+            json!({"misfire_policy":null}),
+            json!({"misfire_policy":"unknown"}),
+            json!({"receipt_version":null,"max_lateness":0}),
+            json!({"receipt_version":2,"max_lateness":0}),
+        ] {
+            let (params, _) = d7_params(verb, extra.clone());
+            assert!(
+                f.declaration(verb, params).await.is_err(),
+                "raw refusal {verb} {extra}"
+            );
+            assert_eq!(
+                f.complete_rows().await,
+                before,
+                "refusal must not create a note, event or auxiliary row"
+            );
+        }
+        for bound in [0, 7] {
+            let (mut params, _) = d7_params(verb, json!({"max_lateness":bound}));
+            params.as_object_mut().unwrap().remove("receipt_version");
+            assert!(
+                f.declaration(verb, params).await.is_err(),
+                "legacy skip bound refused"
+            );
+            assert_eq!(f.complete_rows().await, before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn v3_skip_zero_and_positive_bounds_drive_exact_fresh_admission() {
+    let Some(root) = isolate("v3_skip_zero_and_positive_bounds_drive_exact_fresh_admission") else {
+        return;
+    };
+    let f = Fixture::open(&root);
+    let (id, first) = d7_declare(&f, "schedule", json!({"max_lateness":0})).await;
+    let clock = TestClock::fixed(f.store.store_id(), first);
+    let selected = f
+        .page_with_global(id, first, 300, 200)
+        .await
+        .selected_occurrence_id
+        .unwrap();
+    let claim = f
+        .store
+        .claim_candidate(id, selected)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.occurrence().effective_max_lateness_s, 0);
+    clock.sequence(vec![Ok(first)]);
+    assert!(
+        matches!(f.store.begin_invocation(&claim).await.unwrap(), Admission::Launch(v) if v.admission_at_us()==first)
+    );
+    assert_eq!(clock.count(), 1);
+    clock.set(first);
+
+    let (id, first) = d7_declare(&f, "schedule", json!({"max_lateness":0})).await;
+    clock.set(first + 1);
+    let page = f.page_with_global(id, first + 1, 300, 200).await;
+    assert!(page.selected_occurrence_id.is_none());
+    let item = f.inventory(id).await.remove(0);
+    assert_eq!(item.effective_max_lateness_s, 0);
+    assert_eq!(item.selection_at_us, first + 1);
+    assert_eq!(
+        item.terminal.as_ref().unwrap()["reason_code"],
+        "selection_deadline_exceeded"
+    );
+    let attempts =
+        f.rt.sql()
+            .reader()
+            .await
+            .unwrap()
+            .query_row(SqlStatement::new(
+                "SELECT COUNT(*) AS count FROM scheduled_attempts_v3 WHERE occurrence_id=?1",
+                vec![SqlValue::Text(item.id.to_string())],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(attempts.i64("count").unwrap(), 0);
+
+    for (bound, final_delta, launch) in [(0, 1, false), (7, 7_000_000, true), (7, 7_000_001, false)]
+    {
+        clock.set(first);
+        let (id, first) = d7_declare(&f, "schedule", json!({"max_lateness":bound})).await;
+        clock.set(first);
+        let selected = f
+            .page_with_global(id, first, 300, 200)
+            .await
+            .selected_occurrence_id
+            .unwrap();
+        let claim = f
+            .store
+            .claim_candidate(id, selected)
+            .await
+            .unwrap()
+            .unwrap();
+        clock.set(first + final_delta);
+        assert!(f.store.renew_claim(&claim).await.unwrap());
+        clock.sequence(vec![Ok(first + final_delta)]);
+        match f.store.begin_invocation(&claim).await.unwrap() {
+            Admission::Launch(intent) if launch => {
+                assert_eq!(intent.admission_at_us(), first + final_delta)
+            }
+            Admission::Settled(receipt) if !launch => {
+                assert_eq!(receipt.outcome, "missed");
+                assert_eq!(receipt.reason_code, "final_deadline_exceeded");
+                assert_eq!(receipt.final_decision_at_us, Some(first + final_delta));
+            }
+            other => panic!("precise final admission: {other:?}"),
+        }
+        assert_eq!(clock.count(), 1);
+        assert_eq!(claim.occurrence().selection_at_us, first);
+        assert_eq!(claim.occurrence().effective_max_lateness_s, bound);
+    }
+}
+
+#[tokio::test]
+async fn v3_skip_bound_window_survives_cold_pages_and_only_new_window_recaptures_global() {
+    let name = "v3_skip_bound_window_survives_cold_pages_and_only_new_window_recaptures_global";
+    if std::env::var(CHILD_CASE).as_deref() != Ok(name) {
+        let root = tempfile::tempdir().unwrap();
+        for arm in ["absent", "zero", "positive"] {
+            let case = root.path().join(arm);
+            std::fs::create_dir_all(&case).unwrap();
+            healthy(child(name, &case, Some("first")));
+            healthy(child(name, &case, Some("resume")));
+            let done: Value =
+                serde_json::from_slice(&std::fs::read(case.join("done.json")).unwrap()).unwrap();
+            assert_eq!(done["original_count"], 601);
+            assert_eq!(done["new_count"], 1);
+        }
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os(CHILD_ROOT).unwrap());
+    let arm = root.file_name().unwrap().to_str().unwrap();
+    let requested = match arm {
+        "absent" => None,
+        "zero" => Some(0),
+        "positive" => Some(7),
+        _ => panic!("closed arm"),
+    };
+    let first_global = if arm == "positive" { 99 } else { 3600 };
+    let changed_global = if arm == "zero" { 999 } else { 0 };
+    let expected_bound = requested.unwrap_or(first_global);
+    let f = Fixture::open(&root);
+    if std::env::var(CHILD_PHASE).as_deref() == Ok("first") {
+        let mut extra = json!({"repeat":"every:1s"});
+        if let Some(bound) = requested {
+            extra["max_lateness"] = json!(bound);
+        }
+        let (id, first) = d7_declare(&f, "schedule", extra).await;
+        let _clock = TestClock::fixed(f.store.store_id(), first + 600_000_000);
+        assert_eq!(
+            f.page_with_global(id, first + 600_000_000, first_global, 200)
+                .await
+                .created,
+            200
+        );
+        let snapshot = f.store.series(id).await.unwrap().unwrap();
+        assert_eq!(snapshot.effective_max_lateness_s, Some(expected_bound));
+        let source = OccurrenceInstant::from_micros(first).unwrap();
+        assert_eq!(snapshot.window_source, Some(source));
+        assert_eq!(
+            snapshot.selected,
+            Some(source),
+            "skip keeps the original source"
+        );
+        assert_eq!(
+            snapshot.horizon,
+            Some(OccurrenceInstant::from_micros(first + 600_000_000).unwrap())
+        );
+        assert_eq!(snapshot.selection_at_us, Some(first + 600_000_000));
+        assert_eq!(
+            snapshot.next,
+            Some(OccurrenceInstant::from_micros(first + 200_000_000).unwrap())
+        );
+        let definition = f.store.definition(&snapshot).await.unwrap();
+        std::fs::write(
+            root.join("rows.json"),
+            serde_json::to_vec(&f.complete_rows().await).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("state.json"), json!({"id":id,"first":first,"store":f.store.store_id(),"canonical":definition.canonical_bytes().unwrap(),"digest":definition.digest().unwrap()}).to_string()).unwrap();
+        return;
+    }
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    let stored: Value =
+        serde_json::from_slice(&std::fs::read(root.join("rows.json")).unwrap()).unwrap();
+    assert_eq!(
+        f.complete_rows().await,
+        stored,
+        "cold read leaves all original rows unchanged"
+    );
+    assert_eq!(
+        f.store.store_id().to_string(),
+        state["store"].as_str().unwrap()
+    );
+    let id = state["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let first = state["first"].as_i64().unwrap();
+    let clock = TestClock::fixed(f.store.store_id(), first + 600_000_000);
+    let before = f.store.series(id).await.unwrap().unwrap();
+    let definition = f.store.definition(&before).await.unwrap();
+    assert_eq!(definition.requested_max_lateness_s, requested);
+    assert_eq!(
+        json!(definition.canonical_bytes().unwrap()),
+        state["canonical"]
+    );
+    assert_eq!(json!(definition.digest().unwrap()), state["digest"]);
+    assert_eq!(
+        f.page_with_global(id, first + 900_000_000, changed_global, 200)
+            .await
+            .created,
+        200
+    );
+    let after = f.store.series(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            after.window_source,
+            after.horizon,
+            after.selected,
+            after.selection_at_us,
+            after.effective_max_lateness_s
+        ),
+        (
+            before.window_source,
+            before.horizon,
+            before.selected,
+            before.selection_at_us,
+            Some(expected_bound)
+        )
+    );
+    assert_eq!(
+        after.next,
+        Some(OccurrenceInstant::from_micros(first + 400_000_000).unwrap())
+    );
+    let rows = f.complete_rows().await;
+    for table in [
+        "scheduled_definitions_v3",
+        "scheduled_occurrences_v3",
+        "scheduled_receipts_v3",
+        "scheduled_notice_outbox_v3",
+    ] {
+        let prior = stored[table].as_array().unwrap();
+        assert_eq!(&rows[table].as_array().unwrap()[..prior.len()], prior);
+    }
+    for expected in [200, 1] {
+        assert_eq!(
+            f.page_with_global(id, first + 900_000_000, changed_global, 200)
+                .await
+                .created,
+            expected
+        );
+    }
+    let original = f.inventory(id).await;
+    assert_eq!(original.len(), 601);
+    for (index, item) in original.iter().enumerate() {
+        assert_eq!(
+            item.key.scheduled_for,
+            OccurrenceInstant::from_micros(first + index as i64 * 1_000_000).unwrap()
+        );
+        assert_eq!(
+            item.id,
+            item.key.id(),
+            "complete original occurrence identity"
+        );
+        assert_eq!(item.effective_max_lateness_s, expected_bound);
+        assert_eq!(item.selection_at_us, first + 600_000_000);
+    }
+    if requested.is_none() {
+        let claim = f
+            .store
+            .claim_candidate(id, original[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        let intent = match f.store.begin_invocation(&claim).await.unwrap() {
+            Admission::Launch(v) => v,
+            other => panic!("frozen source bound: {other:?}"),
+        };
+        f.store
+            .finish(
+                &intent,
+                ObservedResult::non_invoked(TerminalOutcome::Succeeded, "cold_window_completed"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    } else {
+        assert_eq!(original[0].terminal.as_ref().unwrap()["outcome"], "missed");
+    }
+    let next = first + 601_000_000;
+    clock.set(next);
+    let new_global = if requested.is_none() {
+        7
+    } else {
+        changed_global
+    };
+    let page = f.page_with_global(id, next, new_global, 200).await;
+    assert_eq!(page.created, 1);
+    let selected = page.selected_occurrence_id.unwrap();
+    let claim = f
+        .store
+        .claim_candidate(id, selected)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.occurrence().effective_max_lateness_s,
+        requested.unwrap_or(new_global)
+    );
+    assert_eq!(claim.occurrence().selection_at_us, next);
+    assert!(
+        matches!(f.store.begin_invocation(&claim).await.unwrap(),Admission::Launch(v) if v.admission_at_us()==next)
+    );
+    std::fs::write(root.join("done.json"),json!({"original_count":original.len(),"new_count":page.created,"store":f.store.store_id()}).to_string()).unwrap();
 }

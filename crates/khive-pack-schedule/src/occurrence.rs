@@ -5,7 +5,7 @@ use khive_runtime::{NamespaceToken, RuntimeError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::misfire::{parse_misfire_policy, MisfirePolicy};
+use crate::misfire::{parse_v3_misfire_policy, MisfirePolicy, V3MisfirePolicy};
 
 /// The maximum number of new occurrence identities in one host drain pass.
 pub const PASS_MATERIALIZATION_LIMIT: usize = 200;
@@ -97,18 +97,18 @@ impl DefinitionV3 {
         first_trigger_text: String,
         first_trigger: DateTime<Utc>,
         repeat: Option<String>,
-        policy: MisfirePolicy,
+        policy: V3MisfirePolicy,
     ) -> Self {
         let creator = DefinitionActor {
             kind: token.actor().kind.to_string(),
             id: token.actor().id.to_string(),
         };
-        let (misfire_policy, requested_max_lateness_s) = match policy {
-            MisfirePolicy::Skip => ("skip".to_owned(), None),
-            MisfirePolicy::CatchUpOnce { max_lateness } => {
-                ("catch_up_once".to_owned(), Some(max_lateness))
-            }
-        };
+        let misfire_policy = match policy.kind() {
+            MisfirePolicy::Skip => "skip",
+            MisfirePolicy::CatchUpOnce { .. } => "catch_up_once",
+        }
+        .to_owned();
+        let requested_max_lateness_s = policy.requested_max_lateness_s();
         Self {
             schema_version: 3,
             schedule_id,
@@ -131,7 +131,9 @@ impl DefinitionV3 {
         if let Some(bound) = self.requested_max_lateness_s {
             value["max_lateness"] = bound.into();
         }
-        parse_misfire_policy(&value).map_err(RuntimeError::InvalidInput)
+        parse_v3_misfire_policy(&value)
+            .map(|policy| policy.kind())
+            .map_err(RuntimeError::InvalidInput)
     }
 
     /// Fixed struct field order and closed, map-free fields define the canonical representation.

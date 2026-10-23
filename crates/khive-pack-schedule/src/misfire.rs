@@ -47,3 +47,58 @@ pub fn parse_misfire_policy(properties: &Value) -> Result<MisfirePolicy, String>
         _ => Err("misfire_policy must be \"skip\" or \"catch_up_once\"".into()),
     }
 }
+
+/// Validated declaration-only policy for version-three occurrence accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct V3MisfirePolicy {
+    kind: MisfirePolicy,
+    requested_max_lateness_s: Option<i64>,
+}
+
+impl V3MisfirePolicy {
+    pub(crate) fn kind(self) -> MisfirePolicy {
+        self.kind
+    }
+
+    pub(crate) fn requested_max_lateness_s(self) -> Option<i64> {
+        self.requested_max_lateness_s
+    }
+}
+
+/// Validate the raw version-three fields before optional serde fields erase nulls.
+pub(crate) fn parse_v3_misfire_policy(properties: &Value) -> Result<V3MisfirePolicy, String> {
+    let policy = match properties.get("misfire_policy") {
+        None => "skip",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "misfire_policy must be \"skip\" or \"catch_up_once\"".to_string())?,
+    };
+    if policy != "skip" {
+        let kind = parse_misfire_policy(properties)?;
+        let requested_max_lateness_s = match kind {
+            MisfirePolicy::CatchUpOnce { max_lateness } => Some(max_lateness),
+            MisfirePolicy::Skip => None,
+        };
+        return Ok(V3MisfirePolicy {
+            kind,
+            requested_max_lateness_s,
+        });
+    }
+    let requested_max_lateness_s = properties
+        .get("max_lateness")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|seconds| *seconds >= 0)
+                .filter(|seconds| Duration::try_seconds(*seconds).is_some())
+                .ok_or_else(|| {
+                    "max_lateness must be a representable nonnegative integer number of seconds"
+                        .to_string()
+                })
+        })
+        .transpose()?;
+    Ok(V3MisfirePolicy {
+        kind: MisfirePolicy::Skip,
+        requested_max_lateness_s,
+    })
+}
