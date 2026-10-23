@@ -161,6 +161,7 @@ async fn rows(runtime: &KhiveRuntime) -> Vec<Event> {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn audit_success_rows_response_usage_freezes_without_a_row() {
     const NAME:&str="server::audit_success_rows_usage_tests::audit_success_rows_response_usage_freezes_without_a_row";
     const CHILD: &str = "KHIVE_TEST_SUCCESS_USAGE_CHILD";

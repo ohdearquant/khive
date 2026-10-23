@@ -104,6 +104,7 @@ fn obligation(error: DispatchError, expected: AuditTerminalReason, value: &Value
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_kept_rows_remain_obligations() {
     let name="pack::audit_success_rows_cut_tests::obligation_tests::audit_success_rows_kept_rows_remain_obligations";
     let cases = [
@@ -223,6 +224,7 @@ async fn audit_success_rows_kept_rows_remain_obligations() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_skips_never_enter_an_injected_failure() {
     let name="pack::audit_success_rows_cut_tests::obligation_tests::audit_success_rows_skips_never_enter_an_injected_failure";
     let Some(case) = isolate(name, &["queue", "append", "late"]) else {
@@ -262,6 +264,7 @@ async fn audit_success_rows_skips_never_enter_an_injected_failure() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_intercepted_usage_freezes_without_a_row() {
     let name="pack::audit_success_rows_cut_tests::obligation_tests::audit_success_rows_intercepted_usage_freezes_without_a_row";
     let Some(_) = isolate(name, &["run"]) else {

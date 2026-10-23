@@ -23,6 +23,7 @@ async fn finish(rig: &Rig) {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_omits_exact_trusted_poll_successes() {
     let Some(case) = isolate(
         &selector("audit_success_rows_omits_exact_trusted_poll_successes"),
@@ -69,6 +70,7 @@ async fn audit_success_rows_omits_exact_trusted_poll_successes() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_registration_boundary_keeps_untrusted_successes() {
     let Some(case) = isolate(
         &selector("audit_success_rows_registration_boundary_keeps_untrusted_successes"),
@@ -154,6 +156,7 @@ async fn audit_success_rows_registration_boundary_keeps_untrusted_successes() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_splitmix_serial_and_restart() {
     let Some(case) = isolate(
         &selector("audit_success_rows_splitmix_serial_and_restart"),
@@ -257,6 +260,7 @@ const SELECTED_8000: [u64; 775] = [
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_concurrent_sequence_is_unique() {
     let Some(_) = isolate(
         &selector("audit_success_rows_concurrent_sequence_is_unique"),
@@ -317,6 +321,7 @@ async fn audit_success_rows_concurrent_sequence_is_unique() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_forcing_is_fail_closed() {
     let cases = [
         "heart_failure",
@@ -425,6 +430,7 @@ async fn audit_success_rows_forcing_is_fail_closed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_preserves_non_success_audits() {
     let Some(case) = isolate(
         &selector("audit_success_rows_preserves_non_success_audits"),
@@ -463,6 +469,7 @@ async fn audit_success_rows_preserves_non_success_audits() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_storeless_dispatch_does_not_cut() {
     let Some(case) = isolate(
         &selector("audit_success_rows_storeless_dispatch_does_not_cut"),
@@ -525,6 +532,7 @@ async fn audit_success_rows_storeless_dispatch_does_not_cut() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_replay_reduces_fixture_rows() {
     let Some(case) = isolate(
         &selector("audit_success_rows_replay_reduces_fixture_rows"),
@@ -569,6 +577,7 @@ async fn audit_success_rows_replay_reduces_fixture_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_two_registries_share_sequences_not_mode() {
     let Some(_) = isolate(
         &selector("audit_success_rows_two_registries_share_sequences_not_mode"),
@@ -644,6 +653,7 @@ impl khive_gate::Gate for DenyGate {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_denial_and_unknown_keep_receipts() {
     let Some(case) = isolate(
         &selector("audit_success_rows_denial_and_unknown_keep_receipts"),
@@ -689,6 +699,7 @@ async fn audit_success_rows_denial_and_unknown_keep_receipts() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_success_rows_dispatch_mode_is_registry_scoped() {
     let Some(case) = isolate(
         &selector("audit_success_rows_dispatch_mode_is_registry_scoped"),

@@ -300,6 +300,7 @@ async fn health(f: &Fixture) -> Vec<Note> {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn real_poll_state_changes_force_audit_rows() {
     if isolated("real_poll_state_changes_force_audit_rows", &["effects"]).is_none() {
         return;
@@ -371,6 +372,7 @@ fn real_poll_state_changes_force_audit_rows() {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn real_poll_errors_keep_audits_without_sequences() {
     if isolated(
         "real_poll_errors_keep_audits_without_sequences",
@@ -417,6 +419,7 @@ fn real_poll_errors_keep_audits_without_sequences() {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn audit_success_rows_diagnostics_count_decisions() {
     if isolated(
         "audit_success_rows_diagnostics_count_decisions",
@@ -603,6 +606,7 @@ fn by_id(rows: Vec<Event>) -> BTreeMap<Uuid, Event> {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn sampled_audit_readers_preserve_rows_and_ids() {
     let Some(case) = isolated(
         "sampled_audit_readers_preserve_rows_and_ids",
