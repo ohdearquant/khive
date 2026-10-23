@@ -31,3 +31,6 @@ mod inbox_filter_tests;
 /// See crates/khive-pack-comm/docs/api/channel-health.md#librschannel_health_namespace--rationale
 /// for the incident history (khive #606, #877, #917).
 pub const CHANNEL_HEALTH_NAMESPACE: &str = "local";
+
+#[cfg(test)]
+mod poll_result_contract_tests;
