@@ -2019,10 +2019,13 @@ name = "khive-capability"
 version = "0.14.0"
 dependencies = [
  "blake3",
+ "hmac",
  "khive-lion-core",
  "khive-types",
  "serde",
+ "sha2",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
