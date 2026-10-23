@@ -203,7 +203,10 @@ async fn capture_fixture() -> Value {
         db_path: None,
         brain_profile: None,
         actor_id: Some(CALLER.into()),
-        visible_namespaces: vec![Namespace::parse("research").unwrap()],
+        visible_namespaces: vec![
+            Namespace::parse("research").unwrap(),
+            Namespace::parse("reader:secondary").unwrap(),
+        ],
         ..RuntimeConfig::no_embeddings()
     };
     config.brain.fleet_readers = vec![CALLER.into()];
