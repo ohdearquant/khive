@@ -115,6 +115,8 @@ pub(super) async fn run_pending_events_on_with_lease(
     let now = Utc::now();
     let grace = fire_grace_from_env();
     let mut summary = DrainSummary::default();
+    // Version-three work is discovered from durable auxiliary rows, even with no live notes.
+    let occurrence_store = super::v3::drain(rt, server, verbose, &mut summary).await?;
 
     // ── Step 0: reconcile claims whose renewable lease expired ───────────
     // A durable succeeded/failed outcome is finalized without invoking the
@@ -122,7 +124,7 @@ pub(super) async fn run_pending_events_on_with_lease(
     // fails closed instead of risking a duplicate side effect. Only legacy
     // pre-receipt claims retain the historical pending retry behavior.
     let reclaimed = reclaim_stale_firing_events(rt, now.timestamp_micros()).await?;
-    summary.reclaimed = reclaimed.rows;
+    summary.reclaimed += reclaimed.rows;
     summary.outcomes_persisted += reclaimed.outcomes_persisted;
     summary.fired += reclaimed.fired;
     summary.advanced += reclaimed.advanced;
@@ -300,6 +302,22 @@ pub(super) async fn run_pending_events_on_with_lease(
                         continue;
                     }
                 };
+                if let Some(store) = &occurrence_store {
+                    if let Some(series) = store.series(id).await? {
+                        // Immutable ownership wins even if a display marker was edited or removed.
+                        store.definition(&series).await?;
+                        continue;
+                    }
+                }
+                if properties
+                    .as_ref()
+                    .and_then(|p| p.get("receipt_version"))
+                    .and_then(Value::as_i64)
+                    == Some(3)
+                {
+                    // A routing marker never supplies authority or activates an unbound definition.
+                    continue;
+                }
                 let content = match row.get("content") {
                     Some(SqlValue::Text(s)) => s.clone(),
                     other => {

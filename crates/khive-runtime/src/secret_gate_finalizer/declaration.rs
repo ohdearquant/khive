@@ -327,6 +327,22 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         acceptance: Acceptance::Test { path: "khive-pack-schedule/src/handlers.rs::reservation_tests::public_schedule_verbs_refuse_reserved_key_on_staged_row" },
     },
     RouteInventoryEntry {
+        id: "schedule.project_note",
+        site: "khive-pack-schedule/src/occurrence_store.rs::project_note",
+        expected_writes: 1,
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::SpecializedWriter,
+        reservation: Reservation::NamedCheck {
+            function: "reject_reserved_projection_properties",
+            file: "khive-pack-schedule/src/occurrence_store.rs",
+        },
+        transaction: TransactionOwner::RunAtomicUnit,
+        stamp: StampCapability::ReservationOnly,
+        family: None,
+        acceptance: Acceptance::Test { path: "khive-pack-schedule/src/occurrence_tests.rs::projection_refuses_carried_reserved_properties_and_rolls_back_complete_state" },
+    },
+    RouteInventoryEntry {
         id: "comm.heartbeat",
         site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::persist_heartbeat",
         expected_writes: 2,

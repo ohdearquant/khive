@@ -19,7 +19,35 @@ use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::Event;
 use khive_types::{EventKind, SubstrateKind};
 
+use crate::occurrence::{DefinitionV3, OccurrenceInstant, ScheduledPayload};
+use crate::occurrence_store::OccurrenceStore;
 use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
+
+fn version_three(params: &Value) -> Result<bool, RuntimeError> {
+    match params.get("receipt_version") {
+        None => Ok(false),
+        Some(value) if value.as_i64() == Some(3) => Ok(true),
+        _ => Err(RuntimeError::InvalidInput(
+            "receipt_version must be the integer 3 when supplied".into(),
+        )),
+    }
+}
+
+async fn activate_occurrence_definition(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    store: &OccurrenceStore,
+    definition: DefinitionV3,
+) -> Result<(), RuntimeError> {
+    let staged = runtime
+        .notes(token)?
+        .get_note(definition.schedule_id)
+        .await?
+        .ok_or_else(|| RuntimeError::Internal("version-3 staged schedule disappeared".into()))?;
+    store
+        .activate_definition(OccurrenceStore::prepare_definition(definition, &staged)?)
+        .await
+}
 
 #[cfg(test)]
 #[path = "handlers_activation_seam.rs"]
@@ -748,6 +776,8 @@ pub(crate) struct RemindParams {
     pub misfire_policy: Option<String>,
     #[serde(default)]
     pub max_lateness: Option<i64>,
+    #[serde(default)]
+    pub receipt_version: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -761,6 +791,8 @@ pub(crate) struct ScheduleParams {
     pub misfire_policy: Option<String>,
     #[serde(default)]
     pub max_lateness: Option<i64>,
+    #[serde(default)]
+    pub receipt_version: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -800,7 +832,9 @@ pub(crate) async fn handle_remind(
         ));
     }
 
-    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+    let policy =
+        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+    let use_v3 = version_three(&params)?;
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -841,6 +875,18 @@ pub(crate) async fn handle_remind(
         properties["max_lateness"] = json!(max_lateness);
     }
 
+    let occurrence_store = use_v3.then(|| OccurrenceStore::open(runtime)).transpose()?;
+    if let Some(store) = &occurrence_store {
+        if !store.is_installed().await? {
+            return Err(RuntimeError::Unconfigured(
+                "version-3 schedule schema is not installed".into(),
+            ));
+        }
+    }
+    if use_v3 {
+        properties["receipt_version"] = json!(p.receipt_version);
+    }
+
     // The report-returning variant keeps a truncated embedding input from
     // failing the call after the note is committed: the staged event must
     // still be activated, and the truncation is disclosed in the response.
@@ -859,6 +905,20 @@ pub(crate) async fn handle_remind(
     #[cfg(test)]
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "remind").await?;
+    if let Some(store) = &occurrence_store {
+        let definition = DefinitionV3::from_declaration(
+            token,
+            note.id,
+            ScheduledPayload::Reminder {
+                content: p.content.clone(),
+            },
+            trigger_at_original.clone(),
+            trigger_utc,
+            p.repeat.clone(),
+            policy,
+        );
+        activate_occurrence_definition(runtime, token, store, definition).await?;
+    }
 
     let mut response = json!({
         "id": short_id(note.id),
@@ -868,6 +928,11 @@ pub(crate) async fn handle_remind(
         "repeat": p.repeat,
         "status": "pending",
     });
+    if let Some(store) = occurrence_store {
+        response["receipt_version"] = json!(3);
+        response["store_id"] = json!(store.store_id());
+        response["definition_revision"] = json!(1);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -879,7 +944,9 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+    let policy =
+        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+    let use_v3 = version_three(&params)?;
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -931,6 +998,18 @@ pub(crate) async fn handle_schedule(
         properties["max_lateness"] = json!(max_lateness);
     }
 
+    let occurrence_store = use_v3.then(|| OccurrenceStore::open(runtime)).transpose()?;
+    if let Some(store) = &occurrence_store {
+        if !store.is_installed().await? {
+            return Err(RuntimeError::Unconfigured(
+                "version-3 schedule schema is not installed".into(),
+            ));
+        }
+    }
+    if use_v3 {
+        properties["receipt_version"] = json!(p.receipt_version);
+    }
+
     // See `handle_remind`: activation must follow a committed note even when
     // its embedding input was truncated.
     let (note, embedding_truncation) = runtime
@@ -948,6 +1027,20 @@ pub(crate) async fn handle_schedule(
     #[cfg(test)]
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "schedule").await?;
+    if let Some(store) = &occurrence_store {
+        let definition = DefinitionV3::from_declaration(
+            token,
+            note.id,
+            ScheduledPayload::Action {
+                action: p.action.clone(),
+            },
+            trigger_at_original.clone(),
+            trigger_utc,
+            p.repeat.clone(),
+            policy,
+        );
+        activate_occurrence_definition(runtime, token, store, definition).await?;
+    }
 
     let mut response = json!({
         "id": short_id(note.id),
@@ -957,6 +1050,11 @@ pub(crate) async fn handle_schedule(
         "repeat": p.repeat,
         "status": "pending",
     });
+    if let Some(store) = occurrence_store {
+        response["receipt_version"] = json!(3);
+        response["store_id"] = json!(store.store_id());
+        response["definition_revision"] = json!(1);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -1040,6 +1138,7 @@ pub(crate) async fn handle_agenda(
     // Accepted timestamps can have unpadded components or signed years, so
     // raw-text date bounds can exclude rows that match the exact UTC window.
     let store = runtime.notes(token)?;
+    let occurrence_store = OccurrenceStore::for_runtime(runtime).await?;
     let namespace = token.namespace().as_str();
     let mut property_filters = vec![
         PropertyFilter {
@@ -1107,7 +1206,37 @@ pub(crate) async fn handle_agenda(
             });
             next = json!({ "after": value, "after_id": last.id });
         }
-        events.extend(page.items.iter().map(note_to_event_json));
+        for note in &page.items {
+            let mut event = note_to_event_json(note);
+            let marked = note
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("receipt_version"))
+                .and_then(Value::as_i64)
+                == Some(3);
+            let bound = match &occurrence_store {
+                Some(store) => store.series(note.id).await?,
+                None => None,
+            };
+            if let Some(series) = bound {
+                let occurrences = occurrence_store
+                    .as_ref()
+                    .expect("bound series came from installed store");
+                occurrences.definition(&series).await?;
+                if series.namespace != namespace {
+                    event["status"] = json!("history_in_original_namespace");
+                } else {
+                    event["receipt_version"] = json!(3);
+                    event["occurrence_state"] = serde_json::to_value(&series)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                    event["status"] = json!(series.state);
+                }
+            } else if marked {
+                event["status"] = json!("accounting_blocked");
+                event["accounting_blocked_reason"] = json!("immutable_definition_missing");
+            }
+            events.push(event);
+        }
         if page_len < page_limit {
             break;
         }
@@ -1128,6 +1257,24 @@ pub(crate) async fn handle_cancel(
         .resolve_uuid_or_prefix_for_verb(token, &p.id, "cancel")
         .await?;
 
+    if let Some(occurrences) = OccurrenceStore::for_runtime(runtime).await? {
+        if let Some(series) = occurrences.series(id).await? {
+            if series.namespace != token.namespace().as_str() {
+                return Err(RuntimeError::NotFound(format!(
+                    "cancel: event {id} not found"
+                )));
+            }
+            let cut = occurrences.cancel_v3(token, id).await?.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "schedule changed during cancellation; retry with fresh state".into(),
+                )
+            })?;
+            return Ok(
+                json!({"id":short_id(id),"full_id":id,"receipt_version":3,"status":"cancelled",
+                "changed":cut.changed,"cancellation_cut_us":cut.cut_at_us}),
+            );
+        }
+    }
     let store = runtime.notes(token)?;
     let mut note = store
         .get_note(id)
@@ -1145,6 +1292,18 @@ pub(crate) async fn handle_cancel(
             "cancel: note {id} is kind {:?}, expected \"scheduled_event\"",
             note.kind
         )));
+    }
+
+    if note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("receipt_version"))
+        .and_then(Value::as_i64)
+        == Some(3)
+    {
+        return Err(RuntimeError::InvalidInput(
+            "version-3 schedule has no activated immutable definition".into(),
+        ));
     }
 
     // Require properties to be a JSON object (or absent — treated as `{}`).
@@ -1229,6 +1388,123 @@ pub(crate) async fn handle_cancel(
         "cancelled_at": cancelled_at,
         "properties": props,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OccurrencesParams {
+    id: String,
+    #[serde(default)]
+    revision: Option<i64>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Read immutable occurrence inventory without requiring a live display note.
+pub(crate) async fn handle_occurrences(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: OccurrencesParams = deser(params)?;
+    let id = Uuid::parse_str(&p.id)
+        .map_err(|_| RuntimeError::InvalidInput("occurrences.id must be a complete UUID".into()))?;
+    if p.revision.is_some_and(|r| r <= 0) {
+        return Err(RuntimeError::InvalidInput(
+            "occurrences.revision must be positive".into(),
+        ));
+    }
+    let after = match (p.after, p.after_id) {
+        (None, None) => None,
+        (Some(at), Some(id)) => Some((
+            OccurrenceInstant::from_datetime(at.parse::<DateTime<Utc>>().map_err(|_| {
+                RuntimeError::InvalidInput("occurrences.after must be RFC3339".into())
+            })?),
+            Uuid::parse_str(&id).map_err(|_| {
+                RuntimeError::InvalidInput("occurrences.after_id must be a UUID".into())
+            })?,
+        )),
+        _ => {
+            return Err(RuntimeError::InvalidInput(
+                "occurrences.after and after_id must be supplied together".into(),
+            ))
+        }
+    };
+    let store = OccurrenceStore::open(runtime)?;
+    let page = store
+        .occurrences(token, id, p.revision, after, p.limit.unwrap_or(20))
+        .await?;
+    let next = if page.has_more {
+        page.items
+            .last()
+            .map(|item| {
+                item.key
+                    .scheduled_for
+                    .datetime()
+                    .map(|at| json!({"after":at.to_rfc3339(),"after_id":item.id}))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(
+        json!({"receipt_version":3,"schedule_id":id,"occurrences":page.items,"has_more":page.has_more,"next":next}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptsParams {
+    id: String,
+    #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Page terminal and reconciliation records in the occurrence's original namespace.
+pub(crate) async fn handle_receipts(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: ReceiptsParams = deser(params)?;
+    let id = Uuid::parse_str(&p.id).map_err(|_| {
+        RuntimeError::InvalidInput("receipts.id must be a complete occurrence UUID".into())
+    })?;
+    let after = match (p.after, p.after_id) {
+        (None, None) => None,
+        (Some(at), Some(id)) => Some((
+            at,
+            Uuid::parse_str(&id).map_err(|_| {
+                RuntimeError::InvalidInput("receipts.after_id must be a UUID".into())
+            })?,
+        )),
+        _ => {
+            return Err(RuntimeError::InvalidInput(
+                "receipts.after and after_id must be supplied together".into(),
+            ))
+        }
+    };
+    let page = OccurrenceStore::open(runtime)?
+        .receipt(token, id, after, p.limit.unwrap_or(20))
+        .await?;
+    let next = if page.has_more {
+        page.items
+            .last()
+            .map(|item| json!({"after":item["recorded_at_us"],"after_id":item["id"]}))
+    } else {
+        None
+    };
+    Ok(
+        json!({"receipt_version":3,"occurrence_id":id,"receipts":page.items,"has_more":page.has_more,"next":next}),
+    )
 }
 
 #[cfg(test)]

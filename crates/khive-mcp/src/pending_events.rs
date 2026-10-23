@@ -81,6 +81,7 @@ mod drain;
 mod receipt;
 mod reclaim;
 mod recurrence;
+mod v3;
 
 use dispatch::{
     action_error_disposition_may_have_committed, dispatch_with_renewable_lease,

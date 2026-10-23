@@ -909,3 +909,242 @@ fn an_exec_run_whose_session_seq_is_taken_in_the_target_fails_the_statement() {
     assert_eq!(events_matching_their_run(&conn, "source"), 1);
     assert_eq!(events_matching_their_run(&conn, "target"), 0);
 }
+
+const SCHEDULED_V3_DDL: &str = include_str!("../sql/namespace-schedule-v3-fixture.sql");
+const SCHEDULED_V3_TABLES: [&str; 6] = [
+    "scheduled_definitions_v3",
+    "scheduled_series_v3",
+    "scheduled_occurrences_v3",
+    "scheduled_attempts_v3",
+    "scheduled_receipts_v3",
+    "scheduled_notice_outbox_v3",
+];
+
+fn scheduled_chain(conn: &Connection, suffix: &str, namespace: &str, state: &str) {
+    let schedule_id = format!("schedule-{suffix}");
+    let occurrence_id = format!("occurrence-{suffix}");
+    let invocation_id = format!("invocation-{suffix}");
+    let receipt_id = format!("receipt-{suffix}");
+    let digest = [7_u8; 32];
+    let suspended = (state == "cancelled").then_some(invocation_id.as_str());
+    conn.execute(
+        "INSERT INTO scheduled_definitions_v3 \
+         (store_id, schedule_id, definition_revision, namespace, definition_digest, \
+          canonical_definition, created_at_us) VALUES ('store', ?1, 1, ?2, ?3, ?4, 1)",
+        rusqlite::params![schedule_id, namespace, &digest[..], &b"{}"[..]],
+    )
+    .expect("scheduled definition");
+    conn.execute(
+        "INSERT INTO scheduled_series_v3 \
+         (store_id, schedule_id, definition_revision, namespace, revision, state, \
+          suspended_invocation_id, cancellation_cut_us) \
+         VALUES ('store', ?1, 1, ?2, 1, ?3, ?4, ?5)",
+        rusqlite::params![
+            schedule_id,
+            namespace,
+            state,
+            suspended,
+            (state == "cancelled").then_some(5_i64)
+        ],
+    )
+    .expect("scheduled series");
+    conn.execute(
+        "INSERT INTO scheduled_occurrences_v3 \
+         (id, store_id, schedule_id, definition_revision, namespace, scheduled_seconds, \
+          scheduled_nanos, materialized_at_us, selection_at_us, effective_max_lateness_s) \
+         VALUES (?1, 'store', ?2, 1, ?3, 1, 0, 1, 1, 300)",
+        rusqlite::params![occurrence_id, schedule_id, namespace],
+    )
+    .expect("scheduled occurrence");
+    conn.execute(
+        "INSERT INTO scheduled_attempts_v3 \
+         (id, occurrence_id, namespace, invocation_id, claim_generation, owner_nonce, \
+          lease_expires_at_us, launch_intent_id, admission_at_us, launch_intent_at_us) \
+         VALUES (?1, ?2, ?3, ?4, 1, 'owner', 10, ?5, 2, 2)",
+        rusqlite::params![
+            format!("attempt-{suffix}"),
+            occurrence_id,
+            namespace,
+            invocation_id,
+            format!("launch-{suffix}")
+        ],
+    )
+    .expect("scheduled attempt");
+    conn.execute(
+        "INSERT INTO scheduled_receipts_v3 \
+         (id, occurrence_id, namespace, record_kind, outcome, reason_code, invocation_id, \
+          recorded_at_us, completed_at_us, canonical_evidence) \
+         VALUES (?1, ?2, ?3, 'terminal', ?4, 'fixture', ?5, 4, 4, ?6)",
+        rusqlite::params![
+            receipt_id,
+            occurrence_id,
+            namespace,
+            if suspended.is_some() {
+                "indeterminate"
+            } else {
+                "succeeded"
+            },
+            invocation_id,
+            &b"{}"[..]
+        ],
+    )
+    .expect("scheduled receipt");
+    conn.execute(
+        "INSERT INTO scheduled_notice_outbox_v3 \
+         (id, store_id, occurrence_id, terminal_receipt_id, namespace, recipient_kind, \
+          recipient_id, notice_kind, intent_digest, canonical_intent, created_at_us) \
+         VALUES (?1, 'store', ?2, ?3, ?4, 'actor', 'fixture-reader', 'outcome_notice', ?5, ?6, 4)",
+        rusqlite::params![
+            format!("notice-{suffix}"),
+            occurrence_id,
+            receipt_id,
+            namespace,
+            &digest[..],
+            &b"{}"[..]
+        ],
+    )
+    .expect("scheduled notice intent");
+}
+
+fn scheduled_source() -> Connection {
+    let conn = store(&[SCHEDULED_V3_DDL]);
+    seed_note(&conn, "n1", "source", "observation");
+    seed_note(&conn, "n2", "source", "decision");
+    for (suffix, namespace, state) in [
+        ("source-1", "source", "cancelled"),
+        ("source-2", "source", "exhausted"),
+        ("target", "target", "exhausted"),
+        ("other", "elsewhere", "exhausted"),
+    ] {
+        scheduled_chain(&conn, suffix, namespace, state);
+    }
+    seed_note(&conn, "schedule-source-1", "source", "scheduled_event");
+    seed_note(&conn, "schedule-source-2", "source", "scheduled_event");
+    conn
+}
+
+fn scheduled_table_images(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = conn
+        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+        .expect("scheduled rows");
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .expect("read scheduled rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("scheduled row images")
+}
+
+fn assert_scheduled_rows_stay(
+    conn: &Connection,
+    counts: &MoveCounts,
+    before: &[Vec<Vec<rusqlite::types::Value>>],
+) {
+    assert_eq!(counts.left_behind.len(), SCHEDULED_V3_TABLES.len());
+    for (table, expected) in SCHEDULED_V3_TABLES.into_iter().zip(before) {
+        assert_eq!(counts.left_behind.get(table), Some(&2), "{table}");
+        assert!(!counts.rows.contains_key(table), "{table}");
+        for (namespace, expected_count) in [("source", 2), ("target", 1), ("elsewhere", 1)] {
+            assert_eq!(
+                pack_rows_in_namespace(conn, table, namespace),
+                expected_count,
+                "{table}/{namespace}"
+            );
+        }
+        assert_eq!(scheduled_table_images(conn, table), *expected, "{table}");
+    }
+}
+
+#[test]
+fn scheduled_occurrence_tables_are_classified_as_leave_behind() {
+    let conn = store(&[SCHEDULED_V3_DDL]);
+    let inventory = namespace_census::census(&conn).expect("census");
+    for name in SCHEDULED_V3_TABLES {
+        let table = inventory
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .unwrap_or_else(|| panic!("{name} must be installed"));
+        assert_eq!(
+            disposition(table),
+            Some(TableDisposition::LeaveBehind),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_total_move_preserves_scheduled_occurrence_rows_and_attribution() {
+    let conn = scheduled_source();
+    let before: Vec<_> = SCHEDULED_V3_TABLES
+        .iter()
+        .map(|table| scheduled_table_images(&conn, table))
+        .collect();
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            route("note:observation", "target"),
+            route("note:decision", "target"),
+            route("note:scheduled_event", "target"),
+        ],
+    )
+    .at(NOW);
+    let counts = move_namespace(&conn, &request).expect("move with retained schedule history");
+    assert_eq!(counts.subjects.get("note:scheduled_event"), Some(&2));
+    assert_eq!(ns(&conn, "notes", "schedule-source-1"), "target");
+    assert_eq!(ns(&conn, "notes", "schedule-source-2"), "target");
+    assert_scheduled_rows_stay(&conn, &counts, &before);
+}
+
+#[test]
+fn a_partitioning_move_preserves_scheduled_occurrence_rows_and_attribution() {
+    let conn = scheduled_source();
+    let before: Vec<_> = SCHEDULED_V3_TABLES
+        .iter()
+        .map(|table| scheduled_table_images(&conn, table))
+        .collect();
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            route("note:observation", "one"),
+            route("note:decision", "another"),
+            route("note:scheduled_event", "one"),
+        ],
+    )
+    .at(NOW);
+    let counts = move_namespace(&conn, &request).expect("partition with retained schedule history");
+    assert_eq!(counts.subjects.get("note:scheduled_event"), Some(&2));
+    assert_eq!(ns(&conn, "notes", "n1"), "one");
+    assert_eq!(ns(&conn, "notes", "n2"), "another");
+    assert_eq!(ns(&conn, "notes", "schedule-source-1"), "one");
+    assert_eq!(ns(&conn, "notes", "schedule-source-2"), "one");
+    for table in SCHEDULED_V3_TABLES {
+        assert_eq!(pack_rows_in_namespace(&conn, table, "one"), 0, "{table}");
+        assert_eq!(
+            pack_rows_in_namespace(&conn, table, "another"),
+            0,
+            "{table}"
+        );
+    }
+    assert_scheduled_rows_stay(&conn, &counts, &before);
+}
+
+#[test]
+fn a_store_without_scheduled_occurrence_tables_moves_cleanly() {
+    let conn = store(&[]);
+    seed_note(&conn, "n1", "source", "observation");
+    let inventory = namespace_census::census(&conn).expect("census");
+    assert!(inventory
+        .tables
+        .iter()
+        .all(|table| !SCHEDULED_V3_TABLES.contains(&table.name.as_str())));
+    let counts = move_namespace(&conn, &observation_request().at(NOW))
+        .expect("absent schedule tables are optional");
+    assert_eq!(counts.subjects.get("note:observation"), Some(&1));
+    assert_eq!(ns(&conn, "notes", "n1"), "target");
+    assert!(counts.left_behind.is_empty());
+}

@@ -360,6 +360,18 @@ pub(super) async fn dispatch_action(
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> std::result::Result<(), DispatchActionError> {
+    dispatch_action_response(action_dsl, namespace, creator_actor, server, verbose)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn dispatch_action_response(
+    action_dsl: &str,
+    namespace: &str,
+    creator_actor: Option<VerifiedActor>,
+    server: &KhiveMcpServer,
+    verbose: bool,
+) -> std::result::Result<Value, DispatchActionError> {
     let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
         let masked_dsl = khive_runtime::secret_gate::bounded_masked_log_text(action_dsl);
         DispatchActionError::known(DispatchFailure::plain(format!(
@@ -452,5 +464,5 @@ pub(super) async fn dispatch_action(
         return Err(action_failures(&failures));
     }
 
-    Ok(())
+    Ok(parsed_result)
 }

@@ -379,6 +379,93 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
         self.assertIn("no such table", result.stdout)
 
+    def schedule_fixture(self):
+        core = self.core_fixture("CREATE TABLE core_anchor (id TEXT);\n")
+        (core / "002-notes.sql").write_text(
+            "CREATE TABLE notes (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    namespace TEXT,\n"
+            "    deleted_at INTEGER\n"
+            ");\n"
+        )
+        # The real trigger dependency is supplied by a later migration, proving
+        # this pack sees the full existing chain, rather than just its baseline.
+        self.write_registry(["schema.sql", "002-notes.sql"])
+        directory = self.root / "crates/khive-pack-schedule/sql"
+        directory.mkdir(parents=True)
+        for name in ["occurrence-schema.sql", "occurrence-clock.sql"]:
+            shutil.copy2(ROOT / "crates/khive-pack-schedule/sql" / name, directory / name)
+        return directory
+
+    def test_real_schedule_lifecycle_schema_uses_only_its_core_fixture(self):
+        self.schedule_fixture()
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("4 file(s) OK (1 prepared, 3 executed)", result.stdout)
+
+        unrelated = self.root / "crates/unrelated/sql"
+        unrelated.mkdir(parents=True)
+        (unrelated / "unexpected_core_visibility.sql").write_text(
+            "CREATE INDEX unexpected_core_visibility ON notes(id);\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table: main.notes", result.stdout)
+
+    def test_schedule_queries_keep_function_arity_table_and_column_checks(self):
+        directory = self.schedule_fixture()
+        query = directory / "occurrence-clock.sql"
+        original = query.read_text()
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        for sql, diagnostic in [
+            ("SELECT khive_now_micros(?1);\n", "wrong number of arguments"),
+            ("SELECT khive_now_micros_typo();\n", "no such function"),
+            ("SELECT khive_now_micros() FROM absent_notes;\n", "no such table"),
+            ("SELECT khive_now_micros(), missing FROM notes;\n", "no such column"),
+        ]:
+            with self.subTest(sql=sql):
+                query.write_text(sql)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("occurrence-clock.sql: FAILED to prepare", result.stdout)
+                self.assertIn(diagnostic, result.stdout)
+        query.write_text(original)
+
+    def test_clock_stub_is_never_evaluated_by_explain(self):
+        self.schedule_fixture()
+        script = self.root / "scripts/lint-sql.sh"
+        source = script.read_text()
+        registration = 'con.create_function("khive_now_micros", 0, lambda: None)'
+        self.assertEqual(source.count(registration), 1)
+        source = source.replace(registration, registration.replace("lambda: None", "lambda: 1 / 0"))
+        script.write_text(source)
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        self.assertIn("4 file(s) OK (1 prepared, 3 executed)", positive.stdout)
+
+        # Prove the throwing stub is live: evaluating the same copied query
+        # fails, whereas its real EXPLAIN preparation above never called it.
+        preparation = 'con.execute("EXPLAIN " + sql.rstrip().rstrip(";"), [None] * highest)'
+        execution = 'con.execute(sql.rstrip().rstrip(";"), [None] * highest).fetchall()'
+        self.assertEqual(source.count(preparation), 1)
+        script.write_text(source.replace(preparation, execution))
+        negative = self.run_lint()
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("occurrence-clock.sql: FAILED to prepare", negative.stdout)
+        self.assertIn("user-defined function raised exception", negative.stdout)
+
+    def test_clock_preparation_stub_does_not_enable_ddl_execution(self):
+        directory = self.schedule_fixture()
+        (directory / "runtime-clock.sql").write_text(
+            "CREATE TABLE runtime_clock AS SELECT khive_now_micros() AS observed;\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runtime-clock.sql: FAILED to load", result.stdout)
+        self.assertIn("no such function: khive_now_micros", result.stdout)
+
     def test_lint_runs_the_interpreter_named_by_the_environment(self):
         # Hosts whose plain python3 predates Connection.setconfig can still run the
         # lint through a newer interpreter; only the SQL phase (stdin "-") marks it.
