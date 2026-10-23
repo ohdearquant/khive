@@ -34,7 +34,7 @@ khive-pack-schedule = { version = "0.14.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.14.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.14.0", path = "../khive-pack-session" }
 khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool", optional = true }
-khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
+khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec", optional = true }
 khive-pack-git = { version = "0.14.0", path = "../khive-pack-git", optional = true }
 khive-pack-code = { version = "0.14.0", path = "../khive-pack-code", optional = true }
 khive-pack-web = { version = "0.14.0", path = "../khive-pack-web", optional = true }
@@ -75,6 +75,8 @@ pack-git = ["dep:khive-pack-git", "khive-runtime/pack-git"]
 pack-code = ["dep:khive-pack-code", "khive-runtime/pack-code"]
 # Tool is optional and off by default.
 pack-tool = ["dep:khive-pack-tool", "khive-runtime/pack-tool"]
+# Exec is optional and also links its Tool prerequisite.
+pack-exec = ["dep:khive-pack-exec", "khive-runtime/pack-exec", "pack-tool"]
 # pack-agent, pack-telemetry, pack-web: link the agent, telemetry and web packs.
 # Without one of them the pack is neither linked nor registered, so it is absent
 # from the pack list the server reports and selecting it is refused as unknown.

@@ -24,6 +24,7 @@ pub use khive_pack_charter::CharterPack as _CharterPack;
 pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
 pub use khive_pack_comm::CommPack as _CommPack;
+#[cfg(feature = "pack-exec")]
 #[doc(hidden)]
 pub use khive_pack_exec::ExecPack as _ExecPack;
 #[cfg(feature = "pack-git")]

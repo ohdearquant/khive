@@ -21,6 +21,7 @@ use khive_pack_charter::CharterPack;
 #[cfg(feature = "pack-code")]
 use khive_pack_code::CodePack;
 use khive_pack_comm::CommPack;
+#[cfg(feature = "pack-exec")]
 use khive_pack_exec::ExecPack;
 #[cfg(feature = "pack-formal")]
 use khive_pack_formal::FormalPack;
@@ -207,6 +208,7 @@ fn linked_packs() -> Vec<Checked> {
         #[cfg(feature = "pack-code")]
         checked(&CodePack::new(rt.clone())),
         checked(&CommPack::new(rt.clone())),
+        #[cfg(feature = "pack-exec")]
         checked(&ExecPack::new(rt.clone())),
         #[cfg(feature = "pack-git")]
         checked(&GitPack::new(rt.clone())),

@@ -63,6 +63,7 @@ mod _pack_links {
     #[cfg(feature = "pack-code")]
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    #[cfg(feature = "pack-exec")]
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;

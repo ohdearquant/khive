@@ -164,3 +164,74 @@ fn a_selected_tool_pack_exposes_its_real_handlers() {
         );
     }
 }
+
+#[test]
+fn exec_factory_and_explicit_selection_follow_the_feature() {
+    assert_eq!(
+        PackRegistry::discovered_names().contains(&"exec"),
+        cfg!(feature = "pack-exec")
+    );
+    let mut selection = vec!["kg".to_string(), "exec".to_string()];
+    if cfg!(feature = "pack-exec") {
+        assert!(cfg!(feature = "pack-tool"));
+        selection.extend(["blob".to_string(), "tool".to_string()]);
+    }
+    let result = PackRegistry::validate_pack_selection(&selection);
+    if cfg!(feature = "pack-exec") {
+        result.expect("Exec can be selected with its explicit prerequisites");
+    } else {
+        assert_eq!(
+            result.expect_err("Exec is unavailable").to_string(),
+            "unknown pack \"exec\""
+        );
+    }
+}
+
+#[test]
+fn an_unselected_exec_pack_contributes_no_handlers_or_prerequisites() {
+    let registry = registry(&["kg"]);
+    assert_eq!(registry.pack_names(), vec!["kg"]);
+    assert!(registry.pack_verbs("exec").is_none());
+    assert!(registry.pack_verbs("tool").is_none());
+    assert!(registry.pack_note_kinds("exec").is_none());
+    assert!(registry.pack_entity_kinds("exec").is_none());
+    assert!(!registry.has_verb("exec.run"));
+    assert!(registry
+        .all_handlers_with_names()
+        .iter()
+        .all(|(pack, handler)| { *pack != "exec" && !handler.name.starts_with("exec.") }));
+}
+
+#[cfg(feature = "pack-exec")]
+#[test]
+fn selected_exec_still_requires_explicit_blob_and_tool_selection() {
+    for (names, missing) in [
+        (&["kg", "blob", "exec"][..], "tool"),
+        (&["kg", "tool", "exec"][..], "blob"),
+    ] {
+        let selection: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+        let error = PackRegistry::validate_pack_selection(&selection)
+            .expect_err("compiled prerequisites must not be selected implicitly");
+        assert!(
+            matches!(error, khive_runtime::PackLoadError::MissingDependency { pack, dep }
+                if pack == "exec" && dep == missing)
+        );
+    }
+}
+
+#[cfg(feature = "pack-exec")]
+#[test]
+fn a_selected_exec_pack_exposes_its_real_handlers() {
+    let registry = registry(&["kg", "blob", "tool", "exec"]);
+    let mut names = registry.pack_names();
+    names.sort_unstable();
+    assert_eq!(names, vec!["blob", "exec", "kg", "tool"]);
+    let handlers = registry.pack_verbs("exec").expect("selected Exec pack");
+    for expected in ["exec.tree_get", "exec.run", "exec.receipt"] {
+        assert!(
+            handlers.iter().any(|handler| handler.name == expected),
+            "{expected}"
+        );
+    }
+    assert!(registry.has_verb("tool.check"));
+}

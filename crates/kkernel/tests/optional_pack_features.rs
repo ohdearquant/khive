@@ -1,4 +1,4 @@
-//! Git, Code, Tool, agent, telemetry and web are optional features of `kkernel` and
+//! Git, Code, Tool, Exec, agent, telemetry and web are optional features of `kkernel` and
 //! `khive-mcp`: a build links and registers a pack exactly when its feature is on.
 //!
 //! Registry assertions exercise the features compiled into this test binary.
@@ -19,10 +19,11 @@ const MAKEFILE: &str = include_str!("../../../Makefile");
 const DEFAULT_OFF_PACKS: [&str; 3] = ["agent", "telemetry", "web"];
 
 /// The optional packs, each paired with whether this build links it.
-const OPTIONAL_PACKS: [(&str, bool); 6] = [
+const OPTIONAL_PACKS: [(&str, bool); 7] = [
     ("code", cfg!(feature = "pack-code")),
     ("git", cfg!(feature = "pack-git")),
     ("tool", cfg!(feature = "pack-tool")),
+    ("exec", cfg!(feature = "pack-exec")),
     ("agent", cfg!(feature = "pack-agent")),
     ("telemetry", cfg!(feature = "pack-telemetry")),
     ("web", cfg!(feature = "pack-web")),
@@ -78,7 +79,10 @@ fn discovered_packs_include_the_default_and_explicitly_selected_packs() {
 fn a_pack_whose_feature_is_off_is_neither_discovered_nor_selectable() {
     let discovered = discovered();
     for (name, linked) in OPTIONAL_PACKS {
-        let selection = vec!["kg".to_string(), name.to_string()];
+        let mut selection = vec!["kg".to_string(), name.to_string()];
+        if linked && name == "exec" {
+            selection.extend(["blob".to_string(), "tool".to_string()]);
+        }
         let result = PackRegistry::validate_pack_selection(&selection);
         if linked {
             assert!(
@@ -234,4 +238,29 @@ fn tool_is_optional_default_off_and_forwarded_to_runtime() {
     assert!(feature(&mcp, "pack-tool").contains(&"khive-runtime/pack-tool".to_string()));
     let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
     assert!(feature(&runtime, "pack-tool").is_empty());
+}
+
+#[test]
+fn exec_is_optional_default_off_and_enables_tool() {
+    for (text, parent) in [
+        (KKERNEL_MANIFEST, "khive-mcp"),
+        (KHIVE_MCP_MANIFEST, "khive-runtime"),
+    ] {
+        let manifest = manifest(text);
+        assert_eq!(feature(&manifest, "default"), vec!["pack-git", "pack-code"]);
+        assert_eq!(
+            manifest["dependencies"]["khive-pack-exec"]["optional"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            feature(&manifest, "pack-exec"),
+            vec![
+                "dep:khive-pack-exec".to_string(),
+                format!("{parent}/pack-exec"),
+                "pack-tool".to_string(),
+            ]
+        );
+    }
+    let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
+    assert!(feature(&runtime, "pack-exec").is_empty());
 }
