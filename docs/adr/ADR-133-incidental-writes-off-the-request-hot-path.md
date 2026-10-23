@@ -1155,15 +1155,19 @@ generation snapshot is not the instrument for this bound in an ordinary build.
 
 ## Amendment 10 (2026-10-20): Success Rows of Six Named Verbs
 
-**Status**: Proposed
+**Status**: Accepted (corrected by Amendment 11).
 
-ADR-103 Amendment 7 proposes omitting the audit rows of most successful dispatches of six named verbs (corrected by Amendment 11). Under that proposal,
-`comm.inbox`, `comm.probe`, `comm.cursor_get` and `whoami` would write none. `comm.heartbeat` and
-`comm.cleanup_expired_quarantine` would write the rows of a hash-selected one in ten, plus the row of
+ADR-103 Amendment 7 stops writing the audit rows of most successful dispatches of six named verbs.
+`comm.inbox`, `comm.probe`, `comm.cursor_get` and `whoami` write none. `comm.heartbeat` and
+`comm.cleanup_expired_quarantine` write the rows of a hash-selected one in ten, plus the row of
 every call whose result reports a state change or a failed poll. Each of those rows carries
 `cost_unit`, so under D3 and D4/INV-1 it is an accounting-bearing record, and for the two
-subhandlers it is a write's dispatch audit. This amendment proposes a named
-exception to INV-1, and INV-4: those success rows would not be produced (corrected by Amendment 11). Its status remains Proposed. The implementation at `7d6ff8fd` already contains omission and sampling in `crates/khive-runtime/src/pack/audit_success_rows.rs:217-241` and skips row construction at `crates/khive-runtime/src/pack/dispatch.rs:1044-1052`; implementation presence does not establish specification acceptance. Amendment 11, Decision 1 gives the complete exception scope.
+subhandlers it is a write's dispatch audit. This amendment records the change as a named
+exception to INV-1 (corrected by Amendment 11), and as an exception to INV-4: for these dispatches a row today's
+implementation commits is no longer produced. At `7d6ff8fd` the omission and sampling are in
+`crates/khive-runtime/src/pack/audit_success_rows.rs:217-241` and row construction is skipped at
+`crates/khive-runtime/src/pack/dispatch.rs:1044-1052` (corrected by Amendment 11). Amendment 11, Decision 1 gives the
+complete exception scope.
 
 **The exception.** It covers a dispatch whose outcome is `Success`, of a verb on ADR-103
 Amendment 7's omitted or sampled constant, served by a pack registered through the trusted path,
@@ -1181,7 +1185,7 @@ amendment's per-verb counters, so the omission is counted, not silent.
   refused admission, a failed append and an elapsed resolution deadline end such a dispatch as they
   end it today, under Amendments 3 to 6, and the row keeps the sequence number and `sampling` object
   it was given at the cut, including when the driver commits it after the caller stopped waiting. (superseded by Amendment 11, Decision 1)
-- Error, denial and unknown-verb rows of the six verbs would retain their existing treatment (corrected by Amendment 11). For the four omitted
+- Error, denial and unknown-verb rows of the six verbs are written as today. For the four omitted
   verbs the omission covers `Success` dispatches only: every non-`Success` dispatch of `comm.inbox`,
   `comm.probe`, `comm.cursor_get` and `whoami` writes its row, unsampled.
 
@@ -1209,8 +1213,8 @@ passing in `all` mode; and the response's `usage` unchanged.
 ## Amendment 11 (2026-10-23) -- Audit release by producer class and terminal reason
 
 **Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR or of earlier amendments. The in-place status correction for Amendment 3
-records its existing acceptance; Amendment 10 remains Proposed.
+does not change the status of the base ADR. The in-place status corrections record the existing acceptance of
+Amendment 3, Amendment 10 and ADR-103 Amendment 7.
 
 **Addresses**: [#3730](https://github.com/ohdearquant/khive/issues/3730).
 
@@ -1256,13 +1260,13 @@ commit, and preserves an actual wait instead of making all submissions return im
 - `PreflightRejected`, `AdmissionClosed`, `IdentityConflict`, `StoreFailure`, `RetryExhausted`,
   `IdempotencyUnsupported`, `DriverPanicked`, `DriverCancelled`, `DriverJoinLost` and
   `DriverExitedInconsistent`: an obligation error permits return without confirmed commit, never a new success.
-- Amendment 10 proposes omitting or sampling success rows of six named verbs. Omitted rows never enter the batch and
-  have no `AuditTerminalReason`. That proposal remains separate from terminal-reason degradation.
+- Amendment 10 omits or samples success rows of six named verbs. Omitted rows never enter the batch and
+  have no `AuditTerminalReason`. That omission remains separate from terminal-reason degradation.
 
 **INV-4 exception list.** The obligation-bearing departures are exactly the same list: `QueueAdmissionExhausted`,
 `AdmissionDeadlineExpired`, `ResolutionDeadlineExpired`, `DriverAppendAbandoned`, `StoreWedged`, `PreflightRejected`,
 `AdmissionClosed`, `IdentityConflict`, `StoreFailure`, `RetryExhausted`, `IdempotencyUnsupported`, `DriverPanicked`,
-`DriverCancelled`, `DriverJoinLost`, `DriverExitedInconsistent`, and Amendment 10's proposed omission or sampling.
+`DriverCancelled`, `DriverJoinLost`, `DriverExitedInconsistent`, and Amendment 10's omission or sampling.
 Pure observability is outside INV-1. For INV-4 it additionally permits a successful return before commit at the
 admission bound, or on an earlier terminal failure, as the same table states. These limits replace the claim that
 batching can never weaken visibility at return or retention in the same situation. Identity uniqueness and exact
@@ -1301,7 +1305,7 @@ normal commit path remains available.
 The wait ends on commit or terminal failure, or at the admission bound under Amendment 1. `kg.get` is an allowlisted
 pair (`crates/khive-runtime/src/pack/registry_access.rs:505`); its produced success row uses bounded submission
 (`crates/khive-runtime/src/pack/audit.rs:584-609`). Queue refusal and deadline expiry remain the two named exceptions;
-they do not remove the normal wait. Amendment 10's proposed omissions remain separately scoped and do not include
+they do not remove the normal wait. Amendment 10's omissions remain separately scoped and do not include
 `kg.get` (`crates/khive-runtime/src/pack/audit_success_rows.rs:55-81`). Failed dispatches are not assigned a successful
 read's cost: their resource payload omits `cost_unit` (`crates/khive-runtime/src/cost_unit.rs:137-142`).
 
@@ -1335,10 +1339,10 @@ with equality and ownership assertions at `crates/khive-runtime/src/pack_tests.r
 
 Amendment 3's status is corrected to Accepted, consistent with the existing acceptance note
 (`docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md:955-957`) and the implemented result-preserving fold
-(`crates/khive-runtime/src/pack/audit.rs:725-729`). Amendment 10 remains Proposed. Its proposed policy is described as
-such even though omission and sampling code is present. Source locations for event-store setup, the audit fold,
+(`crates/khive-runtime/src/pack/audit.rs:725-729`). Amendment 10's status, and that of ADR-103 Amendment 7, is
+corrected to Accepted: both were approved together and merged in #5832, and the omission and sampling are implemented
+(`crates/khive-runtime/src/pack/audit_success_rows.rs:217-241`). Source locations for event-store setup, the audit fold,
 recall dispatch, serve-ledger batching, error projection, the census and ADR-103's audit payload are corrected in place.
-These corrections distinguish source facts and specification status without accepting a proposal by implication.
 
 **Base acceptance 1: unexecuted.** No two-revision census comparison is established by this amendment. The committed
 manifest pins one source revision and a 12-pack inventory with 91 entries
@@ -1365,4 +1369,4 @@ Test names identify existing coverage or explicitly identify coverage to add.
 | A11-9  | A shared identity is accepted only for an identical record, and an ambiguous acknowledgement retry accounts for exactly one row.                                      | `crates/khive-db/src/stores/event.rs:526-533`; `d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row`, `crates/khive-runtime/tests/adr133_audit_batch.rs:1003-1042`.                                                                                                                              |
 | A11-10 | The 70-pair allowlist resolves to the named owners and covers the classified Assertive surface.                                                                       | `admission_degrade_safe_assertive_census_matches_live_pack_sources`, `crates/khive-runtime/src/pack_tests.rs:382-567`; count entries at `crates/khive-runtime/src/pack/registry_access.rs:456-553`.                                                                                                      |
 | A11-11 | Base acceptance 1 compares source-pinned inventories for the same pack population at two revisions.                                                                   | Unexecuted. `scripts/data/writer-census-v1.json:3-133` and `crates/khive-runtime/tests/data/adr133-writer-census.json:3-37` expose the unmatched populations and missing final revision.                                                                                                                 |
-| A11-12 | The amended text retains the 5 s read wait and Proposed status of Amendment 10, and both invariants name the same obligation departures.                              | D1's release table and Amendment 11, Decisions 1, 2 and 4 in this file; `crates/khive-runtime/src/audit_batch.rs:307`.                                                                                                                                                                                   |
+| A11-12 | The amended text retains the 5 s read wait, records Amendment 10 as Accepted, and both invariants name the same obligation departures.                                | D1's release table and Amendment 11, Decisions 1, 2 and 4 in this file; `crates/khive-runtime/src/audit_batch.rs:307`.                                                                                                                                                                                   |
