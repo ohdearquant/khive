@@ -155,6 +155,9 @@ fn write_format(tmp: &TempDir, format: &str, records: &[Value]) -> PathBuf {
 #[test]
 fn every_explicit_import_route_refuses_strict_and_preserves_relaxed_kinds_without_verbose() {
     for format in ["archive", "json", "ndjson", "csv", "tsv"] {
+        if format != "archive" && !cfg!(feature = "kg-adapters") {
+            continue;
+        }
         for log in ["error", "off"] {
             let tmp = TempDir::new().unwrap();
             let strict = config(&tmp, true);
@@ -213,6 +216,7 @@ fn every_explicit_import_route_refuses_strict_and_preserves_relaxed_kinds_withou
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn identical_snapshot_distinguishes_strict_relaxed_and_actual_local_sync() {
     for existing in [false, true] {
@@ -403,6 +407,9 @@ fn closed_relations_reservations_credentials_and_late_bad_records_never_touch_de
         }
         // Positive controls prove the same archive and adapter edges reach real writes.
         for format in ["archive", "json", "ndjson"] {
+            if format != "archive" && !cfg!(feature = "kg-adapters") {
+                continue;
+            }
             let tmp = TempDir::new().unwrap();
             let config = config(&tmp, strict_mode);
             let db = tmp.path().join("db");
@@ -440,6 +447,7 @@ fn closed_relations_reservations_credentials_and_late_bad_records_never_touch_de
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn actual_config_selection_defaults_warnings_and_gate_fail_before_target_setup() {
     for text in ["", "[schema]\n", "[schema]\nstrict=true\n"] {
@@ -508,6 +516,7 @@ fn actual_config_selection_defaults_warnings_and_gate_fail_before_target_setup()
     no_destination(&fresh);
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn declared_destination_read_only_conflicts_and_aliases_refuse_without_writes() {
     for case in 0..3 {
@@ -541,6 +550,7 @@ fn declared_destination_read_only_conflicts_and_aliases_refuse_without_writes() 
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn standalone_delimited_edges_keep_existing_cli_endpoint_refusal() {
     for strict_mode in [true, false] {
@@ -565,6 +575,9 @@ fn standalone_delimited_edges_keep_existing_cli_endpoint_refusal() {
 #[test]
 fn distinct_raw_unknown_kind_warning_counts_survive_quiet_global_filters() {
     for format in ["archive", "json", "ndjson", "csv", "tsv"] {
+        if format != "archive" && !cfg!(feature = "kg-adapters") {
+            continue;
+        }
         let tmp = TempDir::new().unwrap();
         let cfg = config(&tmp, false);
         let input = vec![
@@ -588,6 +601,7 @@ fn distinct_raw_unknown_kind_warning_counts_survive_quiet_global_filters() {
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn gate_write_denials_preserve_seeded_destination_and_fresh_parent() {
     for existing in [false, true] {
@@ -617,6 +631,7 @@ fn gate_write_denials_preserve_seeded_destination_and_fresh_parent() {
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn declared_fresh_main_import_succeeds_with_configured_writer_limits() {
     let tmp = TempDir::new().unwrap();
@@ -629,6 +644,7 @@ fn declared_fresh_main_import_succeeds_with_configured_writer_limits() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn declared_chmod_guard_refuses_existing_main_before_writable_open() {
     use std::os::unix::fs::PermissionsExt;
@@ -653,6 +669,7 @@ fn declared_chmod_guard_refuses_existing_main_before_writable_open() {
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn actual_adapter_routes_keep_known_alias_and_pack_normalization_in_both_modes() {
     for strict_mode in [true, false] {
@@ -689,6 +706,7 @@ fn actual_adapter_routes_keep_known_alias_and_pack_normalization_in_both_modes()
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn actual_json_and_ndjson_adapter_relations_stay_closed_before_destination_setup() {
     for strict_mode in [true, false] {

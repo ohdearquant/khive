@@ -147,6 +147,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           HEAD_REF: ${{ github.head_ref }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -155,7 +156,8 @@ jobs:
           # whether that commit is tested. A range that cannot be compared counts as such a change.
           classifiers_changed() {
             local changed
-            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
               echo "full suite: the path classifiers could not be compared with $1"
               return 0
             fi
@@ -168,7 +170,15 @@ jobs:
           docs_only=false
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
-            if ! classifiers_changed "$base"; then
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+            if ! classifiers_changed "$classifier_base"; then
               docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
             fi
           elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
@@ -226,8 +236,8 @@ jobs:
             docs_only=false
           fi
           echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
-      # The path rules run first, on the changed paths alone (--paths-only prints `full` or `map`). Only a
-      # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
+      # After the classifier guard, the path rules use changed paths alone (--paths-only prints `full` or `map`).
+      # Only a change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
       # successful push run on main published, which ingests this checkout's map and resolves the changed
       # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
       # and every event other than a pull request or an integration push writes `full`. An integration push
@@ -241,6 +251,7 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           TESTED_BASE: ${{ steps.classify.outputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -249,7 +260,8 @@ jobs:
           # whether that commit is tested. A range that cannot be compared counts as such a change.
           classifiers_changed() {
             local changed
-            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
               echo "full suite: the path classifiers could not be compared with $1"
               return 0
             fi
@@ -271,11 +283,22 @@ jobs:
           else
             echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
           fi
-          if [[ -n "$base" ]] && classifiers_changed "$base"; then
+          classifier_base="$base"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+          fi
+          if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then
             base=""
           fi
           if [[ -n "$base" ]]; then
-            mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            mode=$(timeout 60 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
             if [[ "$mode" == "map" ]]; then
               binary=""
               runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
@@ -293,7 +316,7 @@ jobs:
               if [[ -z "$binary" ]]; then
                 echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
               else
-                test_scope=$(timeout 300 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                test_scope=$(timeout 300 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
                   || test_scope=full
               fi
             fi

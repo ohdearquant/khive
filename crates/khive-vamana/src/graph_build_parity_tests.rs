@@ -277,7 +277,7 @@ fn legacy_build_sq8(
 fn fixed_vectors(count: usize, dimensions: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut vectors: Vec<f32> = (0..count * dimensions)
-        .map(|_| rng.gen_range(-1.0..1.0))
+        .map(|_| rng.random_range(-1.0..1.0))
         .collect();
     for vector in vectors.chunks_exact_mut(dimensions) {
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();

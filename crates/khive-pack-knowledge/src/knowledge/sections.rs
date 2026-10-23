@@ -448,8 +448,8 @@ fn split_import_frontmatter<'a>(
     let yaml = if header.trim().is_empty() {
         Value::Object(serde_json::Map::new())
     } else {
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str(header).map_err(|error| frontmatter_error(source_path, error))?;
+        let yaml: yaml_serde::Value =
+            yaml_serde::from_str(header).map_err(|error| frontmatter_error(source_path, error))?;
         serde_json::to_value(yaml).map_err(|error| frontmatter_error(source_path, error))?
     };
     let Value::Object(mut fields) = yaml else {

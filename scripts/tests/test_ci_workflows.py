@@ -2847,6 +2847,39 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
 
 
+class PythonPathIsolationTests(unittest.TestCase):
+    def test_classifier_python_invocations_use_isolated_path_mode(self):
+        ci_job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        ci_scope = textwrap.dedent(ci_job.split("- name: Scope\n", 1)[1])
+        train_job = indented_block(indented_block(workflow_text("bench-track.yml"), "jobs", 0), "changes", 2)
+        train_step = train_job.split("- name: Scope the train\n", 1)[1]
+        train_scope = textwrap.dedent(
+            re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", train_step + "\n").group(1)
+        )
+
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            train_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            train_scope,
+        )
+        self.assertIn(
+            'python3 -P "$scanner" --published-markdown "$path" < /dev/null',
+            (REPO_ROOT / "scripts" / "ci-docs-only.sh").read_text(),
+        )
+        self.assertIn("python3 -P -c '", (REPO_ROOT / "scripts" / "ci.sh").read_text())
+
+
 class DocsOnlyClassifierTests(unittest.TestCase):
     """scripts/ci-docs-only.sh on real temporary repositories, and the classifier job's event routing."""
 
@@ -2870,6 +2903,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("docs/guide/counts.md", "# Counts\n")
         self.write("docs/adr/ADR-001-guide.md", "# ADR\n")
         self.base = self.commit("base")
+        self.remote = pathlib.Path(self.temp.name) / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
 
     def git(self, *args):
         return subprocess.run(
@@ -2942,6 +2979,84 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         )
         self.assertEqual((completed.returncode, completed.stdout), (0, "false\n"), completed.stderr)
         self.assertIn("count scanner failed for docs/adr/ADR-001-guide.md", completed.stderr)
+
+    def test_scanner_cannot_truncate_unread_changed_paths(self):
+        self.write("README.md", "# Readme\n\nChanged.\n")
+        self.write("src/lib.rs", "pub fn f() {} // changed\n")
+        head = self.commit("readme and source")
+        scripts = self.repo / "scripts"
+        scripts.mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, scripts / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts" / "ci-inert-docs-data.txt", scripts / "ci-inert-docs-data.txt")
+        scanner = self.repo / "tests" / "documented_verb_counts.py"
+        scanner.parent.mkdir(exist_ok=True)
+        marker = scanner.with_name("list-truncated")
+        scanner.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "tmpdir = Path(os.environ['TMPDIR'])\n"
+            "for candidate in tmpdir.iterdir():\n"
+            "    try:\n"
+            "        contents = candidate.read_bytes()\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    if b'README.md\\0' in contents and b'src/lib.rs\\0' in contents:\n"
+            "        candidate.write_bytes(b'')\n"
+            "        Path(__file__).with_name('list-truncated').write_text(candidate.name)\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('change list not found')\n"
+            "raise SystemExit(1)\n"
+        )
+        tmpdir = pathlib.Path(self.temp.name) / "tmp"
+        tmpdir.mkdir()
+        bin_dir = pathlib.Path(self.temp.name) / "bin"
+        bin_dir.mkdir()
+        bash = bin_dir / "bash"
+        bash.write_text('#!/bin/sh\nexec /bin/bash "$@"\n')
+        bash.chmod(0o755)
+        mktemp = bin_dir / "mktemp"
+        mktemp.write_text(
+            "#!/bin/bash\n"
+            "counter=0\n"
+            "if [[ -f \"$TMPDIR/counter\" ]]; then read -r counter < \"$TMPDIR/counter\"; fi\n"
+            "counter=$((counter + 1))\n"
+            "printf '%s\\n' \"$counter\" > \"$TMPDIR/counter\"\n"
+            "path=\"$TMPDIR/tmp.$counter\"\n"
+            ": > \"$path\"\n"
+            "printf '%s\\n' \"$path\"\n"
+        )
+        mktemp.chmod(0o755)
+        completed = subprocess.run(
+            ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo,
+            env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmpdir)},
+            text=True, capture_output=True,
+            timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(
+            marker.is_file(),
+            f"the scanner did not truncate the classifier's change list\n{completed.stdout}{completed.stderr}",
+        )
+        self.assertEqual(completed.stdout, "false\n", completed.stderr)
+        self.assertIn("not Markdown: src/lib.rs", completed.stderr)
+
+    def test_job_pull_request_that_edits_the_count_scanner_runs_full_suite(self):
+        head = self.merge_ref("tests/documented_verb_counts.py", "print('changed scanner')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: tests/documented_verb_counts.py\n", log
+        )
+
+    def test_job_pull_request_that_edits_the_inert_docs_data_runs_full_suite(self):
+        data = (REPO_ROOT / "scripts" / "ci-inert-docs-data.txt").read_text()
+        head = self.merge_ref("scripts/ci-inert-docs-data.txt", data + "# Changed.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-inert-docs-data.txt\n", log
+        )
 
     def test_code_that_starts_like_a_comment_still_names_markdown(self):
         cases = [
@@ -3117,7 +3232,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
 
     def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
-                     head_repository=None, classifier=None):
+                     head_repository=None, classifier=None, default_branch="main"):
         """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
         unset unless given, as on a push. classifier, when given, is the text of the checked-out
         scripts/ci-docs-only.sh in place of this repository's own."""
@@ -3150,7 +3265,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
             env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x", **pull},
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": default_branch, **pull},
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
@@ -3170,6 +3285,23 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.git("merge", "-q", "--no-ff", "-m", "merge", topic)
         return self.git("rev-parse", "HEAD")
 
+    def stacked_merge_ref(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
     def test_job_pull_request_compares_the_merge_ref_with_its_base_parent(self):
         head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=true")
@@ -3177,6 +3309,22 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    def test_stacked_pull_request_compares_classifiers_with_the_default_branch(self):
+        head = self.stacked_merge_ref()
+        verdict, log = self.classify_job(
+            "pull_request", head, classifier=self.LENIENT_CLASSIFIER
+        )
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log
+        )
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_suite(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head, default_branch="missing")
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
 
     # A classifier that answers "documentation only" for every change, as a change could carry.
     LENIENT_CLASSIFIER = "#!/bin/bash\necho true\n"
@@ -4207,6 +4355,10 @@ esac
 
     def setUp(self):
         super().setUp()
+        self.remote = self.root / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         tools = {"gh": self.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
@@ -4230,7 +4382,8 @@ esac
             timeout=60, check=False,
             env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": "main",
+                 "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
                  "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake), **(extra_env or {})},
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
@@ -4250,10 +4403,41 @@ esac
         self.assertEqual([call.split()[2] for call in downloads], ["201", "202"])
         self.assertTrue(self.calls(self.runner_temp / "kkernel-main-202"))
 
-    def test_the_path_rules_run_before_any_fetch(self):
+    def stacked_pull_request(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", "#!/bin/bash\necho true\n")
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("crates/k/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("docs/default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
+    def test_stacked_pull_request_classifier_change_forces_full_scope(self):
+        head = self.stacked_pull_request()
+        scope, log = self.run_step("pull_request", head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-docs-only.sh", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_manifest_skips_the_binary_lookup(self):
         scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
         self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_scope(self):
+        head = self.change("crates/k/src/lib.rs")
+        scope, log = self.run_step("pull_request", head, extra_env={"DEFAULT_BRANCH": "missing"})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_other_events_are_never_scoped(self):
@@ -4405,6 +4589,16 @@ class BenchTrainScopeTests(ScopeFixture):
         self.assertIn(f"train range: {self.base}..", log)
         self.assertIn("kkernel from main push run 202", log)
 
+    def test_a_train_that_edits_the_scope_classifier_runs_full_scope(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.write("scripts/ci-test-scope.py", ScopeStepTests.LENIENT_SCOPE)
+        head = self.commit("edit the scope classifier")
+        scope, log = self.scope(head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py", log)
+        self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
     def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
         scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
@@ -4431,14 +4625,43 @@ class BenchTrainScopeTests(ScopeFixture):
         self.assertEqual(self.components("khive-types khive-storage"), set())
 
     def test_the_binary_lookup_is_the_ci_scope_steps_own(self):
-        def shared(script):
-            lines = script.splitlines()
-            start = next(i for i, line in enumerate(lines) if line.lstrip().startswith("mode=$("))
-            end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-            return "\n".join(lines[start:end])
-
         ci = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
         ci_run = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", ci + "\n").group(1))
+
+        def classifier_guard(script):
+            lines = script.splitlines()
+            function_start = next(
+                (i for i, line in enumerate(lines) if line.strip() == "classifiers_changed() {"), None
+            )
+            self.assertIsNotNone(function_start, "classifier guard function is missing")
+            function_end = next(i for i in range(function_start + 1, len(lines)) if lines[i].strip() == "}")
+            call_start = next(
+                (i for i, line in enumerate(lines)
+                 if line.strip() == 'if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then'),
+                None,
+            )
+            self.assertIsNotNone(call_start, "classifier guard call is missing")
+            indent = len(lines[call_start]) - len(lines[call_start].lstrip())
+            call_end = next(
+                i for i in range(call_start + 1, len(lines)) if lines[i] == " " * indent + "fi"
+            )
+            return (
+                textwrap.dedent("\n".join(lines[function_start:function_end + 1])),
+                textwrap.dedent("\n".join(lines[call_start:call_end + 1])),
+            )
+
+        self.assertEqual(classifier_guard(self.step("Scope the train")), classifier_guard(ci_run))
+
+        def shared(script):
+            lines = script.splitlines()
+            start = next(
+                i for i, line in enumerate(lines)
+                if line.strip() == 'if [[ "$mode" == "map" ]]; then'
+            )
+            indent = len(lines[start]) - len(lines[start].lstrip())
+            end = next(i for i in range(start + 1, len(lines)) if lines[i] == " " * indent + "fi")
+            return textwrap.dedent("\n".join(lines[start:end + 1]))
+
         self.assertEqual(shared(self.step("Scope the train")), shared(ci_run))
 
     def test_every_benchmarked_crate_is_in_exactly_one_component(self):
@@ -4618,7 +4841,7 @@ class InertDocumentationDataTests(unittest.TestCase):
         self.write("re.py", 'with open("inert-reader-shadow-imported", "w") as marker:\n'
                             '    marker.write("checkout module executed\\n")\n')
         source = self.classifier.read_text()
-        scanner_call = '    python3 "$scanner" --published-markdown "$path" < /dev/null'
+        scanner_call = '    python3 -P "$scanner" --published-markdown "$path" < /dev/null'
         self.assertEqual(source.count(scanner_call), 1)
         # The existing scanner is a separate import site; only the new stdin reader is under test here.
         self.classifier.write_text(source.replace(scanner_call, "    false"))

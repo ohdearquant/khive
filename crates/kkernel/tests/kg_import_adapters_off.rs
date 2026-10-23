@@ -82,6 +82,41 @@ fn adapter_formats_are_refused_before_the_destination_exists() {
 }
 
 #[test]
+fn missing_adapter_sources_are_refused_before_file_read() {
+    let cases: [(&str, Option<&str>, &str); 2] = [
+        ("missing.txt", Some("csv"), "csv"),
+        ("missing.bib", None, "bibtex"),
+    ];
+    for (file, format, name) in cases {
+        let fixture = Fixture::new();
+        let source = fixture.directory.path().join(file);
+        assert!(
+            !source.exists(),
+            "missing source fixture unexpectedly exists"
+        );
+        let output = fixture.import(&source, format);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{file} {format:?} was accepted");
+        assert!(
+            stderr.contains("kg-adapters") && stderr.contains(&format!("of {name} input")),
+            "{file} {format:?} refusal does not name the feature and format: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("read {}", source.display())),
+            "{file} {format:?} returned a source-read error: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{file} {format:?} emitted output for a refused import"
+        );
+        assert!(
+            !fixture.db.exists() && !fixture.db.parent().unwrap().exists(),
+            "{file} {format:?} created the destination"
+        );
+    }
+}
+
+#[test]
 fn a_native_archive_still_imports() {
     let fixture = Fixture::new();
     let archive = json!({

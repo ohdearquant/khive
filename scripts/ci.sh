@@ -25,7 +25,7 @@ in_scope() {
 # Fails, rather than printing nothing, when the member list cannot be read, so a broken read never
 # turns into an unfiltered workspace command.
 scope_package_args() {
-    members=$(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
+    members=$(cargo metadata --no-deps --format-version 1 --locked | python3 -P -c '
 import json, sys
 meta = json.load(sys.stdin)
 ids = set(meta["workspace_members"])
