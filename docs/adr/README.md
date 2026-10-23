@@ -366,9 +366,7 @@ need returns as a new proposal against the current code.
 - [ADR-112](ADR-112-git-outbound-publish-verbs.md): withdrawn; the git pack's remote push, pull request, review and merge verbs cover the outbound path.
 - [ADR-120](ADR-120-khive-flow-control-flow-envelope.md): withdrawn.
 - [ADR-123](ADR-123-comm-forward.md): withdrawn.
-- [ADR-134](ADR-134-store-durability-posture.md): withdrawn.
 - [ADR-138](ADR-138-blob-enumeration.md): withdrawn.
-- [ADR-150](ADR-150-single-write-owner-topology.md): withdrawn.
 - [ADR-158](ADR-158-cargo-source-role-projections.md): withdrawn.
 - [ADR-161](ADR-161-agent-process-lineage.md): withdrawn.
 - [ADR-163](ADR-163-restart-boundary-event-legibility.md): withdrawn.

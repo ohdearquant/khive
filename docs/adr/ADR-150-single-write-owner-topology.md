@@ -1,6 +1,6 @@
 # ADR-150: Single Write-Owner Topology — Bounded Admission, Read Admission, and Query Interruption
 
-**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
+**Status**: proposed\
 **Date**: 2026-08-09\
 **Authors**: khive maintainers
 

@@ -1,6 +1,6 @@
 # ADR-134: Store durability posture, and the obligation it carries for accounting records
 
-- **Status:** withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
+- **Status:** Proposed
 - **Date:** 2026-07-29
 - **Relates to:** ADR-103 (resource attribution — routes accounting through the per-dispatch audit
   row), ADR-133 (write-path handling of that row), ADR-091 (WAL/checkpoint behaviour)
