@@ -830,13 +830,16 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 
 If you are adding a new pack or a new verb to an existing pack:
 
-1. **Express CRUD-shaped operations through kg dispatch-by-kind.** A new pack that only
-   creates, reads, updates, deletes, or searches records of some kind should route through
-   the kg pack's `create`/`search`/`list`/`get`/`update`/`delete` verbs (dispatched by
-   `kind`) rather than introducing bespoke pack-prefixed verbs for the same operation. A
-   bespoke verb is justified only when the operation carries genuine non-CRUD domain logic —
-   a state machine, an atomic multi-step guard, or side effects beyond storing a record —
-   that dispatch-by-kind cannot express.
+1. **Express CRUD-shaped operations through kg dispatch-by-kind.** The one-verb-per-capability
+   rule governs internal implementation paths, not the wire-facing verb surface. A CRUD-shaped
+   operation of a new pack (create, read, update, delete, or search over an entity or note kind)
+   uses the shared dispatch-by-kind path with its KindHook, not a parallel handler. A pack may
+   still expose a named verb for that operation because named verbs are the discoverability
+   surface described in [ADR-095 Amendment 1](docs/adr/ADR-095-verb-surface-consolidation.md).
+   No existing verb is retired, renamed, or aliased.
+   A separate implementation path is justified only when the operation carries genuine non-CRUD domain
+   logic (a state machine, an atomic multi-step guard, or side effects beyond storing a record) that the shared
+   path cannot express.
 2. **Put per-kind create-time field validation in `KindHook::prepare_create`.** Enum checks,
    format checks, and cross-field guards for a kind belong in that kind's `KindHook`
    implementation ([ADR-017](docs/adr/ADR-017-pack-standard.md)), not in a parallel handler
