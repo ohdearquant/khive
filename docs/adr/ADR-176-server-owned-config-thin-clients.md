@@ -132,8 +132,7 @@ copies fail loudly instead of lingering.
 
 ## Amendment 1 (2026-10-23) -- Align daemon mode with shipped behavior
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR or of earlier amendments.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 **Addresses**: [#5591](https://github.com/ohdearquant/khive/issues/5591).
 

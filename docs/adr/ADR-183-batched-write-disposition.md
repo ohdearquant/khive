@@ -268,8 +268,7 @@ revised and arms 14 to 16 added by Amendment 1, Acceptance.)_
 
 ## Amendment 1 (2026-10-23) -- Atomic by default, complete refusal lists, explicit partial writes
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent
-implementation lands. It does not change the status of the base ADR.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR.
 
 **Addresses**: [#1751](https://github.com/ohdearquant/khive/issues/1751).
 

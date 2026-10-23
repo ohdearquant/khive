@@ -582,7 +582,7 @@ crates/khive-pack-kg/src/schema.rs:74-99).
 
 ## Amendment 2 (2026-10-23) -- Rule 4 scope for identifier-typed parameters
 
-**Status**: Proposed. It does not change the status of the base ADR or of Amendment 1.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of Amendment 1.
 
 **Addresses**: [#5557](https://github.com/ohdearquant/khive/issues/5557),
 [#5996](https://github.com/ohdearquant/khive/issues/5996).
