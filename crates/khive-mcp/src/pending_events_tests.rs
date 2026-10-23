@@ -3813,6 +3813,55 @@ async fn normal_finalize_refuses_when_a_concurrent_writer_changed_properties_sin
     );
 }
 
+struct AbortPausedDrainOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortPausedDrainOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn bounded_production_drain_race<F: std::future::Future<Output = ()>>(test: F) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), test)
+        .await
+        .expect("production drain race did not complete within the existing progress bound");
+}
+
+async fn await_drain_barrier(
+    barrier: &tokio::sync::Barrier,
+    drain: &mut tokio::task::JoinHandle<Result<DrainSummary>>,
+    phase: &str,
+) {
+    let arrived = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            _ = barrier.wait() => None,
+            outcome = &mut *drain => Some(outcome),
+        }
+    })
+    .await;
+    match arrived {
+        Ok(None) => {}
+        Ok(Some(outcome)) => panic!("drain completed before {phase}: {outcome:?}"),
+        Err(_) => {
+            drain.abort();
+            panic!("drain did not reach {phase} within the existing handshake bound");
+        }
+    }
+}
+
+async fn join_paused_drain(
+    mut drain: tokio::task::JoinHandle<Result<DrainSummary>>,
+) -> DrainSummary {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await {
+        Ok(outcome) => outcome.expect("drain task").expect("drain must not error"),
+        Err(_) => {
+            drain.abort();
+            panic!("drain task did not finish within the existing completion bound");
+        }
+    }
+}
+
 /// Regression test driven through the PRODUCTION
 /// drain entry point (`run_pending_events_on`) rather than calling
 /// `final_properties_after_dispatch` directly — this closes a gap a
@@ -3828,71 +3877,72 @@ async fn normal_finalize_refuses_when_a_concurrent_writer_changed_properties_sin
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn production_drain_preserves_a_property_written_between_claim_and_current_read() {
-    let (_tmp, db_path) = tmp_db();
-    let rt = make_rt(&db_path).await;
-    let id = create_scheduled_event(
-        &rt,
-        "local",
-        &due_rfc3339(),
-        Some("stats()"),
-        None,
-        "schedule",
-    )
+    bounded_production_drain_race(async {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let mut drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+        let _abort_drain_on_unwind = AbortPausedDrainOnDrop(drain_task.abort_handle());
+
+        // Block until the drain task has genuinely parked at the seam — which
+        // sits AFTER the candidate-page query and the claim, immediately
+        // before the fresh pre-finalize read — THEN write, THEN release it.
+        // That placement is what makes the write land strictly between the
+        // page-query snapshot and the fresh read: parked any earlier, the
+        // write would already be inside the page snapshot and the test would
+        // pass whether finalization used the stale page or the fresh read.
+        await_drain_barrier(&gate.reached, &mut drain_task, "configured pause point").await;
+
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, \
+                          '$.custom', 'added-concurrently') WHERE id = ?1"
+                    .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_concurrent_property_add".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        await_drain_barrier(&gate.release, &mut drain_task, "release handshake").await;
+        let summary = join_paused_drain(drain_task).await;
+        assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["custom"].as_str(),
+            Some("added-concurrently"),
+            "a property written between claim and the finalizer's current-properties read \
+                 must survive finalization, got {stored:?}"
+        );
+        assert_eq!(stored["status"].as_str(), Some("fired"));
+    })
     .await;
-
-    let gate = race_seam::PauseGate {
-        at: race_seam::PausePoint::BeforeFinalizeRead,
-        reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-        release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-    };
-
-    let drain_task = {
-        let rt = rt.clone();
-        let gate = gate.clone();
-        tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
-            let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-            run_pending_events_on(&rt, &server, false).await
-        }))
-    };
-
-    // Block until the drain task has genuinely parked at the seam — which
-    // sits AFTER the candidate-page query and the claim, immediately
-    // before the fresh pre-finalize read — THEN write, THEN release it.
-    // That placement is what makes the write land strictly between the
-    // page-query snapshot and the fresh read: parked any earlier, the
-    // write would already be inside the page snapshot and the test would
-    // pass whether finalization used the stale page or the fresh read.
-    gate.reached.wait().await;
-
-    let mut writer = rt.sql().writer().await.expect("writer");
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes SET properties = json_set(properties, \
-                      '$.custom', 'added-concurrently') WHERE id = ?1"
-                .to_string(),
-            params: vec![SqlValue::Text(id.to_string())],
-            label: Some("test_concurrent_property_add".into()),
-        })
-        .await
-        .expect("concurrent write");
-    assert_eq!(rows, 1);
-    drop(writer);
-
-    gate.release.wait().await;
-    let summary = drain_task
-        .await
-        .expect("drain task")
-        .expect("drain must not error");
-    assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
-
-    let stored = get_note_props(&rt, id).await;
-    assert_eq!(
-        stored["custom"].as_str(),
-        Some("added-concurrently"),
-        "a property written between claim and the finalizer's current-properties read \
-             must survive finalization, got {stored:?}"
-    );
-    assert_eq!(stored["status"].as_str(), Some("fired"));
 }
 
 /// Guarding the finalizer's write on the freshly-read properties protects
@@ -3912,68 +3962,70 @@ async fn production_drain_preserves_a_property_written_between_claim_and_current
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn production_drain_schedules_from_the_fresh_read_not_the_page_snapshot() {
-    let (_tmp, db_path) = tmp_db();
-    let rt = make_rt(&db_path).await;
-    let id = create_scheduled_event(
-        &rt,
-        "local",
-        &due_rfc3339(),
-        Some("stats()"),
-        Some("daily"),
-        "schedule",
-    )
+    bounded_production_drain_race(async {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let mut drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+        let _abort_drain_on_unwind = AbortPausedDrainOnDrop(drain_task.abort_handle());
+
+        await_drain_barrier(&gate.reached, &mut drain_task, "configured pause point").await;
+
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql:
+                    "UPDATE notes SET properties = json_set(properties, '$.repeat', json('null')) \
+                          WHERE id = ?1"
+                        .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_concurrent_repeat_clear".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        await_drain_barrier(&gate.release, &mut drain_task, "release handshake").await;
+        let summary = join_paused_drain(drain_task).await;
+        assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
+
+        let stored = get_note_props(&rt, id).await;
+        assert!(
+            stored.get("repeat").is_none() || stored["repeat"].is_null(),
+            "the concurrent clear of `repeat` must survive finalization, got {stored:?}"
+        );
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("fired"),
+            "finalization must schedule from the repeat it read fresh (cleared, so terminal), \
+                 not from the pre-claim page snapshot (\"daily\", which would reschedule to \
+                 pending): got {stored:?}"
+        );
+    })
     .await;
-
-    let gate = race_seam::PauseGate {
-        at: race_seam::PausePoint::BeforeFinalizeRead,
-        reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-        release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-    };
-
-    let drain_task = {
-        let rt = rt.clone();
-        let gate = gate.clone();
-        tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
-            let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-            run_pending_events_on(&rt, &server, false).await
-        }))
-    };
-
-    gate.reached.wait().await;
-
-    let mut writer = rt.sql().writer().await.expect("writer");
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes SET properties = json_set(properties, '$.repeat', json('null')) \
-                      WHERE id = ?1"
-                .to_string(),
-            params: vec![SqlValue::Text(id.to_string())],
-            label: Some("test_concurrent_repeat_clear".into()),
-        })
-        .await
-        .expect("concurrent write");
-    assert_eq!(rows, 1);
-    drop(writer);
-
-    gate.release.wait().await;
-    let summary = drain_task
-        .await
-        .expect("drain task")
-        .expect("drain must not error");
-    assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
-
-    let stored = get_note_props(&rt, id).await;
-    assert!(
-        stored.get("repeat").is_none() || stored["repeat"].is_null(),
-        "the concurrent clear of `repeat` must survive finalization, got {stored:?}"
-    );
-    assert_eq!(
-        stored["status"].as_str(),
-        Some("fired"),
-        "finalization must schedule from the repeat it read fresh (cleared, so terminal), \
-             not from the pre-claim page snapshot (\"daily\", which would reschedule to \
-             pending): got {stored:?}"
-    );
 }
 
 /// The claim's `trigger_at` fence, isolated. The receipt's `occurrence_id`
@@ -4075,89 +4127,90 @@ async fn claim_refuses_when_a_concurrent_writer_rescheduled_since_the_page_read(
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn production_drain_refuses_to_claim_an_event_rescheduled_in_the_claim_window() {
-    let (_tmp, db_path) = tmp_db();
-    let rt = make_rt(&db_path).await;
-    let id = create_scheduled_event(
-        &rt,
-        "local",
-        &due_rfc3339(),
-        Some("stats()"),
-        None,
-        "schedule",
-    )
+    bounded_production_drain_race(async {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeClaim,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let mut drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+        let _abort_drain_on_unwind = AbortPausedDrainOnDrop(drain_task.abort_handle());
+
+        await_drain_barrier(&gate.reached, &mut drain_task, "configured pause point").await;
+
+        // Still due, so the row stays a drain candidate and the refusal cannot
+        // be confused with the event simply not being ready.
+        let rescheduled_trigger = "2001-01-01T00:00:00Z";
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
+                          WHERE id = ?1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(rescheduled_trigger.to_string()),
+                ],
+                label: Some("test_concurrent_reschedule".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        await_drain_barrier(&gate.release, &mut drain_task, "release handshake").await;
+        let summary = join_paused_drain(drain_task).await;
+        assert_eq!(
+            summary.fired, 0,
+            "an event rescheduled inside the claim window must not fire on this pass: {summary:?}"
+        );
+        assert_eq!(
+            summary.skipped_race, 1,
+            "the pass must record the refusal as a lost race, not as a failure or a silent \
+                 no-candidate pass: {summary:?}"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "a refused claim is not an error: {summary:?}"
+        );
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("pending"),
+            "the refused row must stay pending for the next drain: {stored:?}"
+        );
+        assert_eq!(
+            stored["trigger_at"].as_str(),
+            Some(rescheduled_trigger),
+            "the writer's reschedule must survive: {stored:?}"
+        );
+        assert!(
+            stored.get("dispatch_receipt").is_none() || stored["dispatch_receipt"].is_null(),
+            "no receipt may be persisted for a claim that never succeeded: {stored:?}"
+        );
+    })
     .await;
-
-    let gate = race_seam::PauseGate {
-        at: race_seam::PausePoint::BeforeClaim,
-        reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-        release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-    };
-
-    let drain_task = {
-        let rt = rt.clone();
-        let gate = gate.clone();
-        tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
-            let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-            run_pending_events_on(&rt, &server, false).await
-        }))
-    };
-
-    gate.reached.wait().await;
-
-    // Still due, so the row stays a drain candidate and the refusal cannot
-    // be confused with the event simply not being ready.
-    let rescheduled_trigger = "2001-01-01T00:00:00Z";
-    let mut writer = rt.sql().writer().await.expect("writer");
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
-                      WHERE id = ?1"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(rescheduled_trigger.to_string()),
-            ],
-            label: Some("test_concurrent_reschedule".into()),
-        })
-        .await
-        .expect("concurrent write");
-    assert_eq!(rows, 1);
-    drop(writer);
-
-    gate.release.wait().await;
-    let summary = drain_task
-        .await
-        .expect("drain task")
-        .expect("drain must not error");
-    assert_eq!(
-        summary.fired, 0,
-        "an event rescheduled inside the claim window must not fire on this pass: {summary:?}"
-    );
-    assert_eq!(
-        summary.skipped_race, 1,
-        "the pass must record the refusal as a lost race, not as a failure or a silent \
-             no-candidate pass: {summary:?}"
-    );
-    assert_eq!(
-        summary.failed, 0,
-        "a refused claim is not an error: {summary:?}"
-    );
-
-    let stored = get_note_props(&rt, id).await;
-    assert_eq!(
-        stored["status"].as_str(),
-        Some("pending"),
-        "the refused row must stay pending for the next drain: {stored:?}"
-    );
-    assert_eq!(
-        stored["trigger_at"].as_str(),
-        Some(rescheduled_trigger),
-        "the writer's reschedule must survive: {stored:?}"
-    );
-    assert!(
-        stored.get("dispatch_receipt").is_none() || stored["dispatch_receipt"].is_null(),
-        "no receipt may be persisted for a claim that never succeeded: {stored:?}"
-    );
 }
 
 /// The post-claim half of the same invariant, and the one that cannot be
@@ -4181,87 +4234,88 @@ async fn production_drain_refuses_to_claim_an_event_rescheduled_in_the_claim_win
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn production_drain_refuses_to_finalize_an_event_rescheduled_after_the_claim() {
-    let (_tmp, db_path) = tmp_db();
-    let rt = make_rt(&db_path).await;
-    let id = create_scheduled_event(
-        &rt,
-        "local",
-        &due_rfc3339(),
-        Some("stats()"),
-        None,
-        "schedule",
-    )
+    bounded_production_drain_race(async {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let mut drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+        let _abort_drain_on_unwind = AbortPausedDrainOnDrop(drain_task.abort_handle());
+
+        // Parked AFTER claim and dispatch, so the claim's trigger_at fence has
+        // already passed and this write cannot be caught by it. Still a valid
+        // parseable instant, so the refusal cannot be confused with the
+        // unparseable-trigger branch.
+        await_drain_barrier(&gate.reached, &mut drain_task, "configured pause point").await;
+        let rescheduled_trigger = "2002-01-01T00:00:00Z";
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
+                          WHERE id = ?1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(rescheduled_trigger.to_string()),
+                ],
+                label: Some("test_reschedule_after_claim".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        await_drain_barrier(&gate.release, &mut drain_task, "release handshake").await;
+        let summary = join_paused_drain(drain_task).await;
+        assert_eq!(
+            summary.fired, 0,
+            "no terminal row may be written for an occurrence the row no longer names: {summary:?}"
+        );
+        assert_eq!(
+            summary.failed, 1,
+            "the refusal must be recorded as a failed finalization, which is what leaves the row \
+                 for recovery: {summary:?}"
+        );
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("firing"),
+            "the row must stay firing so the recovery scan, which fences on status='firing', can \
+                 still reach it; a terminal row would be past that scan forever: {stored:?}"
+        );
+        assert_eq!(
+            stored["trigger_at"].as_str(),
+            Some(rescheduled_trigger),
+            "the writer's reschedule must survive: {stored:?}"
+        );
+        assert!(
+            stored.get("dispatch_receipt").is_some(),
+            "the claim receipt stays on the row for the validator to adjudicate: {stored:?}"
+        );
+    })
     .await;
-
-    let gate = race_seam::PauseGate {
-        at: race_seam::PausePoint::BeforeFinalizeRead,
-        reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-        release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-    };
-
-    let drain_task = {
-        let rt = rt.clone();
-        let gate = gate.clone();
-        tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
-            let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-            run_pending_events_on(&rt, &server, false).await
-        }))
-    };
-
-    // Parked AFTER claim and dispatch, so the claim's trigger_at fence has
-    // already passed and this write cannot be caught by it. Still a valid
-    // parseable instant, so the refusal cannot be confused with the
-    // unparseable-trigger branch.
-    gate.reached.wait().await;
-    let rescheduled_trigger = "2002-01-01T00:00:00Z";
-    let mut writer = rt.sql().writer().await.expect("writer");
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
-                      WHERE id = ?1"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(rescheduled_trigger.to_string()),
-            ],
-            label: Some("test_reschedule_after_claim".into()),
-        })
-        .await
-        .expect("concurrent write");
-    assert_eq!(rows, 1);
-    drop(writer);
-
-    gate.release.wait().await;
-    let summary = drain_task
-        .await
-        .expect("drain task")
-        .expect("drain must not error");
-    assert_eq!(
-        summary.fired, 0,
-        "no terminal row may be written for an occurrence the row no longer names: {summary:?}"
-    );
-    assert_eq!(
-        summary.failed, 1,
-        "the refusal must be recorded as a failed finalization, which is what leaves the row \
-             for recovery: {summary:?}"
-    );
-
-    let stored = get_note_props(&rt, id).await;
-    assert_eq!(
-        stored["status"].as_str(),
-        Some("firing"),
-        "the row must stay firing so the recovery scan, which fences on status='firing', can \
-             still reach it; a terminal row would be past that scan forever: {stored:?}"
-    );
-    assert_eq!(
-        stored["trigger_at"].as_str(),
-        Some(rescheduled_trigger),
-        "the writer's reschedule must survive: {stored:?}"
-    );
-    assert!(
-        stored.get("dispatch_receipt").is_some(),
-        "the claim receipt stays on the row for the validator to adjudicate: {stored:?}"
-    );
 }
 
 /// `schedule.cancel` on a row that is currently `status="firing"` — even

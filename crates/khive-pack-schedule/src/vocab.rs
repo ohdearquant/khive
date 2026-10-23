@@ -166,8 +166,10 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 6] = [
         }],
     },
     HandlerDef {
-        name: "schedule.occurrences", description: "Read durable version-3 occurrence history in the original namespace, including after display-note cancellation, movement or deletion. No historical v1/v2 inventory is inferred.",
-        visibility: Visibility::Verb, category: khive_types::VerbCategory::Assertive,
+        name: "schedule.occurrences",
+        description: "Read durable version-3 occurrence history in the original namespace, including after display-note cancellation, movement or deletion. No historical v1/v2 inventory is inferred.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
         params: &[
             ParamDef { name:"id",param_type:"string",required:true,description:"Complete schedule UUID.",resolution_mode:IdResolutionMode::NotApplicable },
             ParamDef { name:"revision",param_type:"integer",required:false,description:"Positive immutable definition revision; omit for all retained revisions.",resolution_mode:IdResolutionMode::NotApplicable },
@@ -178,8 +180,10 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 6] = [
     },
 
     HandlerDef {
-        name:"schedule.receipts",description:"Page immutable terminal and reconciliation evidence for one version-3 occurrence in its original namespace.",
-        visibility:Visibility::Verb,category:khive_types::VerbCategory::Assertive,
+        name: "schedule.receipts",
+        description:"Page immutable terminal and reconciliation evidence for one version-3 occurrence in its original namespace.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
         params:&[
             ParamDef{name:"id",param_type:"string",required:true,description:"Complete occurrence UUID.",resolution_mode:IdResolutionMode::NotApplicable},
             ParamDef{name:"after",param_type:"integer",required:false,description:"Exclusive recorded_at_us cursor returned in next.after; supply with after_id.",resolution_mode:IdResolutionMode::NotApplicable},

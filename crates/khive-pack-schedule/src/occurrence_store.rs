@@ -14,7 +14,12 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::misfire::MisfirePolicy;
-use crate::occurrence::*;
+use crate::occurrence::{
+    next_nominal, Admission, AuxiliaryWork, ClaimHandle, DefinitionActor, DefinitionV3,
+    LaunchIntent, ObservedResult, OccurrenceInstant, OccurrenceKey, OccurrenceObservation,
+    OccurrencePage, ScheduledPayload, SeriesSnapshot, TerminalOutcome, TerminalReceipt, WorkPage,
+    WorkPurpose, PASS_MATERIALIZATION_LIMIT,
+};
 
 const DEFINITION_INSERT: &str = include_str!("../sql/occurrence-definition-insert.sql");
 const DEFINITION_GET: &str = include_str!("../sql/occurrence-definition-get.sql");
@@ -360,12 +365,17 @@ impl OccurrenceStore {
             return value.map_err(Into::into);
         }
 
-        let mut reader = self.sql.reader().await?;
-        let row = reader
-            .query_row(SqlStatement::new(CLOCK, vec![]))
-            .await?
-            .ok_or_else(|| RuntimeError::Internal("schedule clock returned no row".into()))?;
-        Ok(row.i64("now_us").map_err(internal)?)
+        // The SQL clock is registered on the dedicated writer connection.
+        // Queue-backed writer handles route standalone SELECTs through readers,
+        // so observe it inside the existing owned transaction instead.
+        let store_id = self.store_id;
+        self.commit_prepared(Box::new(move |writer| {
+            Box::pin(async move {
+                let now = writer_now(writer, store_id).await?;
+                Ok(boxed(now))
+            })
+        }))
+        .await
     }
 
     pub(crate) fn prepare_definition(
