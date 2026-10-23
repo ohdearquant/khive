@@ -644,8 +644,7 @@ Acceptance evidence includes exact source head, commands and features, pre-fix f
 
 ## Amendment 6 (2026-10-23) -- Quarantine records are readable only by the maintainer
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the Accepted status of the base ADR or the Proposed status of Amendments 1 to 5.
+**Status**: Accepted 2026-10-23. It does not change the Accepted status of the base ADR or the Proposed status of Amendments 1 to 5.
 
 **Addresses**: [#5424](https://github.com/ohdearquant/khive/issues/5424).
 

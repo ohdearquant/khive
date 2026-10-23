@@ -1,6 +1,6 @@
 # ADR-093: zstd Compression for Session-Mirror Raw Storage
 
-**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
+**Status**: Proposed
 **Date**: 2026-07-04
 **Depends on**: ADR-028 (pack-scoped backends), ADR-080 (session pack OSS storage mechanism)
 

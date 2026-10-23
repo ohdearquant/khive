@@ -496,8 +496,7 @@ presentation policy or format is introduced.
 
 ## Amendment 1 (2026-10-23) -- Shipped surface and conformance scope
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before
-dependent conformance work lands. It does not change the status of the base ADR or of
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of
 earlier amendments.
 
 **Addresses**: [#5557](https://github.com/ohdearquant/khive/issues/5557).

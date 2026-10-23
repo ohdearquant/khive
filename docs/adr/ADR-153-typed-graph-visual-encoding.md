@@ -1,6 +1,6 @@
 # ADR-153: Typed Graph Visual Encoding
 
-**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
+**Status**: Proposed\
 **Date**: 2026-08-10\
 **Authors**: khive maintainers\
 **Related**: [ADR-001](ADR-001-entity-kind-taxonomy.md),
