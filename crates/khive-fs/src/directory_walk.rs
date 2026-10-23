@@ -102,9 +102,48 @@ fn open_anchor(absolute: bool) -> io::Result<File> {
 /// that ceiling is refused as InvalidData, never returned as potentially truncated success.
 /// Repeated reads do not prove the link stayed unchanged; callers own identity rechecks.
 pub fn read_link_at(parent: &File, name: &OsStr) -> io::Result<PathBuf> {
+    match read_link_buffer(parent, name, 128, libc::PATH_MAX as usize)? {
+        BoundedLinkRead::Complete(bytes) => Ok(PathBuf::from(OsString::from_vec(bytes))),
+        BoundedLinkRead::TooLarge { .. } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symlink target fills PATH_MAX buffer",
+        )),
+    }
+}
+
+/// A complete symlink target, or evidence that it does not fit the requested bound.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoundedLinkRead {
+    /// The target's original bytes, without decoding or following the link.
+    Complete(Vec<u8>),
+    /// A full buffer is never reported as complete: the target may have been truncated.
+    TooLarge { observed_at_least: u64 },
+}
+
+/// Read a symlink target relative to a held directory with a caller-supplied byte cap.
+///
+/// Buffers grow from at most 256 bytes up to `max_bytes + 1`, saturating at the
+/// platform's addressable size. Filling that ceiling returns [`BoundedLinkRead::TooLarge`],
+/// even when the full length is unknown. A zero cap can therefore still observe one byte.
+/// Names follow [`c_name`]; native errors pass through unchanged. As with [`read_link_at`],
+/// callers own identity rechecks across repeated reads. Allocation failure is an I/O error.
+pub fn read_link_at_bounded(
+    parent: &File,
+    name: &OsStr,
+    max_bytes: u64,
+) -> io::Result<BoundedLinkRead> {
+    let ceiling = max_bytes.saturating_add(1).min(usize::MAX as u64) as usize;
+    read_link_buffer(parent, name, 256, ceiling)
+}
+
+fn read_link_buffer(
+    parent: &File,
+    name: &OsStr,
+    initial_capacity: usize,
+    ceiling: usize,
+) -> io::Result<BoundedLinkRead> {
     let name = c_name(name)?;
-    let ceiling = libc::PATH_MAX as usize;
-    let mut capacity = 128.min(ceiling);
+    let mut capacity = initial_capacity.min(ceiling);
     loop {
         let mut buffer = Vec::new();
         buffer
@@ -125,13 +164,12 @@ pub fn read_link_at(parent: &File, name: &OsStr) -> io::Result<PathBuf> {
         }
         if (length as usize) < capacity {
             buffer.truncate(length as usize);
-            return Ok(PathBuf::from(OsString::from_vec(buffer)));
+            return Ok(BoundedLinkRead::Complete(buffer));
         }
         if capacity == ceiling {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "symlink target fills PATH_MAX buffer",
-            ));
+            return Ok(BoundedLinkRead::TooLarge {
+                observed_at_least: capacity as u64,
+            });
         }
         capacity = capacity.checked_mul(2).unwrap_or(ceiling).min(ceiling);
     }

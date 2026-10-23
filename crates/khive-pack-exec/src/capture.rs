@@ -138,12 +138,16 @@ fn read_regular_bounded(
 #[cfg(unix)]
 mod platform {
     use super::{read_regular_bounded, CaptureRead, CapturedContent};
-    use khive_fs::fd_relative::{c_name, list_names, open_at, stat_at, stat_fd};
+    use khive_fs::directory_walk::{read_link_at_bounded, BoundedLinkRead};
+    #[cfg(test)]
+    use khive_fs::fd_relative::c_name;
+    use khive_fs::fd_relative::{list_names, open_at, stat_at, stat_fd};
     use khive_fs::opened_file::opened_file_path;
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io;
+    #[cfg(test)]
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
@@ -326,36 +330,14 @@ mod platform {
     }
 
     fn read_link_at(parent: &File, name: &OsStr, max_bytes: u64) -> io::Result<CaptureRead> {
-        let name = c_name(name)?;
-        let ceiling = max_bytes.saturating_add(1).min(usize::MAX as u64) as usize;
-        let mut capacity = ceiling.clamp(1, 256);
-        loop {
-            let mut bytes = vec![0u8; capacity];
-            let len = unsafe {
-                libc::readlinkat(
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                )
-            };
-            if len < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if len as usize == capacity {
-                if capacity == ceiling {
-                    return Ok(CaptureRead::TooLarge {
-                        observed_at_least: capacity as u64,
-                    });
-                }
-                capacity = capacity.saturating_mul(2).min(ceiling);
-                continue;
-            }
-            bytes.truncate(len as usize);
-            return Ok(CaptureRead::Complete(CapturedContent {
+        match read_link_at_bounded(parent, name, max_bytes)? {
+            BoundedLinkRead::Complete(bytes) => Ok(CaptureRead::Complete(CapturedContent {
                 digest: blake3::hash(&bytes).to_hex().to_string(),
                 bytes,
-            }));
+            })),
+            BoundedLinkRead::TooLarge { observed_at_least } => {
+                Ok(CaptureRead::TooLarge { observed_at_least })
+            }
         }
     }
 
