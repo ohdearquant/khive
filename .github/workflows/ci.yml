@@ -1716,7 +1716,7 @@ jobs:
       - name: Run the pack composition tests without the optional packs
         run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
       # Exercise enabled branches of all eight frontend pack features. The
-      # independent profile step below also tests core, published defaults and
+      # independent frontend profile jobs also test core, published defaults and
       # each singleton without cross-frontend feature unification.
       - name: Run the library tests with every optional pack
         run: cargo test -p kkernel -p khive-mcp --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,pack-agent,pack-telemetry,pack-web --lib --locked
@@ -1759,12 +1759,45 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p khive-mcp --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace --locked --test tool_request_notification_identity --test missing_object_errors --test namespace_move_pack_census
 
+  frontend-pack-profiles:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Frontend pack profiles (${{ matrix.package }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [kkernel, khive-mcp]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # Select one frontend per Cargo invocation. This checks its own default
       # forwarding and factory anchors instead of unifying the two frontends.
       # Keep compile-only all-target evidence separate from executed composition.
       - name: Independently build and test frontend pack profiles
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          PROFILE_PACKAGE: ${{ matrix.package }}
         run: |
           set -euo pipefail
           status=0
@@ -1787,12 +1820,11 @@ jobs:
             fi
             printf '%s %s: all-targets=%s composition=%s\n' "$package" "$profile" "$checked" "$tested" >> "$GITHUB_STEP_SUMMARY"
           }
-          for package in kkernel khive-mcp; do
-            run_profile "$package" core --no-default-features
-            run_profile "$package" default
-            for feature in pack-git pack-code pack-tool pack-exec pack-workspace pack-agent pack-telemetry pack-web; do
-              run_profile "$package" "$feature" --no-default-features --features "$feature"
-            done
+          package=$PROFILE_PACKAGE
+          run_profile "$package" core --no-default-features
+          run_profile "$package" default
+          for feature in pack-git pack-code pack-tool pack-exec pack-workspace pack-agent pack-telemetry pack-web; do
+            run_profile "$package" "$feature" --no-default-features --features "$feature"
           done
           exit "$status"
 
@@ -2148,6 +2180,7 @@ jobs:
       - minio-blob-compat
       - msrv-check
       - core-only
+      - frontend-pack-profiles
     if: always()
     steps:
       - name: Check aggregated job results
@@ -2170,7 +2203,7 @@ jobs:
                then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
-                     "msrv-check", "core-only"]
+                     "msrv-check", "core-only", "frontend-pack-profiles"]
                else [] end) as $docs_lane_skips
             | (.["changed-paths"].outputs.test_scope // "") as $scope
             | (if .["changed-paths"].result == "success"

@@ -537,7 +537,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
         "wasm-parity", "vamana-portability", "minio-blob-compat",
-        "msrv-check", "core-only",
+        "msrv-check", "core-only", "frontend-pack-profiles",
     }
     # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
     # save the runner, like the gated lane jobs.
@@ -1394,13 +1394,13 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
                 'local profile_log="$RUNNER_TEMP/pack-profile-$package-$profile.log"',
                 '../scripts/assert-tests-ran.sh "$profile_log" 1; then',
             ]
-            and commands[-8:] == [
-                "for package in kkernel khive-mcp; do",
+            and commands[-7:] == [
+                "package=$PROFILE_PACKAGE",
                 'run_profile "$package" core --no-default-features',
                 'run_profile "$package" default',
                 "for feature in pack-git pack-code pack-tool pack-exec pack-workspace pack-agent pack-telemetry pack-web; do",
                 'run_profile "$package" "$feature" --no-default-features --features "$feature"',
-                "done", "done", 'exit "$status"',
+                "done", 'exit "$status"',
             ]
         )
 
@@ -1537,6 +1537,7 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
             ('--test optional_pack_features 2>&1 | tee "$profile_log"',
              '--test optional_pack_features new_filter 2>&1 | tee "$profile_log"'),
             ("shift 2", "shift 1"),
+            ("package=$PROFILE_PACKAGE", "package=kkernel"),
             ('run_profile "$package" default', 'run_profile "$package" default new_filter'),
             ('../scripts/assert-tests-ran.sh "$profile_log" 1; then', 'true; then'),
         ):
@@ -2388,29 +2389,30 @@ class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
 
 
 class FrontendPackProfileWorkflowTests(unittest.TestCase):
+    PACKAGES = ("kkernel", "khive-mcp")
     FEATURES = (
         "pack-git", "pack-code", "pack-tool", "pack-exec", "pack-workspace",
         "pack-agent", "pack-telemetry", "pack-web",
     )
 
     def profile_script(self):
-        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        job = indented_block(workflow_text("ci.yml"), "frontend-pack-profiles", 2)
         step = step_block(job, "Independently build and test frontend pack profiles")
         self.assertIn("if: ${{ !cancelled() }}", step)
         self.assertRegex(step, r"(?m)^\s+shell: bash$")
         self.assertNotRegex(step, r"continue-on-error:\s*(?:true|\$)")
+        self.assertIn("PROFILE_PACKAGE: ${{ matrix.package }}", step)
         return textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def expected_profiles(self):
+    def expected_profiles(self, package):
         return [(package, profile, flags)
-                for package in ("kkernel", "khive-mcp")
                 for profile, flags in [
                     ("core", ["--no-default-features"]), ("default", []),
                     *((feature, ["--no-default-features", "--features", feature])
                       for feature in self.FEATURES),
                 ]]
 
-    def run_profiles(self, failure="none", *, script=None):
+    def run_profiles(self, package, failure="none", *, script=None):
         if script is None:
             script = self.profile_script()
         with tempfile.TemporaryDirectory(prefix="frontend-profiles-") as directory:
@@ -2424,7 +2426,7 @@ class FrontendPackProfileWorkflowTests(unittest.TestCase):
                     log.write(json.dumps(args) + "\\n")
                 package = args[args.index("-p") + 1]
                 feature = args[args.index("--features") + 1] if "--features" in args else None
-                selected = package == "kkernel" and feature == "pack-tool"
+                selected = package == os.environ["PROFILE_PACKAGE"] and feature == "pack-tool"
                 failure = os.environ["PROFILE_FAILURE"] if selected else "none"
                 if args[0] == "check":
                     sys.exit(19 if failure == "check" else 0)
@@ -2442,7 +2444,7 @@ class FrontendPackProfileWorkflowTests(unittest.TestCase):
                 path.write_bytes(data)
                 sys.stdout.buffer.write(data)
                 sys.exit(29 if os.environ["PROFILE_FAILURE"] == "tee" and
-                         path.name == "pack-profile-kkernel-pack-tool.log" else 0)
+                         path.name == f"pack-profile-{os.environ['PROFILE_PACKAGE']}-pack-tool.log" else 0)
                 """))
             cargo.chmod(0o700)
             tee.chmod(0o700)
@@ -2450,6 +2452,7 @@ class FrontendPackProfileWorkflowTests(unittest.TestCase):
                    if key not in {"BASH_ENV", "ENV"} and not key.startswith("BASH_FUNC_")}
             env.update(PATH=str(root) + os.pathsep + env.get("PATH", ""),
                        PROFILE_CALLS=str(calls), PROFILE_FAILURE=failure,
+                       PROFILE_PACKAGE=package,
                        RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(summary))
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
@@ -2458,51 +2461,96 @@ class FrontendPackProfileWorkflowTests(unittest.TestCase):
             )
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
             expected = []
-            for package, _, flags in self.expected_profiles():
+            for package, _, flags in self.expected_profiles(package):
                 expected.extend([
                     ["check", "-p", package, *flags, "--all-targets", "--locked"],
                     ["test", "-p", package, *flags, "--locked", "--test", "optional_pack_features"],
                 ])
-            self.assertEqual(len(invocations), 40, result.stdout + result.stderr)
+            self.assertEqual(len(invocations), 20, result.stdout + result.stderr)
             self.assertEqual(invocations, expected, "each frontend/profile is isolated")
             rows = summary.read_text().splitlines()
-            self.assertEqual(len(rows), 20)
+            self.assertEqual(len(rows), 10)
             return result, rows
 
-    def assert_outcomes(self, result, rows, failure):
+    def assert_outcomes(self, package, result, rows, failure):
         self.assertEqual(result.returncode, 0 if failure == "none" else 1,
                          result.stdout + result.stderr)
         expected = []
-        for package, profile, _ in self.expected_profiles():
-            selected = package == "kkernel" and profile == "pack-tool"
+        for package, profile, _ in self.expected_profiles(package):
+            selected = profile == "pack-tool"
             checked = "failed" if selected and failure == "check" else "passed"
             tested = "failed" if selected and failure in {"test", "tee", "zero"} else "passed"
             expected.append(f"{package} {profile}: all-targets={checked} composition={tested}")
         self.assertEqual(rows, expected, "failures must not skip later profiles")
 
+    def test_each_frontend_has_an_independent_required_job(self):
+        workflow = workflow_text("ci.yml")
+        job = indented_block(workflow, "frontend-pack-profiles", 2)
+        self.assertIn("    needs: [resolve-revision, changed-paths]\n", job)
+        self.assertIn("    if: needs.changed-paths.outputs.docs_only != 'true'\n", job)
+        self.assertIn("    runs-on: ubuntu-latest\n", job)
+        self.assertIn("    timeout-minutes: 35\n", job)
+        strategy = indented_block(job, "strategy", 4)
+        self.assertIn("      fail-fast: false\n", strategy)
+        self.assertEqual(mapping_entries(indented_block(strategy, "matrix", 6)),
+                         {"package: [kkernel, khive-mcp]"})
+        self.assertEqual(mapping_entries(indented_block(job, "env", 4)), {
+            "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
+            "CARGO_PROFILE_TEST_DEBUG: line-tables-only",
+            'CARGO_INCREMENTAL: "0"', 'LATTICE_OFFLINE: "1"',
+        })
+        self.assertIn("        working-directory: crates\n", job)
+        self.assertEqual(job.count("uses: actions/checkout@v7"), 1)
+        self.assertIn("ref: ${{ needs.resolve-revision.outputs.checkout_sha }}", job)
+        self.assertIn("uses: dtolnay/rust-toolchain@1.95.0", job)
+        self.assertIn('run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"', job)
+        cache = job.split("uses: Swatinem/rust-cache@v2\n", 1)[1].split("\n      #", 1)[0]
+        self.assertEqual(mapping_entries(indented_block(cache, "with", 8)), {
+            "workspaces: crates", "cache-on-failure: true",
+            "save-if: ${{ github.ref == 'refs/heads/main' }}",
+        })
+        self.assertNotIn("embedding model cache", job)
+        self.assertNotIn("warm-model-cache.sh", job)
+        self.assertNotRegex(job, r"continue-on-error:\s*(?:true|\$)")
+        core = indented_block(workflow, "core-only", 2)
+        self.assertNotIn("Independently build and test frontend pack profiles", core)
+        self.assertIn("    timeout-minutes: 60\n", core)
+        gate_needs = indented_block(indented_block(workflow, "ci-gate", 2), "needs", 4)
+        needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
+        self.assertIn("core-only", needs, "the needs list was read")
+        self.assertIn("frontend-pack-profiles", needs)
+
     def test_all_twenty_profiles_run_both_commands_and_a_nonzero_floor(self):
-        result, rows = self.run_profiles()
-        self.assert_outcomes(result, rows, "none")
-        self.assertEqual(result.stdout.count("counted=2 floor=1"), 20)
+        floors = 0
+        for package in self.PACKAGES:
+            with self.subTest(package=package):
+                result, rows = self.run_profiles(package)
+                self.assert_outcomes(package, result, rows, "none")
+                self.assertEqual(result.stdout.count("counted=2 floor=1"), 10)
+                floors += result.stdout.count("counted=2 floor=1")
+        self.assertEqual(floors, 20)
 
     def test_check_test_tee_and_zero_selection_fail_independently_and_continue(self):
-        for failure in ("check", "test", "tee", "zero"):
-            with self.subTest(failure=failure):
-                result, rows = self.run_profiles(failure)
-                self.assert_outcomes(result, rows, failure)
-                if failure == "zero":
-                    self.assertIn("counted=0 floor=1", result.stdout)
-                    self.assertIn("below the required floor", result.stderr)
+        for package in self.PACKAGES:
+            for failure in ("check", "test", "tee", "zero"):
+                with self.subTest(package=package, failure=failure):
+                    result, rows = self.run_profiles(package, failure)
+                    self.assert_outcomes(package, result, rows, failure)
+                    if failure == "zero":
+                        self.assertIn("counted=0 floor=1", result.stdout)
+                        self.assertIn("below the required floor", result.stderr)
 
     def test_removing_the_floor_is_detected_by_the_zero_selection_control(self):
         script = self.profile_script()
         floor = ' &&\n    ../scripts/assert-tests-ran.sh "$profile_log" 1; then'
         self.assertEqual(script.count(floor), 1)
         mutant = script.replace(floor, "; then")
-        result, rows = self.run_profiles("zero", script=mutant)
-        self.assert_outcomes(result, rows, "none")
-        with self.assertRaises(AssertionError):
-            self.assert_outcomes(result, rows, "zero")
+        for package in self.PACKAGES:
+            with self.subTest(package=package):
+                result, rows = self.run_profiles(package, "zero", script=mutant)
+                self.assert_outcomes(package, result, rows, "none")
+                with self.assertRaises(AssertionError):
+                    self.assert_outcomes(package, result, rows, "zero")
 
 
 class HistoricalReplayWorkflowTests(unittest.TestCase):
@@ -2523,6 +2571,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
         "core-only": "Core-only feature set build and tests",
+        "frontend-pack-profiles": "Frontend pack profiles (${{ matrix.package }})",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
         "changed-paths": "Classify changed paths",
