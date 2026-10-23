@@ -1512,7 +1512,7 @@ mod tests {
         assert!(command
             .get_subcommands()
             .any(|entry| entry.get_name() == "code-audit"));
-        let error = Args::try_parse_from(["kkernel", "kg", "entity-type-backfill", "--help"])
+        let error = Args::try_parse_from(["kkernel", "entity-type-backfill", "--help"])
             .expect_err("core backfill help remains available");
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
     }
