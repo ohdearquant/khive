@@ -740,10 +740,10 @@ impl OccurrenceStore {
             && after
                 .selected
                 .is_some_and(|selected| selected.within_bound(selection_at_us, bound));
-        if !after
+        if after
             .next
             .zip(after.horizon)
-            .is_some_and(|(next, horizon)| next <= horizon)
+            .is_none_or(|(next, horizon)| next > horizon)
             && !selected_can_launch
         {
             after.selected = None;
@@ -956,10 +956,10 @@ fn same_claim(row: &SqlRow, claim: &ClaimHandle) -> StorageResult<bool> {
     )
 }
 fn clear_completed_window(series: &mut SeriesSnapshot) {
-    if !series
+    if series
         .next
         .zip(series.horizon)
-        .is_some_and(|(next, horizon)| next <= horizon)
+        .is_none_or(|(next, horizon)| next > horizon)
     {
         series.window_source = None;
         series.horizon = None;

@@ -888,7 +888,7 @@ async fn production_schema_matches_namespace_fixture_and_real_move_retains_histo
         .expect("owned namespace writer")
         .transaction(|conn| {
             khive_db::namespace_move::move_namespace(conn, &request)
-                .map_err(|e| khive_db::SqliteError::InvalidInput(e.to_string()))
+                .map_err(|e| khive_db::SqliteError::InvalidData(e.to_string()))
         })
         .expect("real namespace move");
     assert_eq!(f.rows().await, before);
@@ -964,7 +964,7 @@ async fn cold_process_resumes_pages_after_last_cancelled_display_note_is_deleted
                     .unwrap()
                     .transaction(|conn| {
                         khive_db::namespace_move::move_namespace(conn, &request)
-                            .map_err(|e| khive_db::SqliteError::InvalidInput(e.to_string()))
+                            .map_err(|e| khive_db::SqliteError::InvalidData(e.to_string()))
                     })
                     .unwrap();
             }
