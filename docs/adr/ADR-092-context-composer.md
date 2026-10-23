@@ -345,8 +345,7 @@ and `crates/khive-pack-memory/src/handlers/feedback.rs:108-113`, and the body ci
 
 ## Amendment 1 (2026-10-23) -- Context composer attribution decisions
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent
-implementation lands. It does not change the status of the base ADR or of earlier amendments.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 **Addresses**: [#5560](https://github.com/ohdearquant/khive/issues/5560), including
 [#4737](https://github.com/ohdearquant/khive/issues/4737).

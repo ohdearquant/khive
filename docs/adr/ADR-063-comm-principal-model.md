@@ -451,8 +451,7 @@ question is closed; no further decision is pending on it.
 
 ## Amendment 1 (2026-10-23) -- Actor visibility and remote transport references
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR or of earlier amendments.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 **Addresses**: [#5549](https://github.com/ohdearquant/khive/issues/5549).
 

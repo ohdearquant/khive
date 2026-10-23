@@ -434,8 +434,7 @@ Acceptance arms added (each names the control that must fail):
 
 ## Amendment 2 (2026-10-23) -- Assurance limits, email admission and policy ownership
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR or of earlier amendments.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 **Addresses**: [#5598](https://github.com/ohdearquant/khive/issues/5598).
 
