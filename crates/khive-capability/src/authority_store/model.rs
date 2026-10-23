@@ -28,6 +28,8 @@ pub enum AuthorityRefusal {
     Unavailable(&'static str),
     #[error("request id already holds different canonical bytes")]
     RequestConflict,
+    #[error("bootstrap manifest conflicts with initialized authority")]
+    InitializationConflict,
     #[error(transparent)]
     Envelope(#[from] EnvelopeError),
 }
@@ -113,6 +115,7 @@ pub struct AuthorityConfiguration {
 pub struct AuthorityStore {
     pub(super) sql: Arc<dyn SqlAccess>,
     pub(super) configuration: Arc<AuthorityConfiguration>,
+    pub(super) bootstrap_manifest: Option<Arc<super::bootstrap::ValidatedBootstrapManifest>>,
 }
 impl AuthorityStore {
     /// Trusted construction over an initialized store. It never creates a marker,
@@ -166,6 +169,7 @@ impl AuthorityStore {
         Ok(Self {
             sql,
             configuration: Arc::new(configuration),
+            bootstrap_manifest: None,
         })
     }
 

@@ -4,12 +4,18 @@
 //! This library installs no wire adapter or evidence-transaction admission seam.
 
 mod authorize;
+mod bootstrap;
 mod current;
 mod history;
 mod model;
 mod mutation;
 mod request;
 
+pub use bootstrap::{
+    AuthorityHistory, BootstrapHistoricalChange, BootstrapManifestInput, BootstrapRuntime,
+    BootstrapSlotInput, InitializationResult, InitializationSeed, InitializationSummary,
+    LoadedAuthority, ValidatedBootstrapManifest,
+};
 pub use history::{HistoricalAdministration, HistoricalChange};
 pub use model::{
     AdministrationOperation, AdmissionBinding, AdmissionContext, AdmissionVerifier, AdmittedCaller,
@@ -28,3 +34,6 @@ pub enum AuthorityError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bootstrap_tests;

@@ -1,11 +1,13 @@
 use super::current::Current;
 use super::model::{AdministrationProof, BodyDigest, CoverageGroup, ProofSet};
 use super::{AuthorityError, AuthorityRefusal, AuthorityResult, RecordRef};
-use crate::durable::{canonical_principal, AdminTarget, ObservationPermission, RightSpec};
+use crate::durable::{
+    canonical_principal, AdminTarget, ClosedCatalog, ObservationPermission, RightSpec,
+};
 
 type Selected = (u16, u16, u16);
 
-fn permission_scope(right: &RightSpec) -> AuthorityResult<&[ObservationPermission]> {
+pub(super) fn permission_scope(right: &RightSpec) -> AuthorityResult<&[ObservationPermission]> {
     match right {
         RightSpec::RecordObservation(scope) => Ok(&scope.permissions),
         RightSpec::GrantAdmin(admin) => match &admin.target {
@@ -21,8 +23,8 @@ fn permission_scope(right: &RightSpec) -> AuthorityResult<&[ObservationPermissio
         .into()),
     }
 }
-fn covers(
-    current: &Current<'_, '_>,
+pub(super) fn covers(
+    catalog: &ClosedCatalog,
     held: &[RightSpec],
     namespace: &str,
     wanted: &ObservationPermission,
@@ -34,11 +36,7 @@ fn covers(
             }
             if let AdminTarget::RecordObservation(scope) = &admin.target {
                 for (permission_index, permission) in scope.permissions.iter().enumerate() {
-                    if current
-                        .configuration
-                        .catalog
-                        .covers_observation_permission(permission, wanted)
-                    {
+                    if catalog.covers_observation_permission(permission, wanted) {
                         return Some((right_index as u16, permission_index as u16));
                     }
                 }
@@ -82,7 +80,7 @@ pub(super) async fn administration(
             for (permission, wanted) in scope.iter().enumerate() {
                 if selected[right][permission].is_none() {
                     if let Some((admin_right, admin_permission)) =
-                        covers(current, &source.rights, namespace, wanted)
+                        covers(&configuration.catalog, &source.rights, namespace, wanted)
                     {
                         selected[right][permission] =
                             Some((reference_index, admin_right, admin_permission));
@@ -133,9 +131,12 @@ pub(super) async fn administration(
                 for (right, scope) in permissions.iter().enumerate() {
                     for (permission, wanted) in scope.iter().enumerate() {
                         if selected[right][permission].is_none() {
-                            if let Some((admin_right, admin_permission)) =
-                                covers(current, &envelope.body().grant.rights, namespace, wanted)
-                            {
+                            if let Some((admin_right, admin_permission)) = covers(
+                                &configuration.catalog,
+                                &envelope.body().grant.rights,
+                                namespace,
+                                wanted,
+                            ) {
                                 selected[right][permission] =
                                     Some((reference_index, admin_right, admin_permission));
                                 used = true;
