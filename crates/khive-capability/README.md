@@ -24,6 +24,9 @@ the workspace copy of `lion-core` 0.4.0, and is licensed Apache-2.0.
   namespace and required-right checks. `revoke` invalidates a grant and its descendants.
 - `RequestValidator` retains the exhaustive finer operation-to-right classification
   and its separate Read/Write binding projection.
+- `CapId`, `Capability`, `PluginId`, `Right`, `Rights` and `SecurityLevel` are re-exported
+  from `khive-lion-core`, so callers name the kernel types through this crate without a
+  direct `khive-lion-core` dependency.
 
 The manager is a trusted authority-management object. Its mint, compose and revoke
 methods do not identify or authorize an external caller. A future caller-facing
