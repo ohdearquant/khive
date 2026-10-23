@@ -73,7 +73,7 @@ async fn apply_atom_weights(
     (weights, None)
 }
 
-fn suggest_word_count(query: &str) -> usize {
+fn query_word_count(query: &str) -> usize {
     let mut other_words = 0;
     let mut cjk_letters = 0;
     for piece in query.split_whitespace() {
@@ -456,7 +456,7 @@ impl KnowledgeHandlers {
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
-        let word_count = suggest_word_count(&raw_query);
+        let word_count = query_word_count(&raw_query);
         if word_count < 5 {
             return Err(RuntimeError::InvalidInput(format!(
                 "suggest query must be at least 5 words for meaningful domain matching \
@@ -877,7 +877,7 @@ impl KnowledgeHandlers {
         let mut suggest_hydration_failures = 0usize;
         let mut query_embedding = QueryEmbeddingCache::default();
         if is_auto {
-            let word_count = raw_query.split_whitespace().count();
+            let word_count = query_word_count(&raw_query);
             if word_count < 10 {
                 return Err(RuntimeError::InvalidInput(format!(
                     "auto-compose query must be at least 10 words for effective domain selection \

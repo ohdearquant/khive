@@ -1,6 +1,12 @@
 use super::*;
 use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
+fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
+    serde_json::from_value(params).map_err(|error| {
+        mask_for_redaction_surface(RedactionSurface::GateProbe, &error.to_string()).into_owned()
+    })
+}
+
 // ── BrainPack handler impl ────────────────────────────────────────────────────
 
 impl BrainPack {
@@ -49,8 +55,7 @@ impl BrainPack {
         struct ConfigParams {
             parameter: Option<String>,
         }
-        let p: ConfigParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: ConfigParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let state = self.state.lock().unwrap();
         let br = &state.balanced_recall;
@@ -117,8 +122,7 @@ impl BrainPack {
         struct EventsParams {
             limit: Option<u32>,
         }
-        let p: EventsParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: EventsParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let limit = p.limit.unwrap_or(20).min(100);
         let ns = token.namespace().as_str().to_string();
@@ -293,8 +297,8 @@ impl BrainPack {
             // bounded page is cheaper and sufficient for most callers.
             exhaustive: Option<bool>,
         }
-        let p: EventCountsParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: EventCountsParams =
+            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let actor_scope = event_actor_read_scope(
             &self.runtime,
@@ -412,8 +416,7 @@ impl BrainPack {
         struct ProfilesParams {
             lifecycle: Option<String>,
         }
-        let p: ProfilesParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: ProfilesParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let state = self.state.lock().unwrap();
         // Only expose the three public-facing lifecycle states.
@@ -470,8 +473,7 @@ impl BrainPack {
             profile_id: Option<String>,
             id: Option<String>,
         }
-        let p: ProfileParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: ProfileParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
         let profile_id = p
             .profile_id
             .or(p.id)
@@ -538,8 +540,7 @@ impl BrainPack {
             namespace: Option<String>,
             consumer_kind: String,
         }
-        let p: ResolveParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: ResolveParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let caller = token.actor().label();
         // Anonymous omission must retain the serve path's wildcard-only resolution.
@@ -627,8 +628,8 @@ impl BrainPack {
         struct LifecycleParams {
             profile_id: String,
         }
-        let p: LifecycleParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: LifecycleParams =
+            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let event_kind = match lifecycle {
             ProfileLifecycle::Active => "brain.activate",
@@ -716,7 +717,7 @@ impl BrainPack {
         struct ResetParams {
             profile_id: Option<String>,
         }
-        let p: ResetParams = serde_json::from_value(params)
+        let p: ResetParams = parse_handler_params(params)
             .map_err(|e| RuntimeError::InvalidInput(format!("brain.reset: {e}")))?;
         let profile_id = p
             .profile_id
@@ -892,8 +893,7 @@ impl BrainPack {
             query: Option<String>,
             candidate_ids: Option<Vec<String>>,
         }
-        let p: FeedbackParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: FeedbackParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         // ADR-081 §6: together-or-rejected. Absent-both is the unchanged,
         // ordinary feedback path; present-both enables dedup + ledger backfill
@@ -1432,8 +1432,8 @@ impl BrainPack {
             query_raw: String,
             served_at: Option<i64>,
         }
-        let p: RecordServeParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: RecordServeParams =
+            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         if p.target_ids.is_empty() {
             return Ok(json!({
@@ -1505,8 +1505,7 @@ impl BrainPack {
         struct MarkTurnParams {
             label: Option<String>,
         }
-        let p: MarkTurnParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: MarkTurnParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
         if let Some(label) = p.label.as_deref() {
             khive_runtime::secret_gate::check_at(label, "turn", "label")?;
         }
@@ -1563,8 +1562,7 @@ impl BrainPack {
             consumer_kind: Option<String>,
             priority: Option<i32>,
         }
-        let p: BindParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: BindParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let actor = p.actor.unwrap_or_else(|| "*".into());
         let namespace = p.namespace.unwrap_or_else(|| "*".into());
@@ -1688,8 +1686,7 @@ impl BrainPack {
             namespace: Option<String>,
             consumer_kind: Option<String>,
         }
-        let p: UnbindParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: UnbindParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         // Require at least one non-null filter to prevent accidental bulk-delete.
         if p.profile_id.is_none()
@@ -1768,8 +1765,7 @@ impl BrainPack {
             namespace: Option<String>,
             consumer_kind: Option<String>,
         }
-        let p: BindingsParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: BindingsParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let caller = token.actor().label();
         let actor = p.actor.as_deref().unwrap_or(&caller);
@@ -1818,8 +1814,8 @@ impl BrainPack {
             consumer_kind: Option<String>,
             seed_priors: Option<serde_json::Value>,
         }
-        let p: CreateProfileParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: CreateProfileParams =
+            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         // Validate profile-id grammar: trim, reject empty, enforce ASCII alphanumeric + hyphen.
         let name = p.name.trim().to_string();
@@ -1999,8 +1995,8 @@ impl BrainPack {
             base_model_revision: String,
             metadata: Option<serde_json::Map<String, serde_json::Value>>,
         }
-        let p: RegisterAdapterParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let p: RegisterAdapterParams =
+            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
 
         let active_revision = std::env::var("KHIVE_BRAIN_BASE_MODEL_REVISION")
             .unwrap_or_else(|_| DEFAULT_BASE_MODEL_REVISION.to_string());

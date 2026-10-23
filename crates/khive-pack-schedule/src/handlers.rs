@@ -57,6 +57,7 @@ use khive_runtime::deser_params as deser;
 /// formats and rationale.
 fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
+        let at = mask_for_redaction_surface(RedactionSurface::GateProbe, at);
         RuntimeError::InvalidInput(format!(
             "{verb}.at: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), got {at:?}"
         ))
@@ -987,6 +988,7 @@ pub(crate) async fn handle_agenda(
     let from_instant: Option<DateTime<Utc>> = match p.from {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.from: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -999,6 +1001,7 @@ pub(crate) async fn handle_agenda(
     let to_instant: Option<DateTime<Utc>> = match p.to {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.to: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -1013,11 +1016,13 @@ pub(crate) async fn handle_agenda(
         (None, None) => None,
         (Some(value), Some(id)) => {
             value.parse::<DateTime<Utc>>().map_err(|_| {
+                let value = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
                 RuntimeError::InvalidInput(format!(
                     "agenda.after: must be an RFC 3339 timestamp; got {value:?}"
                 ))
             })?;
             let id = Uuid::parse_str(id).map_err(|_| {
+                let id = mask_for_redaction_surface(RedactionSurface::GateProbe, id);
                 RuntimeError::InvalidInput(format!("agenda.after_id: must be a UUID; got {id:?}"))
             })?;
             Some(NoteInstantSeekAfter {

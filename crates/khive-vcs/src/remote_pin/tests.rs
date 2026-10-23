@@ -32,7 +32,7 @@ fn apply(temp: &tempfile::TempDir, commit: &str) -> Result<RemotePinUpdate> {
 }
 
 fn value(path: &Path) -> Value {
-    serde_yaml::from_slice(&fs::read(path).unwrap()).unwrap()
+    yaml_serde::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 fn pending_count(path: &Path) -> usize {
@@ -501,3 +501,5 @@ fn git_failure_masks_exact_local_and_userless_scp_sources() {
         assert!(!error.contains(source), "{error}");
     }
 }
+
+mod yaml_compatibility;
