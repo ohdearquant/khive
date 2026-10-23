@@ -30,7 +30,7 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     .await;
     expect_ids(&response, &observation, &[id(101), id(102)]);
     assert_eq!(observation.fetched_rows, 4);
-    assert_eq!(observation.retained_rows["visible"], 2);
+    assert_eq!(observation.retained_rows["folded"], 2);
     assert_eq!(response["messages"][0]["content"], "message 101");
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][1]["read"], false);
@@ -61,7 +61,7 @@ async fn thread_baseline_t3_both_addressed_participants_see_one_physical_owner()
         )
         .await;
         expect_ids(&response, &observation, &[root]);
-        assert_eq!(observation.retained_rows["visible"], 2);
+        assert_eq!(observation.peak_owner_rows, 1);
         assert_eq!(observation.retained_rows["folded"], 1);
         assert_eq!(response["messages"][0]["read"], true);
     }

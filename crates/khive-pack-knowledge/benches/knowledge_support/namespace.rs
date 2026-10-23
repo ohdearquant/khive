@@ -12,7 +12,6 @@ use crate::fixture::{executor, Fixture, CONTENT};
 // Exactly 17 whitespace-delimited words; no explicit pins bypass auto-suggest.
 const QUERY: &str = "knowledge retrieval benchmark generated atom corpus vector embedding search ranking domain briefing evidence budget selection normalized synthetic";
 const FOREIGN_ROWS: usize = 20_000;
-const STORE_ATOMS: usize = 180_474;
 const STORE_DOMAINS: usize = 25_504;
 
 async fn seed_atoms(fixture: &Fixture, namespace: &str, count: usize) {
@@ -104,7 +103,7 @@ fn report(name: &str, foreign: usize, samples: &mut [Duration]) {
     );
 }
 
-pub fn run(samples: usize, full: bool) {
+pub fn run(samples: usize, store_atoms: Option<usize>) {
     assert_eq!(QUERY.split_whitespace().count(), 17);
     let rt = executor();
     for foreign in [0, FOREIGN_ROWS] {
@@ -164,14 +163,14 @@ pub fn run(samples: usize, full: bool) {
         report("knowledge_namespace/full_suggest", foreign, &mut suggest);
         rt.block_on(fixture.close());
     }
-    if full {
+    if let Some(store_atoms) = store_atoms {
         let fixture = Fixture::new(&rt, false);
         rt.block_on(async {
-            seed_atoms(&fixture, "local", STORE_ATOMS).await;
-            seed_domains(&fixture, STORE_DOMAINS, STORE_ATOMS).await;
+            seed_atoms(&fixture, "local", store_atoms).await;
+            seed_domains(&fixture, STORE_DOMAINS, store_atoms).await;
         });
         let (_, stats) = fixture.measure(&rt, "knowledge.stats", json!({}));
-        assert_eq!(stats["total_atoms"], STORE_ATOMS);
+        assert_eq!(stats["total_atoms"], store_atoms);
         assert_eq!(stats["total_domains"], STORE_DOMAINS);
         // Three bounded individual calls, including the first call after setup.
         // A missed target is evidence, not an invitation to retry until success.
@@ -192,7 +191,7 @@ pub fn run(samples: usize, full: bool) {
                 "{}",
                 json!({
                     "scenario": "knowledge_namespace/full_compose_store_size",
-                    "sample": sample, "local_atoms": STORE_ATOMS, "local_domains": STORE_DOMAINS,
+                    "sample": sample, "local_atoms": store_atoms, "local_domains": STORE_DOMAINS,
                     "query_words": 17, "max_tokens": 1500,
                     "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
                     "absolute_target_ms": 6000, "under_target": elapsed < Duration::from_secs(6),

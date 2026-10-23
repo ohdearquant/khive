@@ -357,6 +357,7 @@ struct State {
     pending: Vec<Waiting>,
     in_flight_generation: Option<u64>,
     driver_active: bool,
+    physical_reservations: usize,
     next_generation_id: u64,
     submitted_rows: u64,
     committed_rows: u64,
@@ -383,6 +384,7 @@ impl State {
             pending: Vec::new(),
             in_flight_generation: None,
             driver_active: false,
+            physical_reservations: 0,
             next_generation_id: 0,
             submitted_rows: 0,
             committed_rows: 0,
@@ -413,9 +415,59 @@ impl State {
 
 struct Inner {
     state: Mutex<State>,
+    // Completion witnesses only: physical shutdown never aborts admitted work.
+    physical_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+struct PhysicalReservation(Arc<Inner>);
+
+impl Drop for PhysicalReservation {
+    fn drop(&mut self) {
+        self.0.state.lock().physical_reservations -= 1;
+    }
 }
 
 impl Inner {
+    fn reserve_physical(self: &Arc<Self>) -> PhysicalReservation {
+        self.state.lock().physical_reservations += 1;
+        PhysicalReservation(Arc::clone(self))
+    }
+
+    fn spawn_physical<F, T>(
+        self: &Arc<Self>,
+        registration: PhysicalReservation,
+        future: F,
+    ) -> JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let running = self.reserve_physical();
+        let handle = tokio::spawn(async move {
+            let result = future.await;
+            drop(running);
+            result
+        });
+        {
+            let mut tasks = self.physical_tasks.lock();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(handle.abort_handle());
+        }
+        // A very short task can finish before its witness is published. Keep
+        // registration reserved until publication to close that zero-work gap.
+        drop(registration);
+        handle
+    }
+
+    fn physically_finished(&self) -> bool {
+        self.state.lock().physical_reservations == 0
+            && self
+                .physical_tasks
+                .lock()
+                .iter()
+                .all(|task| task.is_finished())
+    }
+
     /// Wins once: the first abnormal driver/supervisor exit sets `Failed`
     /// and drains every accepted waiter (this generation's, plus anything
     /// still queued for a future one) with the same typed reason. A later
@@ -681,6 +733,7 @@ impl AuditBatch {
         Arc::new(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::new()),
+                physical_tasks: Mutex::new(Vec::new()),
             }),
             store,
             config: Arc::new(config),
@@ -705,14 +758,45 @@ impl AuditBatch {
         }
     }
 
-    fn spawn_supervisor_if_idle(&self) {
+    fn spawn_supervisor_if_idle(&self, registration: PhysicalReservation) {
         let inner = self.inner.clone();
         let store = self.store.clone();
         let config = self.config.clone();
-        let handle = tokio::spawn(async move {
+        let handle = self.inner.spawn_physical(registration, async move {
             supervisor_loop(inner, store, config).await;
         });
         *self.supervisor.lock() = Some(handle);
+    }
+
+    /// Stop admission and wait until all accepted append tasks and their
+    /// supervisors/reapers have physically finished. Unlike `close_and_drain`,
+    /// a driver-abandoned append still holds this barrier until it returns.
+    ///
+    /// Task completion witnesses stay on the batch, so cancelling this wait
+    /// neither detaches a taken join nor loses the barrier for a later call.
+    /// No admitted write is aborted. This may wait indefinitely for a store
+    /// that never returns; callers may cancel their wait without cancelling it.
+    /// The batch's own store Arc remains owned until the batch is dropped.
+    pub(crate) async fn close_and_wait_for_physical_completion(
+        &self,
+    ) -> Result<(), AuditTerminalReason> {
+        {
+            let mut state = self.inner.state.lock();
+            if matches!(state.lifecycle, Lifecycle::Open) {
+                state.lifecycle = Lifecycle::Closing;
+            }
+        }
+        let result = AuditBatchControl::quiesce(self).await;
+        while !self.inner.physically_finished() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        {
+            let mut state = self.inner.state.lock();
+            if result.is_ok() && matches!(state.lifecycle, Lifecycle::Closing) {
+                state.lifecycle = Lifecycle::Closed;
+            }
+        }
+        result
     }
 
     /// Enqueue one row and keep waiting for its real generation outcome past
@@ -761,7 +845,7 @@ impl AuditBatch {
 
         let producer = row.producer;
         let (tx, mut rx) = oneshot::channel();
-        let need_spawn = {
+        let supervisor_registration = {
             let mut state = self.inner.state.lock();
             match state.lifecycle {
                 Lifecycle::Closed | Lifecycle::Closing => {
@@ -782,11 +866,16 @@ impl AuditBatch {
             let need_spawn = !state.driver_active;
             if need_spawn {
                 state.driver_active = true;
+                // Publish this obligation under the admission lock, before a
+                // concurrent physical close can observe terminal/idle state.
+                state.physical_reservations += 1;
+                Some(PhysicalReservation(Arc::clone(&self.inner)))
+            } else {
+                None
             }
-            need_spawn
         };
-        if need_spawn {
-            self.spawn_supervisor_if_idle();
+        if let Some(registration) = supervisor_registration {
+            self.spawn_supervisor_if_idle(registration);
         }
 
         if wait_until_resolved {
@@ -918,8 +1007,10 @@ async fn supervisor_loop(
             .map(|w| w.event.clone())
             .collect();
 
-        let mut child: JoinHandle<GenerationResult> =
-            tokio::spawn(run_generation(store.clone(), events, config.clone()));
+        let mut child: JoinHandle<GenerationResult> = inner.spawn_physical(
+            inner.reserve_physical(),
+            run_generation(store.clone(), events, config.clone()),
+        );
 
         #[cfg(any(test, feature = "fault-injection"))]
         if fault::CHILD_CANCEL.swap(false, Ordering::SeqCst) {
@@ -973,7 +1064,7 @@ async fn supervisor_loop(
                         .send(Err(AuditTerminalReason::DriverAppendAbandoned));
                 }
                 let reaper_inner = inner.clone();
-                tokio::spawn(async move {
+                inner.spawn_physical(inner.reserve_physical(), async move {
                     let result = child.await;
                     let mut state = reaper_inner.state.lock();
                     state.outstanding_abandoned_appends =
@@ -1332,3 +1423,7 @@ mod test_internals {
 
 #[cfg(any(test, feature = "test-internals"))]
 pub use test_internals::*;
+
+#[cfg(test)]
+#[path = "audit_batch_physical_close_tests.rs"]
+mod physical_close_tests;

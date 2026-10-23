@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingRole, EmbeddingService,
-    NativeEmbeddingService, DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_BYTES,
+    NativeEmbeddingService, TokenCount, DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_BYTES,
 };
 use tokio::sync::{mpsc, Notify, OnceCell};
 
@@ -75,7 +75,9 @@ pub(crate) async fn with_embedding_admission<T>(
                     _ = &mut stopped, if !bound_expired => bound_expired = true,
                 }
                 match admission.state.load(Ordering::Acquire) {
-                    ADMISSION_ACCEPTED => return future.await.map_err(RuntimeError::from),
+                    // An accepted job can be followed by another admission wait.
+                    // Keep supervising that next phase without cancelling this one.
+                    ADMISSION_ACCEPTED => {}
                     ADMISSION_WAITING if bound_expired => {
                         return Err(RuntimeError::Storage(
                             khive_storage::StorageError::AdmissionTimeout {
@@ -99,6 +101,12 @@ enum EmbeddingCall {
     Generic,
     Query,
     Passage,
+    CountTokens(EmbeddingRole),
+}
+
+enum EmbeddingOutput {
+    Vectors(Vec<Vec<f32>>),
+    TokenCounts(Vec<TokenCount>),
 }
 
 const EMBEDDING_QUEUE_CAPACITY: usize = 32;
@@ -149,12 +157,12 @@ struct EmbeddingJob {
     texts: Vec<String>,
     model: EmbeddingModel,
     call: EmbeddingCall,
-    reply: tokio::sync::oneshot::Sender<lattice_embed::Result<Vec<Vec<f32>>>>,
+    reply: tokio::sync::oneshot::Sender<lattice_embed::Result<EmbeddingOutput>>,
     _in_flight: InFlightBytes,
 }
 
-/// Bounds non-cancellable native inference to one worker and a fixed queue.
-/// Callers can detach safely because closed queued jobs are skipped before inference.
+/// Bounds non-cancellable native work to one worker and a fixed queue.
+/// Callers can detach safely because closed queued jobs are skipped before execution.
 pub(crate) struct BlockingEmbeddingService<S> {
     inner: Arc<S>,
     worker: OnceLock<Result<mpsc::Sender<EmbeddingJob>, String>>,
@@ -244,9 +252,22 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
             }
             let result = runtime.block_on(async {
                 match job.call {
-                    EmbeddingCall::Generic => inner.embed(&job.texts, job.model).await,
-                    EmbeddingCall::Query => inner.embed_query(&job.texts, job.model).await,
-                    EmbeddingCall::Passage => inner.embed_passage(&job.texts, job.model).await,
+                    EmbeddingCall::Generic => inner
+                        .embed(&job.texts, job.model)
+                        .await
+                        .map(EmbeddingOutput::Vectors),
+                    EmbeddingCall::Query => inner
+                        .embed_query(&job.texts, job.model)
+                        .await
+                        .map(EmbeddingOutput::Vectors),
+                    EmbeddingCall::Passage => inner
+                        .embed_passage(&job.texts, job.model)
+                        .await
+                        .map(EmbeddingOutput::Vectors),
+                    EmbeddingCall::CountTokens(role) => inner
+                        .count_tokens(&job.texts, job.model, role)
+                        .await
+                        .map(EmbeddingOutput::TokenCounts),
                 }
             });
             let _ = job.reply.send(result);
@@ -259,6 +280,20 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
         model: EmbeddingModel,
         call: EmbeddingCall,
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        match self.run_job(texts, model, call).await? {
+            EmbeddingOutput::Vectors(vectors) => Ok(vectors),
+            EmbeddingOutput::TokenCounts(_) => Err(lattice_embed::EmbedError::Internal(
+                "embedding worker returned token counts for a vector request".to_owned(),
+            )),
+        }
+    }
+
+    async fn run_job(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        call: EmbeddingCall,
+    ) -> lattice_embed::Result<EmbeddingOutput> {
         let input_bytes = Self::input_bytes(texts)?;
         let sender = self.worker()?;
         let admission = EMBEDDING_ADMISSION.try_with(Arc::clone).ok();
@@ -365,6 +400,23 @@ impl<S: EmbeddingService + 'static> EmbeddingService for BlockingEmbeddingServic
         model: EmbeddingModel,
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
         self.run(texts, model, EmbeddingCall::Passage).await
+    }
+
+    async fn count_tokens(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> lattice_embed::Result<Vec<TokenCount>> {
+        match self
+            .run_job(texts, model, EmbeddingCall::CountTokens(role))
+            .await?
+        {
+            EmbeddingOutput::TokenCounts(counts) => Ok(counts),
+            EmbeddingOutput::Vectors(_) => Err(lattice_embed::EmbedError::Internal(
+                "embedding worker returned vectors for a token-count request".to_owned(),
+            )),
+        }
     }
 
     fn model_config(&self, model: EmbeddingModel) -> lattice_embed::ModelConfig {
@@ -824,6 +876,10 @@ fn cached_blocking_service<S: EmbeddingService + 'static>(
 #[cfg(test)]
 #[path = "embedding_cache_admission_tests.rs"]
 mod cache_admission_tests;
+
+#[cfg(test)]
+#[path = "embedding_token_count_tests.rs"]
+mod token_count_tests;
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -1423,6 +1479,57 @@ mod tests {
         assert!(after_deadline.is_pending(),
             "already-running inference cannot be called a pre-admission refusal: {after_deadline:?}");
         assert_eq!(call.await.unwrap(), vec![1.0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_second_job_keeps_the_original_admission_bound() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let service = BlockingEmbeddingService::new(Arc::clone(&inner));
+        let first = vec!["first".to_owned()];
+        let second = vec!["second".to_owned()];
+        let mut call = Box::pin(khive_storage::scope_request_read_deadline(
+            Duration::from_millis(100),
+            with_embedding_admission(async {
+                service.embed(&first, EmbeddingModel::default()).await?;
+                service.embed(&second, EmbeddingModel::default()).await
+            }),
+        ));
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        drive_until_entered(call.as_mut(), &inner, 1).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(
+            poll_once(call.as_mut()).await.is_pending(),
+            "the admitted first job must finish despite expiry"
+        );
+        inner.release();
+
+        // A wall-clock watchdog keeps the paused clock from racing worker completion.
+        let watchdog = std::time::Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let std::task::Poll::Ready(result) = poll_once(call.as_mut()).await {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "second-job admission must settle instead of waiting forever"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Storage(
+                    khive_storage::StorageError::AdmissionTimeout {
+                        timeout_ms: 100,
+                        ..
+                    }
+                ))
+            ),
+            "the second job must use the original bound: {result:?}"
+        );
+        assert_eq!(*inner.calls.lock().unwrap(), vec!["first".to_owned()]);
+        assert_eq!(inner.entered.load(Ordering::Acquire), 1);
     }
 
     struct CustomWaitingService {

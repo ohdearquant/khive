@@ -1,5 +1,22 @@
 # khive-pack-memory Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-memory`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                              | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| -------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `recall/n_memories/10`                 | 1.130 ms         | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `recall/n_memories/100`                | 1.461 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `recall/n_memories/500`                | 2.609 ms         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `recall_with_min_score/min_score_0_3`  | 1.246 ms         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `remember/baseline`                    | 48.779 ms        | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `remember_with_source/with_annotation` | 1.625 ms         | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Inventory
 
 | Name           | File                      | Purpose                                                                                                                                                                    |

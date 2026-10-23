@@ -108,6 +108,16 @@ trends, not the fixed-percentage rule in the historical regression notes.
 
 ### Fixture and timing protocol
 
+In ordinary modes, these three targets construct runtimes and generated corpora only
+after Criterion selects a scene. `--list` and filters matching no scene do not build
+indexes, materialize results or open databases. Selected correctness runs still execute
+their full workload and checks; the limits-only scene needs no generated fixture.
+Selected scenes reuse their target's initialized inputs. Initialization remains outside
+recorded operation intervals. Profiling (`--bench --profile-time`, including the `=value`
+form) preserves eager initialization before each group, including for unmatched filters,
+so fixture construction stays outside the external profiler's callback. Criterion rejects
+`--list` combined with `--profile-time`; options after `--` are literal filter text.
+
 - HNSW uses 500 vectors of 384 dimensions, an LCG corpus seed of 42 and HNSW level seed 42,
   fixed insertion order and deterministic IDs. BM25 indexes 500 generated documents. The
   old/sentinel corpus uses seed 43 and disjoint IDs, also with 500 items. No files or models

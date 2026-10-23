@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::error::{AuditObligationFailure, DispatchError, RuntimeError};
 use crate::runtime::NamespaceToken;
 
+use super::audit::{enrich_search_success, enrich_stream_truncate_success, stamp_error_class};
 use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
@@ -336,7 +337,8 @@ impl VerbRegistry {
 
         let started = Instant::now();
         let token = self.mint_intercepted_read_token(&gate_req, params, identity);
-        let mut result = dispatch(token).await;
+        let (mut result, search_arms) =
+            crate::search_audit::capture(verb == "search", async { dispatch(token).await }).await;
         let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
@@ -385,12 +387,12 @@ impl VerbRegistry {
             if let Some(audit) = deferred_audit.take() {
                 let audit_outcome = self
                     .persist_intercepted_audit(
-                        verb,
                         &gate_req,
                         audit,
                         result.as_ref().map(|outcome| &outcome.result),
                         duration_us,
                         request_id,
+                        search_arms,
                     )
                     .await;
                 result = fold_audit_obligation(result, audit_outcome, |outcome| outcome.result);
@@ -401,17 +403,22 @@ impl VerbRegistry {
 
     async fn persist_intercepted_audit(
         &self,
-        verb: &str,
         gate_req: &GateRequest,
         audit: AuditEvent,
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
+        search_arms: crate::search_audit::SearchArms,
     ) -> Result<(), AuditObligationFailure> {
+        let verb = gate_req.verb.as_str();
         let Some(store) = &self.event_store else {
             return Ok(());
         };
-        let event = match result {
+        let success_row = self.audit_success_row_action(verb, result.ok());
+        if success_row.is_skipped() {
+            return Ok(());
+        }
+        let mut event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
                 let resource = crate::cost_unit::resource_payload(
                     verb,
@@ -451,13 +458,13 @@ impl VerbRegistry {
                 gate_req,
                 &audit,
                 EventOutcome::Success,
-                Some(crate::cost_unit::resource_payload(
+                Some(success_row.resource(crate::cost_unit::resource_payload(
                     verb,
                     &gate_req.args,
                     value,
                     || 0,
                     request_id,
-                )),
+                ))),
             )
             .with_duration_us(duration_us),
             Err(_) => build_audit_storage_event(
@@ -468,6 +475,13 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
+        match result {
+            Ok(value) => {
+                enrich_stream_truncate_success(&mut event, gate_req, value);
+                enrich_search_success(&mut event, gate_req, value, search_arms);
+            }
+            Err(error) => stamp_error_class(&mut event, error.audit_error_class()),
+        }
         let producer = if result.is_ok() {
             crate::audit_batch::AuditProducer::DispatchSucceeded
         } else {
@@ -586,6 +600,15 @@ impl VerbRegistry {
             error = %crate::secret_gate::bounded_masked_log_text(&error.to_string()),
             "gate check failed (fail-closed)"
         );
+        let failure = RuntimeError::GateUnavailable {
+            verb: gate_req.verb.clone(),
+            // Caller-visible: a stable, classified reason derived from the
+            // `GateError` variant only. `error`'s `Display` text is logged
+            // above (server-side, via `tracing::warn!`) and must never be
+            // interpolated here — a gate backend's error message can embed
+            // connection details, addresses, or credentials.
+            reason: error.wire_reason().to_string(),
+        };
         if let Some(store) = &self.event_store {
             let mut event = build_audit_storage_event(
                 gate_req,
@@ -593,6 +616,7 @@ impl VerbRegistry {
                 EventOutcome::Error,
                 Some(crate::cost_unit::base_resource_payload(request_id)),
             );
+            stamp_error_class(&mut event, failure.audit_error_class());
             if let Some(target) = effective_target {
                 event = event.with_target(target);
             }
@@ -606,15 +630,7 @@ impl VerbRegistry {
             )
             .await;
         }
-        RuntimeError::GateUnavailable {
-            verb: gate_req.verb.clone(),
-            // Caller-visible: a stable, classified reason derived from the
-            // `GateError` variant only. `error`'s `Display` text is logged
-            // above (server-side, via `tracing::warn!`) and must never be
-            // interpolated here — a gate backend's error message can embed
-            // connection details, addresses, or credentials.
-            reason: error.wire_reason().to_string(),
-        }
+        failure
     }
 
     /// Dispatch a verb to the first pack that handles it.
@@ -966,14 +982,18 @@ impl VerbRegistry {
                 let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
                     serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
                 });
-                let mut result = match definition {
-                    Ok(Some(definition)) => {
-                        pack.dispatch_mounted(&definition, verb, params, self, &token)
-                            .await
-                    }
-                    Ok(None) => pack.dispatch(verb, params, self, &token).await,
-                    Err(error) => Err(error),
-                };
+                let (mut result, search_arms) =
+                    crate::search_audit::capture(verb == "search", async {
+                        match definition {
+                            Ok(Some(definition)) => {
+                                pack.dispatch_mounted(&definition, verb, params, self, &token)
+                                    .await
+                            }
+                            Ok(None) => pack.dispatch(verb, params, self, &token).await,
+                            Err(error) => Err(error),
+                        }
+                    })
+                    .await;
                 let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
@@ -1021,6 +1041,7 @@ impl VerbRegistry {
                     || git_digest_receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected);
                 if let (true, Some(audit)) = (needs_generic_audit, deferred_audit.take()) {
                     if let Some(store) = &self.event_store {
+                        let success_row = self.audit_success_row_action(verb, result.as_ref().ok());
                         let is_link_singleton =
                             verb == "link" && gate_req.args.get("links").is_none();
                         // Read-only pass over `result` first: every arm below
@@ -1028,6 +1049,7 @@ impl VerbRegistry {
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
                         let audit_outcome: Result<(), AuditObligationFailure> = match &result {
+                            _ if success_row.is_skipped() => Ok(()),
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -1121,12 +1143,17 @@ impl VerbRegistry {
                                 let (outcome, resource) = match &result {
                                     Ok(ok_val) => (
                                         EventOutcome::Success,
-                                        Some(crate::cost_unit::resource_payload(
-                                            verb,
-                                            &gate_req.args,
-                                            ok_val,
-                                            || pack.registered_embedding_model_names().len() as i64,
-                                            request_id,
+                                        Some(success_row.resource(
+                                            crate::cost_unit::resource_payload(
+                                                verb,
+                                                &gate_req.args,
+                                                ok_val,
+                                                || {
+                                                    pack.registered_embedding_model_names().len()
+                                                        as i64
+                                                },
+                                                request_id,
+                                            ),
                                         )),
                                     ),
                                     Err(_) => (
@@ -1142,6 +1169,25 @@ impl VerbRegistry {
                                 let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Ok(value) = &result {
+                                    enrich_stream_truncate_success(
+                                        &mut storage_event,
+                                        &gate_req,
+                                        value,
+                                    );
+                                    enrich_search_success(
+                                        &mut storage_event,
+                                        &gate_req,
+                                        value,
+                                        search_arms,
+                                    );
+                                }
+                                if let Err(error) = &result {
+                                    stamp_error_class(
+                                        &mut storage_event,
+                                        error.audit_error_class(),
+                                    );
+                                }
                                 if let Some(metadata) = &mounted_audit {
                                     storage_event.payload["mounted_tool"] = metadata.clone();
                                 }
@@ -1270,6 +1316,7 @@ impl VerbRegistry {
         // `Event::new` default of 0 — no dispatch occurred to measure) so an
         // allowed-but-unknown verb is never silently dropped from the audit
         // trail (matches the "no audit row is ever dropped" contract above).
+        let failure = self.unknown_verb_error(verb);
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
                 // Dispatch is about to return `UnknownVerb` below (no pack
@@ -1277,12 +1324,13 @@ impl VerbRegistry {
                 // not `Success`. `work_class` is still stamped (ADR-103
                 // Decision (a)); `resource.cost_unit` is omitted, matching
                 // every other errored-dispatch row.
-                let storage_event = build_audit_storage_event(
+                let mut storage_event = build_audit_storage_event(
                     &gate_req,
                     &audit,
                     EventOutcome::Error,
                     Some(crate::cost_unit::base_resource_payload(request_id)),
                 );
+                stamp_error_class(&mut storage_event, failure.audit_error_class());
                 // Dispatch already returns `UnknownVerb` below regardless, so
                 // — as with the deny paths above — there is no success
                 // outcome to fold a commit failure into.
@@ -1301,9 +1349,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(DispatchError::before_dispatch(
-            self.unknown_verb_error(verb),
-        ))
+        Err(DispatchError::before_dispatch(failure))
     }
 
     /// Dispatch a verb under an out-of-band verified actor identity.

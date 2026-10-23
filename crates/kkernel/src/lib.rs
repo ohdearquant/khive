@@ -23,6 +23,7 @@ pub mod kg;
 pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
+#[cfg(feature = "repo-showcase")]
 pub mod repo;
 mod supervisor;
 pub mod sync;

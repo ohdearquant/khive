@@ -15,8 +15,6 @@ description = "Git-lifecycle pack — commit/issue/pull_request provenance notes
 contract-faults = ["khive-runtime/contract-faults"]
 
 [dependencies]
-khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
-khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool" }
 tempfile = { workspace = true }
 zeroize = "1"
 khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
@@ -33,7 +31,6 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
 blake3 = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -52,6 +49,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
+khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool" }
 rusqlite = { workspace = true, features = ["functions"] }
 khive-db = { version = "0.14.0", path = "../khive-db" }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }

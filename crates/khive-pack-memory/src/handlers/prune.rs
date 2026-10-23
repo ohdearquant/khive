@@ -10,7 +10,7 @@ use crate::ann;
 use crate::MemoryPack;
 
 use super::common::{
-    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    decode_params, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC,
 };
 
@@ -56,7 +56,7 @@ impl MemoryPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let p: PruneParams = serde_json::from_value(params).map_err(|e| {
+        let p: PruneParams = decode_params(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.prune: invalid params: {e}"))
         })?;
 
@@ -252,7 +252,7 @@ impl MemoryPack {
 
     pub(crate) async fn handle_vacuum(&self, params: Value) -> Result<Value, RuntimeError> {
         // Validate params — must be empty object or omitted.
-        let _: VacuumParams = serde_json::from_value(params).map_err(|e| {
+        let _: VacuumParams = decode_params(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.vacuum: invalid params: {e}"))
         })?;
 

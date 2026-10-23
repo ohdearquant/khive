@@ -383,7 +383,20 @@ const MEMORY_VISIBILITY_EPOCHS: &str = "memory_visibility_epochs";
 /// deletion of their outbound note. The session mirror uses provider session
 /// identities, not the IDs of caller-authored `session` notes. Neither has a
 /// route in `MoveRequest`, so retain their source attribution and report it.
-const LEAVE_BEHIND_TABLES: &[&str] = &["comm_sender_transport", "sessions", "session_messages"];
+/// Stream floors and open truncation permits name a stream, not a routed note;
+/// carrying them would change that stream's namespace identity.
+/// Authority epochs and records are grant state issued for the namespace they
+/// name. As with `tool_grants`, a row carried into a target would grant there
+/// what no administrator of the target issued, so both stay and are reported.
+const LEAVE_BEHIND_TABLES: &[&str] = &[
+    "comm_sender_transport",
+    "sessions",
+    "session_messages",
+    "note_stream_floors",
+    "note_stream_truncations",
+    "authority_epochs",
+    "authority_records",
+];
 
 /// What a move does with one namespace-bearing table.
 ///

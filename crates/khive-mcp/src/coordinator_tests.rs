@@ -1620,3 +1620,132 @@ async fn t6e_multi_backend_search_limit_u32_max_is_capped_at_100() {
         "T6e: u32::MAX must be capped at 100 before reaching the coordinator"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn multi_backend_link_uses_canonical_parameter_validation_before_writing() {
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    for invalid in [
+        r#"weight="0.5""#,
+        "weight=true",
+        "weight=[]",
+        r#"resurrect="false""#,
+        "resurrect=1",
+        r#"verbose="true""#,
+        r#"atomic="false""#,
+        "dependency_kind=7",
+        "unexpected=42",
+    ] {
+        for namespace in ["", r#", namespace="local""#] {
+            let ops = format!(
+                r#"link(source="{source}", target="{target}", kind="implements", {invalid}{namespace})"#
+            );
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let entry = first_result_entry(&server, &ops).await;
+            let (registry, _runtime) = make_registry();
+            let canonical = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg");
+            let expected = first_result_entry(&canonical, &ops).await;
+            assert_eq!(expected["ok"], json!(false), "canonical must refuse {ops}");
+            assert!(expected["error"].to_string().contains("bad params:"));
+            assert_eq!(entry["error"], expected["error"], "parameter parity: {ops}");
+            assert!(
+                !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "invalid parameters reached the coordinated write: {ops}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn multi_backend_link_keeps_valid_optional_parameters_and_help() {
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    for optional in [
+        "",
+        ", weight=null, resurrect=null, verbose=null, atomic=null",
+        ", weight=0.5, resurrect=true, verbose=false, atomic=true",
+        r#", namespace="local", metadata={"ordinary":7}, dependency_kind="artifact""#,
+    ] {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        let ops = format!(
+            r#"link(source_id="{source}", target_id="{target}", relation="implements"{optional})"#
+        );
+        first_result_entry(&server, &ops).await;
+        assert!(
+            coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+            "{ops}"
+        );
+    }
+
+    // Help precedes both admission and parameter validation on the registry path.
+    let gate = Arc::new(CapturingGate::denying());
+    let (registry, _runtime) = make_registry_with_gate(gate.clone());
+    let coord = MockCoordinator::multi_backend();
+    let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+        .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+    let ops = format!(
+        r#"link(source_id="{source}", target_id="{target}", relation="implements", weight="invalid", help=true)"#
+    );
+    let entry = first_result_entry(&server, &ops).await;
+    let (registry, _runtime) = make_registry();
+    let canonical = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg");
+    let expected = first_result_entry(&canonical, &ops).await;
+    assert_eq!(
+        entry["ok"],
+        json!(true),
+        "help must not perform the link: {entry}"
+    );
+    assert_eq!(entry["result"], expected["result"]);
+    assert!(!coord.link_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!gate
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.verb == "link"));
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn multi_backend_link_admission_still_precedes_parameter_validation() {
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let gate = Arc::new(CapturingGate::denying());
+    let (registry, _runtime) = make_registry_with_gate(gate.clone());
+    let coord = MockCoordinator::multi_backend();
+    let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+        .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+    let ops = format!(
+        r#"link(source_id="{source}", target_id="{target}", relation="implements", weight="invalid")"#
+    );
+    let entry = first_result_entry(&server, &ops).await;
+    assert_eq!(entry["ok"], json!(false));
+    assert!(
+        entry["error"]
+            .to_string()
+            .contains("denied by coordinator parity test"),
+        "{entry}"
+    );
+    assert!(
+        !entry["error"].to_string().contains("bad params:"),
+        "{entry}"
+    );
+    assert_eq!(
+        gate.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.verb == "link")
+            .count(),
+        1
+    );
+    assert!(!coord.link_called.load(std::sync::atomic::Ordering::SeqCst));
+}

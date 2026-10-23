@@ -98,6 +98,9 @@ pub(super) async fn dispatch_via_coordinator_inner(
 
     match tool {
         "link" => {
+            if args_value.get("help").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
             // Only intercept single-link form (not bulk `links` array).
             // Bulk link falls through to the registry for now.
             if args_value.get("links").is_some() {
@@ -133,6 +136,13 @@ pub(super) async fn dispatch_via_coordinator_inner(
                     args_value,
                     identity,
                     |namespace| async move {
+                        // Use the handler's schema after admission, before a coordinated write.
+                        // The registry consumes namespace before ordinary pack dispatch too.
+                        if let Some(fields) = link_args.as_object_mut() {
+                            fields.remove("namespace");
+                        }
+                        let _: khive_pack_kg::handlers::LinkParams =
+                            khive_runtime::deser_params(link_args)?;
                         // The coordinator receives the same metadata as the KG
                         // handler: a top-level dependency_kind fills the key only
                         // when metadata does not already contain it.

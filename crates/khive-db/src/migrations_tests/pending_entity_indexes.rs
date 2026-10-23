@@ -23,7 +23,7 @@ fn pending_index_migration_installs_schema_on_fresh_and_existing_databases() {
         .iter()
         .find(|migration| migration.name == NAME)
         .unwrap();
-    assert_eq!(migration.version, 62);
+    assert_eq!(migration.version, 63);
     let mut fresh = open_memory();
     run_migrations(&mut fresh).unwrap();
     assert!(table_exists(&fresh, "pending_entity_indexes"));

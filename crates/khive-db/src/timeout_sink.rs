@@ -11,8 +11,8 @@
 //! and returns immediately — it never opens a file, never creates a
 //! directory, never calls `fsync`, and never blocks on a full channel (a
 //! full channel just drops the event and bumps a counter). All of that I/O
-//! happens on a single dedicated background thread that owns the NDJSON
-//! file exclusively, so there is never a second writer to race for
+//! happens on one dedicated background thread per resolved log directory,
+//! owning its NDJSON file exclusively, so no second writer races for
 //! `O_APPEND` atomicity. Pool boot (`init`) mirrors this: it only resolves a
 //! directory path (pure, no I/O) and spawns that thread — the thread itself
 //! does the first `create_dir_all`/`open` on its own schedule, never on the
@@ -23,10 +23,12 @@
 //! file, dead process) looks identical to a healthy quiet one unless the
 //! heartbeat cadence is also checked. The sink is never initialized for an
 //! in-memory or read-only pool (neither can report a writer-admission timeout)
-//! — only a writable file-backed pool's boot claims the process-global writer
-//! thread, so `startup`/`heartbeat` rows always carry a real, writable database
-//! identity. Skipping read-only pools also prevents inspection from writing a
-//! sibling log tree or starving a later writable pool of the global claim.
+//! — only a writable file-backed pool registers with its resolved directory's
+//! writer, so `startup`/`heartbeat` rows carry a writable database identity.
+//! Skipping read-only pools prevents inspection from writing a sibling log tree.
+//! Ordinary pool Drop leaves the sink running. An explicit close handle, obtained
+//! before pool release and awaited after writer settlement, drains and joins it;
+//! new registration in that directory is refused while it is closing.
 //!
 //! A short write (the OS accepting only part of a line) is treated as
 //! TERMINAL for the sink instance rather than retried: with a single writer
@@ -89,11 +91,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::pool::{ConnectionPool, TEST_HARNESS_ENV};
+
+#[path = "timeout_sink/lifecycle.rs"]
+mod lifecycle;
+pub(crate) use lifecycle::{Registration, WriterLease};
+pub use lifecycle::{TimeoutSinkCloseError, TimeoutSinkCloseHandle};
 
 /// Default liveness cadence. A 24h-zero-timeouts claim is only valid
 /// alongside heartbeats at (at least) this cadence — see module docs.
@@ -370,9 +377,7 @@ struct WriterStageFields {
     total_micros: u64,
 }
 
-/// Process-global handle to the writer thread's inbox. Set at most once per
-/// process by [`init`] — see that function's doc comment for why an
-/// in-memory pool never claims this slot.
+/// Handle to one resolved directory's writer-thread inbox.
 struct SinkHandle {
     sender: SyncSender<QueuedEvent>,
     /// Shared with the writer thread: incremented here on a full channel
@@ -380,8 +385,6 @@ struct SinkHandle {
     /// — one counter, reported via `sink_error_summary`.
     dropped: Arc<AtomicU64>,
 }
-
-static SINK: OnceLock<SinkHandle> = OnceLock::new();
 
 #[cfg(test)]
 static SQLITE_FULL_CAPTURE: std::sync::Mutex<Option<mpsc::Sender<String>>> =
@@ -514,7 +517,7 @@ fn truncate_error(s: &str, max_bytes: usize) -> String {
 /// Push `event` onto `sender` without ever blocking. A full channel drops
 /// the event and increments `dropped` — the only failure mode a caller-side
 /// enqueue can have. Pulled out of [`emit_timeout`] so it is unit-testable
-/// against a bare channel, with no dependency on the process-global `SINK`.
+/// against a bare channel, with no dependency on the routing registry.
 fn enqueue(sender: &SyncSender<QueuedEvent>, dropped: &AtomicU64, event: QueuedEvent) {
     if sender.try_send(event).is_err() {
         dropped.fetch_add(1, Ordering::Relaxed);
@@ -795,11 +798,8 @@ fn writer_thread_loop(
     dropped: Arc<AtomicU64>,
     heartbeat_interval: Duration,
 ) {
-    // No filesystem effect without a published handle: `init` only sends
-    // this token after `SINK.set` confirms this thread's handle won the
-    // `OnceLock` race. On a lost race the sender is dropped without ever
-    // sending, this `recv` returns `Err`, and the thread exits having
-    // touched nothing on disk.
+    // No filesystem effect without a published registry entry. Registration
+    // retains this thread's join before sending its startup token.
     if go.recv().is_err() {
         return;
     }
@@ -952,75 +952,23 @@ fn pause_at_startup_barrier_for_test() {
     let _ = std::fs::write(dir.join("resumed"), b"resumed");
 }
 
-/// Initialize the process-global sink on first call from a writable file-backed
-/// pool; every later call (from another pool booting in the same process)
-/// is a cheap no-op once a sink is in place. Does no filesystem I/O itself —
-/// only path resolution (pure) plus spawning the writer thread, which does
-/// its own first `create_dir_all`/`open` on its own schedule (see module
-/// docs and [`writer_thread_loop`]). This is what keeps pool boot off the
-/// filesystem-latency hook entirely.
-///
-/// `db_parent` is the booting pool's database file's parent directory,
-/// `None` for an in-memory pool. The caller also skips this function entirely
-/// for a read-only pool. Neither kind may claim the sink: there is no possible
-/// writer timeout to report, and claiming the slot first would starve out a
-/// later writable file-backed pool. `db_identity` names the claiming pool in
-/// the `startup` row.
-pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
+/// Register a writable file-backed pool with its resolved directory's sink.
+/// This resolves paths and spawns a thread without caller-side filesystem I/O.
+/// Pools sharing the directory share its writer. Ordinary Drop keeps the sink
+/// running; explicit close refuses new registration until the old thread joins.
+/// In-memory and read-only pools do not register. Thread-allocation failure is
+/// best-effort as before; a later pool may retry initialization.
+pub(crate) fn init(
+    db_parent: Option<&Path>,
+    db_identity: &str,
+) -> Result<Option<Registration>, crate::error::SqliteError> {
     let Some(db_parent) = db_parent else {
-        return;
+        return Ok(None);
     };
-    if SINK.get().is_some() {
-        return;
-    }
     let Some(dir) = resolve_log_dir(Some(db_parent)) else {
-        return;
+        return Ok(None);
     };
-
-    let heartbeat_interval = heartbeat_interval_from_env();
-    let (sender, receiver) = mpsc::sync_channel::<QueuedEvent>(QUEUE_CAPACITY);
-    let (go_sender, go_receiver) = mpsc::sync_channel::<()>(1);
-    let dropped = Arc::new(AtomicU64::new(0));
-    let thread_dropped = Arc::clone(&dropped);
-    let db_identity = db_identity.to_string();
-
-    // Spawn the writer thread FIRST, before publishing anything through the
-    // process-global `OnceLock`. `Builder::spawn` fails when the OS can't
-    // create a new thread (resource exhaustion — the process is already at
-    // its thread-count or memory limit); if that happens here, the slot
-    // must stay unclaimed rather than get permanently wedged into "sink
-    // present, but its writer thread never actually started" — a later
-    // pool booting in the same process (by which point the transient
-    // exhaustion may have cleared) gets to retry `init` from scratch instead
-    // of inheriting a dead claim. The spawned thread does no filesystem
-    // work of its own accord: it blocks on `go_receiver` until this
-    // function sends the go token below, so spawning it here has no
-    // observable effect until publication succeeds.
-    let spawn_result = thread::Builder::new()
-        .name("khive-writer-timeout-sink".to_string())
-        .spawn(move || {
-            writer_thread_loop(
-                go_receiver,
-                receiver,
-                dir,
-                db_identity,
-                thread_dropped,
-                heartbeat_interval,
-            )
-        });
-
-    if spawn_result.is_ok() {
-        let handle = SinkHandle { sender, dropped };
-        // On a lost `OnceLock` race (another pool's `init` call published
-        // first), `handle` — and with it `sender` — is simply dropped here,
-        // and `go_sender` below is never sent, only dropped. The thread
-        // spawned above sees its `go_receiver` error on its blocking `recv`
-        // and exits immediately, having done no filesystem work; the pool
-        // that won the race already has its own thread running.
-        if SINK.set(handle).is_ok() {
-            let _ = go_sender.send(());
-        }
-    }
+    lifecycle::init(dir, db_identity)
 }
 
 /// This pool's identity string for the sink's `db` field: its canonical
@@ -1037,7 +985,7 @@ pub(crate) fn db_label(pool: &ConnectionPool) -> String {
 /// caller. A no-op if the sink was never initialized (no file-backed pool
 /// has booted yet in this process).
 pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option<u64>) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1061,7 +1009,7 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
 /// the pool mutex stage, with `site` naming the lease and `phase` the capacity
 /// phase the caller received (`CapacityUnavailable { phase: LockContended }`).
 pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1107,7 +1055,7 @@ pub(crate) fn maybe_emit_sqlite_full(db: &str, error: &(dyn std::error::Error + 
         let _ = sender.send(db.to_string());
     }
     tracing::error!(db, error = %error, "SQLite ran out of disk space during a write");
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = sqlite_full_event(db, error);
@@ -1136,7 +1084,7 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
 /// was never accepted (ADR-136 D1 gate 6a). Before this, `WriteQueueFull`
 /// reached the caller with no sink emission at all.
 pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1160,7 +1108,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
 /// permanently (ADR-136 D1 gate 6b). Before this, retirement was observable
 /// only through a `tracing::error!` line before the queue closed.
 pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1183,7 +1131,7 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
 /// then settled. `outcome` says whether the rollback restored autocommit or the
 /// writer was retired.
 pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1316,7 +1264,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
             events.push((db.to_owned(), site));
         }
     });
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1343,7 +1291,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
 pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStageObservation) {
     #[cfg(test)]
     record_slow_write_capture(db, slow_write_labels_from(stages));
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {

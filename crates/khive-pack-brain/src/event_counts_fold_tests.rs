@@ -30,6 +30,7 @@ async fn exhaustive_fold_admits_only_final_prefix_in_original_saturating_order()
     assert_eq!(
         result,
         json!({
+            "sampled_success_rows": {},
             "counts_by_kind": {"feedback_explicit": 3},
             "counts_by_actor": {"lambda:caller": 3},
             "counts_by_verb": {"memory.recall": 3},
@@ -102,7 +103,7 @@ async fn fold_preflight_refusal_and_live_shortfall_keep_exact_semantics() {
     counts.add_to_result(&mut empty, false);
     assert_eq!(
         empty,
-        json!({"counts_by_kind": {}, "counts_by_actor": {}, "counts_by_verb": {}})
+        json!({"sampled_success_rows": {}, "counts_by_kind": {}, "counts_by_actor": {}, "counts_by_verb": {}})
     );
 
     let store = GeneratedEvents::new(&[9, 8], 3, false);
@@ -164,7 +165,7 @@ fn incremental_group_and_cost_parsing_keep_empty_and_malformed_behavior() {
     counts.add_to_result(&mut result, false);
     assert_eq!(
         result,
-        json!({"counts_by_kind": {"audit": 3}, "counts_by_actor": {"a": 3},
+        json!({"sampled_success_rows": {}, "counts_by_kind": {"audit": 3}, "counts_by_actor": {"a": 3},
         "counts_by_verb": {"v": 3}, "counts_by_work_class": {"fallback": 1}})
     );
 }

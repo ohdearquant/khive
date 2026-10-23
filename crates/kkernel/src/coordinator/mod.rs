@@ -22,3 +22,6 @@ mod ranking_tests;
 mod search_profile_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod search_audit_tests;

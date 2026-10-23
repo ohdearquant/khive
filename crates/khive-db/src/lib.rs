@@ -12,6 +12,8 @@
 //! and releases the lease. The process keeps running: the host decides whether
 //! to exit.
 
+/// Transaction-scoped persistence for shared authority records.
+pub mod authority;
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
 /// Periodic WAL checkpoint task.

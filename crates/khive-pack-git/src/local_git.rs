@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use khive_pack_exec::tree::{self, TreeEntry};
+use khive_runtime::blob_tree::{self as tree, TreeEntry};
 use khive_runtime::{KhiveRuntime, RuntimeError, VerifiedBlob};
 use khive_storage::{ContentRef, MAX_BLOB_WHOLE_BYTES};
 use serde::Serialize;
@@ -735,7 +735,7 @@ pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) ->
         reader.finish().await?;
     }
     let value = tree::entries_json(&entries);
-    let manifest = serde_json::json!({"schema": "khive-tree/v1", "entries": &value});
+    let manifest = serde_json::json!({"schema": tree::TREE_SCHEMA, "entries": &value});
     if manifest.to_string().len() as u64 > tree::MAX_MANIFEST_BYTES {
         return Err(LocalGitError::new(
             "output_limit",

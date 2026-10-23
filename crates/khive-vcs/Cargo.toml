@@ -16,7 +16,7 @@ khive-types = { version = "0.14.0", path = "../khive-types" }
 khive-fs = { version = "0.14.0", path = "../khive-fs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 semver = "1"
 thiserror = { workspace = true }
 uuid = { workspace = true }

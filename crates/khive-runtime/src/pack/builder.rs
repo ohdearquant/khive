@@ -16,8 +16,8 @@ use crate::error::{
 use crate::KhiveRuntime;
 
 use super::{
-    DispatchHook, EdgeEndpointRule, EntityTypeDef, HandlerDef, PackByIdResolver, PackRuntime,
-    VerbCategory, VerbRegistry, Visibility, RESERVED_ENVELOPE_ARGS,
+    AuditSuccessRowsMode, DispatchHook, EdgeEndpointRule, EntityTypeDef, HandlerDef,
+    PackByIdResolver, PackRuntime, VerbCategory, VerbRegistry, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 #[cfg(doc)]
 use super::{PackFactory, PackRegistry};
@@ -78,6 +78,7 @@ pub struct VerbRegistryBuilder {
     /// constructs the batch seam from `event_store`. `None` uses
     /// `AuditBatchConfig::default()`.
     audit_batch_config: Option<crate::audit_batch::AuditBatchConfig>,
+    audit_success_rows_mode: Option<AuditSuccessRowsMode>,
 }
 
 impl VerbRegistryBuilder {
@@ -99,6 +100,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: false,
             dispatch_hook: None,
             audit_batch_config: None,
+            audit_success_rows_mode: None,
         }
     }
 
@@ -280,6 +282,12 @@ impl VerbRegistryBuilder {
         config: crate::audit_batch::AuditBatchConfig,
     ) -> &mut Self {
         self.audit_batch_config = Some(config);
+        self
+    }
+
+    /// Override `KHIVE_AUDIT_SUCCESS_ROWS` for this registry (ADR-103 Amendment 7).
+    pub fn with_audit_success_rows_mode(&mut self, mode: AuditSuccessRowsMode) -> &mut Self {
+        self.audit_success_rows_mode = Some(mode);
         self
     }
 
@@ -515,6 +523,36 @@ impl VerbRegistryBuilder {
             }
         }
 
+        let mut audit_success_row_omitted_verbs = HashSet::new();
+        let mut audit_success_row_sampled_verbs = HashMap::new();
+        let mut success_row_owners = HashSet::new();
+        for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
+            for handler in pack.handlers() {
+                // An earlier untrusted subhandler still owns dispatch; a later
+                // trusted declaration must not lend that handler its privileges.
+                if !success_row_owners.insert(handler.name) {
+                    continue;
+                }
+                if trusted
+                    && VerbRegistry::AUDIT_SUCCESS_ROW_OMITTED_VERBS
+                        .contains(&(pack.name(), handler.name))
+                {
+                    audit_success_row_omitted_verbs.insert(handler.name);
+                }
+                if let Some(&(_, _, every, forcing)) = VerbRegistry::AUDIT_SUCCESS_ROW_SAMPLED_VERBS
+                    .iter()
+                    .find(|&&(owner, verb, _, _)| owner == pack.name() && verb == handler.name)
+                {
+                    if trusted {
+                        audit_success_row_sampled_verbs.insert(handler.name, (every, forcing));
+                    }
+                }
+            }
+        }
+        let audit_success_rows_mode = self
+            .audit_success_rows_mode
+            .unwrap_or_else(AuditSuccessRowsMode::from_env);
+
         // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
         // once here, from the trust bit the composition root recorded at
         // registration time (never from `pack.name()`'s self-report) plus
@@ -625,6 +663,9 @@ impl VerbRegistryBuilder {
             disabled_verbs: Arc::new(disabled_verbs),
             handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
+            audit_success_rows_mode,
+            audit_success_row_omitted_verbs: Arc::new(audit_success_row_omitted_verbs),
+            audit_success_row_sampled_verbs: Arc::new(audit_success_row_sampled_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,

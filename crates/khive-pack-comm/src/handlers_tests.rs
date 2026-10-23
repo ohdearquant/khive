@@ -1281,6 +1281,7 @@ fn comm_write_response_reports_atomic_note_embedding_truncation() {
         &khive_runtime::retrieval::EmbeddingTruncationReport {
             truncated: 2,
             discarded_bytes: 18,
+            ..Default::default()
         },
     );
     assert_eq!(

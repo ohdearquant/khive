@@ -1,7 +1,7 @@
 //! Public event declaration contract; no event-store routing is exercised here.
 use khive_types::{EventKind, EventSink};
 
-const EXISTING_KIND_NAMES: [&str; 42] = [
+const EXISTING_KIND_NAMES: [&str; 43] = [
     "audit",
     "recall_executed",
     "rerank_executed",
@@ -44,6 +44,7 @@ const EXISTING_KIND_NAMES: [&str; 42] = [
     "phase_completed",
     "phase_cancelled",
     "refusal",
+    "grant_change",
 ];
 
 #[test]

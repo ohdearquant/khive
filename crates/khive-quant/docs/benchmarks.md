@@ -1,5 +1,29 @@
 # Quantization benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-quant`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                            | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------ | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `sq8_kernel/384d/GsSq8Codec::l2_sq`  | 127.582 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/384d/f32_l2sq`           | 305.455 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/384d/u8_l2sq_u32`        | 123.819 ns       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/f32_l2sq/128`    | 88.303 ns        | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/f32_l2sq/256`    | 196.991 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/f32_l2sq/384`    | 305.473 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/f32_l2sq/64`     | 38.258 ns        | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/f32_l2sq/768`    | 631.072 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/u8_l2sq_u32/128` | 42.380 ns        | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/u8_l2sq_u32/256` | 83.118 ns        | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/u8_l2sq_u32/384` | 123.774 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/u8_l2sq_u32/64`  | 22.034 ns        | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `sq8_kernel/scaling/u8_l2sq_u32/768` | 245.999 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 The Criterion targets use generated, seeded fixtures and the public scalar
 codec APIs. They need no external data or model. The existing `sq8_kernel`
 target is preserved.

@@ -612,6 +612,7 @@ impl KgPack {
                 if existing.namespace != token.namespace().as_str() {
                     return Err(foreign_restore_target(&p.id));
                 }
+                refuse_pack_registry_row(&existing, "restore")?;
                 if let Some(expected) = specific.as_ref() {
                     if existing.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(

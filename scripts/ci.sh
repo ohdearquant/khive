@@ -25,7 +25,7 @@ in_scope() {
 # Fails, rather than printing nothing, when the member list cannot be read, so a broken read never
 # turns into an unfiltered workspace command.
 scope_package_args() {
-    members=$(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
+    members=$(cargo metadata --no-deps --format-version 1 --locked | python3 -P -c '
 import json, sys
 meta = json.load(sys.stdin)
 ids = set(meta["workspace_members"])
@@ -96,6 +96,7 @@ phase_lint() {
 
     echo "=== CI Workflow Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_clippy.py"
     python3 "$SCRIPT_DIR/tests/test_ci_infra_retry.py"
 
     echo "=== CI Empty-HOME Sentinel Tests ==="
@@ -192,18 +193,23 @@ phase_no_stubs() {
 }
 
 phase_clippy() {
-    echo "=== Clippy ==="
     if scoped; then
         packages=$(scope_package_args) || return 1
         if [ -z "$packages" ]; then
             echo "scope: no workspace member is under test; clippy skipped"
             return 0
         fi
-        # shellcheck disable=SC2086
-        cargo clippy $packages --all-targets --all-features -- -D warnings
-        return
+    else
+        packages="--workspace"
     fi
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    # Optional features can hide warnings in the default configuration. Keep
+    # both checks on the same affected-package closure, with default first.
+    echo "=== Clippy (default features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets -- -D warnings || return $?
+    echo "=== Clippy (all features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets --all-features -- -D warnings
 }
 
 phase_docs() {
@@ -447,16 +453,22 @@ phase_daemon_recovery_flake() {
 }
 
 phase_no_default_features() {
-    echo "=== No-Default-Features Check ==="
-    # Check the package alone: workspace feature unification enables fold's
+    echo "=== No-Default-Features Clippy ==="
+    # Lint the package alone: workspace feature unification enables fold's
     # default serde feature through its runtime/pack dependents (#3341).
     if in_scope khive-fold; then
-        cargo check --locked -p khive-fold --no-default-features --lib
+        cargo clippy --locked -p khive-fold --no-default-features --lib -- -D warnings
         cargo test --locked -p khive-fold --no-default-features --test no_default_checkpoint
     else
         echo "scope: khive-fold is not under test; its no-default-features checks skipped"
     fi
-    cargo check --workspace --no-default-features
+    # Workspace dependents also enable khive-types features, hiding no-default test warnings.
+    if in_scope khive-types; then
+        cargo clippy --locked -p khive-types --no-default-features --all-targets -- -D warnings
+    else
+        echo "scope: khive-types is not under test; its no-default-features checks skipped"
+    fi
+    cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 }
 
 # Single source of truth for where the built kkernel binary lives: KKERNEL_BINARY

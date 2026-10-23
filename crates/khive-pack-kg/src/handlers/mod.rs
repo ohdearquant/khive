@@ -1,6 +1,7 @@
 //! KG pack verb handlers — split into one file per verb group.
 
 mod apply_changeset;
+mod attach;
 mod common;
 mod context;
 mod create;

@@ -345,6 +345,9 @@ impl VerbRegistry {
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
                 admission_unresolved_obligations_last_at_ms:
                     audit_admission_unresolved_obligation_last_at_ms(),
+                audit_success_rows_omitted: self.audit_success_rows_omitted_counts(),
+                audit_success_rows_sampled_out: self.audit_success_rows_sampled_out_counts(),
+                audit_success_rows_forced: self.audit_success_rows_forced_counts(),
             }
         })
     }
@@ -475,6 +478,13 @@ impl VerbRegistry {
         ("brain", "brain.profile"),
         ("brain", "brain.resolve"),
         ("brain", "brain.bindings"),
+        // charter (SQL reader only; compile reads the phrase registry and
+        // writes nothing, the other writers are Declarations and Directives)
+        ("charter", "charter.compile"),
+        ("charter", "charter.get"),
+        ("charter", "charter.list"),
+        ("charter", "charter.runs"),
+        ("charter", "charter.waiting"),
         // Registered rollback-mode map reads: no domain or maintenance writes.
         ("code", "code.deps"),
         ("code", "code.list"),

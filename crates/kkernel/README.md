@@ -145,10 +145,16 @@ Two feature flags gate optional functionality, both pass-through to `khive-mcp`:
 builds) and `channel-email` (SMTP/IMAP polling loop, inert without `KHIVE_EMAIL_*` env vars).
 
 The agent, telemetry and web packs are the optional features `pack-agent`, `pack-telemetry` and
-`pack-web`. All three are on by default, so a default build links the packs it always has. A build
-without one (`--no-default-features`, adding back only the packs you want) does not link that pack:
-it is absent from the pack list the server reports, and naming it in `--pack` or `KHIVE_PACKS` is
-refused as an unknown pack.
+`pack-web`. All three are off by default; enable the ones you want with `--features` (the operator
+build, `make build-local`, enables all three). A build without one does not link that pack: it is
+absent from the pack list the server reports, and naming it in `--pack` or `KHIVE_PACKS` is refused
+as an unknown pack.
+
+Two command-line features are also off by default and on in the operator build. `kg-adapters`
+adds JSON, NDJSON, CSV, TSV and BibTeX input to `kkernel kg import`; without it `kg import` reads
+native khive-kg archives and refuses any other format, named or inferred from the file extension,
+before it reads the source. `repo-showcase` adds `kkernel repo export` and `kkernel repo build`,
+which write offline repository showcase bundles.
 
 ## Where this sits
 

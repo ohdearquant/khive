@@ -6,16 +6,21 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use crate::RuntimeError;
 
 /// Deserialize a verb's JSON `params` into `T`.
 ///
 /// A failure becomes [`RuntimeError::InvalidInput`] whose text is `bad params: ` followed by the
-/// message serde reports, for example a missing required field or a field rejected by
-/// `deny_unknown_fields`.
+/// message serde reports with recognized secrets masked, for example a missing required field
+/// or a field rejected by `deny_unknown_fields`. Ordinary diagnostics remain unchanged.
 pub fn deser_params<T: DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
+    serde_json::from_value(params).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "bad params: {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &e.to_string())
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -33,7 +38,7 @@ mod tests {
         count: u32,
     }
 
-    /// The message serde itself reports for `params`, which `deser_params` must carry through.
+    /// Ordinary serde diagnostics must still pass through byte for byte.
     fn serde_message(params: &serde_json::Value) -> String {
         serde_json::from_value::<Sample>(params.clone())
             .expect_err("these params must not deserialize")
@@ -85,5 +90,79 @@ mod tests {
             count: 0,
         };
         assert_eq!(defaulted, expected_default);
+    }
+
+    fn assert_masked_decode_failure<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+        params: serde_json::Value,
+        raw: &str,
+    ) {
+        let original = serde_json::from_value::<T>(params.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            original.contains(raw),
+            "fixture must exercise an echoed operand"
+        );
+        let RuntimeError::InvalidInput(message) = deser_params::<T>(params).unwrap_err() else {
+            panic!("parameter refusal changed its error variant");
+        };
+        if raw.starts_with("sk-proj-") {
+            assert!(
+                !message.contains(raw),
+                "decoder exposed a recognized credential"
+            );
+            assert!(message.contains("***MASKED***"), "decoder omitted the mask");
+        }
+        assert_eq!(
+            message,
+            format!(
+                "bad params: {}",
+                crate::secret_gate::mask_for_redaction_surface(
+                    crate::secret_gate::RedactionSurface::GateProbe,
+                    &original
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn wrong_type_diagnostics_mask_recognized_credentials() {
+        for raw in ["bogus".to_string(), format!("sk-proj-{}", "A".repeat(80))] {
+            assert_masked_decode_failure::<Sample>(json!({"name":"alpha", "count":raw}), &raw);
+        }
+    }
+
+    #[test]
+    fn unknown_field_diagnostics_mask_recognized_credentials() {
+        for raw in ["extra".to_string(), format!("sk-proj-{}", "A".repeat(80))] {
+            let mut params = json!({"name":"alpha"});
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert(raw.clone(), json!(true));
+            assert_masked_decode_failure::<Sample>(params, &raw);
+        }
+    }
+
+    #[test]
+    fn nested_enum_diagnostics_mask_recognized_credentials() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        enum Mode {
+            Read,
+            Write,
+        }
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Nested {
+            modes: Vec<Mode>,
+        }
+        for raw in ["bogus".to_string(), format!("sk-proj-{}", "A".repeat(80))] {
+            assert_masked_decode_failure::<Nested>(json!({"modes":[raw]}), &raw);
+        }
+        assert_eq!(
+            deser_params::<Nested>(json!({"modes":["Read", "Write"]})).unwrap(),
+            Nested {
+                modes: vec![Mode::Read, Mode::Write]
+            }
+        );
     }
 }

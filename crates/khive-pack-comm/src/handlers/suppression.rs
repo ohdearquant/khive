@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -584,6 +585,7 @@ fn validate_closed_set<'a>(
     if allowed.contains(&value) {
         Ok(value)
     } else {
+        let value = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
         Err(RuntimeError::InvalidInput(format!(
             "{verb}: invalid `{field}` {value:?}; expected {}",
             allowed.join(", ")

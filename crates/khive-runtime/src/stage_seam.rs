@@ -1,4 +1,4 @@
-//! Test seam for the text stage of entity search and note search.
+//! Shared text-stage entry and test seam for entity and note search.
 //!
 //! Both searches run their text stage and their vector stage together. A test that runs a
 //! search inside `TEXT_STAGE_DOUBLE.scope(..)` replaces the text stage with a future of its
@@ -30,6 +30,7 @@ tokio::task_local! {
 
 /// Awaits `stage`, or the scoped test double in its place.
 pub(crate) async fn text_stage(stage: impl Future<Output = TextStageResult>) -> TextStageResult {
+    crate::search_audit::record(crate::search_audit::SearchArm::Text);
     #[cfg(test)]
     {
         if let Ok(double) = TEXT_STAGE_DOUBLE.try_with(Arc::clone) {

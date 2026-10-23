@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken, NotePatch, NoteUpdateEffect,
     RuntimeError,
@@ -220,12 +221,14 @@ fn resolve_due_zone(
         };
         let name = value.as_str().ok_or_else(|| {
             RuntimeError::InvalidInput(format!(
-                "{key} must be an IANA zone name string (e.g. \"America/New_York\"); got {value}"
+                "{key} must be an IANA zone name string (e.g. \"America/New_York\"); got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
             ))
         })?;
         let zone = name.parse::<chrono_tz::Tz>().map_err(|_| {
             RuntimeError::InvalidInput(format!(
-                "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
+                "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, name)
             ))
         })?;
         supplied_zone.get_or_insert(zone);
