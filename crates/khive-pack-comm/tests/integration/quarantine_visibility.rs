@@ -379,7 +379,7 @@ async fn am6_assert_readers(
 
     let neighbors = fixture.call(actor, "neighbors", json!({"id":rows.anchor,"direction":"in","relations":["annotates"],"projection":"record","limit":100})).await.unwrap();
     assert_eq!(
-        am6_ids(&neighbors["neighbors"], "node_id"),
+        am6_ids(&neighbors["neighbors"], "id"),
         *visible,
         "neighbors actor={actor:?}"
     );
@@ -483,7 +483,7 @@ async fn am6_maintainer_read_permission_does_not_authorize_reply() {
         .call(
             Some(OTHER),
             "comm.send",
-            json!({"to":MAINTAINER,"content":"ordinary reply control"}),
+            json!({"to":MAINTAINER,"content":"ordinary reply control","idempotency_key":"am6-ordinary-reply-control"}),
         )
         .await
         .unwrap();
