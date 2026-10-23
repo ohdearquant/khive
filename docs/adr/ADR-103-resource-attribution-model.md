@@ -929,7 +929,7 @@ the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_V
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
 successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
 (`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
-owning pack. Its count is taken from the code: at this revision the constant holds 65 entries. A
+owning pack. Its count is taken from the code: at this revision the constant holds 70 entries. A
 test fails when this list or this count differs from the constant, so an entry added on one side
 only cannot pass unnoticed.
 
@@ -937,6 +937,7 @@ only cannot pass unnoticed.
 - blob: `blob.get`, `blob.stat`;
 - brain: `brain.event_counts`, `brain.event_page`, `brain.profiles`, `brain.profile`,
   `brain.resolve`, `brain.bindings`;
+- charter: `charter.compile`, `charter.get`, `charter.list`, `charter.runs`, `charter.waiting`;
 - code: `code.deps`, `code.list`, `code.search`;
 - comm: `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`, `comm.thread`,
   `comm.health`, `comm.probe`;
@@ -1653,7 +1654,9 @@ For these six verbs, after this amendment:
   rows carrying `resource.sampling`), `sample_rows` (those with `selected_by = "sample"`),
   `forced_rows` (those with `selected_by = "forced"`), `unsampled_rows` (stored `Success` rows of
   the verb with no `sampling` object: rows written before this amendment or in `all` mode) and
-  `every` (the value the window's `sampling` objects carry, or null when they carry more than one).
+  `every` (the value the window's `sampling` objects carry, or null when they carry more than one
+  value or the window has no complete `sampling` object; in the second case `sample_rows` is 0 and
+  the estimate below is unaffected).
   A row whose `sampling` object lacks one of these fields or holds another value counts in `rows`
   only. The field is computed over the same authorized, filtered and fetched rows as the other
   fields (Amendment 6). When the fetch is truncated it is named `sampled_success_rows_page_scoped`,

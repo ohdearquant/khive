@@ -379,3 +379,62 @@ fn standard_policy_macos_acl_hot_cold_walks_keep_mode_bits() {
     );
     println!("ancestor-policy actual macOS ACL no/deny-only: ALLOW; grant: DENY parent_acl_grant");
 }
+
+#[test]
+fn bounded_link_reads_preserve_bytes_at_zero_growth_and_exact_caps() {
+    use khive_fs::directory_walk::{read_link_at, read_link_at_bounded, BoundedLinkRead};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStringExt;
+
+    let scratch = Scratch::new("bounded-link-bytes");
+    let base = scratch.base();
+    let mut target = vec![b'a'; 257];
+    target[128] = 0xff;
+    symlink(OsString::from_vec(target.clone()), base.join("link")).unwrap();
+    let parent = File::open(&base).unwrap();
+    let name = OsStr::new("link");
+    for (cap, observed) in [(0, 1), (127, 128), (255, 256), (256, 257)] {
+        assert_eq!(
+            read_link_at_bounded(&parent, name, cap).unwrap(),
+            BoundedLinkRead::TooLarge {
+                observed_at_least: observed
+            },
+            "cap {cap}"
+        );
+    }
+    for cap in [257, u64::MAX] {
+        assert_eq!(
+            read_link_at_bounded(&parent, name, cap).unwrap(),
+            BoundedLinkRead::Complete(target.clone()),
+            "cap {cap}"
+        );
+    }
+    assert_eq!(
+        read_link_at(&parent, name)
+            .unwrap()
+            .into_os_string()
+            .into_vec(),
+        target
+    );
+}
+
+#[test]
+fn bounded_link_reads_keep_native_errors_and_reject_path_names() {
+    use khive_fs::directory_walk::read_link_at_bounded;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let scratch = Scratch::new("bounded-link-errors");
+    let base = scratch.base();
+    std::fs::write(base.join("regular"), b"data").unwrap();
+    let parent = File::open(&base).unwrap();
+    let regular = read_link_at_bounded(&parent, OsStr::new("regular"), 8).unwrap_err();
+    assert_eq!(regular.raw_os_error(), Some(libc::EINVAL));
+    let missing = read_link_at_bounded(&parent, OsStr::new("missing"), 8).unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    for name in [b"".as_slice(), b"a/b", b"/absolute", b"a\0b"] {
+        let error = read_link_at_bounded(&parent, OsStr::from_bytes(name), 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.raw_os_error(), None);
+    }
+}

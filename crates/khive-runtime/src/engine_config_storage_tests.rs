@@ -138,6 +138,7 @@ floor_bytes = 100000000000
         }
     }
 
+    #[cfg(feature = "blob-s3")]
     #[test]
     fn test_storage_blob_s3_selection_parses() {
         let dir = tempfile::tempdir().unwrap();
@@ -171,6 +172,33 @@ prefix = "blobs"
             }
             other => panic!("expected BlobConfig::S3, got {other:?}"),
         }
+    }
+
+    #[cfg(not(feature = "blob-s3"))]
+    #[test]
+    fn test_storage_blob_s3_requires_feature_at_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+        let diagnostic_path = std::fs::canonicalize(&path).unwrap();
+        let err = KhiveConfig::load(Some(&path)).expect_err("S3 requires the blob-s3 feature");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::BlobS3FeatureDisabled),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("blob-s3"), "{message}");
+        assert!(
+            message.contains(&diagnostic_path.display().to_string()),
+            "{message}"
+        );
     }
 
     // An unknown field under [storage.blob] must be a startup error, not

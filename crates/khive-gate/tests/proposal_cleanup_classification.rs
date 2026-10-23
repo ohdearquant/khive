@@ -46,6 +46,18 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("brain.resolve", OperationAccess::Read),
     ("brain.state", OperationAccess::Read),
     ("brain.unbind", OperationAccess::Write),
+    ("charter.cancel", OperationAccess::Write),
+    ("charter.claim", OperationAccess::Write),
+    ("charter.compile", OperationAccess::Read),
+    ("charter.get", OperationAccess::Read),
+    ("charter.list", OperationAccess::Read),
+    ("charter.observe", OperationAccess::Write),
+    ("charter.publish", OperationAccess::Write),
+    ("charter.runs", OperationAccess::Read),
+    ("charter.sample", OperationAccess::Write),
+    ("charter.start", OperationAccess::Write),
+    ("charter.vocabulary", OperationAccess::Write),
+    ("charter.waiting", OperationAccess::Read),
     ("code.deps", OperationAccess::Read),
     ("code.ingest", OperationAccess::Write),
     ("code.list", OperationAccess::Read),
@@ -210,7 +222,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v22");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v23");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

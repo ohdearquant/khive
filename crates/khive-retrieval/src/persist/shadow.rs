@@ -3,7 +3,7 @@
 //! Shadow validation verifies persisted snapshots can be correctly
 //! restored without blocking production operations. Discrepancies are logged only.
 
-use rand::Rng;
+use rand::RngExt;
 
 // ---------------------------------------------------------------------------
 // Shadow Validation
@@ -83,7 +83,7 @@ pub(crate) fn should_sample(rate: f64) -> bool {
     if rate <= 0.0 {
         return false;
     }
-    rand::thread_rng().gen::<f64>() < rate
+    rand::rng().random::<f64>() < rate
 }
 
 /// Log the validation result (logging-only, non-blocking).

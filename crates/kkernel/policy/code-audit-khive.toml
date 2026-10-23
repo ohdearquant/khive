@@ -40,6 +40,7 @@ khive-quant = 0
 khive-text = 0
 khive-types = 0
 khive-wire-protocol = 0
+khive-capability = 1
 khive-changeset = 1
 khive-channel-email = 1
 khive-channel-telegram = 1
@@ -86,9 +87,9 @@ khive-pack-brain = 7
 khive-pack-exec = 7
 khive-pack-knowledge = 7
 khive-pack-memory = 7
-khive-pack-git = 8
-khive-mcp = 9
-kkernel = 10
+khive-pack-git = 6
+khive-mcp = 8
+kkernel = 9
 
 # Non-crate projects the workspace also ships and `code.ingest` resolves. The
 # npm distribution graph is a real DAG evaluated in isolation: the six

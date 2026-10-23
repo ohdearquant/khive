@@ -36,7 +36,7 @@ blake3 = { workspace = true, features = ["std"] }
 fs4 = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
-object_store = { workspace = true }
+object_store = { workspace = true, optional = true }
 bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
@@ -99,6 +99,7 @@ path = "benches/db_edge_mutations.rs"
 # Exposes the task-scoped SQLite progress probe for dependent-crate tests.
 test-support = []
 default = []
+blob-s3 = ["dep:object_store", "object_store/aws"]
 vectors = ["dep:sqlite-vec"]
 # Experimental namespace-bounded FTS5 trigram tokenizer; no schema migration.
 namespace-trigram-proto = []

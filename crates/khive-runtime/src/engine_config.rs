@@ -30,6 +30,9 @@ pub(crate) use peers::{canonical_engine_name, validate_peer_engines};
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("[storage.blob] backend = \"s3\" requires the blob-s3 feature")]
+    BlobS3FeatureDisabled,
+
     #[error(transparent)]
     Credential(#[from] crate::credentials::CredentialError),
 
@@ -577,6 +580,7 @@ fn default_pack_backend() -> String {
 // ---- Blob store config (ADR-111 Amendment 2) ----
 
 /// `[storage.blob]` section: a closed `backend = "fs" | "s3"` selector.
+/// The `s3` backend requires the opt-in `blob-s3` Cargo feature.
 ///
 /// Internally tagged on `backend` with `deny_unknown_fields`: an unknown
 /// top-level key, a field that belongs to the other backend variant (e.g.
@@ -1847,6 +1851,11 @@ impl KhiveConfig {
     /// Engine names and storage keys are unique; dimensions and weights are
     /// positive. Non-unit weights remain refused until retrieval applies them.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        #[cfg(not(feature = "blob-s3"))]
+        if matches!(&self.storage.blob, Some(BlobConfig::S3 { .. })) {
+            return Err(ConfigError::BlobS3FeatureDisabled);
+        }
+
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
