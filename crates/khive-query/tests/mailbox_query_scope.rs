@@ -871,9 +871,10 @@ fn quarantine_partition_precedes_note_limits_and_query_endpoint_hydration() {
                 "{mailbox:?}"
             );
             for offset in 0..=messages.len() {
+                let total_limit = offset + 1;
                 let query = parse(
                     QueryLanguage::Gql,
-                    &format!("MATCH (n:message) RETURN n.id SKIP {offset} LIMIT 1"),
+                    &format!("MATCH (n:message) RETURN n.id SKIP {offset} LIMIT {total_limit}"),
                 )
                 .unwrap();
                 let actual = compile_with_mailbox(&query, &options(100), &mailbox).unwrap();
