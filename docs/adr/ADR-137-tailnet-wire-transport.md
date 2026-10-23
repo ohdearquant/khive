@@ -5,23 +5,23 @@
 
 ## Context
 
-The present daemon uses a Unix-domain socket at `~/.khive/khived.sock`, accepts length-prefixed JSON frames, and checks the local peer UID reported by the operating system, as of commit `e40e0392fba5ec7f9e4c7d406b68e35799f8087c`. Source: `crates/khive-runtime/src/daemon.rs:95-106,306-320,607-678,1443-1503,1608-1651` at commit `e40e0392f`.
+At the historical e40 source revision, the daemon uses a Unix-domain socket at `~/.khive/khived.sock`, accepts length-prefixed JSON frames, and checks the local peer UID reported by the operating system, as of commit `e40e0392fba5ec7f9e4c7d406b68e35799f8087c`. Source: `crates/khive-runtime/src/daemon.rs:95-106,306-320,607-678,1443-1503,1608-1651` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
-No authenticated TCP or HTTP ingress for the khive verb surface exists in that source revision. The built-in foreground transport is MCP over stdio, and the transport registry registers `StdioTransport` only. Source: `crates/khive-mcp/src/transport.rs:34-90`; `crates/kkernel/src/cli.rs:259-283`; and `crates/khive-runtime/src/daemon.rs:95-106,1492-1503` at commit `e40e0392f`.
+No authenticated TCP or HTTP ingress for the khive verb surface exists in that source revision. The built-in foreground transport is MCP over stdio, and the transport registry registers `StdioTransport` only. Source: `crates/khive-mcp/src/transport.rs:34-90`; `crates/kkernel/src/cli.rs:259-283`; and `crates/khive-runtime/src/daemon.rs:95-106,1492-1503` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
-The existing daemon protocol accepts frame-carried `namespace`, `actor_id`, and `visible_namespaces` from the connecting process, while the Unix peer UID is the non-forgeable local fact. A remote transport must therefore establish identity at server ingress instead of trusting those frame fields. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at commit `e40e0392f`.
+At the historical e40 source revision, the daemon protocol accepts frame-carried `namespace`, `actor_id`, and `visible_namespaces` from the connecting process, while the Unix peer UID is the non-forgeable local fact. A remote transport must therefore establish identity at server ingress instead of trusting those frame fields. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
-The current request surface has two execution paths after parsing: chain mode reaches `dispatch_op`, while single and parallel modes reach `dispatch_with_identity` separately. A policy check inserted in only one path would not constrain the other path. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at commit `e40e0392f`.
+At the historical e40 source revision, the request surface has two execution paths after parsing: chain mode reaches `dispatch_op`, while single and parallel modes reach `dispatch_with_identity` separately. A policy check inserted in only one path would not constrain the other path. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
-ADR-049 establishes the warm daemon, its Unix-socket framing, and its local client recovery behavior. Source: ADR-049, Decision sections 1 through 4 and Amendment 2. ADR-109 establishes the constrained-caller policy requirements, including a closed allowlist and fail-closed gateway behavior. Source: ADR-109, Decision and Hard rules.
+ADR-049 establishes the warm daemon, its Unix-socket framing, and its local client recovery behavior. Source: ADR-049, Decision sections 1 through 4 and Amendment 2. ADR-109 proposes the constrained-caller policy requirements (corrected by Amendment 2), including a closed allowlist and fail-closed gateway behavior. Source: ADR-109, Decision and Hard rules.
 
 ## Decision
 
-khive will add a second transport for the existing frame protocol. The transport is a TCP listener that may bind only to explicitly configured tailnet interface addresses. It must not bind loopback, wildcard, public, or other non-tailnet addresses; local processes continue to use the Unix-domain socket, so a loopback TCP path would duplicate an existing authenticated local path without adding one fact to authenticate it with.
+khive will add a second transport for the existing frame protocol. (superseded by Amendment 2, Decision 3, for the shared-envelope claim) The transport is a TCP listener that may bind only to explicitly configured tailnet interface addresses. It must not bind loopback, wildcard, public, or other non-tailnet addresses; local processes continue to use the Unix-domain socket, so a loopback TCP path would duplicate an existing authenticated local path without adding one fact to authenticate it with.
 
 ### Shared protocol crate and handshake
 
-A shared Rust crate, `khive-wire-protocol`, will define framing, the handshake, frame kinds, protocol versioning, and protocol errors. Its crate documentation is the normative wire specification. Rust clients will link this crate, while non-Rust clients will implement that specification directly.
+A shared Rust crate, `khive-wire-protocol`, will define framing, the handshake, frame kinds, protocol versioning, and protocol errors. Its crate documentation is the normative wire specification. (superseded by Amendment 2, Decision 4, where Amendment 1 specifies different behaviour) Rust clients will link this crate, while non-Rust clients will implement that specification directly.
 
 The existing length-prefixed JSON framing remains the base framing. The first application frame on every TCP connection must be a `handshake` carrying a protocol version. The server answers with `handshake_ack` naming the accepted version, or with the wire error `unsupported_version` followed by connection close, before it accepts any request or subscription frame. The client must surface that rejection without fallback.
 
@@ -29,7 +29,7 @@ The protocol defines a closed set of frame kinds: `handshake`, `handshake_ack`, 
 
 ### Transport identity and actor mapping
 
-Unix-domain-socket handling remains local. It continues to derive local peer facts from the operating system credential mechanism represented by the current `SO_PEERCRED` or equivalent path. Source: `crates/khive-runtime/src/daemon.rs:306-320,1608-1651` at commit `e40e0392f`.
+Unix-domain-socket handling remains local. It continues to derive local peer facts from the operating system credential mechanism represented by the current `SO_PEERCRED` or equivalent path. Source: `crates/khive-runtime/src/daemon.rs:306-320,1608-1651` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 For a TCP connection, the server must invoke `tailscale whois` against the connecting address and derive the peer identity from the stable node identity in that server-side result — the tailnet node identifier, not the transient network address alone. The server must then resolve that node identity through an explicit server-side mapping table. A mapping row assigns the node exactly one khive actor, one peer class, one write namespace, and one visible namespace set. Failure of the lookup, absence of a mapping, or an invalid mapping must reject the connection with `identity_rejected`. An unmapped peer must never receive a default actor.
 
@@ -42,17 +42,17 @@ An operation-level `namespace` argument in the DSL is governed by a posture ever
 - A **constrained** class — the mandatory posture for every class carrying ADR-109 gateway traffic, and the default for an undeclared class — rejects every operation-level `namespace` argument with a per-operation authorization error at the DSL layer (ADR-016), and the operation executes against the server-substituted mapped namespaces. This is ADR-109's Hard rule 2 applied unmodified: a constrained caller's namespace is pinned server-side and is never caller-suppliable, by frame field or by DSL argument. Source: ADR-109, Hard rules, rule 2.
 - A **scoped** class — a posture an operator declares explicitly, intended for first-party khive processes — treats the argument as a scope selector, never an identity override: it is honored only when it names the mapped write namespace (for a mutating operation) or a member of the mapped visible namespace set (for a read), and any other value fails that operation with a per-operation authorization error, never a silent retarget.
 
-Both postures close the distinction between caller-supplied identity fields and operating-system-proven local credentials observed in the current daemon. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at commit `e40e0392f`.
+Both postures close the distinction between caller-supplied identity fields and operating-system-proven local credentials observed in the current daemon. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 The TCP transport does not add TLS inside the tailnet. This decision relies on WireGuard transport encryption supplied by the tailnet as a deployment precondition. The encryption guarantee is external to khive and is UNVERIFIED by the cited sources. Binding any non-tailnet address is out of scope for this ADR and requires a separate ADR with its own transport security decision.
 
 ### Peer classes and dispatch enforcement
 
-The server must enforce a closed allowlist for every peer class at the dispatch chokepoint before execution. A class allowlist names permitted dispatch targets and permitted subscription topics. The dispatch-target type is a closed union of two members: a registered native verb, and a canonical pinned mounted-tool identifier as defined by the outbound-mount contract of the agentic process runtime proposal (ADR-142, a companion proposal under concurrent review). A mounted identifier participates in allowlist membership, class-write validation, and the allowlist comparisons below exactly as a verb does, while remaining unreachable through ordinary request or CLI dispatch — it is a dispatcher-internal tool target, and only the runtime's own agent-loop dispatcher can present one at this chokepoint. A remote owned-agent host reaches that dispatcher only through a server-owned record attachment: an agent-context frame names a server-issued, connection-scoped attachment reference, created only at `agent.spawn` or an owner `agent.resume` on that connection and binding the frame to exactly one process record, per the record-attachment contract of the agentic process runtime proposal (ADR-142, a companion proposal under concurrent review). An ordinary `request` frame names no attachment, carries no record context, and cannot reach a mounted identifier; a frame naming an unknown, expired, or other-connection attachment is denied, fail closed. The attachment selects a record and never asserts identity — the frame's actor remains solely the connection's server-side mapping. A class write validates every named target against that union and rejects an entry that names neither a registered verb nor a currently pinned mounted identifier. A read-only peer class is defined as a mapped class whose allowlist contains only explicit read targets and permitted topics; it must not include a state-mutating dispatch target or state-mutating protocol frame. For a native verb, the distinction is a closed registered **effect classification** — `read` or `mutating` — declared as a first-class field of the verb's handler registration; a verb whose registration carries no classification is treated as `mutating`. Speech-act metadata is expressly not this predicate: the existing verb-category tag is documented as not used for permission checking, and it can diverge from real effects — `db_diagnostics` registers as assertive while its diagnostic probe issues a real `PRAGMA wal_checkpoint(PASSIVE)` [`crates/khive-types/src/pack.rs:32-36,86-90` and `crates/khive-pack-kg/src/handler_defs.rs:964-972` at commit `e40e0392f`] — so read-only validation consumes only the registered effect classification, never a category, name, or description. For a mounted identifier, no schema or description can establish an external tool's side effects, so the distinction is a pinned, operator-declared effect classification — `read` or `mutating` — recorded per pinned identifier in the mount record at registration or re-pin, per the outbound-mount contract of the agentic process runtime proposal (ADR-142, a companion proposal under concurrent review). Class-write validation for a read-only class consumes the applicable classification for both target kinds and fails closed: a native verb or mounted identifier whose classification is not `read` — including one with no classification — is rejected from a read-only class at the class write, and the shared dispatch gate re-checks the classification of every target a read-only class presents at dispatch, denying a target no longer classified `read`. Examples, symmetric across the union: a read-only class write naming the native verb `stats` is accepted (registered effect classification `read`); the same write naming the native verb `update` is rejected (`mutating`); the same write naming pinned mounted identifier `search.web_fetch` is accepted only if that identifier's pinned effect classification is `read`, and rejected if it is `mutating` or absent. The implementation carries both arms as tests.
+The server must enforce a closed allowlist for every peer class at the dispatch chokepoint before execution. A class allowlist names permitted dispatch targets and permitted subscription topics. The dispatch-target type is a closed union of two members: a registered native verb, and a canonical pinned mounted-tool identifier as defined by the outbound-mount contract of the agentic process runtime proposal (ADR-142, Accepted (corrected by Amendment 2)). A mounted identifier participates in allowlist membership, class-write validation, and the allowlist comparisons below exactly as a verb does, while remaining unreachable through ordinary request or CLI dispatch — it is a dispatcher-internal tool target, and only the runtime's own agent-loop dispatcher can present one at this chokepoint. (superseded by Amendment 2, Decision 2) A remote owned-agent host reaches that dispatcher only through a server-owned record attachment: an agent-context frame names a server-issued, connection-scoped attachment reference, created only at `agent.spawn` or an owner `agent.resume` on that connection and binding the frame to exactly one process record, per the record-attachment contract of the agentic process runtime proposal (ADR-142, Accepted (corrected by Amendment 2)). An ordinary `request` frame names no attachment, carries no record context, and cannot reach a mounted identifier (superseded by Amendment 2, Decision 2); a frame naming an unknown, expired, or other-connection attachment is denied, fail closed. Under Amendment 2, Decision 2, an ordinary request reaches a mounted identifier under the resolved caller's authorization through the single gate, and a remote peer reaches it only if its class allowlist names it. The attachment selects a record and never asserts identity — the frame's actor remains solely the connection's server-side mapping. A class write validates every named target against that union and rejects an entry that names neither a registered verb nor a currently pinned mounted identifier. A read-only peer class is defined as a mapped class whose allowlist contains only explicit read targets and permitted topics; it must not include a state-mutating dispatch target or state-mutating protocol frame. For a native verb, the distinction is a closed registered **effect classification** — `read` or `mutating` — declared as a first-class field of the verb's handler registration; a verb whose registration carries no classification is treated as `mutating`. Speech-act metadata is expressly not this predicate: the existing verb-category tag is documented as not used for permission checking, and it can diverge from real effects — `db_diagnostics` registers as assertive while its diagnostic probe issues a real `PRAGMA wal_checkpoint(PASSIVE)` [`crates/khive-types/src/pack.rs:32-36,86-90` and `crates/khive-pack-kg/src/handler_defs.rs:964-972` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2)], so read-only validation consumes only the registered effect classification, never a category, name, or description. For a mounted identifier, no schema or description can establish an external tool's side effects, so the distinction is a pinned, operator-declared effect classification — `read` or `mutating` — recorded per pinned identifier in the mount record at registration or re-pin, per the outbound-mount contract of the agentic process runtime proposal (ADR-142, Accepted (corrected by Amendment 2)). Class-write validation for a read-only class consumes the applicable classification for both target kinds and fails closed: a native verb or mounted identifier whose classification is not `read` — including one with no classification — is rejected from a read-only class at the class write, and the shared dispatch gate re-checks the classification of every target a read-only class presents at dispatch, denying a target no longer classified `read`. Examples, symmetric across the union: a read-only class write naming the native verb `stats` is accepted (registered effect classification `read`); the same write naming the native verb `update` is rejected (`mutating`); the same write naming pinned mounted identifier `search.web_fetch` is accepted only if that identifier's pinned effect classification is `read`, and rejected if it is `mutating` or absent. The implementation carries both arms as tests.
 
-Both dispatch paths are a correctness condition, not an implementation preference. The enforcement must cover chain mode through `dispatch_op` and single or parallel mode through `dispatch_with_identity`; a check that covers only one path is non-conformant. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at commit `e40e0392f`.
+Both dispatch paths are a correctness condition, not an implementation preference. The enforcement must cover chain mode through `dispatch_op` and single or parallel mode through `dispatch_with_identity`; a check that covers only one path is non-conformant. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
-The all-mode integration point must reject every parsed operation outside the mapped peer class before `run_parsed` dispatches it. This placement follows from the distinct current execution paths and is not an existing implementation. Source: `crates/khive-mcp/src/server.rs:2038-2122` and `crates/khive-mcp/src/server.rs:1031-1165` at commit `e40e0392f`.
+The all-mode integration point must reject every parsed operation outside the mapped peer class before `run_parsed` dispatches it. This placement follows from the distinct current execution paths and is not an existing implementation. Source: `crates/khive-mcp/src/server.rs:2038-2122` and `crates/khive-mcp/src/server.rs:1031-1165` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 The mapping table and class definitions are live server state, with three defined effect boundaries. First, request context: each `request` frame snapshots the connection's mapping and class at admission, as specified in "Transport identity and actor mapping", so revoking or narrowing a mapping takes effect for an already-open connection at its next request frame. Second, mapping deletion: deleting a node's mapping row terminates every open connection from that node at the change itself, with exactly one `identity_rejected` frame — eagerly rather than at the next operation, because a subscribed connection may never send another frame — and `identity_rejected` is the deletion's only terminal code, taking precedence over `subscription_revoked` even when the connection holds active subscriptions (the full abort semantics for in-flight operation ids are under "Operation correlation" and "Subscriptions"). Third, active subscriptions: when a mapping or class change short of deletion removes a topic from the allowed-topic set of a connection holding an active subscription to that topic, the server terminates that connection at the change with `subscription_revoked`; on reconnect, the client re-subscribes its remaining topics with its resume cursors, and a topic the narrowed class no longer permits is rejected per-operation with `subscription_denied`. A change that affects neither the connection's existence nor an active subscription — a verb-allowlist narrowing, for example — takes effect at the next request frame with no connection interruption.
 
@@ -68,12 +68,12 @@ This differs deliberately from ADR-049's local client behavior, which includes d
 
 ### Interop edge: inner ring and outer ring
 
-The transport surface has two rings. The **inner ring** is the native frame protocol defined above: the Unix-domain-socket and tailnet-TCP connections carrying the shared `khive-wire-protocol` framing, reserved for first-party khive processes and for constrained callers admitted under this ADR's identity and peer-class rules. Nothing outside this ADR's native framing is ever admitted to the inner ring, and internal khive processes use native frames or in-process dispatch exclusively.
+The transport surface has two rings. The **inner ring** is the native frame protocol defined above: the Unix-domain-socket and tailnet-TCP connections carrying the shared `khive-wire-protocol` framing (superseded by Amendment 2, Decision 3, for the Unix-socket envelope), reserved for first-party khive processes and for constrained callers admitted under this ADR's identity and peer-class rules. Nothing outside this ADR's native framing is ever admitted to the inner ring, and internal khive processes use native frames or in-process dispatch exclusively.
 
 The **outer ring** is a first-class, gated boundary surface, not a compatibility shim:
 
 - **Inbound.** A remotely hosted agent or MCP-speaking client reaches khive only through a standard-protocol edge adapter, which may include a Streamable-HTTP-class MCP transport as a supported product surface where a deployment enables one. The edge adapter is an in-process transport module of the daemon, in the same structural position as the native TCP listener: it terminates the standard protocol and hands each admitted invocation to the shared dispatch chokepoint through a named in-process interface that carries only server-derived caller context. The adapter has no native-frame client path, and this ADR defines no out-of-process edge relay: a relay process would either need native-frame access an edge-only mapping denies, or would authenticate as the relay's node rather than the caller's — frame-carried identity being rejected on this transport — so that topology is rejected rather than left unspecified. The adapter binds only the same explicitly configured tailnet interface addresses the native listener may bind, and accepts only direct tailnet ingress: it derives the caller's identity exclusively, per request, from the direct connection's whois-resolved node identity under the same mapping rules as the native TCP transport, must not honor forwarded-identity or other client-supplied identity headers, and trusts no reverse proxy in front of it. Consistent with the MCP specification's current revision (2026-07-28), the adapter treats every request as self-contained: it holds no cross-request session state and infers no identity, capability, or protocol-version state from a prior request. A credential a client presents at this surface terminates at this surface: it is never forwarded upstream and never becomes an internal identity input — identity is solely the server-side node mapping — which applies the current MCP token-audience and token-passthrough prohibitions at this boundary rather than a khive-local preference. Subscription and event delivery are inner-ring native-frame capabilities and do not project through this adapter: MCP revision 2026-07-28 defines a client-opened `subscriptions/listen` channel for server-to-client notifications, but no generic, replayable projection of an arbitrary topic contract — the revision removes resumable SSE `Last-Event-ID` replay. This ADR deliberately does not map khive subscriptions or events onto that bounded notification surface; an eventing surface for standard-protocol clients would be a separate decision under the MCP specification's own notification mechanisms, and this ADR does not define one. A proxied, public, or otherwise non-tailnet HTTP exposure is out of scope for this ADR and requires the separate ADR named under "Non-tailnet binding" below. The per-peer-class allowlist enforcement defined in "Peer classes and dispatch enforcement" applies to every operation the edge adapter admits; a caller admitted at this surface is a mapped, edge-only peer class like any other caller, never an implicitly trusted internal client.
-- **Outbound (deferred).** Mounting an external standard-protocol tool server as a tool source for runtime-owned agents is deliberately not defined by this transport ADR. Its registration, credential, attribution, and capability contract belongs to the agentic process runtime proposal (ADR-142, a companion proposal under concurrent review), which owns the dispatcher seam that outbound tool calls would share with ordinary verbs. Until that contract is accepted, no outbound mount is authorized by this ADR.
+- **Outbound (deferred).** Mounting an external standard-protocol tool server as a tool source for runtime-owned agents is deliberately not defined by this transport ADR. Its registration, credential, attribution, and capability contract belongs to the agentic process runtime proposal (ADR-142, Accepted (corrected by Amendment 2)), which owns the dispatcher seam that outbound tool calls would share with ordinary verbs. Until that contract is accepted, no outbound mount is authorized by this ADR.(superseded by Amendment 2, Decision 2) ADR-142 is Accepted; its 2026-09-08 amendment governs ordinary mounted-tool dispatch (corrected by Amendment 2).
 
 The inner/outer distinction is a hard boundary, stated once and applied everywhere in this ADR: a standard protocol such as MCP is never the internal fabric between first-party khive processes, and the inner ring's native framing is never exposed directly to a standard-protocol client. Enabling an inbound edge adapter for a given deployment is a configuration decision that must confirm the identity-mapping and peer-class-allowlist requirements above are satisfied before the adapter accepts a connection; it does not require a new ADR, but it does require the same server-side identity and allowlist mechanism this ADR defines for the native TCP transport.
 
@@ -81,7 +81,7 @@ The inner/outer distinction is a hard boundary, stated once and applied everywhe
 
 This ADR treats the framed protocol as a product contract, not a private daemon detail, and specifies the following wire-level mechanics normatively:
 
-- **Canonical schema.** The `khive-wire-protocol` crate's documentation is the normative wire specification, and its schema is versioned together with the handshake's protocol version; a schema change that is not backward-compatible requires a version bump.
+- **Canonical schema.** The `khive-wire-protocol` crate's documentation is the normative wire specification (superseded by Amendment 2, Decision 4, where Amendment 1 specifies different behaviour), and its schema is versioned together with the handshake's protocol version; a schema change that is not backward-compatible requires a version bump.
 - **Capability negotiation.** The `handshake` frame carries the client's supported protocol version; the server answers `handshake_ack` or rejects with `unsupported_version` before accepting any other frame, as specified above.
 - **Operation correlation.** Every `request`, `subscribe`, and `unsubscribe` frame carries a caller-generated operation id, unique across all three frame kinds for the lifetime of the connection; the server echoes that id on the operation's single terminal frame — `response` or `error` for a request, `subscribe_ack` or `error` for a subscribe, `unsubscribe_ack` or `error` for an unsubscribe — so a caller can correlate concurrent in-flight operations on one connection. A `cancel` frame references a `request` operation id only; a `cancel` naming a subscribe or unsubscribe id is treated as naming an unknown id, a no-op. The single-terminal-frame promise is scoped to operations a connection-terminal error does not interrupt: a connection-terminal error is the terminal outcome of the connection itself, it carries no operation id, and every operation id still unfinished when it is sent is aborted with the connection, with no individual echoed terminal — the one connection-terminal frame and the close are the only signal. A caller therefore treats every id unfinished at connection loss as **outcome-unknown**, on this path exactly as on a network drop: an unfinished `subscribe` or `unsubscribe` may be safely re-issued on a new connection (admission re-derives authorization, and unsubscribe of a non-subscribed topic is an idempotent no-op), while re-issuing an unfinished `request` is the caller's own idempotency decision, exactly as for any response the caller never observed.
 
@@ -170,7 +170,7 @@ MCP over stdio remains a boundary compatibility adapter for foreign agent runtim
 
 This ADR amends one specific part of ADR-109: the section "Fork (a): Process boundary" and its "Resolution (Open Question 1 - process boundary)" paragraph, which selects a thin gateway binary that "connects to the warm daemon as a client, a proxy" without specifying the transport that connection uses. This ADR supplies that transport: a tailnet-connected gateway binary connects to the daemon over this ADR's native frame protocol, with the daemon performing server-side peer-identity mapping and peer-class allowlist enforcement at the shared dispatch chokepoint, rather than through an MCP stdio or HTTP-facing remote executor. Source: ADR-109, "Fork (a): Process boundary" and its Resolution.
 
-ADR-109's "Hard rules (not forked)" 1 (closed, explicit verb allowlist), 2 (pinned, non-caller-suppliable namespace), and 6 (fail-closed on anything outside the contract) remain in force unchanged for a peer class defined by this ADR; this ADR's server-side peer-class allowlist is an additional transport-layer enforcement point, not a replacement for those rules. Rule 2 is carried concretely by the **constrained** namespace posture defined in "Transport identity and actor mapping": every class carrying ADR-109 gateway traffic is constrained, so its callers' operation-level `namespace` arguments are rejected and the server substitutes the mapped namespaces; the **scoped** posture exists only for operator-declared first-party classes outside ADR-109's constrained-caller scope. Source: ADR-109, "Hard rules (not forked)", rules 1, 2, and 6. ADR-109's separate gateway binary also remains the structural boundary for constrained processes co-resident with higher-privilege clients; this ADR's one-node-one-boundary rule above is what keeps the native listener from dissolving that boundary. Source: ADR-109, "Fork (a): Process boundary", alternative A1.
+ADR-109's "Hard rules (not forked)" 1 (closed, explicit verb allowlist), 2 (pinned, non-caller-suppliable namespace), and 6 (fail-closed on anything outside the contract) are adopted here as proposed requirements for a peer class defined by this ADR; ADR-109 itself remains Proposed (corrected by Amendment 2); this ADR's server-side peer-class allowlist is an additional transport-layer enforcement point, not a replacement for those rules. Rule 2 is carried concretely by the **constrained** namespace posture defined in "Transport identity and actor mapping": every class carrying ADR-109 gateway traffic is constrained, so its callers' operation-level `namespace` arguments are rejected and the server substitutes the mapped namespaces; the **scoped** posture exists only for operator-declared first-party classes outside ADR-109's constrained-caller scope. Source: ADR-109, "Hard rules (not forked)", rules 1, 2, and 6. ADR-109's separate gateway binary also remains the structural boundary for constrained processes co-resident with higher-privilege clients; this ADR's one-node-one-boundary rule above is what keeps the native listener from dissolving that boundary. Source: ADR-109, "Fork (a): Process boundary", alternative A1.
 
 This amendment is limited to the gateway's process-boundary transport, ingress identity, and the corresponding dispatch integration. ADR-109 remains the authority for its capability declaration format, authentication resolution, and Phase B relationship (Forks (b), (c), and (d)), which this ADR does not amend. Source: ADR-109, "Decision" and "Resolutions". A future revision of ADR-109 should add a forward reference to this ADR under its "Fork (a): Process boundary" section, naming this ADR as the source of the process-boundary transport it left open.
 
@@ -197,6 +197,9 @@ changed without a compatibility break.
 Each decision below is marked **RATIFIED** where the implemented behaviour is correct and this
 amendment records it as contract, or **CHANGED** where the contract differs from what the crate
 does today and the crate must move to match.
+
+(Amendment 2, Decision 1: RATIFIED below means the decision matches code at
+`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`; it is ratified only with the conformance matrix.)
 
 ### Framing and version
 
@@ -443,7 +446,7 @@ does today and the crate must move to match.
     version-`0` clause, so a conforming implementation cannot put a frame on the wire that a
     conforming peer must refuse. The crate currently enforces neither: the encode-side validator
     matches `Frame::Event` and performs no shape check, so `encode_frame` will emit a scalar,
-    array, or `null` payload today. A decode-only rule would leave exactly that behaviour legal,
+    array, or `null` payload at `7d6ff8fde3a801afdc16d3cd13b6410731cb03ae` (corrected by Amendment 2). A decode-only rule would leave exactly that behaviour legal,
     and the resulting split — one implementation sending what another must reject — is the
     interoperability failure this amendment exists to prevent. Both directions therefore need
     conformance vectors.
@@ -516,7 +519,7 @@ should be deleted rather than left standing as a permanent second source of trut
 ### Conformance
 
 **This is a requirement on ratification, not a description of what exists.** No vector matrix is
-checked in today. `crates/khive-wire-protocol/tests/` holds eleven golden hex fixtures, one
+checked in at `7d6ff8fde3a801afdc16d3cd13b6410731cb03ae` (corrected by Amendment 2). `crates/khive-wire-protocol/tests/` holds eleven golden hex fixtures, one
 well-formed frame per kind, and `golden_frames.rs`, which exercises those fixtures and a set of
 malformed-frame cases. That is a useful regression floor and it is not a conformance matrix: it
 carries no negative vectors for the rules this amendment changes, no independent implementation,
@@ -644,7 +647,7 @@ and a reader who never saw it can tell that the decision above has been touched 
 
 ## Consequences
 
-The daemon gains a location-transparent wire transport while retaining one framing and dispatch contract. The shared crate makes version and frame-kind changes reviewable as protocol changes instead of client-specific conventions.
+The daemon gains a location-transparent wire transport while retaining one framing and dispatch contract. (superseded by Amendment 2, Decision 3, for the shared-envelope claim) The shared crate makes version and frame-kind changes reviewable as protocol changes instead of client-specific conventions.
 
 The server becomes responsible for remote identity proof, actor mapping, and peer-class admission. This increases operational responsibility for the mapping table and for availability of `tailscale whois`, but it prevents a remote caller from selecting an actor through frame content, and the one-node-one-boundary rule makes node placement of processes an explicit deployment decision rather than an implicit trust grant.
 
@@ -661,19 +664,19 @@ No general public-network listener is introduced. A deployment that needs a non-
 
 ### HTTP or HTTPS projection as the remote execution surface
 
-This alternative is rejected because it would add a second request projection and a second internal protocol boundary. The cited source revision has no HTTP route table or product HTTP ingress, so this alternative would be new surface rather than an extension of the daemon's existing frames. Source: `crates/khive-mcp/src/transport.rs:34-90`; `crates/khive-runtime/src/daemon.rs:95-106,1492-1503`; and `crates/kkernel/src/cli.rs:259-283` at commit `e40e0392f`.
+This alternative is rejected because it would add a second request projection and a second internal protocol boundary. The cited source revision has no HTTP route table or product HTTP ingress, so this alternative would be new surface rather than an extension of the daemon's existing frames. Source: `crates/khive-mcp/src/transport.rs:34-90`; `crates/khive-runtime/src/daemon.rs:95-106,1492-1503`; and `crates/kkernel/src/cli.rs:259-283` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 ### MCP as the internal fabric
 
-This alternative is rejected because the existing MCP surface is stdio transport and does not provide a remote authenticated frame transport in the cited source revision. MCP remains appropriate as a compatibility adapter at the boundary. Source: `crates/khive-mcp/src/transport.rs:34-90` at commit `e40e0392f`.
+This alternative is rejected because the existing MCP surface is stdio transport and does not provide a remote authenticated frame transport in the cited source revision. MCP remains appropriate as a compatibility adapter at the boundary. Source: `crates/khive-mcp/src/transport.rs:34-90` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 ### Client-asserted remote actor identity
 
-This alternative is rejected because the current daemon accepts the relevant identity fields from the connecting process. A remote caller could otherwise assert a different actor or namespace. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at commit `e40e0392f`.
+This alternative is rejected because the current daemon accepts the relevant identity fields from the connecting process. A remote caller could otherwise assert a different actor or namespace. Source: `crates/khive-runtime/src/daemon.rs:306-320,1055-1081` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 ### A policy check in one dispatch path
 
-This alternative is rejected because chain execution and single or parallel execution follow distinct paths before registry dispatch. A one-path check would leave a route outside the peer-class allowlist. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at commit `e40e0392f`.
+This alternative is rejected because chain execution and single or parallel execution follow distinct paths before registry dispatch. A one-path check would leave a route outside the peer-class allowlist. Source: `crates/khive-mcp/src/server.rs:1031-1165,2038-2122` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
 
 ### Loopback TCP binding
 
@@ -685,4 +688,198 @@ This alternative is rejected because it would make a remote endpoint failure cap
 
 ### Non-tailnet binding
 
-This alternative is rejected because this ADR does not define public-network authentication or transport-security controls. The absence of a current TCP product listener is measured, but the security requirements for a future public listener are UNVERIFIED and require a separate ADR. Source: `crates/khive-runtime/src/daemon.rs:95-106,1492-1503` at commit `e40e0392f`.
+This alternative is rejected because this ADR does not define public-network authentication or transport-security controls. The absence of a current TCP product listener is measured, but the security requirements for a future public listener are UNVERIFIED and require a separate ADR. Source: `crates/khive-runtime/src/daemon.rs:95-106,1492-1503` at historical commit `e40e0392f` (e40-only; corrected by Amendment 2).
+
+## Amendment 2 (2026-10-23) -- Conformance gate, mounted dispatch, and TCP translation
+
+**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
+does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#5579](https://github.com/ohdearquant/khive/issues/5579).
+
+**Trigger.** Source agreement and ratification were conflated despite Amendment 1's conformance gate
+(`docs/adr/ADR-137-tailnet-wire-transport.md:197-202,530-532`). Mounted identifiers are ordinary routes under
+ADR-142's accepted 2026-09-08 amendment (`docs/adr/ADR-142-agentic-process-runtime.md:260-293`), contradicting the
+earlier dispatch restriction. The local daemon and wire crate also define different envelopes
+(`crates/khive-runtime/src/daemon/wire_frames.rs:13-114,212-261`;
+`crates/khive-wire-protocol/src/frame.rs:111-165`). The following rules distinguish those contracts and retain the
+implementation fences. Unless explicitly marked historical, source citations in this amendment refer to
+`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`.
+
+### Decision 1 -- Source agreement does not waive ratification
+
+Amendment 1's ratification gate is kept without waiver. Its unchanged decisions keep the label RATIFIED, which this amendment defines as "matches code at
+`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`; ratified with the conformance matrix". The second clause is conditional:
+neither the label nor this amendment declares ratification. The label text itself is unchanged because the derived
+passages and the displacement table key on it (`scripts/lint-adr-137-displacements.py`). The vector set under
+`crates/khive-wire-protocol/tests/`, with a runner, is the first child of #5579. The runner must execute the matrix
+against the Rust crate and at least one independent JSON implementation, with the stages, endpoint roles, agreement
+criteria, and coverage already required by Amendment 1 (`docs/adr/ADR-137-tailnet-wire-transport.md:542-593`).
+
+The existing golden tests exercise canonical frames and malformed inputs
+(`crates/khive-wire-protocol/tests/golden_frames.rs:49-62,223-277`). They do not replace that matrix. Source agreement
+for the five unchanged decisions is supported by the version floor
+(`crates/khive-wire-protocol/src/version.rs:39-68`), frame ceiling
+(`crates/khive-wire-protocol/src/codec.rs:36,375-395,423-453`), operation-id validation
+(`crates/khive-wire-protocol/src/frame.rs:51-58`), and string-typed topics and timestamps
+(`crates/khive-wire-protocol/src/frame.rs:177-239`). This distinction prevents a source observation from being treated
+as cross-implementation conformance.
+
+### Decision 2 -- Ordinary mounted identifiers use caller authorization
+
+[ADR-142's 2026-09-08 amendment](ADR-142-agentic-process-runtime.md#amendment-ordinary-mounted-tool-dispatch-2026-09-08)
+governs mounted-tool reachability. A configured, pinned `<mount>.<tool>` is reachable through ordinary `request(ops)`
+and `kkernel exec` under the resolved caller's authorization through the same single gate as native verbs. A remote
+peer may reach that identifier only if its class allowlist names it. An ordinary request does not require a process
+attachment to invoke a mounted identifier. Record attachment remains a separate process-context contract.
+
+This supersedes the structural unreachability and attachment-only restrictions in the base "Peer classes and dispatch
+enforcement" section. It preserves the class allowlist, pinned effect classification, and revalidation requirements.
+ADR-142 is Accepted (`docs/adr/ADR-142-agentic-process-runtime.md:3,260-293`); its ordinary dispatch route is already
+represented by the shared gate and mounted dispatch branch
+(`crates/khive-runtime/src/pack/dispatch.rs:713-724,932-990`) and the ordinary MCP request assertions
+(`crates/khive-mcp/tests/mounts.rs:147-174`). Those assertions do not establish remote class enforcement.
+
+Both execution paths must enforce the remote class restriction before execution. Their current registry calls are in
+`crates/khive-mcp/src/server/execution.rs:293,571`; chain execution also enters through `dispatch_op` at lines 687 and
+942 of that file. ADR-142 carries a reciprocal reference to this decision so ordinary reachability cannot be read as
+unconditional remote permission.
+
+### Decision 3 -- Translate TCP requests at the dispatch boundary
+
+The crate's frames govern the TCP transport only. The local Unix socket retains `DaemonRequestFrame` and
+`DaemonResponseFrame`; replacing those envelopes is out of scope. The separate events protocol, including
+`EVENTS_PROTOCOL_VERSION = 6`, is also out of scope (`crates/khive-runtime/src/events_split/paths.rs:20`;
+`crates/khive-runtime/src/events_split/server.rs:11-34`). Local IPC version 8
+(`crates/khive-runtime/src/daemon.rs:126`) and crate protocol version 1
+(`crates/khive-wire-protocol/src/version.rs:39`) are separate version domains.
+
+The TCP listener admits a crate request, resolves its mapped identity and class snapshot, then translates it into the
+internal dispatch reached by the local socket. The local call site supplies a `RequestIdentity` and calls
+`dispatch_with_error_detail` (`crates/khive-runtime/src/daemon/connection.rs:416-451`); the MCP implementation reaches
+`dispatch_request_inner` (`crates/khive-mcp/src/daemon/dispatch.rs:59-82`). Translation shares dispatch, not local
+socket admission or local recovery. In particular, frame-carried identity is rejected with `context_rejected` before dispatch;
+the mapped fields are supplied server-side, never copied from those wire overrides.
+
+#4959 is re-scoped to this translation and folds into #4961. The combined work depends on Amendment 1 Decisions 4, 5,
+6, 9, and 10. There is no waiver of the first-consumer fence
+(`docs/adr/ADR-137-tailnet-wire-transport.md:510-517`). Extending a wire envelope with local-only fields is not a
+translation: the payload structs reject unknown fields (`crates/khive-wire-protocol/src/frame.rs:113,141,153`).
+
+#### Request field table
+
+Each row covers one field of `DaemonRequestFrame`. Fixed values below are inputs to the proposed TCP translation, not
+a claim that a TCP listener already supplies them. A value derived from server state is identified separately from a
+literal constant. OPEN marks a mapping that is not settled by this amendment.
+
+| Local field and type                               | TCP counterpart or server-side value                                                                   | Reason and source                                                                                                                                                                                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ops: String`                                      | `request.ops: String`, unchanged.                                                                      | Shared DSL input. `crates/khive-runtime/src/daemon/wire_frames.rs:14`; `crates/khive-wire-protocol/src/frame.rs:118`.                                                                                                                 |
+| `plan: bool`                                       | `false`.                                                                                               | A wire request executes the DSL; local plan-only admission bypasses dispatch. `crates/khive-runtime/src/daemon/connection.rs:305-318`.                                                                                                |
+| `presentation: Option<String>`                     | `Some("verbose")`.                                                                                     | Preserve the full result instead of applying the local default's presentation trimming. `crates/khive-mcp/src/server/rendering.rs:208-215`; `crates/khive-types/src/pack.rs:207-213`.                                                 |
+| `presentation_per_op: Option<Vec<Option<String>>>` | `None`.                                                                                                | No wire counterpart; all operations use the fixed presentation. `crates/khive-mcp/src/server/rendering.rs:416-420`.                                                                                                                   |
+| `namespace: String`                                | Mapped write namespace from the admission snapshot. Reject any `request.namespace`.                    | Identity is server-derived. `crates/khive-runtime/src/daemon/wire_frames.rs:27`; `crates/khive-wire-protocol/src/frame.rs:124-129`.                                                                                                   |
+| `actor_id: Option<String>`                         | `Some(mapped_actor)` from the same snapshot. Reject any `request.actor_id`.                            | No anonymous fallback for an unmapped peer. `crates/khive-runtime/src/daemon/wire_frames.rs:28-33`; `crates/khive-wire-protocol/src/frame.rs:130-132`.                                                                                |
+| `process_ref: Option<String>`                      | `None`.                                                                                                | An ordinary remote request carries no attested originating-process reference; do not attribute it to the daemon process. `crates/khive-runtime/src/daemon/wire_frames.rs:34-40`; `crates/khive-runtime/src/pack/dispatch.rs:927-930`. |
+| `visible_namespaces: Vec<String>`                  | Mapped visible set from the same snapshot. Reject any `request.visible_namespaces`.                    | The client cannot widen visibility. `crates/khive-runtime/src/daemon/wire_frames.rs:41-49`; `crates/khive-wire-protocol/src/frame.rs:133-136`.                                                                                        |
+| `config_id: String`                                | The serving dispatcher's own `config_id()`, if an internal local frame is materialized.                | Local engine-coherence admission is not remote identity or remote configuration negotiation. `crates/khive-runtime/src/daemon/connection.rs:170,286`; `crates/khive-mcp/src/daemon/dispatch.rs:97-99`.                                |
+| `protocol_version: u32`                            | The serving daemon's `PROTOCOL_VERSION` (8 at the cited revision), if materialized internally.         | Never copy the independently negotiated crate version. `crates/khive-runtime/src/daemon.rs:126`; `crates/khive-runtime/src/daemon/connection.rs:171-175`.                                                                             |
+| `probe_only: bool`                                 | `false`.                                                                                               | A remote request cannot select local recovery probes. `crates/khive-runtime/src/daemon/connection.rs:319-335`.                                                                                                                        |
+| `metrics_only: bool`                               | `false`.                                                                                               | A remote request cannot select the process-global metrics bypass. `crates/khive-runtime/src/daemon/connection.rs:249-276`.                                                                                                            |
+| `format: Option<String>`                           | `Some("json")`.                                                                                        | `response.result` is a JSON value, so a local text/table default cannot choose its representation. `crates/khive-mcp/src/server/rendering.rs:222-230`; `crates/khive-wire-protocol/src/frame.rs:148`.                                 |
+| `format_per_op: Option<Vec<Option<String>>>`       | `None`.                                                                                                | No wire counterpart; use the fixed JSON format throughout the result. `crates/khive-mcp/src/server/rendering.rs:406-410`.                                                                                                             |
+| `from_wire: bool`                                  | `true`.                                                                                                | Remote ingress must not inherit the trusted local operator bypass for subhandlers. `crates/khive-runtime/src/daemon/wire_frames.rs:90-101`; `crates/khive-mcp/src/server/execution.rs:271,532`.                                       |
+| `request_id: Option<u64>`                          | OPEN for internal audit correlation. Retain `request.id: OperationId` separately for wire correlation. | An arbitrary non-empty string has no lossless fixed `u64` conversion; allocation/association is unspecified. `crates/khive-runtime/src/daemon/wire_frames.rs:102-113`; `crates/khive-wire-protocol/src/frame.rs:25,51-58,116`.        |
+
+The wire-only `request.id` is connection-scoped state and is echoed unchanged on the terminal wire frame. It is not
+parsed, truncated, or hashed into the local numeric correlation field by this decision. `request.deadline_ms` remains
+listener/execution state with the operation-boundary semantics in "Deadlines and cancellation"; it has no local frame
+field (`crates/khive-wire-protocol/src/frame.rs:119-123`). These controls must survive translation even though they are
+not arguments of the current `DaemonDispatch` method (`crates/khive-runtime/src/daemon/dispatch_trait.rs:58-78`).
+
+#### Response field table
+
+These rows describe the relationship to a local response if one is materialized. The TCP listener emits crate frames,
+not a serialized `DaemonResponseFrame`. Dynamic outcomes cannot safely be replaced with fixed success values.
+
+| Local field and type                      | TCP counterpart or server-side disposition                                                                                             | Reason and source                                                                                                                                                                                                                          |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ok: bool`                                | Select a successful `response` or a classified failure; no copied envelope member. OPEN for unclassified dispatch failures.            | Local transport success is distinct from each DSL operation's `ok`. `crates/khive-runtime/src/daemon/connection.rs:464-495`; `crates/khive-wire-protocol/src/error.rs:3-6`.                                                                |
+| `result: Option<String>`                  | The JSON dispatch aggregate becomes `response.result`, without quoting it as a JSON string.                                            | Fixed JSON output supplies the value; preserve opaque bytes under Amendment 1 Decision 9 and remove private daemon markers. `crates/khive-runtime/src/daemon/wire_frames.rs:263-295`; `crates/khive-wire-protocol/src/frame.rs:139-148`.   |
+| `error: Option<String>`                   | `error.message` only for a classified wire failure; DSL failures stay in `response.result`. OPEN for a total dispatch-failure mapping. | Text does not determine a closed wire code or terminal scope. `crates/khive-wire-protocol/src/frame.rs:151-165`; `crates/khive-wire-protocol/src/error.rs:3-6,117-134`.                                                                    |
+| `error_detail: Option<serde_json::Value>` | OPEN. No wire error-field counterpart and no safe fixed replacement for failure metadata.                                              | Metadata can carry domain disposition and committed results; the successful lexical-timeout diagnostic is local-only. `crates/khive-runtime/src/daemon/wire_frames.rs:154-206,216-220`; `crates/khive-wire-protocol/src/frame.rs:153-165`. |
+| `namespace_mismatch: bool`                | No wire member; `false` for an admitted translated request.                                                                            | Mapped identity is validated before dispatch; local mismatch fallback is not a remote control. `crates/khive-runtime/src/daemon/connection.rs:278-285,472`.                                                                                |
+| `config_mismatch: bool`                   | No wire member; `false` for an admitted translated request.                                                                            | The listener selects its serving dispatcher, not a client engine configuration. `crates/khive-runtime/src/daemon/connection.rs:286-303,473`.                                                                                               |
+| `served_config_id: Option<String>`        | No wire member; serving configuration remains server-side.                                                                             | No local fallback or config negotiation is added to the remote protocol. `crates/khive-runtime/src/daemon/wire_frames.rs:227-234`.                                                                                                         |
+| `version_mismatch: bool`                  | No wire member; `false` for an admitted internal dispatch.                                                                             | TCP version refusal uses handshake `unsupported_version`, not a local IPC flag. `crates/khive-runtime/src/daemon/wire_frames.rs:235-240`; `crates/khive-wire-protocol/src/handshake.rs:175-195`.                                           |
+| `daemon_protocol_version: u32`            | No wire member; local version stays server-side. `handshake_ack.version` is the crate version.                                         | Separate version domains cannot be equated. `crates/khive-runtime/src/daemon/wire_frames.rs:241-245`; `crates/khive-wire-protocol/src/frame.rs:106-108`.                                                                                   |
+| `metrics: Option<MetricsSnapshot>`        | `None`; no wire counterpart.                                                                                                           | The request fixes `metrics_only = false`. `crates/khive-runtime/src/daemon/wire_frames.rs:246-252`.                                                                                                                                        |
+| `request_id: Option<u64>`                 | OPEN for internal audit echo; wire `response.id` or request-terminal `error.id` echoes the saved string operation id.                  | Local numeric audit correlation cannot substitute for wire correlation. `crates/khive-runtime/src/daemon/wire_frames.rs:253-260`; `crates/khive-wire-protocol/src/frame.rs:143-159`.                                                       |
+
+The OPEN rows require an explicit translation contract before #4961 can implement them. In particular, assigning
+`internal` to every local failure would not establish where structured domain-outcome information belongs. This
+amendment adds neither a wire error field nor a new error code to conceal that gap. Grammar extensions remain subject
+to the versioning rule (`crates/khive-wire-protocol/src/version.rs:8-11`).
+
+```mermaid
+flowchart LR
+    TCP[TCP crate frames] --> Admission[Handshake and mapped class admission]
+    Admission --> Translation[Field translation]
+    Translation --> Dispatch[Shared internal dispatch and gate]
+    Unix[Local daemon frames] --> Local[Unix admission]
+    Local --> Dispatch
+    Events[Events IPC version 6]
+```
+
+```mermaid
+sequenceDiagram
+    participant C as TCP client
+    participant L as TCP listener
+    participant D as Shared dispatch
+    C->>L: handshake(version)
+    L-->>C: handshake_ack(version) or terminal error
+    C->>L: request(id, ops, deadline_ms?)
+    L->>L: Snapshot mapping and class; reject context overrides
+    L->>L: Retain wire id; apply field table
+    L->>D: Authorized ops with mapped context
+    D-->>L: Dispatch aggregate or failure
+    L-->>C: response(id, result) or classified error
+```
+
+### Decision 4 -- Correct status and source precedence
+
+ADR-142's status is Accepted; ADR-109's status is Proposed
+(`docs/adr/ADR-142-agentic-process-runtime.md:3`; `docs/adr/ADR-109-sandboxed-kkernel-gateway.md:3`). References to
+ADR-109's rules therefore describe this ADR's adoption of proposed requirements, not prior ratification of ADR-109.
+The base crate-specification sentences point to Amendment 1's precedence: where its Decisions 1, 4, 5, 6, 9, or 10
+conflict with crate documentation, those decisions govern. That pointer changes neither amendment's status.
+
+The e40 citations in the base record are historical e40-only evidence. Current dispatch entry points are
+`crates/khive-mcp/src/server/request_dispatch.rs:382` and `crates/khive-mcp/src/server/execution.rs:293,571,687,942`.
+Current local identity construction is `crates/khive-runtime/src/daemon/connection.rs:416-422`, and local peer
+credential retrieval is `crates/khive-runtime/src/daemon/locks.rs:173-205`. These locations replace no historical
+claim about a different revision.
+
+The codec documentation's frame-cap citation must name `crates/khive-runtime/src/daemon.rs:116`, not the obsolete
+line 38 (`crates/khive-wire-protocol/src/codec.rs:30`). The handshake documentation's dangling section reference must
+point to Amendment 1, Decision 6 (`crates/khive-wire-protocol/src/handshake.rs:85-88`), which specifies the violation
+code and role coverage. These are documentation corrections, not changes to executable behaviour.
+
+### Acceptance
+
+The following are acceptance obligations, not assertions that the required implementation or conformance run exists.
+Named new tests are required cases for the indicated suite; they are not claimed as existing test functions.
+
+| ID  | Statement                                                                                                                                                                                                   | Evidence                                                                                                                                                                                       |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1  | Amendment 1 retains its matrix gate; source-agreement labels do not assert ratification.                                                                                                                    | `docs/adr/ADR-137-tailnet-wire-transport.md`, Amendment 1 "Conformance" and Amendment 2 Decision 1.                                                                                            |
+| A2  | #5579's first child supplies a stage-aware, role-aware vector set and executable runner, with Rust and independent JSON results agreeing on every required criterion.                                       | #5579; `crates/khive-wire-protocol/tests/`; runner output for Amendment 1's complete vector set.                                                                                               |
+| A3  | D4 rejects duplicate and explicit-null envelope members, D5 rejects id-less unknown codes, D6 covers both roles, D9 preserves opaque spans, and D10 rejects non-object event payloads at decode and encode. | Required conformance cases under `crates/khive-wire-protocol/tests/`; runner results for each named decision.                                                                                  |
+| A4  | Ordinary mounted calls resolve under caller authorization; ADR-142 and this record cross-link the governing rules.                                                                                          | `crates/khive-mcp/tests/mounts.rs:147-174`; both ADRs' mounted-dispatch amendments.                                                                                                            |
+| A5  | A remote mounted call executes only when named by its class allowlist in single, parallel, and chain modes; a denied call causes no mounted invocation.                                                     | Required #4962 integration cases at both call paths in `crates/khive-mcp/src/server/execution.rs:293,571`.                                                                                     |
+| A6  | TCP uses crate envelopes; local socket and events IPC retain their separate envelopes and version domains.                                                                                                  | Required #4961 translation cases; `crates/khive-runtime/src/daemon/wire_frames.rs`; `crates/khive-runtime/src/events_split/paths.rs:20`.                                                       |
+| A7  | Every request and response field has the table's disposition; OPEN audit-correlation and structured-failure mappings are explicitly resolved before dependent translation.                                  | Required #4961 suite `crates/khive-runtime/tests/adr137_tcp_translation.rs`, covering all 16 request fields and 11 response fields against this record's resolved table.                       |
+| A8  | Identity overrides return `context_rejected`; admitted operations use the mapped actor and namespaces, including after mapping changes.                                                                     | Required #4961/#4962 mapped-context cases against `crates/khive-runtime/src/pack/dispatch.rs:879-930`.                                                                                         |
+| A9  | Arbitrary string wire ids survive response/error correlation; `deadline_ms` and cancellation retain operation-boundary semantics; local recovery is never selected.                                         | Required suites `crates/khive-runtime/tests/adr137_tcp_translation.rs` (#4961) and `crates/khive-mcp/tests/adr137_remote_endpoint.rs` (#4963), including nonnumeric ids and endpoint failures. |
+| A10 | #4959 is translation work folded into #4961, and the first consumer depends on D4, D5, D6, D9, and D10 without waiver.                                                                                      | #5579, #4959, #4961 dependency and acceptance text; `docs/adr/ADR-137-tailnet-wire-transport.md`, Amendment 1 "Implementation fences".                                                         |
+| A11 | Status, precedence, historical-source, frame-cap, and handshake references resolve to their stated targets.                                                                                                 | This record, Decision 4; `crates/khive-wire-protocol/src/codec.rs`; `crates/khive-wire-protocol/src/handshake.rs`; ADR-109 and ADR-142 status lines.                                           |
