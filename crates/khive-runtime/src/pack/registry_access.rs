@@ -345,6 +345,9 @@ impl VerbRegistry {
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
                 admission_unresolved_obligations_last_at_ms:
                     audit_admission_unresolved_obligation_last_at_ms(),
+                audit_success_rows_omitted: self.audit_success_rows_omitted_counts(),
+                audit_success_rows_sampled_out: self.audit_success_rows_sampled_out_counts(),
+                audit_success_rows_forced: self.audit_success_rows_forced_counts(),
             }
         })
     }

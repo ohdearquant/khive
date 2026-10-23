@@ -290,3 +290,7 @@ mod gate_argument_contract_tests;
 #[cfg(test)]
 #[path = "pack/audit_success_rows_tests.rs"]
 mod audit_success_rows_tests;
+
+#[cfg(test)]
+#[path = "pack/audit_success_rows_metrics_tests.rs"]
+mod audit_success_rows_metrics_tests;
