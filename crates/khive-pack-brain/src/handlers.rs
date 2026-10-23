@@ -101,6 +101,11 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             Only that ordered pair is supported; omission/null adds no cross. Grouping reuses the \
             existing actor scope and event-row caps, with no distinct-cell budget. Use kind=\"audit\" \
             for a dispatch-audit census and exhaustive=true when the complete window is needed. \
+            Non-success audit rows additionally split by their known payload.error_class in \
+            counts_by_error_class; missing, malformed or unknown classes contribute only to \
+            unclassified_error_count. Both keys are absent when no failed audit row was read, \
+            and both use a _page_scoped suffix when truncated. Success and non-audit rows \
+            never contribute, even if their payload carries error_class. Stored rows are unchanged. \
             feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \

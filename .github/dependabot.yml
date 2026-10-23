@@ -1,0 +1,34 @@
+# Security updates only. open-pull-requests-limit: 0 turns version updates off for each ecosystem, while
+# Dependabot still opens a pull request for every published advisory against a locked dependency, grouped
+# into one pull request per ecosystem. cargo-deny in CI remains the gate on every pull request.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - /crates
+      - /crates/khive-merge
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /apps/kg-editor
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
