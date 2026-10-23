@@ -518,7 +518,7 @@ fn validate_draft(catalog: &ClosedCatalog, grant: &EnvelopeDraft) -> EnvelopeRes
             ))
         }
     }
-    catalog.validate_rights(&grant.rights, &grant.namespace, &grant.grantee)?;
+    let _ = catalog.validate_rights(&grant.rights, &grant.namespace, &grant.grantee)?;
     Ok(())
 }
 pub(super) fn issuance_alias(id: Uuid) -> u128 {

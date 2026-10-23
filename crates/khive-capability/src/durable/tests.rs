@@ -30,7 +30,7 @@ fn old_tag(body: &GrantBody, original: &[u8]) -> Vec<u8> {
 fn v1_permission_contract_is_closed() {
     let catalog = catalog();
     let alice = principal("alice");
-    catalog
+    let _ = catalog
         .validate_rights(&ro(permission()), "research", &alice)
         .unwrap();
     let mut p = permission();
@@ -40,7 +40,7 @@ fn v1_permission_contract_is_closed() {
         source: source_binding(),
         response_contract: contract("response", 6),
     };
-    catalog
+    let _ = catalog
         .validate_rights(&ro(p.clone()), "research", &alice)
         .unwrap();
     let accepted = p.clone();
@@ -115,7 +115,7 @@ fn actor_report_pins_full_contract_and_source_is_not_producer() {
     c.push(entry(alternate.clone(), ProducerClass::Actor));
     let catalog = ClosedCatalog::provision(a, b, c, d, e).unwrap();
     let rights = ro(actor_report());
-    catalog
+    let _ = catalog
         .validate_rights(&rights, "research", &principal("alice"))
         .unwrap();
     assert!(catalog
@@ -137,7 +137,7 @@ fn actor_report_pins_full_contract_and_source_is_not_producer() {
             permissions: vec![actor_report()],
         }),
     });
-    catalog
+    let _ = catalog
         .validate_rights(&[admin], "research", &principal("administrator"))
         .unwrap();
 }
@@ -162,7 +162,7 @@ fn action() -> ObservationPermission {
 #[test]
 fn registration_defensively_rejects_ambiguous_action_occurrence() {
     let catalog = catalog();
-    catalog
+    let _ = catalog
         .validate_rights(&ro(action()), "research", &principal("alice"))
         .unwrap();
     for round in [0, -1] {
@@ -251,7 +251,7 @@ fn permission_coverage_preserves_complete_constraints() {
     if let SubmissionBinding::Instrument(s) = &mut p.binding {
         s.arguments = vec![tuple(1, "a"), tuple(2, "b")];
     }
-    catalog
+    let _ = catalog
         .validate_rights(&ro(p.clone()), "research", &principal("alice"))
         .unwrap();
     let mut cross = p.clone();
@@ -702,7 +702,7 @@ fn repository_coverage_uses_provisioned_immutable_membership() {
     let catalog = ClosedCatalog::provision(a, b, c, d, e).unwrap();
     let mut parent = permission();
     parent.subject.selector = SubjectSelector::Repositories(vec![repo("r1"), repo("r2")]);
-    catalog
+    let _ = catalog
         .validate_rights(&ro(parent.clone()), "research", &principal("alice"))
         .unwrap();
     let mut child = permission();
@@ -738,7 +738,7 @@ fn action_reporting_fallbacks_are_structural_and_explicit() {
                 *reporter = ReportingBinding::Initiator(who.clone());
             }
         }
-        catalog
+        let _ = catalog
             .validate_rights(&ro(p.clone()), "research", &who)
             .unwrap();
         assert!(catalog
