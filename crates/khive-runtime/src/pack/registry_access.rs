@@ -536,6 +536,8 @@ impl VerbRegistry {
         ("moodboard", "moodboard.preference"),
         // schedule
         ("schedule", "schedule.agenda"),
+        ("schedule", "schedule.occurrences"),
+        ("schedule", "schedule.receipts"),
         // session
         ("session", "session.list"),
         ("session", "session.resume"),
