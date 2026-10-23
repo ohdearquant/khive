@@ -143,7 +143,7 @@ async fn reindex_restores_the_fts_document_a_degraded_conditional_insert_lacks()
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: true,
         namespace: Some("local".to_string()),
         knowledge_only: false,

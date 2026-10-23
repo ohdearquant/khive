@@ -235,6 +235,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)                 | Dependency-Scoped Pull-Request CI from the Code Map                                                        |
 | [ADR-206](ADR-206-crate-performance-guarantees.md)                      | Crate Performance Guarantees                                                                               |
 | [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
+| [ADR-208](ADR-208-charter-workflows.md)                                 | Charter Workflows — Declared Topologies over Registered Phrases                                            |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -279,7 +280,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 Amendments to accepted records:
 
 - [ADR-001 companion: explicit import and VCS snapshot policy boundary](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786) (2026-10-10): entry-point boundary for unknown-kind operator import and the existing VCS degradation contract (#4786).
-- [ADR-002 amendment: an omitted qualifier on a pair with no default](ADR-002-edge-ontology.md#amendment-2026-10-19-an-omitted-qualifier-on-a-pair-with-no-default-5709) (2026-10-19): a `depends_on` edge whose endpoint pair has no inference default is accepted and stored without a `dependency_kind`; an explicit value is validated on every pair (#5709).
+- [ADR-002 amendment: an omitted qualifier on a pair with no default](ADR-002-edge-ontology.md#amendment-2026-10-19-an-omitted-qualifier-on-a-pair-with-no-default-5709) (2026-10-19): accepted 2026-10-21; a `depends_on` edge whose endpoint pair has no inference default is accepted and stored without a `dependency_kind`; an explicit value is validated on every pair (#5709).
 - [ADR-014 Amendment 7](ADR-014-curation-operations.md#amendment-7-recover-unfinished-indexes-after-a-committed-entity-update-4755) (2026-10-18): proposed recovery of unfinished search indexes after a committed entity update: one pending record per entity, completed per target inside the guarded publication transaction (#4755).
 - [ADR-015 amendment: live entity list indexes](ADR-015-schema-migrations.md#proposed-amendment-live-entity-list-indexes-2026-10-04) (2026-10-04): proposed V50 live entity namespace/order and namespace/type/order indexes, bounded eligible first-page plans, and one unforced retry for a missing index (#3689).
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
@@ -287,7 +288,7 @@ Amendments to accepted records:
 - [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
-- [ADR-020 amendment: import conflict modes](ADR-020-git-native-kg-implementation.md#amendment-2026-10-19-import-conflict-modes-over-edges-the-update-projection-and-the-force-flag-4766) (2026-10-19): proposed `kkernel kg import` conflict modes applied to edge UUIDs as well as records, the `update` projection, and what `--force` bypasses (#4766).
+- [ADR-020 amendment: import conflict modes](ADR-020-git-native-kg-implementation.md#amendment-2026-10-19-import-conflict-modes-over-edges-the-update-projection-and-the-force-flag-4766) (2026-10-19): accepted 2026-10-21; `kkernel kg import` conflict modes applied to edge UUIDs as well as records, the `update` projection, and what `--force` bypasses (#4766).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14) (2026-09-14): resolve fallback-limit disclosure.
 - [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
@@ -327,7 +328,9 @@ Amendments to accepted records:
 - [ADR-144 Amendment 3](ADR-144-memory-write-visibility-fence.md#amendment-3-2026-10-04-partitioned-moves-carry-memory-vectors-with-receipts) (2026-10-04): partitioned memory vector carry with receipts and exact destination fences (#3696).
 - [ADR-144 Amendment 4](ADR-144-memory-write-visibility-fence.md#amendment-4-2026-10-04-unknown-write-epochs-at-the-sealed-receipt-cutover) (2026-10-04): Accepted unknown-epoch refusal and durable provenance at the sealed-receipt cutover (#3619).
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
+- [ADR-180 Amendment 7](ADR-180-tool-pack.md#amendment-7-2026-10-21-a-unit-checks-the-grant-it-holds-by-id-on-the-writer-it-was-handed) (2026-10-21): proposed by-id live-grant check on a caller-supplied reader, so a unit can check the grant it holds and consume in one transaction; the by-id check and `decide` share one predicate and one row parse.
 - [ADR-181 Amendment 11](ADR-181-exec-verb-sandboxed-run.md#amendment-11-2026-09-29-timeout-residual-for-detached-descendants) (2026-09-29): timeout residual for detached descendants.
+- [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (2026-10-21): proposed outbound network declaration on exec registrations: a pin input only when declared, honoured only by an exact-name grant to an authenticated caller, refused rather than run without network, outbound-only rules under their own template digest; amends ADR-180 Amendment 1 item 1 for one property.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
 
 Amendments inside records whose own status is Proposed:

@@ -641,7 +641,11 @@ mod tests {
             .iter()
             .filter(|verb| verb.visibility == VerbVisibility::Verb)
             .collect();
-        assert_eq!(public.len(), 29, "kg public verb inventory: {public:?}");
+        assert_eq!(public.len(), 31, "kg public verb inventory: {public:?}");
+        assert!(
+            public.iter().any(|verb| verb.name == "attach"),
+            "attach must remain public"
+        );
         let internal: Vec<_> = info
             .verbs
             .iter()

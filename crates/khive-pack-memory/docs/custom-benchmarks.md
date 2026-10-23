@@ -34,6 +34,16 @@ retains its original temporary database, `RuntimeConfig::default()` constructor,
 registry setup, multi-thread Tokio executor, and lifecycle; its volume-lock policy
 comes from that existing runtime configuration. No benchmark reads the user's data.
 
+Synthetic `e2e_recall` and `p95_gate` processes default the chained ANN rebuild
+coalescing delay to 5 ms before starting their executor. The finite generated write
+burst does not need the production 30-second coalescing window. An explicit
+`KHIVE_ANN_REBUILD_DEBOUNCE_MS` remains unchanged; set it to `30000` to measure the
+production delay. Real-model mode keeps the production default. This reduces
+coalescing waits paid during setup and teardown; background scheduling may also
+affect timings. The existing readiness checks, p95 settle interval, event-count
+and per-sample guards, and joined writer teardown remain. Compare runs with the
+same cohort and debounce setting; this change supplies no new reference measurements.
+
 ## Listing and running
 
 Run from the repository root:
@@ -111,10 +121,13 @@ cargo bench --manifest-path crates/Cargo.toml -p khive-pack-memory --bench fts_g
 The checker tests both cohort listings with five-second watchdogs. A list-only
 sentinel immediately after the list branch makes accidental workload entry fail
 without loading models. `--regression-case=report-contract` feeds known values
-through the same p95 JSON emitter, checks the exact ID set, and rejects missing
-or duplicate rows, nonfinite values, wrong units, and incomplete sample counts.
-Those known values are protocol probes, never measured baselines. `--measure`
-additionally runs the caller-selected cohort with a 300-second watchdog.
+through the same JSON emitter with the distinct statistic `report_contract_probe`,
+checks the exact ID set, and rejects missing or duplicate rows, nonfinite values,
+wrong statistics, and incomplete sample counts. Those known values are protocol
+probes, never measured baselines. The checker accepts that statistic only for the
+explicit report-contract probe. `--measure` additionally runs the caller-selected
+cohort with a 300-second watchdog and requires `p95_ns`; probe rows and mixed
+probe/timing output fail measurement validation, even when the values match.
 
 All previous p95 `--regression-case` names remain available, including held build,
 held rebuild, chained handoff, task-completion, timeout, and gate-role controls.

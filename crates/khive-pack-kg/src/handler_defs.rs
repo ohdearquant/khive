@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (30 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (32 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,19 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
+    HandlerDef {
+        name: "attach",
+        description: "Add or replace one role-keyed blob rendition on an existing live main-backend entity or note. Bytes are base64. Returns id, role, content_ref, size, media_type and replaced. Authenticated pack-owned roles require their owning pack's publication verbs; local file paths are not accepted.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "id", param_type: "uuid", required: true, description: "Existing entity or note UUID, unique hexadecimal prefix or entity name under normal KG resolution.", resolution_mode: IdResolutionMode::UnscopedById },
+            ParamDef { name: "role", param_type: "string", required: true, description: "Nonempty rendition role without control characters, for example markdown, pdf or content. One attachment per role per record.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "bytes", param_type: "string", required: true, description: "Standard base64-encoded bytes to publish before the attachment row commits.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "media_type", param_type: "string", required: false, description: "Optional caller-declared MIME type, for example text/markdown.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     HandlerDef {
         name: "kg.proposal_cleanup",
         description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
@@ -86,7 +98,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
     },
     HandlerDef {
         name: "stream.read",
-        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        description: "Read retained entries after an exclusive sequence in ascending order, with floor_seq, head_seq and next_after from the same snapshot. A cursor below the persisted floor resumes at the retained prefix. Unknown streams return an empty page with floor_seq 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -98,12 +110,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
     },
     HandlerDef {
         name: "stream.stat",
-        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        description: "Read retained count, persisted floor_seq and head_seq in one snapshot. Head survives whole-prefix truncation; retained density is count = head_seq - floor_seq + 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.truncate",
+        description: "Hard-delete a stream prefix below before_seq in one writer transaction, removing each ledger row and note together. Returns {removed, floor_seq, head_seq}; head and future numbering do not move. Values at or below the floor are no-ops, values above head_seq + 1 are clipped, and unknown streams return {removed:0, floor_seq:1, head_seq:0}. Requires namespace write authority. Retention policy is caller-owned.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "before_seq", param_type: "integer", required: true, description: "Exclusive prefix boundary as a signed 64-bit integer. Values at or below floor_seq remove nothing; values above head_seq + 1 are clipped.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Write namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },
     HandlerDef {
@@ -264,6 +287,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "hydrate", param_type: "array of string", required: false, description: "Entity/note attachment roles whose bytes should be included as base64 in the role-keyed attachments map. Default get includes metadata only; an unknown requested role is an error. Records without attachments omit the map.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "parse_content",
                 param_type: "boolean",
@@ -999,7 +1023,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
-                    implements: project->concept, service->concept. \
+                    implements: project->concept, service->concept, artifact->concept. \
                     competes_with (symmetric): concept<->concept, project<->project, service<->service, org<->org. \
                     composed_with (symmetric): concept<->concept, project<->project. \
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \

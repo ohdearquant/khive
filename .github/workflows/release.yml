@@ -103,7 +103,7 @@ jobs:
         if: ${{ !matrix.cross }}
         working-directory: crates
         run: |
-          cargo build --release --target ${{ matrix.target }} -p kkernel
+          cargo build --profile dist --target ${{ matrix.target }} -p kkernel
 
       - name: Build binaries (zigbuild cross)
         if: ${{ matrix.cross }}
@@ -115,13 +115,13 @@ jobs:
           CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
           CFLAGS_aarch64_unknown_linux_gnu: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: |
-          cargo zigbuild --release --target ${{ matrix.target }} -p kkernel
+          cargo zigbuild --profile dist --target ${{ matrix.target }} -p kkernel
 
       - name: Stage binaries into subpackage bin/
         shell: bash
         run: |
           PKG_DIR="npm/kernel-${{ matrix.platform }}/bin"
-          SRC="crates/target/${{ matrix.target }}/release"
+          SRC="crates/target/${{ matrix.target }}/dist"
           # Remove the placeholder so it is not shipped in the published tarball (MIN-1).
           rm -f "${PKG_DIR}/.gitkeep"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then

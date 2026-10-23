@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     candidate_bytes BLOB NOT NULL CHECK (typeof(candidate_bytes) = 'blob'),
     assurance TEXT NOT NULL DEFAULT 'recording_only' CHECK (assurance = 'recording_only'),
     state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'cancelled', 'superseded', 'invalidated', 'failed')),
+    parent_run_id TEXT,
+    terminal_outcome TEXT,
     current_phase_id TEXT,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(revision) = 'integer' AND revision >= 0),
     created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
@@ -44,6 +46,7 @@ WHEN NEW.policy_domain IS NOT OLD.policy_domain OR NEW.run_id IS NOT OLD.run_id
     OR NEW.charter_id IS NOT OLD.charter_id OR NEW.definition_version IS NOT OLD.definition_version
     OR NEW.definition_digest IS NOT OLD.definition_digest OR NEW.candidate_digest IS NOT OLD.candidate_digest
     OR NEW.candidate_bytes IS NOT OLD.candidate_bytes OR NEW.assurance IS NOT OLD.assurance
+    OR NEW.parent_run_id IS NOT OLD.parent_run_id
     OR NEW.created_at_us IS NOT OLD.created_at_us
 BEGIN
     SELECT RAISE(ABORT, 'charter run pins are immutable');
@@ -53,4 +56,19 @@ CREATE TRIGGER IF NOT EXISTS charter_runs_no_delete
 BEFORE DELETE ON charter_runs
 BEGIN
     SELECT RAISE(ABORT, 'charter run identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS charter_runs_parent_immutable
+BEFORE UPDATE ON charter_runs
+WHEN NEW.parent_run_id IS NOT OLD.parent_run_id
+BEGIN
+    SELECT RAISE(ABORT, 'charter run parent is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS charter_runs_parent_exists
+BEFORE INSERT ON charter_runs
+WHEN NEW.parent_run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM charter_runs
+    WHERE policy_domain = NEW.policy_domain AND run_id = NEW.parent_run_id)
+BEGIN
+    SELECT RAISE(ABORT, 'charter run parent must exist');
 END;

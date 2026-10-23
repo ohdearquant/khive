@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [features]
+blob-s3 = ["khive-db/blob-s3"]
 contract-faults = []
 fault-injection = []
 test-internals = ["khive-db/test-support"]
@@ -94,4 +95,8 @@ harness = false
 
 [[bench]]
 name = "runtime_writes"
+harness = false
+
+[[bench]]
+name = "runtime_edge_mutations"
 harness = false

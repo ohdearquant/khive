@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -7,7 +8,9 @@ use khive_types::{EventKind, SubstrateKind};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{complete, executor, measure, report, Fixture, ACTOR, MICROS, REPORT_SAMPLES};
+use super::{
+    complete, executor, measure, report, reports_enabled, Fixture, ACTOR, MICROS, REPORT_SAMPLES,
+};
 
 const EVENTS: usize = 10_000;
 const VERBS: [&str; 4] = ["create", "update", "get", "search"];
@@ -60,9 +63,9 @@ fn expected_counts(window: bool) -> Value {
 }
 
 pub fn bench_count(c: &mut Criterion) {
-    let rt = executor();
-    let fixture = Fixture::new();
-    rt.block_on(seed_events(&fixture));
+    let rt = OnceCell::new();
+    let fixture = OnceCell::new();
+    let reports = reports_enabled();
     let mut group = c.benchmark_group("kg_count_dispatch");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
@@ -74,31 +77,45 @@ pub fn bench_count(c: &mut Criterion) {
             params["until"] = json!(MICROS + 7500);
         }
         let expected = expected_counts(window);
-        let sample = || {
-            let prepared = params.clone();
-            let (elapsed, result) = measure(&rt, &fixture, "count", prepared);
-            assert_eq!(result, expected);
-            elapsed
-        };
-        let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| sample()).collect();
-        report(&format!("kg_count_dispatch/{name}"), &samples, None);
+        let mut reported = false;
         group.bench_function(name, |b| {
+            let rt = rt.get_or_init(executor);
+            let fixture = fixture.get_or_init(|| {
+                let fixture = Fixture::new();
+                rt.block_on(seed_events(&fixture));
+                fixture
+            });
+            let sample = || {
+                let prepared = params.clone();
+                let (elapsed, result) = measure(rt, fixture, "count", prepared);
+                assert_eq!(result, expected);
+                elapsed
+            };
+            if reports && !reported {
+                let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| sample()).collect();
+                report(&format!("kg_count_dispatch/{name}"), &samples, None);
+                reported = true;
+            }
             b.iter_custom(|iterations| (0..iterations).map(|_| sample()).sum());
         });
     }
     group.finish();
-    assert_eq!(
-        rt.block_on(
-            fixture
-                .runtime
-                .events(&fixture.token)
-                .unwrap()
-                .count_events(EventFilter::default())
-        )
-        .unwrap(),
-        EVENTS as u64
-    );
-    fixture.close();
+    if let Some(fixture) = fixture.into_inner() {
+        assert_eq!(
+            rt.get()
+                .expect("initialized fixture executor")
+                .block_on(
+                    fixture
+                        .runtime
+                        .events(&fixture.token)
+                        .unwrap()
+                        .count_events(EventFilter::default())
+                )
+                .unwrap(),
+            EVENTS as u64
+        );
+        fixture.close();
+    }
 }
 
 fn check_path(result: &Value, ids: &[Uuid], depth: usize, direction: &str, roots: bool) {
@@ -144,11 +161,9 @@ fn check_path(result: &Value, ids: &[Uuid], depth: usize, direction: &str, roots
 }
 
 pub fn bench_traverse(c: &mut Criterion) {
-    let rt = executor();
-    let fixture = Fixture::new();
-    let ids = rt.block_on(fixture.seed_entities(100, false));
-    let pairs: Vec<_> = ids.windows(2).map(|w| (w[0], w[1])).collect();
-    rt.block_on(fixture.seed_edges(&pairs));
+    let rt = OnceCell::new();
+    let fixture = OnceCell::new();
+    let reports = reports_enabled();
     let mut group = c.benchmark_group("kg_traverse_matrix");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
@@ -156,25 +171,39 @@ pub fn bench_traverse(c: &mut Criterion) {
     for (direction, roots) in [("out", false), ("out", true), ("in", true), ("both", true)] {
         for depth in [1, 2, 3] {
             let name = format!("{direction}/include_roots_{roots}");
-            let params = json!({"roots":[ids[50]], "direction":direction,
-                "include_roots":roots, "max_depth":depth, "limit":100});
-            let sample = || {
-                let prepared = params.clone();
-                let (elapsed, result) = measure(&rt, &fixture, "traverse", prepared);
-                check_path(&result, &ids, depth, direction, roots);
-                elapsed
-            };
-            let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| sample()).collect();
-            report(
-                &format!("kg_traverse_matrix/{name}/{depth}"),
-                &samples,
-                None,
-            );
-            group.bench_with_input(BenchmarkId::new(name, depth), &depth, |b, _| {
+            let mut reported = false;
+            group.bench_with_input(BenchmarkId::new(&name, depth), &depth, |b, _| {
+                let rt = rt.get_or_init(executor);
+                let (fixture, ids) = fixture.get_or_init(|| {
+                    let fixture = Fixture::new();
+                    let ids = rt.block_on(fixture.seed_entities(100, false));
+                    let pairs: Vec<_> = ids.windows(2).map(|w| (w[0], w[1])).collect();
+                    rt.block_on(fixture.seed_edges(&pairs));
+                    (fixture, ids)
+                });
+                let params = json!({"roots":[ids[50]], "direction":direction,
+                        "include_roots":roots, "max_depth":depth, "limit":100});
+                let sample = || {
+                    let prepared = params.clone();
+                    let (elapsed, result) = measure(rt, fixture, "traverse", prepared);
+                    check_path(&result, ids, depth, direction, roots);
+                    elapsed
+                };
+                if reports && !reported {
+                    let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| sample()).collect();
+                    report(
+                        &format!("kg_traverse_matrix/{name}/{depth}"),
+                        &samples,
+                        None,
+                    );
+                    reported = true;
+                }
                 b.iter_custom(|iterations| (0..iterations).map(|_| sample()).sum());
             });
         }
     }
     group.finish();
-    fixture.close();
+    if let Some((fixture, _)) = fixture.into_inner() {
+        fixture.close();
+    }
 }

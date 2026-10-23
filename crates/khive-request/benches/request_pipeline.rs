@@ -2,6 +2,7 @@
 
 mod pipeline_support;
 
+use std::cell::OnceCell;
 use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -52,15 +53,21 @@ fn pipeline(c: &mut Criterion) {
         ("chain/5", fixtures::make_chain(5), 5, ExecutionMode::Chain),
     ];
     for (name, input, count, mode) in planning {
-        let parsed = parse_request(&input).expect("legacy planning input");
-        assert_eq!(parsed.ops.len(), count);
-        assert_eq!(parsed.mode, mode);
+        let parsed = OnceCell::new();
         scene(
             &mut group,
             &format!("plan/{name}"),
             || input.as_str(),
             |text| plan_request(text, black_box(&catalog)),
-            |plan| fixtures::check_plan(plan, &parsed, &catalog),
+            |plan| {
+                let parsed = parsed.get_or_init(|| {
+                    let parsed = parse_request(&input).expect("legacy planning input");
+                    assert_eq!(parsed.ops.len(), count);
+                    assert_eq!(parsed.mode, mode);
+                    parsed
+                });
+                fixtures::check_plan(plan, parsed, &catalog);
+            },
         );
     }
     for count in [10, 50, 100] {

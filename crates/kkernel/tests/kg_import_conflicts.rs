@@ -255,6 +255,7 @@ fn default_and_explicit_error_refuse_entity_collisions_before_any_row_write() {
     fixture.assert_no_destination();
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn skip_keeps_existing_records_and_omits_only_their_incident_edges() {
     let fixture = Fixture::new();
@@ -440,6 +441,7 @@ fn fresh_edge_uuid_with_a_stored_triple_refuses_every_mode_before_writes() {
     }
 }
 
+#[cfg(feature = "kg-adapters")]
 #[test]
 fn force_skips_only_missing_or_contract_invalid_edges_and_reports_each_cause() {
     let fixture = Fixture::new();

@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 struct CheckpointClaim {
     ann: Weak<AnnState>,
     key: AnnKey,
+    owner_dropped: CancellationToken,
 }
 
 impl CheckpointClaim {
@@ -19,6 +20,7 @@ impl CheckpointClaim {
         timers.insert(key.clone()).then(|| Self {
             ann: Arc::downgrade(ann),
             key: key.clone(),
+            owner_dropped: ann.owner_dropped.clone(),
         })
     }
 }
@@ -67,29 +69,30 @@ pub(super) async fn schedule_checkpoint(rt: &KhiveRuntime, ann: &SharedAnn, key:
     let Some(claim) = CheckpointClaim::take(ann, key) else {
         return;
     };
-    spawn_checkpoint(
-        rt.clone(),
+    drop(spawn_checkpoint(
+        rt,
         CheckpointTimer {
             claim,
             delay,
             checkpoint,
         },
-    );
+    ));
 }
 
 // Keep spawning synchronous so a deadline handoff has an independent Send future.
-fn spawn_checkpoint(rt: KhiveRuntime, timer: CheckpointTimer) {
+fn spawn_checkpoint(rt: &KhiveRuntime, timer: CheckpointTimer) -> tokio::task::JoinHandle<()> {
     let shutdown = khive_runtime::daemon_shutdown_token();
     let key = timer.claim.key.clone();
-    // Runtime hooks can own ANN state, so a weak claim alone does not bound its
-    // lifetime. Retention is one finite delay plus one cancellable attempt.
-    khive_runtime::track_named_background_task("memory_ann_checkpoint", async move {
+    // Pack callbacks can own ANN state; retaining them would keep the weak
+    // claim alive after the last external runtime and pack were dropped.
+    let rt = rt.detached_for_note_search_ann_provider();
+    khive_runtime::spawn_named_tracked_task("memory_ann_checkpoint", async move {
         if let Some(ann) = run_timer(&rt, timer, shutdown).await {
             // run_timer has released the old claim. Another writer may win this
             // claim, in which case its deadline already covers the new period.
             schedule_checkpoint(&rt, &ann, &key).await;
         }
-    });
+    })
 }
 
 /// Return a new dirty period only when a publication advanced its deadline.
@@ -108,7 +111,13 @@ async fn run_timer(
         biased;
         _ = shutdown.cancelled() => None,
         result = async {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                _ = claim.owner_dropped.cancelled() => return None,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            // Once admitted, this strong owner covers the existing checkpoint
+            // attempt. Last-owner cancellation only interrupts the idle delay.
             let ann = claim.ann.upgrade()?;
             let policy = checkpoint_policy(&ann);
             let deadline = ann.indexes.read().await.get(&claim.key).and_then(|bridge| {
@@ -191,6 +200,112 @@ mod tests {
             "timer claim must retain ANN state weakly"
         );
         drop(claim);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_task_releases_runtime_and_writer_when_last_ann_owner_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("checkpoint-owner.db");
+        let backend = Arc::new(
+            khive_db::StorageBackend::sqlite_for_test_with_journal_mode_in(
+                &db_path,
+                true,
+                Duration::from_secs(10),
+                dir.path().join("locks"),
+            )
+            .unwrap(),
+        );
+        backend.prepare_core_schema().unwrap();
+        assert!(backend.pool().write_queue_active());
+        assert!(backend.pool().writer_task_handle().unwrap().is_some());
+        let writer = backend.pool().take_writer_task_join().unwrap();
+        let rt = KhiveRuntime::from_prepared_backend(
+            backend.clone(),
+            khive_runtime::RuntimeConfig {
+                db_path: Some(db_path),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
+            },
+        )
+        .unwrap();
+        let ann = new_shared_for_role(true);
+        rt.install_note_search_ann_provider(Arc::new(
+            crate::note_search::MemoryNoteSearchAnnProvider::new(rt.clone(), ann.clone()),
+        ));
+        let key = AnnKey::new("timer-model");
+        let timer = CheckpointTimer {
+            claim: CheckpointClaim::take(&ann, &key).unwrap(),
+            delay: Duration::from_secs(300),
+            checkpoint: Instant::now(),
+        };
+        let retained_owner = ann.clone();
+        let weak = Arc::downgrade(&ann);
+        let owner_dropped = ann.owner_dropped.clone();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let task = spawn_checkpoint(&rt, timer);
+        drop(rt);
+        drop(backend);
+        drop(ann);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&retained_owner),
+            1,
+            "checkpoint runtime must not retain its installed ANN provider"
+        );
+        assert!(!owner_dropped.is_cancelled());
+        assert!(
+            !task.is_finished(),
+            "a remaining owner keeps its timer alive"
+        );
+
+        drop(retained_owner);
+        assert!(weak.upgrade().is_none());
+        assert!(owner_dropped.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("last owner drop must end an idle checkpoint before its 300s deadline")
+            .unwrap();
+        assert_eq!(tokio::time::Instant::now(), started);
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("checkpoint exit must release the file-backed writer")
+            .unwrap();
+        dir.close().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_ann_owner_preserves_the_full_checkpoint_delay_and_releases_claim() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ann = new_shared_for_role(true);
+        let key = AnnKey::new("timer-model");
+        let timer = CheckpointTimer {
+            claim: CheckpointClaim::take(&ann, &key).unwrap(),
+            delay: Duration::from_secs(300),
+            checkpoint: Instant::now(),
+        };
+        let mut pending = Box::pin(run_timer(&rt, timer, CancellationToken::new()));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(299)).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(CheckpointClaim::take(&ann, &key).is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            pending.await.is_none(),
+            "an absent bridge needs no checkpoint"
+        );
+        assert!(!ann.owner_dropped.is_cancelled());
+        assert!(ann.checkpoint_timers.lock().unwrap().is_empty());
+        let replacement = CheckpointClaim::take(&ann, &key).unwrap();
+        drop(replacement);
     }
 
     #[tokio::test]

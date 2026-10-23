@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::embedding_warning::add_embedding_truncation_warning;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
@@ -56,6 +57,7 @@ use khive_runtime::deser_params as deser;
 /// formats and rationale.
 fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
+        let at = mask_for_redaction_surface(RedactionSurface::GateProbe, at);
         RuntimeError::InvalidInput(format!(
             "{verb}.at: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), got {at:?}"
         ))
@@ -448,8 +450,9 @@ fn classify_create_kind(
         });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "schedule.action: verb \"create\" with kind={raw:?} always fails at replay (unknown \
+        "schedule.action: verb \"create\" with kind={:?} always fails at replay (unknown \
          kind; valid: entity | note | edge | event | proposal | {} | {})",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         registry.all_entity_kinds().join(" | "),
         registry.all_note_kinds().join(" | "),
     )))
@@ -475,7 +478,8 @@ fn canonical_entity_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_entity_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown entity_kind {raw:?}; valid: {}",
+        "unknown entity_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
@@ -494,7 +498,8 @@ fn canonical_note_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_note_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown note_kind {raw:?}; valid: {}",
+        "unknown note_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
@@ -983,6 +988,7 @@ pub(crate) async fn handle_agenda(
     let from_instant: Option<DateTime<Utc>> = match p.from {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.from: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -995,6 +1001,7 @@ pub(crate) async fn handle_agenda(
     let to_instant: Option<DateTime<Utc>> = match p.to {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.to: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -1009,11 +1016,13 @@ pub(crate) async fn handle_agenda(
         (None, None) => None,
         (Some(value), Some(id)) => {
             value.parse::<DateTime<Utc>>().map_err(|_| {
+                let value = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
                 RuntimeError::InvalidInput(format!(
                     "agenda.after: must be an RFC 3339 timestamp; got {value:?}"
                 ))
             })?;
             let id = Uuid::parse_str(id).map_err(|_| {
+                let id = mask_for_redaction_surface(RedactionSurface::GateProbe, id);
                 RuntimeError::InvalidInput(format!("agenda.after_id: must be a UUID; got {id:?}"))
             })?;
             Some(NoteInstantSeekAfter {

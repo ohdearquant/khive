@@ -4,7 +4,9 @@ use rand::{prelude::*, SeedableRng};
 
 fn rand_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     for row in raw.chunks_mut(dim) {
         let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {

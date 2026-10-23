@@ -132,7 +132,13 @@ fn every_current_namespace_table_has_a_move_disposition() {
             .unwrap();
         assert_eq!(disposition(table), Some(expected));
     }
-    for name in ["comm_sender_transport", "sessions", "session_messages"] {
+    for name in [
+        "comm_sender_transport",
+        "sessions",
+        "session_messages",
+        "note_stream_floors",
+        "note_stream_truncations",
+    ] {
         let table = inventory
             .tables
             .iter()

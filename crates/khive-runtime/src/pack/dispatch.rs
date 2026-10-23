@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::error::{AuditObligationFailure, DispatchError, RuntimeError};
 use crate::runtime::NamespaceToken;
 
+use super::audit::{enrich_search_success, enrich_stream_truncate_success};
 use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
@@ -336,7 +337,8 @@ impl VerbRegistry {
 
         let started = Instant::now();
         let token = self.mint_intercepted_read_token(&gate_req, params, identity);
-        let mut result = dispatch(token).await;
+        let (mut result, search_arms) =
+            crate::search_audit::capture(verb == "search", async { dispatch(token).await }).await;
         let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
@@ -385,12 +387,12 @@ impl VerbRegistry {
             if let Some(audit) = deferred_audit.take() {
                 let audit_outcome = self
                     .persist_intercepted_audit(
-                        verb,
                         &gate_req,
                         audit,
                         result.as_ref().map(|outcome| &outcome.result),
                         duration_us,
                         request_id,
+                        search_arms,
                     )
                     .await;
                 result = fold_audit_obligation(result, audit_outcome, |outcome| outcome.result);
@@ -401,17 +403,18 @@ impl VerbRegistry {
 
     async fn persist_intercepted_audit(
         &self,
-        verb: &str,
         gate_req: &GateRequest,
         audit: AuditEvent,
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
+        search_arms: crate::search_audit::SearchArms,
     ) -> Result<(), AuditObligationFailure> {
+        let verb = gate_req.verb.as_str();
         let Some(store) = &self.event_store else {
             return Ok(());
         };
-        let event = match result {
+        let mut event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
                 let resource = crate::cost_unit::resource_payload(
                     verb,
@@ -468,6 +471,10 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
+        if let Ok(value) = result {
+            enrich_stream_truncate_success(&mut event, gate_req, value);
+            enrich_search_success(&mut event, gate_req, value, search_arms);
+        }
         let producer = if result.is_ok() {
             crate::audit_batch::AuditProducer::DispatchSucceeded
         } else {
@@ -966,14 +973,18 @@ impl VerbRegistry {
                 let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
                     serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
                 });
-                let mut result = match definition {
-                    Ok(Some(definition)) => {
-                        pack.dispatch_mounted(&definition, verb, params, self, &token)
-                            .await
-                    }
-                    Ok(None) => pack.dispatch(verb, params, self, &token).await,
-                    Err(error) => Err(error),
-                };
+                let (mut result, search_arms) =
+                    crate::search_audit::capture(verb == "search", async {
+                        match definition {
+                            Ok(Some(definition)) => {
+                                pack.dispatch_mounted(&definition, verb, params, self, &token)
+                                    .await
+                            }
+                            Ok(None) => pack.dispatch(verb, params, self, &token).await,
+                            Err(error) => Err(error),
+                        }
+                    })
+                    .await;
                 let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
@@ -1142,6 +1153,19 @@ impl VerbRegistry {
                                 let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Ok(value) = &result {
+                                    enrich_stream_truncate_success(
+                                        &mut storage_event,
+                                        &gate_req,
+                                        value,
+                                    );
+                                    enrich_search_success(
+                                        &mut storage_event,
+                                        &gate_req,
+                                        value,
+                                        search_arms,
+                                    );
+                                }
                                 if let Some(metadata) = &mounted_audit {
                                     storage_event.payload["mounted_tool"] = metadata.clone();
                                 }

@@ -33,7 +33,6 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
 blake3 = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]

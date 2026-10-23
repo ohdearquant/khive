@@ -156,7 +156,7 @@ async fn thread_baseline_t6_selected_physical_child_appends_after_the_scan() {
     expect_ids(&response, &observation, &[id(3)]);
     assert_eq!(response["thread_id"], root.to_string());
     assert_eq!(observation.fetched_rows, 3);
-    assert_eq!(observation.rendered_rows, 4);
+    assert_eq!(observation.rendered_rows, 1);
     assert_eq!(
         response["messages"][0]["read"], false,
         "selected child is appended last even though its timestamp is newest"
@@ -191,7 +191,7 @@ async fn thread_baseline_t6_selected_outbound_append_promotes_the_physical_owner
     .await;
     assert_eq!(observation.final_owner_ids, vec![id(3).to_string()]);
     assert_eq!(observation.fetched_rows, 1);
-    assert_eq!(observation.rendered_rows, 2);
+    assert_eq!(observation.rendered_rows, 1);
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][0]["properties"]["read"], false);
     assert!(response["messages"][0].get("full_id").is_none());

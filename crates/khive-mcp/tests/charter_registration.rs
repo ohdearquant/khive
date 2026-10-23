@@ -4,7 +4,7 @@ use khive_runtime::{
 };
 
 #[test]
-fn charter_is_linked_for_explicit_selection_without_exposing_verbs() {
+fn charter_is_linked_for_explicit_selection_and_exposes_its_verbs() {
     assert!(PackRegistry::discovered_names().contains(&"charter"));
     assert!(!RuntimeConfig::built_in_packs().contains(&"charter".to_string()));
     let packs = vec!["charter".to_string()];
@@ -36,8 +36,27 @@ fn charter_is_linked_for_explicit_selection_without_exposing_verbs() {
     PackRegistry::register_packs(&packs, runtime, &mut builder).expect("register charter");
     let registry = builder.build_metadata().expect("charter metadata");
     assert_eq!(registry.pack_names(), vec!["charter"]);
-    assert!(registry
+    let verbs: Vec<&str> = registry
         .pack_verbs("charter")
         .expect("charter pack")
-        .is_empty());
+        .iter()
+        .map(|verb| verb.name)
+        .collect();
+    assert_eq!(
+        verbs,
+        vec![
+            "charter.compile",
+            "charter.publish",
+            "charter.vocabulary",
+            "charter.start",
+            "charter.observe",
+            "charter.sample",
+            "charter.claim",
+            "charter.cancel",
+            "charter.waiting",
+            "charter.get",
+            "charter.runs",
+            "charter.list",
+        ]
+    );
 }

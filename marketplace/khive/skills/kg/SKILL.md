@@ -5,10 +5,10 @@ description: Work the knowledge graph as typed entities and edges — search bef
 # Work the knowledge graph
 
 The kg pack is the shared, cross-project knowledge graph: typed entities (9 kinds), a closed set
-of edge relations (20), and notes. 29 verbs — the bare names `create`, `get`, `list`, `search`, `update`,
+of edge relations (20), and notes. 31 verbs — the bare names `create`, `attach`, `get`, `list`, `search`, `update`,
 `delete`, `restore`, `merge`, `link`, `neighbors`, `traverse`, `query`, `context`, `resolve`, `whoami`,
-`scan`, `db_diagnostics`, `stats`, `propose`, `review`, `withdraw`, `verbs`, `apply_changeset`, plus `stream.append` /
-`stream.read` / `stream.stat` — but the thing worth learning is the
+`scan`, `db_diagnostics`, `stats`, `count`, `schema`, `propose`, `review`, `withdraw`, `verbs`, `apply_changeset`, plus `stream.append` /
+`stream.read` / `stream.stat` / `stream.batch` / `stream.truncate` — but the thing worth learning is the
 _graph discipline_, not the verb list.
 Per-verb param detail is one call away: `request(ops="create(help=true)")`.
 
