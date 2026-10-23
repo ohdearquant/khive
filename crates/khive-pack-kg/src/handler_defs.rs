@@ -1023,7 +1023,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
-                    implements: project->concept, service->concept. \
+                    implements: project->concept, service->concept, artifact->concept. \
                     competes_with (symmetric): concept<->concept, project<->project, service<->service, org<->org. \
                     composed_with (symmetric): concept<->concept, project<->project. \
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
