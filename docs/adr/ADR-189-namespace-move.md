@@ -133,15 +133,16 @@ read with `WHERE namespace = ?` (`khive-pack-brain/sql/brain_implicit_mass_read.
 Add a move primitive to the store surface.
 
 ```
-move_namespace(source, routes: [(record_kind, target_namespace)]) -> MoveCounts
+move_namespace(source, routes: [(subject_class, target_namespace)]) -> MoveCounts
+(corrected by Amendment 5)
 ```
 
 ### The route map is data, not a callback
 
 One source namespace fans out to several targets, so a single rename cannot express the operation.
-The routing is supplied as a list of `(record_kind, target_namespace)` pairs rather than as a
-function, because a list can be validated whole before the transaction opens, logged, replayed and
-tested against a fixture, and a closure can do none of those.
+The routing is supplied as a list of `(subject_class, target_namespace)` pairs (corrected by
+Amendment 5) rather than as a function, because a list can be validated whole before the transaction
+opens, logged, replayed and tested against a fixture, and a closure can do none of those.
 
 Validation before any write, with two outcomes that must not look alike:
 
@@ -194,8 +195,9 @@ owns them.
 The four fts5 tables do not take one mechanism, and the split is measured rather than assumed.
 `fts_notes` and `fts_entities` are ordinary fts5 tables: an `UPDATE` of their `namespace` column is
 accepted, preserves the rowid the two maps are keyed on, and leaves the index intact. `fts_knowledge`
-and `fts_sections` are declared `content=` over `knowledge_atoms` and `knowledge_sections`, and there
-an `UPDATE` of the same column returns success and changes nothing, because the value a reader gets
+is declared over the filtered `knowledge_atoms_fts_content` view and `fts_sections` is declared over
+`knowledge_sections` (corrected by Amendment 5). For both, an `UPDATE` of the same column returns
+success and changes nothing, because the value a reader gets
 comes from the content table. That pair is maintained by schema triggers firing on
 `UPDATE OF ... namespace` (`sql/schema.sql`, `sql/026-knowledge-fts-repair.sql`), so writing the base
 row is both sufficient and the only thing that works. The dangerous half is the second: a sweep that
@@ -273,12 +275,14 @@ paragraph revisited before it is made, rather than after.
 
 ### A stream member cannot move at all
 
-`sql/029-note-streams.sql` pins stream membership to a namespace with four triggers, and the pin is
+`sql/029-note-streams.sql` pins stream membership to a namespace with six triggers (corrected by
+Amendment 5), and the pin is
 absolute rather than conditional. `refuse_stream_entry_rewrite` aborts any `UPDATE` of a member
 note that names `namespace` in its `SET` list; `refuse_stream_entry_delete` aborts the delete;
 `refuse_stream_ledger_update` and `refuse_stream_ledger_delete` abort every write to the ledger
 rows themselves. `stream_schema_tests.rs:37` already asserts the first of these directly, with
 `UPDATE notes SET namespace='other'` in its list of forbidden statements.
+Two additional triggers guard stream insertion and sequence continuity.
 
 So a stream member has no move at all, by update or by delete and reinsert, and the primitive
 refuses any move whose routed kinds reach one. The refusal comes from a read of `note_streams` by
@@ -350,32 +354,32 @@ happened under, and rewriting it makes the history claim something that did not 
 whole reason, and it does not need a cost to justify it.
 
 The cost it does carry is narrow and worth stating precisely, because the wider version invites a
-workaround nobody needs. Only a read that FILTERS BY NAMESPACE pays it: `stores/event.rs:1264` and
-the list at `:1314` scope by namespace, so after a move those return the moved records' history
-under the source namespace and a reader wanting the whole trail asks for both. A read keyed on
-anything else - by id at `:387`, or by any caller-side identifier that is not the namespace - is
-unaffected, and there is no verb today that publishes a namespace-scoped event read to a consumer.
+workaround nobody needs. `stores/event.rs:1402-1417` scopes the public `get_event` read by namespace.
+The ID-only helper at `:441-450` is used by event append, not by the public getter. The claim that
+the public by-ID read is unaffected is superseded by Amendment 5, Decision 1.
 
 ## Consequences
 
 An edge's namespace is the namespace of the connection that wrote it, not of its endpoints
 (`khive-pack-kg/src/handlers/link.rs:63`, `:193`, `:284`). After a kind-partitioned move an edge can
 therefore sit in a different namespace from the records it joins, and it hydrates because by-id
-`get` is namespace-agnostic. That property is under discussion in #2802. Anything that scopes by-id
-reads to the caller's own namespace would break cross-pack neighbours on exactly the trees this
-move creates, and whoever takes that issue needs to read this paragraph first.
+`get` is namespace-agnostic. This property is specified by Rule 9 of [ADR-007](ADR-007-namespace.md)
+and documented in PR #2923 (corrected by Amendment 5). Anything that scopes by-id reads to the
+caller's own namespace would break cross-pack neighbours on exactly the trees this move creates.
 
-The affected-table set is not a constant and must not become one. A migration that adds a
-namespace-carrying table adds it to this primitive's scope, and a migration that adds a
-namespace-bearing uniqueness constraint adds it to the refusal set. Both are silent failures if
-missed: the first skips rows, the second corrupts them.
+The affected-table set is not a constant and must not become one. A namespace-carrying table with no
+disposition refuses with `UnknownTable`, rather than being silently skipped (corrected by Amendment
+5). A namespace-bearing uniqueness constraint omitted from collision enumeration can still refuse
+through the statement constraint and transaction rollback, as described in Amendment 2 (corrected
+by Amendment 5).
 
 ## Acceptance
 
 - A move over a populated store leaves every affected table consistent, asserted per table rather
   than by a spot check, with the vector tables enumerated from `sqlite_master` rather than from a
   list written into the test.
-- A concurrent writer during the move cannot produce a resurrected or a lost row.
+- A concurrent writer during the move cannot produce a resurrected or a lost row. (Not established
+  by an executed acceptance test at this revision.)
 - A route map naming classes whose rows live in another backend succeeds here reporting zero for
   them, so the same map is re-runnable against each backend of a split store.
 - A route map missing a kind that has rows refuses without writing anything, and a routed kind with
@@ -397,22 +401,24 @@ missed: the first skips rows, the second corrupts them.
 - A move reaching a stream member refuses before writing anything, names the notes and their
   `(stream, seq)`, and the arm is distinguishable from a trigger abort: the mutation control removes
   the pre-flight read and the same case then fails with `stream_member` from inside the transaction.
+  (Not established by an executed acceptance test at this revision.)
 - The fixture is parameterized rather than collision-only. A clean move asserting counts in equals
   counts out, non-zero, is the arm that would go missing if every case collided, and it is the arm
   that detects a conflict-swallowing insert.
 - An ANN consumer that was caught up before the move consumes the moved subjects afterwards, which
   is the arm that fails if the write log is rewritten instead of appended to.
-- The fixture is built through the store's own writers. A SQL seed produces no fts5 shadow rows, no
-  write-log entries and no vector rows, so it would exercise everything except the part that is
-  hard.
+- The fixture uses writer-shaped SQL rather than the public store writers (corrected by Amendment
+  5). The fixture builder documents which derived rows are produced by triggers and which are added
+  explicitly in `crates/khive-db/src/namespace_move_fixture.rs:13-32`.
 
 ## Amendment 1 (2026-09-15): the source side of a move, and what a partitioning move cannot carry
 
 **Status: accepted (2026-09-16).** Accepted on its own acceptance arm rather than on review:
 `the_source_index_stops_answering_for_a_moved_subject`, in the knowledge pack, holds the source
 bridge at its pre-move watermark, drives the fresh-tail leg past it, and asserts that the tail
-carries a delete naming the moved subject. Three corrections found while implementing the primitive
-this ADR specifies.
+carries a delete naming the moved subject. This arm establishes the fresh-tail instruction, not a
+search result from either namespace (corrected by Amendment 5). Three corrections found while
+implementing the primitive this ADR specifies.
 Each is a place where the accepted text describes one side of a two-sided operation, or presumes a
 shape of request it does not name.
 
@@ -836,3 +842,83 @@ These storage routing fixtures do not establish warmed ANN consumer behavior, wh
 Amendment 1's consumer acceptance. Amendment 2's orphan and competing-subject refusals are proven by
 its own `partitioned_orphan_and_competing_subject_routes_refuse_before_any_write` fixture, not by
 these.
+
+## Amendment 5 (2026-10-23) -- event lookup and operator invocation
+
+**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent
+implementation lands. It does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#5595](https://github.com/ohdearquant/khive/issues/5595).
+
+**Trigger.** The public `get_event` query filters by namespace and ID, while the resolver describes
+the storage read as ID-only and applies visibility after it receives the event
+(`crates/khive-db/src/stores/event.rs:1402-1417`,
+`crates/khive-runtime/src/operations/identity_reads.rs:282-286`). The move is defined as a
+per-backend function over a connection (`crates/khive-db/src/namespace_move.rs:1353-1363`). The
+route stores a `SubjectClass` in each `MoveRoute` (`crates/khive-db/src/namespace_move.rs:115-120`).
+The amendment defines the event lookup contract and the invocation boundary for namespace moves.
+
+### Decision 1 -- event lookup is ID-only at storage
+
+The storage `get_event(id)` query is ID-only. The resolver applies the caller's visible namespace
+set after reading the event. A source-namespace event is therefore resolved from the target
+namespace only when the source namespace is in that visible set. This follows the existing resolver
+shape for notes and the namespace-agnostic by-ID contract in ADR-007 Rules 1 and 2
+(`crates/khive-runtime/src/operations/identity_reads.rs:275-286`,
+`docs/adr/ADR-007-namespace.md:242-246`).
+
+The existing public query still contains `WHERE namespace = ?1 AND id = ?2`, so this decision
+specifies a change that the current implementation does not yet satisfy
+(`crates/khive-db/src/stores/event.rs:1402-1417`). The ID-only helper at lines 441-450 is used by
+event append and does not satisfy the public getter contract
+(`crates/khive-db/src/stores/event.rs:441-450,521`).
+
+### Decision 2 -- acceptance records the tested consumer arm
+
+The move-then-read case moves a note, leaves its event in the source namespace, and reads the event
+by ID from the target. The returned event is checked against the expected text. Resolution succeeds only when
+the source namespace is in the caller's visible set, and it does not resolve when that namespace
+is absent. The storage getter is ID-only; the visible-set decision belongs to resolution, as
+Decision 1 states (`crates/khive-runtime/src/operations/identity_reads.rs:282-286`).
+
+Amendment 1 remains accepted on the executed fresh-tail arm. That arm drives
+`vamana::fresh_tail_leg` and asserts a source-side delete instruction for the moved subject; it
+does not assert source or target search results (`crates/khive-pack-knowledge/src/knowledge/namespace_move_consumer_tests.rs:27-43,78,143-188`).
+The search requirements in Amendment 1 remain acceptance criteria until a test asserts them.
+The base concurrency and stream-member acceptance arms are also unexecuted and remain open; the
+corresponding acceptance requirements remain open
+(`crates/khive-db/src/namespace_move.rs:741-747`).
+
+### Decision 3 -- invocation is operator-only
+
+The first and only invocation surface is `kkernel db move-namespace`, a subcommand of the existing
+`kkernel db` group beside `migrate` and `check` (`crates/kkernel/src/cli.rs:87,292-295`). It runs in a
+local kkernel process against the store that process opens, as `kkernel db migrate` does. No MCP
+server, daemon socket request or remote peer reaches it, so a tenant credential has no path to it.
+A verb form is not part of this amendment; adding one requires its own amendment naming its gate.
+The refusal vocabulary follows the store's existing errors:
+`UnroutedClass`, `StreamMembers`, and `Collisions`
+(`crates/khive-db/src/namespace_move.rs:261-285,314-325`). The primitive stays per-backend
+(`crates/khive-db/src/namespace_move.rs:1353-1363`); the subcommand applies one route map to each
+backend in turn through that backend's writer, reports per-backend counts, stops at the first failing
+backend, and is re-runnable, which is the per-backend and resume behaviour the base text specifies.
+
+The in-place factual corrections record the current schema and refusal behavior. `fts_knowledge`
+uses the filtered `knowledge_atoms_fts_content` view (`crates/khive-db/sql/026-knowledge-fts-repair.sql:20-33`),
+and the stream migration defines six triggers (`crates/khive-db/sql/029-note-streams.sql:11-51`).
+An unhandled namespace table refuses with `UnknownTable`
+(`crates/khive-db/src/namespace_move.rs:308-312,713-717`). The namespace-move fixture uses
+statements and documents trigger-produced rows separately from rows it inserts explicitly
+(`crates/khive-db/src/namespace_move_fixture.rs:13-32`).
+
+### Acceptance
+
+| ID   | Statement                                                                                                                                            | Evidence                                                                                                                                                                                                                      |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A5.1 | `get_event` by ID returns the event regardless of its stored namespace.                                                                              | `cargo test -p khive-db get_event_by_id_is_namespace_agnostic`<br>`crates/khive-db/src/stores/event.rs:1402-1417`                                                                                                             |
+| A5.2 | After a note moves and its event remains in the source, target resolution returns it when source is visible and does not when source is not visible. | `cargo test -p khive-runtime resolve_moved_event_by_id_visibility`<br>`crates/khive-runtime/src/operations/identity_reads.rs:282-286`                                                                                         |
+| A5.3 | The accepted Amendment 1 evidence asserts the source fresh-tail delete; search-result acceptance is separate.                                        | `the_source_index_stops_answering_for_a_moved_subject`<br>`crates/khive-pack-knowledge/src/knowledge/namespace_move_consumer_tests.rs:78-188`<br>`cargo test -p khive-pack-knowledge namespace_move_source_and_target_search` |
+| A5.4 | A concurrent writer cannot resurrect or lose a row during a move.                                                                                    | `cargo test -p khive-db namespace_move_concurrent_writer`                                                                                                                                                                     |
+| A5.5 | A stream-member move refuses before writes and names the member rows.                                                                                | `cargo test -p khive-db namespace_move_stream_member_refusal`; preflight in `crates/khive-db/src/namespace_move.rs:666-679,741-743`                                                                                           |
+| A5.6 | `kkernel db move-namespace` is the only non-test caller of `move_namespace`, and no registered verb calls it.                                        | caller search for `move_namespace(` over `crates/` excluding tests; `cargo test -p kkernel` covering the subcommand's refusal output                                                                                          |
+| A5.7 | Refusals use the store's `UnroutedClass`, `StreamMembers`, and `Collisions` errors.                                                                  | `crates/khive-db/src/namespace_move.rs:261-285,314-325`                                                                                                                                                                       |
