@@ -112,6 +112,20 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
             retry_exhausted_obligations_last_at_ms: Some(1_700_000_000_789),
             admission_unresolved_obligations: 2,
             admission_unresolved_obligations_last_at_ms: Some(1_700_000_000_456),
+            audit_success_rows_omitted: [
+                ("comm.inbox", 1),
+                ("comm.probe", 2),
+                ("comm.cursor_get", 3),
+                ("whoami", 4),
+            ],
+            audit_success_rows_sampled_out: [
+                ("comm.heartbeat", 5),
+                ("comm.cleanup_expired_quarantine", 6),
+            ],
+            audit_success_rows_forced: [
+                ("comm.heartbeat", 7),
+                ("comm.cleanup_expired_quarantine", 8),
+            ],
         }),
     )
     .await
@@ -169,6 +183,26 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
 
     let wire = serde_json::to_value(&with_control.writer_contention).unwrap();
     assert_eq!(wire["audit_retry_exhausted_obligations"], 4);
+    assert_eq!(
+        wire["audit_success_rows_omitted"],
+        serde_json::json!({"comm.inbox": 1, "comm.probe": 2, "comm.cursor_get": 3, "whoami": 4})
+    );
+    assert_eq!(
+        wire["audit_success_rows_sampled_out"],
+        serde_json::json!({"comm.heartbeat": 5, "comm.cleanup_expired_quarantine": 6})
+    );
+    assert_eq!(
+        wire["audit_success_rows_forced"],
+        serde_json::json!({"comm.heartbeat": 7, "comm.cleanup_expired_quarantine": 8})
+    );
+    let without_wire = serde_json::to_value(&without_control.writer_contention).unwrap();
+    for field in [
+        "audit_success_rows_omitted",
+        "audit_success_rows_sampled_out",
+        "audit_success_rows_forced",
+    ] {
+        assert!(without_wire[field].is_null(), "no batch metrics: {field}");
+    }
     assert_eq!(
         wire["audit_retry_exhausted_obligations_last_at_ms"],
         1_700_000_000_789_u64

@@ -414,6 +414,10 @@ impl VerbRegistry {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
+        let success_row = self.audit_success_row_action(verb, result.ok());
+        if success_row.is_skipped() {
+            return Ok(());
+        }
         let mut event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
                 let resource = crate::cost_unit::resource_payload(
@@ -454,13 +458,13 @@ impl VerbRegistry {
                 gate_req,
                 &audit,
                 EventOutcome::Success,
-                Some(crate::cost_unit::resource_payload(
+                Some(success_row.resource(crate::cost_unit::resource_payload(
                     verb,
                     &gate_req.args,
                     value,
                     || 0,
                     request_id,
-                )),
+                ))),
             )
             .with_duration_us(duration_us),
             Err(_) => build_audit_storage_event(
@@ -1037,6 +1041,7 @@ impl VerbRegistry {
                     || git_digest_receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected);
                 if let (true, Some(audit)) = (needs_generic_audit, deferred_audit.take()) {
                     if let Some(store) = &self.event_store {
+                        let success_row = self.audit_success_row_action(verb, result.as_ref().ok());
                         let is_link_singleton =
                             verb == "link" && gate_req.args.get("links").is_none();
                         // Read-only pass over `result` first: every arm below
@@ -1044,6 +1049,7 @@ impl VerbRegistry {
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
                         let audit_outcome: Result<(), AuditObligationFailure> = match &result {
+                            _ if success_row.is_skipped() => Ok(()),
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -1137,12 +1143,17 @@ impl VerbRegistry {
                                 let (outcome, resource) = match &result {
                                     Ok(ok_val) => (
                                         EventOutcome::Success,
-                                        Some(crate::cost_unit::resource_payload(
-                                            verb,
-                                            &gate_req.args,
-                                            ok_val,
-                                            || pack.registered_embedding_model_names().len() as i64,
-                                            request_id,
+                                        Some(success_row.resource(
+                                            crate::cost_unit::resource_payload(
+                                                verb,
+                                                &gate_req.args,
+                                                ok_val,
+                                                || {
+                                                    pack.registered_embedding_model_names().len()
+                                                        as i64
+                                                },
+                                                request_id,
+                                            ),
                                         )),
                                     ),
                                     Err(_) => (

@@ -7,6 +7,7 @@ use super::{
 };
 use crate::tools::request::RequestParams;
 use khive_runtime::audit_batch::{AuditBatchConfig, AuditBatchControl, AuditTerminalReason};
+use khive_runtime::pack::AuditSuccessRowsMode;
 use khive_runtime::{
     AuditObligationFailure, DomainDisposition, KhiveRuntime, Namespace, RuntimeConfig,
     RuntimeError, VerbRegistry, VerbRegistryBuilder,
@@ -213,6 +214,9 @@ impl Fixture {
         builder.register(ErrorPack);
         builder.with_event_store(audit.clone());
         builder.with_audit_batch_config(config);
+        // A3 proves admission dispositions, so every success row has to reach
+        // admission; reduced mode omits `whoami` before it gets there.
+        builder.with_audit_success_rows_mode(AuditSuccessRowsMode::All);
         let server = KhiveMcpServer::from_registry(builder.build().expect("A3 registry"));
         Self {
             runtime,

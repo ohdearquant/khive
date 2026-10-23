@@ -321,7 +321,7 @@ pub async fn events(
 ) -> Result<Value, RuntimeError> {
     let run_id = opt_str(&params, "run_id")?;
     let limit = opt_limit(&params, "limit", 200, 5000)?;
-    let rows = receipts::events(rt, token.namespace().as_str(), run_id.as_deref(), limit).await?;
+    let rows = receipts::events(rt, token, run_id.as_deref(), limit).await?;
     Ok(json!({ "events": rows, "count": rows.len() }))
 }
 
@@ -887,7 +887,7 @@ pub async fn run(
 
     match preflight(rt, token, cfg, &req, &mut receipt).await {
         Ok(ready) => {
-            if let Err(error) = execute(rt, &ns, cfg, &req, ready, &mut receipt).await {
+            if let Err(error) = execute(rt, token, cfg, &req, ready, &mut receipt).await {
                 // Hydration, profile/blob writes and spawn can fail after
                 // policy allowed the call. They still need a durable receipt.
                 receipt.success = false;
@@ -1404,7 +1404,7 @@ fn decode_limit_report(report: &[u8; LIMIT_REPORT_LEN]) -> Value {
 #[cfg(not(unix))]
 async fn execute(
     _rt: &KhiveRuntime,
-    _ns: &str,
+    _token: &NamespaceToken,
     _cfg: &Resolved,
     _req: &Request,
     _ready: Ready,
@@ -1418,7 +1418,7 @@ async fn execute(
 #[cfg(unix)]
 async fn execute(
     rt: &KhiveRuntime,
-    ns: &str,
+    token: &NamespaceToken,
     cfg: &Resolved,
     req: &Request,
     ready: Ready,
@@ -1446,7 +1446,7 @@ async fn execute(
     })?;
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "materialized",
         json!({ "run_dir": run_dir.to_string_lossy(), "entries": ready.entries.len() }),
@@ -1552,7 +1552,7 @@ async fn execute(
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "launched",
         json!({ "pid": pid, "pgid": pid, "argv": receipt.argv }),
@@ -1614,7 +1614,7 @@ async fn execute(
     // "exited" observes the directly waited child, not the whole process tree.
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "exited",
         json!({ "pid": pid, "timed_out": receipt.timed_out, "elapsed_ms": started.elapsed().as_millis() as u64 }),

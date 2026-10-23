@@ -1083,9 +1083,15 @@ pub struct WriterContentionDiagnostics {
     /// Why `audit_admission_unresolved_obligations` is unavailable to this
     /// caller.
     pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
+    /// Process-wide omitted success decisions by verb; unavailable without registry metrics.
+    pub audit_success_rows_omitted: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide unselected, unforced success decisions by verb.
+    pub audit_success_rows_sampled_out: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide force-only success decisions, including rows that do not commit.
+    pub audit_success_rows_forced: Option<std::collections::BTreeMap<&'static str, u64>>,
 }
 
-/// Process-wide audit-batch health counters, supplied by the runtime layer
+/// Process-wide audit health and success-row decision counters, supplied by the runtime layer
 /// that owns the audit-batch control. `khive-db` never produces these itself
 /// — a direct `khive-db` caller always sees the corresponding
 /// `WriterContentionDiagnostics` fields as `None` plus an explicit reason.
@@ -1120,6 +1126,12 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_unresolved_obligations` last moved;
     /// `None` until it moves.
     pub admission_unresolved_obligations_last_at_ms: Option<u64>,
+    /// Bounded per-verb decision snapshots (ADR-103 Amendment 7), independent of commits.
+    pub audit_success_rows_omitted: [(&'static str, u64); 4],
+    /// Sampled successes that produced no row.
+    pub audit_success_rows_sampled_out: [(&'static str, u64); 2],
+    /// Successes retained only by their forcing rule.
+    pub audit_success_rows_forced: [(&'static str, u64); 2],
 }
 
 /// Live graph-edge rows compared with the durable list-cursor ledger.

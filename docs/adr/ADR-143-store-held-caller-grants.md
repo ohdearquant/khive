@@ -660,6 +660,8 @@ This amendment serves the project owner's instruction of 2026-10-22, rendered: "
 
 This amendment defines the administration wire contract required by ADR-193 Amendment 5 D1. Sections M3.1–7 are proposed requirements; M3.8 states their verification obligations. ADR-193 Amendment 5 remains the sole definition of observation permission fields, matching, source contracts, receipts and evidence eligibility.
 
+ADR-193 Amendment 6 (2026-10-23) fixes representation choices this amendment leaves open: the terminal state of a record holding both rights (M3.3); a half-open validity interval that the server derives with no new M3.2 request field, whose expiry includes the equality instant in M3.8's control; a 2 MiB durable record bound separate from M3.2's 1 MiB request bound; and revocation results that name targets by identifier and digest, so revocation is never refused for size and fits M3.2's replay bound.
+
 **Explicit amendment to staging:** the minimum standing-right profile below may operate before completion of ADR-129 Stage 1b/1c. For this profile, ADR-143 §2's one-instance boot construction is satisfied by one boot-assembled gate composition owning one shared authority service. It does not require that composition already implement general `CapabilityGate` dispatch. This qualifies construction order only for this profile; it neither completes those stages nor changes the requirements for the Stage 2 default flip.
 
 ### M3.1. One service, constructed at boot
