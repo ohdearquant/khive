@@ -204,8 +204,11 @@ pub(super) fn fixed_body() -> GrantBody {
     }
 }
 
+// An item rather than an expression, so tools that parse every source file read it as Rust.
+include!("fixtures/canonical_body_v1.rs");
+
 pub(super) fn canonical_fixture_bytes() -> Vec<u8> {
-    let literal: &str = include!("fixtures/canonical_body_v1.rs");
+    let literal = CANONICAL_BODY_V1_HEX;
     assert!(literal.len().is_multiple_of(2));
     literal
         .as_bytes()
