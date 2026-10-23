@@ -3,18 +3,20 @@
 **Status**: proposed
 **Date**: 2026-07-02
 **Authors**: khive maintainers
-**Would amend if accepted**: [ADR-023](ADR-023-declarative-pack-format.md) §3 (kg verb
-table -- adds the `schema` verb). The table edit would ride with the implementation PR,
-so ADR-023 keeps describing the live surface at every commit. `AGENTS.md` taxonomy
-sections would become generated artifacts under §5 once the verb ships.
+**Would amend if accepted**: [ADR-023](ADR-023-declarative-pack-format.md) §4 (kg verb
+table). The `schema` row is present in ADR-023, where its contract remains proposed
+pending this ADR's acceptance and conformance validation (ADR-023 §4, lines 172-200;
+crates/khive-pack-kg/src/handler_defs.rs:53-61). Amendment 1 corrects the earlier
+implementation and documentation status statements.
 **Does not amend**: [ADR-016](ADR-016-request-dsl.md). The DSL grammar requires no change
 (see Context §"Phantom gaps").
 
-> **Implementation status (2026-07-31): deferred / not shipped.** `schema` is absent
-> from the registered `KG_HANDLERS` table, and `schema()` currently follows the
-> unknown-verb path. Section 2 specifies a proposed wire contract, not an available
-> public surface. None of this ADR's proposed rules becomes normative unless the ADR is
-> accepted and the corresponding implementation and conformance tests land.
+> **Implementation status (2026-10-23): `schema` shipped.** The verb is registered and
+> dispatched as a read operation (crates/khive-pack-kg/src/handler_defs.rs:53-61;
+> crates/khive-pack-kg/src/dispatch.rs:150-152;
+> crates/khive-gate/src/operation.rs:192). This implementation status does not accept
+> this ADR or establish that its other rules and tests are implemented (corrected by
+> Amendment 1, Decision 4).
 
 ---
 
@@ -22,20 +24,27 @@ sections would become generated artifacts under §5 once the verb ships.
 
 ### The disease: documentation drift against a compiled surface
 
-khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (10 under the
-default pack set today), and the per-relation endpoint matrix -- is a closed, compiled
-contract. The base endpoint allowlist lives in
-`BASE_ENTITY_ENDPOINT_RULES` (`crates/khive-runtime/src/operations.rs`), extended additively
-by each loaded pack's `EDGE_RULES` (ADR-017). No runtime surface exposes this merged
-contract. Agents learn it from documentation snapshots that provably rot:
+khive's ontology, 9 entity kinds, 20 edge relations, 6 base note kinds (12 declared under
+the example packs), and the per-relation endpoint matrix, is a closed, compiled contract
+(corrected by Amendment 1, Decision 4). The base endpoint allowlist is defined in
+`BASE_ENTITY_ENDPOINT_RULES` (`crates/khive-types/src/edge_rules.rs:37-106`) and re-exported
+by the runtime (`crates/khive-runtime/src/operations.rs:432-435`), then extended
+additively by each loaded pack's `EDGE_RULES` (ADR-017). The `schema` verb exposes the
+merged declarations (`crates/khive-pack-kg/src/schema.rs:52-121`). Agents learn the
+contract from documentation snapshots that can become stale:
 
 - **Measured casualty**: a production skill taught 11 relations and 4 entity
-  kinds against the real 17 and 9. Agents consuming that skill gave wrong answers to
-  endpoint-legality questions until the drift was caught by hand.
+  kinds against the then-current contract. The current ontology has 20 relations and
+  9 entity kinds (`crates/khive-types/src/edge.rs:81-106;
+  crates/khive-pack-kg/src/pack.rs:76-80; corrected by Amendment 1, Decision 4).
+  Agents consuming that skill gave wrong answers to endpoint-legality questions until
+  the drift was caught by hand.
 - **Endpoint-legality questions** ("can a `resource` be the source of an `annotates`
-  edge?") currently require reading Rust source or ADRs. A recorded wrong-answer incident
-  established the standing instruction "verify edge endpoints against `operations.rs`
-  RULES, not ADRs" -- an instruction that concedes the documentation cannot be trusted.
+  edge?") previously required reading Rust source or ADRs. The `schema` verb now exposes
+  the merged endpoint declarations (`crates/khive-pack-kg/src/schema.rs:74-99;
+  corrected by Amendment 1, Decision 4). A recorded wrong-answer incident established
+  the instruction to verify edge endpoints against source rules, an instruction that
+  concedes the documentation cannot be trusted.
 
 ### Phantom capability gaps: the strongest evidence
 
@@ -44,15 +53,14 @@ capabilities that already ship. Callers believed the surface could not do things
 
 1. **Multi-line strings in the function-call DSL.** Believed impossible; escapes were
    specified in ADR-016 from the start ("String escapes follow JSON: `\\`, `\"`, `\n`,
-   `\t`, `\r`") and the lexer implements them. Only raw control-character bytes fail,
-   with an error message that does not point at the escape syntax. Multiple independent
-   agent memories recorded "must switch to the JSON op form" as a workaround for a
-   problem that does not exist at the DSL layer. The friction is nonetheless real one
-   layer up: the `ops` string travels as a JSON value in the MCP tool call, so a caller
-   who writes `\n` in that JSON has it decoded to a literal newline byte _by the
-   transport_ before the DSL parser sees it. The working form from an MCP client is the
-   double escape `\\n`, which nobody discovers unaided from the current error. The gap
-   is discoverability, not grammar -- addressed normatively in §3c.
+   `\t`, `\r`") and the parser implements them. Function-call values also accept literal
+   newline, carriage-return, and tab bytes, rewriting those bytes before JSON decoding;
+   other raw control bytes remain errors (docs/adr/ADR-016-request-dsl.md:136-146;
+   crates/khive-request/src/parser/scan.rs:118-218;
+   crates/khive-request/src/parser/parser_impl.rs:618-630;
+   crates/khive-request/tests/parser_tests/string_values_tests.rs:13-26; corrected by
+   Amendment 1, Decision 2). The JSON form keeps strict JSON string rules. The gap is
+   discoverability, not grammar.
 2. **`memory.remember` tags.** Believed missing; `RememberParams` carries
    `tags: Option<Vec<String>>` and the handler persists them.
 3. **`recall | auto_feedback` chaining.** Believed impossible ("`$prev` cannot address a
@@ -101,8 +109,9 @@ documentation generatable instead of hand-maintained.
 ### 1. The consistency contract
 
 Normative rules binding all packs compiled into the kkernel binary. Each rule names its
-current violators; violators become tracked conformance failures (issues), not
-grandfathered exceptions.
+current violators. Existing non-conforming pairs are listed in the Phase-1 legacy
+baseline, with one tracking issue per entry. The baseline may only shrink: no entry may
+be added, and an entry leaves when its issue closes (Amendment 1, Decision 1).
 
 **Rule 1 -- ID-resolution ladder.** Every parameter that accepts a record identifier
 resolves, in order: full UUID → registered slug (where the verb declares slug support) →
@@ -118,8 +127,11 @@ _absent_ parameters, never to _invalid_ ones. Violator at ratification: `parse_d
 
 **Rule 3 -- help-schema fidelity.** The `help=true` envelope for a verb is generated from
 the same `ParamDef` slice the registry serves; a documented default must be the default
-the code applies. (The `neighbors` direction default -- docs said `both`, code applies
-`Out` -- is the motivating instance.)
+the code applies. (`neighbors` was the motivating instance: the proposal snapshot's help
+said `both` while its code applied `Out`; its current handler and help both use `Both`
+(crates/khive-pack-kg/src/handlers/graph.rs:52-56;
+crates/khive-pack-kg/src/handler_defs.rs:1125-1129; corrected by Amendment 1,
+Decision 4).)
 
 **Rule 4 -- param-naming conventions.** Canonical names for recurring concepts: `query`
 (never `q`), `id` (never `thread_id` or verb-specific synonyms for the primary record
@@ -149,13 +161,19 @@ declares `session` in their `Pack` impls; brain writes kg-owned `artifact` (cove
 the `REQUIRES` exception) -- the default pack set has no violator. Enforcement: review-level for new
 packs, plus the end-to-end smoke test asserting that every kind present in a driven store
 run appears in the merged declared vocabulary (`HandlerDef` carries no write-set, so a
-static phase-1 check is impossible; this is a §4 Phase-2-class boundary, stated not
-hidden).
+static phase-1 check is impossible; the end-to-end smoke test remains required as
+specified in this rule and §4 (corrected by Amendment 1, Decision 3).
+
+The Rule 6 end-to-end smoke test is normative and is part of the conformance checklist
+for issue [#5557](https://github.com/ohdearquant/khive/issues/5557) (Amendment 1,
+Decision 3).
 
 ### 2. The `schema` verb
 
-A new kg-pack verb (bare name, per ADR-023 naming rules), assertive, read-only,
-no side effects. It returns the merged live ontology of the running binary:
+The kg-pack `schema` verb is a bare name, per ADR-023 naming rules, and is assertive,
+read-only, and has no side effects. It returns the merged live ontology of the running
+binary (`crates/khive-pack-kg/src/handler_defs.rs:53-61;
+crates/khive-pack-kg/src/schema.rs:52-121; corrected by Amendment 1, Decision 4):
 
 ```json
 {
@@ -176,9 +194,11 @@ no side effects. It returns the merged live ontology of the running binary:
     "question",
     "decision",
     "reference",
+    "head",
     "task",
     "memory",
     "message",
+    "channel_health",
     "scheduled_event",
     "session"
   ],
@@ -186,6 +206,8 @@ no side effects. It returns the merged live ontology of the running binary:
     "contains",
     "part_of",
     "instance_of",
+    "links_to",
+    "located_in",
     "extends",
     "variant_of",
     "introduced_by",
@@ -199,7 +221,8 @@ no side effects. It returns the merged live ontology of the running binary:
     "composed_with",
     "annotates",
     "supports",
-    "refutes"
+    "refutes",
+    "owns"
   ],
   "endpoint_rules": [
     { "source": "concept", "relation": "extends", "target": "concept", "origin": "base" },
@@ -235,13 +258,12 @@ Normative details:
 5. **Presentation**: ADR-045 rules apply. The response must render sanely in agent mode
    (count summary plus full matrix) and `format=table` must work.
 6. **Implementation is serialization plus one attributed accessor**: the base matrix is
-   already exposed via `base_entity_endpoint_rules()` (added for the ADR-076 certificate
-   tests). Pack rules, however, are currently only reachable through helpers that
-   flatten ownership away (`all_edge_rules` / the registry's installed
-   `Vec<EdgeEndpointRule>`), which cannot reconstruct `origin`. The implementation MUST
-   therefore add a pack-attributed accessor returning `(pack_name, EdgeEndpointRule)`
-   rows (the registry knows the owning pack at installation time) and serialize from
-   that; the existing flattened helpers are not a sufficient source for this verb.
+   exposed via `base_entity_endpoint_rules()` (added for the ADR-076 certificate tests).
+   The registry captures pack ownership with each endpoint declaration, and the schema
+   handler serializes those attributed rows through `all_edge_rules_with_packs()`
+   (`crates/khive-runtime/src/pack/catalog.rs:482-493;
+   crates/khive-runtime/src/pack/builder.rs:636-650,961-963;
+   crates/khive-pack-kg/src/schema.rs:74-99; corrected by Amendment 1, Decision 4).
 
 The name `schema` aligns with the existing "KG schema.yaml" ontology-manifest concept;
 this verb is that manifest's runtime dual. `verbs` and `help=true` are unchanged and
@@ -265,30 +287,41 @@ search must rank identically to entity-tag search," which no current consumer re
 distinct fields (they are different concepts). Supplying `content` to an entity create,
 or `description`/omitting `content` on a note create, returns an error that names the
 correct field for that substrate.
+This behavior remains normative and is part of the conformance checklist for issue
+[#5557](https://github.com/ohdearquant/khive/issues/5557) (Amendment 1, Decision 3).
 
-**3c. DSL string-error discoverability.** The parse error for a raw control character
-inside a quoted string must teach the fix: state that string escapes follow JSON, show
+**3c. DSL string-error discoverability.** A parse error for an unsupported raw control
+byte inside a quoted string must teach the fix: state that string escapes follow JSON, show
 the escape form (`\n`), and note that callers passing `ops` through a JSON transport
 (every MCP client) must double-escape (`\\n` in the wire form) because the transport
-decodes one level before the DSL parser runs. The canonical multi-line guidance --
-escape form and the transport double-escape -- is documented in the generated `AGENTS.md`
-DSL section (§5). The grammar itself is unchanged (see Alternatives §6).
+decodes one level before the DSL parser runs (superseded by Amendment 1, Decision 2).
+The accepted multi-line behavior is documented in ADR-016, whose parser accepts literal
+newline, carriage-return, and tab bytes inside quoted values (docs/adr/ADR-016-request-dsl.md:136-146;
+crates/khive-request/src/parser/scan.rs:118-218;
+crates/khive-request/src/parser/parser_impl.rs:618-630; corrected by Amendment 1,
+Decision 2). Section 5 concerns taxonomy generation, not DSL documentation.
 
 **3d. Tracked conformance failures (Rules 1-3).** `brain.feedback` full-UUID-only,
 `knowledge.get` missing prefix resolution, `parse_direction` silent coercion, and the
 `neighbors` help/default mismatch were recorded as conformance issues at ratification.
 `knowledge.get` has since been resolved with full UUID → exact scoped slug → unique prefix
-precedence. The remaining fixes are ordinary bugfix PRs referencing this ADR; none is gated
-on the `schema` verb landing.
+precedence. The listed resolution, enum, and help/default behaviors are now present in the
+code paths (crates/khive-pack-brain/src/handlers.rs:767-788;
+crates/khive-pack-knowledge/src/knowledge/crud.rs:861-887;
+crates/khive-pack-kg/src/handlers/common.rs:809-817;
+crates/khive-pack-kg/src/handlers/graph.rs:52-56;
+crates/khive-pack-kg/src/handler_defs.rs:1125-1129), corrected by Amendment 1,
+Decision 4. Their presence does not replace the normative conformance checks below.
 
 ### 4. The conformance test -- two declared phases
 
 A workspace test walks every registered pack's `HandlerDef` slices and asserts the
 mechanically checkable subset of the contract.
 
-**Phase 1 (ships with this ADR's implementation).** Checkable from today's `ParamDef`
-(`{name, param_type, required, description}`, where `param_type` is a free-form
-documentation string not used in validation):
+**Phase 1 (ships with this ADR's implementation).** Checkable from `ParamDef`
+(`{name, param_type, required, description, resolution_mode}`). `param_type` uses a closed
+vocabulary to build the published JSON Schema; it does not validate argument values
+(`crates/khive-types/src/pack.rs:156-179; corrected by Amendment 1, Decision 3):
 
 - no duplicate param names within a verb;
 - param names match the naming conventions (Rule 4), checked against an explicit
@@ -302,13 +335,15 @@ documentation string not used in validation):
   canonical naming;
 - every verb has a non-empty description; required flags are internally consistent.
 
-**Phase 2 (declared, not shipped here).** Rules 1 and 2 are _behavioral_ -- prefix
-resolution and enum rejection cannot be verified from a free-form type string. Enforcing
-them mechanically requires enriching `ParamDef` with a typed `kind` (e.g.
-`ParamKind::{Uuid, Enum(&[...]), String, Int, Bool, Array}`) and an ID-resolution flag,
-plumbed through the pack/registry/catalog layers. That enrichment is its own change with
-its own review; until it lands, Rules 1-2 are enforced by review and by the tracked-issue
-list, and this ADR does not claim otherwise.
+The Phase-1 workspace test is normative and is part of the conformance checklist for
+issue [#5557](https://github.com/ohdearquant/khive/issues/5557) (Amendment 1, Decision 3).
+
+**Phase 2 (declared, not shipped here).** Rules 1 and 2 are _behavioral_: prefix
+resolution and enum rejection require execution checks. `ParamDef` now carries an
+`IdResolutionMode`, but it has no typed enum-value declaration for validating accepted
+values (`crates/khive-types/src/pack.rs:166-179; corrected by Amendment 1, Decision 3).
+Behavioral checks for Rules 1 and 2 remain required; this ADR does not claim they are
+mechanically enforced by the Phase-1 metadata test.
 
 **Honest boundary.** The conformance test binds packs compiled into the tested workspace.
 It does not and cannot bind external third-party packs; for those, the contract is a
@@ -377,40 +412,43 @@ taxonomy cannot silently diverge from the compiled one.
    rejected: touches FTS/index triggers and every note read path for a problem the
    surface mapping solves at zero storage cost. Trigger condition stated in §3a.
 6. **Amend ADR-016 for multi-line strings.** Rejected: the escapes already ship and are
-   already specified, so no grammar addition is needed. A variant was also considered --
-   tolerating raw control characters inside quoted strings, which would make the naive
-   single-escaped form work with zero failed round-trips. Rejected because it breaks the
-   "string escapes follow JSON" contract, and an unterminated quote would then swallow
-   subsequent lines and surface as a confusing failure far from the fault. The
-   discoverability failure that motivated both variants is real and is addressed
-   normatively by §3c (a teaching error message covering the transport double-escape)
-   plus generated documentation (§5); a naive caller pays at most one self-explaining
-   failed call instead of a folklore hunt.
+   specified, so no grammar addition is needed. A variant allowing arbitrary raw control
+   bytes inside quoted strings was rejected because it would extend the accepted input
+   beyond the three-byte newline, carriage-return, and tab carve-out in ADR-016; other
+   raw control bytes remain errors (docs/adr/ADR-016-request-dsl.md:136-146;
+   crates/khive-request/src/parser/scan.rs:118-218;
+   crates/khive-request/src/parser/parser_impl.rs:618-630; corrected by Amendment 1,
+   Decision 2). The transport double-escape instruction in §3c is superseded by that
+   accepted carve-out.
 
 ## References
 
 - [ADR-016](ADR-016-request-dsl.md) -- request DSL; string escapes and `$prev[N].field`
-  addressing (both verified shipped, unamended)
+  addressing. The accepted string contract includes the literal newline, carriage-return,
+  and tab carve-out recorded in #957 (docs/adr/ADR-016-request-dsl.md:136-146; corrected
+  by Amendment 1, Decision 2).
 - [ADR-017](ADR-017-pack-standard.md) -- Pack trait, `EDGE_RULES`, pack-extensible
   endpoints (the merge semantics `schema` serializes)
-- [ADR-023](ADR-023-declarative-pack-format.md) -- verb surface and naming rules (would
-  gain a `schema` row if this proposal is accepted and implemented)
+- [ADR-023](ADR-023-declarative-pack-format.md) -- verb surface and naming rules; §4 has
+  the `schema` row with a proposed contract pending acceptance and conformance validation
+  (lines 172-200; corrected by Amendment 1, Decision 4).
 - [ADR-045](ADR-045-verb-response-presentation.md) -- presentation rules applied to `schema`
   output
 - [ADR-048](ADR-048-knowledge-section-profiles.md) -- `resource` kind (pack-declared;
   why §2 serializes merged vocabulary)
 - [ADR-076](ADR-076-relation-calculability-and-system-role.md) -- certificate tests that motivated
   `base_entity_endpoint_rules()`
-- `crates/khive-runtime/src/operations.rs` -- `BASE_ENTITY_ENDPOINT_RULES`
+- `crates/khive-types/src/edge_rules.rs` -- defines `BASE_ENTITY_ENDPOINT_RULES` at line 37;
+  the runtime re-exports it in `crates/khive-runtime/src/operations.rs:432-435`
 - `crates/khive-types/src/pack.rs` -- `ParamDef` / `HandlerDef` (phase-1 test substrate)
 
 ## Proposed implementation clarification (2026-10-10)
 
 This clarification remains **Proposed**. Source preparation for `schema` does not
-accept this ADR or establish completed conformance validation. The dated deferred
-status above records the earlier baseline; architectural acceptance and driven
-implementation validation remain pending. This section clarifies §2 only; it does
-not implement the other verb-surface or generated-document rules in this ADR.
+accept this ADR or establish completed conformance validation. The status banner above
+records the implemented schema verb, while architectural acceptance and conformance
+validation remain pending (corrected by Amendment 1, Decision 4). This section clarifies §2 only; it does not implement the other verb-surface or
+generated-document rules in this ADR.
 
 `schema()` accepts no filters. Normal registry Gate admission, namespace argument
 validation and configured dispatch audit behavior apply. The handler projects only
@@ -422,7 +460,8 @@ which does not exempt it from ordinary incidental audit behavior.
 The response retains `entity_kinds`, `note_kinds`, `edge_relations`,
 `endpoint_rules`, `packs_loaded` and `contract_version`. A `counts` object contains
 the length of each of the first five arrays. The closed relation array is drawn
-from `EdgeRelation::ALL`; the historical example's 17 names are not a fixed count.
+from `EdgeRelation::ALL`; its current declaration contains 20 names
+(`crates/khive-types/src/edge.rs:81-106; corrected by Amendment 1, Decision 4).
 Kind and pack-name arrays are lexicographically sorted and deduplicated; relation
 spellings are lexicographically sorted.
 
@@ -454,3 +493,90 @@ empty vocabulary arrays. The existing table renderer emits every endpoint row an
 all vocabulary, pack, count and hash siblings; it does not filter the matrix or
 substitute a shorter summary. Table escaping remains display behavior. No new
 presentation policy or format is introduced.
+
+## Amendment 1 (2026-10-23) -- Shipped surface and conformance scope
+
+**Status**: Proposed 2026-10-23. This draft requires specification approval before
+dependent conformance work lands. It does not change the status of the base ADR or of
+earlier amendments.
+
+**Addresses**: [#5557](https://github.com/ohdearquant/khive/issues/5557).
+
+**Trigger.** The status banner and context described `schema` as unshipped and said no
+runtime surface exposed the merged contract, while the handler is registered, dispatched,
+and classified as a read (`crates/khive-pack-kg/src/handler_defs.rs:53-61;
+crates/khive-pack-kg/src/dispatch.rs:150-152; crates/khive-gate/src/operation.rs:192;
+crates/khive-pack-kg/src/schema.rs:52-121). The record also conflicts with the accepted
+DSL rule for literal newline, carriage-return, and tab bytes inside quoted values
+(`docs/adr/ADR-016-request-dsl.md:136-146`). The decisions below state the conformance
+baseline, preserve three normative checks, and correct stale counts and implementation
+references.
+
+### Decision 1 -- Shrink-only legacy baseline
+
+The Phase-1 legacy baseline is a checked-in allowlist of the existing non-conforming
+`(verb, param)` pairs. Each entry names its tracking issue. No entry may be added, and an
+entry leaves the baseline when its issue closes. This preserves the explicit deprecation
+path for shipped parameter names in Rule 4 while preventing new exceptions. The
+no-grandfathering alternative was rejected because treating existing pairs as untracked
+failures would block the record on unrelated migrations
+(`docs/adr/ADR-084-verb-surface-consistency.md:124-132,
+284-303`).
+
+### Decision 2 -- ADR-016 string behavior
+
+The accepted ADR-016 contract governs quoted DSL values. Literal newline, carriage-return,
+and tab bytes are rewritten before JSON decoding; other raw control bytes remain errors
+(`docs/adr/ADR-016-request-dsl.md:136-146;
+crates/khive-request/src/parser/scan.rs:118-218;
+crates/khive-request/src/parser/parser_impl.rs:618-630;
+crates/khive-request/tests/parser_tests/string_values_tests.rs:13-26;
+crates/khive-request/tests/parser_tests/control_characters_tests.rs:16-29). The transport
+double-escape instruction in §3c is superseded. The rejected alternative was accepting
+arbitrary raw control bytes, which is broader than ADR-016's three-byte carve-out. This
+follows the accepted ADR rather than changing it to match a proposed rule; the parser
+change that shipped the carve-out is recorded in #957.
+
+### Decision 3 -- Normative conformance checks
+
+The Phase-1 workspace test, the Rule 6 end-to-end smoke test, and the §3b entity-create
+field error remain normative and must appear on the conformance checklist for #5557.
+The Phase-1 test checks the metadata contract in §4. The Rule 6 smoke test compares kinds
+written by its driven store with the merged declared vocabulary. The entity-create check
+requires `content` supplied to an entity create to return an error naming `description`.
+These requirements retain the scope already stated in §1, §3b, and §4.
+
+### Decision 4 -- Corrected counts and implementation facts
+
+The relation count is 20 (`crates/khive-types/src/edge.rs:81-106`). The base note
+vocabulary contains six kinds (`crates/khive-pack-kg/src/vocab.rs:95-131`). The example
+packs declare six additional note kinds, for twelve total: comm declares `message` and
+`channel_health`, and gtd, memory, schedule, and session each declare one
+(`crates/khive-pack-comm/src/pack.rs:40;
+crates/khive-pack-gtd/src/pack.rs:25;
+crates/khive-pack-memory/src/pack.rs:76;
+crates/khive-pack-schedule/src/pack.rs:24;
+crates/khive-pack-session/src/pack.rs:29). The nine entity kinds remain as declared by
+kg (`crates/khive-pack-kg/src/pack.rs:76-80`).
+
+The `schema` handler is implemented and registered, but ADR-084 remains Proposed until
+accepted. ADR-023 places its verb table in §4 and marks the `schema` row's contract
+proposed pending ADR-084 acceptance and conformance validation
+(`docs/adr/ADR-023-declarative-pack-format.md:172-200`). The base endpoint table is defined
+in `crates/khive-types/src/edge_rules.rs:37-106`; the runtime re-exports it at
+`crates/khive-runtime/src/operations.rs:432-435`. The schema handler uses the registry's
+pack-attributed accessor (`crates/khive-runtime/src/pack/catalog.rs:482-493;
+crates/khive-runtime/src/pack/builder.rs:636-650,961-963;
+crates/khive-pack-kg/src/schema.rs:74-99).
+
+### Acceptance
+
+| ID | Statement                                                                                  | Evidence                                                                                                                                                                                                                                                                                                                                                                                        |
+| -- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1 | A Phase-1 test checks all compiled handler metadata and permits only a shrinking baseline. | Required workspace Phase-1 `HandlerDef` conformance test in §4.                                                                                                                                                                                                                                                                                                                                 |
+| A2 | The Rule 6 smoke test compares every written kind with schema vocabulary.                  | Required extension of `crates/khive-mcp/tests/integration_tests/kind_hook_tests.rs`.                                                                                                                                                                                                                                                                                                            |
+| A3 | Singleton entity create with `content` fails and names `description`.                      | Required assertion in `crates/khive-pack-kg/src/handlers/tests.rs`; parameter and branch path in `crates/khive-pack-kg/src/handlers/params.rs:43-54` and `crates/khive-pack-kg/src/handlers/create.rs:788-825,1032-1072`.                                                                                                                                                                       |
+| A4 | Schema returns merged declarations, counts, attributed rows, and hash.                     | `crates/kkernel/tests/schema.rs::default_schema_is_complete_attributed_and_does_not_write_domain_rows`; `crates/khive-pack-kg/src/schema.rs:52-121`.                                                                                                                                                                                                                                            |
+| A5 | Relation and note-kind counts match their declarations.                                    | `crates/khive-types/src/edge.rs:81-106`; `crates/khive-pack-kg/src/vocab.rs:95-131`; pack declarations in Decision 4.                                                                                                                                                                                                                                                                           |
+| A6 | Literal newline, carriage-return, and tab bytes round-trip; other raw controls fail.       | `crates/khive-request/tests/parser_tests/string_values_tests.rs::multiline_string_value_round_trips`; `tab_and_carriage_return_literal_in_string`; `crates/khive-request/tests/parser_tests/control_characters_tests.rs::other_raw_control_chars_in_quoted_string_still_rejected`; `crates/khive-request/src/parser/scan.rs:118-218`; `crates/khive-request/src/parser/parser_impl.rs:618-630`. |
+| A7 | The three normative checks in Decision 3 appear on the #5557 checklist.                    | [#5557](https://github.com/ohdearquant/khive/issues/5557).                                                                                                                                                                                                                                                                                                                                      |
