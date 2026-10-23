@@ -159,4 +159,7 @@ mod event_counts_group_tests;
 mod event_counts_fold_tests;
 
 #[cfg(test)]
+mod event_counts_error_tests;
+
+#[cfg(test)]
 mod unknown_event_usage_tests;
