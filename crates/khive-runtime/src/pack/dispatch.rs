@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::error::{AuditObligationFailure, DispatchError, RuntimeError};
 use crate::runtime::NamespaceToken;
 
-use super::audit::{enrich_search_success, enrich_stream_truncate_success};
+use super::audit::{enrich_search_success, enrich_stream_truncate_success, stamp_error_class};
 use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
@@ -471,9 +471,12 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
-        if let Ok(value) = result {
-            enrich_stream_truncate_success(&mut event, gate_req, value);
-            enrich_search_success(&mut event, gate_req, value, search_arms);
+        match result {
+            Ok(value) => {
+                enrich_stream_truncate_success(&mut event, gate_req, value);
+                enrich_search_success(&mut event, gate_req, value, search_arms);
+            }
+            Err(error) => stamp_error_class(&mut event, error.audit_error_class()),
         }
         let producer = if result.is_ok() {
             crate::audit_batch::AuditProducer::DispatchSucceeded
@@ -593,6 +596,15 @@ impl VerbRegistry {
             error = %crate::secret_gate::bounded_masked_log_text(&error.to_string()),
             "gate check failed (fail-closed)"
         );
+        let failure = RuntimeError::GateUnavailable {
+            verb: gate_req.verb.clone(),
+            // Caller-visible: a stable, classified reason derived from the
+            // `GateError` variant only. `error`'s `Display` text is logged
+            // above (server-side, via `tracing::warn!`) and must never be
+            // interpolated here — a gate backend's error message can embed
+            // connection details, addresses, or credentials.
+            reason: error.wire_reason().to_string(),
+        };
         if let Some(store) = &self.event_store {
             let mut event = build_audit_storage_event(
                 gate_req,
@@ -600,6 +612,7 @@ impl VerbRegistry {
                 EventOutcome::Error,
                 Some(crate::cost_unit::base_resource_payload(request_id)),
             );
+            stamp_error_class(&mut event, failure.audit_error_class());
             if let Some(target) = effective_target {
                 event = event.with_target(target);
             }
@@ -613,15 +626,7 @@ impl VerbRegistry {
             )
             .await;
         }
-        RuntimeError::GateUnavailable {
-            verb: gate_req.verb.clone(),
-            // Caller-visible: a stable, classified reason derived from the
-            // `GateError` variant only. `error`'s `Display` text is logged
-            // above (server-side, via `tracing::warn!`) and must never be
-            // interpolated here — a gate backend's error message can embed
-            // connection details, addresses, or credentials.
-            reason: error.wire_reason().to_string(),
-        }
+        failure
     }
 
     /// Dispatch a verb to the first pack that handles it.
@@ -1166,6 +1171,12 @@ impl VerbRegistry {
                                         search_arms,
                                     );
                                 }
+                                if let Err(error) = &result {
+                                    stamp_error_class(
+                                        &mut storage_event,
+                                        error.audit_error_class(),
+                                    );
+                                }
                                 if let Some(metadata) = &mounted_audit {
                                     storage_event.payload["mounted_tool"] = metadata.clone();
                                 }
@@ -1294,6 +1305,7 @@ impl VerbRegistry {
         // `Event::new` default of 0 — no dispatch occurred to measure) so an
         // allowed-but-unknown verb is never silently dropped from the audit
         // trail (matches the "no audit row is ever dropped" contract above).
+        let failure = self.unknown_verb_error(verb);
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
                 // Dispatch is about to return `UnknownVerb` below (no pack
@@ -1301,12 +1313,13 @@ impl VerbRegistry {
                 // not `Success`. `work_class` is still stamped (ADR-103
                 // Decision (a)); `resource.cost_unit` is omitted, matching
                 // every other errored-dispatch row.
-                let storage_event = build_audit_storage_event(
+                let mut storage_event = build_audit_storage_event(
                     &gate_req,
                     &audit,
                     EventOutcome::Error,
                     Some(crate::cost_unit::base_resource_payload(request_id)),
                 );
+                stamp_error_class(&mut storage_event, failure.audit_error_class());
                 // Dispatch already returns `UnknownVerb` below regardless, so
                 // — as with the deny paths above — there is no success
                 // outcome to fold a commit failure into.
@@ -1325,9 +1338,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(DispatchError::before_dispatch(
-            self.unknown_verb_error(verb),
-        ))
+        Err(DispatchError::before_dispatch(failure))
     }
 
     /// Dispatch a verb under an out-of-band verified actor identity.
