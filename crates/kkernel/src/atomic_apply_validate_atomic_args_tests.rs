@@ -14,6 +14,7 @@ fn atomic_update_result_uses_matching_post_commit_truncation_outcome() {
         truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
             truncated: 1,
             discarded_bytes: 17,
+            ..Default::default()
         },
     }];
     let mut result = json!({"id": note_id});
@@ -52,6 +53,7 @@ fn atomic_duplicate_update_effect_aggregates_later_truncation_outcome() {
             truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
                 truncated: 1,
                 discarded_bytes: 23,
+                ..Default::default()
             },
         },
     ];

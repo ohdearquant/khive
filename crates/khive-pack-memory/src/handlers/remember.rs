@@ -6,6 +6,7 @@ use uuid::Uuid;
 use khive_runtime::keyed_memory::{
     create_keyed_memory_with_receipt_and_report, validate_memory_key, KeyedMemorySpec,
 };
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
@@ -131,14 +132,16 @@ impl MemoryPack {
                     Ok(Some(uuid)) => annotates.push(uuid),
                     Ok(None) => {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "source_id {sid:?}: no record matches this prefix"
+                            "source_id {:?}: no record matches this prefix",
+                            mask_for_redaction_surface(RedactionSurface::GateProbe, sid)
                         )));
                     }
                     Err(e) => return Err(e),
                 }
             } else {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "source_id {sid:?} is not a valid UUID or 8-char short ID"
+                    "source_id {:?} is not a valid UUID or 8-char short ID",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, sid)
                 )));
             }
         }

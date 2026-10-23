@@ -130,7 +130,7 @@ async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity
     let encoded = serde_json::to_value(&report).unwrap();
     assert_eq!(
         encoded["embedding_truncation_report"],
-        json!({"truncated": 1, "discarded_bytes": 7})
+        json!({"truncated": 1, "discarded_bytes": 7, "token_reporting_unavailable": 2})
     );
     assert_eq!(
         captured.lock().unwrap().as_slice(),

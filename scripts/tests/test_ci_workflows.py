@@ -2032,6 +2032,23 @@ class DocsFormatPhaseTests(unittest.TestCase):
         install = docs_job.index("run: scripts/ci-install-ripgrep.sh")
         self.assertLess(install, docs_job.index("run: scripts/ci.sh content-sweeps"))
 
+    def test_docs_job_checks_generated_benchmark_reference_blocks(self):
+        # The benchmark reference block is generated from a committed file. A
+        # shallow checkout can hold the document without the baseline commit the
+        # renderer must date, so the docs job fetches full history before running
+        # the renderer's own tests and its fail-closed drift check.
+        job = indented_block(workflow_text("ci.yml"), "docs", 2)
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("actions/setup-python@v6", job)
+        self.assertIn(
+            "run: python3 -m unittest scripts.tests.test_render_bench_reference -v",
+            job,
+        )
+        self.assertIn("run: python3 scripts/render-bench-reference.py --check", job)
+        tests = job.index("test_render_bench_reference")
+        check = job.index("render-bench-reference.py --check")
+        self.assertLess(tests, check)
+
     def test_ripgrep_install_has_one_copy(self):
         workflow = workflow_text("ci.yml")
         self.assertNotIn("apt-get install", workflow)
@@ -2661,6 +2678,39 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
 
 
+class PythonPathIsolationTests(unittest.TestCase):
+    def test_classifier_python_invocations_use_isolated_path_mode(self):
+        ci_job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        ci_scope = textwrap.dedent(ci_job.split("- name: Scope\n", 1)[1])
+        train_job = indented_block(indented_block(workflow_text("bench-track.yml"), "jobs", 0), "changes", 2)
+        train_step = train_job.split("- name: Scope the train\n", 1)[1]
+        train_scope = textwrap.dedent(
+            re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", train_step + "\n").group(1)
+        )
+
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            train_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            train_scope,
+        )
+        self.assertIn(
+            'python3 -P "$scanner" --published-markdown "$path" < /dev/null',
+            (REPO_ROOT / "scripts" / "ci-docs-only.sh").read_text(),
+        )
+        self.assertIn("python3 -P -c '", (REPO_ROOT / "scripts" / "ci.sh").read_text())
+
+
 class DocsOnlyClassifierTests(unittest.TestCase):
     """scripts/ci-docs-only.sh on real temporary repositories, and the classifier job's event routing."""
 
@@ -2684,6 +2734,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("docs/guide/counts.md", "# Counts\n")
         self.write("docs/adr/ADR-001-guide.md", "# ADR\n")
         self.base = self.commit("base")
+        self.remote = pathlib.Path(self.temp.name) / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
 
     def git(self, *args):
         return subprocess.run(
@@ -2749,12 +2803,91 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         head = self.commit("adr")
         (self.repo / "scripts").mkdir(exist_ok=True)
         shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
         completed = subprocess.run(
             ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo, env=self.env,
             text=True, capture_output=True, timeout=30, check=False,
         )
         self.assertEqual((completed.returncode, completed.stdout), (0, "false\n"), completed.stderr)
         self.assertIn("count scanner failed for docs/adr/ADR-001-guide.md", completed.stderr)
+
+    def test_scanner_cannot_truncate_unread_changed_paths(self):
+        self.write("README.md", "# Readme\n\nChanged.\n")
+        self.write("src/lib.rs", "pub fn f() {} // changed\n")
+        head = self.commit("readme and source")
+        scripts = self.repo / "scripts"
+        scripts.mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, scripts / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts" / "ci-inert-docs-data.txt", scripts / "ci-inert-docs-data.txt")
+        scanner = self.repo / "tests" / "documented_verb_counts.py"
+        scanner.parent.mkdir(exist_ok=True)
+        marker = scanner.with_name("list-truncated")
+        scanner.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "tmpdir = Path(os.environ['TMPDIR'])\n"
+            "for candidate in tmpdir.iterdir():\n"
+            "    try:\n"
+            "        contents = candidate.read_bytes()\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    if b'README.md\\0' in contents and b'src/lib.rs\\0' in contents:\n"
+            "        candidate.write_bytes(b'')\n"
+            "        Path(__file__).with_name('list-truncated').write_text(candidate.name)\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('change list not found')\n"
+            "raise SystemExit(1)\n"
+        )
+        tmpdir = pathlib.Path(self.temp.name) / "tmp"
+        tmpdir.mkdir()
+        bin_dir = pathlib.Path(self.temp.name) / "bin"
+        bin_dir.mkdir()
+        bash = bin_dir / "bash"
+        bash.write_text('#!/bin/sh\nexec /bin/bash "$@"\n')
+        bash.chmod(0o755)
+        mktemp = bin_dir / "mktemp"
+        mktemp.write_text(
+            "#!/bin/bash\n"
+            "counter=0\n"
+            "if [[ -f \"$TMPDIR/counter\" ]]; then read -r counter < \"$TMPDIR/counter\"; fi\n"
+            "counter=$((counter + 1))\n"
+            "printf '%s\\n' \"$counter\" > \"$TMPDIR/counter\"\n"
+            "path=\"$TMPDIR/tmp.$counter\"\n"
+            ": > \"$path\"\n"
+            "printf '%s\\n' \"$path\"\n"
+        )
+        mktemp.chmod(0o755)
+        completed = subprocess.run(
+            ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo,
+            env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmpdir)},
+            text=True, capture_output=True,
+            timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(
+            marker.is_file(),
+            f"the scanner did not truncate the classifier's change list\n{completed.stdout}{completed.stderr}",
+        )
+        self.assertEqual(completed.stdout, "false\n", completed.stderr)
+        self.assertIn("not Markdown: src/lib.rs", completed.stderr)
+
+    def test_job_pull_request_that_edits_the_count_scanner_runs_full_suite(self):
+        head = self.merge_ref("tests/documented_verb_counts.py", "print('changed scanner')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: tests/documented_verb_counts.py\n", log
+        )
+
+    def test_job_pull_request_that_edits_the_inert_docs_data_runs_full_suite(self):
+        data = (REPO_ROOT / "scripts" / "ci-inert-docs-data.txt").read_text()
+        head = self.merge_ref("scripts/ci-inert-docs-data.txt", data + "# Changed.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-inert-docs-data.txt\n", log
+        )
 
     def test_code_that_starts_like_a_comment_still_names_markdown(self):
         cases = [
@@ -2930,7 +3063,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
 
     def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
-                     head_repository=None, classifier=None):
+                     head_repository=None, classifier=None, default_branch="main"):
         """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
         unset unless given, as on a push. classifier, when given, is the text of the checked-out
         scripts/ci-docs-only.sh in place of this repository's own."""
@@ -2945,6 +3078,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
         else:
             self.write("scripts/ci-docs-only.sh", classifier)
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -2962,7 +3096,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
             env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x", **pull},
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": default_branch, **pull},
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
@@ -2982,6 +3116,23 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.git("merge", "-q", "--no-ff", "-m", "merge", topic)
         return self.git("rev-parse", "HEAD")
 
+    def stacked_merge_ref(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
     def test_job_pull_request_compares_the_merge_ref_with_its_base_parent(self):
         head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=true")
@@ -2989,6 +3140,22 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    def test_stacked_pull_request_compares_classifiers_with_the_default_branch(self):
+        head = self.stacked_merge_ref()
+        verdict, log = self.classify_job(
+            "pull_request", head, classifier=self.LENIENT_CLASSIFIER
+        )
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log
+        )
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_suite(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head, default_branch="missing")
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
 
     # A classifier that answers "documentation only" for every change, as a change could carry.
     LENIENT_CLASSIFIER = "#!/bin/bash\necho true\n"
@@ -4019,6 +4186,10 @@ esac
 
     def setUp(self):
         super().setUp()
+        self.remote = self.root / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         tools = {"gh": self.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
@@ -4042,7 +4213,8 @@ esac
             timeout=60, check=False,
             env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": "main",
+                 "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
                  "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake), **(extra_env or {})},
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
@@ -4062,10 +4234,41 @@ esac
         self.assertEqual([call.split()[2] for call in downloads], ["201", "202"])
         self.assertTrue(self.calls(self.runner_temp / "kkernel-main-202"))
 
-    def test_the_path_rules_run_before_any_fetch(self):
+    def stacked_pull_request(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", "#!/bin/bash\necho true\n")
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("crates/k/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("docs/default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
+    def test_stacked_pull_request_classifier_change_forces_full_scope(self):
+        head = self.stacked_pull_request()
+        scope, log = self.run_step("pull_request", head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-docs-only.sh", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_manifest_skips_the_binary_lookup(self):
         scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
         self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_scope(self):
+        head = self.change("crates/k/src/lib.rs")
+        scope, log = self.run_step("pull_request", head, extra_env={"DEFAULT_BRANCH": "missing"})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_other_events_are_never_scoped(self):
@@ -4217,6 +4420,16 @@ class BenchTrainScopeTests(ScopeFixture):
         self.assertIn(f"train range: {self.base}..", log)
         self.assertIn("kkernel from main push run 202", log)
 
+    def test_a_train_that_edits_the_scope_classifier_runs_full_scope(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.write("scripts/ci-test-scope.py", ScopeStepTests.LENIENT_SCOPE)
+        head = self.commit("edit the scope classifier")
+        scope, log = self.scope(head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py", log)
+        self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
     def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
         scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
@@ -4243,14 +4456,43 @@ class BenchTrainScopeTests(ScopeFixture):
         self.assertEqual(self.components("khive-types khive-storage"), set())
 
     def test_the_binary_lookup_is_the_ci_scope_steps_own(self):
-        def shared(script):
-            lines = script.splitlines()
-            start = next(i for i, line in enumerate(lines) if line.lstrip().startswith("mode=$("))
-            end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-            return "\n".join(lines[start:end])
-
         ci = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
         ci_run = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", ci + "\n").group(1))
+
+        def classifier_guard(script):
+            lines = script.splitlines()
+            function_start = next(
+                (i for i, line in enumerate(lines) if line.strip() == "classifiers_changed() {"), None
+            )
+            self.assertIsNotNone(function_start, "classifier guard function is missing")
+            function_end = next(i for i in range(function_start + 1, len(lines)) if lines[i].strip() == "}")
+            call_start = next(
+                (i for i, line in enumerate(lines)
+                 if line.strip() == 'if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then'),
+                None,
+            )
+            self.assertIsNotNone(call_start, "classifier guard call is missing")
+            indent = len(lines[call_start]) - len(lines[call_start].lstrip())
+            call_end = next(
+                i for i in range(call_start + 1, len(lines)) if lines[i] == " " * indent + "fi"
+            )
+            return (
+                textwrap.dedent("\n".join(lines[function_start:function_end + 1])),
+                textwrap.dedent("\n".join(lines[call_start:call_end + 1])),
+            )
+
+        self.assertEqual(classifier_guard(self.step("Scope the train")), classifier_guard(ci_run))
+
+        def shared(script):
+            lines = script.splitlines()
+            start = next(
+                i for i, line in enumerate(lines)
+                if line.strip() == 'if [[ "$mode" == "map" ]]; then'
+            )
+            indent = len(lines[start]) - len(lines[start].lstrip())
+            end = next(i for i in range(start + 1, len(lines)) if lines[i] == " " * indent + "fi")
+            return textwrap.dedent("\n".join(lines[start:end + 1]))
+
         self.assertEqual(shared(self.step("Scope the train")), shared(ci_run))
 
     def test_every_benchmarked_crate_is_in_exactly_one_component(self):
@@ -4274,6 +4516,269 @@ class BenchTrainScopeTests(ScopeFixture):
         # The train maps a crate to crates/<name>/Cargo.toml, so every member's directory is its package name.
         self.assertEqual({m for m in members if m not in packages or packages[m].parent.name != m}, set(),
                          "a component names a crate that is not a package of that directory name")
+
+
+class InertDocumentationDataTests(unittest.TestCase):
+    """An explicit inert-data exception cannot hide a source reader from CI."""
+
+    DOCS = "docs" + "/"
+    DATA = DOCS + "testing/fixture-exclusions.tsv"
+    LIST = "scripts/ci-inert-docs-data.txt"
+
+    @classmethod
+    def entries(cls, root):
+        paths = []
+        for number, line in enumerate((root / cls.LIST).read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            path, marker, reason = line.partition("#")
+            path = path.strip()
+            parts = pathlib.PurePosixPath(path).parts
+            if (not marker or not reason.strip() or not path.startswith(cls.DOCS)
+                    or any(part in (".", "..") for part in path.split("/"))
+                    or "//" in path or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+                    or pathlib.PurePosixPath(path).suffix not in (".tsv", ".csv", ".txt")
+                    or path in paths or len(parts) < 2):
+                raise ValueError(f"invalid inert data entry at line {number}: {path}")
+            if not (root / path).is_file() or (root / path).is_symlink():
+                raise ValueError(f"inert data is not a regular file: {path}")
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def path_pieces(line):
+        def expand(token):
+            brace = re.search(r"\{([^{}]*)\}", token)
+            if brace is None:
+                return [token]
+            return [expanded for arm in brace[1].split(",")
+                    for expanded in expand(token[:brace.start()] + arm + token[brace.end():])]
+
+        pieces = []
+        for token in re.findall(r"[A-Za-z0-9_.*/?\[\]{},-]+", line):
+            candidates = re.split(r"[{},]", token)
+            candidates += [part for expanded in expand(token) for part in expanded.split(",")]
+            for piece in candidates:
+                while piece.startswith(("[", "./", "../", "/")):
+                    if piece.startswith("../"):
+                        piece = piece[3:]
+                    elif piece.startswith("./"):
+                        piece = piece[2:]
+                    else:
+                        piece = piece[1:]
+                pieces.append(piece.rstrip("].,"))
+        return pieces
+
+    @classmethod
+    def permitted_root_line(cls, source, line):
+        allowed = {
+            "Makefile": {"deno fmt " + cls.DOCS, "deno fmt --check " + cls.DOCS},
+            "deno.json": {'"include": ["' + cls.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'},
+            ".github/workflows/ci.yml": {
+                "# Pull requests from this repository's `split/` and `" + cls.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + cls.DOCS + "'))",
+            },
+            "scripts/ci.sh": {
+                "# Reads Markdown under " + cls.DOCS
+                + ", crates/ and scripts/ by content, so the documentation lane must run it.",
+            },
+        }
+        return line.strip() in allowed.get(source, set())
+
+    @classmethod
+    def naming_error(cls, source, line, listed):
+        target = pathlib.PurePosixPath(listed)
+        if target.name in line:
+            return "file name"
+        directories = {str(parent) for parent in target.parents if len(parent.parts) >= 2}
+        for piece in cls.path_pieces(line):
+            if piece in (cls.DOCS, cls.DOCS + "*", cls.DOCS + "**"):
+                if not cls.permitted_root_line(source, line):
+                    return "documentation root"
+            if any(piece in (directory, directory + "/", directory + "/*", directory + "/**")
+                   for directory in directories):
+                return "containing directory"
+            segment = piece.rsplit("/", 1)[-1]
+            if any(char in segment for char in "*?[") and segment.endswith(target.suffix):
+                return "extension pattern"
+        return None
+
+    @classmethod
+    def inventory_errors(cls, root):
+        listed = cls.entries(root)
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True,
+                                 timeout=10).stdout.decode().split("\0")
+        errors = []
+        for source in tracked:
+            # The inventory declares exceptions; it is not a consumer of the data it lists.
+            if not source or source == cls.LIST or source.startswith(cls.DOCS) or source.endswith(".md"):
+                continue
+            for number, line in enumerate((root / source).read_bytes().decode("utf-8", errors="replace").splitlines(), 1):
+                for path in listed:
+                    reason = cls.naming_error(source, line, path)
+                    if reason:
+                        errors.append(f"{source}:{number}: {reason} names {path}")
+        return errors
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        self.write(self.LIST, self.DATA + " # Historical exclusions, not read by source.\n")
+        self.write(self.DATA, "CHANGELOG.md\thistorical exclusion\n")
+        self.write("CHANGELOG.md", "# Changes\n")
+        self.classifier = self.repo / "scripts/ci-docs-only.sh"
+        shutil.copy(REPO_ROOT / "scripts/ci-docs-only.sh", self.classifier)
+        (self.repo / "tests").mkdir()
+        shutil.copy(REPO_ROOT / "tests/documented_verb_counts.py", self.repo / "tests/documented_verb_counts.py")
+        self.base = self.commit("base")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo,
+                              env=self.env, text=True, capture_output=True, timeout=10, check=True).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify_change(self):
+        self.write("CHANGELOG.md", "# Changes\n\nA documented change.\n")
+        head = self.commit("changelog")
+        result = subprocess.run(["bash", str(self.classifier), self.base, head], cwd=self.repo,
+                                env=self.env, text=True, capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip(), result.stderr
+
+    def test_listed_changelog_takes_documentation_lane(self):
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_inert_list_reader_does_not_execute_checkout_modules(self):
+        """A Python stdin reader must not execute import-shadowing modules from the checkout."""
+        marker = self.repo / "inert-reader-shadow-imported"
+        self.write("re.py", 'with open("inert-reader-shadow-imported", "w") as marker:\n'
+                            '    marker.write("checkout module executed\\n")\n')
+        source = self.classifier.read_text()
+        scanner_call = '    python3 -P "$scanner" --published-markdown "$path" < /dev/null'
+        self.assertEqual(source.count(scanner_call), 1)
+        # The existing scanner is a separate import site; only the new stdin reader is under test here.
+        self.classifier.write_text(source.replace(scanner_call, "    false"))
+        self.env.pop("PYTHONPATH", None)
+        self.env.pop("PYTHONSAFEPATH", None)
+        self.base = self.commit("checkout shadow module and isolated reader")
+        verdict, reasons = self.classify_change()
+        self.assertFalse(marker.exists(), "the inert-list reader imported the checkout's re.py")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_unlisted_changelog_takes_full_suite(self):
+        self.write(self.LIST, "# No exceptions.\n")
+        self.base = self.commit("unlisted")
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("named by a non-Markdown file", reasons)
+
+    def test_unreadable_or_malformed_list_takes_full_suite(self):
+        malformed = ["missing", self.DATA + "\n", self.DATA + " # \n",
+                     "elsewhere/file.tsv # Outside documentation\n",
+                     self.DOCS + "testing/../file.tsv # Traversal\n",
+                     self.DOCS + "testing/file.json # Wrong extension\n"]
+        for content in malformed:
+            with self.subTest(content=content):
+                if content == "missing":
+                    (self.repo / self.LIST).unlink(missing_ok=True)
+                else:
+                    self.write(self.LIST, content)
+                self.base = self.commit("invalid list")
+                self.write("CHANGELOG.md", "# Before\n")
+                self.base = self.commit("before markdown change")
+                verdict, reasons = self.classify_change()
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn("cannot read or parse inert documentation data list", reasons)
+
+    def test_inventory_rejects_non_documentation_and_other_extensions(self):
+        for path in ("elsewhere/file.tsv", self.DOCS + "testing/file.json"):
+            with self.subTest(path=path):
+                self.write(path, "data\n")
+                self.write(self.LIST, path + " # Invalid location or extension\n")
+                with self.assertRaises(ValueError):
+                    self.inventory_errors(self.repo)
+
+    def assert_reader_rejected(self, text):
+        self.write("scripts/consumer.txt", text + "\n")
+        self.git("add", "scripts/consumer.txt")
+        errors = self.inventory_errors(self.repo)
+        self.assertTrue(any(error.startswith("scripts/consumer.txt:1:") for error in errors), errors)
+
+    def test_inventory_rejects_file_directory_and_extension_readers(self):
+        directory = self.DOCS + "testing"
+        suffix = pathlib.PurePosixPath(self.DATA).suffix
+        for text in (pathlib.PurePosixPath(self.DATA).name, self.DATA, directory, directory + "/",
+                     directory + "/*", directory + "/**", "*" + suffix, "?" + suffix,
+                     "row[ab]" + suffix, self.DOCS + "**/*" + suffix):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_rejects_root_readers_except_exact_documented_lines(self):
+        for text in (self.DOCS, self.DOCS + "*", self.DOCS + "**"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+        for source in ("Makefile", "deno.json", ".github/workflows/ci.yml", "scripts/ci.sh"):
+            self.assertIsNotNone(self.naming_error(source, "cat " + self.DOCS, self.DATA))
+        permitted = {
+            "Makefile": ["deno fmt " + self.DOCS, "deno fmt --check " + self.DOCS],
+            "deno.json": ['"include": ["' + self.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'],
+            ".github/workflows/ci.yml": [
+                "# Pull requests from this repository's `split/` and `" + self.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + self.DOCS + "'))"],
+            "scripts/ci.sh": ["# Reads Markdown under " + self.DOCS
+                              + ", crates/ and scripts/ by content, so the documentation lane must run it."],
+        }
+        for source, lines in permitted.items():
+            for line in lines:
+                with self.subTest(source=source, line=line):
+                    self.assertIsNone(self.naming_error(source, line, self.DATA))
+                    self.assertIsNotNone(self.naming_error("scripts/consumer.txt", line, self.DATA))
+                    self.assertIsNotNone(self.naming_error(source, line + " extra", self.DATA))
+
+    def test_inventory_rejects_list_and_variable_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("{" + directory + ",elsewhere}", "[" + directory + ",elsewhere]",
+                     "elsewhere," + directory, "${ROOT}/" + directory,
+                     self.DOCS + "{testing,guide}", "*." + "{tsv,csv}", "[*" + ".tsv,*" + ".csv]",
+                     "${ROOT}/*" + ".tsv", "elsewhere,*" + ".tsv"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_normalizes_relative_and_punctuated_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("./" + directory, "../../" + directory, "/" + directory,
+                     "[../" + directory + "].", directory + ".", directory + ","):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_longer_paths_do_not_name_containing_directories(self):
+        for text in ("docs/testing/sibling.csv", self.DOCS + "testing-extra", self.DOCS + "testing/other/file"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.naming_error("scripts/consumer.txt", text, self.DATA))
+
+    def test_repository_inventory_has_no_source_readers(self):
+        self.assertNotEqual(self.entries(REPO_ROOT), [])
+        self.assertEqual(self.inventory_errors(REPO_ROOT), [])
+
 
 
 class OptionalWorkflowCodexSkipTests(unittest.TestCase):

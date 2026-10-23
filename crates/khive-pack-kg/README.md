@@ -12,12 +12,13 @@ See [event subject history](docs/api/event-target-filter.md) for exact event `ta
 The [canonical change-set apply](docs/api/apply-changeset.md) verb lands staged identifiers and
 captured preimages in one writer transaction.
 
-29 public verbs and one operator-only `kg.proposal_cleanup` subhandler, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+31 public verbs and one operator-only `kg.proposal_cleanup` subhandler, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb              | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apply_changeset` | Apply a bounded canonical NDJSON change-set atomically, retaining staged IDs and validating captured preimages                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `create`          | Create an entity or note (singleton), or a batch of entities (bulk via `items`)                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `attach`          | Add or replace a role-keyed attachment on an existing entity or note from base64 bytes.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `get`             | Fetch any record by UUID (short hex prefix accepted, min 8 chars)                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `list`            | List records with optional filtering                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `count`           | Count events by stored verb, kind or actor across caller-visible namespaces, with optional time and event filters                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -42,8 +43,9 @@ captured preimages in one writer transaction.
 | `db_diagnostics`  | Reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics: reader admission capacity/availability, pooled checkouts, separately attributed standalone opens, timeouts and hold lifecycle; aggregate plus pooled/standalone/writer-task writer acquisitions, writer-task failures, swallowed audit failures, duplicate edge-ID/list-ledger counts, checkpoint counters, PASSIVE probe, WAL size, and qualified holder census (probe may backfill WAL frames; never TRUNCATE or create/delete files) |
 
 | `stream.append` | Append immutable JSON with a dense sequence and optional expected_seq precondition |
-| `stream.read` | Read an ordered page, head_seq and next_after from one snapshot |
-| `stream.stat` | Count entries and read head_seq from one snapshot |
+| `stream.read` | Read a retained page, floor_seq, head_seq and next_after from one snapshot |
+| `stream.stat` | Read retained count, floor_seq and head_seq from one snapshot |
+| `stream.truncate` | Hard-delete an idempotent prefix while retaining the floor and sequence head |
 | `stream.batch` | Append over several streams in one request, atomic under a fence or per member |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
@@ -163,12 +165,29 @@ a mismatch returns `conflict` with string-valued `details.reason="seq_conflict"`
 `stream`, `expected_seq` and `next_seq`, without inserting a note or ledger row.
 The result is `{seq, id, created_at}`.
 
-`stream.read(stream, after=0, limit=1000)` returns `{entries, head_seq, next_after}`.
+`stream.read(stream, after=0, limit=1000)` returns `{entries, floor_seq, head_seq, next_after}`.
 Entries carry `{seq, id, record, created_at}` and are ordered by sequence, strictly
 after the supplied cursor. `next_after` is the last returned sequence when more
 entries remain, otherwise null. An unknown stream is an empty page with head 0.
-`stream.stat(stream)` returns `{head_seq, count}` from a single snapshot; count
-and head are read independently to expose any density defect.
+`stream.stat(stream)` returns `{head_seq, floor_seq, count}` from a single snapshot.
+The floor is 1 for a never-truncated stream; retained density is
+`count = head_seq - floor_seq + 1`.
+
+`stream.truncate(stream, before_seq)` hard-deletes entries below the exclusive
+boundary, their notes and indexes in one writer transaction. It returns
+`{removed, floor_seq, head_seq}`. The floor is persisted even after the whole
+prefix is removed, so the next append continues at the old head plus one.
+Boundaries at or below the floor are no-ops; those above `head_seq + 1` are
+clipped. Unknown streams return `{removed:0, floor_seq:1, head_seq:0}`. Namespace
+write authority is required. The caller chooses its retention policy; this verb
+does not drop a stream. A reader behind the floor starts at that retained prefix.
+
+The last assignable sequence is `i64::MAX - 1`. An `expected_seq` mismatch is
+reported before exhaustion, including `seq_conflict` with `next_seq=i64::MAX` on
+a retry at the top. A matching or omitted expectation at the exhausted head
+returns `stream sequence exhausted` and writes no note. Atomic batches roll back
+all members on exhaustion; per-member batches return that refusal as the
+member's value with `domain_disposition:not_committed`, retaining its siblings.
 
 Entry content, properties (including tags), kind and namespace are immutable;
 soft and hard deletion are refused with `details.reason="stream_member"` and
@@ -240,3 +259,6 @@ client.batch([op("stream.append", stream="run", record=None, expected_seq=1)])
 
 Use verbose JSON for full identifiers and canonical timestamps. Agent presentation
 also preserves each stream record exactly and keeps empty pages and terminal cursors.
+
+See [record attachments](docs/api/attachments.md) for base64 publication, selective
+hydration, role ownership and the canonical-main limitation.

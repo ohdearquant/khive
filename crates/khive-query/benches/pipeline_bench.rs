@@ -2,6 +2,7 @@
 
 mod pipeline_support;
 
+use std::cell::OnceCell;
 use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -22,28 +23,33 @@ fn pipeline(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     for &(name, text) in GQL {
-        let parsed = parse(QueryLanguage::Gql, text).expect("legacy GQL fixture must parse");
+        let parsed = OnceCell::new();
+        let input = || {
+            parsed.get_or_init(|| {
+                parse(QueryLanguage::Gql, text).expect("legacy GQL fixture must parse")
+            })
+        };
         scene(
             &mut group,
             &format!("compile/{name}"),
-            || (),
-            |_| compile(black_box(&parsed), black_box(&opts)),
-            |_, compiled| fixtures::assert_compiled(compiled, &parsed),
+            input,
+            |parsed| compile(black_box(*parsed), black_box(&opts)),
+            |parsed, compiled| fixtures::assert_compiled(compiled, parsed),
         );
         scene(
             &mut group,
             &format!("validate/{name}"),
-            || parsed.clone(),
+            || input().clone(),
             validate,
-            |normalized, _| fixtures::assert_shape(normalized, &parsed),
+            |normalized, _| fixtures::assert_shape(normalized, input()),
         );
         scene(
             &mut group,
             &format!("validate_with_warnings/{name}"),
-            || parsed.clone(),
+            || input().clone(),
             validate_with_warnings,
             |normalized, warnings| {
-                fixtures::assert_shape(normalized, &parsed);
+                fixtures::assert_shape(normalized, input());
                 assert!(warnings.is_empty());
             },
         );

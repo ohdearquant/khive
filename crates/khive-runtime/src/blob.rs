@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "blob-s3")]
 use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_db::{SqliteError, StorageBackend};
 use khive_storage::{
@@ -329,6 +330,7 @@ pub fn resolve_blob_store(
             let root_path = root.as_ref().map(std::path::PathBuf::from);
             backend.blob_store(root_path.as_deref(), *floor_bytes)
         }
+        #[cfg(feature = "blob-s3")]
         Some(BlobConfig::S3 {
             bucket,
             region,
@@ -349,6 +351,10 @@ pub fn resolve_blob_store(
             let store = S3BlobStore::new(s3_cfg)?;
             Ok(Arc::new(store))
         }
+        #[cfg(not(feature = "blob-s3"))]
+        Some(BlobConfig::S3 { .. }) => Err(SqliteError::InvalidConfig(
+            crate::engine_config::ConfigError::BlobS3FeatureDisabled.to_string(),
+        )),
     }
 }
 
@@ -374,6 +380,7 @@ pub fn resolve_blob_store_for_mode(
             let root_path = root.as_ref().map(std::path::PathBuf::from);
             backend.blob_store_read_only(root_path.as_deref(), *floor_bytes)?
         }
+        #[cfg(feature = "blob-s3")]
         Some(BlobConfig::S3 {
             bucket,
             region,
@@ -392,6 +399,12 @@ pub fn resolve_blob_store_for_mode(
                 s3_cfg = s3_cfg.with_allow_http(*allow_http);
             }
             Arc::new(S3BlobStore::new(s3_cfg)?)
+        }
+        #[cfg(not(feature = "blob-s3"))]
+        Some(BlobConfig::S3 { .. }) => {
+            return Err(SqliteError::InvalidConfig(
+                crate::engine_config::ConfigError::BlobS3FeatureDisabled.to_string(),
+            ));
         }
     };
     Ok(Arc::new(ReadOnlyBlobStore { inner }))

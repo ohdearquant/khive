@@ -1,5 +1,6 @@
 //! Channel heartbeat writes and expired-quarantine maintenance.
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use std::future::Future;
 
 use chrono::Utc;
@@ -389,6 +390,7 @@ pub(super) async fn persist_heartbeat(
     let outcome = match p.outcome.as_str() {
         s @ ("success" | "failure") => s,
         other => {
+            let other = mask_for_redaction_surface(RedactionSurface::GateProbe, other);
             return Err(RuntimeError::InvalidInput(format!(
                 "heartbeat: invalid `outcome` {other:?}; expected \"success\" or \"failure\""
             )));
@@ -456,6 +458,7 @@ pub(super) async fn persist_heartbeat(
     }
     if let Some(reason) = p.original_not_retained_reason.as_deref() {
         if !ORIGINAL_NOT_RETAINED_REASONS.contains(&reason) {
+            let reason = mask_for_redaction_surface(RedactionSurface::GateProbe, reason);
             return Err(RuntimeError::InvalidInput(format!(
                 "heartbeat: unknown `original_not_retained_reason` {reason:?}; expected one of {}",
                 ORIGINAL_NOT_RETAINED_REASONS.join(", ")
@@ -464,6 +467,7 @@ pub(super) async fn persist_heartbeat(
     }
     if let Some(state) = p.original_retention_state.as_deref() {
         if !ORIGINAL_RETENTION_STATES.contains(&state) {
+            let state = mask_for_redaction_surface(RedactionSurface::GateProbe, state);
             return Err(RuntimeError::InvalidInput(format!(
                 "heartbeat: `original_retention_state` must be \"retained\" or \"failing\", got \
                  {state:?}"

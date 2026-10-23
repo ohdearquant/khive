@@ -87,14 +87,14 @@ fn list_items(response: &Value) -> &[Value] {
 
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
-// KG includes the schema introspection verb and the four stream verbs.
+// KG includes the schema introspection verb and the five stream verbs.
 #[test]
-fn pack_verbs_returns_twenty_nine() {
+fn pack_verbs_returns_thirty_one() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        29,
-        "KgPack must expose exactly 29 verbs including schema and canonical change-set apply"
+        31,
+        "KgPack must expose exactly 31 verbs including attach, schema and canonical change-set apply"
     );
 }
 
@@ -104,6 +104,7 @@ fn pack_verbs_names_are_correct() {
     let names: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
     for expected in &[
         "apply_changeset",
+        "attach",
         "create",
         "get",
         "list",
@@ -131,6 +132,7 @@ fn pack_verbs_names_are_correct() {
         "stream.batch",
         "stream.read",
         "stream.stat",
+        "stream.truncate",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }

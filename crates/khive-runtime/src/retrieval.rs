@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lattice_embed::{EmbeddingModel, MAX_TEXT_BYTES};
+use lattice_embed::{EmbeddingModel, EmbeddingRole, EmbeddingService, TokenCount, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -35,6 +35,9 @@ mod single_engine;
 
 #[cfg(test)]
 mod request_stop_tests;
+
+#[cfg(test)]
+mod token_report_tests;
 
 /// Bounds provider input and per-page outcome memory while amortizing model setup.
 pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
@@ -80,6 +83,9 @@ pub struct DocumentEmbeddingOutcome {
     pub prepared_text_fingerprint: Option<ContentRef>,
     pub source_bytes: usize,
     pub embedded_bytes: usize,
+    /// Counts for the byte-bounded input, including role instructions and special tokens.
+    /// None means the provider does not support token reporting.
+    pub provider_token_count: Option<TokenCount>,
     pub truncated: bool,
 }
 
@@ -88,14 +94,30 @@ pub struct DocumentEmbeddingOutcome {
 pub struct EmbeddingTruncationReport {
     pub truncated: u64,
     pub discarded_bytes: u64,
+    #[serde(default, skip_serializing_if = "counter_is_zero")]
+    pub discarded_tokens: u64,
+    #[serde(default, skip_serializing_if = "counter_is_zero")]
+    pub token_reporting_unavailable: u64,
+}
+
+fn counter_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl EmbeddingTruncationReport {
     pub fn observe(&mut self, outcome: &DocumentEmbeddingOutcome) {
         if outcome.truncated {
-            self.truncated += 1;
-            self.discarded_bytes +=
-                outcome.source_bytes.saturating_sub(outcome.embedded_bytes) as u64;
+            self.truncated = self.truncated.saturating_add(1);
+            self.discarded_bytes = self
+                .discarded_bytes
+                .saturating_add(outcome.source_bytes.saturating_sub(outcome.embedded_bytes) as u64);
+        }
+        if let Some(count) = outcome.provider_token_count {
+            self.discarded_tokens = self
+                .discarded_tokens
+                .saturating_add(count.before_truncation.saturating_sub(count.embedded) as u64);
+        } else {
+            self.token_reporting_unavailable = self.token_reporting_unavailable.saturating_add(1);
         }
     }
 
@@ -108,7 +130,62 @@ impl EmbeddingTruncationReport {
     pub fn merge(&mut self, other: Self) {
         self.truncated = self.truncated.saturating_add(other.truncated);
         self.discarded_bytes = self.discarded_bytes.saturating_add(other.discarded_bytes);
+        self.discarded_tokens = self.discarded_tokens.saturating_add(other.discarded_tokens);
+        self.token_reporting_unavailable = self
+            .token_reporting_unavailable
+            .saturating_add(other.token_reporting_unavailable);
     }
+}
+
+struct DocumentEmbeddings {
+    vectors: Vec<Vec<f32>>,
+    token_counts: Option<Vec<TokenCount>>,
+}
+
+async fn document_embeddings(
+    service: &dyn EmbeddingService,
+    texts: &[String],
+    model: EmbeddingModel,
+) -> RuntimeResult<DocumentEmbeddings> {
+    let result = with_embedding_admission(async {
+        match service
+            .embed_with_report(texts, model, EmbeddingRole::Passage)
+            .await
+        {
+            Ok(report) => Ok(DocumentEmbeddings {
+                vectors: report.embeddings,
+                token_counts: Some(report.token_counts),
+            }),
+            Err(lattice_embed::EmbedError::Unsupported(_)) => service
+                .embed_passage(texts, model)
+                .await
+                .map(|vectors| DocumentEmbeddings {
+                    vectors,
+                    token_counts: None,
+                }),
+            Err(error) => Err(error),
+        }
+    })
+    .await?;
+    if let Some(counts) = &result.token_counts {
+        if result.vectors.len() != texts.len() || counts.len() != texts.len() {
+            return Err(RuntimeError::Internal(format!(
+                "embed_with_report returned {} vectors and {} token counts for {} inputs",
+                result.vectors.len(),
+                counts.len(),
+                texts.len(),
+            )));
+        }
+        if counts
+            .iter()
+            .any(|count| count.embedded > count.before_truncation)
+        {
+            return Err(RuntimeError::Internal(
+                "embed_with_report returned an embedded token count above the input count".into(),
+            ));
+        }
+    }
+    Ok(result)
 }
 
 /// Maximum document bytes accepted before the embedding service adds its model prefix.
@@ -189,7 +266,7 @@ impl KhiveRuntime {
 
     /// Embed a document/passage for indexing using the named model.
     ///
-    /// Applies `EmbeddingService::embed_passage`, which prepends the model's
+    /// Applies `EmbeddingService::embed_with_report` with the passage role, which prepends the model's
     /// `document_instruction()` prefix when defined (e.g. `"passage: "` for
     /// multilingual-e5). For models with no document prefix (MiniLM, BGE) this
     /// is identical to [`Self::embed_with_model`].
@@ -242,8 +319,9 @@ impl KhiveRuntime {
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings =
-            with_embedding_admission(service.embed_passage(&[text.to_string()], emb_model)).await;
-        let mut vectors = embeddings?;
+            document_embeddings(service.as_ref(), &[text.to_string()], emb_model).await?;
+        let provider_token_count = embeddings.token_counts.map(|counts| counts[0]);
+        let mut vectors = embeddings.vectors;
         if vectors.len() != 1 {
             return Err(RuntimeError::Internal(format!(
                 "embed_passage returned {} vectors for 1 input",
@@ -258,7 +336,8 @@ impl KhiveRuntime {
                 .then(|| prepared_document_fingerprint(text, emb_model)),
             source_bytes,
             embedded_bytes,
-            truncated,
+            provider_token_count,
+            truncated: truncated || provider_token_count.is_some_and(|count| count.truncated()),
         })
     }
 
@@ -414,7 +493,7 @@ impl KhiveRuntime {
 
     /// Embed a batch of documents for indexing using the named model.
     ///
-    /// Applies `EmbeddingService::embed_passage`. Use for all bulk
+    /// Applies passage-role embedding with token reporting when supported. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
     /// A mixed batch is bounded into one ordered owned batch so truncation never
     /// fragments one provider batch into sequential singleton inference calls.
@@ -442,8 +521,8 @@ impl KhiveRuntime {
         }
         if report.any_truncated() {
             return Err(RuntimeError::InvalidInput(format!(
-                "embedding input truncated for {} documents ({} discarded bytes); use embed_document_batch_with_model_outcomes to inspect the bounded vectors",
-                report.truncated, report.discarded_bytes
+                "embedding input truncated for {} documents ({} discarded bytes, {} discarded tokens); use embed_document_batch_with_model_outcomes to inspect the bounded vectors",
+                report.truncated, report.discarded_bytes, report.discarded_tokens
             )));
         }
         Ok(outcomes.into_iter().map(|outcome| outcome.vector).collect())
@@ -488,18 +567,19 @@ impl KhiveRuntime {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         }
         let out = if texts.iter().all(|text| text.len() <= budget) {
-            with_embedding_admission(service.embed_passage(texts, emb_model)).await
+            document_embeddings(service.as_ref(), texts, emb_model).await
         } else {
             let bounded_texts: Vec<String> = texts
                 .iter()
                 .map(|text| bounded_embedding_input(text, budget).0.to_owned())
                 .collect();
-            with_embedding_admission(service.embed_passage(&bounded_texts, emb_model)).await
+            document_embeddings(service.as_ref(), &bounded_texts, emb_model).await
         };
         if token.is_none() {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         }
-        let vectors = out?;
+        let embeddings = out?;
+        let vectors = embeddings.vectors;
         if vectors.len() != texts.len() {
             return Err(RuntimeError::Internal(format!(
                 "embed_passage returned {} vectors for {} inputs",
@@ -510,8 +590,11 @@ impl KhiveRuntime {
         Ok(texts
             .iter()
             .zip(vectors)
-            .map(|(text, vector)| {
+            .enumerate()
+            .map(|(index, (text, vector))| {
                 let (bounded, truncated) = bounded_embedding_input(text, budget);
+                let provider_token_count =
+                    embeddings.token_counts.as_ref().map(|counts| counts[index]);
                 DocumentEmbeddingOutcome {
                     model_name: model_name.to_owned(),
                     vector,
@@ -519,7 +602,9 @@ impl KhiveRuntime {
                         .then(|| prepared_document_fingerprint(bounded, emb_model)),
                     source_bytes: text.len(),
                     embedded_bytes: bounded.len(),
-                    truncated,
+                    provider_token_count,
+                    truncated: truncated
+                        || provider_token_count.is_some_and(|count| count.truncated()),
                 }
             })
             .collect())

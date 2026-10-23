@@ -17,14 +17,12 @@ khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
 khive-storage = { version = "0.14.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 uuid = { workspace = true }
-tracing = { workspace = true }
 blake3 = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+chrono = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["fault-injection"] }
 khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }

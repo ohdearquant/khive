@@ -105,7 +105,7 @@ default = false
         db: Some(db_path.to_str().unwrap().to_owned()),
         config: Some(config.clone()),
         model,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: true,
         namespace: Some("local".into()),
         knowledge_only: false,
@@ -725,6 +725,7 @@ fn report_serializes_per_model_truncation_accounting() {
         EmbeddingTruncationReport {
             truncated: 2,
             discarded_bytes: 17,
+            ..Default::default()
         },
     );
     let json = serde_json::to_value(report).expect("serialize report");
@@ -743,6 +744,7 @@ fn human_report_renders_per_model_truncation_in_sorted_order() {
         EmbeddingTruncationReport {
             truncated: 3,
             discarded_bytes: 29,
+            ..Default::default()
         },
     );
     report.truncation_by_model.insert(
@@ -750,6 +752,7 @@ fn human_report_renders_per_model_truncation_in_sorted_order() {
         EmbeddingTruncationReport {
             truncated: 1,
             discarded_bytes: 7,
+            ..Default::default()
         },
     );
 
@@ -1976,7 +1979,7 @@ async fn run_reindex_populates_fts_without_embedding_model() {
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: Some("local".to_string()),
         knowledge_only: false,
@@ -2261,7 +2264,7 @@ async fn run_reindex_populates_entity_fts_without_embedding_model() {
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: Some("local".to_string()),
         knowledge_only: false,
@@ -2405,7 +2408,7 @@ async fn run_reindex_scoped_run_does_not_rebuild_fts() {
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: Some("local".to_string()), // explicit → scoped run
         knowledge_only: false,
@@ -2447,7 +2450,7 @@ async fn run_reindex_without_the_flag_does_not_rebuild_fts() {
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: None, // omitted namespace resolves to the configured one
         knowledge_only: false,
@@ -2488,7 +2491,7 @@ async fn run_reindex_with_the_flag_rebuilds_fts() {
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: None,
         knowledge_only: false,
@@ -2616,7 +2619,7 @@ fn snapshot_reindex_args(dir: &std::path::Path, best_effort: bool) -> ReindexArg
         db: Some(dir.join("reindex.db").to_str().unwrap().to_owned()),
         config: Some(write_empty_test_config(dir)),
         model: None,
-        batch_size: 100,
+        batch_size: Some(100),
         keep_existing: false,
         namespace: Some("local".into()),
         knowledge_only: false,

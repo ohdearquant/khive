@@ -269,6 +269,9 @@ async fn arm30_tool_pack_absence_refuses_tree_commit_but_preserves_legacy_paths(
     }
 
     let f = Fixture::new_with_tool_pack(true, true, false).await;
+    assert!(f.registry.has_verb("git.commit"));
+    assert!(!f.registry.has_verb("tool.check"));
+    assert!(!f.registry.has_verb("exec.tree_put"));
     let mut reader = f.rt.sql().reader().await.expect("schema reader");
     let tables = reader.query_all(SqlStatement {
         sql:"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tool_policy', 'tool_grants')".into(),

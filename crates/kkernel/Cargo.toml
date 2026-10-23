@@ -26,7 +26,7 @@ khive-db = { version = "0.14.0", path = "../khive-db" }
 khive-storage = { version = "0.14.0", path = "../khive-storage" }
 khive-types = { version = "0.14.0", path = "../khive-types" }
 khive-vcs = { version = "0.14.0", path = "../khive-vcs" }
-khive-vcs-adapters = { version = "0.14.0", path = "../khive-vcs-adapters" }
+khive-vcs-adapters = { version = "0.14.0", path = "../khive-vcs-adapters", optional = true }
 khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.14.0", path = "../khive-pack-gtd" }
 khive-pack-memory = { version = "0.14.0", path = "../khive-pack-memory" }
@@ -48,7 +48,8 @@ khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace" }
 khive-pack-charter = { version = "0.14.0", path = "../khive-pack-charter" }
 khive-request = { version = "0.14.0", path = "../khive-request" }
 khive-changeset = { version = "0.14.0", path = "../khive-changeset" }
-khive-repo-showcase = { version = "0.14.0", path = "../khive-repo-showcase" }
+# Without `repo-showcase` only the hardened Git helpers are linked (`kg diff` uses them).
+khive-repo-showcase = { version = "0.14.0", path = "../khive-repo-showcase", default-features = false }
 lru = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -77,7 +78,7 @@ inventory = { workspace = true }
 khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-template = { version = "0.14.0", path = "../khive-pack-template" }
 libc = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
@@ -94,9 +95,11 @@ khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["te
 blake3 = { workspace = true, features = ["std"] }
 
 [features]
-# The default set links every pack this binary has always linked. The agent,
-# telemetry and web packs are optional; formal and moodboard stay off.
-default = ["pack-agent", "pack-telemetry", "pack-web"]
+blob-s3 = ["khive-runtime/blob-s3", "khive-mcp/blob-s3"]
+# The default set links only the core packs. The agent, telemetry and web packs
+# are optional and off by default, like formal and moodboard; the operator build
+# (`make build-local`) enables all three.
+default = []
 # Pass-through, plus links kkernel's own force-link reference: enables the agent
 # pack. A build without it does not link or register the pack, so it is absent
 # from the pack list the server reports and `--pack agent` is an unknown pack.
@@ -107,6 +110,13 @@ pack-telemetry = ["khive-mcp/pack-telemetry", "khive-pack-telemetry"]
 # Pass-through, plus links kkernel's own force-link reference: enables the web
 # pack and its HTTP client (same behaviour without it as pack-agent).
 pack-web = ["khive-mcp/pack-web", "khive-pack-web"]
+# Adds JSON, NDJSON, CSV, TSV and BibTeX input to `kg import`. Without it
+# `kg import` reads native khive-kg archives and refuses the other formats
+# before reading the source. Off by default; the operator build enables it.
+kg-adapters = ["dep:khive-vcs-adapters"]
+# Adds the `repo export` and `repo build` commands, which link the repository
+# showcase bundle exporter. Off by default; the operator build enables it.
+repo-showcase = ["khive-repo-showcase/export"]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
 # Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
@@ -145,3 +155,18 @@ harness = false
 [[bench]]
 name = "coord_locate"
 harness = false
+
+[[test]]
+name = "repo_showcase_cli"
+required-features = ["repo-showcase"]
+
+[[test]]
+name = "kg_import_csv"
+required-features = ["kg-adapters"]
+
+[[test]]
+name = "kg_import_bibtex"
+required-features = ["kg-adapters"]
+
+[[test]]
+name = "kg_import_schema"

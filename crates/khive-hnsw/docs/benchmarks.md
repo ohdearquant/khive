@@ -1,5 +1,33 @@
 # khive-hnsw Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-hnsw`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `build/sequential_1000`         | 175.167 ms       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `build/sequential_5000`         | 1.583 s          | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `distance/cosine_384d`          | 642.676 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `distance/dot_384d`             | 25.590 ns        | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `distance/l2_384d`              | 31.782 ns        | 1.009     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n5k_k10`                | 140.218 µs       | 1.012     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n5k_k10_with_ctx`       | 139.139 µs       | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n5k_k50`                | 141.196 µs       | 1.009     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n5k_k50_with_ctx`       | 140.694 µs       | 1.021     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/ctx_fresh_k10`  | 140.036 µs       | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/ctx_reuse_k10`  | 138.791 µs       | 1.005     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/new_ef200`      | 202.749 ns       | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/new_ef80`       | 171.884 ns       | 1.116     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_metrics/n5k_k10_cosine` | 138.271 µs       | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_metrics/n5k_k10_dot`    | 139.282 µs       | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_metrics/n5k_k10_l2`     | 156.273 µs       | 1.026     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_quantized/n5k_k10_int8` | 205.641 µs       | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite
 
 Benchmarks live in `benches/hnsw_bench.rs` and are run with Criterion.

@@ -1,5 +1,5 @@
 use khive_vamana::{VamanaConfig, VamanaIndex};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 pub const DIM: usize = 384;
 pub const BASE_ROWS: usize = 5000;
@@ -8,7 +8,7 @@ pub const BASE_SEED: u64 = 42;
 pub fn unit_vectors(rows: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut vectors: Vec<f32> = (0..rows * DIM)
-        .map(|_| rng.gen_range(-1.0f32..1.0))
+        .map(|_| rng.random_range(-1.0f32..1.0))
         .collect();
     for row in vectors.chunks_exact_mut(DIM) {
         let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();

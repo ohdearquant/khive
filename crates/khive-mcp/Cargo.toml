@@ -67,9 +67,10 @@ khive-channel-email = { version = "0.14.0", path = "../khive-channel-email", opt
 khive-channel-telegram = { version = "0.14.0", path = "../khive-channel-telegram", optional = true }
 
 [features]
-# The default set links every pack this crate has always linked. The agent,
-# telemetry and web packs are optional; moodboard stays off.
-default = ["pack-agent", "pack-telemetry", "pack-web"]
+blob-s3 = ["khive-runtime/blob-s3"]
+# The default set links only the core packs. The agent, telemetry and web packs
+# are optional and off by default, like moodboard.
+default = []
 # pack-agent, pack-telemetry, pack-web: link the agent, telemetry and web packs.
 # Without one of them the pack is neither linked nor registered, so it is absent
 # from the pack list the server reports and selecting it is refused as unknown.

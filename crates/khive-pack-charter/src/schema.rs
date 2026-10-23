@@ -1,6 +1,6 @@
 //! Recording-only charter storage. Activation, revocation and admission are unavailable.
 //!
-//! A subject is global to its physical forge/repository/PR/target tuple. Its
+//! A subject is global to its subject kind and reference. Its
 //! policy domain and namespace retain creation attribution; they confer no
 //! authority and do not partition its single unresolved-attempt slot. Runs and
 //! their evidence remain scoped to a policy domain and pinned definition.
@@ -8,7 +8,7 @@
 //! Command callers must use their canonical structural identity, not a display
 //! label. Their request IDs are caller-scoped across domains and verbs. Exact
 //! replay requires reading and validating the held immutable receipt before
-//! attempting any insert; this schema does not implement replay handling.
+//! attempting any insert; the pack's verbs do that, the schema does not.
 //!
 //! The evidence insert trigger enforces a dense per-run sequence, but transaction
 //! owners must still append evidence and command receipts in the same atomic
@@ -26,6 +26,8 @@ pub(crate) const CHARTER_SCHEMA_STATEMENTS: &[&str] = &[
     include_str!("../sql/005-charter-evidence.sql"),
     include_str!("../sql/006-charter-attempts.sql"),
     include_str!("../sql/007-charter-commands.sql"),
+    include_str!("../sql/008-charter-vocabularies.sql"),
+    include_str!("../sql/009-charter-waiting-changes.sql"),
 ];
 
 #[cfg(test)]

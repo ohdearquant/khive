@@ -66,6 +66,30 @@ Knowledge retrieval uses the default embedder for both query and atom vectors. A
 `knowledge.index` writes only default-model atom vectors; additional registered models are not
 indexed until a knowledge read path can select or fuse them.
 
+### Learned atom weights
+
+`knowledge.search` reads persisted `atom_weights` for candidate atom IDs in the
+caller's namespace on each request, in one bounded batch. Each candidate stage fetches up to
+100 candidates regardless of the requested output limit; the lexical raw candidate
+pool remains unchanged. The distinct lexical/ANN union may therefore contain up
+to 200 candidates. Candidates outside those stage caps are not globally reranked.
+Missing weight rows apply a factor of `1.0`; stored weights use the shared
+loader's `0.1` to `5.0` bounds. Domain hits always apply `1.0`.
+
+After any embedding blend and status normalization/multipliers, the score is
+multiplied by the learned factor. Search then sorts by weighted score (slug
+breaks ties), applies `min_score` to that weighted score and takes the requested
+limit. The resulting score can exceed `1.0`; it is not clamped. A factor of
+`1.0` preserves the candidate's prior score. Each hit reports its applied factor
+as numeric `atom_weight`.
+
+A failed weight read retains the candidate scores with factor `1.0` and reports
+`degraded.atom_weights_unavailable`, even when results are nonempty. The reason
+is `cancelled` for request cancellation, `timeout` for a deadline or admission
+timeout, and `storage` for other read failures. This fallback does not claim
+that stored weight rows are absent. The read uses the original request deadline
+and adds no retry. A request with no atom candidates performs no weight read.
+
 ### Vamana ANN Signal
 
 Alongside the TF-IDF signal, if a Vamana ANN index is warm (populated via `knowledge.index
@@ -112,7 +136,8 @@ composes with `knowledge.suggest`'s existing ANN-unavailable degradation object 
 through auto-`knowledge.compose` when its internal suggestion is degraded.
 
 Eligibility refill does not override caller-requested score semantics: `min_score` is reapplied
-after status multipliers, so a genuine score-floor rejection may still return fewer than `limit`.
+after status multipliers and learned atom weights, so a genuine score-floor rejection may still
+return fewer than `limit`.
 
 ## Fold (`knowledge.fold`)
 
@@ -187,3 +212,24 @@ All public request float fields (`min_score`, `intersection_bonus`, `rerank_alph
 `diversity_bias`, `epistemic_weight`, `category_weights.*`, `candidates[*].score`,
 `candidates[*].information_gain`, `weights.*`) are validated with `is_finite()` at the handler
 boundary before being cast to `f32`. Non-finite values return `RuntimeError::InvalidInput`.
+
+## Suggest query admission
+
+`knowledge.suggest` requires at least five words of orientation context. Each
+whitespace-separated piece without CJK characters counts as one word, preserving
+existing Latin-query behavior. Han, Hiragana, Katakana, and Hangul letters in the
+shared CJK script ranges count as one word per two letters; the total is rounded
+down once across the entire query. Punctuation within these CJK script ranges does not contribute letters
+or an additional whitespace word. A piece containing CJK does not also count as
+a separate Latin word.
+
+For example, `如何提升中文检索质量` has ten CJK letters and is admitted;
+`如何提升中文检索质` has nine and is refused. `如何提升中文检索质 retrieval`
+has four CJK-derived words plus one whitespace word and is admitted. Short queries
+can use `knowledge.search`.
+
+Auto-`knowledge.compose` uses the same counting rule with a ten-word minimum, so
+an unspaced query needs twenty CJK letters. Providing explicit `domain_ids` or
+`atom_ids` bypasses that minimum; a nonempty query is still required. The thresholds
+remain five words for suggest and ten for auto-compose. Retrieval ranking and
+embedding-model selection are unchanged.

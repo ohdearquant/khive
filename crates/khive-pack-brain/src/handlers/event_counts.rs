@@ -177,7 +177,7 @@ pub(crate) async fn visit_events_cursor_walk<F: FnMut(Event)>(
         .await
         .map_err(|cause| match cause {
             khive_runtime::EventCursorWalkError::Storage(error) => {
-                RuntimeError::InvalidInput(error.to_string())
+                event_counts_storage_error(error)
             }
             khive_runtime::EventCursorWalkError::MissingBoundary => RuntimeError::Internal(
                 "event cursor walk saw duplicate rows before any boundary".to_string(),

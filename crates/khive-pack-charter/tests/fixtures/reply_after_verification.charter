@@ -1,0 +1,33 @@
+charter reply_after_verification v1
+title "Verify a message before replying"
+subject message
+
+roles:
+    operator "reads and verifies an incoming message"
+
+triggers:
+    message.arrived
+    prompt.received
+    schedule.fired
+
+workflow:
+    phase intake by operator:
+        await message.arrived or prompt.received or schedule.fired
+        goto read
+
+    phase read by operator:
+        action inbox.read(limit=20) by operator
+        when message.kind is stop_order: goto stop
+        when message.kind is directive: goto verify
+        when message.kind is question: goto verify
+        when message.kind is report: goto verify
+        when message.kind is other: goto verify
+
+    phase verify by operator:
+        goto reply
+
+    phase reply by operator:
+        terminate "the verified reply is pending delivery confirmation"
+
+    phase stop by operator:
+        terminate "the received instruction requests work to stop"

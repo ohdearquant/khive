@@ -701,6 +701,112 @@ async fn spoofed_from_no_authentication_results_quarantines_auth_absent() {
 }
 
 #[tokio::test]
+async fn quarantine_claimed_to_preserves_parsed_order_casing_and_json_escaping() {
+    let raw = b"From: maintainer@example.com\r\n\
+                Delivered-To: delivered@example.com\r\n\
+                To: First <FIRST+Tag@Example.COM>, Second <\"A\\\\B\"@Example.NET>, FIRST+Tag@Example.COM\r\n\
+                Cc: copy@example.com\r\n\
+                In-Reply-To: <untrusted-thread@example.com>\r\n\
+                Subject: claimed recipients\r\n\
+                \r\n\
+                body";
+    let email = parse_raw_bytes(1, raw, "imap.example.com", 1).expect("parsed input");
+    let expected = email.to.clone();
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    // The existing connector lowercases To addresses. Metadata preserves that
+    // parsed spelling, order and duplicates, without normalizing a second time.
+    assert_eq!(expected[0], "first+tag@example.com");
+    assert_eq!(expected[2], expected[0]);
+    assert!(expected[1].ends_with("@example.net"), "{expected:?}");
+    assert!(
+        expected[1].contains('\\') || expected[1].contains('"'),
+        "{expected:?}"
+    );
+    let ch = build_channel("maintainer@example.com", vec![email]);
+    let envelopes = ch.poll(Utc::now()).await.expect("quarantine poll");
+    assert_eq!(envelopes.len(), 1);
+    let envelope = &envelopes[0];
+    let encoded = envelope
+        .metadata
+        .get("quarantine_claimed_to")
+        .expect("claimed To metadata");
+    let claimed: Vec<String> = serde_json::from_str(encoded).expect("JSON recipient array");
+    assert_eq!(claimed, expected);
+    assert!(!claimed
+        .iter()
+        .any(|address| address == "delivered@example.com" || address == "copy@example.com"));
+    assert_eq!(envelope.metadata["quarantine_reason"], "auth-absent");
+    assert_eq!(envelope.from, EMAIL_QUARANTINE_SENDER);
+    assert_eq!(envelope.to, "email:maintainer@example.com");
+    assert!(envelope.correlation_external_id.is_none());
+    let replay = envelope
+        .quarantine_replay
+        .as_ref()
+        .expect("quarantine replay");
+    assert_eq!(replay.notification_to, "email:maintainer@example.com");
+    assert_eq!(replay.bytes.as_slice(), raw.as_slice());
+}
+
+#[tokio::test]
+async fn quarantine_without_to_omits_claimed_recipients_even_with_other_recipient_headers() {
+    for headers in [
+        "",
+        "Delivered-To: delivered@example.com\r\nCc: copy@example.com\r\n",
+    ] {
+        let raw = format!("From: maintainer@example.com\r\n{headers}Subject: no To\r\n\r\nbody");
+        let email =
+            parse_raw_bytes(1, raw.as_bytes(), "imap.example.com", 1).expect("parsed input");
+        assert!(email.to.is_empty());
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envelopes = ch.poll(Utc::now()).await.expect("quarantine poll");
+        assert_eq!(envelopes.len(), 1);
+        let envelope = &envelopes[0];
+        assert!(!envelope.metadata.contains_key("quarantine_claimed_to"));
+        assert_eq!(envelope.from, EMAIL_QUARANTINE_SENDER);
+        assert_eq!(envelope.to, "email:maintainer@example.com");
+        assert!(envelope.correlation_external_id.is_none());
+        let replay = envelope
+            .quarantine_replay
+            .as_ref()
+            .expect("quarantine replay");
+        assert_eq!(replay.notification_to, "email:maintainer@example.com");
+        assert_eq!(replay.bytes.as_slice(), raw.as_bytes());
+    }
+}
+
+#[test]
+fn malformed_quarantine_omits_claimed_to_even_when_replay_bytes_have_recipients() {
+    let ch = build_channel("maintainer@example.com", vec![]);
+    let raw = b"From: claimed@example.com\r\nTo: target@example.com\r\n\r\nbody".to_vec();
+    for bytes in [None, Some(raw)] {
+        for reason in [
+            QuarantineReason::MissingBody,
+            QuarantineReason::TooLarge,
+            QuarantineReason::ParseFailure,
+        ] {
+            let expected_reason = reason.to_string();
+            let envelope = ch.malformed_quarantine_envelope(
+                1,
+                "imap:imap.example.com:1:1",
+                reason,
+                bytes.clone(),
+            );
+            assert!(!envelope.metadata.contains_key("quarantine_claimed_to"));
+            assert_eq!(envelope.metadata["quarantine_reason"], expected_reason);
+            assert_eq!(envelope.from, EMAIL_QUARANTINE_SENDER);
+            assert_eq!(envelope.to, "email:maintainer@example.com");
+            assert!(envelope.correlation_external_id.is_none());
+            let replay = envelope
+                .quarantine_replay
+                .as_ref()
+                .expect("quarantine replay");
+            assert_eq!(replay.notification_to, "email:maintainer@example.com");
+            assert_eq!(replay.bytes, bytes.clone().unwrap_or_default());
+        }
+    }
+}
+
+#[tokio::test]
 async fn rejected_auth_headers_disclose_only_bounded_untrusted_evidence() {
     for (headers, anchor, reason, family, status, seen_id) in [
         ("", TrustAnchor::AuthservId("mx.example.com".into()), "auth-absent", None, None, None),
@@ -1853,6 +1959,16 @@ async fn both_email_quarantine_builders_ingest_on_first_call() {
             .expect("adapter reason");
         assert!(params["legacy_external_id"].is_string(), "{builder}");
         assert_eq!(params["metadata"]["quarantined"], "true", "{builder}");
+        let claimed_to = if builder == "attribution gate" {
+            Some("[\"me@example.com\"]")
+        } else {
+            None
+        };
+        assert_eq!(
+            params["metadata"]["quarantine_claimed_to"].as_str(),
+            claimed_to,
+            "{builder}"
+        );
 
         let first = registry
             .dispatch("comm.ingest", params.clone())
@@ -1892,6 +2008,15 @@ async fn both_email_quarantine_builders_ingest_on_first_call() {
         );
         assert_eq!(props["quarantined"], "true", "{builder}");
         assert_eq!(props["from_actor"], EMAIL_QUARANTINE_SENDER, "{builder}");
+        assert_eq!(props["to"], "email:maintainer@example.com", "{builder}");
+        assert_eq!(props["to_actor"], "lambda:maintainer", "{builder}");
+        assert_eq!(
+            props
+                .get("quarantine_claimed_to")
+                .and_then(serde_json::Value::as_str),
+            claimed_to,
+            "{builder}"
+        );
     }
 }
 

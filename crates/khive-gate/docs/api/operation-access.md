@@ -72,6 +72,20 @@ Revision `domain-effects-v20` classifies `kg.proposal_cleanup` as `Write`: the
 operator-only subhandler archives resolved proposal projection rows. Its internal
 visibility does not exempt it from ordinary caller write restrictions.
 
+Revision `domain-effects-v21` classifies `stream.truncate` as `Write`: it removes
+a stream prefix and its notes in one transaction.
+
+Revision `domain-effects-v22` classifies `attach` as `Write`: it writes blob bytes and
+adds or replaces an existing record's attachment row. Selective hydration through
+`get` remains `Read`.
+
+Revision `domain-effects-v23` classifies the charter verbs. `charter.compile`, `charter.get`,
+`charter.list`, `charter.runs` and `charter.waiting` are `Read`: they compile or query through a
+reader connection and store nothing. `charter.publish`, `charter.vocabulary`, `charter.start`,
+`charter.observe`, `charter.sample`, `charter.claim` and `charter.cancel` are `Write`: each
+stores a definition, a run, an observation or a state change. `charter.claim` stays `Write`
+even where claims are not yet admitted and it refuses without writing.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -80,6 +94,7 @@ visibility does not exempt it from ordinary caller write restrictions.
 | `agent.spawn`                     | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L13)                               |
 | `agent.suspend`                   | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L74)                               |
 | `apply_changeset`                 | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
+| `attach`                          | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
 | `blob.abort`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L133)                                |
 | `blob.begin`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L67)                                 |
 | `blob.commit`                     | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L118)                                |
@@ -111,6 +126,18 @@ visibility does not exempt it from ordinary caller write restrictions.
 | `brain.resolve`                   | Read   | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L203)                      |
 | `brain.state`                     | Read   | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L41)                       |
 | `brain.unbind`                    | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L538)                      |
+| `charter.cancel`                  | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L229)                          |
+| `charter.claim`                   | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L222)                          |
+| `charter.compile`                 | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L141)                          |
+| `charter.get`                     | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L255)                          |
+| `charter.list`                    | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L280)                          |
+| `charter.observe`                 | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L178)                          |
+| `charter.publish`                 | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L148)                          |
+| `charter.runs`                    | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L266)                          |
+| `charter.sample`                  | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L198)                          |
+| `charter.start`                   | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L162)                          |
+| `charter.vocabulary`              | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L155)                          |
+| `charter.waiting`                 | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L241)                          |
 | `code.deps`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
 | `code.ingest`                     | Write  | Verb       | [khive-pack-code/src/vocab.rs](../../../khive-pack-code/src/vocab.rs#L11)                               |
 | `code.list`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
@@ -242,6 +269,7 @@ visibility does not exempt it from ordinary caller write restrictions.
 | `stream.batch`                    | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L57)                     |
 | `stream.read`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L35)                     |
 | `stream.stat`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L47)                     |
+| `stream.truncate`                 | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L110)                    |
 | `telemetry.channels`              | Read   | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L9)                        |
 | `telemetry.counts`                | Read   | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L113)                      |
 | `telemetry.emit`                  | Write  | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L18)                       |

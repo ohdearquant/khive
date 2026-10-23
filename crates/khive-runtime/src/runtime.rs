@@ -29,8 +29,13 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
 
+mod close;
 #[path = "runtime/config_access.rs"]
 mod config_access;
+pub use close::{
+    RuntimeCloseError, RuntimeCloseHostTasks, RuntimeCloseOwner, RuntimeClosePhase,
+    RuntimeCloseRoot, RuntimeCloseRootKind,
+};
 mod embedder_init;
 mod engine_binding;
 mod events_disk_policy;

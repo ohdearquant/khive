@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use khive_channel::ChannelError;
-use rand::Rng;
+use rand::RngExt;
 
 /// Default base delay: the first backoff step after a single failure.
 pub const DEFAULT_BASE: Duration = Duration::from_secs(5);
@@ -135,7 +135,7 @@ fn jitter(step: Duration) -> Duration {
     }
     let ms = step.as_millis().min(u128::from(u64::MAX)) as u64;
     let jitter_max = (ms / 4).max(1);
-    let jitter_ms = rand::thread_rng().gen_range(0..=jitter_max);
+    let jitter_ms = rand::rng().random_range(0..=jitter_max);
     Duration::from_millis(ms + jitter_ms)
 }
 

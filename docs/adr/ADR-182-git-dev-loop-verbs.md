@@ -8,6 +8,13 @@
 - **Relates to**: [ADR-180](ADR-180-tool-pack.md) (policy per actor), [ADR-088](ADR-088-git-lifecycle-pack.md)
   (provenance ingest), [ADR-018](ADR-018-authorization-gate.md)
 
+**Implementation ownership (2026-10-22).** The `khive-tree/v1` manifest helpers
+live in `khive_runtime::blob_tree`; Exec retains its existing Rust paths as active
+re-exports. Git uses the shared helpers and the gate's actor-label API directly,
+so its normal crate dependencies do not require Exec or Tool. The manifest bytes,
+validation, hydration and call-time `tool.check` requirements are unchanged,
+including `policy_unavailable` when Tool is not loaded (Amendments 4–5).
+
 ## Context
 
 ADR-108 lets an actor commit, branch and push through khive against repositories an operator has

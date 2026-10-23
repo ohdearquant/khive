@@ -5,7 +5,7 @@
 # when it needs the full suite. The reasons go to stderr.
 #
 # The documentation lane is allowed when every path that differs is a Markdown file, no non-Markdown file
-# at <head> names that file's base name on any line, and the file is not one whose verb and pack count
+# at <head> names that file's base name on any line, except listed inert documentation data, and the file is not one whose verb and pack count
 # claims the smoke tests check against the live registry.
 #
 # A Markdown file named by code may be read by it (include_str!, a test fixture path, a crate readme), so
@@ -45,7 +45,8 @@ scanner=$(cd "$(dirname "$0")/.." && pwd)/tests/documented_verb_counts.py || ful
 
 list=$(mktemp) || full "mktemp failed"
 targets=$(mktemp) || full "mktemp failed"
-trap 'rm -f "$list" "$targets"' EXIT
+inert=$(mktemp) || full "mktemp failed"
+trap 'rm -f "$list" "$targets" "$inert"' EXIT
 git diff --no-renames --name-only -z "$base" "$head" -- > "$list" || full "git diff $base $head failed"
 [ -s "$list" ] || full "no changed paths between $base and $head"
 
@@ -61,8 +62,46 @@ while read -r mode oid; do
     esac
 done <<< "$entries"
 
-count=0
+# Read the checked-out classifier's policy once; an unreadable or malformed policy cannot narrow CI.
+inert_data=$(dirname "$0")/ci-inert-docs-data.txt
+python3 -P - "$inert_data" > "$inert" <<'PY_INERT'
+import pathlib
+import re
+import sys
+
+try:
+    seen = set()
+    for number, line in enumerate(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        path, marker, reason = line.partition("#")
+        path = path.strip()
+        parts = path.split("/")
+        if (not marker or not reason.strip() or len(parts) < 2 or parts[0] != "docs"
+                or any(part in ("", ".", "..") for part in parts)
+                or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+                or pathlib.PurePosixPath(path).suffix not in (".tsv", ".csv", ".txt")
+                or path in seen or "\0" in line):
+            raise ValueError(f"invalid inert data entry at line {number}")
+        seen.add(path)
+        sys.stdout.buffer.write(path.encode("utf-8") + b"\0")
+except (OSError, UnicodeError, ValueError) as error:
+    print(error, file=sys.stderr)
+    sys.exit(1)
+PY_INERT
+[ "$?" -eq 0 ] || full "cannot read or parse inert documentation data list"
+name_paths=(':(exclude)*.md')
+while IFS= read -r -d '' inert_path; do
+    name_paths+=(":(top,exclude,literal)$inert_path")
+done < "$inert"
+
+paths=()
 while IFS= read -r -d '' path; do
+    paths+=("$path")
+done < "$list"
+
+count=0
+for path in "${paths[@]}"; do
     count=$((count + 1))
     case "$path" in
         *.md) ;;
@@ -71,7 +110,7 @@ while IFS= read -r -d '' path; do
     name=${path##*/}
     # git grep's own status, not a pipe: under pipefail an early-exiting reader would fail its writer and
     # read as "not named", the unsafe direction.
-    git grep -q -F -e "$name" "$head" -- ':(exclude)*.md'
+    git grep -q -F -e "$name" "$head" -- "${name_paths[@]}"
     rc=$?
     case $rc in
         0) full "$path is named by a non-Markdown file" ;;
@@ -85,7 +124,7 @@ while IFS= read -r -d '' path; do
         1) ;;
         *) full "symlink target search for $name failed (rc $rc)" ;;
     esac
-    python3 "$scanner" --published-markdown "$path" < /dev/null
+    python3 -P "$scanner" --published-markdown "$path" < /dev/null
     rc=$?
     case $rc in
         0) full "$path carries verb or pack counts the smoke tests check against the live registry" ;;
@@ -93,7 +132,7 @@ while IFS= read -r -d '' path; do
         *) full "count scanner failed for $path (rc $rc)" ;;
     esac
     printf 'documentation only: %s\n' "$path" >&2
-done < "$list"
+done
 
 [ "$count" -gt 0 ] || full "no paths read from the diff"
 echo true

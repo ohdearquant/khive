@@ -298,12 +298,13 @@ pub(crate) async fn handle_read(
     }
 }
 
-/// Sort/cursor key (`created_at`, `full_id`) plus rendered message JSON, so
-/// `handle_thread` compares exact tuples instead of re-parsing the ISO string.
+/// Captured logical owner and its sort/cursor key. The displayed read state
+/// may come from an inbound twin without changing the owner's properties.
 struct ThreadRow {
     created_at: i64,
     full_id: Uuid,
-    json: Value,
+    note: Note,
+    display_read: bool,
 }
 
 /// `after` cursor resolved to a comparable key (id cursor: full tie-break tuple;
@@ -356,4 +357,4 @@ mod tests;
 
 #[cfg(test)]
 #[path = "read_cluster_tests.rs"]
-mod read_cluster_tests;
+pub(crate) mod read_cluster_tests;

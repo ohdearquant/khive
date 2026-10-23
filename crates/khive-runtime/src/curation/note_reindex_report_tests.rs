@@ -180,7 +180,17 @@ async fn assert_report(fault: Fault, stage: ReindexModelStage) {
     assert_eq!(report.failures[0].model, "broken");
     assert_eq!(report.failures[0].stage, stage);
     assert!(!report.failures[0].error.is_empty());
-    assert_eq!(report.truncation, EmbeddingTruncationReport::default());
+    assert_eq!(
+        report.truncation,
+        EmbeddingTruncationReport {
+            token_reporting_unavailable: if matches!(fault, Fault::Provider) {
+                1
+            } else {
+                2
+            },
+            ..Default::default()
+        }
+    );
 }
 
 #[tokio::test]
@@ -587,7 +597,10 @@ async fn healthy_note_merge_keeps_reindex_diagnostics_empty() {
     assert_eq!(summary.post_commit_reindex_error, None);
     assert_eq!(
         summary.embedding_truncation,
-        EmbeddingTruncationReport::default()
+        EmbeddingTruncationReport {
+            token_reporting_unavailable: 2,
+            ..Default::default()
+        }
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_committed_merge_indexes(
@@ -907,7 +920,13 @@ async fn public_note_update_keeps_healthy_truncation_success_and_unfenced_noop()
         )
         .await
         .unwrap();
-    assert_eq!(report, EmbeddingTruncationReport::default());
+    assert_eq!(
+        report,
+        EmbeddingTruncationReport {
+            token_reporting_unavailable: 1,
+            ..Default::default()
+        }
+    );
     assert_eq!(
         updated,
         assert_committed_update(&runtime, &token, &note, short, &["healthy"], 1).await

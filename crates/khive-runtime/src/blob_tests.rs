@@ -731,6 +731,7 @@ fn explicit_fs_root_is_selected() {
     drop(store);
 }
 
+#[cfg(feature = "blob-s3")]
 #[test]
 fn s3_backend_selection_reaches_s3_construction() {
     // No AWS credentials in this test process: `S3BlobStore::new` must
@@ -766,4 +767,31 @@ fn s3_backend_selection_reaches_s3_construction() {
 // Guards the two credential env vars this module's test toggles, since
 // `std::env::set_var`/`remove_var` mutate real process-global state and
 // the crate's default parallel test runner would otherwise interleave.
+#[cfg(feature = "blob-s3")]
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(not(feature = "blob-s3"))]
+#[test]
+fn s3_backend_resolution_requires_feature_for_both_access_modes() {
+    let backend = memory_backend();
+    let cfg = KhiveConfig {
+        storage: StorageSectionConfig {
+            blob: Some(BlobConfig::S3 {
+                bucket: "khive-blobs".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                prefix: None,
+                allow_http: None,
+            }),
+        },
+        ..KhiveConfig::default()
+    };
+    for result in [
+        resolve_blob_store(&cfg, &backend),
+        resolve_blob_store_for_mode(&cfg, &backend, true),
+    ] {
+        let err = result.expect_err("S3 requires the blob-s3 feature");
+        assert!(matches!(err, SqliteError::InvalidConfig(_)), "{err:?}");
+        assert!(err.to_string().contains("blob-s3"), "{err}");
+    }
+}

@@ -51,10 +51,10 @@ fn tool_string_list_trims_and_refuses_blank_items() {
     ] {
         assert!(matches!(opt_str_list(&params, "names"),
             Err(RuntimeError::InvalidInput(message))
-            if message == "names must be an array of non-empty strings"));
+            if message == format!("names must be an array of non-empty strings; got {}", params["names"][0])));
     }
     assert!(matches!(opt_str_list(&json!({"names": "hello"}), "names"),
-        Err(RuntimeError::InvalidInput(message)) if message == "names must be an array of strings"));
+        Err(RuntimeError::InvalidInput(message)) if message == "names must be an array of strings; got \"hello\""));
 }
 
 #[test]

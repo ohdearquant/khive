@@ -91,6 +91,7 @@ impl KhiveRuntime {
                 khive_storage::request_context::SearchPhase::VectorSearch,
             );
             if query_vector.is_some() || !self.default_embedder_name().is_empty() {
+                crate::search_audit::record(crate::search_audit::SearchArm::Vector);
                 self.note_search_vector_search(token, query_vector, query_text, candidates)
                     .await
             } else {
