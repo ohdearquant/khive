@@ -2007,6 +2007,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-capability"
+version = "0.14.0"
+dependencies = [
+ "blake3",
+ "khive-lion-core",
+ "khive-types",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "khive-changeset"
 version = "0.14.0"
 dependencies = [

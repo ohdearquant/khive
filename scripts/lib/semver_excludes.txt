@@ -4,6 +4,7 @@
 # adds them. Consumed by scripts/publish.sh (semver-checks
 # preflight/live gate) and .github/workflows/release.yml (release SemVer gate).
 # One blank-/comment-filtered crate name per line.
+khive-capability
 khive-channel-telegram
 khive-fs
 khive-graph-diff
