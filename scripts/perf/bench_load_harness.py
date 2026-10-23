@@ -691,6 +691,7 @@ def main() -> int:
     base_env["KHIVE_PID"] = pid_path_file
     base_env["KHIVE_LOCK"] = lock_path
     base_env["KHIVE_PACKS"] = args.packs
+    base_env["KHIVE_AUDIT_SUCCESS_ROWS"] = "all"
     base_env["KHIVE_DAEMON_STRICT"] = "1"
     base_env["KHIVE_WRITE_QUEUE"] = "1"
     base_env["KHIVE_CONFIG"] = scratch_config_path
@@ -741,6 +742,7 @@ def main() -> int:
         while not pathlib.Path(sock_path).exists() and time.time() < deadline:
             time.sleep(0.1)
         bpd.assert_daemon_engaged(sock_path, pid_path_file, db_path, label="loadharness-bootstrap")
+        mbc.require_all_audit_success_rows(bootstrap_proc)
         print("[ok] bootstrap daemon engagement confirmed", flush=True)
 
         try:
