@@ -17,6 +17,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
+pub mod audit_error;
 pub mod backend_handle;
 pub mod blob;
 pub mod bounded_read;
