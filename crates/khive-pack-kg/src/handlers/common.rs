@@ -8,6 +8,7 @@ use std::{borrow::Cow, str::FromStr, sync::OnceLock};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     micros_to_iso, ContentMergeStrategy, EntityDedupMergePolicy, KhiveRuntime, NamespaceToken,
     PackByIdResolver, QueryResult, RuntimeError, VerbRegistry,
@@ -1008,9 +1009,13 @@ pub(crate) fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeErro
         "success" => Ok(EventOutcome::Success),
         "denied" => Ok(EventOutcome::Denied),
         "error" => Ok(EventOutcome::Error),
-        _ => Err(RuntimeError::InvalidInput(format!(
-            "unknown outcome {raw:?}; valid: success | denied | error"
-        ))),
+        _ => Err(RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!("unknown outcome {raw:?}; valid: success | denied | error"),
+            )
+            .into_owned(),
+        )),
     }
 }
 
@@ -1019,24 +1024,41 @@ pub(crate) fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeE
         .to_ascii_lowercase()
         .parse::<SubstrateKind>()
         .map_err(|_| {
-            RuntimeError::InvalidInput(format!(
-                "unknown substrate {raw:?}; valid: note | entity | event"
-            ))
+            RuntimeError::InvalidInput(
+                mask_for_redaction_surface(
+                    RedactionSurface::GateProbe,
+                    &format!("unknown substrate {raw:?}; valid: note | entity | event"),
+                )
+                .into_owned(),
+            )
         })
 }
 
 pub(crate) fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
-    raw.parse::<EventKind>()
-        .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
+    raw.parse::<EventKind>().map_err(|e| {
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!("unknown event_kind {raw:?}: {e}"),
+            )
+            .into_owned(),
+        )
+    })
 }
 
 fn parse_exact_event_filter_id(field: &str, raw: &str) -> Result<Uuid, RuntimeError> {
     Uuid::from_str(raw).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "list: {field} must contain a full UUID because a short-prefix resolution can miss \
-             or be ambiguous, while an event filter must identify the exact stable record; \
-             got {raw:?}: {error}"
-        ))
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                "list: {field} must contain a full UUID because a short-prefix resolution can miss \
+                 or be ambiguous, while an event filter must identify the exact stable record; \
+                 got {raw:?}: {error}"
+            ),
+            )
+            .into_owned(),
+        )
     })
 }
 

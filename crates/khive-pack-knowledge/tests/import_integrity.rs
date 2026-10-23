@@ -859,3 +859,6 @@ async fn import_target_conflicts_in_other_namespaces_do_not_block() {
         assert_eq!(atom["namespace"], "local");
     }
 }
+
+#[path = "import_integrity/yaml_frontmatter.rs"]
+mod yaml_frontmatter;

@@ -68,3 +68,19 @@ fn remote_schema_references_and_duplicate_identifiers_are_refused() {
     let tool = json!({"name":"A","inputSchema":{"type":"object"}});
     assert!(pin(&cfg, &[tool.clone(), tool], 1).is_err());
 }
+
+#[test]
+fn local_schema_references_validate_instances_without_external_resolvers() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {"value": {"type": "integer", "minimum": 1}},
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/value"}},
+        "required": ["value"]
+    });
+    validate_schema(&schema).expect("local schema references are supported");
+    assert!(validates(&schema, &json!({"value": 1})));
+    assert!(!validates(&schema, &json!({"value": 0})));
+    assert!(!validates(&schema, &json!({"value": "1"})));
+    assert!(!validates(&schema, &json!({})));
+}

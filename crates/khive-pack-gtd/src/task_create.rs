@@ -411,7 +411,8 @@ pub(crate) async fn prepare_task_create(
             None => runtime.config().display_timezone,
             Some(name) => name.parse::<chrono_tz::Tz>().map_err(|_| {
                 RuntimeError::InvalidInput(format!(
-                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
+                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
                 ))
             })?,
         };

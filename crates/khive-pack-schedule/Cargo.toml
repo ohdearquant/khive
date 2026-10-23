@@ -26,7 +26,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

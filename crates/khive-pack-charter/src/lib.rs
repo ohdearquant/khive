@@ -1,7 +1,9 @@
-//! Charter recording schema and transaction-scoped transition primitives.
-//!
-//! This foundation exposes no verbs or action admission. See ADR-193 M1.
+//! Charter workflows: a phrase-registry language (ADR-208) compiled into definitions, and a
+//! recording engine that tracks runs, phases and observations (ADR-193 M1). The engine
+//! records what happened and what each phase waits on; it admits and performs no action.
 
+pub mod engine;
+pub mod lang;
 mod pack;
 mod schema;
 pub mod transition;

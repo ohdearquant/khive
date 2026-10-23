@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `embedding_truncation_report` replies may now include `discarded_tokens` and
+  `token_reporting_unavailable` counters. Both new counters are omitted when zero.
+  Document embeddings report provider token cuts alongside the existing byte limit.
 - `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared
   dependency-kind defaults to caller-resolved entity kinds without I/O.
 - Writer contention diagnostics now report per-pool FIFO admission depth, its
@@ -61,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_runtime::DocumentEmbeddingOutcome` adds `provider_token_count`; direct
+  struct literals must set it. `EmbeddingTruncationReport` adds `discarded_tokens`
+  and `token_reporting_unavailable`; literals must set them or use `Default`.
 - `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
   `writer_admission_unavailable_reason`. Direct struct literals must set them.
 - `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.

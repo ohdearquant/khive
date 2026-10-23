@@ -82,7 +82,7 @@ fn set_max_passes(v: Option<usize>) {
 /// reruns greedy search and robust_prune over the graph the first pass just
 /// produced, and a more-connected graph changes which candidates survive
 /// pruning. This is not idempotent — differential testing at production scale
-/// (n>=250, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+/// (n>=300, 384-dim normalized vectors) shows the two-pass and skip-second-pass
 /// adjacency diverge, so a run with only the first pass is a materially
 /// different (and less-refined) graph, not a redundant rerun.
 fn refinement_alpha_schedule(config_alpha: f64) -> Vec<f64> {
@@ -1028,11 +1028,11 @@ fn select_medoid(vectors: &[f32], dimensions: usize, num_vectors: usize) -> Resu
     let sample_count = MEDOID_SAMPLE_K.min(num_vectors);
 
     let mut indices: Vec<usize> = (0..num_vectors).collect();
-    indices.partial_shuffle(&mut rng, sample_count);
-    let sample = &indices[..sample_count];
+    // The selected elements are the returned slice, which rand places at the end.
+    let (sample, _) = indices.partial_shuffle(&mut rng, sample_count);
 
     let mut mean = vec![0.0f32; dimensions];
-    for &idx in sample {
+    for &idx in sample.iter() {
         let v = row(vectors, dimensions, idx as u32);
         for (m, x) in mean.iter_mut().zip(v.iter()) {
             *m += x;
@@ -1099,7 +1099,7 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
             let mut neighbors: Vec<u32> = Vec::with_capacity(count);
             shuffle_swaps.clear();
             for k in 0..count {
-                let j = rng.gen_range(k..available);
+                let j = rng.random_range(k..available);
                 pool.swap(k, j);
                 shuffle_swaps.push((k, j));
                 neighbors.push(pool[k]);

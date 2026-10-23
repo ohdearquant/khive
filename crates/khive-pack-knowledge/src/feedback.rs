@@ -1,5 +1,6 @@
 //! Knowledge-owned feedback targets and section-learning handoff (#1781).
 use khive_brain_core::{resolve_consumer_profile, ConsumerKind, FeedbackSignal, SectionType};
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     EventAttribution, NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry,
 };
@@ -26,7 +27,8 @@ fn parse_signal(value: &str) -> Result<FeedbackSignal, RuntimeError> {
         "not_useful" => Ok(FeedbackSignal::NotUseful),
         "wrong" => Ok(FeedbackSignal::Wrong),
         other => Err(RuntimeError::InvalidInput(format!(
-            "unknown feedback signal {other:?}; expected useful | not_useful | wrong"
+            "unknown feedback signal {:?}; expected useful | not_useful | wrong",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -61,7 +63,8 @@ impl KnowledgePack {
             for (key, val) in raw {
                 let section = SectionType::from_str_loose(key).ok_or_else(|| {
                     RuntimeError::InvalidInput(format!(
-                        "unknown section_type: {key:?}; valid: {}",
+                        "unknown section_type: {:?}; valid: {}",
+                        mask_for_redaction_surface(RedactionSurface::GateProbe, key),
                         SectionType::NAMES.join(", ")
                     ))
                 })?;

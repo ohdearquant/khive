@@ -16,6 +16,7 @@ use khive_fusion::FusionStrategy;
 use khive_retrieval::hybrid::{
     combine_best_ranked_evidence, fuse_labelled_scored, HitLabel, HybridConfig,
 };
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     fts_text_leg_or_err, MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError,
     SearchHit, SearchSource, VerbRegistry,
@@ -312,15 +313,22 @@ pub(super) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError>
     serde_json::to_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
 }
 
+pub(super) fn decode_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
+    serde_json::from_value(params).map_err(|error| {
+        mask_for_redaction_surface(RedactionSurface::GateProbe, &error.to_string()).into_owned()
+    })
+}
+
 pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
+    decode_params(params).map_err(RuntimeError::InvalidInput)
 }
 
 pub(crate) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
     match mt {
         "episodic" | "semantic" => Ok(()),
         other => Err(RuntimeError::InvalidInput(format!(
-            "unknown memory_type {other:?}; valid: episodic | semantic"
+            "unknown memory_type {:?}; valid: episodic | semantic",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -335,7 +343,8 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
         "vector_only" => Ok(FusionStrategy::VectorOnly),
         "keyword_only" => Ok(FusionStrategy::KeywordOnly),
         other => Err(RuntimeError::InvalidInput(format!(
-            "invalid fusion_strategy {other:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\""
+            "invalid fusion_strategy {:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\"",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -380,11 +389,13 @@ pub(super) async fn resolve_serving_profile(
     if let Some(profile_id) = brain_profile {
         return Some(profile_id.clone());
     }
-    khive_brain_core::resolve_consumer_profile(
+    // Boxed for the same reason as the profile load: the resolution
+    // dispatches through the registry.
+    Box::pin(khive_brain_core::resolve_consumer_profile(
         registry,
         token,
         khive_brain_core::ConsumerKind::Recall,
-    )
+    ))
     .await
 }
 

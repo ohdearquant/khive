@@ -1238,8 +1238,8 @@ async fn test_search_unranked_counts_exactly_one_fts_pass() {
 }
 
 #[tokio::test]
-async fn test_search_rank_within_cap_counts_two_fts_passes() {
-    let store = setup_memory_store("rank_within_cap_counts_twice");
+async fn test_search_rank_within_cap_counts_exactly_one_fts_pass() {
+    let store = setup_memory_store("rank_within_cap_counts_once");
     store
         .upsert_document(make_document(
             Uuid::new_v4(),
@@ -1250,7 +1250,7 @@ async fn test_search_rank_within_cap_counts_two_fts_passes() {
         .unwrap();
 
     let ctx = khive_storage::usage::UsageContext::new();
-    khive_storage::usage::scope(ctx.clone(), async {
+    let hits = khive_storage::usage::scope(ctx.clone(), async {
         store
             .search_with_options(
                 TextSearchRequest {
@@ -1270,7 +1270,8 @@ async fn test_search_rank_within_cap_counts_two_fts_passes() {
     .await
     .unwrap();
 
-    assert_eq!(ctx.snapshot()["fts_passes"], 2);
+    assert_eq!(hits.len(), 1, "the issued query must return its seeded row");
+    assert_eq!(ctx.snapshot()["fts_passes"], 1);
 }
 
 /// ADR-136 D1 gate 2/4: `rename_namespace`'s flag-on path must route through
@@ -1627,3 +1628,6 @@ fn memory_kind_match_work_is_bounded_by_memory_corpus() {
          small plan:\n{small_plan}\nlarge plan:\n{large_plan}"
     );
 }
+
+#[path = "text_tests/bounded_ranking_tests.rs"]
+mod bounded_ranking_tests;

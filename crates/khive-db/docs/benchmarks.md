@@ -105,6 +105,44 @@ and machine are also **pending** until the owner measures after the gate.
 The [release ledger](api/benchmarks.md) preserves older observations and contains
 pending current-main rows for the two existing targets and both new targets.
 
+### Edge invalidation trigger comparison
+
+`db_edge_mutations` measures singleton insertion, 100/1000-edge bulk insertion,
+weight/metadata update, endpoint update, and soft/hard deletion. Each operation
+uses a fresh file-backed WAL fixture with live memory endpoints and a required
+writer task. Preparation and persisted-result checks are outside its timer.
+
+`runtime_edge_mutations` measures the actual entity and note merge APIs with
+eight outgoing incident edges each, verifying all eight retained edge IDs and
+rewritten endpoints after timing. It also runs 4 and 16 concurrent producers,
+each issuing 64 product link calls through a barrier. That throughput interval
+includes task launch, calls and joins; fixture setup, diagnostic snapshots,
+percentile calculation and result checks are outside it. Both targets use one
+fixture at a time and drain its writer before deleting its private directory.
+
+Each `writer-queue:` JSON line reports the individual caller-latency nearest-rank
+p95 and the existing writer-admission queue-age and service histograms. The
+histograms subtract the fixture-setup snapshot bucket by bucket and require
+exactly one accepted and serviced admission per composed link call. Their p95
+is a power-of-two bucket upper bound; compare it as a bound. Caller-latency p95
+uses all successful per-call nanosecond samples and can support a percentage
+comparison. Missing telemetry, incomplete admissions, operation errors and
+incorrect persisted row counts fail the workload.
+
+Run the identical benchmark source on the pre-migration and post-migration
+trees with the same features, toolchain, machine and settings:
+
+```bash
+cargo bench -p khive-db --bench db_edge_mutations --locked
+cargo bench -p khive-runtime --bench runtime_edge_mutations --locked
+```
+
+These are generic writes with governance inactive and no stamped markers.
+They measure installed-trigger overhead for the dormant schema; they do not
+measure future active-governance decision or invalidation-ledger populations.
+All timing observations are pending native execution. No speedup or bound is
+claimed from benchmark source alone.
+
 ## Performance guarantees
 
 | Operation               | Input                       | Metric         | Bound                                                                     |

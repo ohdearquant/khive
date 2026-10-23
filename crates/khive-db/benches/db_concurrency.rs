@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -54,9 +54,9 @@ const WORDS: &[&str] = &[
 ];
 
 fn gen_doc(rng: &mut StdRng, i: usize) -> TextDocument {
-    let n_words = rng.gen_range(20..35usize);
+    let n_words = rng.random_range(20..35usize);
     let mut words: Vec<String> = (0..n_words)
-        .map(|_| WORDS[rng.gen_range(0..WORDS.len())].to_string())
+        .map(|_| WORDS[rng.random_range(0..WORDS.len())].to_string())
         .collect();
     words.push(format!("doc_{i}"));
     TextDocument {

@@ -24,7 +24,7 @@ fn allocation_count() -> usize {
 fn fixture_vectors() -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(0x3787);
     (0..(BUILD_BATCH_SIZE + 17) * 4)
-        .map(|_| rng.gen_range(-1.0..1.0))
+        .map(|_| rng.random_range(-1.0..1.0))
         .collect()
 }
 
