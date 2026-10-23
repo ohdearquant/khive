@@ -1136,3 +1136,95 @@ refuses every observation does not satisfy the positive controls.
   verified; existing schemas and accepted decisions alone provide neither.
 - No new charter expression language, tenant isolation mechanism, effect
   credential custody or root signing facility is introduced by this amendment.
+
+## Amendment 6 (2026-10-23): durable encoding of producer registrations
+
+**Status**: Proposed.
+
+This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect:
+charter + gate + privileges, the whole automated permission system has nearly taken shape in khive".
+Amendment 5 and ADR-143 Amendment 3 serve the same instruction; this amendment fixes representation
+choices that their durable registration leaves open.
+
+It amends Amendment 5 D1 and D3 and ADR-143 Amendment 3 M3.2, M3.3 and M3.8, as specified below. It
+adds no right, verb, table or migration.
+
+### A6.1. Terminal state of a record holding both rights
+
+ADR-143 Amendment 3 M3.2 lets one grant record carry `RecordObservation` and `GrantAdmin` together.
+M3.3 names `disabled` as the terminal state for `RecordObservation` and `revoked` for other supported
+grants, and names no state for a record holding both. Such a record has one whole-record terminal
+state: `disabled` if any `RecordObservation` right is present, otherwise `revoked`. Either name ends
+every right on the record. The typed history read names every right the record carried (A6.6), and
+`authority.list` shows the recorded terminal state for the whole record, so a `GrantAdmin` right
+that ends under the name `disabled` is read from history, not inferred. A mixed
+grant is not refused, split into several identities, or terminated in part.
+
+### A6.2. Keys of the actor reporting binding
+
+D3 binds an action result to its run, phase visit, action occurrence and exact arguments. The keys
+are the ones the run engine already uses:
+
+- Run: the run's UUID, which the engine mints as a version-4 UUID. A registration stores its 16
+  bytes and accepts only the canonical lowercase hyphenated text at its boundary.
+- Phase visit: the phase identifier and the round, an integer of at least 1. A phase that has not
+  been entered holds round 0 and each entry adds one, so round 0 names no visit and refuses.
+- Action occurrence: the visit and the action name. The definition checker refuses a phase that
+  performs one child twice, so a published definition cannot make an occurrence ambiguous. A
+  registration naming such a definition also refuses; that check is defense in depth over a
+  definition that cannot be published, not the mechanism.
+
+### A6.3. Claim-time platform bundles in the M1 profile
+
+D1 requires a claim-time platform bundle to pin its designated executor and bundle purpose, and no
+decision enumerates the purposes. ADR-143 Amendment 3 M3.1 leaves `charter.claim` unavailable in
+the M1 profile. In that profile a registration for a claim-time bundle refuses with a named outcome
+of the `RightNotSupported` family; it is never dropped silently. The ordinary platform relay is
+supported. This is a limit of the M1 profile, not a permanent exclusion: the profile that enables
+`charter.claim` enumerates the purposes.
+
+### A6.4. Validity interval
+
+Instants are `khive_types::Timestamp` values, microseconds since the Unix epoch. The interval is
+half-open: a registration is valid from `not_before` inclusive until `expires_at` exclusive,
+`expires_at` must be later than `not_before`, and at `t == expires_at` the registration has expired.
+An explicitly absent `expires_at` is a standing permission. ADR-143 Amendment 3 M3.8's
+expiry-at-the-seam control includes the equality instant.
+
+A grant request names no interval: M3.2's grant item carries the grantee, namespace, parent and
+rights, and this amendment adds no request field. The server derives the interval inside the writer
+transaction from one clock read, the same instant at which the chosen ordinary parent (or the
+bootstrap source) is checked: `not_before` is that verification instant and `expires_at` is the
+source's `expires_at`, absent when the source is standing. Because the source is valid at that
+instant, the derived interval is never empty. A registration is therefore never valid for an instant
+before it was issued, so evidence recorded earlier cannot become eligible under it. The
+administrative proof is checked at the same instant and does not shorten the interval. The derived
+interval is returned with the record.
+
+### A6.5. Digests, durations and the record bound
+
+Contract digests (entry contracts, source contracts and canonical references) are BLAKE3-256 under
+one algorithm tag in this version; an unknown tag refuses. Duration-typed argument values are whole
+seconds, the unit of the charter language's duration literal. The canonical durable record of one
+grant is bounded at 2 MiB, separately from M3.2's 1 MiB canonical request bound, because the record
+adds server-derived fields and their authentication to the request's content. Every collection in
+it holds at most 256 entries. An over-limit record refuses with the applicable bound and the
+measured size, before issue and before insert; it is never truncated.
+
+### A6.6. Revocation is never refused for size
+
+An issued grant stays revocable. The terminal transition, the revoke or retire event and the revoke
+authorization snapshot name each target, and each administering grant of the caller, by its UUID and
+the BLAKE3-256 digest of its preserved canonical body, together with the terminal state and the
+action and event identifiers. None of them copies a right set, so their size does not grow with the
+record they end, and a record at the 2 MiB bound revokes with a result inside M3.2's 1 MiB replay
+bound. The history read and `authority.list` decode the preserved grant bytes, check the digest and
+return every former right beside the terminal state. The preserved canonical grant body is retained
+after the terminal transition and is never purged in this version, because the history read names
+every former right only while those bytes exist.
+
+### Known limits
+
+- A claim-time platform bundle cannot be registered in the M1 profile (A6.3).
+- The binding keys fix how a report names its run, visit and occurrence. Whether the reporter is
+  the bound actor remains D3's check.
