@@ -37,6 +37,9 @@ appears absent.
 
 This slice adds no background recovery. Failed targets remain durable until a later
 covered update or a future recovery component handles them. Note updates, merges,
-model-revision tracking and backfill are unchanged. Namespace-move integration is
-a required follow-on: the existing move census refuses moves from a namespace with
-pending rows until a subject-keyed disposition and generation refresh are added.
+model-revision tracking and backfill are unchanged. Pending records follow their entity IDs during single-target and partitioned namespace
+moves, in the same transaction. The move refreshes the observed namespace, source
+version and generation, resets completion for every retained target, and preserves
+first-pending time and retry state. It captures no new models and performs no
+embedding or index publication; recovery remains responsible for unfinished work.
+An already-moved entity is not refreshed again by repeating the same move.

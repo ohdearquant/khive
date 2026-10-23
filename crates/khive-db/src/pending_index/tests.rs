@@ -501,3 +501,97 @@ async fn failure_metadata_rejects_raw_messages_saturates_attempts_and_preserves_
     .await
     .unwrap();
 }
+
+fn namespace_move_record() -> PendingEntityIndex {
+    PendingEntityIndex {
+        entity_id: Uuid::from_u128(0x2222),
+        namespace: "stale".into(),
+        source_version: 2,
+        generation: Uuid::from_u128(0x1111),
+        first_pending_at: 10,
+        targets: vec![
+            PendingIndexTarget {
+                kind: PendingIndexTargetKind::Fts,
+                done: true,
+                attempts: 2,
+                last_error: Some("old_failure".into()),
+                next_eligible_at: 9_000_000_000_000_000,
+            },
+            PendingIndexTarget {
+                kind: vector("completed", 3),
+                done: true,
+                attempts: 4,
+                last_error: None,
+                next_eligible_at: 90,
+            },
+            PendingIndexTarget {
+                kind: PendingIndexTargetKind::Vector {
+                    model: "blocked".into(),
+                    dimensions: vec![3, 5],
+                },
+                done: false,
+                attempts: 7,
+                last_error: Some("model_unavailable".into()),
+                next_eligible_at: 9_000_000_000_000_001,
+            },
+        ],
+    }
+}
+
+#[test]
+fn namespace_move_generation_has_an_independent_binary_golden() {
+    let old = Uuid::from_u128(0x1111);
+    let entity = Uuid::from_u128(0x2222);
+    let generation = move_generation(old, entity, "destination/α", 7).unwrap();
+    assert_eq!(
+        generation.to_string(),
+        "4ec303c0-17df-5d4c-ba53-d5fecf914cd2"
+    );
+    assert_ne!(generation, old);
+    for different in [
+        move_generation(old, entity, "destination/α", 8).unwrap(),
+        move_generation(old, entity, "destination/α\0", 7).unwrap(),
+        move_generation(old, Uuid::from_u128(0x2223), "destination/α", 7).unwrap(),
+        move_generation(Uuid::from_u128(0x1112), entity, "destination/α", 7).unwrap(),
+    ] {
+        assert_ne!(generation, different);
+    }
+    assert!(move_generation(Uuid::nil(), entity, "target", 7).is_err());
+    assert!(move_generation(old, entity, "target", 0).is_err());
+    assert!(move_generation(old, entity, "target", -1).is_err());
+}
+
+#[test]
+fn namespace_move_refresh_preserves_complete_targets_and_retry_state() {
+    let old = namespace_move_record();
+    let before = serde_json::to_vec(&old).unwrap();
+    let generation = move_generation(old.generation, old.entity_id, "target", 10).unwrap();
+    let refreshed = refresh_for_live_revision(&old, "target", 10, generation).unwrap();
+    let mut expected = old.clone();
+    expected.namespace = "target".into();
+    expected.source_version = 10;
+    expected.generation = generation;
+    for target in &mut expected.targets {
+        target.done = false;
+    }
+    assert_eq!(refreshed, expected);
+    assert_eq!(serde_json::to_vec(&old).unwrap(), before);
+    assert_eq!(refreshed.targets.len(), 3);
+    assert!(refreshed.targets.iter().all(|target| !target.done));
+    assert!(refreshed.targets[2].kind.is_blocked());
+}
+
+#[test]
+fn namespace_move_refresh_refuses_reused_generation_and_invalid_revision() {
+    let old = namespace_move_record();
+    for generation in [Uuid::nil(), old.generation] {
+        assert!(refresh_for_live_revision(&old, "target", 10, generation).is_err());
+    }
+    let generation = move_generation(old.generation, old.entity_id, "target", 10).unwrap();
+    for version in [0, -1] {
+        assert!(refresh_for_live_revision(&old, "target", version, generation).is_err());
+    }
+    let mut invalid = old.clone();
+    invalid.targets[2].done = true;
+    assert!(refresh_for_live_revision(&invalid, "target", 10, generation).is_err());
+}

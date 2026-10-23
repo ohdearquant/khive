@@ -1,8 +1,8 @@
 //! Durable obligations for deferred entity indexing (ADR-014 Amendment 7).
 //!
-//! Every mutation here must run on the writer passed to `SqlAccess::atomic_unit`.
-//! Reads and writes use only that writer; no helper opens a transaction, embeds,
-//! retries, or interprets a transaction's unknown outcome as success or failure.
+//! Deferred publication uses the writer passed to `SqlAccess::atomic_unit`;
+//! namespace moves use their caller's existing native transaction. No helper
+//! opens a transaction, embeds, retries, or settles an unknown outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +17,8 @@ const INSERT: &str = include_str!("../sql/pending-entity-index-insert.sql");
 const REPLACE: &str = include_str!("../sql/pending-entity-index-replace.sql");
 const REMOVE: &str = include_str!("../sql/pending-entity-index-remove.sql");
 const LIVE: &str = include_str!("../sql/pending-entity-index-live.sql");
+const MOVE_PAGE: &str = include_str!("../sql/pending-entity-index-move-page.sql");
+const MOVE_PAGE_SIZE: i64 = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -115,18 +117,35 @@ fn validate(record: &PendingEntityIndex) -> StorageResult<()> {
     Ok(())
 }
 
-fn decode(row: SqlRow) -> StorageResult<PendingEntityIndex> {
+fn decode_fields(
+    entity_id: &str,
+    namespace: &str,
+    source_version: i64,
+    generation: &str,
+    first_pending_at: i64,
+    targets_json: &str,
+) -> StorageResult<PendingEntityIndex> {
     let record = PendingEntityIndex {
-        entity_id: Uuid::parse_str(row.text("entity_id").map_err(invalid)?).map_err(invalid)?,
-        namespace: row.text("namespace").map_err(invalid)?.to_owned(),
-        source_version: row.i64("source_version").map_err(invalid)?,
-        generation: Uuid::parse_str(row.text("generation").map_err(invalid)?).map_err(invalid)?,
-        first_pending_at: row.i64("first_pending_at").map_err(invalid)?,
-        targets: serde_json::from_str(row.text("targets_json").map_err(invalid)?)
-            .map_err(invalid)?,
+        entity_id: Uuid::parse_str(entity_id).map_err(invalid)?,
+        namespace: namespace.to_owned(),
+        source_version,
+        generation: Uuid::parse_str(generation).map_err(invalid)?,
+        first_pending_at,
+        targets: serde_json::from_str(targets_json).map_err(invalid)?,
     };
     validate(&record)?;
     Ok(record)
+}
+
+fn decode(row: SqlRow) -> StorageResult<PendingEntityIndex> {
+    decode_fields(
+        row.text("entity_id").map_err(invalid)?,
+        row.text("namespace").map_err(invalid)?,
+        row.i64("source_version").map_err(invalid)?,
+        row.text("generation").map_err(invalid)?,
+        row.i64("first_pending_at").map_err(invalid)?,
+        row.text("targets_json").map_err(invalid)?,
+    )
 }
 
 fn values(record: &PendingEntityIndex) -> StorageResult<Vec<SqlValue>> {
@@ -378,6 +397,119 @@ pub async fn record_failure(
     target.last_error = Some(category.to_owned());
     target.next_eligible_at = target.next_eligible_at.max(next_eligible_at);
     replace(writer, observed_generation, &record).await
+}
+
+fn move_generation(
+    old: Uuid,
+    entity_id: Uuid,
+    namespace: &str,
+    source_version: i64,
+) -> StorageResult<Uuid> {
+    if old.is_nil() || source_version <= 0 {
+        return Err(invalid("invalid namespace move generation input"));
+    }
+    let mut name = b"khive.pending-entity-index.namespace-move.v1\0".to_vec();
+    name.extend_from_slice(entity_id.as_bytes());
+    let length = u64::try_from(namespace.len()).map_err(invalid)?;
+    name.extend_from_slice(&length.to_be_bytes());
+    name.extend_from_slice(namespace.as_bytes());
+    name.extend_from_slice(&source_version.to_be_bytes());
+    let generation = Uuid::new_v5(&old, &name);
+    if generation.is_nil() || generation == old {
+        return Err(invalid("namespace move generation was reused"));
+    }
+    Ok(generation)
+}
+
+fn refresh_for_live_revision(
+    old: &PendingEntityIndex,
+    namespace: &str,
+    source_version: i64,
+    generation: Uuid,
+) -> StorageResult<PendingEntityIndex> {
+    validate(old)?;
+    if generation.is_nil() || generation == old.generation {
+        return Err(invalid("namespace move generation was reused"));
+    }
+    let mut record = old.clone();
+    record.namespace = namespace.to_owned();
+    record.source_version = source_version;
+    record.generation = generation;
+    for target in &mut record.targets {
+        target.done = false;
+    }
+    validate(&record)?;
+    Ok(record)
+}
+
+fn native_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+fn decode_move_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PendingEntityIndex, i64)> {
+    let record = decode_fields(
+        &row.get::<_, String>("entity_id")?,
+        &row.get::<_, String>("namespace")?,
+        row.get("source_version")?,
+        &row.get::<_, String>("generation")?,
+        row.get("first_pending_at")?,
+        &row.get::<_, String>("targets_json")?,
+    )
+    .map_err(native_error)?;
+    Ok((record, row.get("live_version")?))
+}
+
+/// Refresh obligations before the matching entity route, within the caller's move transaction.
+pub(crate) fn refresh_for_namespace_move(
+    conn: &rusqlite::Connection,
+    source: &str,
+    target: &str,
+    kind: &str,
+) -> rusqlite::Result<u64> {
+    let mut after: Option<String> = None;
+    let mut refreshed = 0_u64;
+    loop {
+        let page = {
+            let mut statement = conn.prepare(MOVE_PAGE)?;
+            let rows = statement.query_map(
+                rusqlite::params![source, kind, after, MOVE_PAGE_SIZE],
+                decode_move_row,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if page.is_empty() {
+            break;
+        }
+        for (old, live_version) in page {
+            after = Some(old.entity_id.to_string());
+            let version = live_version
+                .checked_add(1)
+                .ok_or_else(|| native_error(invalid("entity version overflow during move")))?;
+            let generation = move_generation(old.generation, old.entity_id, target, version)
+                .map_err(native_error)?;
+            let record = refresh_for_live_revision(&old, target, version, generation)
+                .map_err(native_error)?;
+            let changed = conn.execute(
+                REPLACE,
+                rusqlite::params![
+                    record.entity_id.to_string(),
+                    record.namespace,
+                    record.source_version,
+                    record.generation.to_string(),
+                    record.first_pending_at,
+                    serde_json::to_string(&record.targets).map_err(native_error)?,
+                    old.generation.to_string(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(native_error(invalid("namespace move generation changed")));
+            }
+            refreshed = refreshed
+                .checked_add(1)
+                .ok_or_else(|| native_error(invalid("namespace move row count overflow")))?;
+        }
+    }
+    Ok(refreshed)
 }
 
 #[cfg(test)]

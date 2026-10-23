@@ -124,6 +124,12 @@ fn every_current_namespace_table_has_a_move_disposition() {
             },
         ),
         ("weight_events", TableDisposition::History),
+        (
+            "pending_entity_indexes",
+            TableDisposition::SubjectKeyed {
+                subject_column: "entity_id",
+            },
+        ),
     ] {
         let table = inventory
             .tables
@@ -1374,4 +1380,342 @@ fn atom_weight_collisions_name_only_the_routed_target_and_leave_every_row_unchan
             1
         );
     }
+}
+
+fn seed_pending_move_entity(conn: &Connection, id: uuid::Uuid, namespace: &str, kind: &str) {
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at, version) \
+         VALUES (?1, ?2, ?3, ?1, 1, 42, 9)",
+        rusqlite::params![id.to_string(), namespace, kind],
+    )
+    .unwrap();
+}
+
+fn seed_pending_move_record(
+    conn: &Connection,
+    id: uuid::Uuid,
+    namespace: &str,
+) -> crate::pending_index::PendingEntityIndex {
+    use crate::pending_index::{PendingEntityIndex, PendingIndexTarget, PendingIndexTargetKind};
+    let target = |kind, done, attempts| PendingIndexTarget {
+        kind,
+        done,
+        attempts,
+        last_error: Some("transient_failure".into()),
+        next_eligible_at: 9_000_000_000_000_000 + i64::try_from(attempts).unwrap(),
+    };
+    let record = PendingEntityIndex {
+        entity_id: id,
+        namespace: namespace.into(),
+        source_version: 2,
+        generation: uuid::Uuid::from_u128(id.as_u128() + 0x10_000),
+        first_pending_at: 10,
+        targets: vec![
+            target(PendingIndexTargetKind::Fts, true, 1),
+            target(
+                PendingIndexTargetKind::Vector {
+                    model: "completed".into(),
+                    dimensions: vec![3],
+                },
+                true,
+                4,
+            ),
+            target(
+                PendingIndexTargetKind::Vector {
+                    model: "missing".into(),
+                    dimensions: vec![5],
+                },
+                false,
+                7,
+            ),
+            target(
+                PendingIndexTargetKind::Vector {
+                    model: "blocked".into(),
+                    dimensions: vec![3, 5],
+                },
+                false,
+                9,
+            ),
+        ],
+    };
+    conn.execute(
+        "INSERT INTO pending_entity_indexes \
+         (entity_id, namespace, source_version, generation, first_pending_at, targets_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            record.entity_id.to_string(),
+            record.namespace,
+            record.source_version,
+            record.generation.to_string(),
+            record.first_pending_at,
+            serde_json::to_string(&record.targets).unwrap(),
+        ],
+    )
+    .unwrap();
+    record
+}
+
+fn moved_pending_record(
+    conn: &Connection,
+    id: uuid::Uuid,
+) -> crate::pending_index::PendingEntityIndex {
+    let (namespace, source_version, generation, first_pending_at, targets_json): (
+        String,
+        i64,
+        String,
+        i64,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT namespace, source_version, generation, first_pending_at, targets_json \
+         FROM pending_entity_indexes WHERE entity_id = ?1",
+            [id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    crate::pending_index::PendingEntityIndex {
+        entity_id: id,
+        namespace,
+        source_version,
+        generation: generation.parse().unwrap(),
+        first_pending_at,
+        targets: serde_json::from_str(&targets_json).unwrap(),
+    }
+}
+
+#[test]
+fn pending_indexes_follow_actual_entity_routes_and_preserve_every_target_across_pages() {
+    for partitioned in [false, true] {
+        let conn = migrated();
+        let concept_target = if partitioned {
+            "concept-target"
+        } else {
+            "target"
+        };
+        let person_target = if partitioned {
+            "person-target"
+        } else {
+            "target"
+        };
+        let note_target = if partitioned { "note-target" } else { "target" };
+        let mut moving = Vec::new();
+        for value in 1..=130 {
+            let id = uuid::Uuid::from_u128(value);
+            seed_pending_move_entity(&conn, id, "source", "concept");
+            moving.push((seed_pending_move_record(&conn, id, "stale"), concept_target));
+        }
+        let person = uuid::Uuid::from_u128(131);
+        seed_pending_move_entity(&conn, person, "source", "person");
+        moving.push((
+            seed_pending_move_record(&conn, person, "older"),
+            person_target,
+        ));
+        let no_pending = uuid::Uuid::from_u128(132);
+        seed_pending_move_entity(&conn, no_pending, "source", "concept");
+        let resident = uuid::Uuid::from_u128(2001);
+        seed_pending_move_entity(&conn, resident, concept_target, "concept");
+        let resident_before = seed_pending_move_record(&conn, resident, "source");
+        let unrelated = uuid::Uuid::from_u128(2002);
+        seed_pending_move_entity(&conn, unrelated, "elsewhere", "concept");
+        let unrelated_before = seed_pending_move_record(&conn, unrelated, "source");
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, name, content, created_at, updated_at) \
+             VALUES (?1, 'source', 'observation', 'same-id note', 'content', 1, 1)",
+            [unrelated.to_string()],
+        )
+        .unwrap();
+        let request = MoveRequest::new(
+            "source",
+            vec![
+                MoveRoute {
+                    class: SubjectClass::Entity("concept".into()),
+                    target: concept_target.into(),
+                },
+                MoveRoute {
+                    class: SubjectClass::Entity("person".into()),
+                    target: person_target.into(),
+                },
+                MoveRoute {
+                    class: SubjectClass::Note("observation".into()),
+                    target: note_target.into(),
+                },
+            ],
+        );
+        let counts = attempt(&conn, &request).expect("move routed pending work");
+        assert_eq!(counts.rows.get("pending_entity_indexes"), Some(&131));
+        assert_eq!(counts.left_behind.get("pending_entity_indexes"), Some(&2));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM pending_entity_indexes"),
+            133
+        );
+        let mut generations = BTreeSet::new();
+        for (old, target) in moving {
+            let actual = moved_pending_record(&conn, old.entity_id);
+            assert_ne!(actual.generation, old.generation);
+            assert!(!actual.generation.is_nil());
+            assert!(generations.insert(actual.generation));
+            let mut expected = old.clone();
+            expected.namespace = target.into();
+            expected.source_version = 10;
+            expected.generation = actual.generation;
+            for target in &mut expected.targets {
+                target.done = false;
+            }
+            assert_eq!(actual, expected);
+            let entity: (String, i64, i64) = conn
+                .query_row(
+                    "SELECT namespace, version, updated_at FROM entities WHERE id = ?1",
+                    [old.entity_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(entity, (target.into(), 10, 42));
+            assert_eq!(
+                conn.execute(
+                    include_str!("../sql/pending-entity-index-remove.sql"),
+                    rusqlite::params![old.entity_id.to_string(), old.generation.to_string()],
+                )
+                .unwrap(),
+                0,
+                "old workers cannot consume moved work"
+            );
+        }
+        assert_eq!(generations.len(), 131);
+        assert_eq!(moved_pending_record(&conn, resident), resident_before);
+        assert_eq!(moved_pending_record(&conn, unrelated), unrelated_before);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_entity_indexes WHERE entity_id = ?1",
+                [no_pending.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        let after_entities = weight_table_rows(&conn, "entities");
+        let after_pending = weight_table_rows(&conn, "pending_entity_indexes");
+        let repeated = attempt(&conn, &request).expect("already-moved route is a no-op");
+        assert_eq!(repeated.rows.get("pending_entity_indexes"), Some(&0));
+        assert!(repeated.subjects.values().all(|count| *count == 0));
+        assert_eq!(weight_table_rows(&conn, "entities"), after_entities);
+        assert_eq!(
+            weight_table_rows(&conn, "pending_entity_indexes"),
+            after_pending
+        );
+    }
+}
+
+#[test]
+fn pending_index_refresh_failure_rolls_back_prior_routes_and_generations() {
+    for partitioned in [false, true] {
+        let conn = migrated();
+        let concept_target = if partitioned {
+            "concept-target"
+        } else {
+            "target"
+        };
+        let person_target = if partitioned {
+            "person-target"
+        } else {
+            "target"
+        };
+        let first = uuid::Uuid::from_u128(1);
+        let second = uuid::Uuid::from_u128(2);
+        let failing = uuid::Uuid::from_u128(3);
+        for (id, kind) in [(first, "concept"), (second, "person"), (failing, "person")] {
+            seed_pending_move_entity(&conn, id, "source", kind);
+            seed_pending_move_record(&conn, id, "stale");
+        }
+        let before_entities = weight_table_rows(&conn, "entities");
+        let before_pending = weight_table_rows(&conn, "pending_entity_indexes");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_pending_move BEFORE UPDATE ON pending_entity_indexes \
+             WHEN OLD.entity_id = '{failing}' BEGIN \
+             SELECT CASE WHEN (SELECT namespace FROM entities WHERE id = '{first}') != '{concept_target}' \
+                 THEN RAISE(ABORT, 'first entity route did not advance') END; \
+             SELECT CASE WHEN (SELECT namespace FROM pending_entity_indexes WHERE entity_id = '{second}') != '{person_target}' \
+                 THEN RAISE(ABORT, 'prior pending refresh did not advance') END; \
+             SELECT CASE WHEN (SELECT namespace FROM entities WHERE id = '{failing}') != 'source' \
+                 OR (SELECT version FROM entities WHERE id = '{failing}') != 9 \
+                 THEN RAISE(ABORT, 'entity advanced before pending refresh') END; \
+             SELECT RAISE(ABORT, 'injected pending generation failure'); END;"
+        )).unwrap();
+        let request = MoveRequest::new(
+            "source",
+            vec![
+                MoveRoute {
+                    class: SubjectClass::Entity("concept".into()),
+                    target: concept_target.into(),
+                },
+                MoveRoute {
+                    class: SubjectClass::Entity("person".into()),
+                    target: person_target.into(),
+                },
+            ],
+        );
+        let error = attempt(&conn, &request).expect_err("the real pending update must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected pending generation failure"),
+            "{error}"
+        );
+        assert_eq!(weight_table_rows(&conn, "entities"), before_entities);
+        assert_eq!(
+            weight_table_rows(&conn, "pending_entity_indexes"),
+            before_pending
+        );
+        conn.execute_batch("DROP TRIGGER reject_pending_move")
+            .unwrap();
+        let moved = attempt(&conn, &request).expect("same routes retry after rollback");
+        assert_eq!(moved.rows.get("pending_entity_indexes"), Some(&3));
+        for (id, target) in [
+            (first, concept_target),
+            (second, person_target),
+            (failing, person_target),
+        ] {
+            let pending = moved_pending_record(&conn, id);
+            assert_eq!(pending.namespace, target);
+            assert_eq!(pending.source_version, 10);
+            assert!(pending.targets.iter().all(|target| !target.done));
+        }
+    }
+}
+
+#[test]
+fn pending_namespace_move_version_overflow_rolls_back_without_consuming_work() {
+    let conn = migrated();
+    let id = uuid::Uuid::from_u128(1);
+    seed_pending_move_entity(&conn, id, "source", "concept");
+    seed_pending_move_record(&conn, id, "stale");
+    conn.execute(
+        "UPDATE entities SET version = ?1 WHERE id = ?2",
+        rusqlite::params![i64::MAX, id.to_string()],
+    )
+    .unwrap();
+    let entities = weight_table_rows(&conn, "entities");
+    let pending = weight_table_rows(&conn, "pending_entity_indexes");
+    let request = MoveRequest::new(
+        "source",
+        vec![MoveRoute {
+            class: SubjectClass::Entity("concept".into()),
+            target: "target".into(),
+        }],
+    );
+    let error =
+        attempt(&conn, &request).expect_err("overflow must refuse before the entity update");
+    assert!(
+        error.to_string().contains("entity version overflow"),
+        "{error}"
+    );
+    assert_eq!(weight_table_rows(&conn, "entities"), entities);
+    assert_eq!(weight_table_rows(&conn, "pending_entity_indexes"), pending);
 }
