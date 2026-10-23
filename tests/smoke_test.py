@@ -13,44 +13,55 @@ get/update/delete/merge auto-detect record kind from UUID — no kind= needed.
 get returns {"kind": "entity"|"note"|"edge", "data": {...}}.
 
 Usage:
-    uv run python tests/smoke_test.py
-    # or: python3 tests/smoke_test.py
+    uv run python tests/smoke_test.py --profile default
+    # Profiles: core (9), default (11), fleet (19), documented (historical 14).
 """
 
+import argparse
 import json
 import subprocess
 import sys
 import os
-import re
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
 from documented_guide_tables import validate_guide_verb_tables
-from kkernel_binary import REPO_ROOT, resolve_binary_path
+from kkernel_binary import resolve_binary_path
 
 BINARY = resolve_binary_path()
 
-def shipped_pack_set() -> frozenset[str]:
-    """The pack set the binary ships when nothing selects packs, read from its
-    declaration (`RuntimeConfig::built_in_packs` in
-    crates/khive-runtime/src/config.rs) rather than from a list typed here.
-    A typed copy drifted from the declaration by two packs and reddened this
-    check a day after the packs landed; reading the declaration keeps the pin
-    on what the registry is compared against, and a declaration that fails to
-    parse fails this test instead of passing an empty set."""
-    source = (REPO_ROOT / "crates" / "khive-runtime" / "src" / "config.rs").read_text()
-    match = re.search(r"pub fn built_in_packs\(\) -> Vec<String> \{\s*\[(.*?)\]", source, re.S)
-    assert match, "RuntimeConfig::built_in_packs declaration not found in config.rs"
-    packs = frozenset(re.findall(r'"([a-z_]+)"', match.group(1)))
-    assert {"kg", "workspace"} <= packs, (
-        f"built_in_packs parse produced an implausible set: {sorted(packs)}"
-    )
-    return packs
+# Independent profile contracts: never infer expected packs from the binary's
+# output or parse cfg-bearing Rust source. Core/default deliberately exercise
+# omitted selection; fleet/documented explicitly select their promised sets.
+CORE_PACKS = frozenset({
+    "kg", "comm", "knowledge", "gtd", "brain", "memory", "session", "schedule", "blob",
+})
+DEFAULT_PACKS = CORE_PACKS | {"git", "code"}
+DOCUMENTED_PACKS = DEFAULT_PACKS | {"tool", "exec", "workspace"}
+FLEET_PACKS = DOCUMENTED_PACKS | {"formal", "moodboard", "agent", "telemetry", "web"}
+PROFILE_PACKS = {
+    "core": CORE_PACKS,
+    "default": DEFAULT_PACKS,
+    "fleet": FLEET_PACKS,
+    "documented": DOCUMENTED_PACKS,
+}
 
 
-DEFAULT_PACKS = shipped_pack_set()
+def smoke_profile_args(profile: str) -> list[str]:
+    packs = PROFILE_PACKS[profile]
+    if profile in {"core", "default"}:
+        return []
+    return [arg for pack in sorted(packs) for arg in ("--pack", pack)]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=tuple(PROFILE_PACKS), required=True)
+    return parser.parse_args(argv)
+
+
 _SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-smoke-home-")
 
 
@@ -137,13 +148,15 @@ def call_verb(proc, name, args):
     return first.get("result")
 
 
-def main():
-    print(f"Binary: {BINARY}")
+def main(profile):
+    expected_packs = PROFILE_PACKS[profile]
+    print(f"Binary: {BINARY}; profile: {profile}")
     assert os.path.exists(BINARY), f"Binary not found: {BINARY}"
 
     env = smoke_child_env()
     proc = subprocess.Popen(
-        [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"],
+        [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"]
+        + smoke_profile_args(profile),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -246,138 +259,67 @@ def main():
         assert isinstance(verbs_result["pack_counts"], dict), (
             f"verbs.pack_counts must be an object: {verbs_result}"
         )
-        # pack_counts covers every loaded pack, zero-verb packs included, and
-        # its values sum to the unfiltered total. `workspace` is the default
-        # set's zero-verb pack: its presence at 0 is the tripwire proving
-        # pack_counts enumerates packs rather than surviving verbs.
+        # Exact profile membership includes zero-verb packs. A total alone
+        # cannot detect a missing Workspace or a leaked optional factory.
         actual_packs = frozenset(verbs_result["pack_counts"])
-        assert actual_packs == DEFAULT_PACKS, (
-            f"default config pack set mismatch; expected {sorted(DEFAULT_PACKS)}, "
+        assert actual_packs == expected_packs, (
+            f"{profile} pack set mismatch; expected {sorted(expected_packs)}, "
             f"got {sorted(actual_packs)}"
         )
-        assert verbs_result["pack_counts"].get("workspace") == 0, (
-            f"zero-verb workspace pack must appear in pack_counts with count 0: "
-            f"{verbs_result['pack_counts']}"
-        )
+        if "workspace" in expected_packs:
+            assert verbs_result["pack_counts"]["workspace"] == 0, (
+                f"zero-verb workspace pack must report count 0: {verbs_result['pack_counts']}"
+            )
         assert sum(verbs_result["pack_counts"].values()) == verbs_result["total"], (
             f"pack_counts must sum to total: {verbs_result['pack_counts']} vs "
             f"{verbs_result['total']}"
         )
-        documented_count_errors = validate_documented_counts(
-            Path(__file__).resolve().parent.parent,
-            verbs_result,
+        assert len(verbs_result["verbs"]) == verbs_result["total"], (
+            f"catalog length must equal total: {verbs_result}"
         )
-        assert not documented_count_errors, (
-            "published verb/pack counts drifted from the live registry:\n"
-            + "\n".join(f"  - {error}" for error in documented_count_errors)
-        )
-        guide_table_errors = [
-            error
-            for source in ("CLAUDE.md", "AGENTS.md")
-            for error in validate_guide_verb_tables(
-                Path(__file__).resolve().parent.parent, verbs_result, source=source
+        if profile == "documented":
+            # Explicit historical fourteen-pack run preserves the existing
+            # documentation oracle without treating it as the slim default.
+            documented_count_errors = validate_documented_counts(
+                Path(__file__).resolve().parent.parent,
+                verbs_result,
             )
-        ]
-        assert not guide_table_errors, (
-            "published pack verb tables drifted from the live registry:\n"
-            + "\n".join(f"  - {error}" for error in guide_table_errors)
-        )
-        # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 160 MCP-callable verbs
-        # (count what verbs() returns, not internal dispatch arms). The session
-        # pack contributes seven verbs: 4 agent-facing T1 verbs
-        # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083, and transcript search (ADR-117a), which
-        # stays unavailable until its required features are ready; stats and vacuum
-        # provide database-wide maintenance;
-        # brain.register_adapter (#354), context
-        # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
-        # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
-        # identity introspection, the 19th kg-substrate bare verb), db_diagnostics
-        # (ADR-091 operator surface, the 20th kg-substrate bare verb), comm.health
-        # (#606, verified live 2026-07-04), comm.probe (#644 read-only
-        # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
-        # windowed event read) and brain.event_page (#4118, bounded pages of
-        # stored event rows) are included in the count; git contributes
-        # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
-        # git.update_ref / git.push (four thin write verbs shelling to system git
-        # with hardened argv construction); code contributes three registered-map
-        # read verbs (`code.list`, `code.search`, `code.deps`, ADR-139) plus
-        # `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
-        # L1.5 import-scan tiers; its `finding` note kind and
-        # `findings.json` batch ingest remain reachable only via the
-        # `kkernel code-ingest` admin CLI, never this MCP verb surface);
-        # workspace (#873) contributes zero verbs, adding only the
-        # `workspace` entity kind and `contains` endpoint rules; blob
-        # contributes nine verbs (put/get/stat, begin/put_part/commit/abort,
-        # and opt-in import/export; ADR-173)
-        # over the `BlobStore` CAS trait. Import/export refuse until enabled
-        # by [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1; storage
-        # operations require an installed backend.
-        # The kg pack also carries its one documented sub-namespace,
-        # stream.append / stream.batch / stream.read / stream.stat / stream.truncate (ADR-174
-        # §2); git grew from four verbs to seventeen with the dev-loop surface
-        # (checkout, diff, gates, receipts, reconcile, status, log, init,
-        # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
-        # (ADR-088 Amendment 1, the persisted ingest cursor read);
-        # tool contributes fourteen verbs, including tool.policy_delete, and
-        # exec nine (the tool registry with use policy and sandboxed runs over trees);
-        # knowledge contributes knowledge.lint for graph hygiene inspection;
-        # comm contributes comm.withheld_body, the recipient's or maintainer's
-        # read of a withheld external message's original (ADR-200 Amendment 1);
-        # kg contributes apply_changeset, the atomic apply of one canonical
-        # NDJSON change-set; attach records a rendition of a record and
-        # hydrates the selected roles.
-        # Update this number when the pack set or verb surface changes; a
-        # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 160, (
-            f"expected 160 user-facing verbs from the 14 default packs "
-            f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
-            f"context is the 17th kg-substrate bare verb per ADR-089; "
-            f"resolve is the 18th kg-substrate bare verb per the unified-verb "
-            f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
-            f"(caller identity introspection); db_diagnostics is the 20th "
-            f"kg-substrate bare verb (ADR-091 read-only-by-intent operator "
-            f"diagnostics); scan is the kg-substrate bare verb answering the "
-            f"secret gate without a write; comm.health is #606; comm.probe is #644; "
-            f"brain.event_counts is #724/ADR-103; brain.event_page is #4118; git contributes git.digest plus "
-            f"git.commit/git.branch/git.update_ref/git.push (ADR-108 and ADR-182); "
-            f"code contributes code.ingest and three registered-map reads (ADR-139); "
-            f"workspace (#873) contributes zero verbs; "
-            f"blob contributes put/get/stat, begin/put_part/commit/abort per ADR-173, "
-            f"and opt-in import/export; "
-            f"brain.mark_turn is the per-actor work-unit marker; "
-            f"comm.unread lists unread inbound messages; comm.mark_read is the "
-            f"named atomic-capable mark-read surface; comm.delivered confirms "
-            f"the internal inbound sibling after an ambiguous atomic write), "
-            f"kg also carries stream.append/stream.batch/stream.read/stream.stat/stream.truncate "
-            f"(ADR-174); "
-            f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
-            f"and git.ingest_cursor; "
-            f"tool contributes fourteen verbs including tool.policy_delete "
-            f"(ADR-180 Amendment 3), and exec nine; "
-            f"knowledge contributes knowledge.lint; "
-            f"kg contributes attach, which records a rendition of a record and "
-            f"hydrates the selected roles; "
-            f"got {verbs_result['total']}: {verbs_result}"
-        )
+            assert not documented_count_errors, (
+                "published verb/pack counts drifted from the live registry:\n"
+                + "\n".join(f"  - {error}" for error in documented_count_errors)
+            )
+            guide_table_errors = [
+                error
+                for source in ("CLAUDE.md", "AGENTS.md")
+                for error in validate_guide_verb_tables(
+                    Path(__file__).resolve().parent.parent, verbs_result, source=source
+                )
+            ]
+            assert not guide_table_errors, (
+                "published pack verb tables drifted from the live registry:\n"
+                + "\n".join(f"  - {error}" for error in guide_table_errors)
+            )
+            assert verbs_result["total"] == 160, (
+                f"expected 160 user-facing verbs from the documented 14 packs; "
+                f"got {verbs_result['total']}: {verbs_result}"
+            )
+        else:
+            print("  [not checked] full documentation catalog: run --profile documented")
+        # Fleet exact per-pack catalog/schema equality is a separate required
+        # old/new-artifact comparison; this smoke run does not substitute for it.
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
         assert "gtd.repair" in verb_names, (
             f"'gtd.repair' (ADR-019 Amendment 7) must appear in verbs listing: {verb_names}"
         )
-        assert "tool.policy_delete" in verb_names, (
-            f"'tool.policy_delete' must appear in verbs listing: {verb_names}"
+        assert ("tool.policy_delete" in verb_names) == ("tool" in expected_packs), (
+            f"tool.policy_delete presence must match {profile}: {verb_names}"
         )
         assert "create" in verb_names, f"'create' must appear in verbs listing: {verb_names}"
         assert "stats" in verb_names, f"'stats' must appear in verbs listing: {verb_names}"
         assert "context" in verb_names, f"'context' (ADR-089) must appear in verbs listing: {verb_names}"
-        assert "code.ingest" in verb_names, (
-            f"'code.ingest' (ADR-085 Amendment 2, PR #1039) must appear in verbs listing: {verb_names}"
-        )
-        for code_read_verb in ("code.list", "code.search", "code.deps"):
-            assert code_read_verb in verb_names, (
-                f"'{code_read_verb}' (ADR-139) must appear in verbs listing: {verb_names}"
+        for code_verb in ("code.ingest", "code.list", "code.search", "code.deps"):
+            assert (code_verb in verb_names) == ("code" in expected_packs), (
+                f"{code_verb} presence must match {profile}: {verb_names}"
             )
         assert "comm.delivered" in verb_names, (
             f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
@@ -411,28 +353,29 @@ def main():
         print(
             f"  [ok] verbs — {verbs_result['total']} total verbs across "
             f"{len(verbs_result['pack_counts'])} packs, {kg_verbs['total']} in kg pack; "
-            "published counts match registry"
+            f"profile={profile}"
         )
 
-        # 3b. Code vocabulary load tripwire (khive#848 F6): `finding` is a note
-        # kind declared only by khive-pack-code's NOTE_KIND_SPECS (ADR-085
-        # D4/Amendment 3). A successful create proves the pack's vocabulary is
-        # loaded under default config, independently of its `code.ingest` verb.
-        code_pack_finding = call_verb(proc, "create", {
-            "kind": "note",
-            "note_kind": "finding",
-            "title": "smoke-test tripwire finding",
-            "properties": {"severity": "low", "confidence": "high"},
-        })
-        assert code_pack_finding["kind"] == "finding", (
-            f"expected kind=finding (proves the zero-verb `code` pack is loaded "
-            f"under default config), got: {code_pack_finding}"
-        )
-        assert code_pack_finding["properties"]["kind_status"] == "open", (
-            f"a finding with no producer status must default kind_status to 'open': "
-            f"{code_pack_finding}"
-        )
-        print(f"  [ok] code pack loaded — create(kind=\"finding\") succeeded under default config")
+        if "code" in expected_packs:
+            # 3b. Code vocabulary load tripwire (khive#848 F6): `finding` is a note
+            # kind declared only by khive-pack-code's NOTE_KIND_SPECS (ADR-085
+            # D4/Amendment 3). A successful create proves the pack's vocabulary is
+            # loaded in the selected profile, independently of its `code.ingest` verb.
+            code_pack_finding = call_verb(proc, "create", {
+                "kind": "note",
+                "note_kind": "finding",
+                "title": "smoke-test tripwire finding",
+                "properties": {"severity": "low", "confidence": "high"},
+            })
+            assert code_pack_finding["kind"] == "finding", (
+                f"expected kind=finding (proves the `code` pack is loaded "
+                f"under the selected profile), got: {code_pack_finding}"
+            )
+            assert code_pack_finding["properties"]["kind_status"] == "open", (
+                f"a finding with no producer status must default kind_status to 'open': "
+                f"{code_pack_finding}"
+            )
+            print(f"  [ok] code pack loaded — create(kind=\"finding\") succeeded under the selected profile")
 
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
         #    granular kind at top level — same shape as create/list)
@@ -1504,9 +1447,10 @@ def schedule_smoke():
 
 
 if __name__ == "__main__":
+    args = parse_args()
     failed_sections: list[str] = []
 
-    code = main()
+    code = main(args.profile)
     if code != 0:
         failed_sections.append("kg")
 
@@ -1524,7 +1468,7 @@ if __name__ == "__main__":
             print(f"  [memory FAIL] {e}")
             failed_sections.append("memory")
 
-    if os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
+    if args.profile in {"fleet", "documented"} and os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
         try:
             formal_smoke()
         except Exception as e:

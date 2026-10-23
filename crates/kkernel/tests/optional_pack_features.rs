@@ -3,7 +3,7 @@
 //!
 //! Registry assertions exercise the features compiled into this test binary.
 //! Manifest assertions keep Git and Code default-on and the other packs default-off,
-//! and Kernel-to-MCP forwarding explicit. The operator build enables the three
+//! and Kernel-to-MCP forwarding explicit. The operator build enables the six
 //! default-off packs without switching on MCP defaults through a dev dependency.
 
 use std::collections::BTreeSet;
@@ -16,7 +16,7 @@ use kkernel as _;
 const KKERNEL_MANIFEST: &str = include_str!("../Cargo.toml");
 const KHIVE_MCP_MANIFEST: &str = include_str!("../../khive-mcp/Cargo.toml");
 const MAKEFILE: &str = include_str!("../../../Makefile");
-const DEFAULT_OFF_PACKS: [&str; 3] = ["agent", "telemetry", "web"];
+const DEFAULT_OFF_PACKS: [&str; 6] = ["tool", "exec", "workspace", "agent", "telemetry", "web"];
 
 /// The optional packs, each paired with whether this build links it.
 const OPTIONAL_PACKS: [(&str, bool); 8] = [
@@ -109,7 +109,7 @@ fn a_pack_whose_feature_is_off_is_neither_discovered_nor_selectable() {
 }
 
 #[test]
-fn default_features_leave_the_three_optional_packs_out() {
+fn default_features_leave_the_six_optional_packs_out() {
     for (crate_name, text) in [
         ("kkernel", KKERNEL_MANIFEST),
         ("khive-mcp", KHIVE_MCP_MANIFEST),
@@ -138,7 +138,7 @@ fn default_features_leave_the_three_optional_packs_out() {
 }
 
 #[test]
-fn the_operator_build_links_the_three_optional_packs() {
+fn the_operator_build_explicitly_links_all_eight_optional_packs() {
     let recipe: Vec<&str> = MAKEFILE
         .lines()
         .skip_while(|line| !line.starts_with("build-local:"))
@@ -154,7 +154,7 @@ fn the_operator_build_links_the_three_optional_packs() {
         !features.is_empty(),
         "the build-local recipe names no --features list: {recipe:?}"
     );
-    for name in DEFAULT_OFF_PACKS {
+    for (name, _) in OPTIONAL_PACKS {
         let pack_feature = format!("pack-{name}");
         assert!(
             features.contains(&pack_feature.as_str()),
@@ -292,4 +292,44 @@ fn workspace_is_optional_default_off_and_enables_git() {
     }
     let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
     assert!(feature(&runtime, "pack-workspace").is_empty());
+}
+
+fn expected_automatic_packs() -> Vec<String> {
+    let mut expected: Vec<String> = [
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "blob",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for (pack, enabled) in [
+        ("git", cfg!(feature = "pack-git")),
+        ("code", cfg!(feature = "pack-code")),
+        ("tool", cfg!(feature = "pack-tool")),
+        ("exec", cfg!(feature = "pack-exec")),
+        ("workspace", cfg!(feature = "pack-workspace")),
+    ] {
+        if enabled {
+            expected.push(pack.to_string());
+        }
+    }
+    expected.sort_unstable();
+    expected
+}
+
+#[test]
+fn automatic_selection_matches_the_frontend_profile_contract() {
+    let expected = expected_automatic_packs();
+    let mut actual = RuntimeConfig::built_in_packs();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    PackRegistry::validate_pack_selection(&actual)
+        .expect("automatic selection must contain only linked packs and all prerequisites");
 }

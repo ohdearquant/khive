@@ -322,3 +322,94 @@ fn selected_workspace_has_zero_verbs_and_exact_membership_vocabulary() {
         );
     }
 }
+
+fn expected_automatic_packs() -> Vec<String> {
+    let mut expected: Vec<String> = [
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "blob",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for (pack, enabled) in [
+        ("git", cfg!(feature = "pack-git")),
+        ("code", cfg!(feature = "pack-code")),
+        ("tool", cfg!(feature = "pack-tool")),
+        ("exec", cfg!(feature = "pack-exec")),
+        ("workspace", cfg!(feature = "pack-workspace")),
+    ] {
+        if enabled {
+            expected.push(pack.to_string());
+        }
+    }
+    expected.sort_unstable();
+    expected
+}
+
+#[test]
+fn automatic_selection_matches_the_frontend_profile_contract() {
+    let expected = expected_automatic_packs();
+    let mut actual = RuntimeConfig::built_in_packs();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    PackRegistry::validate_pack_selection(&actual)
+        .expect("automatic selection must contain only linked packs and all prerequisites");
+}
+
+#[test]
+fn discovered_factories_match_the_standalone_mcp_feature_set() {
+    let mut expected = expected_automatic_packs();
+    expected.push("charter".to_string());
+    for (pack, enabled) in [
+        ("agent", cfg!(feature = "pack-agent")),
+        ("telemetry", cfg!(feature = "pack-telemetry")),
+        ("web", cfg!(feature = "pack-web")),
+        ("moodboard", cfg!(feature = "pack-moodboard")),
+    ] {
+        if enabled {
+            expected.push(pack.to_string());
+        }
+    }
+    expected.sort_unstable();
+    let mut actual: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn agent_telemetry_and_web_selection_follow_their_features() {
+    let core = registry(&["kg"]);
+    for (pack, enabled) in [
+        ("agent", cfg!(feature = "pack-agent")),
+        ("telemetry", cfg!(feature = "pack-telemetry")),
+        ("web", cfg!(feature = "pack-web")),
+    ] {
+        assert!(core.pack_verbs(pack).is_none());
+        assert!(core.pack_note_kinds(pack).is_none());
+        assert!(core.pack_entity_kinds(pack).is_none());
+        let selection = vec!["kg".to_string(), pack.to_string()];
+        let result = PackRegistry::validate_pack_selection(&selection);
+        if enabled {
+            result.expect("linked optional pack can be explicitly selected");
+            let selected = registry(&["kg", pack]);
+            assert!(!selected.pack_verbs(pack).expect("selected pack").is_empty());
+        } else {
+            assert_eq!(
+                result
+                    .expect_err("unlinked pack must be refused")
+                    .to_string(),
+                format!("unknown pack {pack:?}")
+            );
+        }
+    }
+}

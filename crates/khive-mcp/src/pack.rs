@@ -8,8 +8,8 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 
 // Force-link pack crates so their `inventory::submit!` constructors are
 // included by the linker. These are the only direct references to the pack
-// crate types inside `khive-mcp`. A pack that is an optional feature (agent,
-// telemetry, web, moodboard) takes a `#[cfg(feature = ...)]` on its line.
+// crate types inside `khive-mcp`. Each optional pack takes a matching
+// `#[cfg(feature = ...)]` on its line.
 #[cfg(feature = "pack-agent")]
 #[doc(hidden)]
 pub use khive_pack_agent::AgentPack as _AgentPack;

@@ -423,8 +423,14 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 16
+    // Nine core packs plus the schema-only Charter and test Template factories.
+    let expected_count = 11
         + [
+            cfg!(feature = "pack-git"),
+            cfg!(feature = "pack-code"),
+            cfg!(feature = "pack-tool"),
+            cfg!(feature = "pack-exec"),
+            cfg!(feature = "pack-workspace"),
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),
             cfg!(feature = "pack-web"),

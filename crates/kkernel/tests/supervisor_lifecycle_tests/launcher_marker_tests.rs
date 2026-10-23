@@ -227,7 +227,7 @@ fn supervisor_missing_pack_dependency_releases_prior_marker() {
     std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
     assert_pack_refusal(
         &fixture,
-        &mut fixture.launch_command_with_packs(&fixture.config, &["git"]),
+        &mut fixture.launch_command_with_packs(&fixture.config, &["gtd"]),
         "requires",
     );
 }

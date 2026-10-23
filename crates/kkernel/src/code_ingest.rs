@@ -798,7 +798,7 @@ mod tests {
     }
 
     impl PacksEnvGuard {
-        fn pin(packs: &[&str]) -> Self {
+        fn pin(packs: &[String]) -> Self {
             let previous = std::env::var_os("KHIVE_PACKS");
             std::env::set_var("KHIVE_PACKS", packs.join(","));
             Self { previous }
@@ -907,7 +907,7 @@ mod tests {
     /// This only decides the pack set when `KHIVE_PACKS` is unset: the
     /// environment variable outranks the file, so gate-path tests pair this
     /// fixture with [`PacksEnvGuard::pin`] on the same list.
-    fn write_test_config_with_packs(dir: &Path, packs: &[&str]) -> PathBuf {
+    fn write_test_config_with_packs(dir: &Path, packs: &[String]) -> PathBuf {
         let path = dir.join("packs-khive-config.toml");
         let list = packs
             .iter()
@@ -1003,44 +1003,9 @@ mod tests {
         path
     }
 
-    /// The full production pack set. Gate-path tests write it into their
-    /// config fixture and pin `KHIVE_PACKS` to it ([`PacksEnvGuard::pin`]),
-    /// because the environment variable outranks the fixture and an ambient
-    /// value naming an unlinked pack would fail registry construction before
-    /// the gate is ever consulted.
-    const ALL_PACKS: &[&str] = &[
-        "kg",
-        "gtd",
-        "memory",
-        "brain",
-        "comm",
-        "schedule",
-        "knowledge",
-        "session",
-        "git",
-        "code",
-        "workspace",
-        "blob",
-        "tool",
-        "exec",
-    ];
-
-    /// The fixture above is a copy of the shipping declaration, and a copy is
-    /// how the set goes stale: when it sat two packs behind, every gate-path
-    /// test in this module ran against a registry smaller than the one that
-    /// ships, and nothing said so. This fails the day they diverge again.
-    #[test]
-    fn all_packs_fixture_matches_the_shipping_declaration() {
-        let mut fixture: Vec<String> = ALL_PACKS.iter().map(|p| p.to_string()).collect();
-        let mut declared = khive_runtime::RuntimeConfig::built_in_packs();
-        fixture.sort();
-        declared.sort();
-        assert_eq!(
-            fixture, declared,
-            "ALL_PACKS must equal RuntimeConfig::built_in_packs(); add the pack to the \
-             declaration and this fixture together, or derive the fixture from it"
-        );
-    }
+    // Gate fixtures derive the active compiled profile and pin KHIVE_PACKS to
+    // the same selection as their config file. Independent frontend profile
+    // tests check the promised core/default pack sets.
 
     #[derive(Debug, Default)]
     struct DenyFindingsIngestGate {
@@ -1156,7 +1121,7 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
-        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let config = write_test_config_with_packs(tmp.path(), &RuntimeConfig::built_in_packs());
         let db = tmp.path().join("hermetic.db");
         let resolve = || {
             resolve_runtime_config(RuntimeConfigInputs {
@@ -1172,14 +1137,14 @@ mod tests {
             .expect("resolve runtime config")
             .packs
         };
-        let expected: Vec<String> = ALL_PACKS.iter().map(|p| p.to_string()).collect();
+        let expected = RuntimeConfig::built_in_packs();
 
         let previous = std::env::var_os("KHIVE_PACKS");
         std::env::set_var("KHIVE_PACKS", "kg,formal");
         // Control: the ambient value steers resolution past the fixture.
         assert_eq!(resolve(), vec!["kg".to_string(), "formal".to_string()]);
         {
-            let _packs = PacksEnvGuard::pin(ALL_PACKS);
+            let _packs = PacksEnvGuard::pin(&RuntimeConfig::built_in_packs());
             assert_eq!(
                 resolve(),
                 expected,
@@ -1205,10 +1170,10 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
-        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let _packs = PacksEnvGuard::pin(&RuntimeConfig::built_in_packs());
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-denied.db");
-        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let config = write_test_config_with_packs(tmp.path(), &RuntimeConfig::built_in_packs());
         let gate = Arc::new(DenyFindingsIngestGate::default());
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
@@ -1281,10 +1246,10 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
-        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let _packs = PacksEnvGuard::pin(&RuntimeConfig::built_in_packs());
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-allowed.db");
-        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let config = write_test_config_with_packs(tmp.path(), &RuntimeConfig::built_in_packs());
         let gate = Arc::new(AllowFindingsIngestGate);
 
         let report = super::code_ingest_batch_with_provider_setup(
@@ -1315,10 +1280,10 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
-        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let _packs = PacksEnvGuard::pin(&RuntimeConfig::built_in_packs());
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-errored.db");
-        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let config = write_test_config_with_packs(tmp.path(), &RuntimeConfig::built_in_packs());
         let gate = Arc::new(ErroringFindingsIngestGate);
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);

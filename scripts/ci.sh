@@ -496,14 +496,11 @@ phase_release() {
     scope_skips kkernel && return 0
     KKERNEL_BINARY="$(kkernel_binary_path)"
     export KKERNEL_BINARY
-    # pack-formal is an optional dependency, so a default build does not link it.
-    # smoke_test.py's formal section spawns the binary with `--pack formal` to
-    # cover the pack's additive EntityOfType endpoint rules, and an unlinked pack
-    # is UnknownPack at startup, not a skip. Link it here so that coverage
-    # survives. pack-moodboard is deliberately NOT linked: it registers verbs,
-    # and test_documented_verb_counts.py asserts the verb surface in this same
-    # phase.
-    cargo build --workspace --release --features kkernel/pack-formal
+    # The documented smoke profile preserves the historical fourteen-pack
+    # catalog and its documentation checks. Link its five optional packs plus
+    # Formal for the separate endpoint probe; Moodboard remains outside this
+    # profile. Core/default/fleet artifact gates are exercised independently.
+    cargo build --workspace --release --features kkernel/pack-git,kkernel/pack-code,kkernel/pack-tool,kkernel/pack-exec,kkernel/pack-workspace,kkernel/pack-formal
 }
 
 phase_contract_tests() {
@@ -522,7 +519,7 @@ phase_smoke_tests() {
     echo "=== Smoke Test ==="
     scope_skips kkernel && return 0
     python3 "$SCRIPT_DIR/../tests/test_documented_verb_counts.py"
-    python3 "$SCRIPT_DIR/../tests/smoke_test.py"
+    python3 "$SCRIPT_DIR/../tests/smoke_test.py" --profile documented
     python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
     python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
     python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"

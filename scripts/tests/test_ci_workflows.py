@@ -1380,6 +1380,30 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
                 return word
         return None
 
+    @staticmethod
+    def is_frontend_profile_command(commands, index):
+        # Only this known function/caller context expands "$@" into feature flags.
+        # Unknown parameterized commands still go through the fixed-filter guard.
+        return (
+            commands[index] == 'if cargo test -p "$package" "$@" --locked --test optional_pack_features 2>&1 | tee "$profile_log" &&'
+            and commands[:5] == [
+                "set -euo pipefail", "status=0", "run_profile() {",
+                "local package=$1 profile=$2", "shift 2",
+            ]
+            and commands[index - 1:index + 2:2] == [
+                'local profile_log="$RUNNER_TEMP/pack-profile-$package-$profile.log"',
+                '../scripts/assert-tests-ran.sh "$profile_log" 1; then',
+            ]
+            and commands[-8:] == [
+                "for package in kkernel khive-mcp; do",
+                'run_profile "$package" core --no-default-features',
+                'run_profile "$package" default',
+                "for feature in pack-git pack-code pack-tool pack-exec pack-workspace pack-agent pack-telemetry pack-web; do",
+                'run_profile "$package" "$feature" --no-default-features --features "$feature"',
+                "done", "done", 'exit "$status"',
+            ]
+        )
+
     @classmethod
     def filtered_steps(cls, workflow: str):
         # Match the repository's indented run scalars, then let shlex distinguish
@@ -1422,6 +1446,8 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
             for command_index, command in enumerate(commands):
                 name = cls.name_filter(command)
                 if name is None:
+                    continue
+                if name == "$@" and cls.is_frontend_profile_command(commands, command_index):
                     continue
                 start = index
                 step_indent = indent - 2
@@ -1502,6 +1528,27 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
             ),
             "module::test",
         )
+
+    def test_parameterized_profile_exception_requires_exact_command_and_context(self):
+        workflow = workflow_text("ci.yml")
+        self.assertEqual(self.name_filter('cargo test -p "$package" "$@"'), "$@")
+        self.assertFalse(any(site[1] == "$@" for site in self.filtered_steps(workflow)))
+        for before, after in (
+            ('--test optional_pack_features 2>&1 | tee "$profile_log"',
+             '--test optional_pack_features new_filter 2>&1 | tee "$profile_log"'),
+            ("shift 2", "shift 1"),
+            ('run_profile "$package" default', 'run_profile "$package" default new_filter'),
+            ('../scripts/assert-tests-ran.sh "$profile_log" 1; then', 'true; then'),
+        ):
+            with self.subTest(change=after):
+                self.assertEqual(workflow.count(before), 1)
+                sites = [site for site in self.filtered_steps(workflow.replace(before, after))
+                         if site[1] == "$@"]
+                self.assertEqual(len(sites), 1)
+                with self.assertRaises(AssertionError):
+                    self.assert_guarded(sites[0])
+        bare = 'jobs:\n  example:\n    steps:\n      - run: cargo test -p "$package" "$@"\n'
+        self.assertEqual([site[1] for site in self.filtered_steps(bare)], ["$@"])
 
     def test_discovery_cannot_skip_cargo_in_block_scalars(self):
         prefix = "jobs:\n  example:\n    steps:\n      - name: Filtered suite\n"
@@ -1894,40 +1941,45 @@ class HarnessEnvironmentTests(unittest.TestCase):
         self.assertEqual(child["PRESERVED"], "yes")
         self.assertEqual(child["KHIVE_NO_DAEMON"], "1")
         self.assertTrue(pathlib.Path(child["HOME"]).is_dir())
-        # The smoke default pack set is read from `RuntimeConfig::built_in_packs`,
-        # so a list typed here would be a third copy of the declaration and would
-        # go stale the day a pack lands. Re-derive it independently instead: parse
-        # the declaration with a different expression than the helper uses, and
-        # require a core floor so a parse that silently yields nothing fails here.
-        declaration = (
-            REPO_ROOT / "crates" / "khive-runtime" / "src" / "config.rs"
-        ).read_text()
-        body = declaration.split("pub fn built_in_packs() -> Vec<String> {", 1)[1]
-        body = body.split("]", 1)[0]
-        declared = {
-            token
-            for token in body.split('"')[1::2]
-            if token and all(c.isalpha() or c == "_" for c in token)
-        }
-        self.assertLessEqual({"kg", "gtd", "comm", "memory", "workspace"}, declared)
-        self.assertEqual(set(self.smoke.DEFAULT_PACKS), declared)
+
+    def test_smoke_profiles_are_explicit_contracts(self):
+        core = {"kg", "comm", "knowledge", "gtd", "brain", "memory", "session", "schedule", "blob"}
+        default = core | {"git", "code"}
+        documented = default | {"tool", "exec", "workspace"}
+        fleet = documented | {"formal", "moodboard", "agent", "telemetry", "web"}
+        expected = {"core": core, "default": default, "documented": documented, "fleet": fleet}
+        self.assertEqual(set(self.smoke.PROFILE_PACKS), set(expected))
+        for profile, packs in expected.items():
+            with self.subTest(profile=profile):
+                self.assertEqual(set(self.smoke.PROFILE_PACKS[profile]), packs)
+                self.assertEqual(self.smoke.parse_args(["--profile", profile]).profile, profile)
+                args = self.smoke.smoke_profile_args(profile)
+                if profile in {"core", "default"}:
+                    self.assertEqual(args, [], "must test omitted pack selection")
+                else:
+                    self.assertEqual(args[::2], ["--pack"] * len(packs))
+                    self.assertEqual(set(args[1::2]), packs)
+                    self.assertEqual(len(args[1::2]), len(packs))
 
     def test_no_new_hand_typed_copy_of_the_shipping_pack_set(self):
-        """The shipping pack set had four copies. One was replaced by a read of
-        the declaration, one reddened this suite two packs behind, one silently
-        shrank a gate fixture's registry, and one is a revision-pinned census
-        manifest. A fifth copy would be found by the next outage, so this fails
-        the moment a file outside the allow-list starts naming the set.
+        """Reject accidental pack-list copies outside documented contract fixtures.
 
-        Allow-list entries are not exemptions from being correct: each one
-        states why it is allowed to carry the names, and three of them assert
-        against the declaration in their own suite.
+        Profile oracles deliberately name expected packs independently of the
+        runtime implementation. Historical census fixtures retain their pinned
+        population. Every allowed copy needs an explicit purpose below.
         """
         allowed = {
             # The declaration itself.
             "crates/khive-runtime/src/config.rs",
-            # Gate fixture; its own unit test asserts equality with the declaration.
+            # Gate fixtures derive their active selection from the declaration.
             "crates/kkernel/src/code_ingest.rs",
+            # Explicit smoke profile oracles checked against real artifact output.
+            "tests/smoke_test.py",
+            # Historical population pin plus active-feature projection; never rewrite history.
+            "crates/khive-runtime/tests/adr133_writer_census.rs",
+            # Frontend profile contracts must detect an incorrect runtime default list.
+            "crates/kkernel/tests/optional_pack_features.rs",
+            "crates/khive-mcp/tests/optional_pack_features.rs",
             # Revision-pinned census manifests, regenerated by scripts/writer_census.py.
             "scripts/data/writer-census-v1.json",
             "crates/khive-runtime/tests/data/adr133-writer-census.json",
@@ -1976,9 +2028,8 @@ class HarnessEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             [],
             offenders,
-            "a new hand-typed copy of the shipping pack set appeared; read it from "
-            "RuntimeConfig::built_in_packs() instead, or add the path to the allow-list "
-            "above with the reason it is allowed to carry the names",
+            "a new hand-typed pack set appeared; use the runtime declaration for consumers, "
+            "or document an independent profile oracle/historical fixture in the allow-list",
         )
 
     def test_full_ci_reports_failed_and_skipped_phases(self):
@@ -2334,6 +2385,124 @@ class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
         needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
         self.assertIn("msrv-check", needs, "the needs list was read")
         self.assertIn("core-only", needs)
+
+
+class FrontendPackProfileWorkflowTests(unittest.TestCase):
+    FEATURES = (
+        "pack-git", "pack-code", "pack-tool", "pack-exec", "pack-workspace",
+        "pack-agent", "pack-telemetry", "pack-web",
+    )
+
+    def profile_script(self):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        step = step_block(job, "Independently build and test frontend pack profiles")
+        self.assertIn("if: ${{ !cancelled() }}", step)
+        self.assertRegex(step, r"(?m)^\s+shell: bash$")
+        self.assertNotRegex(step, r"continue-on-error:\s*(?:true|\$)")
+        return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+    def expected_profiles(self):
+        return [(package, profile, flags)
+                for package in ("kkernel", "khive-mcp")
+                for profile, flags in [
+                    ("core", ["--no-default-features"]), ("default", []),
+                    *((feature, ["--no-default-features", "--features", feature])
+                      for feature in self.FEATURES),
+                ]]
+
+    def run_profiles(self, failure="none", *, script=None):
+        if script is None:
+            script = self.profile_script()
+        with tempfile.TemporaryDirectory(prefix="frontend-profiles-") as directory:
+            root = pathlib.Path(directory)
+            calls, summary = root / "calls.jsonl", root / "summary"
+            cargo = root / "cargo"
+            cargo.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                import json, os, sys
+                args = sys.argv[1:]
+                with open(os.environ["PROFILE_CALLS"], "a") as log:
+                    log.write(json.dumps(args) + "\\n")
+                package = args[args.index("-p") + 1]
+                feature = args[args.index("--features") + 1] if "--features" in args else None
+                selected = package == "kkernel" and feature == "pack-tool"
+                failure = os.environ["PROFILE_FAILURE"] if selected else "none"
+                if args[0] == "check":
+                    sys.exit(19 if failure == "check" else 0)
+                if args[0] != "test":
+                    sys.exit(97)
+                count = 0 if failure == "zero" else 2
+                print(f"test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")
+                sys.exit(23 if failure == "test" else 0)
+                """))
+            tee = root / "tee"
+            tee.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                import os, pathlib, sys
+                data = sys.stdin.buffer.read()
+                path = pathlib.Path(sys.argv[1])
+                path.write_bytes(data)
+                sys.stdout.buffer.write(data)
+                sys.exit(29 if os.environ["PROFILE_FAILURE"] == "tee" and
+                         path.name == "pack-profile-kkernel-pack-tool.log" else 0)
+                """))
+            cargo.chmod(0o700)
+            tee.chmod(0o700)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in {"BASH_ENV", "ENV"} and not key.startswith("BASH_FUNC_")}
+            env.update(PATH=str(root) + os.pathsep + env.get("PATH", ""),
+                       PROFILE_CALLS=str(calls), PROFILE_FAILURE=failure,
+                       RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(summary))
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                cwd=REPO_ROOT / "crates", env=env, text=True, capture_output=True,
+                timeout=30, check=False,
+            )
+            invocations = [json.loads(line) for line in calls.read_text().splitlines()]
+            expected = []
+            for package, _, flags in self.expected_profiles():
+                expected.extend([
+                    ["check", "-p", package, *flags, "--all-targets", "--locked"],
+                    ["test", "-p", package, *flags, "--locked", "--test", "optional_pack_features"],
+                ])
+            self.assertEqual(len(invocations), 40, result.stdout + result.stderr)
+            self.assertEqual(invocations, expected, "each frontend/profile is isolated")
+            rows = summary.read_text().splitlines()
+            self.assertEqual(len(rows), 20)
+            return result, rows
+
+    def assert_outcomes(self, result, rows, failure):
+        self.assertEqual(result.returncode, 0 if failure == "none" else 1,
+                         result.stdout + result.stderr)
+        expected = []
+        for package, profile, _ in self.expected_profiles():
+            selected = package == "kkernel" and profile == "pack-tool"
+            checked = "failed" if selected and failure == "check" else "passed"
+            tested = "failed" if selected and failure in {"test", "tee", "zero"} else "passed"
+            expected.append(f"{package} {profile}: all-targets={checked} composition={tested}")
+        self.assertEqual(rows, expected, "failures must not skip later profiles")
+
+    def test_all_twenty_profiles_run_both_commands_and_a_nonzero_floor(self):
+        result, rows = self.run_profiles()
+        self.assert_outcomes(result, rows, "none")
+        self.assertEqual(result.stdout.count("counted=2 floor=1"), 20)
+
+    def test_check_test_tee_and_zero_selection_fail_independently_and_continue(self):
+        for failure in ("check", "test", "tee", "zero"):
+            with self.subTest(failure=failure):
+                result, rows = self.run_profiles(failure)
+                self.assert_outcomes(result, rows, failure)
+                if failure == "zero":
+                    self.assertIn("counted=0 floor=1", result.stdout)
+                    self.assertIn("below the required floor", result.stderr)
+
+    def test_removing_the_floor_is_detected_by_the_zero_selection_control(self):
+        script = self.profile_script()
+        floor = ' &&\n    ../scripts/assert-tests-ran.sh "$profile_log" 1; then'
+        self.assertEqual(script.count(floor), 1)
+        mutant = script.replace(floor, "; then")
+        result, rows = self.run_profiles("zero", script=mutant)
+        self.assert_outcomes(result, rows, "none")
+        with self.assertRaises(AssertionError):
+            self.assert_outcomes(result, rows, "zero")
 
 
 class HistoricalReplayWorkflowTests(unittest.TestCase):

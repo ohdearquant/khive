@@ -2,7 +2,7 @@
 //!
 //! Verifies the mechanism the full census depends on rather than the full
 //! 100-verb population: the manifest is pinned to a source revision and to
-//! the exact built-in pack set, and the scanner is fail-closed — absence of
+//! its historical fourteen-pack population, and the scanner is fail-closed — absence of
 //! evidence for a write classifies `UNKNOWN`, never `NO-WRITER` — proved by
 //! re-deriving the classification from live source at test time rather than
 //! trusting the manifest's own claim.
@@ -51,6 +51,25 @@ enum Classification {
 /// slice built from) exactly: the committed manifest is only meaningful
 /// against the exact source it describes, not "close enough".
 const PINNED_BASE_REVISION: &str = "9b53aaff2f2260e68c0a0cbe2eeace77cb087a8e";
+
+// This is the population classified at PINNED_BASE_REVISION, not the current
+// deployment's automatic selection. Preserve it when pack defaults change.
+const HISTORICAL_PACK_SET: [&str; 14] = [
+    "kg",
+    "gtd",
+    "memory",
+    "brain",
+    "comm",
+    "schedule",
+    "knowledge",
+    "session",
+    "git",
+    "code",
+    "workspace",
+    "blob",
+    "tool",
+    "exec",
+];
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")))
@@ -102,13 +121,12 @@ fn writer_census_is_revision_and_pack_pinned() {
 
     let mut manifest_pack_set = manifest.pack_set.clone();
     manifest_pack_set.sort();
-    let mut live_pack_set = khive_runtime::RuntimeConfig::built_in_packs();
-    live_pack_set.sort();
+    let mut historical_pack_set = HISTORICAL_PACK_SET.map(str::to_owned).to_vec();
+    historical_pack_set.sort();
     assert_eq!(
-        manifest_pack_set, live_pack_set,
-        "the manifest's pinned pack set must equal the live built-in pack set exactly — \
-         population is deployment-dependent (ADR-133), so a mismatch here means the manifest \
-         describes a different server than the one under test"
+        manifest_pack_set, historical_pack_set,
+        "the manifest must retain the exact population classified at its pinned revision; \
+         changing a deployment profile does not reclassify historical evidence"
     );
 
     assert_eq!(
@@ -131,6 +149,32 @@ fn writer_census_is_revision_and_pack_pinned() {
             entry.classification
         );
     }
+}
+
+#[test]
+fn writer_census_active_profile_projects_historical_population() {
+    // Only the active population is projected. The manifest entries and their
+    // classifications still describe the exact historical fourteen-pack set.
+    let mut projected: Vec<String> = HISTORICAL_PACK_SET
+        .into_iter()
+        .filter(|pack| match *pack {
+            "git" => cfg!(feature = "pack-git"),
+            "code" => cfg!(feature = "pack-code"),
+            "tool" => cfg!(feature = "pack-tool"),
+            "exec" => cfg!(feature = "pack-exec"),
+            "workspace" => cfg!(feature = "pack-workspace"),
+            _ => true,
+        })
+        .map(str::to_owned)
+        .collect();
+    projected.sort();
+    let mut live_pack_set = khive_runtime::RuntimeConfig::built_in_packs();
+    live_pack_set.sort();
+    assert_eq!(
+        live_pack_set, projected,
+        "the active automatic profile must exactly project the historical population \
+         through the five runtime feature markers"
+    );
 }
 
 #[test]
