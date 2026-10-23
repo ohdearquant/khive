@@ -204,3 +204,59 @@ exposing the primitive; final call is the reviewer's.
 - ADR-014 — curation operations (merge) and the data-vs-view currency rule.
 - ADR-018 — the authorization Gate; redirect resolution must authorize on the effective target `K`.
 - ADR-055 — epistemic edges and edge annotation, the practice a re-minted edge id would orphan.
+
+## Amendment 1 (2026-10-23) -- part (a) as implemented, and the part (b) collision rule
+
+**Status**: Proposed 2026-10-23. This amendment requires specification approval. It records part (a) as implemented
+and leaves part (b) Proposed.
+
+**Addresses**: [#5570](https://github.com/ohdearquant/khive/issues/5570).
+
+Line references are to `dev/khive` at `698d5812`.
+
+### Decision 1 -- part (a) is implemented
+
+Part (a) is implemented by commit `030edd70a` (2026-09-25, closing #1485). `get` and `resolve` follow a merged
+entity's redirect chain to the first live entity (`crates/khive-pack-kg/src/handlers/redirect.rs:21-60`), with the
+cycle guard and the 32-hop bound named by the base text (`redirect.rs:7, 31-34, 47-50`). The resolution arm is the
+explicit one: a followed read carries a `redirected_from` marker, and a read of a live id carries none
+(`crates/khive-pack-kg/src/handlers/get.rs:179-190`). Authorization on the effective entity is a second Gate
+consultation on the kept id, `authorize_effective_kg_read`, which records its own audit row and leaves the public
+`GateRequest` shape unchanged (`crates/khive-runtime/src/pack/registry_access.rs:100-106`). No ADR-018 amendment is
+needed for it. The open-fork language at lines 85, 91-96 and 140 is settled by this choice.
+
+`include_deleted=true` returns the tombstone without following it on `get`. `resolve` has no `include_deleted`
+parameter, so the opt-out described at lines 69-71 applies to `get` only.
+
+### Decision 2 -- corrections to Context and Scope
+
+- Lines 22-25 describe the read path before part (a). After `030edd70a`, `get` and `resolve` follow the redirect.
+- Lines 34-36 say `update` never changes an edge's endpoints. The input surface has no endpoint parameters, but an
+  `update` on a symmetric edge rewrites its canonical source and target under the same id
+  (`crates/khive-runtime/src/operations/edge_query.rs:893-900`), and on a canonical collision it deletes the
+  addressed edge. Part (b) does not change that path. Whether the fail-loud collision rule of part (b) should also
+  govern the public symmetric update is left open; changing it changes shipped behaviour and needs its own decision.
+- Lines 102-103 say `neighbors` and `traverse` rooted at a tombstoned id return an empty result. `traverse` with the
+  default `include_roots=true` returns one root-only path naming the tombstoned id
+  (`crates/khive-db/src/stores/graph/traversal.rs:145-150`); only `include_roots=false` returns an empty result.
+- The "data-vs-view currency rule" cited at lines 48, 151 and 204 is ADR-014's "Data vs view" curation guardrail.
+
+### Decision 3 -- the part (b) primitive
+
+Part (b) stays Proposed. Its collision check is the edge table's unique key, `(namespace, source_id, target_id,
+relation)` (`crates/khive-db/sql/schema.sql:224`), so a tombstoned row with the same triple in the edge's namespace
+is a collision. The move runs in one transaction. Endpoint re-validation reuses `validate_edge_relation_endpoints`
+(`crates/khive-runtime/src/operations/link_ops.rs:47-58`), which also refuses a self-loop, and the primitive's
+acceptance tests include a self-loop refusal.
+
+Whether a kg verb exposes the move (#4918), and its name, parameters, return value and write class, is not decided by
+this record and needs its own decision.
+
+### Acceptance
+
+| ID   | Statement                                                                                                 | Evidence                                                                                                             |
+| ---- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| A1.1 | A merged entity read by `get` or `resolve` returns the kept entity with `redirected_from`.                | `get_and_resolve_follow_merged_entity_with_explicit_marker` (`crates/khive-pack-kg/src/handlers/tests.rs:3125`)      |
+| A1.2 | A Gate deny on the kept id denies the followed read and writes one denied audit row on the kept id.       | `redirected_reads_recheck_the_effective_id_and_audit_the_denial` (`crates/khive-pack-kg/src/handlers/tests.rs:3543`) |
+| A1.3 | A part (b) move onto a triple held by a tombstoned row in the same namespace refuses and mutates nothing. | test owed with the primitive                                                                                         |
+| A1.4 | A part (b) move that would create a self-loop refuses through `validate_edge_relation_endpoints`.         | test owed with the primitive                                                                                         |
