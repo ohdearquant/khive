@@ -83,5 +83,6 @@ mod _pack_links {
     use khive_pack_tool::ToolPack as _;
     #[cfg(feature = "pack-web")]
     use khive_pack_web::WebPack as _;
+    #[cfg(feature = "pack-workspace")]
     use khive_pack_workspace::WorkspacePack as _;
 }

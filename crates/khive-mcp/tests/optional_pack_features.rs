@@ -235,3 +235,90 @@ fn a_selected_exec_pack_exposes_its_real_handlers() {
     }
     assert!(registry.has_verb("tool.check"));
 }
+
+#[test]
+fn workspace_factory_and_explicit_selection_follow_the_feature() {
+    assert_eq!(
+        PackRegistry::discovered_names().contains(&"workspace"),
+        cfg!(feature = "pack-workspace")
+    );
+    let mut selection = vec!["kg".to_string(), "workspace".to_string()];
+    if cfg!(feature = "pack-workspace") {
+        assert!(cfg!(feature = "pack-git"));
+        selection.extend(["git".to_string(), "gtd".to_string(), "session".to_string()]);
+    }
+    let result = PackRegistry::validate_pack_selection(&selection);
+    if cfg!(feature = "pack-workspace") {
+        result.expect("Workspace can be selected with its explicit prerequisites");
+    } else {
+        assert_eq!(
+            result.expect_err("Workspace is unavailable").to_string(),
+            "unknown pack \"workspace\""
+        );
+    }
+}
+
+#[test]
+fn an_unselected_workspace_pack_contributes_no_vocabulary_or_endpoints() {
+    let registry = registry(&["kg"]);
+    assert_eq!(registry.pack_names(), vec!["kg"]);
+    assert!(registry.pack_verbs("workspace").is_none());
+    assert!(registry.pack_entity_kinds("workspace").is_none());
+    assert!(!registry.all_entity_kinds().contains(&"workspace"));
+    assert!(registry
+        .all_edge_rules_with_packs()
+        .iter()
+        .all(|(pack, _)| *pack != "workspace"));
+}
+
+#[cfg(feature = "pack-workspace")]
+#[test]
+fn selected_workspace_still_requires_explicit_git_selection() {
+    let selection = ["kg", "gtd", "session", "workspace"].map(str::to_string);
+    let error = PackRegistry::validate_pack_selection(&selection)
+        .expect_err("compiled Git must not be selected implicitly");
+    assert!(
+        matches!(error, khive_runtime::PackLoadError::MissingDependency { pack, dep }
+            if pack == "workspace" && dep == "git")
+    );
+}
+
+#[cfg(feature = "pack-workspace")]
+#[test]
+fn selected_workspace_has_zero_verbs_and_exact_membership_vocabulary() {
+    use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind};
+
+    let registry = registry(&["kg", "git", "gtd", "session", "workspace"]);
+    let mut names = registry.pack_names();
+    names.sort_unstable();
+    assert_eq!(names, vec!["git", "gtd", "kg", "session", "workspace"]);
+    assert!(registry
+        .pack_verbs("workspace")
+        .expect("selected Workspace pack")
+        .is_empty());
+    assert_eq!(
+        registry.pack_entity_kinds("workspace").unwrap(),
+        &["workspace"]
+    );
+    assert!(registry.all_entity_kinds().contains(&"workspace"));
+    assert!(registry
+        .all_handlers_with_names()
+        .iter()
+        .all(|(pack, _)| *pack != "workspace"));
+    let rules: Vec<_> = registry
+        .all_edge_rules_with_packs()
+        .into_iter()
+        .filter_map(|(pack, rule)| (pack == "workspace").then_some(rule))
+        .collect();
+    assert_eq!(rules.len(), 5);
+    for target in ["issue", "pull_request", "commit", "task", "session"] {
+        assert!(
+            rules.contains(&EdgeEndpointRule {
+                relation: EdgeRelation::Contains,
+                source: EndpointKind::EntityOfKind("workspace"),
+                target: EndpointKind::NoteOfKind(target),
+            }),
+            "missing workspace contains {target}"
+        );
+    }
+}

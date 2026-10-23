@@ -51,6 +51,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_template::TemplatePack>(),
         #[cfg(feature = "pack-tool")]
         declared::<khive_pack_tool::ToolPack>(),
+        #[cfg(feature = "pack-workspace")]
         declared::<khive_pack_workspace::WorkspacePack>(),
     ];
     #[cfg(feature = "pack-agent")]

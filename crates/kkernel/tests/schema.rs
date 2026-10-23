@@ -190,6 +190,36 @@ async fn default_schema_is_complete_attributed_and_does_not_write_domain_rows() 
     if !cfg!(feature = "pack-code") {
         assert!(rows.iter().all(|row| row["origin"] != "pack:code"));
     }
+    assert_eq!(
+        value["entity_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workspace")),
+        cfg!(feature = "pack-workspace")
+    );
+    let workspace_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row["origin"] == "pack:workspace")
+        .collect();
+    assert_eq!(
+        workspace_rows.len(),
+        if cfg!(feature = "pack-workspace") {
+            5
+        } else {
+            0
+        }
+    );
+    if cfg!(feature = "pack-workspace") {
+        for target in ["issue", "pull_request", "commit", "task", "session"] {
+            assert!(
+                rows.contains(&json!({
+                    "source": "workspace", "source_substrate": "entity", "relation": "contains",
+                    "target": target, "target_substrate": "note", "origin": "pack:workspace"
+                })),
+                "missing workspace contains {target}"
+            );
+        }
+    }
     assert!(rows
         .iter()
         .filter(|row| row["origin"] == "base")

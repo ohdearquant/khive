@@ -41,6 +41,7 @@ use khive_pack_telemetry::TelemetryPack;
 use khive_pack_tool::ToolPack;
 #[cfg(feature = "pack-web")]
 use khive_pack_web::WebPack;
+#[cfg(feature = "pack-workspace")]
 use khive_pack_workspace::WorkspacePack;
 use khive_runtime::pack::{PackRegistry, PackRuntime};
 use khive_runtime::{
@@ -222,6 +223,7 @@ fn linked_packs() -> Vec<Checked> {
         checked(&SessionPack::new(rt.clone())),
         #[cfg(feature = "pack-tool")]
         checked(&ToolPack::new(rt.clone())),
+        #[cfg(feature = "pack-workspace")]
         checked(&WorkspacePack::new(rt.clone())),
     ];
     #[cfg(feature = "pack-agent")]

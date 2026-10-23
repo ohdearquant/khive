@@ -110,6 +110,7 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("session", khive_pack_session::SessionPack::HANDLERS),
         #[cfg(feature = "pack-tool")]
         ("tool", khive_pack_tool::ToolPack::HANDLERS),
+        #[cfg(feature = "pack-workspace")]
         ("workspace", khive_pack_workspace::WorkspacePack::HANDLERS),
     ];
     #[cfg(feature = "pack-agent")]

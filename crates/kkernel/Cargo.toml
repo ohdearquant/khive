@@ -44,7 +44,7 @@ khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec", optional = 
 khive-pack-git = { version = "0.14.0", path = "../khive-pack-git", optional = true }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.14.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace" }
+khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace", optional = true }
 khive-pack-charter = { version = "0.14.0", path = "../khive-pack-charter" }
 khive-request = { version = "0.14.0", path = "../khive-request" }
 khive-changeset = { version = "0.14.0", path = "../khive-changeset" }
@@ -106,6 +106,8 @@ pack-code = ["dep:khive-pack-code", "khive-mcp/pack-code"]
 pack-tool = ["dep:khive-pack-tool", "khive-mcp/pack-tool"]
 # Exec is optional and also links its Tool prerequisite.
 pack-exec = ["dep:khive-pack-exec", "khive-mcp/pack-exec", "pack-tool"]
+# Workspace is optional and also links its Git prerequisite.
+pack-workspace = ["dep:khive-pack-workspace", "khive-mcp/pack-workspace", "pack-git"]
 # Pass-through, plus links kkernel's own force-link reference: enables the agent
 # pack. A build without it does not link or register the pack, so it is absent
 # from the pack list the server reports and `--pack agent` is an unknown pack.

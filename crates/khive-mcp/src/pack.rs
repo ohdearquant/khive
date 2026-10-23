@@ -54,5 +54,6 @@ pub use khive_pack_tool::ToolPack as _ToolPack;
 #[cfg(feature = "pack-web")]
 #[doc(hidden)]
 pub use khive_pack_web::WebPack as _WebPack;
+#[cfg(feature = "pack-workspace")]
 #[doc(hidden)]
 pub use khive_pack_workspace::WorkspacePack as _WorkspacePack;

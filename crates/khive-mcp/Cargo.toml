@@ -41,7 +41,7 @@ khive-pack-web = { version = "0.14.0", path = "../khive-pack-web", optional = tr
 khive-pack-telemetry = { version = "0.14.0", path = "../khive-pack-telemetry", optional = true }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.14.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace" }
+khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace", optional = true }
 khive-pack-charter = { version = "0.14.0", path = "../khive-pack-charter" }
 uuid = { workspace = true }
 inventory = { workspace = true }
@@ -77,6 +77,8 @@ pack-code = ["dep:khive-pack-code", "khive-runtime/pack-code"]
 pack-tool = ["dep:khive-pack-tool", "khive-runtime/pack-tool"]
 # Exec is optional and also links its Tool prerequisite.
 pack-exec = ["dep:khive-pack-exec", "khive-runtime/pack-exec", "pack-tool"]
+# Workspace is optional and also links its Git prerequisite.
+pack-workspace = ["dep:khive-pack-workspace", "khive-runtime/pack-workspace", "pack-git"]
 # pack-agent, pack-telemetry, pack-web: link the agent, telemetry and web packs.
 # Without one of them the pack is neither linked nor registered, so it is absent
 # from the pack list the server reports and selecting it is refused as unknown.

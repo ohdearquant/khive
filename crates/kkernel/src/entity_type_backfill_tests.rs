@@ -271,6 +271,7 @@ fn classifier_resolves_the_selected_git_document_subtype() {
 /// line from `compose_registry` makes the refusal arm below fail — the
 /// workspace entity's missing `schema_version` update succeeds instead
 /// of being refused, and `expect_err` panics.
+#[cfg(feature = "pack-workspace")]
 #[tokio::test]
 async fn compose_registry_installs_entity_kind_hooks_for_backfill_writes() {
     let runtime = KhiveRuntime::new(RuntimeConfig {
