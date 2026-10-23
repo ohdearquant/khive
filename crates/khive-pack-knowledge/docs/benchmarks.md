@@ -150,7 +150,8 @@ Numbers not yet recorded in this ledger entry; will be added on next full bench 
 
 ## Accepted Regressions
 
-A p50 regression gate of +20% applies to the Criterion `knowledge_bench` scenarios.
+A p50 regression gate of +20% was stated for the Criterion `knowledge_bench` scenarios
+as of v0.2.8. No check enforces it; see the note under Generated workload coverage.
 
 Last reviewed: v0.2.8 (2026-06-08)
 
@@ -314,8 +315,8 @@ in this ledger yet.
 | `knowledge_list/corpus/100`         | 100 atoms                     | median latency | Advisory trend; last recorded value 213.2 µs (`docs/benchmarks.md` v0.2.8) |
 | `knowledge_upsert_atoms/atoms/50`   | 50 atoms                      | median latency | Advisory trend; last recorded value 11.89 ms (`docs/benchmarks.md` v0.2.8) |
 | `knowledge_get/by_slug`             | 1 atom                        | median latency | Advisory trend; last recorded value 29.35 µs (`docs/benchmarks.md` v0.2.8) |
-| `bench_search_scale` (new)          | 10 000 atoms, limit 20        | median latency | Advisory trend against the recorded baseline                               |
-| `bench_index_build` (new)           | 10 000 atoms cold build       | build time     | Advisory trend against the recorded baseline                               |
+| `knowledge_search_scale/atoms10000` | 10 000 atoms, limit 20        | median latency | Advisory trend; baseline pending                                           |
+| `knowledge_index_build`             | 10 000 atoms cold build       | build time     | Advisory trend; baseline pending                                           |
 
 These rows add no deterministic performance bound or automatic percentage gate.
 Historical values are observations. New rolling and fixed-reference comparisons
