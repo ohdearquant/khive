@@ -258,3 +258,72 @@ though their algorithms do not change.
   `pack.rs`, `pack_runtime_tests.rs`, `event_counts_grouping.rs`, `fold.rs`
 - `crates/khive-runtime/src/event_actor_scope.rs`, `event_cursor_walk.rs`,
   `event_page.rs`
+
+## Amendment 1 (2026-10-23) -- implementation base and packaging
+
+**Status**: Proposed 2026-10-23. This amendment requires specification approval. It settles the packaging that the
+base text leaves to review ("Review of this ADR must explicitly settle that packaging before those follow-ups
+proceed") and moves the implementation base forward.
+
+**Addresses**: [#4510](https://github.com/ohdearquant/khive/issues/4510),
+[#4554](https://github.com/ohdearquant/khive/issues/4554).
+
+Line references are to `dev/khive` at `698d5812` unless they name this record.
+
+### Decision 1 -- the implementation base is the current tree
+
+The source baseline `94cc01b1` predates `63e78032e` (#5609), which split `handlers.rs` into submodules under the
+file-size rules of #5605. The `impl BrainPack` block that `handlers.rs` held at the baseline is now
+`crates/khive-pack-brain/src/handlers/brain_handlers.rs:12` (a 2,049-line file), the event count helpers are
+`handlers/event_counts.rs`, and the router is `handlers/router.rs`. The pack's other four `impl BrainPack` blocks are
+in `handlers/auto_feedback.rs`, `handlers/event_page.rs`, `pack.rs` and `section_feedback.rs`, as they were. `handlers.rs`
+keeps the handler table (`handlers.rs:57-757`), the dispatch prelude and the module declarations. #5609 moved code
+verbatim by file size; it does not implement any home in section 1, which stays the plan.
+
+Each move in section 1 starts from the file that holds the code on its implementation base, and the block mapping its
+pull request publishes names that file. #5150 (`978caa14f`) and #5177 (`1ccae15b1`) are merged and are part of the
+base, so the overlap condition in "Rollout and review units" is met. #3709 is closed.
+
+### Decision 2 -- packaging is approved on measured floors
+
+The proposed packaging exceptions are approved:
+
+- B1: the handler table is 701 lines (`handlers.rs:57-757`), so its floor is 1,402 changed lines before wiring. This
+  replaces the 691-line table and 1,382-line floor in the B1 row.
+- B4: `handle_feedback_from` is 549 lines (`handlers/brain_handlers.rs:864-1412`), so the 1,098-line floor in the B4 row
+  holds; the body is now in `brain_handlers.rs`.
+- E1 and E2 land as one `khive-runtime` pull request at their measured size. For that pull request this supersedes the
+  budget of approximately 500 changed lines in #4554.
+
+Each implementation pull request re-measures its floor on its own base and states it beside the `git diff --stat` and
+block mapping the base text requires. The B units land as one `khive-pack-brain` pull request by default; the general
+split rule ("Split a batch where dependencies or unrelated behavior require it") is the only ground for a second, and B4
+is one case of it.
+
+For #4510's "moves only, tests unchanged", the meaning is the one the base text gives: module, import and include-path
+adjustments named in the block mapping are allowed, and no assertion, fixture or negative control changes.
+
+### Decision 3 -- the grouped count is already adopted for window totals
+
+#4554 asks that `brain.event_counts` use a grouped count from khive-db rather than per-group queries. #5150 did this for
+the window totals: `grouped_window_total` and the unfiltered audit and non-audit totals call `count_events_grouped`
+(`handlers/event_counts.rs:40-51, 88-97`). Payload and crossed aggregates keep folding the admitted rows, as section 3
+requires ("Never replace admitted-row payload/cross folds with full-window SQL aggregates"). So #4554's second pull
+request has no grouped-count work left under this record, and E2 moves the grouped totals and the admitted-row folds as
+they are.
+
+### Decision 4 -- corrections
+
+- "Count and page readers share the private `parse_rfc3339_micros` helper": the helper is `pub(super)`
+  (`handlers/event_counts.rs:298`), visible inside `handlers` and not outside it. The reason E2 moves both readers
+  together holds.
+- The References entry for `handlers.rs` also covers `handlers/brain_handlers.rs` and `handlers/event_counts.rs`, which
+  hold the bodies this record moves.
+
+### Acceptance
+
+| ID   | Statement                                                                                                                            | Evidence                       |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
+| A1.1 | The B pull request states the B1 and B4 floors re-measured on its base, with the file each block moves from.                         | the pull request body          |
+| A1.2 | E1 and E2 land as one `khive-runtime` pull request with its diff stat and block mapping.                                             | the pull request body          |
+| A1.3 | After E2, `brain.event_counts` window totals still call `count_events_grouped`, and no brain-side copy of the moved readers remains. | source grep on the merged head |
