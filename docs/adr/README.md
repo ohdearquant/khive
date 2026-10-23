@@ -237,6 +237,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
 | [ADR-208](ADR-208-charter-workflows.md)                                 | Charter Workflows — Declared Topologies over Registered Phrases                                            |
 | [ADR-209](ADR-209-root-policy-overrides-and-flow-history.md)            | Root Policy Overrides, Resource Grants, and Verifiable Flow History                                        |
+| [ADR-211](ADR-211-event-archive-backfill.md)                            | Event Archive Backfill                                                                                     |
+| [ADR-212](ADR-212-expendable-event-retention-class.md)                  | Expendable Event Retention Class                                                                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -364,6 +366,7 @@ Amendments to accepted records:
 
 Amendments inside records whose own status is Proposed:
 
+- [ADR-168 Amendment 3](ADR-168-event-retention-classes.md#amendment-3-2026-10-23----separate-retention-policies-and-reproducible-archive-contracts) (2026-10-23): proposed retention classes for every event kind, including the authority change, refusal and shared audit keys, which stay ineligible for archival until their owning records state a terminal condition; a reader rule for duplicate completion rows; the archive backfill and the expendable class move to ADR-211 and ADR-212.
 - [ADR-205 Amendment 1](ADR-205-dependency-scoped-pull-request-ci.md#amendment-1-scope-integration-branch-pushes-and-narrow-three-full-suite-triggers-2026-10-18) (2026-10-18): proposed scoping of `integration/**` pushes from a fully tested base, and crate manifests, the workspace lockfile and Markdown named only by an inert documentation data file taken off the full-suite triggers, each failing toward the full suite.
 - [ADR-205 Amendment 2](ADR-205-dependency-scoped-pull-request-ci.md#amendment-2-a-dependency-that-appears-or-disappears-and-a-symbolic-link-under-crates-run-the-full-suite-2026-10-19) (2026-10-19): proposed full suite for a crate manifest dependency entry that appears or disappears, for any difference in a lockfile entry outside the workspace, and for a symbolic link under `crates/` in the base or head tree.
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
