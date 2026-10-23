@@ -537,7 +537,7 @@ fn migrated_connection(path: &std::path::Path) -> rusqlite::Connection {
 
 fn insert_marker(conn: &rusqlite::Connection, epoch: u128) -> rusqlite::Result<usize> {
     conn.execute(
-        include_str!("../../sql/authority/epoch-insert.sql"),
+        include_str!("../../sql/authority-epoch-insert.sql"),
         rusqlite::params![
             Uuid::from_u128(epoch).to_string(),
             Uuid::from_u128(epoch + 1000).to_string(),
