@@ -55,6 +55,9 @@ sys.exit(status)
                 executable.write_text(fake)
                 executable.chmod(0o755)
             env = os.environ.copy()
+            # The CI job exports its own TEST_SCOPE; a scope without kkernel would skip the contract-suite phase
+            # under test and exit 0, so the harness runs unscoped whatever the calling job's scope is.
+            env.pop("TEST_SCOPE", None)
             env.update(
                 PATH=str(bin_dir) + os.pathsep + env.get("PATH", ""),
                 HARNESS_FAKE_LOG=str(root / "calls.json"),
