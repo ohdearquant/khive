@@ -579,3 +579,53 @@ crates/khive-pack-kg/src/schema.rs:74-99).
 | A5 | Relation and note-kind counts match their declarations.                                    | `crates/khive-types/src/edge.rs:81-106`; `crates/khive-pack-kg/src/vocab.rs:95-131`; pack declarations in Decision 4.                                                                                                                                                                                                                                                                           |
 | A6 | Literal newline, carriage-return, and tab bytes round-trip; other raw controls fail.       | `crates/khive-request/tests/parser_tests/string_values_tests.rs::multiline_string_value_round_trips`; `tab_and_carriage_return_literal_in_string`; `crates/khive-request/tests/parser_tests/control_characters_tests.rs::other_raw_control_chars_in_quoted_string_still_rejected`; `crates/khive-request/src/parser/scan.rs:118-218`; `crates/khive-request/src/parser/parser_impl.rs:618-630`. |
 | A7 | The three normative checks in Decision 3 appear on the #5557 checklist.                    | [#5557](https://github.com/ohdearquant/khive/issues/5557).                                                                                                                                                                                                                                                                                                                                      |
+
+## Amendment 2 (2026-10-23) -- Rule 4 scope for identifier-typed parameters
+
+**Status**: Proposed. It does not change the status of the base ADR or of Amendment 1.
+
+**Addresses**: [#5557](https://github.com/ohdearquant/khive/issues/5557),
+[#5996](https://github.com/ohdearquant/khive/issues/5996).
+
+**Trigger.** §4 Phase 1 says that params whose `param_type` is `"uuid"`, or whose name is
+`id`/`ids`, follow the canonical naming. Read literally, every uuid-typed parameter must be
+named `id` or `ids`. Shipped verbs carry more than one uuid parameter with different roles:
+`link` takes `source_id` and `target_id` (`crates/khive-pack-kg/src/handler_defs.rs:976-989`),
+and renaming both to `id` is refused by the duplicate-name check in the same list. Rule 4
+itself names the concept it governs: `id` is the name of the primary record identifier
+(§1, Rule 4).
+
+### Decision 1 -- Rule 4 covers the primary record identifier
+
+The `id`/`ids` convention applies to the parameter that names the record the verb acts on.
+A uuid-typed parameter with a distinct role, such as an edge endpoint, is not a Rule 4
+violation because of its type alone. The Phase-1 check applies this reading as follows:
+
+1. Eligible params are those whose `param_type` is `"uuid"` or `"array of uuid"`, or whose
+   name is `id` or `ids`. The `q`, `slugs`, `thread_id` and `due` checks apply to every
+   param regardless of its type.
+2. Each eligible param not named `id`/`ids` is classified by an exact `(verb, param)` row
+   in a reviewed table, either as an alias of the primary record identifier or as a
+   distinct role. Each distinct-role row states in one line what the field refers to. No
+   name suffix, required flag, resolution mode or description text grants a
+   classification.
+3. The table is exhaustive. A missing, duplicate or stale row fails the check, and an
+   eligible pair without a row fails until a reviewed row is added.
+4. Violations are computed before the legacy baseline is consulted. A primary-identifier
+   alias is a violation and is admitted only as an exact baseline pair with its tracking
+   issue (Amendment 1, Decision 1); a baseline row that no longer violates fails.
+
+The literal reading was rejected because it puts pairs into the baseline that no rename can
+resolve, while Amendment 1, Decision 1 requires the baseline to shrink. A name-pattern rule
+(for example, any param ending in `_id` is a distinct role) was rejected because it would
+exempt shipped primary identifiers named `node_id` and `target_id`, which are tracked as
+aliases in #5996.
+
+### Acceptance
+
+| ID | Statement                                                                                                                                                                                       | Evidence                                                |
+| -- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| B1 | The Phase-1 check classifies every eligible param by an exact reviewed row, and an eligible param on a new handler with no row fails.                                                           | Required workspace Phase-1 conformance test for #5557.  |
+| B2 | `link.source_id` and `link.target_id` pass through distinct-role rows named for them.                                                                                                           | Required workspace Phase-1 conformance test for #5557.  |
+| B3 | A get-style optional `id` passes; the same param renamed `thread_id` fails; a plural `slugs` fails; `get.id` renamed `target_id` with no row fails.                                             | Required control cases in the Phase-1 conformance test. |
+| B4 | The shipped primary-identifier aliases (`neighbors.node_id`, `traverse.roots`, `memory.feedback.target_id`, `brain.feedback.target_id`, `brain.emit.target_id`) are baseline rows citing #5996. | Baseline file of the Phase-1 conformance test; #5996.   |
