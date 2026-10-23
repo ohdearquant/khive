@@ -412,6 +412,32 @@ async fn hot_path_guard_g3_warm_note_search_uses_ann_without_fallback() {
 #[serial(note_search_ann)]
 #[serial_test::serial(config_ledger)]
 async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window() {
+    // Hold any newly enqueued rebuild at its existing test barrier so even a
+    // fast worker cannot disappear before the per-model enqueue assertion.
+    struct RebuildProbe(ann::SharedAnn);
+
+    impl Drop for RebuildProbe {
+        fn drop(&mut self) {
+            self.0
+                .attempt_floor_barrier
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.0.attempt_floor_release.notify_one();
+        }
+    }
+
+    async fn assert_no_rebuild_enqueued(shared: &ann::SharedAnn, key: &ann::AnnKey) {
+        let idle = ann::wait_until_warm_idle(shared, key);
+        tokio::pin!(idle);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(idle.as_mut(), cx).is_ready(),
+                "G5 fresh-tail path must not enqueue an ANN rebuild"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let rt = runtime(&dir.path().join("g5.db"), "main", true);
     let token = rt.authorize(Namespace::local()).expect("local token");
@@ -421,7 +447,14 @@ async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window()
         seed(&rt, &token, &format!("g5 candidate note {index}")).await;
     }
     warm(&rt, &token, &pack).await;
+    let key = ann::AnnKey::new(MODEL);
+    let rebuild_probe = RebuildProbe(pack.ann.clone());
+    rebuild_probe
+        .0
+        .attempt_floor_barrier
+        .store(true, std::sync::atomic::Ordering::Release);
     seed(&rt, &token, "g5 candidate note fresh tail").await;
+    assert_no_rebuild_enqueued(&pack.ann, &key).await;
     let query = rt.embed_query("g5 candidate note").await.expect("query");
     let before = rt
         .db_diagnostics()
@@ -442,6 +475,7 @@ async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window()
         )
         .await
         .expect("warm note search");
+    assert_no_rebuild_enqueued(&pack.ann, &key).await;
 
     let after = rt.db_diagnostics().await.expect("diagnostics after search");
     let hydrated = after.search_mechanism.note_candidate_hydration_rows
