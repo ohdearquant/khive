@@ -332,7 +332,7 @@ vocabulary to build the published JSON Schema; it does not validate argument val
   may only shrink -- adding to it fails the test by construction, which is what makes
   the recurrence guard mechanical rather than review-dependent;
 - params whose `param_type` is `"uuid"` (or whose name is `id`/`ids`) follow the
-  canonical naming;
+  canonical naming (read by Amendment 2, Decision 1);
 - every verb has a non-empty description; required flags are internally consistent.
 
 The Phase-1 workspace test is normative and is part of the conformance checklist for
@@ -629,3 +629,23 @@ aliases in #5996.
 | B2 | `link.source_id` and `link.target_id` pass through distinct-role rows named for them.                                                                                                           | Required workspace Phase-1 conformance test for #5557.  |
 | B3 | A get-style optional `id` passes; the same param renamed `thread_id` fails; a plural `slugs` fails; `get.id` renamed `target_id` with no row fails.                                             | Required control cases in the Phase-1 conformance test. |
 | B4 | The shipped primary-identifier aliases (`neighbors.node_id`, `traverse.roots`, `memory.feedback.target_id`, `brain.feedback.target_id`, `brain.emit.target_id`) are baseline rows citing #5996. | Baseline file of the Phase-1 conformance test; #5996.   |
+
+### Implementation record
+
+The Phase-1 check ships in `crates/khive-mcp/tests/verb_surface_conformance.rs`
+([#5999](https://github.com/ohdearquant/khive/pull/5999)). This section records how it
+applies Decision 1; it does not change Decision 1.
+
+- The reviewed table is `CLASSIFICATIONS` (`verb_surface_conformance.rs:29-60`), the legacy
+  baseline is `ACTIVE_BASELINE` (`:100-126`), and `APPROVED_CEILING` (`:71-97`) holds the
+  approved historical population that the baseline may not grow past.
+- A param named `q`, `slugs`, `thread_id` or `due` is eligible whatever its type
+  (`:148-154`), so it needs an exact reviewed row as well. Distinct-role rows admit
+  `thread_id` on `comm.send`, `comm.inbox`, `comm.ingest` and `list`, where it names a
+  thread group rather than the message the verb acts on, and `due` on `gtd.assign`, where it
+  is the new task's deadline. A new `thread_id` with no row still fails (B3).
+- The same test refuses a handler name declared by more than one linked pack, across every
+  visibility (`DUPLICATE_HANDLER_NAME`, `:577-592`).
+- Boundary: the ceiling is a constant in the same file. A change to it shows in the diff and
+  needs review; no in-repository test stops one edit from raising the ceiling and the
+  baseline together.
