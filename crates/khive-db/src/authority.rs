@@ -63,20 +63,20 @@ pub struct AuthorityTransaction<'w> {
     writer: &'w mut dyn SqlWriter,
 }
 
-macro_rules! statement {
-    ($name:literal, $params:expr) => {
-        SqlStatement::new(
-            include_str!(concat!("../sql/authority/", $name, ".sql")),
-            $params,
-        )
-        .labelled(concat!("authority.", $name))
-    };
+// Each statement names its file in a literal `include_str!` so source scans can tie every
+// SQL asset to its loader.
+fn statement(label: &'static str, sql: &'static str, params: Vec<SqlValue>) -> SqlStatement {
+    SqlStatement::new(sql, params).labelled(label)
 }
 
 impl AuthorityTransaction<'_> {
     pub async fn epoch(&mut self) -> StorageResult<Option<AuthorityEpoch>> {
         self.writer
-            .query_row(statement!("epoch-get", vec![]))
+            .query_row(statement(
+                "authority.epoch-get",
+                include_str!("../sql/authority-epoch-get.sql"),
+                vec![],
+            ))
             .await?
             .map(rows::epoch)
             .transpose()
@@ -86,8 +86,9 @@ impl AuthorityTransaction<'_> {
         bounded_to("manifest", &value.manifest, MAX_AUTHORITY_MANIFEST_BYTES)?;
         bounded("namespace", value.namespace.as_bytes())?;
         self.writer
-            .execute(statement!(
-                "epoch-insert",
+            .execute(statement(
+                "authority.epoch-insert",
+                include_str!("../sql/authority-epoch-insert.sql"),
                 vec![
                     id(value.epoch_id),
                     id(value.marker_id),
@@ -95,19 +96,27 @@ impl AuthorityTransaction<'_> {
                     SqlValue::Blob(value.manifest_digest.to_vec()),
                     SqlValue::Blob(value.manifest.clone()),
                     SqlValue::Text(value.namespace.clone()),
-                    SqlValue::Integer(value.created_at)
-                ]
+                    SqlValue::Integer(value.created_at),
+                ],
             ))
             .await?;
         self.writer
-            .execute(statement!("revision-insert", vec![id(value.epoch_id)]))
+            .execute(statement(
+                "authority.revision-insert",
+                include_str!("../sql/authority-revision-insert.sql"),
+                vec![id(value.epoch_id)],
+            ))
             .await?;
         Ok(())
     }
 
     pub async fn revision(&mut self, epoch_id: Uuid) -> StorageResult<Option<i64>> {
         self.writer
-            .query_row(statement!("revision-get", vec![id(epoch_id)]))
+            .query_row(statement(
+                "authority.revision-get",
+                include_str!("../sql/authority-revision-get.sql"),
+                vec![id(epoch_id)],
+            ))
             .await?
             .map(|row| {
                 let value = rows::integer(&row, "revision")?;
@@ -127,9 +136,10 @@ impl AuthorityTransaction<'_> {
             .ok_or_else(|| invalid("authority revision is negative or exhausted"))?;
         let changed = self
             .writer
-            .execute(statement!(
-                "revision-advance",
-                vec![id(epoch_id), SqlValue::Integer(expected)]
+            .execute(statement(
+                "authority.revision-advance",
+                include_str!("../sql/authority-revision-advance.sql"),
+                vec![id(epoch_id), SqlValue::Integer(expected)],
             ))
             .await?;
         if changed != 1 {
@@ -148,7 +158,11 @@ impl AuthorityTransaction<'_> {
         record_id: Uuid,
     ) -> StorageResult<Option<AuthorityRecord>> {
         self.writer
-            .query_row(statement!("record-get", vec![id(epoch_id), id(record_id)]))
+            .query_row(statement(
+                "authority.record-get",
+                include_str!("../sql/authority-record-get.sql"),
+                vec![id(epoch_id), id(record_id)],
+            ))
             .await?
             .map(rows::record)
             .transpose()
@@ -157,8 +171,9 @@ impl AuthorityTransaction<'_> {
     pub async fn insert_record(&mut self, value: &AuthorityRecord) -> StorageResult<()> {
         value.validate()?;
         self.writer
-            .execute(statement!(
-                "record-insert",
+            .execute(statement(
+                "authority.record-insert",
+                include_str!("../sql/authority-record-insert.sql"),
                 vec![
                     id(value.id),
                     id(value.epoch_id),
@@ -169,19 +184,20 @@ impl AuthorityTransaction<'_> {
                     SqlValue::from_opt_text(value.bootstrap_slot.as_deref()),
                     optional_id(value.root_anchor_id),
                     SqlValue::Integer(value.created_at),
-                    SqlValue::Blob(value.body.clone())
-                ]
+                    SqlValue::Blob(value.body.clone()),
+                ],
             ))
             .await?;
         for tag in &value.right_types {
             self.writer
-                .execute(statement!(
-                    "record-right-type-insert",
+                .execute(statement(
+                    "authority.record-right-type-insert",
+                    include_str!("../sql/authority-record-right-type-insert.sql"),
                     vec![
                         id(value.epoch_id),
                         id(value.id),
-                        SqlValue::Text(tag.clone())
-                    ]
+                        SqlValue::Text(tag.clone()),
+                    ],
                 ))
                 .await?;
         }
@@ -200,14 +216,15 @@ impl AuthorityTransaction<'_> {
         let probe = page_probe(limit)?;
         let rows = self
             .writer
-            .query_all(statement!(
-                "records-principal",
+            .query_all(statement(
+                "authority.records-principal",
+                include_str!("../sql/authority-records-principal.sql"),
                 vec![
                     id(epoch_id),
                     SqlValue::Blob(principal.to_vec()),
                     cursor(after),
-                    SqlValue::Integer(probe)
-                ]
+                    SqlValue::Integer(probe),
+                ],
             ))
             .await?;
         let values = rows
@@ -223,9 +240,10 @@ impl AuthorityTransaction<'_> {
         record_id: Uuid,
     ) -> StorageResult<Option<AuthorityTransition>> {
         self.writer
-            .query_row(statement!(
-                "transition-get",
-                vec![id(epoch_id), id(record_id)]
+            .query_row(statement(
+                "authority.transition-get",
+                include_str!("../sql/authority-transition-get.sql"),
+                vec![id(epoch_id), id(record_id)],
             ))
             .await?
             .map(rows::transition)
@@ -235,8 +253,9 @@ impl AuthorityTransaction<'_> {
     pub async fn insert_transition(&mut self, value: &AuthorityTransition) -> StorageResult<()> {
         bounded("transition body", &value.body)?;
         self.writer
-            .execute(statement!(
-                "transition-insert",
+            .execute(statement(
+                "authority.transition-insert",
+                include_str!("../sql/authority-transition-insert.sql"),
                 vec![
                     id(value.id),
                     id(value.epoch_id),
@@ -245,8 +264,8 @@ impl AuthorityTransaction<'_> {
                     id(value.action_id),
                     id(value.event_id),
                     SqlValue::Integer(value.created_at),
-                    SqlValue::Blob(value.body.clone())
-                ]
+                    SqlValue::Blob(value.body.clone()),
+                ],
             ))
             .await?;
         Ok(())
@@ -270,15 +289,16 @@ impl AuthorityTransaction<'_> {
         }
         crate::stores::event::append_event_on_writer(self.writer, event).await?;
         self.writer
-            .execute(statement!(
-                "change-insert",
+            .execute(statement(
+                "authority.change-insert",
+                include_str!("../sql/authority-change-insert.sql"),
                 vec![
                     id(change.event_id),
                     id(change.epoch_id),
                     id(change.action_id),
                     SqlValue::Text(change.kind.name().into()),
-                    id(change.record_id)
-                ]
+                    id(change.record_id),
+                ],
             ))
             .await?;
         Ok(())
@@ -295,14 +315,15 @@ impl AuthorityTransaction<'_> {
         let probe = page_probe(limit)?;
         let rows = self
             .writer
-            .query_all(statement!(
-                "changes-action",
+            .query_all(statement(
+                "authority.changes-action",
+                include_str!("../sql/authority-changes-action.sql"),
                 vec![
                     id(epoch_id),
                     id(action_id),
                     cursor(after),
-                    SqlValue::Integer(probe)
-                ]
+                    SqlValue::Integer(probe),
+                ],
             ))
             .await?;
         let values = rows
@@ -315,7 +336,11 @@ impl AuthorityTransaction<'_> {
     /// The service must recheck current authorization before calling this method.
     pub async fn replay(&mut self, key: &ReplayKey) -> StorageResult<Option<AuthorityReplay>> {
         self.writer
-            .query_row(statement!("replay-get", key.params()?))
+            .query_row(statement(
+                "authority.replay-get",
+                include_str!("../sql/authority-replay-get.sql"),
+                key.params()?,
+            ))
             .await?
             .map(|row| {
                 Ok(AuthorityReplay {
@@ -345,7 +370,11 @@ impl AuthorityTransaction<'_> {
         params.push(SqlValue::Blob(value.canonical_request.clone()));
         params.push(SqlValue::Blob(value.result.clone()));
         self.writer
-            .execute(statement!("replay-insert", params))
+            .execute(statement(
+                "authority.replay-insert",
+                include_str!("../sql/authority-replay-insert.sql"),
+                params,
+            ))
             .await?;
         Ok(())
     }
