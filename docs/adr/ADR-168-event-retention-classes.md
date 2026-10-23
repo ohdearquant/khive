@@ -43,7 +43,7 @@ Accepted decisions make it load-bearing in four distinct ways:
 A uniform cutoff that is safe for the fourth silently breaks the first three. The unit at
 which safety can be stated is the event class, and the plane already has the pattern for
 per-class contract dimensions: attribution (ADR-162 §2), additive evolution (§3), write
-posture (§4), and sink (ADR-164 §1). This decision adds the fifth dimension, lifetime ,
+posture (§4), and sink (ADR-164 §1). This decision adds the fifth dimension, lifetime,
 in the same form: a closed vocabulary, declared per class, with a fail-safe rule for
 classes that have not declared.
 
@@ -67,8 +67,8 @@ posture, and sink as a per-class contract dimension. The vocabulary is closed:
   durable record with a stated home, written before eligibility and never reset by the
   archival that follows it. Any class serving quota or admission accounting takes this
   value: an aggregate that survives archival is what makes a non-resetting quota
-  implementable over a bounded live store. The verification contract for an aggregate ,
-  what is checked, against what, and recorded where, is defined at the first class
+  implementable over a bounded live store. The verification contract for an aggregate
+  (what is checked, against what, and recorded where) is defined at the first class
   assignment that takes this value, not inherited silently from this decision.
 - **`age_archivable`**, rows are eligible on horizon age alone (§4). The value for pure
   audit and telemetry classes with no referent and no accounting consumer.
@@ -394,7 +394,7 @@ for a given kind, it remains a Table B row (§2) and is not part of the closed p
     prune); **`false` is reserved for a completed comparison that mismatched**, never for a
     comparison that could not be made.
   - **`unknown`** is also the value for an allowed `unseal` or `restore` whose digest
-    recomputation cannot complete, for example, a read error against the segment media ,
+    recomputation cannot complete (for example, a read error against the segment media),
     because no comparison was made; see below for the corresponding outcome.
   - **`unknown`** is also the value for an allowed `replace_segment` or `delete_segment`,
     which do not read the segment's current content before acting (§6): there is no digest
@@ -566,7 +566,7 @@ definitions, since the sequence cannot succeed without the re-verification passi
 delete that destroys the segment's media appends a completion row with
 `EventOutcome::Success` and `terminal_disposition: "destroyed"`. A failure at any step of
 the replace sequence appends a completion row with `EventOutcome::Error`, with
-`replace_verification_status` stating strictly how far the re-verification itself got ,
+`replace_verification_status` stating strictly how far the re-verification itself got:
 `not_attempted` when the failure preceded it (for example, reading the replacement's
 manifest back at re-verification setup), `failed` when it ran and mismatched, `verified`
 when it passed and a later step (the version-pointer write) failed, and
@@ -613,7 +613,7 @@ Retention must not silently change what a query means. Two additive contract beh
 
 - **Horizon disclosure on `list`.** A `list(kind="event")` whose effective time window
   extends past the oldest live row's horizon (superseded by Amendment 3, Decision 4) reports that the window is
-  horizon-clipped ,
+  horizon-clipped:
   a completeness fact on the result envelope, present only when clipping occurred.
   Consumers that never query past the horizon see no change. This discriminant is scoped
   to retention state only; the general availability discriminant (whether the plane
@@ -687,9 +687,9 @@ implementer may choose any of them at run time. That follow-up ADR must state, a
   correlation-keyed class (§1, §2 rows 47-49), how the backfill groups historical rows into
   units when the unit's completeness was never evaluated against this ADR's rule at write
   time, and how an incomplete historical unit is distinguished from one whose closing event
-  exists but predates the backfill's own bookkeeping. This grouping must be **deterministic**
-  , the same historical rows always yield the same units under the same classifier version
-  , so that a later audit or re-run reproduces the same eligibility result; a
+  exists but predates the backfill's own bookkeeping. This grouping must be **deterministic**:
+  the same historical rows always yield the same units under the same classifier version,
+  so that a later audit or re-run reproduces the same eligibility result; a
   non-deterministic or ordering-dependent grouping rule does not satisfy this requirement.
 - **Stub/index creation.** How the archived-stub index (§7) is populated for historical
   rows the backfill archives, so by-ID `get` resolution stays honest for pre-existing event
@@ -1766,7 +1766,7 @@ private log (`crates/khive-pack-brain/src/handlers/auto_feedback.rs:318`), so it
 `GrantChange` is `pinned_while_referenced` (provisional), with no correlation key. Its referent is the authority
 record identified by `record_id` within its authority epoch. It records an authority change rather than telemetry:
 the storage transaction accepts a change only with its matching successful GrantChange event and indexes the event
-id, epoch and record (`crates/khive-db/src/authority.rs:274`, `crates/khive-db/src/authority.rs:296`).
+id, epoch and record (`crates/khive-db/src/authority.rs:274`, `crates/khive-db/src/authority.rs:300`).
 `authority.history` returns full visible change events (`docs/adr/ADR-143-store-held-caller-grants.md:687`), and its
 reader requires the indexed event and matching target (`crates/khive-capability/src/authority_store/history.rs:169`).
 Archiving that event while the authority record is live would break its history. ADR-143 has not stated an archival
