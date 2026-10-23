@@ -817,3 +817,231 @@ incident boundaries and recovery summaries; exact attempt volume and persistence
 reported by ADR-091's process counters. This makes the storage invariant explicit: one sustained
 episode produces at most one opening append attempt and one recovery append attempt, regardless
 of checkpoint cadence or pin duration.
+
+## 2026-10-21 amendment: a config-lock row belongs to the runtime that read the value (#5901)
+
+**Status**: Proposed (this amendment only; the ADR stays Accepted).
+
+This amendment supersedes Decision 7(a)'s process-wide pending slot, its "enqueued exactly once per
+process lifetime" cardinality, its "the very next dispatch (on any verb, from any caller) drains it"
+liveness argument and the drain pseudocode under it, and Decision 5's sentence bounding `ConfigLocked`
+at "at most once per config key per process lifetime" over "3 today" sites. The accepted provenance
+quirk in Decision 7(a) is narrowed as stated in item 5 below. Every other decision is unchanged.
+
+### Why
+
+Decision 7(a) assumed that the next dispatch writes to the store whose handler read the value. That
+holds only while a process holds one runtime. A process can hold several, each with its own event
+store: the kkernel search coordinator fans one search out over several backend runtimes, and the
+supported multi-tenant shape is one store per tenant (ADR-007 Rev 8, Rule 9). With the process-wide
+queue, a value read by runtime A's handler is written by whichever registry dispatches next, so the
+row can land in runtime B's store under B's namespace and actor (#5901). The payload is a config name
+and value, never record content; the defect is provenance. A store's event record cannot be read as
+"the events this store's dispatches caused" while it can hold a row another runtime caused.
+
+The producer census has also grown. At `4500273d`, eight production call sites call
+`config_ledger::record_config_locked`, each inside a `OnceLock::get_or_init` closure:
+
+| Site                                           | Config name                           | Scope                                                                      |
+| ---------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------- |
+| `khive-pack-memory/src/handlers/common.rs:172` | `KHIVE_RECALL_PROFILE`                | runtime (pack handler)                                                     |
+| `khive-pack-memory/src/handlers/common.rs:187` | `ANN_OVERFETCH_MAX_ROUNDS`            | runtime (pack handler)                                                     |
+| `khive-pack-memory/src/handlers/common.rs:205` | `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`   | runtime (pack handler)                                                     |
+| `khive-pack-memory/src/pack.rs:709`            | `KHIVE_MEMORY_RECALL_DEADLINE_MS`     | runtime (pack handler)                                                     |
+| `khive-pack-kg/src/handlers/context.rs:76`     | `KHIVE_CONTEXT_PROFILE`               | runtime (pack handler)                                                     |
+| `kkernel/src/coordinator/search_profile.rs:51` | `KHIVE_SEARCH_PROFILE`                | process (coordinator over several runtimes)                                |
+| `kkernel/src/coordinator/dispatch.rs:1638`     | `KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS` | process (read before fan-out over several runtimes)                        |
+| `khive-mcp/src/server/bridge.rs:31`            | `KHIVE_REQUEST_READ_TIMEOUT_SECS`     | process (bridge transport; a forwarded request performs no local dispatch) |
+
+Decision 7(a)'s claim that every producer runs inside a pack handler no longer holds for the last three.
+
+### Decision
+
+1. **One ledger per runtime.** `KhiveRuntime` carries one config-lock ledger, shared by all clones of
+   that runtime. A `VerbRegistry` whose audit sink is configured with
+   `VerbRegistryBuilder::with_runtime_event_store(&runtime)` drains that runtime's ledger and no other.
+   A registry configured with an explicit `with_event_store` sink, or with no sink, drains no ledger.
+   Two registries bound to one runtime share its ledger, and either may drain it; they write to the same
+   runtime's store. A runtime handle that `KhiveRuntime::core()` returns over a different backend is not a
+   clone and does not share its source's ledger: a runtime keeps one core ledger while its core-backend
+   binding is unchanged, shares it with the clones that retain that binding, and gives it to every such
+   handle, so a value read through those handles is written to the core store, once per name, and only by
+   a registry bound to one of them. Changing the binding with `with_core_backend` creates a fresh core
+   ledger; handles taken before the change keep the old ledger and its pending entries.
+
+2. **One row per config name per runtime.** The resolved value stays in the process-wide `OnceLock`, so
+   when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
+   accessor resolves the cached value and then observes `(name, value)` on the ledger of the runtime its
+   caller holds. A ledger enqueues a name the first time it observes it and ignores later observations
+   of that name; the first observation is decided by the seen-set insertion's own result, so of two
+   overlapping observations of one name exactly one enqueues it. It keeps every enqueued name until a
+   drain takes it for the existing at-most-once, best-effort append attempt; no capacity limit drops
+   one, and neither does an entry's age. A runtime that reads a value another runtime already cached
+   therefore still gets its own row. Two runtimes constructed over the same database each have a
+   ledger, so that store can hold one row per runtime construction for the same name; this is accepted
+   and is what "per runtime" means.
+
+3. **Runtime-scope producers take the ledger from the runtime they hold.** The five pack-handler
+   producers (memory four, kg one) pass the ledger of `self.runtime` (or the runtime the handler was
+   given) into the accessor. No producer finds its ledger through a global, a task-local or "the
+   current registry".
+
+4. **Process-scope settings are not written to any store.** `KHIVE_SEARCH_PROFILE` and
+   `KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS` configure the coordinator, which owns several runtimes, and
+   `KHIVE_REQUEST_READ_TIMEOUT_SECS` configures the bridge's transport, which may forward a request
+   without any local dispatch. Each is reported once per process as a `tracing` record (target
+   `khive::config_lock`, fields `name` and `value`), and no `ConfigLocked` row is written for it. Any
+   store chosen for these rows would name a store that did not read the value. At `4500273d` no
+   production code reads `ConfigLocked` rows for a purpose of its own, but the production `list` and
+   `count` handlers select them through their generic event-kind filters (`event_kind="config_locked"`,
+   `khive-pack-kg/src/handlers/common.rs:1060-1068`), and unfiltered event listings and counts include
+   them. Every such population changes: the three process-scope names no longer appear in any store,
+   and a runtime-scope name appears once per runtime instead of once per process.
+   A later amendment may give the coordinator or the bridge an audit store of its own; this one does
+   not.
+
+5. **Drain point and payload unchanged; the destination is fixed, the actor is not.** The bound registry
+   drains its runtime's ledger at the same place as before (after the gate audit in `dispatch`), as
+   `EventKind::ConfigLocked` rows under the `config.lock` verb with payload `{key, value}`, through the
+   existing best-effort audit append and batching path. Rows still carry the draining dispatch's
+   namespace and actor. Within one runtime that dispatch is a caller of the same store; attributing the
+   row to the actor whose read caused it would need the producer to carry the caller's identity, and this
+   amendment does not do that.
+
+6. **Lifetime and loss.** Pending rows are dropped with the last clone of their runtime, and lost on a
+   crash before the bound registry's next dispatch, as before. A runtime with no bound registry never
+   writes its rows. A ledger holds at most one pending entry per config name, so it cannot grow without
+   bound. A row is never moved to another runtime's store to force its delivery.
+
+7. **Cost.** Dispatch's empty-ledger case stays one atomic read, now of the bound runtime's pending
+   flag. Observing a name the ledger has already seen takes no I/O, no allocation and no await.
+
+8. **Ledger structure.** A ledger's seen set, pending entries and pending flag sit under one mutex, and
+   only the two operations below touch them. Outside that mutex the flag is true exactly when entries are
+   pending. Observing is one critical section: insert the name into the seen set, and only if that
+   insertion added it, push the entry and set the flag. A drain reads the flag without the mutex and does
+   nothing when it is false; otherwise, in one critical section, it takes every pending entry and clears
+   the flag. Nothing else writes the flag. Acquiring the mutex waits; neither operation skips on
+   contention. The taken entries belong to that drain alone and are appended to its own registry's store
+   with no ledger lock held, so two drains of one ledger never share a batch or overwrite one another's
+   destination.
+
+### Test list (acceptance)
+
+Real `OnceLock` producers run in an isolated process with no earlier read of the name; synthetic tests
+use config names that no other fixture uses. Each mutation must compile and turn its named test red.
+These fixtures discriminate the named mutations; they do not establish correctness for every entry age,
+value length, name or retry policy, and Decision 2 still forbids a loss or a duplicate of that kind. Nor
+do they establish Decision 8: an implementation that splits a critical section, skips on contention or
+shares a batch between drains can pass every arm below. Decision 8 is checked by reading the ledger
+module. The implementation puts the seen set, the pending entries, the flag and the two production
+operations in that module, and every later change to the module is reviewed against Decision 8. The schedules in arm 3 remain regression checks for
+the mutations they name.
+
+1. **Destination.** Runtimes A and B with separate stores and distinct namespace and actor, one registry
+   each bound with `with_runtime_event_store`. A's handler reads a fresh name; A's dispatch completes;
+   B dispatches; then A dispatches again. B's store holds no `ConfigLocked` row for the name; A's holds
+   exactly one. Mutation: restore the process-wide queue; B's store gains A's row.
+2. **Cardinality.** Further reads and dispatches in A add no row. B then reads the same, already cached
+   name and dispatches: B's store gains exactly one row. Mutation: observe inside `get_or_init`; B's row
+   is absent. In a third runtime C, two distinct names K and L are observed before one drain; right after
+   that completed drain, before any other name is observed, C's store holds exactly one row for K and one
+   for L. A new name M is then observed, then K, L and M again with a dispatch between each: C's store
+   holds exactly one row for each of K, L and M. Mutations: replace the ledger's set of seen names with one
+   seen-anything flag (the rows for L and M are absent); drain only one entry per dispatch and re-arm the
+   flag while entries remain (after the first drain, K or L has no row). Runtimes D and E are constructed
+   independently with `KhiveRuntime::from_backend` over the same prepared `Arc<StorageBackend>`, with the
+   same namespace and actor. D observes a fresh name N; E observes that cached name, and a second fresh name
+   Q that D never reads, before either drains. After D's completed drain their shared store holds exactly
+   one row for N and none for Q; after E's completed drain it holds exactly two rows for N and one for Q.
+   Mutations: intern ledgers by backend identity (one row for N in total), intern only pending state by
+   backend identity while keeping runtime-local seen sets (two rows for N after D's drain), or intern only
+   pending state and drain one entry per distinct name per dispatch, re-arming while entries remain (D's
+   drain writes Q). Repeat D and E with E observing Q before N; the same counts hold, so a drain of the
+   longest queue prefix without a repeated name still writes Q during D's drain. In each order, D then
+   dispatches once more after its first completed drain and before E drains: their store still holds
+   exactly one row for N and none for Q. Mutation: intern only pending state while keeping runtime-local
+   seen sets, and drain one queued entry per distinct name that the draining runtime has seen (D's second
+   drain writes E's N, two rows before E dispatches). In a further pair D2 and E2 built the same way, only
+   D2 has a registry bound with `with_runtime_event_store`, and only E2 observes a fresh name R. After D2's
+   completed drain their store holds no row for R; after a registry bound to E2 dispatches and drains, it
+   holds exactly one. Mutation: a backend-shared pending queue drained by whichever bound registry
+   dispatches next (D2's drain writes R). Last, a fresh pair D3 and E3 built the same way, both bound, runs
+   a seeded schedule of at least 200 steps, each step one of: D3 or E3 observes a name drawn from a pool of
+   four fresh names, or D3 or E3 dispatches once. After every completed drain, the store's row count for
+   each name equals the count from a reference model in which each runtime keeps its own seen set and its
+   own pending entries and a drain writes only the draining runtime's entries; a failure reports the seed
+   and the step. Mutation: each pending-state mutation named before this case diverges from the model at
+   some step of the fixed seed. Finally, a runtime F observes six fresh distinct names, one more than the
+   five runtime-scope names in the census, before any dispatch, and completes one drain: its store holds
+   exactly one row for each. F then reads all six again and dispatches: no row is added. A producer added
+   to the census raises this count with it. Mutation: a pending buffer with any fixed capacity below six
+   drops a name after marking it seen, and that name never gets a row. The seeded schedule cannot show this,
+   since lifetime deduplication caps each runtime's pending entries at the size of its pool. Then a runtime
+   G observes one fresh name and is kept, with no drain, while one second passes (a wait that ages the
+   entry, not one that orders operations; with an injectable clock, an advance of the same length), and its
+   bound registry completes a healthy drain: the store holds exactly one row for that name. G reads the
+   name again and dispatches: no row is added. Mutation: discarding pending entries at least one second old
+   while keeping their names seen leaves that name with no row; no earlier checkpoint needs an entry to
+   wait that long.
+3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
+   A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
+   cleared by either registry; A's row is lost or lands in B. Also test one fresh runtime and name: pause
+   the first observation immediately before it first acquires a ledger mutex, complete a drain
+   through a registry bound to that same runtime, resume the observation, then complete another drain.
+   Exactly one row exists; rereading the name and draining adds none. Mutation: publishing the pending flag
+   before acquiring that mutex and enqueueing lets the overlapping drain clear the flag too early, and the
+   pair is stranded. Also observe fresh K on one runtime, pause a bound drain after it takes K and before
+   it finishes its `ConfigLocked` appends, complete the observation of fresh L on that same runtime, resume
+   and complete the first drain, then complete another drain. The store holds exactly one row each for K
+   and L; rereading L and draining adds none. Mutation: clearing the pending flag again after the append
+   loop erases L's publication, and L is stranded. Also pause a first observation of one fresh name just
+   after it first releases a ledger mutex, complete a second observation of that name through a
+   clone of the same runtime, then resume and complete the first. One bound drain completes: exactly one
+   row exists; rereading the name and draining adds none. Mutation: checking the seen set and inserting
+   under separate lock acquisitions, ignoring the insertion's result, lets both observations enqueue and
+   the store holds two rows.
+4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
+   A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
+   through the bound registry. A secondary runtime S over one store and its `core()` handle over a
+   different main store each get a bound registry. A fresh name read only through S: the core registry
+   drains first and the main store gains no row, then S's registry drains and S's store holds exactly one.
+   A second fresh name read first through that bound core handle and then through a second `core()`
+   handle of S that gets its own bound registry, and never through S: after both core registries drain,
+   the main store holds exactly one row for it and S's store none. Mutations: give the core handle S's
+   own ledger (the first name lands in the main store); give each `core()` call a fresh ledger (the second
+   name gets two rows).
+5. **Process scope.** In a process with one bound registry, a coordinated search and a bridge request
+   exercise all three process-scope accessors. Neither drains a ledger itself (the coordinated path,
+   `dispatch.rs:268`, has no drain, and a forwarded bridge request returns at `bridge.rs:542-557` without a
+   local dispatch), so an ordinary dispatch on the bound registry follows, and its audit append completes
+   before any store is read. No store holds a `ConfigLocked` row for the three names, and there is one
+   `khive::config_lock` tracing record per name. Mutation: keep the tracing record and also observe one
+   of the three names on the bound runtime's ledger; the final dispatch writes its row.
+6. **Unchanged behaviour.** A successful drain writes a row whose verb is `config.lock` and whose payload
+   is exactly `{key, value}` with the observed name and value. A failed `ConfigLocked` append leaves the
+   dispatch's own result unchanged and records the degradation it records today. The existing failure
+   tests (`khive-runtime/src/pack_tests.rs:5667` and `:5721`) enqueue through the process-wide queue and
+   set an explicit `with_event_store` sink, which under item 1 drains no ledger, so they are ported: the
+   name is observed on a runtime's ledger, the registry is bound to that runtime with
+   `with_runtime_event_store`, and that runtime's store refuses the append through a test seam. The
+   failing store is not set with `with_event_store` afterwards, because that setter clears the runtime
+   binding (`khive-runtime/src/pack/builder.rs:241-244`). The ported tests show that a `ConfigLocked`
+   append was attempted and refused. After the refusal the store accepts appends again, the name is read
+   again, and the registry dispatches: no row is written for that name, because the refused attempt was
+   the entry's one attempt and the drain removed it (the removal contract above is unchanged). Mutations:
+   changing the verb or dropping `value` from the payload turns the successful-drain test red; returning
+   the append's error from the dispatch turns a failure test red; keeping a refused entry pending and
+   retrying it on the next drain writes the row and turns the no-retry check red. A second check holds an
+   admitted `ConfigLocked` append past the caller's admission deadline: the dispatch observes the timeout,
+   the held append is then released and completes, the name is read again and the registry dispatches.
+   Once the append path is idle the store holds exactly one row for the name and the ledger made no second
+   submission. Mutation: re-enqueue the taken entry only when the submission returns
+   `AdmissionDeadlineExpired`; the next drain writes a second event and the check fails.
+
+### Sequencing
+
+The implementation changes the drain block in `khive-runtime/src/pack/dispatch.rs`, which #5898 also
+edits in other hunks; it lands after #5898 merges, as one change covering the ledger, the drain, all
+five runtime-scope producers and the three process-scope sites. No producer is left on the
+process-wide queue.
