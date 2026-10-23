@@ -138,6 +138,8 @@ fn every_current_namespace_table_has_a_move_disposition() {
         "session_messages",
         "note_stream_floors",
         "note_stream_truncations",
+        "authority_epochs",
+        "authority_records",
     ] {
         let table = inventory
             .tables
