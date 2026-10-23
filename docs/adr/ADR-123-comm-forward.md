@@ -1,6 +1,6 @@
 # ADR-123: comm.forward — Provenance-Preserving Message Forwarding
 
-**Status**: proposed\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-07-24\
 **Authors**: khive maintainers\
 **Depends on**:
