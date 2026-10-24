@@ -122,13 +122,13 @@ use bridge::{strict_fallback_envelope_response, ForwardFuture};
 use dispatch_helpers::{
     apply_presentation_to_result, chain_aggregation_depth_reject, chain_ok_envelope_or_depth_error,
     decorate_schedule_agenda_with_ticker_health, dispatch_via_coordinator_inner,
-    drop_value_iteratively, note_content_scope, parse_content_requested,
-    present_ok_envelope_or_depth_error, result_within_depth_limit, stamp_usage,
+    note_content_scope, parse_content_requested, present_ok_envelope_or_depth_error, stamp_usage,
     substitution_error_payload,
 };
 #[cfg(test)]
 use dispatch_helpers::{
-    coordinator_search_visibility, ok_envelope, result_exceeds_depth_limit, runtime_error_value,
+    coordinator_search_visibility, drop_value_iteratively, ok_envelope, result_exceeds_depth_limit,
+    result_within_depth_limit, runtime_error_value,
 };
 #[cfg(unix)]
 use rendering::cancelled_forward_error;
