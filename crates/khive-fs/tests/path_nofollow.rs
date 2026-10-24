@@ -225,3 +225,165 @@ fn fifo_refusal_finishes_without_a_writer() {
         "child case did not run: {stdout}\n{stderr}"
     );
 }
+
+fn readonly_descriptor_flags(file: &File) {
+    close_on_exec(file);
+    // SAFETY: file owns a live descriptor; F_GETFL only reads its status flags.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+    assert_ne!(flags & libc::O_NONBLOCK, 0);
+}
+
+#[test]
+fn readonly_open_preserves_regular_bytes_and_accepts_directories() {
+    use khive_fs::opened_file::open_readonly_file_nofollow;
+
+    let scratch = Scratch::new();
+    let real = scratch.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("data"), b"readonly unchanged").unwrap();
+    symlink("real", scratch.path().join("ancestor")).unwrap();
+    for path in [real.join("data"), scratch.path().join("ancestor/data")] {
+        let mut file = open_readonly_file_nofollow(&path).unwrap();
+        readonly_descriptor_flags(&file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"readonly unchanged");
+    }
+    let directory = open_readonly_file_nofollow(&real).unwrap();
+    readonly_descriptor_flags(&directory);
+    assert!(directory.metadata().unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(real.join("data")).unwrap(),
+        b"readonly unchanged"
+    );
+}
+
+#[test]
+fn readonly_open_preserves_raw_errors_and_refuses_final_symlinks() {
+    use khive_fs::opened_file::open_readonly_file_nofollow;
+
+    let scratch = Scratch::new();
+    let data = scratch.path().join("data");
+    std::fs::write(&data, b"unchanged").unwrap();
+    symlink("data", scratch.path().join("alias")).unwrap();
+    assert_eq!(
+        open_readonly_file_nofollow(&scratch.path().join("alias"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ELOOP)
+    );
+    let missing = open_readonly_file_nofollow(&scratch.path().join("missing")).unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    let nul = PathBuf::from(OsString::from_vec(b"bad\0path".to_vec()));
+    assert_eq!(
+        open_readonly_file_nofollow(&nul).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(std::fs::read(&data).unwrap(), b"unchanged");
+}
+
+struct BoundedReadonlyChild {
+    child: Child,
+    cleanup_attempted: bool,
+}
+
+impl BoundedReadonlyChild {
+    fn stop_and_reap(&mut self) -> bool {
+        self.cleanup_attempted = true;
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn wait_bounded(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll readonly FIFO child") {
+                self.cleanup_attempted = true;
+                return status;
+            }
+            if Instant::now() >= deadline {
+                assert!(
+                    self.stop_and_reap(),
+                    "readonly FIFO child exceeded the reap deadline"
+                );
+                panic!("readonly FIFO open waited for a writer");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for BoundedReadonlyChild {
+    fn drop(&mut self) {
+        if !self.cleanup_attempted {
+            let _ = self.stop_and_reap();
+        }
+    }
+}
+
+const READONLY_FIFO_PATH: &str = "KHIVE_FS_READONLY_NOFOLLOW_FIFO_PATH";
+const READONLY_FIFO_MARKER: &str = "KHIVE_FS_READONLY_NOFOLLOW_FIFO_MARKER";
+
+#[test]
+#[ignore = "invoked only by readonly_fifo_open_finishes_without_a_writer in an owned child"]
+fn readonly_fifo_child_case() {
+    use khive_fs::opened_file::open_readonly_file_nofollow;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let path = PathBuf::from(std::env::var_os(READONLY_FIFO_PATH).expect("readonly FIFO path"));
+    let marker =
+        PathBuf::from(std::env::var_os(READONLY_FIFO_MARKER).expect("readonly FIFO marker"));
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_fifo());
+    let file = open_readonly_file_nofollow(&path).expect("raw readonly FIFO open");
+    readonly_descriptor_flags(&file);
+    assert!(file.metadata().unwrap().file_type().is_fifo());
+    std::fs::write(marker, b"readonly FIFO descriptor checked").unwrap();
+}
+
+#[test]
+fn readonly_fifo_open_finishes_without_a_writer() {
+    let scratch = Scratch::new();
+    let fifo = scratch.path().join("readonly-fifo");
+    let marker = scratch.path().join("readonly-done");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is NUL-terminated and remains alive for mkfifo.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut child = BoundedReadonlyChild {
+        child: Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "readonly_fifo_child_case",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(READONLY_FIFO_PATH, &fifo)
+            .env(READONLY_FIFO_MARKER, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn readonly FIFO child"),
+        cleanup_attempted: false,
+    };
+    assert!(child.wait_bounded().success(), "readonly FIFO child failed");
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"readonly FIFO descriptor checked"
+    );
+}
