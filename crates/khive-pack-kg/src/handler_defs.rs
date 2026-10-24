@@ -1193,13 +1193,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "roots",
+                name: "ids",
                 param_type: "array of uuid",
                 required: true,
                 description: "Starting node complete UUIDs, unique 8+ hex prefixes, or entity \
                               names (maximum 100; aliases resolving to the same UUID are \
                               de-duplicated). Prefix and name resolution search the caller's \
-                              primary namespace.",
+                              primary namespace. `roots` and `start_ids` remain accepted aliases for `ids`.",
                 resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
