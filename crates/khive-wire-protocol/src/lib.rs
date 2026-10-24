@@ -9,7 +9,7 @@
 //! below are written to meet it.
 //!
 //! This crate does no I/O and depends on no async runtime. It is types, a
-//! byte-buffer codec, and a handshake state machine; a transport crate
+//! byte-buffer codec, and handshake state machines; a transport crate
 //! (Unix-domain socket, tailnet TCP, or any other carrier of the same
 //! framing) drives it.
 //!
@@ -175,6 +175,24 @@
 //! property of the gate's API rather than a rule every call site has to
 //! remember to check.
 //!
+//! [`client_handshake::ClientHandshakeGate`] implements the client side. After
+//! successfully writing its handshake, a transport calls
+//! [`ClientHandshakeGate::record_handshake_sent`] with the exact version sent,
+//! then feeds every decoded inbound frame to [`ClientHandshakeGate::admit`]. A
+//! fresh gate admits nothing. An outstanding offer admits only an acknowledgment
+//! naming that exact version or a connection-terminal server error; after an
+//! exact acknowledgment, server application frames are admitted and another
+//! handshake/acknowledgment or any client-to-server kind is a violation.
+//!
+//! Both gates close permanently on a sequence or direction violation. A client
+//! gate also closes when it admits a connection-terminal server error:
+//! [`ClientHandshakeOutcome::ServerTerminated`] means the original inbound error
+//! was admitted for surfacing, not replaced by `malformed_frame`. The caller
+//! retains that frame and must surface its original code/message, close the
+//! transport, and never fall back. Local misuse of `record_handshake_sent`,
+//! including version zero, is a distinct [`ClientHandshakeStartError`] and leaves
+//! state unchanged. Encoding/decoding stays role-agnostic; the gates do no I/O.
+//!
 //! ## Wire error taxonomy
 //!
 //! [`error::WireErrorCode`] is the closed set of wire-level error codes for
@@ -266,12 +284,16 @@
 //! - Peer-class allowlists and dispatch enforcement — ADR-137's "Peer
 //!   classes and dispatch enforcement".
 
+pub mod client_handshake;
 pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod version;
 
+pub use client_handshake::{
+    ClientHandshakeGate, ClientHandshakeOutcome, ClientHandshakeStartError,
+};
 pub use codec::{
     decode_frame, decode_frame_with_consumed, encode_frame, encode_frame_with_max, CodecError,
     FrameCodec, DEFAULT_MAX_FRAME_BYTES,
