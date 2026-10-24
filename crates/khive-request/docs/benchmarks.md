@@ -8,15 +8,37 @@ Reference baselines for `khive-request`. Values are the committed reference medi
 
 Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
 
-| Benchmark               | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ----------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `parse/batch/10`        | 4.702 µs         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/batch/3`         | 821.109 ns       | 1.011     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/chain/2`         | 830.479 ns       | 1.021     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/chain/5`         | 2.094 µs         | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/json_form/3_ops` | 1.592 µs         | 1.034     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/single/complex`  | 944.605 ns       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `parse/single/simple`   | 199.715 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| Benchmark                                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-request:request_bench/parse/batch/10/median_ns`                          | 4.860 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/batch/3/median_ns`                           | 863.223 ns       | 1.030     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/chain/2/median_ns`                           | 846.450 ns       | 1.026     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/chain/5/median_ns`                           | 2.140 µs         | 1.025     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/json_form/3_ops/median_ns`                   | 1.558 µs         | 1.028     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/single/complex/median_ns`                    | 989.087 ns       | 1.016     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/single/simple/median_ns`                     | 205.004 ns       | 1.033     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/10/median_ns`  | 39.736 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/100/median_ns` | 274.487 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/50/median_ns`  | 144.144 ns       | 1.082     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/10/median_ns`     | 115.114 ns       | 1.046     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/100/median_ns`    | 1.933 µs         | 1.110     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/50/median_ns`     | 770.521 ns       | 1.039     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/10/median_ns`  | 183.408 ns       | 1.025     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/100/median_ns` | 2.834 µs         | 1.075     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/50/median_ns`  | 1.316 µs         | 1.070     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_batch/100/median_ns`     | 49.937 µs        | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_batch/50/median_ns`      | 23.504 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_chain/10/median_ns`      | 3.676 µs         | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_chain/20/median_ns`      | 7.576 µs         | 1.060     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/batch/10/median_ns`       | 16.593 µs        | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/batch/3/median_ns`        | 4.256 µs         | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/chain/2/median_ns`        | 3.458 µs         | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/chain/5/median_ns`        | 8.441 µs         | 1.048     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/single/complex/median_ns` | 2.765 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/single/simple/median_ns`  | 1.420 µs         | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/10/median_ns`       | 2.177 µs         | 1.076     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/100/median_ns`      | 21.916 µs        | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/50/median_ns`       | 11.167 µs        | 1.038     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 
