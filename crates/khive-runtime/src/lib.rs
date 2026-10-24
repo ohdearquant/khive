@@ -178,7 +178,10 @@ pub use error::{
     WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
-pub use error_projection::runtime_error_value;
+pub use error_projection::{
+    failure_entry_parts, failure_error_disposition, runtime_error_value, FailureEntryParts,
+    FailureEntrySource,
+};
 pub use event_actor_scope::{resolve_event_actor_read_scope, EventActorReadScope};
 pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
