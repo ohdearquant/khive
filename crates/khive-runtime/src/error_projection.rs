@@ -15,6 +15,17 @@ use crate::{DomainDisposition, RuntimeError};
 /// without cloning or recursively serializing it; callers apply their own depth
 /// limits before any recursive operation on the returned value.
 pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    let disposition = if disposition == DomainDisposition::Committed {
+        disposition
+    } else {
+        error.batch_write_disposition().unwrap_or(disposition)
+    };
+    runtime_error_value_inner(error, disposition)
+}
+
+// Choose operation-local proof once. Recursive projection must not promote an
+// inner batch proof past an enclosing context with earlier or unknown effects.
+fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
     let sqlite_write_failure = match error.refusal_source() {
@@ -101,14 +112,14 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             // Preparation precedes all domain DML. Keep the original typed
             // refusal (including secret detector/permission receipt) and add
             // only the constituent's index; never stringify captured input.
-            let mut value = runtime_error_value(*source, DomainDisposition::NotCommitted);
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::NotCommitted);
             value["op_index"] = json!(op_index);
             value["domain_disposition"] = json!("not_committed");
             value["retryable"] = json!(false);
             return value;
         }
         RuntimeError::LintFix { source, detail } => {
-            let mut value = runtime_error_value(*source, DomainDisposition::Unknown);
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::Unknown);
             let object = value
                 .as_object_mut()
                 .expect("runtime error projection is an object");
@@ -126,7 +137,7 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
 
         RuntimeError::WithResolution { context } => {
             let crate::error::ResolutionFailureContext { source, resolution } = context;
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             let details = value
                 .as_object_mut()
                 .expect("runtime error projection is an object")
@@ -138,11 +149,35 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             details["resolution"] = json!(resolution);
             return value;
         }
+        RuntimeError::BatchWrite { context } => {
+            let crate::error::BatchWriteContext {
+                source, admission, ..
+            } = *context;
+            let mut value = runtime_error_value_inner(*source, disposition);
+            if let Some(report) = admission {
+                if report.validation_complete {
+                    if let Some(first) = report.refused.first() {
+                        if !value["details"].is_object() {
+                            value["details"] = json!({});
+                        }
+                        value["details"]["index"] = json!(first.index.to_string());
+                        value["details"]["field"] = json!(first.field);
+                        value["details"]["reason"] = json!(first.reason);
+                    }
+                } else {
+                    value["unchecked_indices"] = json!(report.unchecked_indices);
+                }
+                value["refused"] = json!(report.refused);
+                value["validation_complete"] = json!(report.validation_complete);
+            }
+            value["domain_disposition"] = json!(disposition.as_str());
+            return value;
+        }
         RuntimeError::RefusedWithEvents { context } => {
             let crate::error::RefusalEventContext { source, recordings } = context;
             // Project the source first so named dispositions, code/details,
             // detector location and refusal text retain their original meaning.
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             if !recordings.is_empty() {
                 value["refusal_recorded"] = json!(recordings.iter().all(|recording| {
                     matches!(recording, crate::RefusalEventRecording::Recorded { .. })

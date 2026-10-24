@@ -72,6 +72,7 @@ impl RuntimeError {
                 source.audit_error_class()
             }
             Self::RefusedWithEvents { context } => context.source.audit_error_class(),
+            Self::BatchWrite { context } => context.source.audit_error_class(),
             Self::WithResolution { context } => context.source.audit_error_class(),
             Self::Storage(error) => storage_class(error),
             Self::Query(error) => match error {
@@ -189,5 +190,108 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
         | StorageError::WriterTaskTerminated { .. }
         | StorageError::Internal(_)
         | StorageError::CapacityUnavailable { .. } => C::Storage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditErrorClass;
+    use crate::error::{BatchAdmissionReport, BatchRefusal, DomainDisposition, RuntimeError};
+    use khive_storage::{StorageError, WriterTaskRequestState};
+
+    #[test]
+    fn batch_write_delegates_audit_class_without_changing_settlement() {
+        for (source, expected) in [
+            (
+                RuntimeError::InvalidInput("fixture input".into()),
+                AuditErrorClass::InvalidParams,
+            ),
+            (
+                RuntimeError::NotFound("fixture target".into()),
+                AuditErrorClass::NotFoundOrNotAddressed,
+            ),
+            (
+                RuntimeError::Internal("fixture internal".into()),
+                AuditErrorClass::Internal,
+            ),
+        ] {
+            assert_eq!(
+                source.audit_error_class(),
+                expected,
+                "unwrapped source control"
+            );
+            let refusal = source.before_requested_write();
+            assert_eq!(
+                refusal.audit_error_class(),
+                expected,
+                "BatchWrite must retain the source audit class"
+            );
+            assert_eq!(
+                refusal.batch_write_disposition(),
+                Some(DomainDisposition::NotCommitted)
+            );
+        }
+
+        let admission = RuntimeError::InvalidInput("fixture admission".into())
+            .with_batch_admission(BatchAdmissionReport {
+                refused: vec![BatchRefusal {
+                    index: 0,
+                    field: "content",
+                    reason: "fixture-refusal",
+                }],
+                validation_complete: true,
+                unchecked_indices: vec![],
+            });
+        assert_eq!(
+            admission.audit_error_class(),
+            AuditErrorClass::InvalidParams
+        );
+        assert_eq!(
+            admission.batch_write_disposition(),
+            Some(DomainDisposition::NotCommitted)
+        );
+
+        for (state, expected) in [
+            (
+                WriterTaskRequestState::NotStarted,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::TransactionRolledBack,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::SideEffectsUnknown,
+                DomainDisposition::Unknown,
+            ),
+        ] {
+            let failure =
+                RuntimeError::atomic_write_failure(StorageError::WriterTaskRequestFailed {
+                    request_state: state,
+                    source: Box::new(StorageError::Internal("fixture write cause".into())),
+                });
+            assert_eq!(failure.audit_error_class(), AuditErrorClass::Storage);
+            assert_eq!(failure.batch_write_disposition(), Some(expected));
+        }
+
+        for (state, expected) in [
+            (
+                WriterTaskRequestState::NotStarted,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::TransactionRolledBack,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::SideEffectsUnknown,
+                DomainDisposition::Unknown,
+            ),
+        ] {
+            let failure =
+                RuntimeError::atomic_write_failure(StorageError::writer_task_terminated(state));
+            assert_eq!(failure.audit_error_class(), AuditErrorClass::Storage);
+            assert_eq!(failure.batch_write_disposition(), Some(expected));
+        }
     }
 }

@@ -78,13 +78,13 @@ async fn upsert_domains_rejects_atom_slug_collision_without_partial_domain() {
             json!({ "domains": [{
                 "slug": "shared-slug",
                 "name": "Colliding Domain",
-                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques through practical retrieval storage evaluation examples",
             }] }),
         )
         .await
         .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::InvalidInput(_)),
+        matches!(err.refusal_source(), RuntimeError::InvalidInput(_)),
         "expected InvalidInput, got: {err:?}"
     );
 
@@ -108,13 +108,13 @@ async fn upsert_domains_rejects_atom_slug_collision_without_partial_domain() {
             json!({ "domains": [{
                 "slug": "shared-slug",
                 "name": "Colliding Domain Retry",
-                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques through practical retrieval storage evaluation examples",
             }] }),
         )
         .await
         .unwrap_err();
     assert!(
-        matches!(err2, RuntimeError::InvalidInput(_)),
+        matches!(err2.refusal_source(), RuntimeError::InvalidInput(_)),
         "expected InvalidInput on retry, got: {err2:?}"
     );
 
@@ -161,7 +161,7 @@ async fn upsert_atoms_rejects_domain_mirror_slug_collision_without_mutation() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::InvalidInput(_)),
+        matches!(err.refusal_source(), RuntimeError::InvalidInput(_)),
         "expected InvalidInput, got: {err:?}"
     );
 
