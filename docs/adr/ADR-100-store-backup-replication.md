@@ -312,7 +312,7 @@ The implementing PR ships a runbook covering, at minimum:
 
 ## Amendment (2026-10-24): a storage-layer database copy, registered as a named WAL holder
 
-**Status**: Proposed. Refs #1845; the scheduled tiers in #5562 build on it.
+**Status**: Accepted (2026-10-24). Refs #1845; the scheduled tiers in #5562 build on it.
 
 ### Context
 
