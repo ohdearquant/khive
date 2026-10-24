@@ -259,6 +259,7 @@ fn assert_no_stamp(row: &Event) {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn generic_dispatch_retention_covers_closed_literals_and_all_outcomes() {
     for intercepted in [false, true] {
         for outcome in [
@@ -298,6 +299,7 @@ async fn generic_dispatch_retention_covers_closed_literals_and_all_outcomes() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn generic_dispatch_retention_preserves_unlisted_and_caller_arguments() {
     let forged = json!({"class": "caller", "policy": "caller-policy", "horizon_seconds": 1});
     for intercepted in [false, true] {
@@ -340,6 +342,7 @@ async fn generic_dispatch_retention_preserves_unlisted_and_caller_arguments() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn generic_dispatch_retention_kind_and_non_generic_survival() {
     let rig = rig(AuditSuccessRowsMode::All, EventOutcome::Success);
     let kinds = [
@@ -432,6 +435,7 @@ fn fresh_sampling_process() -> bool {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn generic_dispatch_retention_retains_sampled_and_forced_success_metadata() {
     if !fresh_sampling_process() {
         return;
