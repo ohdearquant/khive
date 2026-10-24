@@ -54,14 +54,14 @@ impl DispatchError {
     }
 
     pub(crate) fn after_handler(source: RuntimeError, domain_succeeded: bool) -> Self {
-        Self::new(
-            source,
-            if domain_succeeded {
-                DomainDisposition::Committed
-            } else {
-                DomainDisposition::Unknown
-            },
-        )
+        let disposition = if domain_succeeded {
+            DomainDisposition::Committed
+        } else {
+            source
+                .batch_write_disposition()
+                .unwrap_or(DomainDisposition::Unknown)
+        };
+        Self::new(source, disposition)
     }
 
     /// Borrow the original error without changing its classification.
@@ -559,6 +559,42 @@ pub enum RefusalEventRecording {
     },
 }
 
+/// Value-free admission evidence for one original input position.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BatchRefusal {
+    pub index: usize,
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+/// Complete or explicitly interrupted record-list admission.
+#[derive(Debug)]
+pub struct BatchAdmissionReport {
+    pub refused: Vec<BatchRefusal>,
+    pub validation_complete: bool,
+    pub unchecked_indices: Vec<usize>,
+}
+
+/// Operation-local proof, independent of any separately recorded refusal events.
+#[derive(Debug)]
+pub struct BatchWriteContext {
+    pub source: Box<RuntimeError>,
+    pub disposition: DomainDisposition,
+    pub admission: Option<BatchAdmissionReport>,
+}
+
+impl fmt::Display for BatchWriteContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.source.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for BatchWriteContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Original refusal and the independent evidence of recording it.
 ///
 /// The runtime variant transparently forwards this context's error source, which
@@ -766,6 +802,10 @@ pub enum RuntimeError {
     #[error(transparent)]
     RefusedWithEvents { context: RefusalEventContext },
 
+    /// A batch boundary's typed admission or atomic-write settlement evidence.
+    #[error(transparent)]
+    BatchWrite { context: Box<BatchWriteContext> },
+
     /// Preserve the original typed failure while carrying facts established
     /// before a `git.digest` ingest failed.
     #[error(transparent)]
@@ -914,6 +954,61 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Certify that this operation refused before attempting requested data writes.
+    pub fn before_requested_write(self) -> Self {
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(self),
+                disposition: DomainDisposition::NotCommitted,
+                admission: None,
+            }),
+        }
+    }
+
+    /// Attach admission evidence established before any requested data write.
+    pub fn with_batch_admission(self, admission: BatchAdmissionReport) -> Self {
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(self),
+                disposition: DomainDisposition::NotCommitted,
+                admission: Some(admission),
+            }),
+        }
+    }
+
+    /// Preserve a single atomic write's actual typed settlement, never its rendered text.
+    pub fn atomic_write_failure(error: khive_storage::StorageError) -> Self {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+        let disposition = match error.without_sqlite_write_stage() {
+            StorageError::WriterTaskRequestFailed { request_state, .. }
+            | StorageError::WriterTaskTerminated { request_state, .. } => match request_state {
+                WriterTaskRequestState::NotStarted
+                | WriterTaskRequestState::TransactionRolledBack => DomainDisposition::NotCommitted,
+                WriterTaskRequestState::SideEffectsUnknown => DomainDisposition::Unknown,
+            },
+            StorageError::WriterTaskBusy { .. }
+            | StorageError::WriteQueueFull { .. }
+            | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
+            _ => DomainDisposition::Unknown,
+        };
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(Self::Storage(error)),
+                disposition,
+                admission: None,
+            }),
+        }
+    }
+
+    /// Read only this operation's proof, never a nested earlier action's finality.
+    pub fn batch_write_disposition(&self) -> Option<DomainDisposition> {
+        match self {
+            Self::BatchWrite { context } => Some(context.disposition),
+            Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
+            _ => None,
+        }
+    }
+
     /// Attach established repo-anchor facts without changing the source error.
     pub fn with_resolution(self, resolution: ResolutionFacts) -> Self {
         Self::WithResolution {
@@ -951,6 +1046,7 @@ impl RuntimeError {
         loop {
             error = match error {
                 Self::RefusedWithEvents { context } => &context.source,
+                Self::BatchWrite { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
                 Self::LintFix { source, .. } => source.as_ref(),
                 Self::CanonicalAdmission { source, .. } => source.as_ref(),
@@ -1048,6 +1144,7 @@ impl RuntimeError {
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
             Self::RefusedWithEvents { context } => context.source.variant_name(),
+            Self::BatchWrite { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
             Self::CanonicalAdmission { source, .. } => source.variant_name(),
@@ -1169,6 +1266,7 @@ impl RuntimeError {
             match enclosing {
                 Self::LintFix { .. } => return None,
                 Self::RefusedWithEvents { context } => enclosing = &context.source,
+                Self::BatchWrite { context } => enclosing = &context.source,
                 Self::WithResolution { context } => enclosing = &context.source,
                 _ => break,
             }
@@ -1292,3 +1390,111 @@ mod stream_policy_refusal_tests;
 #[cfg(test)]
 #[path = "error_channel_ingest_failure_class_tests.rs"]
 mod channel_ingest_failure_class_tests;
+
+#[cfg(test)]
+mod batch_write_proof_tests {
+    use super::*;
+    use crate::runtime_error_value;
+
+    fn proof() -> RuntimeError {
+        RuntimeError::InvalidInput("fixture-prewrite-refusal".into()).before_requested_write()
+    }
+
+    fn project_failed(source: RuntimeError) -> (DomainDisposition, serde_json::Value) {
+        let error = DispatchError::after_handler(source, false);
+        let borrowed = error.disposition();
+        let (source, disposition) = error.into_parts();
+        assert_eq!(borrowed, disposition);
+        let value = runtime_error_value(source, disposition);
+        assert_eq!(value["domain_disposition"], disposition.as_str());
+        (disposition, value)
+    }
+
+    #[test]
+    fn batch_proof_reaches_dispatch_owned_parts_and_projection() {
+        let (disposition, value) = project_failed(proof());
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("fixture-prewrite-refusal"));
+        for source in [
+            RuntimeError::InvalidInput("ordinary".into()),
+            RuntimeError::Storage(khive_storage::StorageError::Internal(
+                "ordinary-storage".into(),
+            )),
+        ] {
+            assert_eq!(project_failed(source).0, DomainDisposition::Unknown);
+        }
+    }
+
+    #[test]
+    fn enclosing_success_and_unknown_contexts_protect_prior_effects() {
+        let error = DispatchError::after_handler(proof(), true);
+        assert_eq!(error.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = error.into_parts();
+        assert_eq!(
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
+        );
+        assert_eq!(
+            runtime_error_value(proof(), DomainDisposition::Committed)["domain_disposition"],
+            "committed"
+        );
+        let source = proof().with_resolution(ResolutionFacts {
+            project_id: Uuid::nil(),
+            duplicate_anchor_ids: vec![],
+            slug_backfilled: false,
+            project_created: true,
+            orphaned_project_id: None,
+            orphaned_note_count: 0,
+        });
+        assert_eq!(
+            source.batch_write_disposition(),
+            None,
+            "enclosing earlier work blocks an inner no-write proof"
+        );
+        let (disposition, value) = project_failed(source);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        assert_eq!(value["details"]["resolution"]["project_created"], true);
+    }
+
+    #[test]
+    fn batch_evidence_preserves_original_source_and_writer_finality() {
+        let source = RuntimeError::atomic_write_failure(
+            khive_storage::StorageError::WriterTaskRequestFailed {
+                request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                source: Box::new(khive_storage::StorageError::Internal(
+                    "fixture-original-cause".into(),
+                )),
+            },
+        )
+        .with_refusal_events(vec![RefusalEventRecording::Recorded {
+            item_index: 0,
+            subject: Uuid::nil(),
+            event_id: Uuid::nil(),
+        }]);
+        assert!(matches!(source.refusal_source(), RuntimeError::Storage(_)));
+        assert_eq!(
+            source.writer_task_failure_context().unwrap().request_state,
+            khive_storage::WriterTaskRequestState::TransactionRolledBack
+        );
+        let mut cause: &(dyn std::error::Error + 'static) = &source;
+        let mut retained = false;
+        while let Some(next) = cause.source() {
+            retained |= next.to_string().contains("fixture-original-cause");
+            cause = next;
+        }
+        assert!(retained, "typed cause remains below the outer error");
+        let (disposition, value) = project_failed(source);
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["request_state"], "transaction_rolled_back");
+        assert_eq!(value["refusal_recorded"], true);
+        let source = RuntimeError::atomic_write_failure(
+            khive_storage::StorageError::writer_task_terminated(
+                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            ),
+        );
+        assert_eq!(project_failed(source).0, DomainDisposition::Unknown);
+    }
+}
