@@ -6,9 +6,7 @@ use serde_json::{json, Value};
 
 #[cfg(doc)]
 use super::execute_bounded_units;
-use super::{
-    drop_value_iteratively, result_within_depth_limit, runtime_error_value, MAX_BATCH_CONCURRENCY,
-};
+use super::MAX_BATCH_CONCURRENCY;
 
 pub(super) struct BatchTask<F> {
     pub(super) index: usize,
@@ -117,13 +115,12 @@ impl ParsedDispatchPolicy {
 
 /// Typed failure crossing the dispatch/envelope seam.
 ///
-/// `error` retains the pre-existing human or structured payload. `reason` is
-/// an additive machine classification and is absent for ordinary validation,
+/// The completed entry retains the human or structured error payload. `reason`
+/// is additive machine classification and is absent for ordinary validation,
 /// storage, transport, coordinator, and authorization-gate failures.
 #[derive(Debug)]
 pub(super) struct DispatchFailure {
-    pub(super) tool: String,
-    pub(super) error: Value,
+    entry: Value,
     pub(super) reason: Option<RefusalReason>,
 }
 
@@ -142,8 +139,7 @@ impl DispatchFailure {
         disposition: DomainDisposition,
     ) -> Self {
         Self {
-            tool: tool.into(),
-            error: error_with_disposition(error, disposition),
+            entry: failure_entry(tool, error, disposition),
             reason: None,
         }
     }
@@ -157,19 +153,20 @@ impl DispatchFailure {
             _ => None,
         };
         Self {
-            tool: tool.into(),
-            error: runtime_error_value(error, disposition),
+            entry: khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Runtime {
+                error,
+                boundary: disposition,
+            })
+            .into_entry(tool),
             reason,
         }
     }
 
-    pub(super) fn into_entry(self) -> Value {
-        let disposition = error_disposition(&self.error);
-        let mut entry = failure_entry(self.tool, self.error, disposition);
+    pub(super) fn into_entry(mut self) -> Value {
         if let Some(reason) = self.reason {
-            entry["reason"] = json!(reason.as_str());
+            self.entry["reason"] = json!(reason.as_str());
         }
-        entry
+        self.entry
     }
 }
 
@@ -182,12 +179,11 @@ pub(super) fn failure_entry(
     error: Value,
     disposition: DomainDisposition,
 ) -> Value {
-    let mut entry = serde_json::Map::new();
-    entry.insert("ok".into(), Value::Bool(false));
-    entry.insert("tool".into(), Value::String(tool.into()));
-    entry.insert("domain_disposition".into(), json!(disposition.as_str()));
-    entry.insert("error".into(), error_with_disposition(error, disposition));
-    Value::Object(entry)
+    khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Value {
+        error,
+        disposition,
+    })
+    .into_entry(tool)
 }
 
 pub(super) fn aborted_entry(tool: impl Into<String>, message: Option<String>) -> Value {
@@ -207,43 +203,13 @@ pub(super) fn aborted_entry(tool: impl Into<String>, message: Option<String>) ->
 
 /// Missing/foreign disposition is uncertainty, never permission to replay.
 pub(super) fn error_disposition(error: &Value) -> DomainDisposition {
-    match error.get("domain_disposition").and_then(Value::as_str) {
-        Some("committed") => DomainDisposition::Committed,
-        Some("not_committed") => DomainDisposition::NotCommitted,
-        _ => DomainDisposition::Unknown,
-    }
+    khive_runtime::failure_error_disposition(error)
 }
 
 pub(super) fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value {
-    let mut error = match error {
-        Value::Object(map) => map,
-        Value::String(message) => serde_json::Map::from_iter([
-            ("kind".into(), json!("runtime_error")),
-            ("message".into(), Value::String(message)),
-        ]),
-        other => {
-            drop_value_iteratively(other);
-            serde_json::Map::from_iter([
-                ("kind".into(), json!("runtime_error")),
-                ("message".into(), json!("operation failed")),
-            ])
-        }
-    };
-    if let Some(result) = error.remove("domain_result") {
-        if disposition != DomainDisposition::Committed {
-            // A nested operation's result is not proof of the outer result.
-            drop_value_iteratively(result);
-        } else if !result_within_depth_limit(&result) {
-            drop_value_iteratively(result);
-            error.insert("code".into(), json!("result_too_deep"));
-            error.insert(
-                "message".into(),
-                json!("committed domain result omitted because it exceeds the nesting depth limit"),
-            );
-        } else {
-            error.insert("domain_result".into(), result);
-        }
-    }
-    error.insert("domain_disposition".into(), json!(disposition.as_str()));
-    Value::Object(error)
+    khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Value {
+        error,
+        disposition,
+    })
+    .into_error()
 }
