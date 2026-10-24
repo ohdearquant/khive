@@ -1326,10 +1326,10 @@ and `failure_entry` with `error_with_disposition` (`crates/khive-mcp/src/server/
 That builder does more than drop a nested `domain_result`. It turns a bare string error into an
 object with `kind = "runtime_error"`, and any other non-object error into one whose message is
 `operation failed` (`batch_types.rs:228`). For a committed error whose `domain_result` exceeds the
-nesting depth limit it replaces `code` and `message`. It writes the error's `domain_disposition`
-from the boundary's disposition (`batch_types.rs:247`), which the wrapper then resets to the
-projection's own (`dispatch_helpers.rs:396`), while the entry's `domain_disposition` keeps the
-boundary's (`batch_types.rs:188`), so the two fields can differ. All of these are classifier
+nesting depth limit it replaces `code` and `message`. The wrapper sets the error's `domain_disposition`
+to the projection's own (`dispatch_helpers.rs:396`), and `failure_entry` then overwrites it with the
+boundary's disposition (`batch_types.rs:247`) and writes the same disposition on the entry
+(`batch_types.rs:188`), so on this path the two fields always agree. All of these are classifier
 inputs, so an entry assembled from the runtime projection alone can classify differently from the
 server's entry for the same error.
 
