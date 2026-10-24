@@ -193,7 +193,7 @@ prepare snapshot so an earlier op in the same atomic unit cannot make the no-op 
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
 visible namespace set.
 Every hit carries `full_id`, a canonical dashed UUID that can be passed directly to
-the strict `memory.feedback(target_id=...)` contract across requests. `full_id` is
+the strict `memory.feedback(id=...)` contract across requests. `full_id` is
 present under the default `json` output format in any presentation mode; the `auto`
 and `table` formats omit it unless the request sets `presentation=verbose`.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally

@@ -304,7 +304,7 @@ must name `memory`. Adds the `memory` note kind.
 | ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                      |
 | `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                             |
-| `memory.feedback` | `target_id`, `signal`                                                                  | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
+| `memory.feedback` | `id`, `signal`                                                                         | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
 | `memory.prune`    | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014) |
 | `memory.vacuum`   | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                |
 
