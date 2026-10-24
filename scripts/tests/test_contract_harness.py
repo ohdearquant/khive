@@ -372,7 +372,7 @@ class HarnessTests(unittest.TestCase):
                 # The short budget belongs to the reap: this server ignores EOF,
                 # so exclude spawn, handshake and the successful request from the
                 # timer that checks close's two reap waits.
-                with self.adapter(kind, store, "ignore_eof", reap_timeout=reap_budget) as request:
+                with self.adapter(kind, store, "ignore_eof", reap_timeout=reap_budget, startup_timeout=2.0) as request:
                     self.assertEqual(request(), [])
                     if kind == "pytest":
                         session = request.__self__
