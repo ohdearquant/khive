@@ -202,5 +202,5 @@ the recorded release and are not new measurements or promises.
 | parse single (complex) | memory.remember 5 args + UUID | latency median | Advisory trend; last ledger value 1.390 µs   | historical: 1.390 µs |
 | parse batch (10 ops)   | 10-op parallel batch          | latency median | Advisory trend; last ledger value 7.083 µs   | historical: 7.083 µs |
 | parse chain (5 ops)    | 5-op chain with $prev         | latency median | Advisory trend; last ledger value 2.948 µs   | historical: 2.948 µs |
-| parse batch (100 ops)  | 100-op batch (MAX_OPS)        | latency median | Advisory trend against the recorded baseline | pending              |
-| plan_request           | 10-op batch                   | latency median | Advisory trend against the recorded baseline | pending              |
+| parse batch (100 ops)  | 100-op batch (MAX_OPS)        | latency median | Advisory trend against the recorded baseline | 49.937 µs (415e1e86) |
+| plan_request           | 10-op batch                   | latency median | Advisory trend against the recorded baseline | 16.593 µs (415e1e86) |
