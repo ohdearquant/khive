@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 
 use super::events_daemon::events_daemon_command;
+use super::policy_entries::run_events_daemon_with_wal_ceiling;
 use super::registry::{direct_backend_with_policies, EventsSplitConfig};
 use crate::RuntimeError;
 use khive_db::{SqliteError, WalCeilingSource};
