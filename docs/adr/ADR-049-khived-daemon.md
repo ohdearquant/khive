@@ -1328,7 +1328,7 @@ interrupts a `COMMIT` that is already executing.
 
 The main daemon registers `supervise_events_daemon_with_readiness` as the tracked
 `events_daemon_supervision` task (`crates/khive-mcp/src/serve/startup.rs`). The supervisor
-(`crates/khive-runtime/src/events_split/daemon.rs`) spawns the events-daemon subcommand when its socket
+(`crates/khive-runtime/src/events_split/events_daemon.rs`) spawns the events-daemon subcommand when its socket
 is unreachable and no child handle is retained, subject to its respawn interval. It polls the retained
 child before each socket probe. A successful exit poll reaps the child; a poll error retains the
 handle for a later attempt unless the OS reports `ECHILD`, which clears the handle without signalling
