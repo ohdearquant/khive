@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlColumnError, SqlRow, SqlStatement, SqlValue};
+use khive_storage::{SqlReader, SqlWriter};
 use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
@@ -376,6 +377,18 @@ pub(crate) async fn select_active_grant(
     now: i64,
     registration: Option<&RegistryPin>,
 ) -> Result<Option<GrantRow>, RuntimeError> {
+    let mut reader = rt.sql().reader().await?;
+    select_active_grant_on(reader.as_mut(), ns, actor, tool, now, registration).await
+}
+
+async fn select_active_grant_on<R: SqlReader + ?Sized>(
+    reader: &mut R,
+    ns: &str,
+    actor: &str,
+    tool: &str,
+    now: i64,
+    registration: Option<&RegistryPin>,
+) -> Result<Option<GrantRow>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
     let tool_match = pattern_match_sql("tool", 3);
     let mut params = vec![
@@ -392,7 +405,6 @@ pub(crate) async fn select_active_grant(
             "registry_id = ?5 AND definition_digest = ?6"
         }
     };
-    let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
@@ -410,6 +422,29 @@ pub(crate) async fn select_active_grant(
         })
         .await?;
     rows.first().map(GrantRow::from_active_row).transpose()
+}
+
+/// Return the live grant id using the caller's SQL writer and prepared inputs.
+///
+/// Uses the same selection and strict row decoding as [`decide`]. The caller
+/// supplies the authorized namespace, evaluation time and registration pin; this
+/// function does not resolve the current registration or acquire a connection.
+/// To make a check and a dependent write atomic, call both with the writer passed
+/// to one [`khive_storage::SqlAccess::atomic_unit`] closure. This function opens no
+/// transaction and performs only SQL and bounded in-memory result bookkeeping.
+pub async fn active_grant_on(
+    writer: &mut dyn SqlWriter,
+    ns: &str,
+    actor: &str,
+    tool: &str,
+    now: i64,
+    registration: Option<&RegistryPin>,
+) -> Result<Option<String>, RuntimeError> {
+    Ok(
+        select_active_grant_on(writer, ns, actor, tool, now, registration)
+            .await?
+            .map(|grant| grant.id),
+    )
 }
 
 pub(crate) struct PolicyWrite<'a> {
