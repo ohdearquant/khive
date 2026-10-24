@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlColumnError, SqlRow, SqlStatement, SqlValue};
-use khive_storage::{SqlReader, SqlWriter};
+use khive_storage::SqlReader;
 use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
@@ -378,17 +378,33 @@ pub(crate) async fn select_active_grant(
     registration: Option<&RegistryPin>,
 ) -> Result<Option<GrantRow>, RuntimeError> {
     let mut reader = rt.sql().reader().await?;
-    select_active_grant_on(reader.as_mut(), ns, actor, tool, now, registration).await
+    Ok(select_grant_on(
+        reader.as_mut(),
+        ns,
+        actor,
+        tool,
+        now,
+        registration,
+        GrantSelector::ByActor,
+    )
+    .await?
+    .map(|(grant, _)| grant))
 }
 
-async fn select_active_grant_on<R: SqlReader + ?Sized>(
-    reader: &mut R,
+enum GrantSelector<'a> {
+    ByActor,
+    Id(&'a str),
+}
+
+async fn select_grant_on(
+    reader: &mut dyn SqlReader,
     ns: &str,
     actor: &str,
     tool: &str,
     now: i64,
     registration: Option<&RegistryPin>,
-) -> Result<Option<GrantRow>, RuntimeError> {
+    selector: GrantSelector<'_>,
+) -> Result<Option<(GrantRow, bool)>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
     let tool_match = pattern_match_sql("tool", 3);
     let mut params = vec![
@@ -405,46 +421,107 @@ async fn select_active_grant_on<R: SqlReader + ?Sized>(
             "registry_id = ?5 AND definition_digest = ?6"
         }
     };
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
+    let scope = "namespace = ?1";
+    let activity = format!(
+        "{scope} AND status = 'granted' \
+         AND {actor_match} AND {tool_match} \
+         AND (expires_at IS NULL OR expires_at > ?4) \
+         AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL \
+         AND {pinned}"
+    );
+    let (sql, check_activity, label) = match selector {
+        GrantSelector::ByActor => (
+            format!(
                 "SELECT {GRANT_COLUMNS} FROM tool_grants \
-                 WHERE namespace = ?1 AND status = 'granted' \
-                 AND {actor_match} AND {tool_match} \
-                 AND (expires_at IS NULL OR expires_at > ?4) \
-                 AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL \
-                 AND {pinned} \
+                 WHERE {activity} \
                  ORDER BY requested_at DESC, id ASC \
                  LIMIT 1"
             ),
+            false,
+            "tool_grant_decide",
+        ),
+        GrantSelector::Id(grant_id) => {
+            params.push(SqlValue::Text(grant_id.to_string()));
+            let id_param = params.len();
+            (
+                format!(
+                    "SELECT {GRANT_COLUMNS}, \
+                     CASE WHEN ({activity}) THEN 1 ELSE 0 END AS grant_active \
+                     FROM tool_grants WHERE {scope} AND id = ?{id_param} LIMIT 1"
+                ),
+                true,
+                "tool_grant_active_by_id",
+            )
+        }
+    };
+    let rows = reader
+        .query_all(SqlStatement {
+            sql,
             params,
-            label: Some("tool_grant_decide".into()),
+            label: Some(label.into()),
         })
         .await?;
-    rows.first().map(GrantRow::from_active_row).transpose()
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    // Parse the named row even when an activity term fails. A malformed grant
+    // must not be reported as absent or inactive.
+    let grant = GrantRow::from_active_row(row)?;
+    let active = if check_activity {
+        let value = row.i64("grant_active").map_err(|error| {
+            RuntimeError::Internal(format!("invalid tool_grants row {}: {error}", grant.id))
+        })?;
+        match value {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(RuntimeError::Internal(format!(
+                    "invalid tool_grants row {}: grant_active must be 0 or 1",
+                    grant.id
+                )));
+            }
+        }
+    } else {
+        true
+    };
+    Ok(Some((grant, active)))
 }
 
-/// Return the live grant id using the caller's SQL writer and prepared inputs.
+/// Check the named grant using the caller's SQL reader and prepared inputs.
 ///
-/// Uses the same selection and strict row decoding as [`decide`]. The caller
-/// supplies the authorized namespace, evaluation time and registration pin; this
-/// function does not resolve the current registration or acquire a connection.
-/// To make a check and a dependent write atomic, call both with the writer passed
-/// to one [`khive_storage::SqlAccess::atomic_unit`] closure. This function opens no
-/// transaction and performs only SQL and bounded in-memory result bookkeeping.
-pub async fn active_grant_on(
-    writer: &mut dyn SqlWriter,
+/// Uses the same activity predicate, pattern matching and strict row decoding as
+/// [`decide`], but checks only `grant_id` in `ns`; another matching grant cannot
+/// authorize it. A malformed named row is an error even when it is inactive.
+/// The caller supplies the authorized namespace, evaluation time and registration
+/// pin. Both `now` and the pin are snapshots: this function does not refresh the
+/// registration or guarantee validity at consumption or commit time.
+///
+/// A unit may pass its writer as this reader and perform its dependent write on
+/// that same writer. This function issues one statement, awaits nothing else,
+/// acquires no connection, opens no transaction and appends no decision event.
+/// A new production unit caller must still satisfy ADR-091's transaction audit.
+/// See ADR-180 Amendment 7.
+pub async fn grant_is_active_on(
+    reader: &mut dyn SqlReader,
     ns: &str,
+    grant_id: &str,
     actor: &str,
     tool: &str,
     now: i64,
     registration: Option<&RegistryPin>,
-) -> Result<Option<String>, RuntimeError> {
-    Ok(
-        select_active_grant_on(writer, ns, actor, tool, now, registration)
-            .await?
-            .map(|grant| grant.id),
+) -> Result<bool, RuntimeError> {
+    Ok(select_grant_on(
+        reader,
+        ns,
+        actor,
+        tool,
+        now,
+        registration,
+        GrantSelector::Id(grant_id),
     )
+    .await?
+    .map(|(_, active)| active)
+    .unwrap_or(false))
 }
 
 pub(crate) struct PolicyWrite<'a> {
@@ -1013,5 +1090,158 @@ mod tests {
         assert!(!pattern_matches("mcp.*", "comm.send"));
         assert!(pattern_matches("comm.send", "comm.send"));
         assert!(!pattern_matches("comm.send", "comm.sendx"));
+    }
+
+    #[tokio::test]
+    async fn selected_grant_modes_refuse_missing_or_mistyped_required_cells() {
+        struct FixedGrantReader {
+            row: SqlRow,
+            calls: usize,
+        }
+
+        #[async_trait::async_trait]
+        impl khive_storage::SqlReader for FixedGrantReader {
+            async fn query_row(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+            ) -> khive_storage::StorageResult<Option<SqlRow>> {
+                self.calls += 1;
+                panic!("selected-grant regression must use only query_all");
+            }
+
+            async fn query_all(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+            ) -> khive_storage::StorageResult<Vec<SqlRow>> {
+                self.calls += 1;
+                Ok(vec![self.row.clone()])
+            }
+
+            async fn query_page(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+                _page: khive_storage::PageRequest,
+            ) -> khive_storage::StorageResult<Vec<SqlRow>> {
+                self.calls += 1;
+                panic!("selected-grant regression must use only query_all");
+            }
+
+            async fn query_scalar(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+            ) -> khive_storage::StorageResult<Option<SqlValue>> {
+                self.calls += 1;
+                panic!("selected-grant regression must use only query_all");
+            }
+
+            async fn count(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+            ) -> khive_storage::StorageResult<u64> {
+                self.calls += 1;
+                panic!("selected-grant regression must use only query_all");
+            }
+
+            async fn explain(
+                &mut self,
+                _statement: khive_storage::SqlStatement,
+            ) -> khive_storage::StorageResult<Vec<SqlRow>> {
+                self.calls += 1;
+                panic!("selected-grant regression must use only query_all");
+            }
+        }
+
+        // ByActor is the exact internal selected-row path called by decide.
+        // This supplement does not claim ordinary SQL can select a missing or
+        // mistyped status while satisfying its status='granted' filter.
+        for by_id in [false, true] {
+            let mode = if by_id {
+                "Id"
+            } else {
+                "ByActor/decide-selected"
+            };
+            let selector = || {
+                if by_id {
+                    super::GrantSelector::Id("grant-id")
+                } else {
+                    super::GrantSelector::ByActor
+                }
+            };
+            let mut healthy = active_row();
+            healthy.columns.push(SqlColumn {
+                name: "grant_active".into(),
+                value: SqlValue::Integer(1),
+            });
+            let mut reader = FixedGrantReader {
+                row: healthy.clone(),
+                calls: 0,
+            };
+            let result = super::select_grant_on(
+                &mut reader,
+                "local",
+                "actor",
+                "tool",
+                100,
+                None,
+                selector(),
+            )
+            .await;
+            assert_eq!(reader.calls, 1, "healthy selected-row query count: {mode}");
+            let (grant, active) = result
+                .expect("healthy selected row decodes")
+                .expect("healthy selected row is present");
+            assert_eq!(
+                grant.id, "grant-id",
+                "healthy selected-row identity: {mode}"
+            );
+            assert!(active, "healthy selected-row activity: {mode}");
+
+            for column in [
+                "id",
+                "actor",
+                "tool",
+                "status",
+                "requested_at",
+                "expires_at",
+            ] {
+                for replacement in [None, Some(SqlValue::Blob(vec![0]))] {
+                    let missing = replacement.is_none();
+                    let mut row = healthy.clone();
+                    row.columns.retain(|field| field.name != column);
+                    if let Some(value) = replacement {
+                        row.columns.push(SqlColumn {
+                            name: column.into(),
+                            value,
+                        });
+                    }
+                    let mut reader = FixedGrantReader { row, calls: 0 };
+                    let result = super::select_grant_on(
+                        &mut reader,
+                        "local",
+                        "actor",
+                        "tool",
+                        100,
+                        None,
+                        selector(),
+                    )
+                    .await;
+                    assert_eq!(
+                        reader.calls, 1,
+                        "malformed selected-row query count: {mode} {column} missing={missing}"
+                    );
+                    let message = match result {
+                        Err(khive_runtime::RuntimeError::Internal(message)) => message,
+                        other => panic!("selected-row decode must refuse: {mode} {column} missing={missing}: {other:?}"),
+                    };
+                    let expected_id = if column == "id" {
+                        "<unreadable id>"
+                    } else {
+                        "grant-id"
+                    };
+                    assert!(message.contains(expected_id), "selected-row error lost identity: {mode} {column} missing={missing}: {message}");
+                    assert!(message.contains(&format!("SQL column {column}")), "selected-row error lost column: {mode} {column} missing={missing}: {message}");
+                }
+            }
+        }
     }
 }
