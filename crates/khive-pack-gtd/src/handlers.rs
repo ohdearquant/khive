@@ -34,12 +34,13 @@ use crate::schema::{
 use crate::GtdPack;
 
 fn idempotency_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
+    let key = mask_for_redaction_surface(RedactionSurface::GateProbe, key);
     KhiveError::conflict(format!(
         "idempotency_key_conflict: key {key:?} already exists; stored content differs (existing task {existing_id})"
     ))
     .with_details(Details::new_owned([
         ("reason", "idempotency_key_conflict".into()),
-        ("key", key.to_owned()),
+        ("key", key.into_owned()),
         ("existing_id", existing_id.to_string()),
     ]))
     .into()
@@ -386,7 +387,8 @@ pub async fn resolve_uuid(
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -406,7 +408,8 @@ async fn resolve_lifecycle_uuid(s: &str, runtime: &KhiveRuntime) -> Result<Uuid,
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -426,7 +429,8 @@ pub(crate) async fn resolve_context_entity_id(
         RuntimeError::InvalidInput(format!(
             "context_entity_id must be a full UUID because a short prefix would require a \
              primary-namespace resolution and this field stores an explicit stable entity \
-             reference; got {raw:?}"
+             reference; got {:?}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
         ))
     })?;
 
