@@ -1113,7 +1113,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "node_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
