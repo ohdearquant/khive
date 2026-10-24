@@ -461,42 +461,41 @@ async fn create_task_json_string_field_refusals_mask_credentials_without_writes(
         .dispatch(
             "create",
             json!({"kind": "task", "name": "Healthy top-level fields", "content": "Safe task body",
-        "due": "2026-06-01", "timezone": "UTC", "priority": "P1"}),
+        "due": "2026-06-01", "priority": "P1", "properties": {"timezone": "UTC"}}),
         )
         .await
-        .expect("actual create accepts the supported top-level task fields");
+        .expect("actual create accepts top-level due and priority with nested timezone");
     assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 2);
     let secret = credential();
-    for field in ["due", "timezone"] {
-        for nested in [false, true] {
-            for (value, masked) in [
-                (json!({"label": "ordinary"}), false),
-                (json!(["ordinary"]), false),
-                (json!({"credential": secret.clone()}), true),
-                (json!([{"credential": secret.clone()}]), true),
-            ] {
-                let secret = masked.then_some(secret.as_str());
-                let shown = json_operand_shown(&value, secret);
-                let mut args = json!({"kind": "task", "name": "Refused JSON task", "content": "Safe task body", "properties": {}});
-                let display_name = if nested {
-                    // Parsing is eager: even a valid winning top-level value
-                    // must not hide a malformed nested calling convention.
-                    args[field] = json!(if field == "due" { "2026-06-01" } else { "UTC" });
-                    args["properties"][field] = value;
-                    format!("properties.{field}")
-                } else {
-                    args[field] = value;
-                    field.to_owned()
-                };
-                refuse(
-                    &registry,
-                    "create",
-                    args,
-                    format!("{display_name} must be a string or null; got {shown}"),
-                    secret,
-                )
-                .await;
-            }
+    // Generic create exposes due at the top level and in properties;
+    // timezone is supported only through properties at this public boundary.
+    for (field, nested) in [("due", false), ("due", true), ("timezone", true)] {
+        for (value, masked) in [
+            (json!({"label": "ordinary"}), false),
+            (json!(["ordinary"]), false),
+            (json!({"credential": secret.clone()}), true),
+            (json!([{"credential": secret.clone()}]), true),
+        ] {
+            let secret = masked.then_some(secret.as_str());
+            let shown = json_operand_shown(&value, secret);
+            let mut args = json!({"kind": "task", "name": "Refused JSON task", "content": "Safe task body", "due": "2026-06-01", "properties": {}});
+            let display_name = if nested {
+                // Parsing is eager: the valid winning top-level due must
+                // not hide a malformed properties.due value.
+                args["properties"][field] = value;
+                format!("properties.{field}")
+            } else {
+                args[field] = value;
+                field.to_owned()
+            };
+            refuse(
+                &registry,
+                "create",
+                args,
+                format!("{display_name} must be a string or null; got {shown}"),
+                secret,
+            )
+            .await;
         }
     }
 }
