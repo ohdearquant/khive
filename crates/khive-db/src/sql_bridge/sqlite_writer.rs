@@ -374,6 +374,17 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // A single statement is self-contained, just like execute_batch.
         // Manual atomic units use their own synchronous InlineWriter; this
         // cached handle never borrows a transaction-wide volume lease.
+        if let Some(keyword) = transaction_control_head(&statement.sql) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "execute".into(),
+                message: format!(
+                    "statement is transaction control ({keyword}); a cached writer \
+                     holds the volume lease only for the call — use \
+                     atomic_unit to run statements as one transaction"
+                ),
+            });
+        }
         // Route through the writer task when available. `self.handle` is
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
@@ -404,17 +415,6 @@ impl khive_storage::SqlWriter for SqliteWriter {
         self.require_standalone_handle("execute")?;
         // A cached standalone statement owns the lease for this call only.
         // Cross-statement transactions belong to atomic_unit's owner.
-        if let Some(keyword) = transaction_control_head(&statement.sql) {
-            return Err(StorageError::InvalidInput {
-                capability: StorageCapability::Sql,
-                operation: "execute".into(),
-                message: format!(
-                    "statement is transaction control ({keyword}); a standalone \
-                     statement holds the volume lease only for the call — use \
-                     atomic_unit to run statements as one transaction"
-                ),
-            });
-        }
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
