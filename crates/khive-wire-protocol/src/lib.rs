@@ -106,19 +106,16 @@
 //! shape is owned by the verb result surface (ADR-016) and the per-topic
 //! event catalog respectively, not by this crate.
 //!
-//! Three deliberate boundaries of the strictness, stated so nobody
-//! re-derives them:
+//! Three details of the strictness, stated so nobody re-derives them:
 //!
-//! - **Explicit `null` on an optional field is equivalent to absence.**
-//!   Optional payload fields are `Option<T>`; a member present with value
-//!   `null` decodes as absent and re-encodes with the member omitted. No
-//!   frame distinguishes present-null from absent.
-//! - **Duplicate members are last-wins, not rejected.** Payloads pass
-//!   through `serde_json`'s object model before field checking, so a
-//!   duplicated member name silently keeps the last occurrence —
-//!   `deny_unknown_fields` cannot see the earlier one. Rejecting
-//!   duplicates would require validating the raw document; the grammar
-//!   takes the documented last-wins stance instead.
+//! - **Optional envelope fields may be omitted, but may not be `null`.**
+//!   ADR-137 Amendment 1 Decision 4 rejects present-null on the declared
+//!   optional Request, Subscribe and Error fields. Opaque JSON nulls remain
+//!   data; this is not a recursive field-name or null prohibition.
+//! - **Duplicate envelope members are rejected before field validation.**
+//!   Raw serde and the codec compare decoded member names, including
+//!   escaped-equivalent and unknown names. This rule does not inspect
+//!   duplicate members inside opaque `result` or `payload` values.
 //! - **`topic` syntax is not validated here.** The codec accepts any JSON
 //!   string (including empty) for `subscribe`/`unsubscribe`/`event`
 //!   topics; the `<domain>.<event>` shape is enforced by the server

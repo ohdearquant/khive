@@ -476,6 +476,15 @@ pub fn decode_frame_with_consumed(
 /// [`Frame::Error`](crate::frame::Frame)'s `unrecognized_code` diagnostic
 /// field.
 pub(crate) fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
+    // Decision 4 requires the Frame visitor to see raw envelope members.
+    // A Value-first success path would erase duplicate keys before it runs.
+    let error = match serde_json::from_slice::<Frame>(payload) {
+        Ok(frame) => return Ok(frame),
+        Err(error) => error,
+    };
+
+    // This second parse classifies an already-refused payload only. It
+    // must never deserialize the Value back into an accepted Frame.
     let value: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| CodecError::InvalidJson(e.to_string()))?;
 
@@ -490,17 +499,14 @@ pub(crate) fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
         return Err(CodecError::UnknownFrameKind(kind));
     }
 
-    serde_json::from_value(value).map_err(|e| {
-        // The visitor reports an id/scope violation through the
-        // deserializer's error type; lift it back into the typed variant
-        // so callers can branch on the specific failure.
-        let detail = e.to_string();
-        match detail.strip_prefix(INCONSISTENT_SCOPE_ERROR_PREFIX) {
-            Some(scope_detail) => CodecError::InconsistentErrorScope {
-                detail: scope_detail.to_string(),
-            },
-            None => CodecError::InvalidFields { kind, detail },
-        }
+    // Preserve the visitor's original refusal, including duplicate keys
+    // and present-null fields, while retaining typed id/scope diagnostics.
+    let detail = error.to_string();
+    Err(match detail.strip_prefix(INCONSISTENT_SCOPE_ERROR_PREFIX) {
+        Some(scope_detail) => CodecError::InconsistentErrorScope {
+            detail: scope_detail.to_string(),
+        },
+        None => CodecError::InvalidFields { kind, detail },
     })
 }
 

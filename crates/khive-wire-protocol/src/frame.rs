@@ -108,6 +108,17 @@ pub struct HandshakeAckPayload {
     pub version: ProtocolVersion,
 }
 
+// Optional envelope fields distinguish omission from an explicit null under
+// ADR-137 Amendment 1 Decision 4. The field default handles omission; a
+// present field must deserialize as T itself, rather than Option<T>.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// The field set of a [`Frame::Request`] payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,20 +130,36 @@ pub struct RequestPayload {
     /// Optional deadline in milliseconds, measured from server receipt
     /// of this frame against the server's monotonic clock. Scopes the
     /// entire request frame (the whole DSL batch or chain).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub deadline_ms: Option<u64>,
     /// Frame-level namespace override. Legal only on transports that
     /// accept caller-supplied identity context; a mapped transport
     /// (ADR-137's TCP transport) rejects any request carrying this with
     /// [`crate::error::WireErrorCode::ContextRejected`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub namespace: Option<String>,
     /// Frame-level actor override; see `namespace` above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub actor_id: Option<String>,
     /// Frame-level visible-namespace-set override; see `namespace`
     /// above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub visible_namespaces: Option<Vec<String>>,
 }
 
@@ -155,7 +182,11 @@ pub struct ErrorPayload {
     /// The operation id this error terminates, for a request-scoped
     /// error. `None` for a connection-terminal error, which carries no
     /// operation id (ADR-137, "Operation correlation").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub id: Option<OperationId>,
     /// The wire error code.
     pub code: crate::error::WireErrorCode,
@@ -185,7 +216,11 @@ pub struct SubscribePayload {
     /// Resume position. Absent starts delivery at new events only;
     /// present replays every retained event with a cursor greater than
     /// this value before delivering new events.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub resume_cursor: Option<Cursor>,
 }
 
@@ -631,9 +666,9 @@ impl Serialize for Frame {
 
 /// The decode half of the closed grammar; see the type-level docs and the
 /// crate documentation's "Strict field rejection" section. The codec's
-/// `decode_payload` drives this via `serde_json::from_value::<Frame>`
-/// after its own closed-set `"kind"` check (which produces the
-/// finer-grained [`crate::codec::CodecError::UnknownFrameKind`]).
+/// `decode_payload` drives this directly from the raw JSON bytes, before
+/// any diagnostic parsing into a Value can discard duplicate members.
+/// It re-classifies refusals into the codec's finer-grained error types.
 ///
 /// The visitor enforces every decode-time rule that only needs the fields
 /// of one frame, so a DIRECT serde decode of `Frame` (e.g.
@@ -664,14 +699,20 @@ impl<'de> Deserialize<'de> for Frame {
                 formatter.write_str("a JSON object with a string \"kind\" discriminant field")
             }
 
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Frame, A::Error> {
-                // Buffer the whole object, then inspect `"kind"` before any
-                // per-kind parsing: the closed-set check needs the
-                // discriminant up front, and the per-kind payload structs
-                // (all `deny_unknown_fields`) must never see the `"kind"`
-                // key itself.
-                let mut object: serde_json::Map<String, serde_json::Value> =
-                    Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Frame, A::Error> {
+                // Decision 4: reject every repeated decoded envelope key
+                // before kind or per-kind field validation. Values inside
+                // result/payload remain opaque JSON, not envelope grammar.
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if object.contains_key(&key) {
+                        return Err(A::Error::custom(format!(
+                            "duplicate envelope field `{key}`"
+                        )));
+                    }
+                    let value = map.next_value::<serde_json::Value>()?;
+                    object.insert(key, value);
+                }
                 let kind_value = object
                     .get("kind")
                     .ok_or_else(|| A::Error::custom("missing field `kind`"))?;
@@ -838,10 +879,9 @@ impl<'de> Deserialize<'de> for Frame {
                             payload: payload.payload,
                         })
                     }
-                    // The codec's closed-set check against `FRAME_KINDS`
-                    // rejects unknown kinds with `UnknownFrameKind` before
-                    // this point; this arm only fires for a direct
-                    // `serde_json::from_value::<Frame>` call.
+                    // The codec re-classifies this refusal as
+                    // UnknownFrameKind. Direct serde retains its own
+                    // deserializer error type.
                     other => Err(A::Error::custom(format!("unknown frame kind: {other:?}"))),
                 }
             }

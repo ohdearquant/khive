@@ -256,3 +256,33 @@ fn opaque_payloads_are_preserved_semantically_not_byte_for_byte() {
         "expected sorted key order in re-encoded payload: {payload}"
     );
 }
+
+#[test]
+fn rejects_raw_duplicate_envelope_keys_without_value_fallback_acceptance() {
+    let codec = FrameCodec::default();
+    let healthy = Frame::Cancel {
+        id: OperationId::from("op-1"),
+    };
+    assert_eq!(
+        codec.decode(&codec.encode(&healthy).unwrap()).unwrap(),
+        healthy
+    );
+    for payload in [
+        br#"{"kind":"cancel","id":"op-1","id":"op-1"}"#.as_slice(),
+        br#"{"kind":"cancel","id":"","id":"op-1"}"#.as_slice(),
+        br#"{"kind":"cancel","id":"op-1","\u0069d":"op-1"}"#.as_slice(),
+        br#"{"kind":"cancel","kind":"cancel","id":"op-1"}"#.as_slice(),
+        br#"{"kind":"handshake","version":0,"version":1}"#.as_slice(),
+        br#"{"kind":"cancel","id":"op-1","extra":1,"extra":2}"#.as_slice(),
+    ] {
+        let mut wire = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+        wire.extend_from_slice(payload);
+        match codec.decode_with_consumed(&wire).unwrap_err() {
+            CodecError::InvalidFields { detail, .. } => assert!(
+                detail.contains("duplicate envelope field"),
+                "D4 raw duplicate was not the refusal: {detail}"
+            ),
+            other => panic!("expected a duplicate-envelope refusal, got {other:?}"),
+        }
+    }
+}

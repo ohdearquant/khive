@@ -261,3 +261,91 @@ fn direct_serde_leaves_unrecognized_code_none_for_a_literal_internal() {
         other => panic!("expected an error frame, got {other:?}"),
     }
 }
+
+#[test]
+fn direct_serde_rejects_duplicate_envelope_keys_before_field_validation() {
+    // Amendment 1 Decision 4 supersedes lossy root-map last-wins behavior.
+    // Missing/unknown fields and invalid first values must not hide a duplicate.
+    for raw in [
+        r#"{"kind":"cancel","kind":"cancel","id":"op-1"}"#,
+        r#"{"kind":"cancel","id":"","id":"op-1"}"#,
+        r#"{"kind":"cancel","id":"op-1","\u0069d":"op-1"}"#,
+        r#"{"kind":"cancel","id":"op-1","extra":1,"extra":2}"#,
+        r#"{"extra":1,"extra":2}"#,
+    ] {
+        let error = serde_json::from_str::<Frame>(raw).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate envelope field"),
+            "D4 must reject the duplicate before field validation: {raw}: {error}"
+        );
+    }
+}
+
+#[test]
+fn direct_serde_distinguishes_omitted_optional_fields_from_null() {
+    let cases = [
+        (
+            "deadline_ms",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","deadline_ms":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "namespace",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","namespace":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "actor_id",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","actor_id":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "visible_namespaces",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","visible_namespaces":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "resume_cursor",
+            r#"{"kind":"subscribe","id":"op-1","topic":"a.b","resume_cursor":null}"#,
+            r#"{"kind":"subscribe","id":"op-1","topic":"a.b"}"#,
+        ),
+        (
+            "id",
+            r#"{"kind":"error","id":null,"code":"unsupported_version","message":"unsupported"}"#,
+            r#"{"kind":"error","code":"unsupported_version","message":"unsupported"}"#,
+        ),
+    ];
+    for (field, raw, omitted) in cases {
+        // Prove the otherwise equivalent omitted form is a valid frame first.
+        let healthy: Frame = serde_json::from_str(omitted).unwrap();
+        assert!(serde_json::to_value(healthy).unwrap().get(field).is_none());
+        let error = serde_json::from_str::<Frame>(raw).unwrap_err();
+        assert!(error.to_string().contains("null"), "D4 {field}: {error}");
+    }
+
+    // The same names, nulls and repeated members inside opaque JSON are data.
+    let response: Frame = serde_json::from_str(
+        r#"{"kind":"response","id":"op-1","result":{"namespace":null,"id":1,"id":2}}"#,
+    )
+    .unwrap();
+    let Frame::Response { result, .. } = response else {
+        panic!("expected response")
+    };
+    assert_eq!(result.get("namespace"), Some(&serde_json::Value::Null));
+    let response_null: Frame =
+        serde_json::from_str(r#"{"kind":"response","id":"op-1","result":null}"#).unwrap();
+    assert!(matches!(
+        response_null,
+        Frame::Response {
+            result: serde_json::Value::Null,
+            ..
+        }
+    ));
+    let event: Frame = serde_json::from_str(
+        r#"{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{"resume_cursor":null,"id":1,"id":2}}"#,
+    ).unwrap();
+    let Frame::Event { payload, .. } = event else {
+        panic!("expected event")
+    };
+    assert_eq!(payload.get("resume_cursor"), Some(&serde_json::Value::Null));
+}
