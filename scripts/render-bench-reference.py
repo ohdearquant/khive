@@ -30,6 +30,7 @@ GENERATED_NOTICE = (
     "`scripts/render-bench-reference.py`; do not edit this block."
 )
 UNMEASURED = "unmeasured"
+NOT_A_TIMING = "n/a"
 
 
 class RenderError(Exception):
@@ -187,12 +188,11 @@ def _v2_rows(
     commit: str,
     date: str,
 ) -> list[Row]:
-    """Turn one scenario record, flat or keyed by metric, into table rows."""
-    if "disposition" in record:
-        return [_v2_row(record, label, where, commit, date)]
-
+    """Turn one scenario record, keyed by metric, into table rows."""
     if not record:
-        raise RenderError(f"{where} must name a disposition or a metric")
+        raise RenderError(f"{where} must name at least one metric")
+    if "verdict" in record:
+        raise RenderError(f"{where} must be keyed by metric, each metric holding its verdict")
     rows: list[Row] = []
     for metric in sorted(record):
         metric_record = _require_mapping(record[metric], f"{where}[{metric!r}]")
@@ -208,6 +208,16 @@ def _v2_rows(
     return rows
 
 
+def _as_emitted(value: Any, where: str) -> str:
+    """A value that is not a timing, written as the benchmark emitted it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RenderError(f"{where} must be a number")
+    if isinstance(value, float):
+        _require_number(value, where)
+        return repr(value)
+    return str(value)
+
+
 def _v2_row(
     record: dict[str, Any],
     label: str,
@@ -215,26 +225,47 @@ def _v2_row(
     commit: str,
     date: str,
 ) -> Row:
-    disposition = record.get("disposition")
-    if disposition == "MEASURED":
-        if "median_ns" in record:
-            value = _duration(
-                _require_number(record.get("median_ns"), f"{where}.median_ns")
-            )
-            aa_value = record.get("aa_spread")
-        elif "value" in record:
-            unit = _require_string(record.get("unit"), f"{where}.unit")
-            number = _require_number(record.get("value"), f"{where}.value")
-            value = f"{number:.3f} {unit}"
-            aa_value = record.get("aa_spread")
+    """One metric record as the reference producer writes it.
+
+    A record's ``kind`` is ``criterion``, ``bench-json`` or ``allocation``.  A
+    record converted from a v1 file keeps its v1 fields as committed and has no
+    ``kind``; v1 holds only Criterion medians, so it renders as one.  A
+    bench-json statistic named ``*_ns`` is a timing; any other statistic and an
+    allocation report are not timings and have no A/A ratio.
+    """
+    verdict = record.get("verdict")
+    if isinstance(verdict, str) and verdict.upper() == UNMEASURED.upper():
+        return Row(label, UNMEASURED, UNMEASURED, commit, date)
+    if verdict != "MEASURED":
+        raise RenderError(f"{where}.verdict must be MEASURED or UNMEASURED")
+
+    kind = record.get("kind")
+    if kind is None or kind == "criterion":
+        value = _duration(_require_number(record.get("median_ns"), f"{where}.median_ns"))
+        aa = _ratio(_require_number(record.get("aa_spread"), f"{where}.aa_spread"))
+    elif kind == "bench-json":
+        statistic = _require_string(record.get("statistic"), f"{where}.statistic")
+        if statistic.endswith("_ns"):
+            value = _duration(_require_number(record.get("value"), f"{where}.value"))
+            aa = _ratio(_require_number(record.get("aa_spread"), f"{where}.aa_spread"))
         else:
-            raise RenderError(f"{where} has neither median_ns nor value")
-        aa = _ratio(_require_number(aa_value, f"{where}.aa_spread"))
-    elif isinstance(disposition, str) and disposition.upper() == UNMEASURED.upper():
-        value = UNMEASURED
-        aa = UNMEASURED
+            value = _as_emitted(record.get("value"), f"{where}.value")
+            if "unit" in record:
+                value = f"{value} {_require_string(record.get('unit'), f'{where}.unit')}"
+            aa = NOT_A_TIMING
+    elif kind == "allocation":
+        report = _require_mapping(record.get("report"), f"{where}.report")
+        fields = [
+            f"{name}={_as_emitted(report[name], f'{where}.report[{name!r}]')}"
+            for name in sorted(report)
+            if name != "scenario"
+        ]
+        if not fields:
+            raise RenderError(f"{where}.report has no counts")
+        value = ", ".join(fields)
+        aa = NOT_A_TIMING
     else:
-        raise RenderError(f"{where}.disposition must be MEASURED or UNMEASURED")
+        raise RenderError(f"{where}.kind {kind!r} is not criterion, bench-json or allocation")
     return Row(label, value, aa, commit, date)
 
 
