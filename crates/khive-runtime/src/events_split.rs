@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(unix)]
 use khive_db::{StorageBackend, WalCeilingPolicy};
 use khive_storage::event::{
     EventGroupBy, EventPageQuery, EventPageWindow, IdempotentEventBatchResult,
@@ -64,14 +65,18 @@ pub use events_count_read_budget::WireReadFailure;
 #[cfg(unix)]
 use events_count_read_budget::{count_storage_error_response, restore_count_read_failure};
 
+#[cfg(all(test, unix))]
+use tokio::net::UnixListener;
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use uuid::Uuid;
 
 #[cfg(unix)]
 use crate::daemon::{read_frame, write_frame};
 
+#[cfg(unix)]
 mod daemon;
+mod file_hardening;
 #[cfg(unix)]
 mod forwarder;
 mod paths;
@@ -89,10 +94,14 @@ pub use forwarder::*;
 #[cfg(unix)]
 use server::*;
 
-#[cfg(not(unix))]
-use daemon::refuse_events_db_symlinks;
 #[cfg(unix)]
 pub use daemon::*;
+
+#[cfg(all(test, unix))]
+use file_hardening::{
+    ensure_events_db_owner_only, ensure_events_db_parent_trusted, events_db_targets,
+    harden_events_db_sidecars, verify_events_db_owner_only_unopened, EventsFileIdentity,
+};
 
 pub use protocol::*;
 
@@ -117,8 +126,6 @@ pub use socket_path::validate_events_socket_path;
 #[cfg(unix)]
 #[path = "events_split_policy_entries.rs"]
 mod policy_entries;
-#[cfg(unix)]
-use policy_entries::standalone_daemon_policies;
 #[cfg(unix)]
 pub use policy_entries::{
     run_events_daemon_with_wal_ceiling, supervise_events_daemon_with_wal_ceiling,
