@@ -2,6 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-10-16\
+**Revised**: 2026-10-24 (last-slice clamping, backfill gate as pacing, backup consequence, page-work bound)\
 **Issue**: #5526\
 **Relates to**: [ADR-091](ADR-091-wal-snapshot-lifetime.md) (checkpoint task; Amendment 16, bounded FTS5 segment
 maintenance), [ADR-117b](ADR-117b-session-deletion-retention.md) D4 (names this branch and its prerequisites),
@@ -12,9 +13,10 @@ maintenance), [ADR-117b](ADR-117b-session-deletion-retention.md) D4 (names this 
 ## Decision summary
 
 The main store switches to `auto_vacuum=INCREMENTAL`. The daemon's checkpoint task releases free pages in bounded
-slices of 1,024 pages (4 MiB) with `PRAGMA incremental_vacuum(1024)`, at most one slice per checkpoint tick, when the
-freelist reaches 5% of the file and at least 4,096 pages. It stops when the freelist is at or below 1% of the file
-(at least 1,024 pages). Every online bulk delete or table move arms the same drain at once. No scheduled full
+slices of at most 1,024 pages (4 MiB) with `PRAGMA incremental_vacuum(N)`, at most one slice per checkpoint tick, when
+the freelist reaches 5% of the file and at least 4,096 pages. It stops when the freelist is at or below its floor,
+the larger of 1% of the file and 1,024 pages; the last slice is clamped to the pages above the floor, and N is never
+zero or negative. Every online bulk delete or table move arms the same drain at once. No scheduled full
 `VACUUM` runs on a live store. The hourly freelist alarm stays as the backstop. Existing files convert once, with
 one `VACUUM` in an announced maintenance window. The events and knowledge stores stay `NONE` until their write
 pattern changes, for the reasons and costs given below.
@@ -189,10 +191,16 @@ safe on secondary stores once they convert.
 - **Check:** every 60 s, read `PRAGMA freelist_count` and `PRAGMA page_count` on the checkpoint connection. Both are
   header reads. The check also runs at once when a bulk path arms it (section 4).
 - **Start:** freelist at least 5% of `page_count` and at least 4,096 pages (16 MiB).
-- **Slice:** `PRAGMA incremental_vacuum(1024)`, so 4 MiB per slice.
+- **Slice:** `PRAGMA incremental_vacuum(N)` with `N = min(1024, freelist_count - floor)`, so at most 4 MiB per slice.
+  The drain issues a slice only when `N` is positive. A zero or negative `N` would release the whole freelist in one
+  call (finding 4), so it is never passed.
 - **Pace:** at most one slice per checkpoint tick (500 ms by default), and only on a tick whose PASSIVE observation
-  showed the WAL fully backfilled (checkpointed frames equal log frames).
-- **Stop:** freelist at or below 1% of `page_count`, and never below 1,024 pages.
+  showed the WAL fully backfilled (checkpointed frames equal log frames). The checkpoint outcome does not carry that
+  comparison today (`CheckpointCoreOutcome` holds the WAL page count, an unavailable reason and a sidecar
+  attribution), so the implementation adds it. The tick runs the bounded FTS5 segment maintenance after the checkpoint
+  core, so FTS writes can follow the observation before the slice runs.
+- **Stop:** freelist at or below the floor, which is the larger of 1% of `page_count` and 1,024 pages. The clamped
+  last slice never takes the freelist below the floor.
 
 Why these numbers:
 
@@ -206,7 +214,8 @@ Why these numbers:
   and its total lock time of about 15-28 s (at the 24-45 µs per page measured with a warm WAL) is spread over 615
   slices of tens of milliseconds, instead of one 27 s hold.
 - **Backfill gate.** Finding 3 shows that slices run faster than checkpoints can absorb under continuous reads. If the
-  slices are not paced, the WAL grows by about 4 KiB for every released page.
+  slices are not paced, the WAL grows by about 4 KiB for every released page. The gate is pacing, not a ceiling on
+  WAL size: it reads an observation that FTS maintenance in the same tick can follow with its own writes.
 - **5% to start.** At the measured cost, draining 5% of the current main store (about 38,000 pages) takes about 1-2 s
   of lock time in total. So the threshold does not need to be high to keep the cost low; it only needs to sit above
   the freelist that ordinary writes create and reuse on their own, which read 0.61% and 0.34% above.
@@ -279,15 +288,18 @@ Existing files are `NONE`, and the mode changes only through one full `VACUUM`:
 
 - Free pages from bulk deletes, table moves and rewrites return to the file system within minutes, without an
   operator and without a long write hold.
-- Whole-file backups copy live data only. On the production store this halved the per-run copy time.
+- Whole-file backups stop copying the released pages. They still copy the free pages kept by the floor, and the
+  partly filled pages that `incremental_vacuum` does not repack. On the production store a full `VACUUM` halved the
+  per-run copy time.
 - The conversion cost is paid once per store, in a window that already exists for binary swaps.
 
 **Negative.**
 
 - Every write on the main store pays the pointer-map upkeep: +5% CPU on bulk loads, +5% to +9% on single-row
   transaction p50, +0.12% file size, as measured above.
-- While a drain runs, an application writer can wait up to one slice, about 24-66 ms and at worst a few hundred
-  milliseconds on a cold cache, at most once per checkpoint tick.
+- While a drain runs, an application writer can wait up to one slice, at most once per checkpoint tick. The bound is
+  on page work (at most 1,024 pages per slice), not on wall time: a warm slice measured 24-66 ms, and the first cold
+  1,024-page slice measured 400.2 ms.
 - Each released page costs about one WAL frame and one checkpoint write, so a drain adds write traffic roughly equal
   to the size it releases.
 - `incremental_vacuum` moves pages but does not repack partly filled pages. A full `VACUUM` released 2.53 GiB from a
@@ -303,12 +315,15 @@ Existing files are `NONE`, and the mode changes only through one full `VACUUM`:
 
 1. A fresh main store reads `auto_vacuum=2`. The test also covers a file where WAL is set before `auto_vacuum`,
    which must be refused or corrected, never silently left at `NONE`.
-2. Delete enough rows to cross 5%. Within one check period the drain starts. Each slice releases exactly its page
-   count, measured as the change in `freelist_count`. The drain stops at the 1% floor. A control arm runs the same
-   slice through `execute_batch` and must release exactly one page.
+2. Delete enough rows to cross 5%. Within one check period the drain starts. Each slice releases exactly the page
+   count it was issued with, measured as the change in `freelist_count`: 1,024 pages, or for the last slice
+   the clamped positive remainder above the floor. The drain stops at the floor and never goes below it. A control
+   arm runs the same slice through `execute_batch` and must release exactly one page.
 3. With an application writer blocked inside an open write transaction, the slice reports busy and returns at once;
    the counter increments and nothing waits on the writer.
-4. With the WAL above its backfill point, no slice runs until a PASSIVE observation shows full backfill.
+4. With the WAL above its backfill point, no slice runs until a PASSIVE observation shows full backfill. The test reads
+   the gate from the checkpoint outcome's backfill comparison and asserts no WAL size bound, because FTS maintenance
+   later in the same tick may write after the observation.
 5. The conversion option on a `NONE` file reports `auto_vacuum` 0 before and 2 after, page and freelist counts before
    and after, and refuses when the disk headroom check fails.
 6. The alarm fires on a `NONE` store above 20% free and reports the `auto_vacuum` mode beside the ratio.
