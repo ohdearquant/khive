@@ -25,6 +25,7 @@ use khive_pack_tool::policy::{
     actor_label, decide_with_receipt, opt_u32 as opt_limit, DecisionCaller, DecisionInvocation,
 };
 use khive_pack_tool::{registry_policy_inputs, RegistryPin};
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
@@ -53,7 +54,8 @@ fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.to_string())),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{key} must be a string; got {other}"
+            "{key} must be a string; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
         ))),
     }
 }
