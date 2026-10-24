@@ -697,8 +697,7 @@ Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.
 
 ## Amendment 7 (2026-10-21): a unit checks the grant it holds, by id, on the writer it was handed
 
-**Status: Proposed; this amendment requires hash sign-off before the dependent
-implementation merges.**
+**Status: Accepted 2026-10-22.** It does not change the status of the base ADR or of earlier amendments.
 
 `decide` (`crates/khive-pack-tool/src/policy.rs:872` at `98508c8f`) finds a live grant through
 `select_active_grant` (`:371`), which reads `tool_grants` on a pooled reader of its own,

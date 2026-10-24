@@ -939,7 +939,7 @@ outside these four runtime paths do not gain automatic lifecycle events.
 
 ## Amendment 7: Recover unfinished indexes after a committed entity update (#4755)
 
-**Status**: Proposed (2026-10-18). **Source pin**: `8493167aaa4e43349372ed6519c00b6f364dde3c`.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments. **Source pin**: `8493167aaa4e43349372ed6519c00b6f364dde3c`.
 
 This amendment qualifies Context item 3, the Index consistency section, and the index-consistency consequences for the deferred entity-update route: updates whose required search indexes publish after the entity commits. Other routes retain their existing boundaries and durable-retry deferral.
 

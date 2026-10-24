@@ -349,7 +349,7 @@ Real request, outbox and ingest paths, with a mock transport and recorded raw me
 
 ## Amendment 1 (2026-10-14) -- Withheld originals are read through comm, and external routing is narrowed
 
-**Status**: Proposed 2026-10-14.
+**Status**: Accepted 2026-10-15. It does not change the status of the base ADR.
 
 **Trigger.** §8.3 keeps a withheld message's original bytes "for an explicit operator read" and names neither the
 read nor its callers. The first implementation keeps the original as a blob, records its content reference in the
@@ -644,7 +644,7 @@ Acceptance evidence includes exact source head, commands and features, pre-fix f
 
 ## Amendment 6 (2026-10-23) -- Quarantine records are readable only by the maintainer
 
-**Status**: Accepted 2026-10-23. It does not change the Accepted status of the base ADR or the Proposed status of Amendments 1 to 5.
+**Status**: Accepted 2026-10-23. It does not change the Accepted status of the base ADR or the status of Amendments 1 to 5.
 
 **Addresses**: [#5424](https://github.com/ohdearquant/khive/issues/5424).
 

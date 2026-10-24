@@ -1139,7 +1139,7 @@ refuses every observation does not satisfy the positive controls.
 
 ## Amendment 6 (2026-10-23): durable encoding of producer registrations
 
-**Status**: Proposed.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect:
 charter + gate + privileges, the whole automated permission system has nearly taken shape in khive".
