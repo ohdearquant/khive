@@ -1570,7 +1570,7 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
     fn visit_expr_match(&mut self, expr: &'ast syn::ExprMatch) {
         if self.root_function(
             "khive-runtime/src/error_projection.rs",
-            "runtime_error_value",
+            "runtime_error_value_inner",
         ) && matches!(expr.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("error"))
         {
             for arm in &expr.arms {
@@ -1783,7 +1783,7 @@ fn a3_runtime_projection_census_rejects_wildcards_at_the_shared_source() {
     };
     census.visit_file(
         &syn::parse_file(
-            r#"fn runtime_error_value(error: RuntimeError) { match error { _ => json!("lost") } }"#,
+            r#"fn runtime_error_value_inner(error: RuntimeError) { match error { _ => json!("lost") } }"#,
         )
         .unwrap(),
     );
