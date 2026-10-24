@@ -759,7 +759,7 @@ mod tests {
             // PrefixScopedToPrimary
             (
                 "neighbors",
-                "node_id",
+                "id",
                 "no namespace check performed by this resolver",
             ),
             // FullAndPrefixScopedToPrimary

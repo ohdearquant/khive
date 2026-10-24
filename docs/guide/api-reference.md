@@ -828,7 +828,7 @@ batch callers verify that every result is associated with the submitted root.
 
 | Param            | Type            | Required | Notes                                                                                                                                                                                        |
 | ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `node_id`        | uuid            | yes      | Node whose neighbors to return.                                                                                                                                                              |
+| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                          |
 | `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
 | `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
 | `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
@@ -838,7 +838,7 @@ batch callers verify that every result is associated with the submitted root.
 | `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
 
 ```
-request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
+request(ops="neighbors(id=\"<uuid>\", direction=\"both\")")
 ```
 
 Response shape:
