@@ -312,7 +312,7 @@ impl FrameFixture {
             },
             Self::Response { id, result } => Frame::Response {
                 id: id.clone().into(),
-                result: result.clone(),
+                result: result.clone().into(),
             },
             Self::Error { id, code, message } => Frame::Error {
                 id: id.get().cloned().map(OperationId::from),
@@ -359,7 +359,7 @@ impl FrameFixture {
                 topic: topic.clone(),
                 cursor: *cursor,
                 occurred_at: occurred_at.clone(),
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             },
         })
     }

@@ -21,7 +21,8 @@ fn sample_frames() -> Vec<Frame> {
         },
         Frame::Response {
             id: OperationId::from("op-1"),
-            result: serde_json::json!({"ok": true, "tool": "stats", "result": {"entities": 3}}),
+            result: serde_json::json!({"ok": true, "tool": "stats", "result": {"entities": 3}})
+                .into(),
         },
         Frame::Error {
             id: Some(OperationId::from("op-1")),
@@ -54,7 +55,7 @@ fn sample_frames() -> Vec<Frame> {
             topic: "comm.message_created".to_string(),
             cursor: 43,
             occurred_at: "2026-08-04T11:00:00Z".to_string(),
-            payload: serde_json::json!({"message_id": "m-1"}),
+            payload: serde_json::json!({"message_id": "m-1"}).into(),
         },
     ]
 }

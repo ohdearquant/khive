@@ -123,23 +123,23 @@
 //!
 //! ## Opaque payload fidelity
 //!
-//! `response.result` and `event.payload` are preserved as JSON VALUES —
-//! semantic equality, not byte-for-byte. Decoding and re-encoding yields a
-//! payload semantically equal to the original under the JSON data model,
-//! but the wire bytes may differ in two documented ways, both consequences
-//! of this workspace's `serde_json` feature set (default features only —
-//! no `preserve_order`, no `arbitrary_precision`):
+//! Under ADR-137 Amendment 1 Decision 9, received `response.result` and
+//! `event.payload` use owned [`OpaqueValue`] tokens. Decode and re-encode
+//! preserve the exact opaque token, including object member order, duplicate
+//! members, whitespace, escape spellings and number lexemes. The outer frame
+//! envelope is serialized normally; its original spelling is not retained.
 //!
-//! - **Object key order is not preserved.** Decoded objects use
-//!   `serde_json`'s `BTreeMap`-backed map and re-encode with keys in
-//!   sorted order. Consumers must treat key order as insignificant.
-//! - **Integers outside the u64/i64 range lose precision.** Integers
-//!   within u64/i64 range — including values above 2^53 — parse and
-//!   re-encode exactly; anything outside that range parses as `f64` and
-//!   may lose precision.
+//! Local values constructed with `OpaqueValue::from(serde_json::Value)` use
+//! serde_json's normal serializer. A fallible [`OpaqueValue::to_value`] returns
+//! a separate parsed value on request: it can round out-of-range numbers or
+//! refuse numbers outside serde_json's representable range. Editing that
+//! projection never changes the retained token. No parsed projection is cached.
 //!
-//! The codec's `opaque_payloads_are_preserved_semantically_not_byte_for_byte`
-//! test pins exactly this behavior.
+//! `PartialEq` compares parsed Value semantics when both projections succeed;
+//! if both received tokens cannot be projected, it compares their exact raw
+//! tokens instead. Equality is not a lexical-fidelity test. The codec's local
+//! opaque-value compatibility test retains the ordinary Value serialization
+//! behavior, while separate received-token tests pin lexical preservation.
 //!
 //! ## Server-produced fields
 //!
@@ -282,6 +282,7 @@ pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+mod opaque;
 pub mod version;
 
 pub use client_handshake::{
@@ -294,4 +295,5 @@ pub use codec::{
 pub use error::{TerminalScope, WireErrorCode, WIRE_ERROR_CODES};
 pub use frame::{Cursor, Frame, OperationId, CLIENT_TO_SERVER_KINDS, FRAME_KINDS};
 pub use handshake::{HandshakeGate, HandshakeOutcome, HandshakeSequenceError};
+pub use opaque::OpaqueValue;
 pub use version::{ProtocolVersion, SupportedVersions, SupportedVersionsError, CURRENT_VERSION};

@@ -39,7 +39,7 @@ fn direct_serde_rejects_every_invalid_wire_shape() {
         },
         Frame::Response {
             id: OperationId::from(""),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         },
         Frame::Error {
             id: Some(OperationId::from("")),
@@ -331,23 +331,26 @@ fn direct_serde_distinguishes_omitted_optional_fields_from_null() {
     let Frame::Response { result, .. } = response else {
         panic!("expected response")
     };
-    assert_eq!(result.get("namespace"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        result.to_value().unwrap().get("namespace"),
+        Some(&serde_json::Value::Null)
+    );
     let response_null: Frame =
         serde_json::from_str(r#"{"kind":"response","id":"op-1","result":null}"#).unwrap();
-    assert!(matches!(
-        response_null,
-        Frame::Response {
-            result: serde_json::Value::Null,
-            ..
-        }
-    ));
+    let Frame::Response { result, .. } = response_null else {
+        panic!("expected response")
+    };
+    assert_eq!(result.to_value().unwrap(), serde_json::Value::Null);
     let event: Frame = serde_json::from_str(
         r#"{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{"resume_cursor":null,"id":1,"id":2}}"#,
     ).unwrap();
     let Frame::Event { payload, .. } = event else {
         panic!("expected event")
     };
-    assert_eq!(payload.get("resume_cursor"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        payload.to_value().unwrap().get("resume_cursor"),
+        Some(&serde_json::Value::Null)
+    );
 }
 
 #[test]
@@ -381,11 +384,11 @@ fn direct_serde_requires_an_object_event_payload() {
 fn direct_and_codec_serialization_require_an_object_event_payload() {
     // Invalid local frames are constructed directly. D10 decode must not be
     // used as setup for an encode-only refusal witness.
-    let event = |payload| Frame::Event {
+    let event = |payload: serde_json::Value| Frame::Event {
         topic: "a.b".to_string(),
         cursor: 1,
         occurred_at: "2026-08-04T11:00:00Z".to_string(),
-        payload,
+        payload: payload.into(),
     };
     let healthy = event(serde_json::json!({"nested": [null, true]}));
     let direct = serde_json::to_vec(&healthy).unwrap();
@@ -393,7 +396,7 @@ fn direct_and_codec_serialization_require_an_object_event_payload() {
     assert_eq!(direct, &wire[crate::codec::LENGTH_PREFIX_BYTES..]);
     let response_null = Frame::Response {
         id: OperationId::from("op-1"),
-        result: serde_json::Value::Null,
+        result: serde_json::Value::Null.into(),
     };
     serde_json::to_vec(&response_null).unwrap();
     crate::codec::encode_frame(&response_null).unwrap();

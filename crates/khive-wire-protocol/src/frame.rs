@@ -6,6 +6,7 @@ use serde::ser::{Error as SerError, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::version::ProtocolVersion;
+use crate::OpaqueValue;
 
 /// A caller-generated operation id.
 ///
@@ -172,7 +173,7 @@ pub struct ResponsePayload {
     /// The verb-dispatch result, exactly as ADR-016's `request` verb
     /// surface returns it (an aggregate `{ok, tool, result}` /
     /// `{ok, summary, ...}` payload). Opaque to this crate.
-    pub result: serde_json::Value,
+    pub result: OpaqueValue,
 }
 
 /// The field set of a [`Frame::Error`] payload.
@@ -271,7 +272,7 @@ pub struct EventPayload {
     /// Topic-specific JSON object. Its field-by-field shape is owned by
     /// the per-topic catalog (ADR-137, "Implementation-phase deliverables").
     /// Amendment 1 Decision 10 requires the outer object shape on the wire.
-    pub payload: serde_json::Value,
+    pub payload: OpaqueValue,
 }
 
 /// One application frame.
@@ -349,7 +350,7 @@ pub enum Frame {
         /// The verb-dispatch result, exactly as ADR-016's `request` verb
         /// surface returns it (an aggregate `{ok, tool, result}` /
         /// `{ok, summary, ...}` payload). Opaque to this crate.
-        result: serde_json::Value,
+        result: OpaqueValue,
     },
 
     /// A wire-level failure terminal frame.
@@ -443,8 +444,8 @@ pub enum Frame {
         occurred_at: String,
         /// Topic-specific JSON object on the wire (Amendment 1 Decision 10).
         /// Its members are opaque to this crate and owned by the per-topic
-        /// catalog; in-memory Value construction remains unrestricted.
-        payload: serde_json::Value,
+        /// catalog; local Value construction uses `OpaqueValue::from`.
+        payload: OpaqueValue,
     },
 }
 
@@ -716,29 +717,32 @@ impl<'de> Deserialize<'de> for Frame {
                 // Decision 4: reject every repeated decoded envelope key
                 // before kind or per-kind field validation. Values inside
                 // result/payload remain opaque JSON, not envelope grammar.
-                let mut object = serde_json::Map::new();
+                let mut object = std::collections::BTreeMap::new();
                 while let Some(key) = map.next_key::<String>()? {
                     if object.contains_key(&key) {
                         return Err(A::Error::custom(format!(
                             "duplicate envelope field `{key}`"
                         )));
                     }
-                    let value = map.next_value::<serde_json::Value>()?;
+                    let value = map.next_value::<Box<serde_json::value::RawValue>>()?;
                     object.insert(key, value);
                 }
                 let kind_value = object
                     .get("kind")
                     .ok_or_else(|| A::Error::custom("missing field `kind`"))?;
-                let kind = kind_value
-                    .as_str()
-                    .ok_or_else(|| A::Error::custom("field `kind` must be a string"))?;
-                let kind = kind.to_string();
+                let kind: String = serde_json::from_str(kind_value.get())
+                    .map_err(|_| A::Error::custom("field `kind` must be a string"))?;
                 object.remove("kind");
 
                 fn parse<T: serde::de::DeserializeOwned>(
-                    object: &serde_json::Map<String, serde_json::Value>,
+                    object: &std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
                 ) -> Result<T, serde_json::Error> {
-                    serde_json::from_value(serde_json::Value::Object(object.clone()))
+                    // Decision 9: serialize raw root members without projecting them
+                    // through Value, then deserialize a plain payload struct. A
+                    // tagged/untagged Content intermediary would lose raw tokens.
+                    // This functional-first path makes a transient JSON byte copy.
+                    let bytes = serde_json::to_vec(object)?;
+                    serde_json::from_slice(&bytes)
                 }
 
                 match kind.as_str() {
@@ -787,8 +791,7 @@ impl<'de> Deserialize<'de> for Frame {
                         // below need the pre-fallback string.
                         let raw_code = object
                             .get("code")
-                            .and_then(|c| c.as_str())
-                            .map(str::to_string);
+                            .and_then(|c| serde_json::from_str::<String>(c.get()).ok());
                         let payload: ErrorPayload = parse(&object).map_err(A::Error::custom)?;
 
                         // ADR-137, "Operation correlation": a
