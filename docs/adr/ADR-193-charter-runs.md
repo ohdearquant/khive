@@ -31,6 +31,8 @@ orchestrator principal, granted by a human, usable once, audited per use. This r
 removal. Charters here are bounded data for a closed set of templates, and their gates are compiled
 code. There is no language.
 
+The sentence "There is no language" is superseded by [ADR-208](ADR-208-charter-workflows.md) (accepted 2026-10-22).
+
 What exists already, and what this record builds on rather than duplicates:
 
 - The GTD pack's status transition table and compare-and-set update discipline, and its pack-owned
@@ -61,6 +63,8 @@ exactly where it matters: restart). A shared helper is extracted only after a se
 identical semantics.
 
 ### D2. Definitions are bounded data for a closed template; gates are compiled
+
+Superseded by [ADR-208](ADR-208-charter-workflows.md) (accepted 2026-10-22), which replaces the closed template with charter workflows over registered phrases.
 
 A definition is immutable data validated against a versioned schema for one **template**. The only
 installable template in v1 is `pr_merge/v1`. Rust owns the template's phase topology, the gate
@@ -467,6 +471,9 @@ generic action strings and internal action adapters; watch-and-compare triggers 
 consumer refreshes observations and reconciles attempts); cross-charter cascades; thresholds and SLA
 logic; hash chaining and external anchoring; merge-queue and stacked pull request modes; in-place
 migration of runs.
+
+Of these, "charter topologies beyond the template", "any definition language" and "cross-charter cascades" are
+superseded by [ADR-208](ADR-208-charter-workflows.md) (accepted 2026-10-22).
 
 ## Amendment 1 (2026-09-22): the merge method is a per-repository datum
 
@@ -1139,7 +1146,7 @@ refuses every observation does not satisfy the positive controls.
 
 ## Amendment 6 (2026-10-23): durable encoding of producer registrations
 
-**Status**: Proposed.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect:
 charter + gate + privileges, the whole automated permission system has nearly taken shape in khive".

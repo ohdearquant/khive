@@ -654,11 +654,11 @@ and bootstrap are stated in ADR-193 Amendment 5 D1, D4, D6 and D7. No other righ
 
 ## Amendment 3 (2026-10-23): grant-administration wire surface and minimum standing-right service
 
-Status: Proposed.
+Status: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
 
 This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect: charter + gate + privileges, the whole automated permission system has nearly taken shape in khive". ADR-193 Amendment 5 serves the same instruction and states it in its opening paragraph; this amendment supplies the administration surface that amendment's D1 requires.
 
-This amendment defines the administration wire contract required by ADR-193 Amendment 5 D1. Sections M3.1–7 are proposed requirements; M3.8 states their verification obligations. ADR-193 Amendment 5 remains the sole definition of observation permission fields, matching, source contracts, receipts and evidence eligibility.
+This amendment defines the administration wire contract required by ADR-193 Amendment 5 D1. Sections M3.1–7 are requirements; M3.8 states their verification obligations. ADR-193 Amendment 5 remains the sole definition of observation permission fields, matching, source contracts, receipts and evidence eligibility.
 
 ADR-193 Amendment 6 (2026-10-23) fixes representation choices this amendment leaves open: the terminal state of a record holding both rights (M3.3); a half-open validity interval that the server derives with no new M3.2 request field, whose expiry includes the equality instant in M3.8's control; a 2 MiB durable record bound separate from M3.2's 1 MiB request bound; and revocation results that name targets by identifier and digest, so revocation is never refused for size and fits M3.2's replay bound.
 

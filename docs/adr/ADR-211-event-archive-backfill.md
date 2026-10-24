@@ -1,14 +1,13 @@
 # ADR-211: Event Archive Backfill
 
-- **Status:** Proposed 2026-10-23
+- **Status:** Accepted 2026-10-23
 - **Date:** 2026-10-23
 - **Grounding commit:** `05dd44348e1d05667757430be922f3ca21b6926a`
 - **Depends on:** [ADR-170](ADR-170-events-daemon-split.md), ADR-168
 - **Relates to:** [ADR-168](ADR-168-event-retention-classes.md)
 - **Addresses:** [#5589](https://github.com/ohdearquant/khive/issues/5589).
 
-This draft requires specification approval before dependent implementation lands. It does not change the status of
-ADR-168 or any other record.
+It does not change the status of ADR-168 or any other record.
 
 ## Context
 
