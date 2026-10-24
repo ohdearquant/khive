@@ -773,7 +773,7 @@ mod tests {
             // UnscopedFullUuidOnly
             (
                 "memory.feedback",
-                "target_id",
+                "id",
                 "no namespace check is performed on this parameter itself",
             ),
         ];
