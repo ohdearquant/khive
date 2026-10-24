@@ -1,4 +1,49 @@
-use super::*;
+#[cfg(unix)]
+use super::events_daemon::{
+    acquire_events_daemon_guard_outcome, events_readiness, run_events_daemon,
+    try_acquire_events_daemon_guard, EventsDaemonGuardAcquisition, EventsNotReadyReason,
+};
+#[cfg(unix)]
+use super::file_hardening::{
+    ensure_events_db_owner_only, events_db_targets, harden_events_db_sidecars,
+    verify_events_db_owner_only_unopened, EventsFileIdentity,
+};
+#[cfg(unix)]
+use super::forwarder::{run_forwarder, EventsSplitClient, ForwardingCounters, QueuedAppend};
+use super::paths::{events_db_path_beside, events_socket_path_beside};
+#[cfg(unix)]
+use super::paths::{
+    EVENTS_PROTOCOL_VERSION, MAX_INFLIGHT_REQUEST_BYTES, MAX_QUERY_EVENTS_PAGE_ROWS,
+};
+use super::protocol::EventsResponse;
+#[cfg(unix)]
+use super::protocol::{EventsRequest, WireWriterTaskFailure, WireWriterTaskState};
+#[cfg(unix)]
+use super::registry::EventsSplitConfig;
+use super::registry::{direct_backend_for, TestRegistryGuard};
+#[cfg(unix)]
+use super::server::{
+    dispatch_events_request, namespace_store_with_cap, read_frame_budgeted, serve_events_conn,
+    storage_error_response, NamespaceStores,
+};
+#[cfg(unix)]
+use super::stores::ForwardingEventStore;
+use super::stores::SplitEventStore;
+#[cfg(unix)]
+use crate::daemon::{read_frame, write_frame};
+use khive_db::StorageBackend;
+use khive_storage::{Event, EventFilter, EventStore, PageRequest, StorageError};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+use uuid::Uuid;
 
 #[test]
 fn fixture_registry_cleanup_preserves_other_roots() {
@@ -33,19 +78,23 @@ fn fixture_registry_cleanup_preserves_other_roots() {
 
 #[cfg(unix)]
 mod target_filter_tests {
-    include!("../events_split_target_tests.rs");
+    include!("tests/target_filter.rs");
 }
 
 // The full daemon/forwarding test suite for this module lands with the
 // final slice of this series; these tests cover the naming and
 // classification contracts the module itself defines.
 
-include!("../events_sidecar_path_tests.rs");
+include!("tests/sidecar_path.rs");
 
 #[cfg(unix)]
 mod store_trust_tests {
-    use super::*;
-    include!("../events_store_trust_tests.rs");
+    use crate::events_split::file_hardening::{ensure_events_db_parent_trusted, events_db_targets};
+    use crate::events_split::registry::{
+        direct_backend_for, direct_backend_read_only_for, TestRegistryGuard,
+    };
+    use std::path::Path;
+    include!("tests/store_trust.rs");
 }
 
 #[cfg(unix)]
@@ -75,8 +124,8 @@ fn deep_symlink_chains_within_the_kernel_bound_derive_the_target_sidecar() {
     );
 }
 
-include!("../events_sidecar_hardening_tests.rs");
-include!("../events_lock_search_parent_tests.rs");
+include!("tests/sidecar_hardening.rs");
+include!("tests/lock_search_parent.rs");
 
 #[cfg(unix)]
 fn write_owner_only_test_file(path: &Path) {
@@ -876,8 +925,8 @@ async fn dispatch_rejects_invalid_wire_namespace() {
     );
 }
 
-include!("../events_split_shutdown_tests.rs");
-include!("../events_split_readiness_tests.rs");
+include!("tests/shutdown.rs");
+include!("tests/readiness.rs");
 
 #[cfg(unix)]
 #[tokio::test]
