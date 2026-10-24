@@ -10,6 +10,8 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[path = "operations/tests/claim_entity_reservation.rs"]
+mod claim_entity_reservation;
 #[path = "operations/tests/embed_failure_latency.rs"]
 mod embed_failure_latency;
 #[path = "operations/tests/entity_list_pages.rs"]
