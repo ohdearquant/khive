@@ -603,14 +603,45 @@ fn replacement_keeps_only_typed_identity_and_validated_metadata() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(config_ledger)]
-async fn real_nonsecret_refusal_stalls_and_a_repaired_page_resumes() {
+async fn missing_create_handler_stalls_and_restored_registry_resumes() {
     if ran_isolated_child().await {
         return;
     }
-    let f = Fixture::new().await;
-    // The Git kind hook rejects a JSON u64 outside its integer representation.
-    f.install_pages(&[remote_pr(u64::MAX, Some(UPDATED), false)]);
+    let mut f = Fixture::new().await;
+    // Exercise an actual unavailable create handler, not a manufactured error
+    // or a remote integer that the Git kind hook deliberately accepts.
+    let healthy_registry = std::mem::replace(
+        &mut f.registry,
+        VerbRegistryBuilder::new()
+            .build()
+            .expect("an empty registry builds without a create handler"),
+    );
+    assert!(!f.registry.has_verb("create"));
+    let missing_create = crate::dispatch_from_token(
+        &f.registry,
+        &f.token,
+        "create",
+        f.payload("pull_request", 50, UPDATED),
+    )
+    .await
+    .expect_err("the actual empty registry has no create handler");
+    match missing_create.refusal_source() {
+        RuntimeError::UnknownVerb(message) => {
+            assert_eq!(message, "unknown verb \"create\"; available: ");
+        }
+        other => panic!("expected the actual missing-create UnknownVerb, got {other:?}"),
+    }
+    let missing_create_warning = format!("create pull_request #50: {missing_create}");
+    f.install_pages(&[remote_pr(50, Some(UPDATED), false)]);
     let (report, records, _, complete) = f.pass().await;
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning == &missing_create_warning),
+        "the real walker must report the actual missing-handler refusal: {:?}",
+        report.warnings
+    );
     assert!(report.cursor_stalled && !report.done && !complete);
     assert!(records.is_empty());
     assert_eq!(
@@ -625,7 +656,8 @@ async fn real_nonsecret_refusal_stalls_and_a_repaired_page_resumes() {
             && checkpoint.at_floor.is_empty()
             && checkpoint.undated.is_empty()
     );
-    f.install_pages(&[remote_pr(50, Some(UPDATED), false)]);
+    // Restore only handler availability and retry the identical stored page.
+    f.registry = healthy_registry;
     let (report, records, _, _) = f.pass().await;
     assert!(!report.cursor_stalled);
     assert_eq!(report.prs_ingested, 1);
