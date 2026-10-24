@@ -6,6 +6,8 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-brain`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
 | Benchmark                                                                                         | Reference median | A/A ratio | Baseline commit                            | Commit date |
 | ------------------------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
 | `khive-pack-brain:brain_pack_bench/brain_pack/feedback_plain/useful/median_ns`                    | 719.028 µs       | 1.028     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
@@ -26,16 +28,17 @@ Fixtures are generated locally; no external corpus, model provider or network se
 
 | Target / group                                       | Scenario            | Actual timed work                                                                     | Input / setup                                                                   | Baseline                                     |
 | ---------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------- |
-| brain_pack_bench / brain_pack/feedback_plain         | useful              | One brain.feedback dispatch and owned fixture destruction                             | Fresh registry and real target entity prepared outside timing                   | pending latency                              |
-| brain_pack_bench / brain_pack/feedback_sections      | capped_200_opposing | 200 opposing feedback dispatches, argument construction and owned fixture destruction | Fresh section profile and 200 positive setup events                             | pending time per 200 dispatches              |
+| brain_pack_bench / brain_pack/feedback_plain         | useful              | One brain.feedback dispatch and owned fixture destruction                             | Fresh registry and real target entity prepared outside timing                   | reference block (latency)                    |
+| brain_pack_bench / brain_pack/feedback_sections      | capped_200_opposing | 200 opposing feedback dispatches, argument construction and owned fixture destruction | Fresh section profile and 200 positive setup events                             | reference block (time per 200 dispatches)    |
 | brain_pack_bench / brain_pack/section_posterior_gate | mean_shift_ge_0_3   | Trivial unit-value Criterion loop; correctness assertion runs before it               | 200 positive then 200 opposing section events; required mean shift at least 0.3 | correctness gate, no useful latency baseline |
-| brain_pack_bench / brain_pack/profile_read           | balanced_recall_v1  | One profile read, argument construction and result destruction                        | Reused registry and default profile                                             | pending latency                              |
-| brain_pack_bench / brain_pack/reset                  | balanced_recall_v1  | One reset dispatch and owned registry destruction                                     | Fresh registry; empty arguments select the default profile                      | pending latency                              |
-| brain_pack_bench / brain_pack/snapshot_roundtrip     | state_read_twice    | Two state serializations and result destruction                                       | Reused registry                                                                 | pending time per two reads                   |
-| brain_resolve / brain_pack/resolve                   | 100_bindings        | One public resolution with the real dispatch, load guard, state lock and binding scan | 100 distinct actor bindings; last actor is the configured caller                | pending latency and calls/sec                |
+| brain_pack_bench / brain_pack/profile_read           | balanced_recall_v1  | One profile read, argument construction and result destruction                        | Reused registry and default profile                                             | reference block (latency)                    |
+| brain_pack_bench / brain_pack/reset                  | balanced_recall_v1  | One reset dispatch and owned registry destruction                                     | Fresh registry; empty arguments select the default profile                      | reference block (latency)                    |
+| brain_pack_bench / brain_pack/snapshot_roundtrip     | state_read_twice    | Two state serializations and result destruction                                       | Reused registry                                                                 | reference block (time per two reads)         |
+| brain_resolve / brain_pack/resolve                   | 100_bindings        | One public resolution with the real dispatch, load guard, state lock and binding scan | 100 distinct actor bindings; last actor is the configured caller                | reference block (latency)                    |
 
-Baselines are pending the qualified-host storage-brain producer. Record the full commit, toolchain,
-machine, load and command with each future measurement. There is no measured baseline supplied here.
+The measured baselines are in the reference block at the top of this file, which names the
+baseline commit and the comparison class (compiler, profile and machine). Record the full commit,
+toolchain, machine, load and command with each future measurement.
 The existing workloads, correctness assertions and timing boundaries are retained.
 
 ## Selection and execution modes

@@ -4,7 +4,9 @@
 The input is ``crates/<crate>/perf/reference.json``.  The output is the block
 between ``<!-- bench-reference:begin -->`` and ``<!-- bench-reference:end -->``
 in that crate's ``docs/benchmarks.md``.  Everything outside the block is left
-alone.
+alone.  The block names the comparison class the file records (compiler,
+profile, CPU, cores and kernel), since every value in one file was measured in
+that class.
 
 The renderer uses only the Python standard library.  It reads the reference
 file as JSON and asks git for the committer date of each baseline commit.  It
@@ -299,6 +301,11 @@ def render_block(reference: pathlib.Path, root: pathlib.Path) -> str:
     crate, entries = entries_for(data, root)
     if not entries:
         raise RenderError(f"{reference} has no measured target entries")
+    comparison = _require_mapping(data.get("class"), "class")
+    compiler, profile, cpu, cores, kernel = (
+        _require_string(comparison.get(field), f"class.{field}")
+        for field in ("rustc", "profile", "cpu", "cores", "kernel")
+    )
 
     headers = (
         "Benchmark",
@@ -337,6 +344,9 @@ def render_block(reference: pathlib.Path, root: pathlib.Path) -> str:
         "median for each benchmark, in the unit shown; A/A is the ratio between "
         "the two same-commit runs. The date is the committer date of the "
         "baseline commit.",
+        "",
+        f"Comparison class: `{compiler}`, `{profile}` profile, {cpu}, cores {cores}, "
+        f"kernel {kernel}.",
         "",
         table_row(headers),
         "| " + " | ".join("-" * width for width in widths) + " |",
