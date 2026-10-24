@@ -39,7 +39,11 @@ fn required_singleton_kind(params: &Value) -> Result<String, RuntimeError> {
         None => Err(RuntimeError::InvalidInput("create requires 'kind'".into())),
         Some(Value::String(kind)) => Ok(kind.clone()),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `kind` must be a string; got {value}"
+            "create: `kind` must be a string; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
@@ -55,7 +59,11 @@ fn optional_singleton_kind_alias(
         )),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
