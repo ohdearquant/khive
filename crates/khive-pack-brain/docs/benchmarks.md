@@ -6,14 +6,15 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-brain`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
-| Benchmark                                             | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ----------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `brain_pack/feedback_plain/useful`                    | 714.177 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `brain_pack/feedback_sections/capped_200_opposing`    | 45.351 ms        | 1.024     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `brain_pack/profile_read/balanced_recall_v1`          | 43.134 µs        | 1.017     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `brain_pack/reset/balanced_recall_v1`                 | 599.688 µs       | 1.090     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `brain_pack/section_posterior_gate/mean_shift_ge_0_3` | 0.035 ns         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `brain_pack/snapshot_roundtrip/state_read_twice`      | 89.976 µs        | 1.030     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| Benchmark                                                                                         | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-pack-brain:brain_pack_bench/brain_pack/feedback_plain/useful/median_ns`                    | 719.028 µs       | 1.028     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_pack_bench/brain_pack/feedback_sections/capped_200_opposing/median_ns`    | 45.498 ms        | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_pack_bench/brain_pack/profile_read/balanced_recall_v1/median_ns`          | 43.624 µs        | 1.001     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_pack_bench/brain_pack/reset/balanced_recall_v1/median_ns`                 | 605.254 µs       | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_pack_bench/brain_pack/section_posterior_gate/mean_shift_ge_0_3/median_ns` | 0.035 ns         | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_pack_bench/brain_pack/snapshot_roundtrip/state_read_twice/median_ns`      | 90.948 µs        | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-brain:brain_resolve/brain_pack/resolve/100_bindings/median_ns`                        | 42.078 µs        | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 

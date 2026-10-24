@@ -6,15 +6,26 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-comm`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
-| Benchmark                          | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ---------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `comm/inbox/10`                    | 309.641 µs       | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/inbox/100`                   | 440.808 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/read`                        | 141.573 µs       | 1.018     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/reply`                       | 722.030 µs       | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/send`                        | 411.994 µs       | 1.042     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/thread/5`                    | 196.582 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/thread_in_busy_mailbox/2000` | 201.326 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| Benchmark                                                                                             | Reference median | A/A ratio  | Baseline commit                            | Commit date |
+| ----------------------------------------------------------------------------------------------------- | ---------------- | ---------- | ------------------------------------------ | ----------- |
+| `khive-pack-comm:comm_bench/comm/inbox/10/median_ns`                                                  | 308.392 µs       | 1.011      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/inbox/100/median_ns`                                                 | 444.211 µs       | 1.015      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/read/median_ns`                                                      | 143.365 µs       | 1.002      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/reply/median_ns`                                                     | 730.416 µs       | 1.013      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/send/median_ns`                                                      | 418.357 µs       | 1.039      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/thread/5/median_ns`                                                  | 179.051 µs       | 1.004      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/thread_in_busy_mailbox/2000/median_ns`                               | 183.672 µs       | 1.008      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cleanup_expired_quarantine/100/median_ns`              | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_commit/median_ns`                               | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_get/median_ns`                                  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_get_commit/median_ns`                           | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/ingest/median_ns`                                      | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/mark_read/200/median_ns`                               | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/suppression_list/100/median_ns`                        | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/hidden490_twins490_owners20/limit_1/median_ns`  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/hidden490_twins490_owners20/limit_20/median_ns` | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/unique_1000/limit_1/median_ns`                  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/unique_1000/limit_20/median_ns`                 | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 

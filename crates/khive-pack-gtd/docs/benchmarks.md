@@ -6,13 +6,17 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-gtd`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
-| Benchmark                    | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ---------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `gtd/assign`                 | 289.588 µs       | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `gtd/next/10`                | 78.478 µs        | 1.017     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `gtd/next/100`               | 183.852 µs       | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `gtd/tasks/filter_by_status` | 134.356 µs       | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `gtd/transition`             | 413.637 µs       | 1.062     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| Benchmark                                                                   | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-pack-gtd:gtd_bench/gtd/assign/median_ns`                             | 295.224 µs       | 1.009     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_bench/gtd/next/10/median_ns`                            | 80.349 µs        | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_bench/gtd/next/100/median_ns`                           | 186.000 µs       | 1.005     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_bench/gtd/tasks/filter_by_status/median_ns`             | 135.988 µs       | 1.021     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_bench/gtd/transition/median_ns`                         | 412.203 µs       | 1.027     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_maintenance/gtd_maintenance/assign_complete/median_ns`  | 2.160 ms         | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_maintenance/gtd_maintenance/census/1000/median_ns`      | 1.658 ms         | 1.004     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_maintenance/gtd_maintenance/complete/median_ns`         | 681.446 µs       | 1.015     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-gtd:gtd_maintenance/gtd_maintenance/repair_apply/100/median_ns` | 38.732 ms        | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 
