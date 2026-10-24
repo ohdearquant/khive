@@ -39,7 +39,7 @@ fn direct_serde_rejects_every_invalid_wire_shape() {
         },
         Frame::Response {
             id: OperationId::from(""),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         },
         Frame::Error {
             id: Some(OperationId::from("")),
@@ -259,5 +259,242 @@ fn direct_serde_leaves_unrecognized_code_none_for_a_literal_internal() {
             unrecognized_code, ..
         } => assert!(unrecognized_code.is_none()),
         other => panic!("expected an error frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_serde_rejects_duplicate_envelope_keys_before_field_validation() {
+    // Amendment 1 Decision 4 supersedes lossy root-map last-wins behavior.
+    // Missing/unknown fields and invalid first values must not hide a duplicate.
+    for raw in [
+        r#"{"kind":"cancel","kind":"cancel","id":"op-1"}"#,
+        r#"{"kind":"cancel","id":"","id":"op-1"}"#,
+        r#"{"kind":"cancel","id":"op-1","\u0069d":"op-1"}"#,
+        r#"{"kind":"cancel","id":"op-1","extra":1,"extra":2}"#,
+        r#"{"extra":1,"extra":2}"#,
+    ] {
+        let error = serde_json::from_str::<Frame>(raw).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate envelope field"),
+            "D4 must reject the duplicate before field validation: {raw}: {error}"
+        );
+    }
+}
+
+#[test]
+fn direct_serde_distinguishes_omitted_optional_fields_from_null() {
+    let cases = [
+        (
+            "deadline_ms",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","deadline_ms":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "namespace",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","namespace":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "actor_id",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","actor_id":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "visible_namespaces",
+            r#"{"kind":"request","id":"op-1","ops":"stats()","visible_namespaces":null}"#,
+            r#"{"kind":"request","id":"op-1","ops":"stats()"}"#,
+        ),
+        (
+            "resume_cursor",
+            r#"{"kind":"subscribe","id":"op-1","topic":"a.b","resume_cursor":null}"#,
+            r#"{"kind":"subscribe","id":"op-1","topic":"a.b"}"#,
+        ),
+        (
+            "id",
+            r#"{"kind":"error","id":null,"code":"unsupported_version","message":"unsupported"}"#,
+            r#"{"kind":"error","code":"unsupported_version","message":"unsupported"}"#,
+        ),
+    ];
+    for (field, raw, omitted) in cases {
+        // Prove the otherwise equivalent omitted form is a valid frame first.
+        let healthy: Frame = serde_json::from_str(omitted).unwrap();
+        assert!(serde_json::to_value(healthy).unwrap().get(field).is_none());
+        let error = serde_json::from_str::<Frame>(raw).unwrap_err();
+        assert!(error.to_string().contains("null"), "D4 {field}: {error}");
+    }
+
+    // The same names, nulls and repeated members inside opaque JSON are data.
+    let response: Frame = serde_json::from_str(
+        r#"{"kind":"response","id":"op-1","result":{"namespace":null,"id":1,"id":2}}"#,
+    )
+    .unwrap();
+    let Frame::Response { result, .. } = response else {
+        panic!("expected response")
+    };
+    assert_eq!(
+        result.to_value().unwrap().get("namespace"),
+        Some(&serde_json::Value::Null)
+    );
+    let response_null: Frame =
+        serde_json::from_str(r#"{"kind":"response","id":"op-1","result":null}"#).unwrap();
+    let Frame::Response { result, .. } = response_null else {
+        panic!("expected response")
+    };
+    assert_eq!(result.to_value().unwrap(), serde_json::Value::Null);
+    let event: Frame = serde_json::from_str(
+        r#"{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{"resume_cursor":null,"id":1,"id":2}}"#,
+    ).unwrap();
+    let Frame::Event { payload, .. } = event else {
+        panic!("expected event")
+    };
+    assert_eq!(
+        payload.to_value().unwrap().get("resume_cursor"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn direct_serde_requires_an_object_event_payload() {
+    let healthy: Frame = serde_json::from_str(
+        r#"{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{"nested":[null,true]}}"#,
+    ).unwrap();
+    assert!(matches!(healthy, Frame::Event { payload, .. } if payload.is_object()));
+
+    for payload in ["[]", r#""text""#, "1", "true", "null"] {
+        let raw = format!(
+            r#"{{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{payload}}}"#
+        );
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for (entrypoint, result) in [
+            ("raw serde", serde_json::from_str::<Frame>(&raw)),
+            ("Value serde", serde_json::from_value::<Frame>(value)),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("event payload must be a JSON object"),
+                "D10 {entrypoint} returned an unrelated refusal: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_and_codec_serialization_require_an_object_event_payload() {
+    // Invalid local frames are constructed directly. D10 decode must not be
+    // used as setup for an encode-only refusal witness.
+    let event = |payload: serde_json::Value| Frame::Event {
+        topic: "a.b".to_string(),
+        cursor: 1,
+        occurred_at: "2026-08-04T11:00:00Z".to_string(),
+        payload: payload.into(),
+    };
+    let healthy = event(serde_json::json!({"nested": [null, true]}));
+    let direct = serde_json::to_vec(&healthy).unwrap();
+    let wire = crate::codec::encode_frame(&healthy).unwrap();
+    assert_eq!(direct, &wire[crate::codec::LENGTH_PREFIX_BYTES..]);
+    let response_null = Frame::Response {
+        id: OperationId::from("op-1"),
+        result: serde_json::Value::Null.into(),
+    };
+    serde_json::to_vec(&response_null).unwrap();
+    crate::codec::encode_frame(&response_null).unwrap();
+
+    for payload in [
+        serde_json::json!([]),
+        serde_json::json!("text"),
+        serde_json::json!(1),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+    ] {
+        let frame = event(payload);
+        let direct_error = serde_json::to_vec(&frame).unwrap_err();
+        assert!(
+            direct_error
+                .to_string()
+                .contains("payload must be a JSON object"),
+            "D10 direct serialization returned an unrelated refusal: {direct_error}"
+        );
+        match crate::codec::encode_frame(&frame).unwrap_err() {
+            crate::codec::CodecError::InvalidFields { kind, detail } => {
+                assert_eq!(kind, "event");
+                assert_eq!(detail, "payload must be a JSON object");
+            }
+            other => panic!("D10 expected typed event payload refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn direct_serde_requires_a_positive_present_request_deadline() {
+    for (member, expected) in [
+        ("", None),
+        (",\"deadline_ms\":1", Some(1_u64)),
+        (",\"deadline_ms\":18446744073709551615", Some(u64::MAX)),
+    ] {
+        let raw = format!(r#"{{"kind":"request","id":"op-1","ops":"stats()"{member}}}"#);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for frame in [
+            serde_json::from_str::<Frame>(&raw).unwrap(),
+            serde_json::from_value::<Frame>(value).unwrap(),
+        ] {
+            let Frame::Request { deadline_ms, .. } = frame else {
+                panic!("expected request")
+            };
+            assert_eq!(deadline_ms, expected);
+        }
+    }
+
+    // ADR-137's positive-integer floor rejects only zero in the u64 domain.
+    let raw = r#"{"kind":"request","id":"op-1","ops":"stats()","deadline_ms":0}"#;
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    for (entrypoint, result) in [
+        ("raw serde", serde_json::from_str::<Frame>(raw)),
+        ("Value serde", serde_json::from_value::<Frame>(value)),
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deadline_ms must be a positive integer"),
+            "zero deadline {entrypoint} returned an unrelated refusal: {error}"
+        );
+    }
+}
+
+#[test]
+fn direct_and_codec_serialization_require_positive_request_deadlines() {
+    let request = |deadline_ms| Frame::Request {
+        id: OperationId::from("op-1"),
+        ops: "stats()".to_string(),
+        deadline_ms,
+        namespace: None,
+        actor_id: None,
+        visible_namespaces: None,
+    };
+    for deadline_ms in [None, Some(1), Some(u64::MAX)] {
+        let frame = request(deadline_ms);
+        let direct = serde_json::to_vec(&frame).unwrap();
+        let wire = crate::codec::encode_frame(&frame).unwrap();
+        assert_eq!(direct, &wire[crate::codec::LENGTH_PREFIX_BYTES..]);
+        assert_eq!(serde_json::from_slice::<Frame>(&direct).unwrap(), frame);
+    }
+
+    // Construct invalid local state directly; decode refuses this shape.
+    let zero = request(Some(0));
+    let direct_error = serde_json::to_vec(&zero).unwrap_err();
+    assert!(
+        direct_error
+            .to_string()
+            .contains("deadline_ms must be a positive integer"),
+        "zero deadline direct serialization returned an unrelated refusal: {direct_error}"
+    );
+    match crate::codec::encode_frame(&zero).unwrap_err() {
+        crate::codec::CodecError::InvalidFields { kind, detail } => {
+            assert_eq!(kind, "request");
+            assert_eq!(detail, "deadline_ms must be a positive integer");
+        }
+        other => panic!("zero deadline expected typed request refusal, got {other:?}"),
     }
 }

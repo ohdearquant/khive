@@ -32,7 +32,7 @@ fn encode_rejects_empty_operation_id_in_every_id_field() {
         },
         Frame::Response {
             id: OperationId::from(""),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         },
         Frame::Subscribe {
             id: OperationId::from(""),
