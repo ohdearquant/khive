@@ -1,5 +1,23 @@
 # Code-pack benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-code`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-pack-code:code_findings/pack_code_findings/clippy_jsonl/100/median_ns`   | 2.883 ms         | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_findings/pack_code_findings/clippy_jsonl/10000/median_ns` | 310.410 ms       | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_findings/pack_code_findings/json/100/median_ns`           | 1.581 ms         | 1.007     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_findings/pack_code_findings/json/10000/median_ns`         | 164.379 ms       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_ingest/pack_code_ingest/fresh_l1_l15/10/median_ns`        | 15.694 ms        | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_ingest/pack_code_ingest/fresh_l1_l15/1000/median_ns`      | 1.306 s          | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-code:code_ingest/pack_code_ingest/fresh_l1_l15/10000/median_ns`     | 14.469 s         | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+
+<!-- bench-reference:end -->
+
 The latency targets call the public ingest functions with generated deterministic
 inputs. They never open an existing map, invoke a compiler, fetch a model, or
 read a git-ignored fixture. Input creation, output checks and destruction are

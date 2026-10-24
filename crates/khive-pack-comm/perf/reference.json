@@ -1,233 +1,1076 @@
 {
+ "attempts": [
+  {
+   "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+   "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+   "fingerprint": {
+    "CARGO_PROFILE_BENCH_DEBUG": "",
+    "CARGO_TARGET_DIR": "/home/ci/oss-targets/khive",
+    "RUSTFLAGS": "",
+    "RUSTUP_TOOLCHAIN": "1.95.0"
+   },
+   "idle_min": 95.0,
+   "in_class": true,
+   "job": "bb-refb-46b7d9c5",
+   "load": {
+    "end": "1.15 1.18 1.55 1/423 301454",
+    "start": "5.73 4.67 2.92 1/428 6213"
+   },
+   "machine_identity": "Ubuntu-noble-latest-amd64-base.zst",
+   "mode": "reference",
+   "posture": {
+    "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549568\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3542524\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+    "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549835\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=400000\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+   },
+   "require_pin": true,
+   "targets": {
+    "khive-pack-brain:brain_pack_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.01639344262295082,
+        "clock_band": 0.005873835127670106,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548618.5,
+        "other_busy_max": 32.7
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.006086890595772349,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548117,
+        "other_busy_max": 19.0
+       }
+      }
+     }
+    ],
+    "khive-pack-brain:brain_resolve": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0025980305688447104,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548842,
+        "other_busy_max": 5.9
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0014619821254442085,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549291,
+        "other_busy_max": 8.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_allocations": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completeness_failure",
+      "reasons": [
+       "no D2 manifest registers an allocation target's identities; its run output cannot register them",
+       "arm a names unregistered identities pack_code_allocations/clippy_jsonl/100, pack_code_allocations/clippy_jsonl/10000, pack_code_allocations/fresh_l1_l15/10, pack_code_allocations/fresh_l1_l15/1000, pack_code_allocations/fresh_l1_l15/10000, pack_code_allocations/json/100, pack_code_allocations/json/10000",
+       "arm b names unregistered identities pack_code_allocations/clippy_jsonl/100, pack_code_allocations/clippy_jsonl/10000, pack_code_allocations/fresh_l1_l15/10, pack_code_allocations/fresh_l1_l15/1000, pack_code_allocations/fresh_l1_l15/10000, pack_code_allocations/json/100, pack_code_allocations/json/10000"
+      ],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0014847648894519287,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549383.5,
+        "other_busy_max": 2.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0017674699314566538,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549141.0,
+        "other_busy_max": 4.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_findings": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.002095710305966939,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547246.0,
+        "other_busy_max": 11.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.001548123759696915,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547520.0,
+        "other_busy_max": 10.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_ingest": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.038461538461538464,
+        "clock_band": 0.0031434454822410547,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548972.0,
+        "other_busy_max": 31.7
+       },
+       "b": {
+        "busy_frac": 0.03349282296650718,
+        "clock_band": 0.008649620230341003,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549520,
+        "other_busy_max": 25.0
+       }
+      }
+     }
+    ],
+    "khive-pack-comm:comm_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.002101982938186742,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549505.5,
+        "other_busy_max": 12.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0022009983099477264,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549298.5,
+        "other_busy_max": 12.0
+       }
+      }
+     }
+    ],
+    "khive-pack-comm:comm_lifecycle": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.017857142857142856,
+        "clock_band": 0.006891582368022787,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547951.5,
+        "other_busy_max": 21.2
+       },
+       "b": {
+        "busy_frac": 0.017543859649122806,
+        "clock_band": 0.005691439892852421,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547257,
+        "other_busy_max": 22.2
+       }
+      }
+     }
+    ],
+    "khive-pack-gtd:gtd_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.020833333333333332,
+        "clock_band": 0.0015960178720193696,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549459.0,
+        "other_busy_max": 22.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.00230778378920682,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548426,
+        "other_busy_max": 5.0
+       }
+      }
+     }
+    ],
+    "khive-pack-gtd:gtd_maintenance": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.00678986327516525,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546905.0,
+        "other_busy_max": 5.1
+       },
+       "b": {
+        "busy_frac": 0.03225806451612903,
+        "clock_band": 0.006886319209241825,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547178,
+        "other_busy_max": 22.0
+       }
+      }
+     }
+    ],
+    "kkernel:coord_locate": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.003646446645871047,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546740.5,
+        "other_busy_max": 5.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.003721941296462591,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546805.0,
+        "other_busy_max": 5.0
+       }
+      }
+     }
+    ],
+    "kkernel:locator": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.023255813953488372,
+        "clock_band": 0.005144597424737647,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3542940,
+        "other_busy_max": 21.0
+       },
+       "b": {
+        "busy_frac": 0.024390243902439025,
+        "clock_band": 0.0045541103258483154,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3543612,
+        "other_busy_max": 22.0
+       }
+      }
+     }
+    ]
+   },
+   "thresholds": {
+    "busy_frac_max": 0.05,
+    "busy_max": 20.0,
+    "clock_bound_frac": 0.975,
+    "clock_floor_khz": 400000,
+    "freq_band": 0.1,
+    "noise_ceiling": 1.15,
+    "pin_max_khz": 3600000
+   }
+  }
+ ],
  "benches": {
   "comm/inbox/10": {
    "a": {
-    "ci_hi_ns": 310830.75076923077,
-    "ci_lo_ns": 309367.40909090906,
-    "median_ns": 310096.90551412874
+    "ci_hi_ns": 308049.33031674207,
+    "ci_lo_ns": 306113.34553349874,
+    "median_ns": 306646.6217948718
    },
-   "aa_spread": 1.003,
+   "aa_spread": 1.0114,
    "b": {
-    "ci_hi_ns": 310041.3507807981,
-    "ci_lo_ns": 308351.0412087912,
-    "median_ns": 309184.2086128881
+    "ci_hi_ns": 310824.4125874126,
+    "ci_lo_ns": 309155.3919413919,
+    "median_ns": 310137.7532993967
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 309640.557,
+   "kind": "criterion",
+   "median_ns": 308392.188,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/inbox/100": {
    "a": {
-    "ci_hi_ns": 439536.4420634921,
-    "ci_lo_ns": 438585.76296296297,
-    "median_ns": 439270.9364230541
+    "ci_hi_ns": 442322.4074074074,
+    "ci_lo_ns": 439966.1327160494,
+    "median_ns": 440849.1032608695
    },
-   "aa_spread": 1.007,
+   "aa_spread": 1.0153,
    "b": {
-    "ci_hi_ns": 443367.7393939394,
-    "ci_lo_ns": 441733.3888888889,
-    "median_ns": 442344.91840277775
+    "ci_hi_ns": 448058.4088888889,
+    "ci_lo_ns": 446368.5486111111,
+    "median_ns": 447572.8057371097
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 440807.927,
+   "kind": "criterion",
+   "median_ns": 444210.954,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/read": {
    "a": {
-    "ci_hi_ns": 140392.74714285714,
-    "ci_lo_ns": 139830.35294117648,
-    "median_ns": 140291.0176129426
+    "ci_hi_ns": 143771.84126984127,
+    "ci_lo_ns": 143326.50396825396,
+    "median_ns": 143491.6275510204
    },
-   "aa_spread": 1.0183,
+   "aa_spread": 1.0018,
    "b": {
-    "ci_hi_ns": 143104.6904716674,
-    "ci_lo_ns": 142656.89285714287,
-    "median_ns": 142854.44880424452
+    "ci_hi_ns": 143504.54518950437,
+    "ci_lo_ns": 142996.34415584416,
+    "median_ns": 143238.89638932497
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 141572.733,
+   "kind": "criterion",
+   "median_ns": 143365.262,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/reply": {
    "a": {
-    "ci_hi_ns": 775881.213389657,
-    "ci_lo_ns": 708766.4706694272,
-    "median_ns": 723637.7835714286
+    "ci_hi_ns": 771308.8782312926,
+    "ci_lo_ns": 707552.5102040817,
+    "median_ns": 725783.6642328042
    },
-   "aa_spread": 1.0045,
+   "aa_spread": 1.0128,
    "b": {
-    "ci_hi_ns": 776881.46875,
-    "ci_lo_ns": 704209.1785714285,
-    "median_ns": 720421.9629629629
+    "ci_hi_ns": 801066.5220734128,
+    "ci_lo_ns": 715939.7815279958,
+    "median_ns": 735048.5879917184
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 722029.873,
+   "kind": "criterion",
+   "median_ns": 730416.126,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/send": {
    "a": {
-    "ci_hi_ns": 432948.57226107223,
-    "ci_lo_ns": 369579.5847203479,
-    "median_ns": 420417.9063800905
+    "ci_hi_ns": 432575.74671669793,
+    "ci_lo_ns": 374275.2976588629,
+    "median_ns": 426350.49781188363
    },
-   "aa_spread": 1.0417,
+   "aa_spread": 1.039,
    "b": {
-    "ci_hi_ns": 426241.02638326585,
-    "ci_lo_ns": 369395.2689842209,
-    "median_ns": 403570.1690934066
+    "ci_hi_ns": 427404.46861772006,
+    "ci_lo_ns": 368819.01923076925,
+    "median_ns": 410363.4565191565
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 411994.038,
+   "kind": "criterion",
+   "median_ns": 418356.977,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/thread/5": {
    "a": {
-    "ci_hi_ns": 197663.65625,
-    "ci_lo_ns": 196436.60625,
-    "median_ns": 197226.41578631452
+    "ci_hi_ns": 179105.16749427043,
+    "ci_lo_ns": 178071.7803030303,
+    "median_ns": 178734.32575757575
    },
-   "aa_spread": 1.0066,
+   "aa_spread": 1.0035,
    "b": {
-    "ci_hi_ns": 196333.57853535353,
-    "ci_lo_ns": 195402.26039915968,
-    "median_ns": 195938.13857142857
+    "ci_hi_ns": 179966.20675505052,
+    "ci_lo_ns": 178747.22826086957,
+    "median_ns": 179368.0906795225
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 196582.277,
+   "kind": "criterion",
+   "median_ns": 179051.208,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
-     "other_busy_max": 21.2
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
     },
     "b": {
-     "band_basis": "both-core-bound",
+     "band_basis": "loaded-core",
      "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
     }
    }
   },
   "comm/thread_in_busy_mailbox/2000": {
    "a": {
-    "ci_hi_ns": 201604.73546273547,
-    "ci_lo_ns": 200706.01914634148,
-    "median_ns": 201405.9837948718
+    "ci_hi_ns": 184628.2679074022,
+    "ci_lo_ns": 184062.5275,
+    "median_ns": 184365.72234848485
    },
-   "aa_spread": 1.0008,
+   "aa_spread": 1.0076,
    "b": {
-    "ci_hi_ns": 201484.13214285715,
-    "ci_lo_ns": 201096.98389668367,
-    "median_ns": 201245.13678571428
+    "ci_hi_ns": 183254.43506493507,
+    "ci_lo_ns": 182570.6261942081,
+    "median_ns": 182977.68204988717
    },
    "clock_khz_median": {
-    "a": 3549370.5,
-    "b": 3549416
+    "a": 3549505.5,
+    "b": 3549298.5
    },
-   "median_ns": 201325.56,
+   "kind": "criterion",
+   "median_ns": 183671.702,
+   "metric": "median_ns",
+   "target": "khive-pack-comm:comm_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014084507042253521,
-     "clock_band": 0.0036336020711278238,
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002101982938186742,
+     "other_busy_max": 12.0
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0022009983099477264,
+     "other_busy_max": 12.0
+    }
+   }
+  },
+  "comm_lifecycle/cleanup_expired_quarantine/100": {
+   "a": {
+    "ci_hi_ns": 75520973.0,
+    "ci_lo_ns": 74908502.5,
+    "median_ns": 75239207.25
+   },
+   "aa_spread": 1.0043,
+   "b": {
+    "ci_hi_ns": 75725415.5,
+    "ci_lo_ns": 75345948.25,
+    "median_ns": 75564316.5
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 75401761.875,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
      "other_busy_max": 21.2
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.0,
-     "clock_band": 0.0025691550384626654,
-     "other_busy_max": 17.8
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/cursor_commit": {
+   "a": {
+    "ci_hi_ns": 284942.45,
+    "ci_lo_ns": 222620.1875,
+    "median_ns": 242959.71666666667
+   },
+   "aa_spread": 1.0151,
+   "b": {
+    "ci_hi_ns": 272148.625,
+    "ci_lo_ns": 225574.625,
+    "median_ns": 246637.85
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 244798.783,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/cursor_get": {
+   "a": {
+    "ci_hi_ns": 142599.4166666667,
+    "ci_lo_ns": 104052.81428571428,
+    "median_ns": 119384.3875
+   },
+   "aa_spread": 1.2576,
+   "b": {
+    "ci_hi_ns": 129827.25,
+    "ci_lo_ns": 82204.83333333334,
+    "median_ns": 94927.95833333334
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 107156.173,
+   "metric": "median_ns",
+   "reasons": [
+    "A/A spread 1.258 > 1.15"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/cursor_get_commit": {
+   "a": {
+    "ci_hi_ns": 335520.4166666667,
+    "ci_lo_ns": 208669.92857142858,
+    "median_ns": 300245.06944444444
+   },
+   "aa_spread": 1.0393,
+   "b": {
+    "ci_hi_ns": 344771.55555555556,
+    "ci_lo_ns": 226371.0,
+    "median_ns": 312055.4375
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 306150.253,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/ingest": {
+   "a": {
+    "ci_hi_ns": 967840.375,
+    "ci_lo_ns": 947687.6041666667,
+    "median_ns": 955837.175
+   },
+   "aa_spread": 1.0064,
+   "b": {
+    "ci_hi_ns": 1007323.8571428572,
+    "ci_lo_ns": 939748.125,
+    "median_ns": 949789.9
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 952813.538,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/mark_read/200": {
+   "a": {
+    "ci_hi_ns": 23380468.5,
+    "ci_lo_ns": 23188004.5,
+    "median_ns": 23319649.0
+   },
+   "aa_spread": 1.0215,
+   "b": {
+    "ci_hi_ns": 23922225.0,
+    "ci_lo_ns": 23721368.75,
+    "median_ns": 23820581.0
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 23570115.0,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_lifecycle/suppression_list/100": {
+   "a": {
+    "ci_hi_ns": 425792.0,
+    "ci_lo_ns": 420414.31944444444,
+    "median_ns": 422476.30000000005
+   },
+   "aa_spread": 1.0007,
+   "b": {
+    "ci_hi_ns": 425752.0,
+    "ci_lo_ns": 420288.0,
+    "median_ns": 422179.45
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 422327.875,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_thread_rendering/hidden490_twins490_owners20/limit_1": {
+   "a": {
+    "ci_hi_ns": 9406957.0,
+    "ci_lo_ns": 7428570.0,
+    "median_ns": 8480838.0
+   },
+   "aa_spread": 1.0465,
+   "b": {
+    "ci_hi_ns": 9286127.0,
+    "ci_lo_ns": 7261741.5,
+    "median_ns": 8104341.0
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 8292589.5,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_thread_rendering/hidden490_twins490_owners20/limit_20": {
+   "a": {
+    "ci_hi_ns": 7567379.0,
+    "ci_lo_ns": 7378855.5,
+    "median_ns": 7476679.5
+   },
+   "aa_spread": 1.2638,
+   "b": {
+    "ci_hi_ns": 9673450.5,
+    "ci_lo_ns": 8933705.0,
+    "median_ns": 9448961.5
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 8462820.5,
+   "metric": "median_ns",
+   "reasons": [
+    "A/A spread 1.264 > 1.15"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_thread_rendering/unique_1000/limit_1": {
+   "a": {
+    "ci_hi_ns": 9498146.0,
+    "ci_lo_ns": 8945230.0,
+    "median_ns": 9221983.0
+   },
+   "aa_spread": 1.0123,
+   "b": {
+    "ci_hi_ns": 9889824.0,
+    "ci_lo_ns": 9039465.0,
+    "median_ns": 9335542.5
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 9278762.75,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
+    }
+   }
+  },
+  "comm_thread_rendering/unique_1000/limit_20": {
+   "a": {
+    "ci_hi_ns": 9434626.5,
+    "ci_lo_ns": 9120329.0,
+    "median_ns": 9334832.0
+   },
+   "aa_spread": 1.0051,
+   "b": {
+    "ci_hi_ns": 9340857.0,
+    "ci_lo_ns": 9193348.5,
+    "median_ns": 9287347.5
+   },
+   "clock_khz_median": {
+    "a": 3547951.5,
+    "b": 3547257
+   },
+   "kind": "criterion",
+   "median_ns": 9311089.75,
+   "metric": "median_ns",
+   "reasons": [
+    "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+   ],
+   "target": "khive-pack-comm:comm_lifecycle",
+   "verdict": "UNMEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017857142857142856,
+     "clock_band": 0.006891582368022787,
+     "other_busy_max": 21.2
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.017543859649122806,
+     "clock_band": 0.005691439892852421,
+     "other_busy_max": 22.2
     }
    }
   }
@@ -247,59 +1090,508 @@
     "3600000"
    ]
   },
-  "host": "Ubuntu-noble-latest-amd64-base.zst",
   "kernel": "6.8.0-142-generic",
-  "mode": "reference",
   "profile": "bench",
-  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
-  "window": "03:55-05:00Z"
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
  },
- "commands": {
-  "khive-pack-comm:comm_bench": {
-   "a": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-comm --locked --bench comm_bench -- --save-baseline aa-a --noplot",
-   "b": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-comm --locked --bench comm_bench -- --save-baseline aa-b --noplot"
-  }
+ "coverage": {
+  "bench_targets": 2,
+  "entered_benchmarks": 18,
+  "measured_benchmarks": 7,
+  "targets_with_entry": 2
  },
  "crate": "khive-pack-comm",
- "criterion": "the benchmark's own configuration (no time or sample-size override)",
- "evidence": {
-  "archive": {
-   "location": "outside the repository",
-   "manifest": "MANIFEST.sha256 (sha256 of every stored file)",
-   "manifest_sha256": "69943a791885867d7bd34b92e40fcd513662b9281e1d07bb1d68f011aaeac6ca"
-  },
-  "band_bound": {
-   "basis": "both-core-bound",
-   "freq_band": 0.1,
-   "max_over_min_all_runs": 0.0189,
-   "why": "the run's sampler recorded one mean busy share for the pinned cores, so the loaded core per sample is not recoverable; the band was read on both pinned cores' readings with the idle floor dropped, a superset of any loaded-core selection"
-  },
-  "job": "bb-ref-212bf72e",
-  "reduced_from_stored_run": "verdicts applied to the run's stored files after the run's own reduction code reproduced its recorded verdicts for all 20 crates (ADR-206 Amendment 2, First references)"
+ "kinds": {
+  "khive-pack-comm:comm_bench": "criterion",
+  "khive-pack-comm:comm_lifecycle": "criterion"
  },
- "excluded_targets": {},
  "load1": {
-  "end": "1.59",
-  "start": "5.65"
+  "end": "1.15",
+  "start": "5.73"
  },
  "pin_status": {
-  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3543900\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549747\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3549083\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
-  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3539321\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3548464\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3550098\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549568\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3542524\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549835\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=400000\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
  },
  "reduction": {
   "aa_spread": "max(a,b)/min(a,b)",
-  "busy": "fraction of samples with a CPU outside the pinned cores above busy_max, judged against busy_frac_max; other_busy_max is logged",
   "busy_frac_max": 0.05,
   "busy_max": 20.0,
-  "clock_band": "(max-min)/median of the loaded pinned core's clock per sample, readings equal to clock_floor_khz dropped",
+  "clock_bound_frac": 0.975,
   "clock_floor_khz": 400000,
+  "criterion": "the benchmark's own configuration",
   "freq_band": 0.1,
   "noise_ceiling": 1.15,
-  "statistic": "Criterion median estimate per arm (estimates.json)"
+  "pin_max_khz": 3600000,
+  "shift": "median of the second run's timing value over the first's"
  },
- "schema": "bench-reference/v1",
- "sha": "212bf72e498de9fbbda42cc0e2902906c730e3ea",
- "targets": [
-  "khive-pack-comm:comm_bench"
- ]
+ "run": {
+  "host": "Ubuntu-noble-latest-amd64-base.zst",
+  "mode": "reference",
+  "window": ""
+ },
+ "schema": "bench-reference/v2",
+ "targets": {
+  "khive-pack-comm:comm_bench": {
+   "entries": [
+    {
+     "attempt": "bb-refb-46b7d9c5",
+     "benchmarks": {
+      "comm/inbox/10": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 308049.33031674207,
+         "ci_lo_ns": 306113.34553349874,
+         "median_ns": 306646.6217948718
+        },
+        "aa_spread": 1.0114,
+        "b": {
+         "ci_hi_ns": 310824.4125874126,
+         "ci_lo_ns": 309155.3919413919,
+         "median_ns": 310137.7532993967
+        },
+        "kind": "criterion",
+        "median_ns": 308392.188,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/inbox/100": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 442322.4074074074,
+         "ci_lo_ns": 439966.1327160494,
+         "median_ns": 440849.1032608695
+        },
+        "aa_spread": 1.0153,
+        "b": {
+         "ci_hi_ns": 448058.4088888889,
+         "ci_lo_ns": 446368.5486111111,
+         "median_ns": 447572.8057371097
+        },
+        "kind": "criterion",
+        "median_ns": 444210.954,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/read": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 143771.84126984127,
+         "ci_lo_ns": 143326.50396825396,
+         "median_ns": 143491.6275510204
+        },
+        "aa_spread": 1.0018,
+        "b": {
+         "ci_hi_ns": 143504.54518950437,
+         "ci_lo_ns": 142996.34415584416,
+         "median_ns": 143238.89638932497
+        },
+        "kind": "criterion",
+        "median_ns": 143365.262,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/reply": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 771308.8782312926,
+         "ci_lo_ns": 707552.5102040817,
+         "median_ns": 725783.6642328042
+        },
+        "aa_spread": 1.0128,
+        "b": {
+         "ci_hi_ns": 801066.5220734128,
+         "ci_lo_ns": 715939.7815279958,
+         "median_ns": 735048.5879917184
+        },
+        "kind": "criterion",
+        "median_ns": 730416.126,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/send": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 432575.74671669793,
+         "ci_lo_ns": 374275.2976588629,
+         "median_ns": 426350.49781188363
+        },
+        "aa_spread": 1.039,
+        "b": {
+         "ci_hi_ns": 427404.46861772006,
+         "ci_lo_ns": 368819.01923076925,
+         "median_ns": 410363.4565191565
+        },
+        "kind": "criterion",
+        "median_ns": 418356.977,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/thread/5": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 179105.16749427043,
+         "ci_lo_ns": 178071.7803030303,
+         "median_ns": 178734.32575757575
+        },
+        "aa_spread": 1.0035,
+        "b": {
+         "ci_hi_ns": 179966.20675505052,
+         "ci_lo_ns": 178747.22826086957,
+         "median_ns": 179368.0906795225
+        },
+        "kind": "criterion",
+        "median_ns": 179051.208,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "comm/thread_in_busy_mailbox/2000": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 184628.2679074022,
+         "ci_lo_ns": 184062.5275,
+         "median_ns": 184365.72234848485
+        },
+        "aa_spread": 1.0076,
+        "b": {
+         "ci_hi_ns": 183254.43506493507,
+         "ci_lo_ns": 182570.6261942081,
+         "median_ns": 182977.68204988717
+        },
+        "kind": "criterion",
+        "median_ns": 183671.702,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      }
+     },
+     "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+     "contract_revision": null,
+     "feature_flags": [],
+     "kind": "criterion",
+     "resolved_features": [],
+     "resolved_features_command": "cargo tree -e features --manifest-path /home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --prefix none --format '{p} {f}'",
+     "runs": {
+      "a": {
+       "busy_frac": 0.0,
+       "clock_band": 0.002101982938186742,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3549505.5,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --bench comm_bench -- --save-baseline aa-a --noplot",
+       "end": 1792867033.2332191,
+       "other_busy_max": 12.0,
+       "start": 1792866958.981716
+      },
+      "b": {
+       "busy_frac": 0.0,
+       "clock_band": 0.0022009983099477264,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3549298.5,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --bench comm_bench -- --save-baseline aa-b --noplot",
+       "end": 1792867107.456717,
+       "other_busy_max": 12.0,
+       "start": 1792867033.23363
+      }
+     },
+     "shift": {
+      "n": 7,
+      "value": 1.0035
+     },
+     "target": "khive-pack-comm:comm_bench"
+    }
+   ],
+   "kind": "criterion"
+  },
+  "khive-pack-comm:comm_lifecycle": {
+   "entries": [
+    {
+     "attempt": "bb-refb-46b7d9c5",
+     "benchmarks": {
+      "comm_lifecycle/cleanup_expired_quarantine/100": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 75520973.0,
+         "ci_lo_ns": 74908502.5,
+         "median_ns": 75239207.25
+        },
+        "aa_spread": 1.0043,
+        "b": {
+         "ci_hi_ns": 75725415.5,
+         "ci_lo_ns": 75345948.25,
+         "median_ns": 75564316.5
+        },
+        "kind": "criterion",
+        "median_ns": 75401761.875,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/cursor_commit": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 284942.45,
+         "ci_lo_ns": 222620.1875,
+         "median_ns": 242959.71666666667
+        },
+        "aa_spread": 1.0151,
+        "b": {
+         "ci_hi_ns": 272148.625,
+         "ci_lo_ns": 225574.625,
+         "median_ns": 246637.85
+        },
+        "kind": "criterion",
+        "median_ns": 244798.783,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/cursor_get": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 142599.4166666667,
+         "ci_lo_ns": 104052.81428571428,
+         "median_ns": 119384.3875
+        },
+        "aa_spread": 1.2576,
+        "b": {
+         "ci_hi_ns": 129827.25,
+         "ci_lo_ns": 82204.83333333334,
+         "median_ns": 94927.95833333334
+        },
+        "kind": "criterion",
+        "median_ns": 107156.173,
+        "metric": "median_ns",
+        "reasons": [
+         "A/A spread 1.258 > 1.15"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/cursor_get_commit": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 335520.4166666667,
+         "ci_lo_ns": 208669.92857142858,
+         "median_ns": 300245.06944444444
+        },
+        "aa_spread": 1.0393,
+        "b": {
+         "ci_hi_ns": 344771.55555555556,
+         "ci_lo_ns": 226371.0,
+         "median_ns": 312055.4375
+        },
+        "kind": "criterion",
+        "median_ns": 306150.253,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/ingest": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 967840.375,
+         "ci_lo_ns": 947687.6041666667,
+         "median_ns": 955837.175
+        },
+        "aa_spread": 1.0064,
+        "b": {
+         "ci_hi_ns": 1007323.8571428572,
+         "ci_lo_ns": 939748.125,
+         "median_ns": 949789.9
+        },
+        "kind": "criterion",
+        "median_ns": 952813.538,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/mark_read/200": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 23380468.5,
+         "ci_lo_ns": 23188004.5,
+         "median_ns": 23319649.0
+        },
+        "aa_spread": 1.0215,
+        "b": {
+         "ci_hi_ns": 23922225.0,
+         "ci_lo_ns": 23721368.75,
+         "median_ns": 23820581.0
+        },
+        "kind": "criterion",
+        "median_ns": 23570115.0,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_lifecycle/suppression_list/100": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 425792.0,
+         "ci_lo_ns": 420414.31944444444,
+         "median_ns": 422476.30000000005
+        },
+        "aa_spread": 1.0007,
+        "b": {
+         "ci_hi_ns": 425752.0,
+         "ci_lo_ns": 420288.0,
+         "median_ns": 422179.45
+        },
+        "kind": "criterion",
+        "median_ns": 422327.875,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_thread_rendering/hidden490_twins490_owners20/limit_1": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 9406957.0,
+         "ci_lo_ns": 7428570.0,
+         "median_ns": 8480838.0
+        },
+        "aa_spread": 1.0465,
+        "b": {
+         "ci_hi_ns": 9286127.0,
+         "ci_lo_ns": 7261741.5,
+         "median_ns": 8104341.0
+        },
+        "kind": "criterion",
+        "median_ns": 8292589.5,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_thread_rendering/hidden490_twins490_owners20/limit_20": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 7567379.0,
+         "ci_lo_ns": 7378855.5,
+         "median_ns": 7476679.5
+        },
+        "aa_spread": 1.2638,
+        "b": {
+         "ci_hi_ns": 9673450.5,
+         "ci_lo_ns": 8933705.0,
+         "median_ns": 9448961.5
+        },
+        "kind": "criterion",
+        "median_ns": 8462820.5,
+        "metric": "median_ns",
+        "reasons": [
+         "A/A spread 1.264 > 1.15"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_thread_rendering/unique_1000/limit_1": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 9498146.0,
+         "ci_lo_ns": 8945230.0,
+         "median_ns": 9221983.0
+        },
+        "aa_spread": 1.0123,
+        "b": {
+         "ci_hi_ns": 9889824.0,
+         "ci_lo_ns": 9039465.0,
+         "median_ns": 9335542.5
+        },
+        "kind": "criterion",
+        "median_ns": 9278762.75,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      },
+      "comm_thread_rendering/unique_1000/limit_20": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 9434626.5,
+         "ci_lo_ns": 9120329.0,
+         "median_ns": 9334832.0
+        },
+        "aa_spread": 1.0051,
+        "b": {
+         "ci_hi_ns": 9340857.0,
+         "ci_lo_ns": 9193348.5,
+         "median_ns": 9287347.5
+        },
+        "kind": "criterion",
+        "median_ns": 9311089.75,
+        "metric": "median_ns",
+        "reasons": [
+         "withheld: the target's runs exceeded the ceiling; comm_lifecycle/cursor_get, comm_thread_rendering/hidden490_twins490_owners20/limit_20 did"
+        ],
+        "verdict": "UNMEASURED"
+       }
+      }
+     },
+     "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+     "contract_revision": null,
+     "feature_flags": [],
+     "kind": "criterion",
+     "resolved_features": [],
+     "resolved_features_command": "cargo tree -e features --manifest-path /home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --prefix none --format '{p} {f}'",
+     "runs": {
+      "a": {
+       "busy_frac": 0.017857142857142856,
+       "clock_band": 0.006891582368022787,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3547951.5,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --bench comm_lifecycle -- --save-baseline aa-a --noplot",
+       "end": 1792867163.6050448,
+       "other_busy_max": 21.2,
+       "start": 1792867107.4571168
+      },
+      "b": {
+       "busy_frac": 0.017543859649122806,
+       "clock_band": 0.005691439892852421,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3547257,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-comm --locked --bench comm_lifecycle -- --save-baseline aa-b --noplot",
+       "end": 1792867219.9894485,
+       "other_busy_max": 22.2,
+       "start": 1792867163.6055565
+      }
+     },
+     "shift": {
+      "n": 11,
+      "value": 1.0043
+     },
+     "target": "khive-pack-comm:comm_lifecycle"
+    }
+   ],
+   "kind": "criterion"
+  }
+ }
 }
