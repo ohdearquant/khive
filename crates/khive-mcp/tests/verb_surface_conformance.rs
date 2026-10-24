@@ -37,7 +37,6 @@ const CLASSIFICATIONS: &[Classification] = &[
     Classification { verb: "merge", param: "from_id", role: Role::DistinctRole("Identifies the consumed endpoint of a two-record merge, distinct from the survivor endpoint.") },
     Classification { verb: "link", param: "source_id", role: Role::DistinctRole("Identifies the directed edge source endpoint, paired with a separately resolved target endpoint.") },
     Classification { verb: "link", param: "target_id", role: Role::DistinctRole("Identifies the directed edge target endpoint, paired with a separately resolved source endpoint.") },
-    Classification { verb: "traverse", param: "roots", role: Role::PrimaryAlias },
     Classification { verb: "propose", param: "parent_id", role: Role::DistinctRole("References a preexisting proposal in the ancestry of the newly created proposal; it is not the new proposal identifier.") },
     Classification { verb: "gtd.assign", param: "due", role: Role::DistinctRole("Stores the new task deadline, including date-only timezone anchoring; it is not a deferred-dispatch schedule time.") },
     Classification { verb: "gtd.assign", param: "depends_on", role: Role::DistinctRole("References blocking task records used to create dependency edges for the newly assigned task.") },
@@ -97,11 +96,6 @@ const APPROVED_CEILING: &[LegacyPair] = &[
 
 // Shrink only. Each still-invalid pair cites the owner's actual tracking issue.
 const ACTIVE_BASELINE: &[LegacyPair] = &[
-    LegacyPair {
-        verb: "traverse",
-        param: "roots",
-        issue: 5996,
-    },
     LegacyPair {
         verb: "memory.feedback",
         param: "target_id",
