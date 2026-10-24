@@ -7,6 +7,8 @@ ADR-017 (pack standard), ADR-035 (three-tier profile resolution), ADR-049 (daemo
 ADR-058 (shared `resolve_consumer_profile` helper), ADR-081 (recall retune driver / serve ledger),
 ADR-089 (kg `context` verb — the kg contributor's retrieval body)
 **Relates to**: ADR-091 (memory-backend connector reader rules — align §Execution when it lands)
+(corrected by Amendment 1, Corrections: ADR-091 is the accepted bounded read-transaction lifetime and
+WAL checkpoint escalation record)
 
 ## Context
 
@@ -37,7 +39,7 @@ Three shapes were considered, and the third was selected:
 ### 1. `ContextContributor` capability trait
 
 A new object-safe async trait in `khive-runtime`, attached to `PackRuntime` by one additive optional
-method defaulting to `None` (the `kind_hook` pattern, `crates/khive-runtime/src/pack.rs:141`, ADR-017):
+method defaulting to `None` (the `kind_hook` pattern, `crates/khive-runtime/src/pack/traits.rs:186-194`, ADR-017):
 
     // crates/khive-runtime/src/pack.rs — on trait PackRuntime
     fn context_contributor(&self) -> Option<Arc<dyn ContextContributor>> { None }
@@ -56,11 +58,11 @@ method defaulting to `None` (the `kind_hook` pattern, `crates/khive-runtime/src/
 (§Execution). `VerbRegistry` gains one additive accessor,
 `context_contributors() -> Vec<Arc<dyn ContextContributor>>`, iterating the existing pack set
 (mirrors the existing `for pack in self.packs.iter()` sweep in `dispatch`,
-`crates/khive-runtime/src/pack.rs:1014`). All existing packs compile unchanged; a pack that does not
-implement the method contributes nothing.
+`crates/khive-runtime/src/pack/catalog.rs:463-467`). All existing packs compile unchanged; a pack
+that does not implement the method contributes nothing.
 
 There is no runtime-built-in (pack-less) verb mechanism to attach to instead: every verb, including
-`verbs()` itself, is a pack-owned `HandlerDef` (`crates/khive-pack-kg/src/handler_defs.rs:692`)
+`verbs()` itself, is a pack-owned `HandlerDef` (`crates/khive-pack-kg/src/handler_defs.rs:1682`)
 dispatched by iterating `self.packs`; a bare built-in would require special-casing the dispatch loop,
 which ADR-017 disallows.
 
@@ -151,17 +153,18 @@ valid empty assembly.
 Read-snapshot hygiene (issue #580): #580 was a long-lived reader pinning the WAL checkpoint, not a
 count problem. `contribute` MUST materialize all reads into owned `ContextSlice` data and release
 every snapshot/transaction/statement before returning; no reader survives the `contribute` call or
-the assembly boundary. The per-contributor timeout (≤1000ms) bounds reader lifetime; bounded
+the assembly boundary. The per-contributor timeout (≤1000ms) bounds reader lifetime (superseded by
+Amendment 1, Decision 4); bounded
 concurrency caps simultaneous acquisition. Full serialization is rejected (latency cost, no #580
 benefit). This invariant aligns with ADR-091's reader-lifetime rules.
 
 ### 6. Serve attribution
 
 **Consumer-kind vocabulary is closed, and this ADR must extend it.** `resolve_consumer_profile`
-(`crates/khive-brain-core/src/profile.rs:118`) takes a `ConsumerKind` enum, not a bare string
+(`crates/khive-brain-core/src/profile.rs:132-136`) takes a `ConsumerKind` enum, not a bare string
 (`crates/khive-brain-core/src/profile.rs:31` currently declares only `Recall`, `KnowledgeCompose`,
 `Rerank`), and ADR-058 is explicit that adding a new consumer means adding a variant, never a bare
-string literal at a new call site (`docs/adr/ADR-058-brain-posterior-read-path.md:343`). This ADR
+string literal at a new call site (`docs/adr/ADR-058-brain-posterior-read-path.md:357-358`). This ADR
 does **not** propose a string-based resolver, and does not treat `context.assemble`'s free-form,
 caller-supplied `consumer_kind` request field (§3, used for budget-weight lookup) as the same thing
 as the closed Rust-side profile-resolution vocabulary — the two are deliberately decoupled:
@@ -169,12 +172,13 @@ as the closed Rust-side profile-resolution vocabulary — the two are deliberate
 - **Required addition**: add `ConsumerKind::Context` (`as_str() == "context"`) to the enum in
   `crates/khive-brain-core/src/profile.rs`, alongside the `brain.record_serve` wrapper, as part of
   this ADR's implementation PR — the same ADR-058-conformant pattern used for `Recall` and
-  `KnowledgeCompose`.
+  `KnowledgeCompose`. (superseded by Amendment 1, Decision 3)
 - **Profile resolution** (`served_by_profile_id`) is attempted **only** when the request's
   `consumer_kind` string maps to a known `ConsumerKind` variant (today: exactly `"context"` →
   `ConsumerKind::Context`, resolved once at the composer level via the existing shared three-tier
   helper `khive_brain_core::resolve_consumer_profile`, ADR-035/ADR-058 — the same helper the memory
   pack (`ConsumerKind::Recall`) and knowledge pack (`ConsumerKind::KnowledgeCompose`) already share).
+  (superseded by Amendment 1, Decision 3)
 - **Budget-weight lookup is unconstrained and separate.** The request's `consumer_kind` string
   (§4's `[context.weights.<consumer_kind>]` config keys, e.g. `"prefetch"`) is used for allocation
   regardless of whether it maps to a `ConsumerKind` variant — this is config-table lookup, not
@@ -190,18 +194,21 @@ as the closed Rust-side profile-resolution vocabulary — the two are deliberate
 
 The ADR-081 §4 cross-session serve ledger (`brain_serve_ledger`) already models exactly the row shape
 this needs: one row per served target, keyed `(namespace, target_id, query_class, served_at)`. Its
-write side, `record_serve` (`crates/khive-pack-brain/src/serve_ledger.rs:83`), is implemented but
+write side, `record_serve` (`crates/khive-pack-brain/src/serve_ledger.rs:164-177`), is implemented but
 **not yet wired to any call path or exposed as a dispatchable verb** — the doc comment on that
 function states it is "provided so the ledger's write contract is implemented, not stubbed, ahead of
 that wiring," and it takes a single `target_id`, not an array. There is currently no `brain.record_serve`
 MCP verb. This ADR corrects an earlier draft's assumption that such a verb and an array-taking
 `target_ids` parameter already existed — they do not; the schema and the row shape do exist and need
-no change.
+no change. (Corrected by Amendment 1, Corrections: the `brain.record_serve` subhandler landed the same
+day this record was drafted. It accepts a `target_ids` array, `memory.recall` dispatches it in-process,
+and it is not catalogued as an MCP verb; the storage function still takes a single `target_id`.)
 
-Concretely, this ADR requires one small addition to `khive-pack-brain`: a thin `brain.record_serve`
+(Superseded by Amendment 1, Decision 1: the composer reuses the existing internal subhandler and adds
+no verb.) Concretely, this ADR requires one small addition to `khive-pack-brain`: a thin `brain.record_serve`
 verb (`Visibility::Verb`, params: `target_ids: Vec<String>`, `consumer_kind`,
 `served_by_profile_id?`, `query_raw`, `served_at`) whose handler derives every field the existing
-`record_serve` function (`crates/khive-pack-brain/src/serve_ledger.rs:83`) requires but the wrapper's
+`record_serve` function (`crates/khive-pack-brain/src/serve_ledger.rs:164-177`) requires but the wrapper's
 own params do not carry directly:
 
 - `namespace` — derived from the dispatch token (the same `NamespaceToken` the registry mints at the
@@ -209,7 +216,7 @@ own params do not carry directly:
 - `id` (row id) — one freshly generated id per target, generated by the handler, not the caller.
 - `query_class` — derived from `query_raw` per ADR-081 §4's deterministic normalization algorithm
   (lowercase, strip punctuation, collapse whitespace, sort unique tokens, join, first 16 hex chars of
-  the SHA-256; `docs/adr/ADR-081-recall-retune-driver.md:182`), computed once per dispatch and reused
+  the SHA-256; `docs/adr/ADR-081-recall-retune-driver.md:189-193`), computed once per dispatch and reused
   for every target in the loop (all targets in one assembly share one `query_raw`).
 - `resolved_profile_id` / `resolved_at` — always `None` on this path; ADR-081 §4's
   `accounting_profile_id` derivation (`COALESCE(served_by_profile_id, resolved_profile_id)`) already
@@ -220,11 +227,14 @@ once per `target_id` in `target_ids`, writing one ledger row per target — no s
 the table already stores one row per `target_id`; every column the table requires is now accounted
 for. The composer fires this dispatch once per assembly, asynchronously off the response path
 (`tokio::spawn`, fail-soft — the same fire-and-forget shape already used elsewhere in the pack, e.g.
-`crates/khive-pack-memory/src/ann.rs:289`), carrying `target_ids` = all appended slice ids across all
-contributors, `consumer_kind`, `query_raw`, `served_at`, `served_by_profile_id` (per the vocabulary
+`crates/khive-pack-memory/src/handlers/recall.rs:1435`; corrected by Amendment 1, Corrections: that
+call site spawns through the tracked `khive_runtime::track_recall_ledger_task`,
+`crates/khive-runtime/src/daemon/load_limits.rs:398-403`), carrying `target_ids` = all appended slice
+ids across all contributors, `consumer_kind`, `query_raw`, `served_at`, `served_by_profile_id` (per the vocabulary
 constraint above: `None` when `consumer_kind` does not map to a known `ConsumerKind` variant). This is
 the least-event-volume design that still gives ADR-081 per-target — and therefore per-substrate
 (target id → owning substrate) — granularity at one dispatch per assembly.
+(Superseded by Amendment 1, Decision 2: no dispatch without a raw query.)
 
 **Feedback path.** The response lists every slice with `{id, source_pack, score_semantics}` and the
 assembly-level `served_by_profile_id`, so the caller (or the ADR-081 out-of-band scorer) emits
@@ -243,7 +253,7 @@ ADR-081 learn _this surface's_ budget-split usefulness (F3/§4 v2). Stamping a c
 onto memory-origin or kg-origin targets means those ledger rows attribute to the composer's profile,
 not to `memory.recall`'s own recall profile — this is intended: the composer is a different
 `consumer_kind`, and conflating its serves with direct `memory.recall` serves would corrupt both
-signals.
+signals. (superseded by Amendment 1, Decision 3)
 
 ### 7. Response shape
 
@@ -267,7 +277,7 @@ signals.
 - **B — composer dispatches MCP verbs with hardcoded adapters.** Rejected: verb-name + response-shape
   coupling; the discover-many-and-consume case reintroduces it even via in-process `registry.dispatch`
   and re-enters the gate + re-mints a token per contributor
-  (`crates/khive-runtime/src/pack.rs:902-1012` runs on every `registry.dispatch`).
+  (`crates/khive-runtime/src/pack/dispatch.rs:268-341` runs on every `registry.dispatch`).
 - **Runtime built-in (pack-less) verb.** Rejected: no such mechanism exists — every verb is
   pack-owned and dispatched by iterating packs (`verbs()` itself is a kg handler). A built-in would
   need dispatch-loop special-casing, violating ADR-017's no-special-casing rule; it is more surface,
@@ -294,11 +304,12 @@ signals.
 - One small addition to `khive-pack-brain`: a thin `brain.record_serve` verb wrapping the existing
   (currently unwired) ADR-081 §4 write function, deriving `namespace`/row `id`/`query_class` and
   looping over `target_ids`. This is new verb surface, scoped to this ADR's implementation PR, not a
-  schema change.
+  schema change. (superseded by Amendment 1, Decision 1)
 - One small addition to `khive-brain-core`: a new `ConsumerKind::Context` variant
   (`crates/khive-brain-core/src/profile.rs:31`), added the same ADR-058-conformant way `Recall` and
   `KnowledgeCompose` were — this is what lets `served_by_profile_id` resolve for the composer's
   default `consumer_kind` at all; it does not open the closed-enum resolver to arbitrary strings.
+  (superseded by Amendment 1, Decision 3)
 - The per-turn prefetch hook can replace its caller-side recall+search assembly with one
   `context.assemble` call — gated on measured wall-time beating the caller-side chain (ADR-089's 2.2s
   baseline is the comparator; if it does not beat it, the verb does not ship). This measured
@@ -309,6 +320,8 @@ signals.
 - ADR-023 surface amendment: the verb catalog gains `context.assemble` (and `brain.record_serve`);
   AGENTS.md and the verb reference document them. kg's `context` (ADR-089) and `context.assemble`
   share the graph-assembly implementation (one internal helper); two surfaces, one code path.
+  (Corrected by Amendment 1, Decision 1: the catalog gains only `context.assemble`;
+  `brain.record_serve` stays an internal subhandler.)
 
 ## Provenance note
 
@@ -320,6 +333,99 @@ takes a single `target_id` and is not yet wired to any verb; §6 above specifies
 needed instead of asserting it as already shipped. (2) the review's cited `recall.rs:589`
 "`resolve_serving_profile`" helper does not exist under that name or in that file; the real, reusable
 three-tier helper is `khive_brain_core::resolve_consumer_profile`
-(`crates/khive-brain-core/src/profile.rs:118`), which §6 cites correctly. All other file:line
+(`crates/khive-brain-core/src/profile.rs:132-136`), which §6 cites correctly. All other file:line
 citations underpinning this ADR (`pack.rs:141`, `pack.rs:1014`, `pack.rs:902-1012`,
 `handler_defs.rs:692`, `feedback.rs:108`) were verified against the worktree at time of writing.
+(Corrected by Amendment 1, Corrections: claim (1) was overtaken the same day. The internal subhandler
+added with the recall serve-attribution wiring accepts `target_ids` and is dispatched in-process; the
+storage function takes a single `target_id`. The citations above now live at
+`crates/khive-runtime/src/pack/traits.rs:186-194`, `crates/khive-runtime/src/pack/catalog.rs:463-467`,
+`crates/khive-runtime/src/pack/dispatch.rs:268-341`, `crates/khive-pack-kg/src/handler_defs.rs:1682`
+and `crates/khive-pack-memory/src/handlers/feedback.rs:108-113`, and the body cites those locations.)
+
+## Amendment 1 (2026-10-23) -- Context composer attribution decisions
+
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#5560](https://github.com/ohdearquant/khive/issues/5560), including
+[#4737](https://github.com/ohdearquant/khive/issues/4737).
+
+**Trigger.** The base text described `brain.record_serve` as absent and proposed exposing it as a
+`Verb`, but the checkout defines it as an internal `Subhandler` and `memory.recall` dispatches it
+in-process (`crates/khive-pack-brain/src/handlers.rs:467-500`;
+`crates/khive-pack-memory/src/handlers/recall.rs:1439-1457`). The ledger handler requires `query_raw`,
+while the request contract permits entity-only assembly
+(`crates/khive-pack-brain/src/handlers.rs:497-500`; §3 above). The brain registry declares only
+`recall` as a consumer kind, and only that kind has a system-default profile
+(`crates/khive-pack-brain/src/pack.rs:261-262`; `crates/khive-pack-brain/docs/design.md:44-53`).
+Finally, Tokio does not stop a blocking read when its awaiting future is dropped; the read cancellation
+path has a 500 ms grace period, a 5000 ms hard cap, and a detach path
+(`crates/khive-db/src/read_cancellation.rs:3-4, 22-47, 819-884`).
+
+### Decision 1 -- Keep serve recording internal
+
+`brain.record_serve` remains `Visibility::Subhandler` and is dispatched in-process by the composer.
+The composer reuses the existing handler and does not require a new MCP `Verb`. This preserves the
+existing internal-only surface while allowing the composer to record query-backed served slices
+(`crates/khive-pack-brain/src/handlers.rs:467-472`;
+`crates/khive-pack-memory/src/handlers/recall.rs:1439-1457`). The contrary statements in §6 and
+Consequences that propose a new `Visibility::Verb` are superseded by this decision, and the catalog
+statement in Consequences is marked as corrected.
+
+### Decision 2 -- Do not record entity-only serves
+
+An entity-only assembly has no `query_raw` and records no serve. The composer dispatches the ledger
+subhandler only when a raw query is available. This follows the handler's required `query_raw` input
+(`crates/khive-pack-brain/src/handlers.rs:497-500`) and the deterministic `query_class` normalization
+in ADR-081 (`docs/adr/ADR-081-recall-retune-driver.md:189-191`). This avoids inventing a query-class
+value for a request without a query. It supersedes the unconditional serve dispatch language in §6.
+
+### Decision 3 -- Leave context profile attribution null
+
+Until a separate decision establishes a context binding, `served_by_profile_id` is null for context
+assemblies. The current `ConsumerKind` enum has no `Context` variant
+(`crates/khive-brain-core/src/profile.rs:31-45`), the brain pack declares only `Recall` as a consumer
+kind (`crates/khive-pack-brain/src/pack.rs:261-262`), and the documented system-default fallback is
+limited to `recall` (`crates/khive-pack-brain/docs/design.md:44-53`). A context binding remains open
+and this decision does not specify its future registration or resolution policy. This changes the §6
+profile-resolution proposal for context.
+
+### Decision 4 -- State the read-lifetime bound accurately
+
+The awaited contributor timeout is at most 1000 ms under §4 (`per_contributor_timeout_ms`, clamped to 50..=1000),
+followed by a 500 ms interrupt grace and a 5000 ms hard cap for the blocking read path. After that
+combined wait, the worker may be detached while its pool admission remains held until the worker exits
+(`crates/khive-db/src/read_cancellation.rs:22-47, 819-884`). The §5 sentence claiming that the
+contributor timeout bounds reader lifetime is superseded. This is a wait bound only; the detached
+worker may continue beyond it.
+
+### Corrections
+
+These change no decision; each is marked where the base text says it.
+
+- The serve-ledger write side was wired the same day this record was drafted: the internal
+  `brain.record_serve` subhandler accepts `target_ids` and `memory.recall` dispatches it in-process
+  (`crates/khive-pack-brain/src/handlers.rs:467-500`;
+  `crates/khive-pack-memory/src/handlers/recall.rs:1435-1457`). §6 and the Provenance note keep their
+  original statements with this correction beside them.
+- The fire-and-forget example in §6 moved; the current in-pack call site is the tracked ledger task at
+  `crates/khive-pack-memory/src/handlers/recall.rs:1435`
+  (`crates/khive-runtime/src/daemon/load_limits.rs:398-403`).
+- ADR-091 is the accepted bounded read-transaction lifetime and WAL checkpoint escalation record, not a
+  memory-backend connector rule set.
+- File and line citations in the base text are re-pinned to the current tree in place.
+
+### Acceptance
+
+| ID | Statement                                                                                        | Evidence                                                                                                                                     |
+| -- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1 | `brain.record_serve` remains an internal subhandler and is not catalogued as an MCP verb.        | `crates/khive-pack-brain/src/handlers.rs:467-472`; `crates/khive-runtime/src/pack/catalog.rs:290-305`                                        |
+| A2 | Query-backed composer dispatch records served slice ids through the existing in-process handler. | New `khive-pack-context` test `query_backed_assembly_records_served_slices` (to add)                                                         |
+| A3 | Entity-only assembly performs no serve-ledger dispatch.                                          | New `khive-pack-context` test `entity_only_assembly_does_not_record_serve` (to add): entity_ids without query; ledger row count remains zero |
+| A4 | Until context binding is separately specified, response `served_by_profile_id` is null.          | New `khive-pack-context` test `context_serve_profile_is_null_until_binding` (to add): response field is null; #4737                          |
+| A5 | Reader lifetime documentation includes the grace, hard-cap, and detach behavior.                 | `crates/khive-db/src/read_cancellation.rs:22-47, 819-884`; §5                                                                                |
+
+**Open question.** The Gate access classification for `context.assemble` when it performs the nested
+`brain.record_serve` write remains undecided. `memory.recall` is classified as Read while its nested
+write is denied and warned for restricted actors
+(`crates/khive-gate/docs/api/operation-access.md:331-335`).

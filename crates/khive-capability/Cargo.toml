@@ -9,11 +9,26 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Process-local sealed grants, attenuating delegation, and namespace-scoped capability validation."
+description = "Sealed grants, durable authenticated envelopes, and attenuating capability delegation."
+
+[features]
+default = []
+authority-store = ["dep:khive-db", "dep:khive-storage", "dep:serde_json"]
 
 [dependencies]
+khive-db = { version = "0.14.0", path = "../khive-db", optional = true }
+khive-storage = { version = "0.14.0", path = "../khive-storage", optional = true }
+serde_json = { workspace = true, optional = true }
 lion-core = { package = "khive-lion-core", version = "0.4.0", path = "../khive-lion-core" }
 khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
 blake3 = { workspace = true }
+hmac = "0.12"
+sha2 = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
+tokio = { workspace = true }
+tempfile = { workspace = true }

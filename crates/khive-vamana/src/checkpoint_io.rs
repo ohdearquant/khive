@@ -196,26 +196,19 @@ impl CheckpointDirectory {
     pub(crate) fn open_lock(&self) -> io::Result<File> {
         #[cfg(unix)]
         {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-            // SAFETY: the directory descriptor and static NUL-terminated name
-            // live through this call; a successful descriptor is uniquely owned.
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    c".checkpoint.lock".as_ptr(),
-                    libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_NOFOLLOW
-                        | libc::O_NONBLOCK
-                        | libc::O_CLOEXEC,
-                    0o644 as libc::c_uint,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` was freshly returned by openat and has one owner.
-            let file = unsafe { File::from_raw_fd(fd) };
+            use khive_fs::fd_relative::{open_file_at, Create, OpenFileOptions};
+            use std::os::fd::AsFd as _;
+
+            let file = open_file_at(
+                self.dir.as_fd(),
+                ".checkpoint.lock",
+                OpenFileOptions {
+                    read_write: true,
+                    create: Create::IfMissing,
+                    nonblock: true,
+                    mode: 0o644,
+                },
+            )?;
             if !file.metadata()?.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -241,28 +234,15 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // SAFETY: the pinned directory descriptor and validated name live
-            // through this call. O_NOFOLLOW rejects a planted final symlink.
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
+            let file = match khive_fs::fd_relative::open_at(
+                &self.dir,
+                std::ffi::OsStr::new(name),
+                false,
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
             };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return if error.kind() == io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(error)
-                };
-            }
-            // SAFETY: openat returned a new descriptor with one owner.
-            let file = unsafe { File::from_raw_fd(fd) };
             if !file.metadata()?.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -391,18 +371,11 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd as _;
-            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // SAFETY: the name and pinned directory descriptor are live. Unlinking
-            // a planted link removes only that directory entry.
-            if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
-                }
+            match khive_fs::fd_relative::unlink_at(&self.dir, std::ffi::OsStr::new(name)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
             }
-            Ok(())
         }
         #[cfg(windows)]
         {
@@ -495,6 +468,35 @@ fn component_name(name: &str) -> io::Result<&str> {
 mod tests {
     use super::CheckpointDirectory;
     use std::{collections::BTreeMap, fs, io, os::unix::fs::symlink, path::Path};
+
+    #[test]
+    fn checkpoint_lock_reopens_without_truncating_and_refuses_a_symlink() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkpoint = CheckpointDirectory::open(dir.path()).unwrap();
+        let lock_path = dir.path().join(".checkpoint.lock");
+        let mut lock = checkpoint.open_lock().unwrap();
+        lock.write_all(b"lock state").unwrap();
+        drop(lock);
+        let mut reopened = checkpoint.open_lock().unwrap();
+        let mut bytes = Vec::new();
+        reopened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"lock state");
+        reopened.rewind().unwrap();
+        reopened.write_all(b"kept").unwrap();
+        drop(reopened);
+        assert_eq!(fs::read(&lock_path).unwrap(), b"kept state");
+
+        fs::remove_file(&lock_path).unwrap();
+        let target = outside.path().join("precious");
+        fs::write(&target, b"outside bytes").unwrap();
+        symlink(&target, &lock_path).unwrap();
+        assert!(checkpoint.open_lock().unwrap_err().raw_os_error().is_some());
+        assert_eq!(fs::read(&target).unwrap(), b"outside bytes");
+        assert_eq!(fs::read_link(&lock_path).unwrap(), target);
+    }
 
     const SEGMENTS: [(&str, &str, &[u8]); 4] = [
         ("vectors.bin.v2new", "vectors.bin", b"new vectors"),

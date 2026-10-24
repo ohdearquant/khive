@@ -128,15 +128,11 @@ pub(super) fn delete_merge_drop_edges(
     incident_preimages: &[MergeEdgePreimage],
 ) -> Result<(), SqliteError> {
     for edge in incident_preimages.iter().rev() {
-        conn.execute(
-            khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-            rusqlite::params![&edge.namespace, edge.id.to_string()],
-        )?;
+        conn.prepare_cached(khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL)?
+            .execute(rusqlite::params![&edge.namespace, edge.id.to_string()])?;
     }
-    conn.execute(
-        khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-        rusqlite::params![&root.namespace, root.id.to_string()],
-    )?;
+    conn.prepare_cached(khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL)?
+        .execute(rusqlite::params![&root.namespace, root.id.to_string()])?;
     Ok(())
 }
 

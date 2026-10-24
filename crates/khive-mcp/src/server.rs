@@ -748,3 +748,7 @@ mod event_row_usage_tests;
 #[cfg(test)]
 #[path = "server/numeric_env_tests.rs"]
 mod numeric_env_tests;
+
+#[cfg(test)]
+#[path = "audit_success_rows_usage_tests.rs"]
+mod audit_success_rows_usage_tests;

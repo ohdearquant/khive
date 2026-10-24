@@ -260,15 +260,14 @@ fn update_edge_symmetric_dml(
         // means stale, not "no conflict" — the probe above already
         // confirmed a conflicting canonical row exists.
         let affected = conn
-            .execute(
-                EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL,
-                rusqlite::params![
-                    &ns,
-                    &edge_id_str,
-                    expected_updated_at_micros,
-                    expected_deleted_at_micros,
-                ],
-            )
+            .prepare_cached(EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL)
+            .map_err(SqliteError::Rusqlite)?
+            .execute(rusqlite::params![
+                &ns,
+                &edge_id_str,
+                expected_updated_at_micros,
+                expected_deleted_at_micros,
+            ])
             .map_err(SqliteError::Rusqlite)?;
         if affected == 0 {
             return Ok(SymmetricEdgeUpdateOutcome::Stale);
@@ -281,21 +280,20 @@ fn update_edge_symmetric_dml(
         // that moved this edge between fetch and this write must be
         // refused, not silently overwritten by a stale full-row update.
         let affected = conn
-            .execute(
-                EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
-                rusqlite::params![
-                    &canon_src_str,
-                    &canon_tgt_str,
-                    &relation_str,
-                    weight,
-                    now_ts,
-                    metadata,
-                    &ns,
-                    &edge_id_str,
-                    expected_updated_at_micros,
-                    expected_deleted_at_micros,
-                ],
-            )
+            .prepare_cached(EDGE_SYMMETRIC_UPDATE_INPLACE_SQL)
+            .map_err(SqliteError::Rusqlite)?
+            .execute(rusqlite::params![
+                &canon_src_str,
+                &canon_tgt_str,
+                &relation_str,
+                weight,
+                now_ts,
+                metadata,
+                &ns,
+                &edge_id_str,
+                expected_updated_at_micros,
+                expected_deleted_at_micros,
+            ])
             .map_err(SqliteError::Rusqlite)?;
         if affected == 0 {
             return Ok(SymmetricEdgeUpdateOutcome::Stale);

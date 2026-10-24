@@ -291,3 +291,8 @@ attachments. The existing enrollment gate applies to mounted and native calls al
 per-verb grants and peer-class effect allowlists remain dependent on their own policy
 implementation. The pinned effect and generation are included on the ordinary dispatch
 audit row so classification is observable before that policy work lands.
+
+For native tailnet TCP requests, the remote peer's class allowlist must name the mounted identifier before it can
+execute. [ADR-137, Amendment 2, Decision 2](ADR-137-tailnet-wire-transport.md)
+applies this amendment's ordinary-dispatch rule to that transport. Ordinary mounted reachability does not grant
+remote permission or require a process attachment.

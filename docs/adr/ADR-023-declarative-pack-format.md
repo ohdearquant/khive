@@ -631,6 +631,7 @@ current verb surface or verb count:
    a record) that dispatch-by-kind cannot express. Existing named verbs accepted for
    exactly this reason (for example the session pack's `session.resume`, per
    ADR-083) are unaffected; this rule governs new packs and new verbs going forward.
+   (superseded by ADR-095 Amendment 1, Decision 1)
 2. Per-kind create-time field validation (enum checks, format checks, cross-field
    guards) lives in that kind's `KindHook::prepare_create` implementation
    ([ADR-017](ADR-017-pack-standard.md) §KindHook), not in a parallel handler that

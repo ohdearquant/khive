@@ -1,6 +1,6 @@
 # ADR-072: Subject OntologySpec as Runtime Data -- Verbless Verticals and Pack Retirement
 
-**Status**: Proposed\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-06-26\
 **Authors**: khive maintainers
 **Extends**: ADR-069 (Subject Model -- component specification and D1)\

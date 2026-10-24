@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use khive_runtime::audit_error::AuditErrorClass;
 use khive_storage::Event;
 use khive_types::{EventKind, EventOutcome};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::handlers::{event_cost_unit, event_work_class};
@@ -92,6 +92,7 @@ pub(crate) struct EventCountsAccumulator {
     counts_by_work_class: std::collections::BTreeMap<String, u64>,
     total_cost_unit: i64,
     cost_unit_by_verb: std::collections::BTreeMap<String, i64>,
+    sampled_success_rows: BTreeMap<String, SampledSuccessRows>,
 }
 
 impl EventCountsAccumulator {
@@ -179,9 +180,28 @@ impl EventCountsAccumulator {
         if let Some(cross) = &mut self.group_counts {
             cross.observe(event, self.default_actor.as_deref());
         }
+        if event.kind == EventKind::Audit
+            && event.outcome == EventOutcome::Success
+            && matches!(
+                event.verb.as_str(),
+                "comm.heartbeat" | "comm.cleanup_expired_quarantine"
+            )
+        {
+            self.sampled_success_rows
+                .entry(event.verb.clone())
+                .or_default()
+                .observe(
+                    event
+                        .payload
+                        .get("resource")
+                        .and_then(|resource| resource.get("sampling")),
+                );
+        }
     }
 
     pub(crate) fn add_to_result(self, result: &mut Value, truncated: bool) {
+        result[BrainPack::truncatable_total_key("sampled_success_rows", truncated)] =
+            json!(self.sampled_success_rows);
         result["counts_by_kind"] = json!(self.counts_by_kind);
         result["counts_by_actor"] = json!(self.counts_by_actor);
         result["counts_by_verb"] = json!(self.counts_by_verb);
@@ -215,6 +235,52 @@ impl EventCountsAccumulator {
             result[BrainPack::truncatable_total_key("total_cost_unit", truncated)] =
                 json!(self.total_cost_unit);
             result["cost_unit_by_verb"] = json!(self.cost_unit_by_verb);
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct SampledSuccessRows {
+    rows: u64,
+    sample_rows: u64,
+    forced_rows: u64,
+    unsampled_rows: u64,
+    every: Option<u64>,
+    #[serde(skip)]
+    mixed_rates: bool,
+}
+
+impl SampledSuccessRows {
+    fn observe(&mut self, sampling: Option<&Value>) {
+        let Some(sampling) = sampling else {
+            self.unsampled_rows += 1;
+            return;
+        };
+        self.rows += 1;
+        let (Some(every), Some(_seq), Some(selected_by)) = (
+            sampling
+                .get("every")
+                .and_then(Value::as_u64)
+                .filter(|every| *every > 0),
+            sampling.get("seq").and_then(Value::as_u64),
+            sampling.get("selected_by").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        match selected_by {
+            "sample" => self.sample_rows += 1,
+            "forced" => self.forced_rows += 1,
+            _ => return,
+        }
+        if !self.mixed_rates {
+            match self.every {
+                None => self.every = Some(every),
+                Some(previous) if previous != every => {
+                    self.every = None;
+                    self.mixed_rates = true;
+                }
+                Some(_) => {}
+            }
         }
     }
 }

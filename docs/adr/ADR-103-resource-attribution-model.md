@@ -1444,7 +1444,7 @@ approved by this amendment.
 
 ## Amendment 7 (2026-10-20): Success Rows of High-Frequency Polling Verbs
 
-**Status**: Proposed
+**Status**: Accepted (status corrected by ADR-133 Amendment 11).
 
 Decision (b) gives every dispatch one `EventKind::Audit` row, and Amendment 3 narrowed that only
 for transient admission pressure. This amendment narrows it for a second, deliberate case: the

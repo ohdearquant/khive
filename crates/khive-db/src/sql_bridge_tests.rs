@@ -42,6 +42,7 @@ async fn top_level_wal_checkpoint_ends_the_active_pin_run() {
 
 include!("sql_bridge_atomic_serialization_tests.rs");
 include!("sql_bridge_write_admission_tests.rs");
+include!("sql_bridge_execute_control_tests.rs");
 
 fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
     match pool.origin() {
