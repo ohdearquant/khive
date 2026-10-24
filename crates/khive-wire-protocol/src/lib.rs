@@ -233,16 +233,12 @@
 //! AND a direct `serde_json::from_str::<Frame>`. The check covers the
 //! same wire invariants in `Frame`'s serializer, so direct
 //! `serde_json::to_vec::<Frame>` cannot bypass the encode-side validation.
-//! On decode, the check covers the codes in the closed set
-//! ([`error::WIRE_ERROR_CODES`]); an unrecognized
-//! code falls back to `internal` and is processed per the fallback rule
-//! above (its true scope is unknown to this version, so the pairing is
-//! not enforced for it), but the raw code string is preserved in the
-//! decoded frame's `unrecognized_code` diagnostic field rather than
-//! discarded.
-//! If that fallback has no operation id, a consumer has nothing safe to
-//! correlate: it should surface the frame as a connection-level diagnostic
-//! and must not guess which request to fail.
+//! On decode, known codes obey their fixed id/scope pairing. Under ADR-137
+//! Amendment 1 Decision 5, an unknown code is accepted only with a non-empty
+//! operation id: it falls back to `internal` (request-terminal), retains its
+//! raw string in `unrecognized_code`, and cannot be re-encoded. An unknown
+//! code without an operation id is malformed and connection-terminal at the
+//! decode boundary; it is never returned as a fallback frame.
 //!
 //! **Fallback frames are not re-encodable by this relay.** A decoded frame
 //! carrying `unrecognized_code` can be inspected locally, but the encode

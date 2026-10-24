@@ -341,9 +341,9 @@ pub enum Frame {
         /// rejects it ([`crate::codec::CodecError::FallbackFrameNotEncodable`])
         /// rather than emit `internal` and silently discard the newer code.
         /// The connection remains healthy; only this relay attempt failed.
-        /// If it has no operation id, a consumer should surface it as a
-        /// connection-level diagnostic rather than guess which request to
-        /// fail.
+        /// Under ADR-137 Amendment 1 Decision 5, only an unknown code with
+        /// an operation id can decode to this fallback. An id-less unknown
+        /// code is rejected as malformed at the decode boundary.
         unrecognized_code: Option<String>,
     },
 
