@@ -728,9 +728,38 @@ async fn task_update_description_type_refusals_mask_credentials_and_preserve_sna
     }
 }
 
+fn properties_policy_refusal_fixture() -> (KhiveRuntime, VerbRegistry) {
+    let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        events_split: None,
+        actor_id: Some("gtd-json-refusal-fixture".into()),
+        packs: vec!["kg".into()],
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("private memory runtime for properties policy refusals");
+    assert!(runtime.backend().pool().canonical_path().is_none());
+    assert!(runtime.backend_data_dir().is_none());
+    assert!(runtime.backend_ann_root().is_none());
+    assert!(runtime.default_embedder_name().is_empty());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("gtd-json-refusal-fixture".into()));
+    builder.with_default_namespace("local");
+    builder.register(KgPack::new(runtime.clone()));
+    builder.register(GtdPack::new(runtime.clone()));
+    let registry = builder.build().expect("properties policy refusal registry");
+    registry
+        .apply_schema_plans_with_map(&Default::default(), runtime.backend())
+        .expect("task schema");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    (runtime, registry)
+}
+
 #[tokio::test]
 async fn task_update_properties_type_refusals_mask_credentials_and_preserve_snapshot() {
-    let registry = json_refusal_fixture();
+    use khive_runtime::Namespace;
+    use uuid::Uuid;
+
+    let (runtime, registry) = properties_policy_refusal_fixture();
     let id = seed(&registry).await;
     let other_id = seed(&registry).await;
     assert_ne!(id, other_id, "two distinct actual task rows");
@@ -747,27 +776,126 @@ async fn task_update_properties_type_refusals_mask_credentials_and_preserve_snap
         stored["properties"]["description"],
         "Accepted object properties"
     );
-    assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 2);
+    let before = tasks(&registry).await;
+    assert_eq!(before.as_array().unwrap().len(), 2);
     let retained_ids = [id.clone(), other_id];
+    let mut snapshots = Vec::new();
+    for retained_id in &retained_ids {
+        let snapshot = registry
+            .dispatch("get", json!({"id": retained_id}))
+            .await
+            .expect("complete retained task before either refusal route");
+        assert!(snapshot.is_object(), "actual retained task readback");
+        snapshots.push((retained_id.clone(), snapshot));
+    }
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let task_id = Uuid::parse_str(id.as_str().unwrap()).unwrap();
+    let task = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(task_id)
+        .await
+        .unwrap()
+        .expect("actual persisted task for the public policy API");
+    assert_eq!(task.id, task_id);
+    assert_eq!(task.kind, "task");
+    let mut healthy_policy_args = json!({
+        "id": id, "properties": {"description": "Accepted object properties"}
+    });
+    registry
+        .prepare_note_update_policy(&runtime, &token, &task, &mut healthy_policy_args)
+        .await
+        .expect("public policy accepts object properties");
+    assert_eq!(
+        healthy_policy_args["content"], "Accepted object properties",
+        "the registered task normalizer ran through the public policy API"
+    );
+    assert_eq!(tasks(&registry).await, before);
+    for (retained_id, snapshot) in &snapshots {
+        assert_eq!(
+            registry
+                .dispatch("get", json!({"id": retained_id}))
+                .await
+                .unwrap(),
+            *snapshot,
+            "healthy preparation does not write a retained task"
+        );
+    }
+
     let secret = credential();
-    for (value, masked) in [
-        (json!(17), false),
-        (json!(["ordinary"]), false),
-        (json!("ordinary"), false),
-        (json!([{"credential": secret.clone()}]), true),
-        (json!(secret.clone()), true),
+    for (value, json_type, masked) in [
+        (json!(17), "number", false),
+        (json!(["ordinary"]), "array", false),
+        (json!("ordinary"), "string", false),
+        (json!([{"credential": secret.clone()}]), "array", true),
+        (json!(secret.clone()), "string", true),
     ] {
-        let secret = masked.then_some(secret.as_str());
-        let shown = json_operand_shown(&value, secret);
-        refuse_task_shape_with_snapshots(
-            &registry,
-            "update",
-            json!({"id": id, "properties": value}),
-            format!("properties on a `task` note must be patched with an object; got {shown}"),
-            secret,
-            &retained_ids,
-        )
-        .await;
+        let shown = json_operand_shown(&value, masked.then_some(secret.as_str()));
+        for through_policy in [false, true] {
+            // KG refuses nonobject properties before the task hook. The public
+            // preparation API also accepts raw args, so exercise that real
+            // boundary separately with the persisted typed Note and no tags.
+            let mut args = json!({"id": id, "properties": value.clone()});
+            let error = if through_policy {
+                match registry
+                    .prepare_note_update_policy(&runtime, &token, &task, &mut args)
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("public task policy accepted nonobject properties"),
+                }
+            } else {
+                registry
+                    .dispatch("update", args)
+                    .await
+                    .expect_err("KG properties type refusal")
+            };
+            let RuntimeError::InvalidInput(message) = &error else {
+                panic!("properties refusal changed kind: {error:?}");
+            };
+            let expected = if through_policy {
+                format!("properties on a `task` note must be patched with an object; got {shown}")
+            } else {
+                format!("properties must be an object; got {json_type}")
+            };
+            assert_eq!(
+                message, &expected,
+                "properties refusal must identify its actual boundary"
+            );
+            assert!(
+                !message.contains(&secret),
+                "properties refusal exposed the synthetic credential"
+            );
+            if through_policy && masked {
+                assert!(
+                    message.contains("***MASKED***"),
+                    "public policy credential mask missing"
+                );
+            }
+            assert_eq!(
+                runtime_error_value(error, DomainDisposition::NotCommitted),
+                json!({
+                    "kind": "runtime_error",
+                    "message": format!("invalid input: {expected}"),
+                    "domain_disposition": "not_committed"
+                })
+            );
+            assert_eq!(
+                tasks(&registry).await,
+                before,
+                "either refusal changed the populated task census"
+            );
+            for (retained_id, snapshot) in &snapshots {
+                assert_eq!(
+                    registry
+                        .dispatch("get", json!({"id": retained_id}))
+                        .await
+                        .unwrap(),
+                    *snapshot,
+                    "either refusal changed a complete retained task snapshot"
+                );
+            }
+        }
     }
 }
 
