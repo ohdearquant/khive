@@ -127,8 +127,7 @@ use dispatch_helpers::{
 };
 #[cfg(test)]
 use dispatch_helpers::{
-    coordinator_search_visibility, drop_value_iteratively, ok_envelope, result_exceeds_depth_limit,
-    result_within_depth_limit, runtime_error_value,
+    coordinator_search_visibility, ok_envelope, result_exceeds_depth_limit, runtime_error_value,
 };
 #[cfg(unix)]
 use rendering::cancelled_forward_error;
