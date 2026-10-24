@@ -1203,7 +1203,7 @@ claimed occurrence's identity.
 
 ## Amendment I: One drain core, two replay paths (2026-10-24)
 
-**Status**: Proposed (2026-10-24). This amendment moves the pending-event drain's core into
+**Status**: Accepted (2026-10-24). This amendment moves the pending-event drain's core into
 `khive-pack-schedule` and adds a second entry that replays stored actions through a host's own
 `VerbRegistry`. Amendment E's creator-bound replay, Amendment F's claim, receipt, lease,
 identity and indeterminate-outcome guarantees, and Amendment H's missed-schedule policy remain
