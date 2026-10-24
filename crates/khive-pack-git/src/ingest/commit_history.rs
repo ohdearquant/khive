@@ -118,11 +118,12 @@ pub(super) async fn find_by_number(
     Ok(row.and_then(|r| r.uuid("id").ok()))
 }
 
-/// Find an existing `document` entity whose `properties.source_uri` or
-/// `name` matches `path` (ADR-086 keying convention); `None` when no match
-/// (v0 never creates documents on the ingester's behalf). See
+/// Find an existing `document` entity by exact `properties.source_uri`, then
+/// by a source-URI suffix, then by basename only when `source_uri` is absent
+/// (ADR-086 Amendment 1); `None` when no match. The ingester never creates
+/// documents on the caller's behalf. See
 /// crates/khive-pack-git/docs/api/ingest.md#find_document_for_path for the
-/// single-query exact-vs-suffix-match ordering rationale.
+/// single-query ordering rationale.
 pub(super) async fn find_document_for_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
