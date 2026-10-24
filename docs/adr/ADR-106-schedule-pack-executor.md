@@ -1244,7 +1244,13 @@ failure-classification code under `crates/khive-mcp/src/pending_events/` moves i
 `khive-runtime`, `khive-storage` and `khive-request` (`crates/khive-pack-schedule/Cargo.toml`).
 The command-line entries `run_pending_events` and `run_pending_events_with_config`, and the
 daemon's `schedule_tick_loop`, stay in `khive-mcp`, because they build or hold a server.
-`khive-mcp` keeps `run_pending_events_on` as a public entry.
+`khive-mcp` keeps `run_pending_events_on` as a public entry. What stays in `khive-mcp` is exactly
+the code that names a `khive-mcp` item: the command-line entries (`crate::args::Args`,
+`crate::serve::build_server_with_explicit_namespace`, `DatabaseOverrideConflict` and
+`resolved_actor_disclosure`, `drain.rs:45-78`), `schedule_tick_loop` (`crate::components::HostContext`
+and `ComponentError`, `pending_events.rs:584-586` and `:620`), and the server's implementation of
+the replay interface (`KhiveMcpServer` and `RequestParams`, `pending_events.rs:73-74`,
+`dispatch.rs:405-428`).
 
 `khive-pack-schedule` gains no dependency on `khive-mcp`. Its new direct dependencies are limited
 to crates already in the workspace dependency table that the moved code uses; the moving pull
@@ -1296,9 +1302,13 @@ identity is the one the server replay constructs (`crates/khive-mcp/src/server/r
 namespaces, while replay is scoped to the event's namespace alone.
 
 The server replay sets `from_wire = true` so that a stored action cannot reach a subhandler verb
-(`request_dispatch.rs:171-178`). The registry implementation gives the same protection by refusing
-any tool for which `VerbRegistry::is_subhandler_verb` (`crates/khive-runtime/src/pack/catalog.rs:726`)
-is true, before dispatch, as a known failure whose disposition is `not_committed`.
+(`request_dispatch.rs:176-178`, passed at `request_dispatch.rs:197`). The server gate exempts a
+`help: true` call (`crates/khive-mcp/src/server/execution.rs:267-271`), which the registry answers
+with the verb's description before any gate or pack (`crates/khive-runtime/src/pack/dispatch.rs:679-691`).
+The registry implementation gives the same protection by refusing any tool for which
+`VerbRegistry::is_subhandler_verb` (`crates/khive-runtime/src/pack/catalog.rs:726`) is true and
+whose stored arguments do not carry `help: true`, before dispatch, as a known failure whose
+disposition is `not_committed`. On both paths a subhandler's handler is never entered.
 
 ### Decision 4: one per-op failure entry, built by one function
 
@@ -1313,11 +1323,15 @@ On the server path, a `DispatchError` reaches the entry through `DispatchError::
 khive-mcp's `runtime_error_value` wrapper over the runtime projection
 (`crates/khive-mcp/src/server/dispatch_helpers.rs:392-398`; `crates/khive-runtime/src/error_projection.rs:17`),
 and `failure_entry` with `error_with_disposition` (`crates/khive-mcp/src/server/batch_types.rs:180-191,217-249`).
-That builder does more than drop a nested `domain_result`: it turns a bare string error into an
-object with `kind = "runtime_error"`, and for a committed error whose `domain_result` exceeds the
-nesting depth limit it replaces `code` and `message`. Both fields are classifier inputs, so an
-entry assembled from the runtime projection alone can classify differently from the server's
-entry for the same error.
+That builder does more than drop a nested `domain_result`. It turns a bare string error into an
+object with `kind = "runtime_error"`, and any other non-object error into one whose message is
+`operation failed` (`batch_types.rs:228`). For a committed error whose `domain_result` exceeds the
+nesting depth limit it replaces `code` and `message`. It writes the error's `domain_disposition`
+from the boundary's disposition (`batch_types.rs:247`), which the wrapper then resets to the
+projection's own (`dispatch_helpers.rs:396`), while the entry's `domain_disposition` keeps the
+boundary's (`batch_types.rs:188`), so the two fields can differ. All of these are classifier
+inputs, so an entry assembled from the runtime projection alone can classify differently from the
+server's entry for the same error.
 
 Therefore the pipeline from `DispatchError` to per-op failure entry becomes one public function
 in `khive-runtime`, called by the server's request executor and by the registry replay. `khive-mcp`
@@ -1336,16 +1350,16 @@ event (`schedule.remind.fire`, kind audit, outcome error, masked error text) is 
 The following are acceptance obligations for the implementing pull request, not claims that the
 tests exist. Each test runs against the registry entry unless it says otherwise.
 
-| ID | Statement                                                                                                                                                             |
-| -- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| I1 | A gate that refuses the replayed operation yields a known failure with nothing committed, and a one-shot follows Amendment F's retry rule.                            |
-| I2 | A stored action naming a subhandler verb is refused before dispatch; the handler is never entered.                                                                    |
-| I3 | The handler sees the provenance creator as its actor, the event's namespace as its namespace, and no other visible namespace.                                         |
-| I4 | A provenance-verified anonymous creator stays anonymous: the handler sees no actor id, never `local`.                                                                 |
-| I5 | An error whose disposition may have committed is classified as on the server path: a repeat advances and a one-shot ends indeterminate.                               |
-| I6 | The same failing operation driven through both entries produces byte-identical per-op failure entries and the same completion, including a committed too-deep result. |
-| I7 | A reminder delivery failure on the registry path appends exactly one `schedule.remind.fire` error event to `registry.event_store()`.                                  |
-| I8 | `khive-pack-schedule`'s manifest names no `khive-mcp` dependency, and the drain's existing tests pass unchanged after the move, run from their new crate.             |
+| ID | Statement                                                                                                                                                                                                                                    |
+| -- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I1 | A gate that refuses the replayed operation yields a known failure with nothing committed, and a one-shot follows Amendment F's retry rule.                                                                                                   |
+| I2 | A stored action naming a subhandler verb is refused before dispatch and its handler is never entered; with `help: true` it returns the verb's description, as on the server path.                                                            |
+| I3 | The handler sees the provenance creator as its actor, the event's namespace as its namespace, and no other visible namespace.                                                                                                                |
+| I4 | A provenance-verified anonymous creator stays anonymous: the handler sees no actor id, never `local`.                                                                                                                                        |
+| I5 | An error whose disposition may have committed is classified as on the server path: a repeat advances and a one-shot ends indeterminate.                                                                                                      |
+| I6 | The same failing operation driven through both entries produces byte-identical per-op failure entries and the same completion, including a committed too-deep result.                                                                        |
+| I7 | A reminder delivery failure on the registry path appends exactly one `schedule.remind.fire` error event to `registry.event_store()`.                                                                                                         |
+| I8 | `khive-pack-schedule`'s manifest names no `khive-mcp` dependency, the drain's existing tests pass unchanged after the move, run from their new crate, and the items Decision 1 lists as staying are the only drain code left in `khive-mcp`. |
 
 ### Not decided here
 
