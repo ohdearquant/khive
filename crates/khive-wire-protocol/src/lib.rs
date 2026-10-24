@@ -71,7 +71,7 @@
 //! | ------------------ | --------------- | -------------------------------------------------------------- | ---- |
 //! | `handshake`        | client → server | `version: u32`                                                 | First frame on every connection; names the client's protocol version. |
 //! | `handshake_ack`    | server → client | `version: u32`                                                 | Accepts a `handshake`; names the version the connection now speaks. |
-//! | `request`          | client → server | `id: string`, `ops: string`, `deadline_ms?: u64`, `namespace?: string`, `actor_id?: string`, `visible_namespaces?: string[]` | One DSL batch/chain (ADR-016) to execute. The three optional identity-override fields exist for transports that accept caller-supplied context; a mapped transport rejects a request carrying any of them with `context_rejected`. |
+//! | `request`          | client → server | `id: string`, `ops: string`, `deadline_ms?: u64`, `namespace?: string`, `actor_id?: string`, `visible_namespaces?: string[]` | One DSL batch/chain (ADR-016) to execute. `deadline_ms`, when present, must be positive (ADR-137, "Deadlines and cancellation"). The three optional identity-override fields exist for transports that accept caller-supplied context; a mapped transport rejects a request carrying any of them with `context_rejected`. |
 //! | `response`         | server → client | `id: string`, `result: json`                                   | Successful terminal frame for a `request`; `result` is the verb-dispatch result, opaque to this crate. |
 //! | `error`            | server → client | `id?: string`, `code: string`, `message: string`               | Wire-level failure. `id` is present for a request-scoped error, absent for a connection-terminal error. |
 //! | `cancel`           | client → server | `id: string`                                                    | Asks the server to terminate the named `request`. No-op on an unknown/subscribe/unsubscribe/already-terminal id. |
@@ -79,7 +79,7 @@
 //! | `subscribe_ack`    | server → client | `id: string`, `topic: string`, `start_cursor: u64`              | Confirms a `subscribe`; names the cursor delivery begins after. |
 //! | `unsubscribe`      | client → server | `id: string`, `topic: string`                                   | Ends delivery for one topic. Idempotent no-op if not subscribed. |
 //! | `unsubscribe_ack`  | server → client | `id: string`, `topic: string`                                   | Confirms an `unsubscribe`. |
-//! | `event`            | server → client | `topic: string`, `cursor: u64`, `occurred_at: string`, `payload: json` | One state-change delivery. Carries no operation id — correlated by topic and ordered by `cursor` instead. `occurred_at` is RFC 3339. `payload`'s field-by-field shape is owned by the per-topic catalog (ADR-137, "Implementation-phase deliverables"), not by this crate. |
+//! | `event`            | server → client | `topic: string`, `cursor: u64`, `occurred_at: string`, `payload: object` | One state-change delivery. Carries no operation id — correlated by topic and ordered by `cursor` instead. `occurred_at` is RFC 3339. `payload` must be a JSON object (Amendment 1 Decision 10); its members are owned by the per-topic catalog. |
 //!
 //! The set is closed within one protocol version. A decoder that sees a
 //! `"kind"` value outside this table rejects the frame
@@ -100,25 +100,22 @@
 //! posture ADR-137 requires: a decoder never guesses that an unrecognized
 //! field is ignorable.
 //!
-//! The strictness covers the fields each frame KIND declares. The two
-//! opaque JSON values — `response.result` and `event.payload` — are data,
-//! not grammar: keys inside them are preserved, and their field-by-field
-//! shape is owned by the verb result surface (ADR-016) and the per-topic
-//! event catalog respectively, not by this crate.
+//! The strictness covers the fields each frame KIND declares. A Response
+//! result may be any JSON value; an Event payload must be a JSON object
+//! (Amendment 1 Decision 10). Inside those values, members are opaque data:
+//! their field-by-field shape is owned by the verb result surface (ADR-016)
+//! and the per-topic event catalog respectively, not by this crate.
 //!
-//! Three deliberate boundaries of the strictness, stated so nobody
-//! re-derives them:
+//! Three details of the strictness, stated so nobody re-derives them:
 //!
-//! - **Explicit `null` on an optional field is equivalent to absence.**
-//!   Optional payload fields are `Option<T>`; a member present with value
-//!   `null` decodes as absent and re-encodes with the member omitted. No
-//!   frame distinguishes present-null from absent.
-//! - **Duplicate members are last-wins, not rejected.** Payloads pass
-//!   through `serde_json`'s object model before field checking, so a
-//!   duplicated member name silently keeps the last occurrence —
-//!   `deny_unknown_fields` cannot see the earlier one. Rejecting
-//!   duplicates would require validating the raw document; the grammar
-//!   takes the documented last-wins stance instead.
+//! - **Optional envelope fields may be omitted, but may not be `null`.**
+//!   ADR-137 Amendment 1 Decision 4 rejects present-null on the declared
+//!   optional Request, Subscribe and Error fields. Opaque JSON nulls remain
+//!   data; this is not a recursive field-name or null prohibition.
+//! - **Duplicate envelope members are rejected before field validation.**
+//!   Raw serde and the codec compare decoded member names, including
+//!   escaped-equivalent and unknown names. This rule does not inspect
+//!   duplicate members inside opaque `result` or `payload` values.
 //! - **`topic` syntax is not validated here.** The codec accepts any JSON
 //!   string (including empty) for `subscribe`/`unsubscribe`/`event`
 //!   topics; the `<domain>.<event>` shape is enforced by the server
@@ -126,23 +123,23 @@
 //!
 //! ## Opaque payload fidelity
 //!
-//! `response.result` and `event.payload` are preserved as JSON VALUES —
-//! semantic equality, not byte-for-byte. Decoding and re-encoding yields a
-//! payload semantically equal to the original under the JSON data model,
-//! but the wire bytes may differ in two documented ways, both consequences
-//! of this workspace's `serde_json` feature set (default features only —
-//! no `preserve_order`, no `arbitrary_precision`):
+//! Under ADR-137 Amendment 1 Decision 9, received `response.result` and
+//! `event.payload` use owned [`OpaqueValue`] tokens. Decode and re-encode
+//! preserve the exact opaque token, including object member order, duplicate
+//! members, whitespace, escape spellings and number lexemes. The outer frame
+//! envelope is serialized normally; its original spelling is not retained.
 //!
-//! - **Object key order is not preserved.** Decoded objects use
-//!   `serde_json`'s `BTreeMap`-backed map and re-encode with keys in
-//!   sorted order. Consumers must treat key order as insignificant.
-//! - **Integers outside the u64/i64 range lose precision.** Integers
-//!   within u64/i64 range — including values above 2^53 — parse and
-//!   re-encode exactly; anything outside that range parses as `f64` and
-//!   may lose precision.
+//! Local values constructed with `OpaqueValue::from(serde_json::Value)` use
+//! serde_json's normal serializer. A fallible [`OpaqueValue::to_value`] returns
+//! a separate parsed value on request: it can round out-of-range numbers or
+//! refuse numbers outside serde_json's representable range. Editing that
+//! projection never changes the retained token. No parsed projection is cached.
 //!
-//! The codec's `opaque_payloads_are_preserved_semantically_not_byte_for_byte`
-//! test pins exactly this behavior.
+//! `PartialEq` compares parsed Value semantics when both projections succeed;
+//! if both received tokens cannot be projected, it compares their exact raw
+//! tokens instead. Equality is not a lexical-fidelity test. The codec's local
+//! opaque-value compatibility test retains the ordinary Value serialization
+//! behavior, while separate received-token tests pin lexical preservation.
 //!
 //! ## Server-produced fields
 //!
@@ -285,6 +282,7 @@ pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+mod opaque;
 pub mod version;
 
 pub use client_handshake::{
@@ -297,4 +295,5 @@ pub use codec::{
 pub use error::{TerminalScope, WireErrorCode, WIRE_ERROR_CODES};
 pub use frame::{Cursor, Frame, OperationId, CLIENT_TO_SERVER_KINDS, FRAME_KINDS};
 pub use handshake::{HandshakeGate, HandshakeOutcome, HandshakeSequenceError};
+pub use opaque::OpaqueValue;
 pub use version::{ProtocolVersion, SupportedVersions, SupportedVersionsError, CURRENT_VERSION};

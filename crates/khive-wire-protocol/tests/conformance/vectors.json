@@ -1,0 +1,2953 @@
+[
+  {
+    "id": "d01.decode.handshake.v0",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000207b226b696e64223a2268616e647368616b65222c2276657273696f6e223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 36
+    },
+    "description": "handshake.version is JSON integer 0; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake.v1",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000207b226b696e64223a2268616e647368616b65222c2276657273696f6e223a317d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 36
+    },
+    "description": "handshake.version is JSON integer 1; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake.v99",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000217b226b696e64223a2268616e647368616b65222c2276657273696f6e223a39397d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 37
+    },
+    "description": "handshake.version is JSON integer 99; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake.u32max",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000297b226b696e64223a2268616e647368616b65222c2276657273696f6e223a343239343936373239357d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 45
+    },
+    "description": "handshake.version is JSON integer 4294967295; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake.overflow",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000297b226b696e64223a2268616e647368616b65222c2276657273696f6e223a343239343936373239367d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=4294967296 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake.negative",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000217b226b696e64223a2268616e647368616b65222c2276657273696f6e223a2d317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=-1 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake.fraction",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000227b226b696e64223a2268616e647368616b65222c2276657273696f6e223a312e357d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=1.5 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake.float_integral",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000227b226b696e64223a2268616e647368616b65222c2276657273696f6e223a312e307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=1.0 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake.exponent",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000227b226b696e64223a2268616e647368616b65222c2276657273696f6e223a3165307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=1e0 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake.boolean",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000237b226b696e64223a2268616e647368616b65222c2276657273696f6e223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake.version=true is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.v0",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000247b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 40
+    },
+    "description": "handshake_ack.version is JSON integer 0; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake_ack.v1",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000247b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a317d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 40
+    },
+    "description": "handshake_ack.version is JSON integer 1; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake_ack.v99",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000257b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a39397d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 41
+    },
+    "description": "handshake_ack.version is JSON integer 99; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake_ack.u32max",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "0000002d7b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a343239343936373239357d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 49
+    },
+    "description": "handshake_ack.version is JSON integer 4294967295; syntax only"
+  },
+  {
+    "id": "d01.decode.handshake_ack.overflow",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "0000002d7b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a343239343936373239367d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=4294967296 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.negative",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000257b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a2d317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=-1 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.fraction",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000267b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a312e357d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=1.5 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.float_integral",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000267b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a312e307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=1.0 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.exponent",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000267b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a3165307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=1e0 is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.decode.handshake_ack.boolean",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000277b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack.version=true is outside unsigned32 or not a JSON integer"
+  },
+  {
+    "id": "d01.admit.server.v0",
+    "stage": "admit",
+    "decision": 1,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 0
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "unsupported_version",
+      "terminal_scope": "connection"
+    },
+    "description": "decoded handshake version0; supported [1,1]"
+  },
+  {
+    "id": "d01.admit.server.v1",
+    "stage": "admit",
+    "decision": 1,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "decoded handshake version1; supported [1,1]"
+  },
+  {
+    "id": "d01.admit.server.v99",
+    "stage": "admit",
+    "decision": 1,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 99
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "unsupported_version",
+      "terminal_scope": "connection"
+    },
+    "description": "decoded handshake version99; supported [1,1]"
+  },
+  {
+    "id": "d01.admit.server.u32max",
+    "stage": "admit",
+    "decision": 1,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 4294967295
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "unsupported_version",
+      "terminal_scope": "connection"
+    },
+    "description": "decoded handshake version4294967295; supported [1,1]"
+  },
+  {
+    "id": "d01.encode.handshake.v1",
+    "stage": "encode",
+    "decision": 1,
+    "role": null,
+    "frame": {
+      "kind": "handshake",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "emitted"
+    },
+    "description": "local handshake version1"
+  },
+  {
+    "id": "d01.encode.handshake.v0",
+    "stage": "encode",
+    "decision": 1,
+    "role": null,
+    "frame": {
+      "kind": "handshake",
+      "version": 0
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local handshake version0; no wire error/scope"
+  },
+  {
+    "id": "d01.encode.handshake_ack.v1",
+    "stage": "encode",
+    "decision": 1,
+    "role": null,
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "emitted"
+    },
+    "description": "local handshake_ack version1"
+  },
+  {
+    "id": "d01.encode.handshake_ack.v0",
+    "stage": "encode",
+    "decision": 1,
+    "role": null,
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 0
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local handshake_ack version0; no wire error/scope"
+  },
+  {
+    "id": "d02.decode.configured.below",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "0000003f7b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a227878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 67
+    },
+    "max_payload_bytes": 64,
+    "description": "Configured64-byte payload boundary; prefix excluded."
+  },
+  {
+    "id": "d02.decode.configured.at",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "000000407b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a22787878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 68
+    },
+    "max_payload_bytes": 64,
+    "description": "Configured64-byte payload boundary; prefix excluded."
+  },
+  {
+    "id": "d02.decode.configured.above",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "000000417b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a2278787878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "frame_too_large",
+      "terminal_scope": "connection"
+    },
+    "max_payload_bytes": 64,
+    "description": "Configured64-byte payload boundary; prefix excluded."
+  },
+  {
+    "id": "d02.decode.default.above",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "00800001",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "frame_too_large",
+      "terminal_scope": "connection"
+    },
+    "description": "Default8MiB guard rejects declared8MiB+1 from prefix only, before body buffering; no huge fixture."
+  },
+  {
+    "id": "d03.decode.request.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000367b226b696e64223a2272657175657374222c226964223a226f7061717565206f702fceb1222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 58
+    },
+    "description": "request.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.request.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "0000002a7b226b696e64223a2272657175657374222c226964223a22222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "request.id empty"
+  },
+  {
+    "id": "d03.decode.response.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "000000337b226b696e64223a22726573706f6e7365222c226964223a226f7061717565206f702fceb1222c22726573756c74223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 55
+    },
+    "description": "response.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.response.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "000000277b226b696e64223a22726573706f6e7365222c226964223a22222c22726573756c74223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "response.id empty"
+  },
+  {
+    "id": "d03.decode.error.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "000000497b226b696e64223a226572726f72222c226964223a226f7061717565206f702fceb1222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 77
+    },
+    "description": "error.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.error.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "0000003d7b226b696e64223a226572726f72222c226964223a22222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "error.id empty"
+  },
+  {
+    "id": "d03.decode.cancel.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000257b226b696e64223a2263616e63656c222c226964223a226f7061717565206f702fceb1227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 41
+    },
+    "description": "cancel.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.cancel.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000197b226b696e64223a2263616e63656c222c226964223a22227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "cancel.id empty"
+  },
+  {
+    "id": "d03.decode.subscribe.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000347b226b696e64223a22737562736372696265222c226964223a226f7061717565206f702fceb1222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 56
+    },
+    "description": "subscribe.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.subscribe.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000287b226b696e64223a22737562736372696265222c226964223a22222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "subscribe.id empty"
+  },
+  {
+    "id": "d03.decode.subscribe_ack.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "000000497b226b696e64223a227375627363726962655f61636b222c226964223a226f7061717565206f702fceb1222c22746f706963223a2274222c2273746172745f637572736f72223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 77
+    },
+    "description": "subscribe_ack.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.subscribe_ack.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "0000003d7b226b696e64223a227375627363726962655f61636b222c226964223a22222c22746f706963223a2274222c2273746172745f637572736f72223a307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "subscribe_ack.id empty"
+  },
+  {
+    "id": "d03.decode.unsubscribe.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "000000367b226b696e64223a22756e737562736372696265222c226964223a226f7061717565206f702fceb1222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 58
+    },
+    "description": "unsubscribe.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.unsubscribe.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "server",
+    "input_hex": "0000002a7b226b696e64223a22756e737562736372696265222c226964223a22222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "unsubscribe.id empty"
+  },
+  {
+    "id": "d03.decode.unsubscribe_ack.nonempty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "0000003a7b226b696e64223a22756e7375627363726962655f61636b222c226964223a226f7061717565206f702fceb1222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 62
+    },
+    "description": "unsubscribe_ack.id is an opaque nonempty non-UUID string; error uses known request-terminal code"
+  },
+  {
+    "id": "d03.decode.unsubscribe_ack.empty",
+    "stage": "decode",
+    "decision": 3,
+    "role": "client",
+    "input_hex": "0000002e7b226b696e64223a22756e7375627363726962655f61636b222c226964223a22222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "unsubscribe_ack.id empty"
+  },
+  {
+    "id": "d04.decode.ordinary",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "ordinary one-member-per-key request"
+  },
+  {
+    "id": "d04.decode.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000327b226b696e64223a2268616e647368616b65222c2276657273696f6e223a312c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "unknown envelope key on otherwise valid handshake"
+  },
+  {
+    "id": "d04.decode.duplicate.version.same",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002c7b226b696e64223a2268616e647368616b65222c2276657273696f6e223a312c2276657273696f6e223a317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "two same-valued version members"
+  },
+  {
+    "id": "d04.decode.duplicate.id.same",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000347b226b696e64223a2272657175657374222c226964223a2269222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "two same-valued nonempty id members"
+  },
+  {
+    "id": "d04.decode.duplicate.id.empty_first",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000337b226b696e64223a2272657175657374222c226964223a22222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "duplicate id: empty then nonempty; duplicate before field validation"
+  },
+  {
+    "id": "d04.decode.duplicate.id.empty_last",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000337b226b696e64223a2272657175657374222c226964223a2269222c226964223a22222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "duplicate id: nonempty then empty; same duplicate rejection"
+  },
+  {
+    "id": "d04.decode.duplicate.escaped_name",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000397b226b696e64223a2272657175657374222c226964223a2269222c225c753030363964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "id and its JSON-escaped equivalent name are duplicate decoded keys"
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "optional request.deadline_ms omitted; error uses known connection-terminal code"
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003e7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "optional request.deadline_ms explicitly null"
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000297b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 45
+    },
+    "description": "optional subscribe.resume_cursor omitted; error uses known connection-terminal code"
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003e7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "optional subscribe.resume_cursor explicitly null"
+  },
+  {
+    "id": "d04.decode.error.id.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000407b226b696e64223a226572726f72222c22636f6465223a22756e737570706f727465645f76657273696f6e222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 68
+    },
+    "description": "optional error.id omitted; error uses known connection-terminal code"
+  },
+  {
+    "id": "d04.decode.error.id.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000004a7b226b696e64223a226572726f72222c22636f6465223a22756e737570706f727465645f76657273696f6e222c226d657373616765223a2264657461696c222c226964223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "optional error.id explicitly null"
+  },
+  {
+    "id": "d05.decode.unknown.with_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "000000437b226b696e64223a226572726f72222c22636f6465223a226675747572655f636f64655f78222c226d657373616765223a2264657461696c222c226964223a2269227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 71,
+      "effective_code": "internal",
+      "raw_error_code": "future_code_x",
+      "fallback_scope": "request",
+      "reencode_outcome": "refused"
+    },
+    "description": "unknown raw code + nonempty id; accepted fallback preserves raw code, request-terminal semantics, connection usable",
+    "check_unknown_fallback": true
+  },
+  {
+    "id": "d05.decode.unknown.without_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "0000003a7b226b696e64223a226572726f72222c22636f6465223a226675747572655f636f64655f78222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "same unknown code, id omitted"
+  },
+  {
+    "id": "d05.decode.known.with_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "0000003e7b226b696e64223a226572726f72222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c222c226964223a2269227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 66
+    },
+    "description": "understood request-terminal code + nonempty id"
+  },
+  {
+    "id": "d05.decode.known.without_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "000000407b226b696e64223a226572726f72222c22636f6465223a22756e737570706f727465645f76657273696f6e222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 68
+    },
+    "description": "understood connection-terminal code, id omitted"
+  },
+  {
+    "id": "d06.admit.server.handshake.fresh",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "inbound supported handshake"
+  },
+  {
+    "id": "d06.admit.client.ack.outstanding",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "outstanding",
+      "offered_version": 1
+    },
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "ack version1 answers local offer1"
+  },
+  {
+    "id": "d06.admit.client.rejection.outstanding",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "outstanding",
+      "offered_version": 1
+    },
+    "frame": {
+      "kind": "error",
+      "code": "unsupported_version",
+      "message": "detail"
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "known connection-terminal unsupported_version error answers outstanding handshake"
+  },
+  {
+    "id": "d06.admit.server.precompletion",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "request arrives before handshake completes"
+  },
+  {
+    "id": "d06.admit.server.repeated_handshake",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "handshake",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake after handshake completes"
+  },
+  {
+    "id": "d06.admit.server.wrong_direction",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "response",
+      "id": "i",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "response in wrong direction after completion"
+  },
+  {
+    "id": "d06.admit.server.terminal_persists",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "preceding": [
+      {
+        "kind": "response",
+        "id": "i",
+        "result": {}
+      }
+    ],
+    "description": "after wrong-direction connection-terminal refusal, another otherwise role-correct frame cannot restore admission"
+  },
+  {
+    "id": "d06.admit.client.precompletion",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "outstanding",
+      "offered_version": 1
+    },
+    "frame": {
+      "kind": "response",
+      "id": "i",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "response arrives before handshake completes"
+  },
+  {
+    "id": "d06.admit.client.repeated_handshake",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack after handshake completes"
+  },
+  {
+    "id": "d06.admit.client.wrong_direction",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "request in wrong direction after completion"
+  },
+  {
+    "id": "d06.admit.client.terminal_persists",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "response",
+      "id": "i",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "preceding": [
+      {
+        "kind": "request",
+        "id": "i",
+        "ops": "verbs()"
+      }
+    ],
+    "description": "after wrong-direction connection-terminal refusal, another otherwise role-correct frame cannot restore admission"
+  },
+  {
+    "id": "d06.admit.client.unsolicited.handshake_ack",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 1
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "handshake_ack arrives with no local offer outstanding"
+  },
+  {
+    "id": "d06.admit.client.unsolicited.connection_terminal_error",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "fresh"
+    },
+    "frame": {
+      "kind": "error",
+      "code": "unsupported_version",
+      "message": "detail"
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "connection_terminal_error arrives with no local offer outstanding"
+  },
+  {
+    "id": "d06.admit.client.ack.mismatched",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "outstanding",
+      "offered_version": 1
+    },
+    "frame": {
+      "kind": "handshake_ack",
+      "version": 99
+    },
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "ack version99 answers local offer1"
+  },
+  {
+    "id": "d06.admit.server.request.established",
+    "stage": "admit",
+    "decision": 6,
+    "role": "server",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "role-correct request after completion"
+  },
+  {
+    "id": "d06.admit.client.response.established",
+    "stage": "admit",
+    "decision": 6,
+    "role": "client",
+    "starting_state": {
+      "phase": "complete",
+      "version": 1
+    },
+    "frame": {
+      "kind": "response",
+      "id": "i",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "admitted"
+    },
+    "description": "role-correct response after completion"
+  },
+  {
+    "id": "d07.decode.subscribe.arbitrary",
+    "stage": "decode",
+    "decision": 7,
+    "role": "server",
+    "input_hex": "000000387b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a226e6f742f636174616c6f673f20e29883227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 60
+    },
+    "description": "arbitrary out-of-catalog punctuation/Unicode subscribe.topic string"
+  },
+  {
+    "id": "d07.decode.subscribe_ack.arbitrary",
+    "stage": "decode",
+    "decision": 7,
+    "role": "client",
+    "input_hex": "0000004d7b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a226e6f742f636174616c6f673f20e29883222c2273746172745f637572736f72223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 81
+    },
+    "description": "arbitrary out-of-catalog punctuation/Unicode subscribe_ack.topic string"
+  },
+  {
+    "id": "d07.decode.unsubscribe.arbitrary",
+    "stage": "decode",
+    "decision": 7,
+    "role": "server",
+    "input_hex": "0000003a7b226b696e64223a22756e737562736372696265222c226964223a2269222c22746f706963223a226e6f742f636174616c6f673f20e29883227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 62
+    },
+    "description": "arbitrary out-of-catalog punctuation/Unicode unsubscribe.topic string"
+  },
+  {
+    "id": "d07.decode.unsubscribe_ack.arbitrary",
+    "stage": "decode",
+    "decision": 7,
+    "role": "client",
+    "input_hex": "0000003e7b226b696e64223a22756e7375627363726962655f61636b222c226964223a2269222c22746f706963223a226e6f742f636174616c6f673f20e29883227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 66
+    },
+    "description": "arbitrary out-of-catalog punctuation/Unicode unsubscribe_ack.topic string"
+  },
+  {
+    "id": "d07.decode.event.arbitrary",
+    "stage": "decode",
+    "decision": 7,
+    "role": "client",
+    "input_hex": "000000557b226b696e64223a226576656e74222c22746f706963223a226e6f742f636174616c6f673f20e29883222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 89
+    },
+    "description": "arbitrary out-of-catalog punctuation/Unicode event.topic string"
+  },
+  {
+    "id": "d07.decode.topic.empty",
+    "stage": "decode",
+    "decision": 7,
+    "role": "client",
+    "input_hex": "000000457b226b696e64223a226576656e74222c22746f706963223a22222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 73
+    },
+    "description": "event.topic empty string"
+  },
+  {
+    "id": "d07.decode.topic.nonstr",
+    "stage": "decode",
+    "decision": 7,
+    "role": "client",
+    "input_hex": "000000447b226b696e64223a226576656e74222c22746f706963223a302c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.topic numeric"
+  },
+  {
+    "id": "d08.decode.occurred_at.rfc3339",
+    "stage": "decode",
+    "decision": 8,
+    "role": "client",
+    "input_hex": "000000597b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a22323032362d31302d32345430303a30303a30305a222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 93
+    },
+    "description": "occurred_at string \"2026-10-24T00:00:00Z\""
+  },
+  {
+    "id": "d08.decode.occurred_at.arbitrary",
+    "stage": "decode",
+    "decision": 8,
+    "role": "client",
+    "input_hex": "000000547b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a226e6f7420612074696d657374616d70222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 88
+    },
+    "description": "occurred_at string \"not a timestamp\""
+  },
+  {
+    "id": "d08.decode.occurred_at.empty",
+    "stage": "decode",
+    "decision": 8,
+    "role": "client",
+    "input_hex": "000000457b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a22222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 73
+    },
+    "description": "occurred_at string \"\""
+  },
+  {
+    "id": "d08.decode.occurred_at.nonstr",
+    "stage": "decode",
+    "decision": 8,
+    "role": "client",
+    "input_hex": "000000447b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a302c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "occurred_at numeric"
+  },
+  {
+    "id": "d09.decode.response.result.member_order",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000337b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b227a223a312c2261223a327d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 55,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b227a223a312c2261223a327d",
+      "opaque_output_hex": "7b227a223a312c2261223a327d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.number_lexemes",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000647b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 104,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d",
+      "opaque_output_hex": "7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.escape_spelling",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000557b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 89,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d",
+      "opaque_output_hex": "7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.interior_whitespace",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000467b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 74,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d",
+      "opaque_output_hex": "7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.nested_duplicates",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000517b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 85,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d",
+      "opaque_output_hex": "7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.combined",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000567b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 90,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d",
+      "opaque_output_hex": "7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d"
+    },
+    "description": "decode then encode unchanged response.result; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.member_order",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000517b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b227a223a312c2261223a327d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 85,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b227a223a312c2261223a327d",
+      "opaque_output_hex": "7b227a223a312c2261223a327d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.number_lexemes",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000827b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 134,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d",
+      "opaque_output_hex": "7b2261223a312e30302c2262223a31652b30302c2263223a2d302c2264223a3132333435363738393031323334353637383930313233343536373839307d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.escape_spelling",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000737b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 119,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d",
+      "opaque_output_hex": "7b2265736361706564223a225c7530303631222c226c69746572616c223a2261222c22736c617368223a225c2f227d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.interior_whitespace",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000647b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 104,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d",
+      "opaque_output_hex": "7b20226122203a205b20312c2032205d2c0a2020226222203a2074727565207d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.nested_duplicates",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "0000006f7b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 115,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d",
+      "opaque_output_hex": "7b2278223a312c2278223a322c226e6573746564223a7b2279223a6e756c6c2c2279223a66616c73657d7d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.event.payload.combined",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000747b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 120,
+      "opaque_field": "event.payload",
+      "opaque_input_hex": "7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d",
+      "opaque_output_hex": "7b20227a223a31652b30302c202261223a225c7530303631222c202261223a5b206e756c6c2c2020312e3030205d207d"
+    },
+    "description": "decode then encode unchanged event.payload; preserve raw token span exactly",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.null",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "0000002a7b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a6e756c6c7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 46,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "6e756c6c",
+      "opaque_output_hex": "6e756c6c"
+    },
+    "description": "response.result null is opaque data, not an absent optional field",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.response.result.array",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "0000003d7b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a5b20312e30302c207b2278223a312c2278223a327d205d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 65,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "5b20312e30302c207b2278223a312c2278223a327d205d",
+      "opaque_output_hex": "5b20312e30302c207b2278223a312c2278223a327d205d"
+    },
+    "description": "response.result array with duplicate-key object inside is allowed",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d09.decode.envelope_whitespace",
+    "stage": "decode",
+    "decision": 9,
+    "role": "client",
+    "input_hex": "000000377b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a2009207b20226122203a2031207d200a207d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 59,
+      "opaque_field": "response.result",
+      "opaque_input_hex": "7b20226122203a2031207d",
+      "opaque_output_hex": "7b20226122203a2031207d"
+    },
+    "description": "whitespace outside opaque span may normalize; compare raw span only",
+    "roundtrip_opaque": true
+  },
+  {
+    "id": "d10.decode.payload.object",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000467b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 74
+    },
+    "description": "event.payload={}"
+  },
+  {
+    "id": "d10.encode.payload.object",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": {}
+    },
+    "expected": {
+      "outcome": "emitted"
+    },
+    "description": "local event.payload={}"
+  },
+  {
+    "id": "d10.decode.payload.array",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000467b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a5b5d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.payload=[]"
+  },
+  {
+    "id": "d10.encode.payload.array",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": []
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local event.payload=[]"
+  },
+  {
+    "id": "d10.decode.payload.string",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000477b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a2278227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.payload=\"x\""
+  },
+  {
+    "id": "d10.encode.payload.string",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": "x"
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local event.payload=\"x\""
+  },
+  {
+    "id": "d10.decode.payload.number",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000457b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.payload=1"
+  },
+  {
+    "id": "d10.encode.payload.number",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": 1
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local event.payload=1"
+  },
+  {
+    "id": "d10.decode.payload.boolean",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000487b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.payload=true"
+  },
+  {
+    "id": "d10.encode.payload.boolean",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": true
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local event.payload=true"
+  },
+  {
+    "id": "d10.decode.payload.null",
+    "stage": "decode",
+    "decision": 10,
+    "role": "client",
+    "input_hex": "000000487b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "event.payload=null"
+  },
+  {
+    "id": "d10.encode.payload.null",
+    "stage": "encode",
+    "decision": 10,
+    "role": null,
+    "frame": {
+      "kind": "event",
+      "topic": "t",
+      "cursor": 0,
+      "occurred_at": "x",
+      "payload": null
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "local event.payload=null"
+  },
+  {
+    "id": "d02.decode.configured128.below",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "0000007f7b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a22787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 131
+    },
+    "max_payload_bytes": 128,
+    "description": "Configured128-byte complete payload boundary."
+  },
+  {
+    "id": "d02.decode.configured128.at",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "000000807b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a2278787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 132
+    },
+    "max_payload_bytes": 128,
+    "description": "Configured128-byte complete payload boundary."
+  },
+  {
+    "id": "d02.decode.configured128.above",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "000000817b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b2270223a227878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878227d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "frame_too_large",
+      "terminal_scope": "connection"
+    },
+    "max_payload_bytes": 128,
+    "description": "Configured128-byte complete payload boundary."
+  },
+  {
+    "id": "d02.decode.u32max.header",
+    "stage": "decode",
+    "decision": 2,
+    "role": "client",
+    "input_hex": "ffffffff",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "frame_too_large",
+      "terminal_scope": "connection"
+    },
+    "description": "Largest unsigned32 prefix exceeds default limit; no body allocation."
+  },
+  {
+    "id": "d04.decode.table.handshake.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000207b226b696e64223a2268616e647368616b65222c2276657273696f6e223a317d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 36
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.handshake.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000327b226b696e64223a2268616e647368616b65222c2276657273696f6e223a312c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.handshake_ack.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000247b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a317d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 40
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.handshake_ack.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000367b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a312c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.request.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.request.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003d7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.response.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000287b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 44
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.response.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000003a7b226b696e64223a22726573706f6e7365222c226964223a2269222c22726573756c74223a7b7d2c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.error.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000003e7b226b696e64223a226572726f72222c226964223a2269222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 66
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.error.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000507b226b696e64223a226572726f72222c226964223a2269222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.cancel.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000001a7b226b696e64223a2263616e63656c222c226964223a2269227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 30
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.cancel.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002c7b226b696e64223a2263616e63656c222c226964223a2269222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.subscribe.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000297b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 45
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.subscribe.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003b7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.subscribe_ack.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000003e7b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 66
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.subscribe_ack.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000507b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a302c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.unsubscribe.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a22756e737562736372696265222c226964223a2269222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.unsubscribe.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003d7b226b696e64223a22756e737562736372696265222c226964223a2269222c22746f706963223a2274222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.unsubscribe_ack.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000002f7b226b696e64223a22756e7375627363726962655f61636b222c226964223a2269222c22746f706963223a2274227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 51
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.unsubscribe_ack.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000417b226b696e64223a22756e7375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.table.event.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000467b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 74
+    },
+    "description": "Documentation-only lib field-table valid floor; no golden fixture used."
+  },
+  {
+    "id": "d04.decode.table.event.unknown",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000587b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d2c22756e6578706563746564223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Closed envelope allowlist for this exact kind."
+  },
+  {
+    "id": "d04.decode.request.namespace.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "Omission is the only absent optional representation."
+  },
+  {
+    "id": "d04.decode.request.namespace.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003c7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c226e616d657370616365223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Amendment1 overrides documentation null equivalence."
+  },
+  {
+    "id": "d04.decode.request.actor_id.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "Omission is the only absent optional representation."
+  },
+  {
+    "id": "d04.decode.request.actor_id.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c226163746f725f6964223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Amendment1 overrides documentation null equivalence."
+  },
+  {
+    "id": "d04.decode.request.visible_namespaces.omitted",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 47
+    },
+    "description": "Omission is the only absent optional representation."
+  },
+  {
+    "id": "d04.decode.request.visible_namespaces.null",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000457b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c2276697369626c655f6e616d65737061636573223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Amendment1 overrides documentation null equivalence."
+  },
+  {
+    "id": "d04.decode.request.all_optionals.valid",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000817b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a312c226e616d657370616365223a226e222c226163746f725f6964223a226163746f72222c2276697369626c655f6e616d65737061636573223a5b226e222c226f74686572225d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 133
+    },
+    "description": "Codec accepts typed context fields; mapped-transport authorization is outside this matrix."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.max",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000004e7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a31383434363734343037333730393535313631357d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 82
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.overflow",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000004e7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a31383434363734343037333730393535313631367d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.negative",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003c7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a2d317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.boolean",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003e7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.float_integral",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003d7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a312e307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "1.0 token does not satisfy integer field grammar."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.max",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000004e7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a31383434363734343037333730393535313631357d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 82
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.overflow",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000004e7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a31383434363734343037333730393535313631367d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.negative",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003c7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a2d317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.boolean",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003e7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.float_integral",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003d7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a312e307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "1.0 token does not satisfy integer field grammar."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.max",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000517b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a31383434363734343037333730393535313631357d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 85
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.overflow",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000517b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a31383434363734343037333730393535313631367d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.negative",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000003f7b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a2d317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.boolean",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000417b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a747275657d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.float_integral",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000407b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a312e307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "1.0 token does not satisfy integer field grammar."
+  },
+  {
+    "id": "d04.decode.event.cursor.max",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000597b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a31383434363734343037333730393535313631352c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 93
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.event.cursor.overflow",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000597b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a31383434363734343037333730393535313631362c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.event.cursor.negative",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000477b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a2d312c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.event.cursor.boolean",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000497b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a747275652c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Documented u64 bound; booleans are not JSON integers."
+  },
+  {
+    "id": "d04.decode.event.cursor.float_integral",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000487b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a312e302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "1.0 token does not satisfy integer field grammar."
+  },
+  {
+    "id": "d04.decode.subscribe.resume_cursor.zero",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003b7b226b696e64223a22737562736372696265222c226964223a2269222c22746f706963223a2274222c22726573756d655f637572736f72223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 63
+    },
+    "description": "Unsigned cursor zero positive; do not import deadline positivity into cursors."
+  },
+  {
+    "id": "d04.decode.subscribe_ack.start_cursor.zero",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "0000003e7b226b696e64223a227375627363726962655f61636b222c226964223a2269222c22746f706963223a2274222c2273746172745f637572736f72223a307d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 66
+    },
+    "description": "Unsigned cursor zero positive; do not import deadline positivity into cursors."
+  },
+  {
+    "id": "d04.decode.event.cursor.zero",
+    "stage": "decode",
+    "decision": 4,
+    "role": "client",
+    "input_hex": "000000467b226b696e64223a226576656e74222c22746f706963223a2274222c22637572736f72223a302c226f636375727265645f6174223a2278222c227061796c6f6164223a7b7d7d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 74
+    },
+    "description": "Unsigned cursor zero positive; do not import deadline positivity into cursors."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.zero",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a307d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "ADR137 parent123: deadline_ms must be positive. Preserve this expectation and report any crate disagreement."
+  },
+  {
+    "id": "d04.encode.request.deadline_ms.zero",
+    "stage": "encode",
+    "decision": 4,
+    "role": null,
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()",
+      "deadline_ms": 0
+    },
+    "expected": {
+      "outcome": "refused"
+    },
+    "description": "ADR137 parent123 positive deadline: no conforming encoder emits a rejected wire shape."
+  },
+  {
+    "id": "d04.decode.request.deadline_ms.positive",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000003b7b226b696e64223a2272657175657374222c226964223a2269222c226f7073223a2276657262732829222c22646561646c696e655f6d73223a317d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 63
+    },
+    "description": "Parent123 positive boundary control."
+  },
+  {
+    "id": "d03.encode.request.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "request",
+      "id": "i",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.request.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "request",
+      "id": "",
+      "ops": "verbs()"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.response.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "response",
+      "id": "i",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.response.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "response",
+      "id": "",
+      "result": {}
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.error.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "error",
+      "id": "i",
+      "code": "internal",
+      "message": "detail"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.error.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "error",
+      "id": "",
+      "code": "internal",
+      "message": "detail"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.cancel.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "cancel",
+      "id": "i"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.cancel.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "cancel",
+      "id": ""
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.subscribe.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "subscribe",
+      "id": "i",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.subscribe.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "subscribe",
+      "id": "",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.subscribe_ack.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "subscribe_ack",
+      "id": "i",
+      "topic": "t",
+      "start_cursor": 0
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.subscribe_ack.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "subscribe_ack",
+      "id": "",
+      "topic": "t",
+      "start_cursor": 0
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.unsubscribe.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "unsubscribe",
+      "id": "i",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.unsubscribe.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "unsubscribe",
+      "id": "",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d03.encode.unsubscribe_ack.nonempty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "unsubscribe_ack",
+      "id": "i",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "emitted"
+    }
+  },
+  {
+    "id": "d03.encode.unsubscribe_ack.empty",
+    "stage": "encode",
+    "decision": 3,
+    "role": null,
+    "frame": {
+      "kind": "unsubscribe_ack",
+      "id": "",
+      "topic": "t"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d05.decode.scope.request_missing_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "000000357b226b696e64223a226572726f72222c22636f6465223a22696e7465726e616c222c226d657373616765223a2264657461696c227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Known code id presence must match terminal scope."
+  },
+  {
+    "id": "d05.encode.scope.request_missing_id",
+    "stage": "encode",
+    "decision": 5,
+    "role": null,
+    "frame": {
+      "kind": "error",
+      "code": "internal",
+      "message": "detail"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d05.decode.scope.connection_with_id",
+    "stage": "decode",
+    "decision": 5,
+    "role": "client",
+    "input_hex": "000000497b226b696e64223a226572726f72222c22636f6465223a22756e737570706f727465645f76657273696f6e222c226d657373616765223a2264657461696c222c226964223a2269227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Known code id presence must match terminal scope."
+  },
+  {
+    "id": "d05.encode.scope.connection_with_id",
+    "stage": "encode",
+    "decision": 5,
+    "role": null,
+    "frame": {
+      "kind": "error",
+      "code": "unsupported_version",
+      "message": "detail",
+      "id": "i"
+    },
+    "expected": {
+      "outcome": "refused"
+    }
+  },
+  {
+    "id": "d04.decode.missing_kind",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000027b7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d04.decode.kind_not_string",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000000a7b226b696e64223a317d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d04.decode.unknown_kind",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000167b226b696e64223a226675747572655f6b696e64227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d04.decode.root_array",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "000000025b5d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.prefix_truncated.0",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.prefix_truncated.1",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "00",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.prefix_truncated.2",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "0000",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.prefix_truncated.3",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "000000",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.body_truncated",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "000000207b226b696e64223a2268616e647368616b65222c2276657273696f6e223a31",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    }
+  },
+  {
+    "id": "d02.decode.trailing_next_frame",
+    "stage": "decode",
+    "decision": 2,
+    "role": "server",
+    "input_hex": "000000207b226b696e64223a2268616e647368616b65222c2276657273696f6e223a317d0000001a7b226b696e64223a2263616e63656c222c226964223a2269227d",
+    "expected": {
+      "outcome": "accepted",
+      "consumed_length": 36
+    },
+    "description": "Consumed length excludes buffered next frame."
+  },
+  {
+    "id": "d01.decode.handshake.null",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000237b226b696e64223a2268616e647368616b65222c2276657273696f6e223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Version requires a u32 integer token; no null/string coercion."
+  },
+  {
+    "id": "d01.decode.handshake.string",
+    "stage": "decode",
+    "decision": 1,
+    "role": "server",
+    "input_hex": "000000227b226b696e64223a2268616e647368616b65222c2276657273696f6e223a2231227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Version requires a u32 integer token; no null/string coercion."
+  },
+  {
+    "id": "d01.decode.handshake_ack.null",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000277b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a6e756c6c7d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Version requires a u32 integer token; no null/string coercion."
+  },
+  {
+    "id": "d01.decode.handshake_ack.string",
+    "stage": "decode",
+    "decision": 1,
+    "role": "client",
+    "input_hex": "000000267b226b696e64223a2268616e647368616b655f61636b222c2276657273696f6e223a2231227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Version requires a u32 integer token; no null/string coercion."
+  },
+  {
+    "id": "d04.decode.duplicate.kind.same",
+    "stage": "decode",
+    "decision": 4,
+    "role": "server",
+    "input_hex": "0000002a7b226b696e64223a2263616e63656c222c226b696e64223a2263616e63656c222c226964223a2269227d",
+    "expected": {
+      "outcome": "rejected",
+      "wire_error_code": "malformed_frame",
+      "terminal_scope": "connection"
+    },
+    "description": "Duplicate discriminator is an envelope duplicate even when values agree."
+  }
+]

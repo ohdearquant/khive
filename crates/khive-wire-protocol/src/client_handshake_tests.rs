@@ -66,7 +66,7 @@ fn all_kinds() -> Vec<Frame> {
         },
         Frame::Response {
             id: OperationId::from("request-1"),
-            result: serde_json::json!({"value": 7}),
+            result: serde_json::json!({"value": 7}).into(),
         },
         error_frame(WireErrorCode::PeerClassDenied, Some("request-1")),
         Frame::Cancel {
@@ -94,7 +94,7 @@ fn all_kinds() -> Vec<Frame> {
             topic: "domain.event".to_string(),
             cursor: 5,
             occurred_at: "2026-10-24T00:00:00Z".to_string(),
-            payload: serde_json::json!({"value": 8}),
+            payload: serde_json::json!({"value": 8}).into(),
         },
     ];
     assert_eq!(frames.len(), 11);
@@ -367,7 +367,7 @@ fn completed_connection_error_is_admitted_then_terminal() {
         assert_closed(&mut gate);
         let response = Frame::Response {
             id: OperationId::from("request-1"),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         };
         assert_malformed(gate.admit(&response).unwrap_err());
     }
