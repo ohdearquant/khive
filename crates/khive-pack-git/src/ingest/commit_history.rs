@@ -135,7 +135,7 @@ pub(super) async fn find_document_for_path(
         .unwrap_or(path);
     let sql = runtime.sql();
     let namespace = token.namespace().as_str().to_string();
-    let like_pattern = format!("%{}", khive_types::escape_like_literal(path));
+    let like_pattern = format!("%/{}", khive_types::escape_like_literal(path));
 
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r

@@ -179,3 +179,44 @@ async fn suffix_match_outranks_basename_fallback() {
         "a suffix source_uri match must outrank a basename fallback"
     );
 }
+
+#[tokio::test]
+async fn suffix_match_requires_a_path_component_boundary() {
+    for (path, wrong_uri, aligned_uri) in [
+        ("a.md", "x/ba.md", "x/a.md"),
+        (
+            "docs/README.md",
+            "workspace/otherdocs/README.md",
+            "workspace/docs/README.md",
+        ),
+    ] {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let wrong = create_document(&rt, &token, wrong_uri).await;
+        assert_eq!(
+            find_document_for_path(&rt, &token, wrong_uri)
+                .await
+                .unwrap(),
+            Some(wrong),
+            "the seeded wrong-suffix document must resolve by its own exact URI"
+        );
+        assert_eq!(
+            find_document_for_path(&rt, &token, path).await.unwrap(),
+            None,
+            "a suffix match must not start inside a path component: {path} in {wrong_uri}"
+        );
+
+        let aligned = create_document(&rt, &token, aligned_uri).await;
+        assert_eq!(
+            find_document_for_path(&rt, &token, path).await.unwrap(),
+            Some(aligned),
+            "a slash-aligned source URI suffix must remain eligible"
+        );
+        let exact = create_document(&rt, &token, path).await;
+        assert_eq!(
+            find_document_for_path(&rt, &token, path).await.unwrap(),
+            Some(exact),
+            "an exact source URI must still outrank the aligned suffix"
+        );
+    }
+}
