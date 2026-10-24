@@ -18,15 +18,11 @@ const PYTHON_INTERPRETER: &str = "python3";
 const EXPECTED_VECTOR_COUNT: usize = 213;
 
 // Unlike Option, this distinguishes an omitted member from an explicit null.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum Field<T> {
+    #[default]
     Missing,
     Present(T),
-}
-impl<T> Default for Field<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 impl<T> Field<T> {
     fn is_missing(&self) -> bool {
