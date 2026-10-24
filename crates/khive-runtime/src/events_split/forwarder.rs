@@ -4,6 +4,7 @@ use super::paths::{
     FORWARDER_BACKOFF, REQUEST_TIMEOUT,
 };
 use super::protocol::{EventsRequest, EventsResponse};
+use super::socket_path::validate_events_socket_path;
 use crate::daemon::{read_frame, write_frame};
 use khive_db::StorageBackend;
 use khive_storage::{Event, EventStore, StorageError, StorageResult};

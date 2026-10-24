@@ -55,8 +55,6 @@ mod server;
 mod stores;
 
 #[cfg(unix)]
-pub(crate) use events_daemon::harness_duration_ms;
-#[cfg(unix)]
 pub use events_daemon::{
     events_readiness, events_readiness_window, run_events_daemon, run_events_daemon_with_policies,
     supervise_events_daemon, supervise_events_daemon_with_policies,
@@ -75,13 +73,15 @@ pub use paths::{
 #[cfg(unix)]
 pub use paths::{DEFAULT_APPEND_QUEUE_BATCHES, DEFAULT_APPEND_QUEUE_BYTES};
 pub use protocol::{EventsRequest, EventsResponse, WireWriterTaskFailure, WireWriterTaskState};
+pub(crate) use registry::direct_backend_with_policies;
 #[cfg(any(test, feature = "test-internals"))]
 #[doc(hidden)]
 pub use registry::TestRegistryGuard;
 #[cfg(unix)]
 pub use registry::{client_for, forwarding_metrics};
 pub use registry::{direct_backend_for, direct_backend_read_only_for, EventsSplitConfig};
-pub(crate) use registry::{direct_backend_with_max_readers, direct_backend_with_policies};
+#[cfg(unix)]
+use server::storage_error_response;
 #[cfg(unix)]
 pub use stores::ForwardingEventStore;
 pub use stores::SplitEventStore;

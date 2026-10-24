@@ -1,6 +1,6 @@
-#[cfg(unix)]
-use super::events_count_read_budget::restore_count_read_failure;
 use super::events_count_read_budget::CountReadBudget;
+#[cfg(unix)]
+use super::events_count_read_budget::{self, restore_count_read_failure};
 #[cfg(unix)]
 use super::forwarder::EventsSplitClient;
 #[cfg(unix)]
