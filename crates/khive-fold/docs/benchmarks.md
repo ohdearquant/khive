@@ -8,41 +8,55 @@ Reference baselines for `khive-fold`. Values are the committed reference median 
 
 Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
 
-| Benchmark                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `fold/count/10`                 | 3.888 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/count/100`                | 45.190 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/count/500`                | 273.978 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/derive/10`                | 6.926 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/derive/100`               | 47.860 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/derive/500`               | 276.900 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/fn_closure/10`            | 2.826 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/fn_closure/100`           | 14.976 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/fn_closure/500`           | 71.768 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/sum_i64/10`               | 19.635 ns        | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/sum_i64/100`              | 173.057 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `fold/sum_i64/500`              | 855.016 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/batch_score/10`      | 24.031 ns        | 1.019     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/batch_score/100`     | 147.290 ns       | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/batch_score/500`     | 631.554 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_all/10`       | 231.538 ns       | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_all/100`      | 2.017 µs         | 1.032     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_all/500`      | 11.741 µs        | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_top/10`       | 119.949 ns       | 1.018     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_top/100`      | 1.630 µs         | 1.005     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `objective/select_top/500`      | 7.182 µs         | 1.028     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/cmp_desc/scalar`      | 16.334 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/heap_top_k/100`       | 798.806 ns       | 1.035     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/heap_top_k/500`       | 4.294 µs         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/sort/10`              | 48.211 ns        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/sort/100`             | 1.277 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `ordering/sort/500`             | 9.514 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy/10`            | 538.735 ns       | 1.047     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy/100`           | 5.251 µs         | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy/500`           | 30.332 µs        | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy_diversity/10`  | 1.630 µs         | 1.037     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy_diversity/100` | 110.148 µs       | 1.018     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `selector/greedy_diversity/500` | 2.758 ms         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| Benchmark                                                                         | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-fold:fold_bench/fold/count/10/median_ns`                                   | 3.887 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/count/100/median_ns`                                  | 45.207 ns        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/count/500/median_ns`                                  | 273.944 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/10/median_ns`                                  | 7.911 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/100/median_ns`                                 | 59.477 ns        | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/500/median_ns`                                 | 289.923 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/10/median_ns`                              | 2.825 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/100/median_ns`                             | 15.257 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/500/median_ns`                             | 71.763 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/10/median_ns`                                 | 16.526 ns        | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/100/median_ns`                                | 144.510 ns       | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/500/median_ns`                                | 713.653 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/10/median_ns`                        | 23.831 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/100/median_ns`                       | 147.257 ns       | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/500/median_ns`                       | 635.010 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/10/median_ns`                         | 230.610 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/100/median_ns`                        | 2.038 µs         | 1.035     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/500/median_ns`                        | 11.729 µs        | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/10/median_ns`                         | 121.119 ns       | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/100/median_ns`                        | 1.625 µs         | 1.008     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/500/median_ns`                        | 7.111 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/cmp_desc/scalar/median_ns`                        | 16.525 ns        | 1.023     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/heap_top_k/100/median_ns`                         | 785.382 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/heap_top_k/500/median_ns`                         | 4.229 µs         | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/10/median_ns`                                | 48.159 ns        | 1.003     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/100/median_ns`                               | 1.280 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/500/median_ns`                               | 9.488 µs         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/10/median_ns`                              | 535.348 ns       | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/100/median_ns`                             | 5.373 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/500/median_ns`                             | 31.103 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/10/median_ns`                    | 2.688 µs         | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/100/median_ns`                   | 36.085 µs        | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/500/median_ns`                   | 229.636 µs       | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/diversity_scale/1000/median_ns`          | 625.680 µs       | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/diversity_scale/5000/median_ns`          | 4.447 ms         | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/epistemic_gain/100/median_ns`            | 2.696 µs         | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/epistemic_gain/500/median_ns`            | 17.144 µs        | 1.027     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/credit/100/median_ns`                           | 24.187 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/credit/500/median_ns`                           | 122.450 µs       | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/trace/100/median_ns`                            | 21.922 µs        | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/trace/500/median_ns`                            | 114.242 µs       | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/checkpoint/save_load/10/median_ns`                     | 9.869 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/checkpoint/save_load/100/median_ns`                    | 106.540 µs       | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/filter_even/500/median_ns`                     | 230.006 ns       | 1.006     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/map_double/500/median_ns`                      | 711.878 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/sequential_composed_five_stages/500/median_ns` | 469.624 ns       | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/sequential_two_stages/500/median_ns`           | 177.975 ns       | 1.008     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 
