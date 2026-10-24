@@ -10,7 +10,6 @@
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-#![allow(clippy::all)]
 
 pub(crate) mod crypto;
 pub mod error;
