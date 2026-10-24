@@ -227,6 +227,9 @@ def _v2_row(
 ) -> Row:
     """One metric record as the reference producer writes it.
 
+    ``verdict`` is the record's disposition in ADR-206 Amendment 3 (A3.4):
+    ``MEASURED`` or ``UNMEASURED``, the same field a v1 row holds.
+
     A record's ``kind`` is ``criterion``, ``bench-json`` or ``allocation``.  A
     record converted from a v1 file keeps its v1 fields as committed and has no
     ``kind``; v1 holds only Criterion medians, so it renders as one.  A
