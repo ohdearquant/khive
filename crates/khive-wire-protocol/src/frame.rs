@@ -268,9 +268,9 @@ pub struct EventPayload {
     pub cursor: Cursor,
     /// Server-assigned event time, RFC 3339.
     pub occurred_at: String,
-    /// Topic-specific payload. Field-by-field shape is owned by the
-    /// per-topic catalog (ADR-137, "Implementation-phase deliverables"),
-    /// not by this crate.
+    /// Topic-specific JSON object. Its field-by-field shape is owned by
+    /// the per-topic catalog (ADR-137, "Implementation-phase deliverables").
+    /// Amendment 1 Decision 10 requires the outer object shape on the wire.
     pub payload: serde_json::Value,
 }
 
@@ -441,9 +441,9 @@ pub enum Frame {
         cursor: Cursor,
         /// Server-assigned event time, RFC 3339.
         occurred_at: String,
-        /// Topic-specific payload. Field-by-field shape is owned by the
-        /// per-topic catalog (ADR-137, "Implementation-phase deliverables"),
-        /// not by this crate.
+        /// Topic-specific JSON object on the wire (Amendment 1 Decision 10).
+        /// Its members are opaque to this crate and owned by the per-topic
+        /// catalog; in-memory Value construction remains unrestricted.
         payload: serde_json::Value,
     },
 }
@@ -500,7 +500,11 @@ fn validate_frame_for_serialize(frame: &Frame) -> Result<(), String> {
         Frame::SubscribeAck { id, .. } => check_id("subscribe_ack", id)?,
         Frame::Unsubscribe { id, .. } => check_id("unsubscribe", id)?,
         Frame::UnsubscribeAck { id, .. } => check_id("unsubscribe_ack", id)?,
-        Frame::Event { .. } => {}
+        Frame::Event { payload, .. } => {
+            if !payload.is_object() {
+                return Err("frame kind \"event\": payload must be a JSON object".to_string());
+            }
+        }
         Frame::Error {
             id,
             code,
@@ -872,6 +876,9 @@ impl<'de> Deserialize<'de> for Frame {
                     }
                     "event" => {
                         let payload: EventPayload = parse(&object).map_err(A::Error::custom)?;
+                        if !payload.payload.is_object() {
+                            return Err(A::Error::custom("event payload must be a JSON object"));
+                        }
                         Ok(Frame::Event {
                             topic: payload.topic,
                             cursor: payload.cursor,

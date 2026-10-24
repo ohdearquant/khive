@@ -92,7 +92,8 @@ pub enum CodecError {
     /// the closed grammar (strict field rejection — see the crate
     /// documentation's "Strict field rejection" section). Encode side: an
     /// operation id field carries the empty string, which the wire grammar
-    /// forbids ([`crate::frame::OperationId`]).
+    /// forbids ([`crate::frame::OperationId`]), or an Event payload is not
+    /// a JSON object (Amendment 1 Decision 10).
     #[error("frame kind {kind:?}: {detail}")]
     InvalidFields { kind: String, detail: String },
 
@@ -245,9 +246,10 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 /// or handshake acknowledgment naming version 0
 /// ([`CodecError::InvalidFields`]), an
 /// `error` frame whose id presence contradicts its code's terminal scope
-/// ([`CodecError::InconsistentErrorScope`]), and a decoded unknown-code
-/// fallback `error` frame ([`CodecError::FallbackFrameNotEncodable`]) are
-/// all rejected here, so a frame this function accepts is one any
+/// ([`CodecError::InconsistentErrorScope`]), a decoded unknown-code
+/// fallback `error` frame ([`CodecError::FallbackFrameNotEncodable`]), and
+/// a non-object Event payload ([`CodecError::InvalidFields`]) are all
+/// rejected here, so a frame this function accepts is one any
 /// conforming decoder accepts. This keeps
 /// encode and decode symmetric: a locally constructed frame that violates
 /// the grammar can never leave this crate as wire bytes.
@@ -273,7 +275,7 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
 /// symmetric and a locally constructed frame can never serialize into wire
 /// bytes no conforming decoder would accept.
 ///
-/// Two rules are enforced here:
+/// These rules are enforced here:
 ///
 /// 1. No operation id field may carry the empty string — an empty string
 ///    can never be a unique caller-generated id. Decode enforces this in
@@ -293,6 +295,8 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
 ///    This relay cannot re-encode a fallback: doing so would emit the
 ///    fallback code (`internal`) and silently discard the newer code the
 ///    peer sent, so this crate refuses to corrupt it.
+/// 5. An Event payload must be a JSON object (Amendment 1 Decision 10).
+///    Response results remain arbitrary JSON.
 fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
     use crate::error::TerminalScope;
 
@@ -323,7 +327,14 @@ fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
                 });
             }
         }
-        Frame::Event { .. } => {}
+        Frame::Event { payload, .. } => {
+            if !payload.is_object() {
+                return Err(CodecError::InvalidFields {
+                    kind: "event".to_string(),
+                    detail: "payload must be a JSON object".to_string(),
+                });
+            }
+        }
         Frame::Request { id, .. } => check_id("request", id)?,
         Frame::Response { id, .. } => check_id("response", id)?,
         Frame::Cancel { id } => check_id("cancel", id)?,

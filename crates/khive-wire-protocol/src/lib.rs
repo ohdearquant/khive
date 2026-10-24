@@ -79,7 +79,7 @@
 //! | `subscribe_ack`    | server → client | `id: string`, `topic: string`, `start_cursor: u64`              | Confirms a `subscribe`; names the cursor delivery begins after. |
 //! | `unsubscribe`      | client → server | `id: string`, `topic: string`                                   | Ends delivery for one topic. Idempotent no-op if not subscribed. |
 //! | `unsubscribe_ack`  | server → client | `id: string`, `topic: string`                                   | Confirms an `unsubscribe`. |
-//! | `event`            | server → client | `topic: string`, `cursor: u64`, `occurred_at: string`, `payload: json` | One state-change delivery. Carries no operation id — correlated by topic and ordered by `cursor` instead. `occurred_at` is RFC 3339. `payload`'s field-by-field shape is owned by the per-topic catalog (ADR-137, "Implementation-phase deliverables"), not by this crate. |
+//! | `event`            | server → client | `topic: string`, `cursor: u64`, `occurred_at: string`, `payload: object` | One state-change delivery. Carries no operation id — correlated by topic and ordered by `cursor` instead. `occurred_at` is RFC 3339. `payload` must be a JSON object (Amendment 1 Decision 10); its members are owned by the per-topic catalog. |
 //!
 //! The set is closed within one protocol version. A decoder that sees a
 //! `"kind"` value outside this table rejects the frame
@@ -100,11 +100,11 @@
 //! posture ADR-137 requires: a decoder never guesses that an unrecognized
 //! field is ignorable.
 //!
-//! The strictness covers the fields each frame KIND declares. The two
-//! opaque JSON values — `response.result` and `event.payload` — are data,
-//! not grammar: keys inside them are preserved, and their field-by-field
-//! shape is owned by the verb result surface (ADR-016) and the per-topic
-//! event catalog respectively, not by this crate.
+//! The strictness covers the fields each frame KIND declares. A Response
+//! result may be any JSON value; an Event payload must be a JSON object
+//! (Amendment 1 Decision 10). Inside those values, members are opaque data:
+//! their field-by-field shape is owned by the verb result surface (ADR-016)
+//! and the per-topic event catalog respectively, not by this crate.
 //!
 //! Three details of the strictness, stated so nobody re-derives them:
 //!

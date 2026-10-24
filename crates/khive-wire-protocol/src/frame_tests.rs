@@ -349,3 +349,76 @@ fn direct_serde_distinguishes_omitted_optional_fields_from_null() {
     };
     assert_eq!(payload.get("resume_cursor"), Some(&serde_json::Value::Null));
 }
+
+#[test]
+fn direct_serde_requires_an_object_event_payload() {
+    let healthy: Frame = serde_json::from_str(
+        r#"{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{"nested":[null,true]}}"#,
+    ).unwrap();
+    assert!(matches!(healthy, Frame::Event { payload, .. } if payload.is_object()));
+
+    for payload in ["[]", r#""text""#, "1", "true", "null"] {
+        let raw = format!(
+            r#"{{"kind":"event","topic":"a.b","cursor":1,"occurred_at":"2026-08-04T11:00:00Z","payload":{payload}}}"#
+        );
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for (entrypoint, result) in [
+            ("raw serde", serde_json::from_str::<Frame>(&raw)),
+            ("Value serde", serde_json::from_value::<Frame>(value)),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("event payload must be a JSON object"),
+                "D10 {entrypoint} returned an unrelated refusal: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_and_codec_serialization_require_an_object_event_payload() {
+    // Invalid local frames are constructed directly. D10 decode must not be
+    // used as setup for an encode-only refusal witness.
+    let event = |payload| Frame::Event {
+        topic: "a.b".to_string(),
+        cursor: 1,
+        occurred_at: "2026-08-04T11:00:00Z".to_string(),
+        payload,
+    };
+    let healthy = event(serde_json::json!({"nested": [null, true]}));
+    let direct = serde_json::to_vec(&healthy).unwrap();
+    let wire = crate::codec::encode_frame(&healthy).unwrap();
+    assert_eq!(direct, &wire[crate::codec::LENGTH_PREFIX_BYTES..]);
+    let response_null = Frame::Response {
+        id: OperationId::from("op-1"),
+        result: serde_json::Value::Null,
+    };
+    serde_json::to_vec(&response_null).unwrap();
+    crate::codec::encode_frame(&response_null).unwrap();
+
+    for payload in [
+        serde_json::json!([]),
+        serde_json::json!("text"),
+        serde_json::json!(1),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+    ] {
+        let frame = event(payload);
+        let direct_error = serde_json::to_vec(&frame).unwrap_err();
+        assert!(
+            direct_error
+                .to_string()
+                .contains("payload must be a JSON object"),
+            "D10 direct serialization returned an unrelated refusal: {direct_error}"
+        );
+        match crate::codec::encode_frame(&frame).unwrap_err() {
+            crate::codec::CodecError::InvalidFields { kind, detail } => {
+                assert_eq!(kind, "event");
+                assert_eq!(detail, "payload must be a JSON object");
+            }
+            other => panic!("D10 expected typed event payload refusal, got {other:?}"),
+        }
+    }
+}
