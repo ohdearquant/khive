@@ -409,12 +409,25 @@ standalone read connections do not set it (it is set only on the read-only write
    `crates/khive-storage/src/tx_registry.rs:122`). The span carries a fixed label constant
    that no other registration uses and that carries no caller value. It opens after
    Decision 3's checks and before the copy connection opens, and closes after that
-   connection closes. Deregistration is the
-   handle's `Drop` (`tx_registry.rs:109`), so success, error, deadline and panic all leave
-   the census. The registry is per process: the name is visible in the process that runs
-   the copy, which is where the checkpoint task's holder reports are written. Another
-   process sees the copy only as a holder process in the OS-level census, the same as any
-   other cross-process reader today.
+   connection closes. Deregistration is the handle's `Drop` (`tx_registry.rs:109`), so
+   success, error, deadline and panic all leave the census.
+
+   The registry is per process. In the process that runs the copy, the checkpoint task's
+   holder reports and the transaction-age sweep name the span by its label. Another
+   process learns the name only through the WAL-pin heartbeat: when the copying process
+   runs a sweep (the daemon's checkpoint task or a session sweep) and the copy's span is
+   that process's oldest past the warning age, the heartbeat body carries its label
+   (ADR-091 Amendment 2 Plank B, `oldest_tx_label` in `crates/khive-db/src/walpin/types.rs:24`).
+   A copying process that runs no sweep appears in the OS-level census as a holder process
+   without a name, as any cross-process reader does today.
+
+   The transaction-age sweep will report every copy longer than its thresholds: a warning
+   past `KHIVE_TX_WARN_SECS` (30 seconds by default) and an error past
+   `KHIVE_TX_MAX_AGE_SECS` (120 seconds by default), both visibility only; nothing in the
+   sweep closes a span (`crates/khive-db/src/checkpoint/config.rs:85-108`, defaults at 121-122). This amendment
+   does not exempt the copy's label from either rung. The label is what lets a reader tell
+   an expected copy from a leaked reader, and an exemption would also hide a copy that
+   never ends. Decision 5's deadline is what ends it.
 
 5. **Bound.** The copy holds one read snapshot for its whole length, so checkpoints cannot
    backfill past it (ADR-091) and the WAL grows until it ends. The deadline is required, not
