@@ -428,16 +428,19 @@ standalone read connections do not set it (it is set only on the read-only write
    These are separate steps, so the sequence is not atomic. A process that can rename
    entries in the destination directory between them can still substitute a regular file.
    The destination directory belongs to the caller and such a process is outside this
-   operation's threat model; the identity check turns a substitution into a reported
-   failure, never a silent success, and the removal rule below leaves a substituted file
-   alone.
+   operation's threat model. Within it, the checks turn a substitution into a reported
+   failure, never a silent success: a file swapped in before the statement and swapped back
+   before the second identity check passes that check, but the output then went to the
+   other file, so the held handle is still empty, and the operation fails the copy unless
+   the held handle's size is non-zero after the statement.
 
    On success the operation syncs the destination's parent directory (on Unix) and returns
    the size read from the held handle's metadata. On any failure it removes `<dest>` only
-   while the path still names the device and inode it created, and removes
-   `<dest>-journal` if one is present (none existed when the call began). If a removal
-   fails, the returned error names the path. The operation never removes a path it did not
-   create.
+   if the path still names the device and inode it created, and removes `<dest>-journal`
+   if one is present (none existed when the call began). If a removal fails, the returned
+   error names the path. The identity check and the removal are two steps as well, so a
+   renamer acting between them could still have its file removed; that is the same residual
+   as above, and outside it the operation removes only files it created.
 
    A process killed during a copy runs none of this and can leave `<dest>` and
    `<dest>-journal` behind. A later copy to that path is refused by the existence check
@@ -519,3 +522,5 @@ standalone read connections do not set it (it is set only on the read-only write
     statement fails the copy; the link's target is unchanged and the link is not removed.
 12. A regular file substituted at `<dest>` in the same window fails the copy on the
     identity check, and the substituted file is not removed.
+13. A regular file swapped in before the statement and swapped back before the second
+    identity check fails the copy because the held handle is still empty.
