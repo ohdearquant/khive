@@ -190,26 +190,59 @@ fn direct_serde_accepts_both_consistent_error_scopes() {
 
 #[test]
 fn direct_serde_fills_unrecognized_code_for_an_unknown_wire_code() {
-    // The fallback diagnostic is filled by the visitor, on every
-    // decode path — not only by the codec. The id/scope pairing is NOT
-    // enforced for an unknown code (its true scope is unknown), so
-    // both id shapes decode.
-    for json in [
+    // ADR-137 Amendment 1 Decision 5 keeps this fallback only with an id;
+    // the superseded id-less acceptance is now tested as a refusal below.
+    let frame: Frame = serde_json::from_str(
         r#"{"kind":"error","id":"op-7","code":"future_code_xyz","message":"from newer peer"}"#,
-        r#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#,
-    ] {
-        let frame: Frame = serde_json::from_str(json).unwrap();
-        match frame {
-            Frame::Error {
-                code,
-                unrecognized_code,
-                ..
-            } => {
-                assert_eq!(code, crate::error::WireErrorCode::Internal);
-                assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
-            }
-            other => panic!("expected an error frame, got {other:?}"),
+    )
+    .unwrap();
+    assert_eq!(
+        frame,
+        Frame::Error {
+            id: Some(OperationId::from("op-7")),
+            code: crate::error::WireErrorCode::Internal,
+            message: "from newer peer".to_string(),
+            unrecognized_code: Some("future_code_xyz".to_string()),
         }
+    );
+    assert_eq!(
+        crate::error::WireErrorCode::Internal.terminal_scope(),
+        crate::error::TerminalScope::Request
+    );
+    assert!(serde_json::to_vec(&frame).is_err());
+    assert_eq!(
+        crate::codec::encode_frame(&frame).unwrap_err(),
+        crate::codec::CodecError::FallbackFrameNotEncodable {
+            code: "future_code_xyz".to_string(),
+        }
+    );
+}
+
+#[test]
+fn direct_serde_rejects_unknown_wire_code_without_an_id() {
+    // Decision 5 is enforced on Frame itself, independently of a client
+    // or server gate. Both raw serde and Value-driven entry points agree.
+    let json = r#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#;
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    let results = [
+        ("raw serde", serde_json::from_str::<Frame>(json)),
+        ("Value serde", serde_json::from_value::<Frame>(value)),
+    ];
+    for (entrypoint, result) in results {
+        assert!(
+            result.is_err(),
+            "D5 {entrypoint} accepted an id-less unknown error code"
+        );
+        let error = result.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("id/scope rule"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("unknown error code requires an operation id"),
+            "unexpected error: {message}"
+        );
     }
 }
 

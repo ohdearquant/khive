@@ -745,13 +745,19 @@ impl<'de> Deserialize<'de> for Frame {
                         // this same visitor) re-classifies the rejection
                         // into its typed
                         // [`crate::codec::CodecError::InconsistentErrorScope`].
-                        // The check covers closed-set codes only: an unknown
-                        // code's true scope is unknowable to this protocol
-                        // version, and the ADR directs the fallback-to-
-                        // `internal` treatment rather than rejection.
+                        // ADR-137 Amendment 1 Decision 5: an unknown code
+                        // falls back to request-terminal `internal` only
+                        // when it carries an operation id. Without one it
+                        // is malformed at this role-agnostic decode boundary.
                         let code_in_closed_set = raw_code
                             .as_deref()
                             .is_some_and(|c| crate::error::WIRE_ERROR_CODES.contains(&c));
+                        if !code_in_closed_set && payload.id.is_none() {
+                            return Err(A::Error::custom(format!(
+                                "{}unknown error code requires an operation id",
+                                crate::codec::INCONSISTENT_SCOPE_ERROR_PREFIX,
+                            )));
+                        }
                         if code_in_closed_set {
                             match (payload.code.terminal_scope(), payload.id.as_ref()) {
                                 (crate::error::TerminalScope::Connection, Some(id)) => {
