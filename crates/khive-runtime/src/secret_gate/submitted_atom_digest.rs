@@ -191,9 +191,7 @@ mod tests {
         let actual = digest(&input);
         assert_eq!(actual, format!("blake3:{}", Hash32::from_blake3(expected)));
         assert_eq!(actual.len(), "blake3:".len() + 64);
-        assert!(actual[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(khive_types::is_lowercase_hex(&actual[7..]));
         assert_eq!(
             digest(
                 &json!({"properties": {"b": false, "y": "ordinary"}, "tags": ["left", "right"]})
