@@ -1,4 +1,4 @@
-//! Client-side handshake admission, per ADR-137 Amendment 1, Decision 6.
+//! Client-side handshake admission, per ADR-137 Amendment 1, Decisions 5 and 6.
 //!
 //! A transport records the version it actually sent, then feeds every decoded
 //! inbound frame through this gate before handling it. This module performs no
@@ -15,6 +15,7 @@ enum CloseReason {
     MismatchedAcknowledgment,
     UnexpectedDuringHandshake,
     WrongDirectionOrRepeatedHandshake,
+    InvalidErrorEnvelope,
     ServerTerminalError,
 }
 
@@ -27,6 +28,7 @@ impl CloseReason {
             Self::WrongDirectionOrRepeatedHandshake => {
                 "a direction or repeated-handshake violation"
             }
+            Self::InvalidErrorEnvelope => "an invalid server error frame",
             Self::ServerTerminalError => "a connection-terminal server error",
         }
     }
@@ -181,6 +183,26 @@ impl ClientHandshakeGate {
                         format!("handshake acknowledgment names version {version}, but the client offered {offered}"),
                     )
                 }
+            }
+            (State::Completed(_), Frame::Error { id: None, unrecognized_code: Some(_), .. }) => self.reject(
+                CloseReason::InvalidErrorEnvelope,
+                "a server error with an unrecognized code must identify an operation".to_string(),
+            ),
+            (State::Completed(_), Frame::Error { id: Some(_), code, .. })
+                if code.terminal_scope() == TerminalScope::Connection =>
+            {
+                self.reject(
+                    CloseReason::InvalidErrorEnvelope,
+                    "a connection-terminal server error must not identify an operation".to_string(),
+                )
+            }
+            (State::Completed(_), Frame::Error { id: None, code, .. })
+                if code.terminal_scope() == TerminalScope::Request =>
+            {
+                self.reject(
+                    CloseReason::InvalidErrorEnvelope,
+                    "a request-terminal server error must identify an operation".to_string(),
+                )
             }
             (State::Outstanding(_) | State::Completed(_), Frame::Error { id: None, code, .. })
                 if code.terminal_scope() == TerminalScope::Connection =>

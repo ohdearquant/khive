@@ -374,6 +374,56 @@ fn completed_connection_error_is_admitted_then_terminal() {
 }
 
 #[test]
+fn completed_rejects_idless_unrecognized_errors_and_stays_closed() {
+    for code in [WireErrorCode::Internal, WireErrorCode::UnsupportedVersion] {
+        let mut gate = completed();
+        let frame = Frame::Error {
+            id: None,
+            code,
+            message: "original newer-server diagnostic".to_string(),
+            unrecognized_code: Some("newer_error".to_string()),
+        };
+        let original = frame.clone();
+        assert_malformed(
+            gate.admit(&frame)
+                .expect_err("an id-less unrecognized error must be refused"),
+        );
+        assert_eq!(frame, original);
+        assert_closed(&mut gate);
+    }
+}
+
+#[test]
+fn completed_rejects_connection_errors_with_ids_and_stays_closed() {
+    for code in CONNECTION_CODES {
+        let mut gate = completed();
+        let frame = error_frame(code, Some("request-1"));
+        let original = frame.clone();
+        assert_malformed(
+            gate.admit(&frame)
+                .expect_err("a connection-terminal error with an operation id must be refused"),
+        );
+        assert_eq!(frame, original);
+        assert_closed(&mut gate);
+    }
+}
+
+#[test]
+fn completed_rejects_request_errors_without_ids_and_stays_closed() {
+    for code in REQUEST_CODES {
+        let mut gate = completed();
+        let frame = error_frame(code, None);
+        let original = frame.clone();
+        assert_malformed(
+            gate.admit(&frame)
+                .expect_err("a request-terminal error without an operation id must be refused"),
+        );
+        assert_eq!(frame, original);
+        assert_closed(&mut gate);
+    }
+}
+
+#[test]
 fn completed_rejects_ack_and_every_client_frame() {
     for frame in all_kinds() {
         if !matches!(
