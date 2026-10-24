@@ -108,7 +108,8 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
         }
         Some(other) => {
             return Err(RuntimeError::InvalidInput(format!(
-                "task update field `name` must be a string; got {other}"
+                "task update field `name` must be a string; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
             )));
         }
     };
@@ -120,13 +121,15 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
             Some(Value::String(description)) => Some(Some(description.clone())),
             Some(other) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "properties.description must be a string or null; got {other}"
+                    "properties.description must be a string or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         },
         Some(other) => {
             return Err(RuntimeError::InvalidInput(format!(
-                "properties on a `task` note must be patched with an object; got {other}"
+                "properties on a `task` note must be patched with an object; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
             )))
         }
     };

@@ -107,7 +107,8 @@ impl TaskCreateInput {
             Some(Value::Object(_)) => args["properties"].clone(),
             Some(other) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "properties must be an object or null; got {other}"
+                    "properties must be an object or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         };
