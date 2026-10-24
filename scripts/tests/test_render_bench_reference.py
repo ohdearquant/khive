@@ -31,6 +31,16 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
+COMPARISON_CLASS = {
+    "cores": "2,3",
+    "cpu": "Example CPU 8C",
+    "cpufreq": {"governor": ["performance"]},
+    "kernel": "6.8.0-1-generic",
+    "profile": "bench",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+}
+
+
 class Fixture:
     def __init__(self, root):
         self.root = pathlib.Path(root)
@@ -65,6 +75,7 @@ class Fixture:
         return {
             "schema": "bench-reference/v1",
             "crate": self.crate,
+            "class": COMPARISON_CLASS,
             "sha": sha,
             "benches": benches,
         }
@@ -144,6 +155,38 @@ class RendererTests(unittest.TestCase):
         self.assertIn(self.sha, text)
         self.assertIn("2026-01-02", text)
         self.assertNotIn("old", text)
+
+    def test_block_names_the_comparison_class(self):
+        self.fixture.write_document(
+            f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        )
+        self.write_block(
+            self.fixture.v1(self.sha, {"search/query": measured(1000.0)})
+        )
+        self.assertIn(
+            "Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, "
+            "Example CPU 8C, cores 2,3, kernel 6.8.0-1-generic.",
+            self.fixture.document.read_text(),
+        )
+
+    def test_reference_without_a_complete_comparison_class_is_refused(self):
+        document = f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        incomplete = {key: value for key, value in COMPARISON_CLASS.items() if key != "kernel"}
+        for label, payload, expected in (
+            ("no class", {"class": None}, "class must be"),
+            ("no kernel", {"class": incomplete}, "class.kernel"),
+        ):
+            with self.subTest(label):
+                self.fixture.write_document(document)
+                reference = self.fixture.v1(self.sha, {"search/query": measured(1000.0)})
+                reference.update(payload)
+                if reference["class"] is None:
+                    del reference["class"]
+                self.fixture.write_reference(reference)
+                code, _, stderr = quiet_main("--write", "--root", str(self.root))
+                self.assertEqual(code, 1)
+                self.assertIn(expected, stderr)
+                self.assertEqual(self.fixture.document.read_text(), document)
 
     def test_unmeasured_row_is_never_rendered_as_a_number(self):
         self.fixture.write_document(
@@ -270,6 +313,7 @@ class RendererTests(unittest.TestCase):
         return {
             "schema": "bench-reference/v2",
             "crate": self.fixture.crate,
+            "class": COMPARISON_CLASS,
             "targets": {
                 "khive-example:bench_target": {"entries": entries},
                 "khive-example:not_run": {"absence": "excluded", "reason": "excluded by the job"},

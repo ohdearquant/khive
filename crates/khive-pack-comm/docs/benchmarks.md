@@ -6,6 +6,8 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-comm`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
 | Benchmark                                                                                             | Reference median | A/A ratio  | Baseline commit                            | Commit date |
 | ----------------------------------------------------------------------------------------------------- | ---------------- | ---------- | ------------------------------------------ | ----------- |
 | `khive-pack-comm:comm_bench/comm/inbox/10/median_ns`                                                  | 308.392 µs       | 1.011      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
@@ -101,8 +103,8 @@ public Rust registry dispatch, not public MCP verbs.
 | ------------------------ | -------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `comm_lifecycle`         | `ingest`                         | One generated inbound message; one `comm.ingest` dispatch                                     | Fresh, non-deduplicated UUID; no committed-write degradation; actual inbound note and recipient  |
 | `comm_lifecycle`         | `cleanup_expired_quarantine/100` | 100 notes ingested with quarantine metadata; one cleanup dispatch                             | All 100 hard-deleted; no routed-owner detachment; each UUID absent                               |
-| `comm_lifecycle`         | `cursor_get`                     | One seeded cursor at generation 1 / high-water 100; one get dispatch                          | Returned checkpoint remains at 100 and equals an additional persisted read                        |
-| `comm_lifecycle`         | `cursor_commit`                  | One seeded cursor at generation 1 / high-water 100; one commit to high-water 101               | Receipt is at 101 and equals an additional persisted read                                         |
+| `comm_lifecycle`         | `cursor_get`                     | One seeded cursor at generation 1 / high-water 100; one get dispatch                          | Returned checkpoint remains at 100 and equals an additional persisted read                       |
+| `comm_lifecycle`         | `cursor_commit`                  | One seeded cursor at generation 1 / high-water 100; one commit to high-water 101              | Receipt is at 101 and equals an additional persisted read                                        |
 | `comm_lifecycle`         | `cursor_get_commit`              | One seeded cursor at generation 1 / high-water 100; get then commit high-water 101            | Old read, new receipt and an additional persisted read agree                                     |
 | `comm_lifecycle`         | `mark_read/200`                  | 200 distinct unread inbound notes; one `comm.mark_read(atomic=false)` dispatch                | Requested, unique and marked counts all 200; no failures or unknowns; all stored read flags true |
 | `comm_lifecycle`         | `suppression_list/100`           | 100 unique outbound address suppressions seeded via `comm.suppression_add`; one list dispatch | Exact 100-entry identity/value set, with limit 100 and offset 0                                  |
@@ -181,13 +183,13 @@ The v0.2.8 ledger above remains historical; none of its numbers are measurements
 these new workloads. Pipeline selection is maintained by the benchmark workflow's
 owning component.
 
-| Group / scenario                                | Reported unit                                              | Baseline | Commit  | Toolchain / machine |
-| ----------------------------------------------- | ---------------------------------------------------------- | -------- | ------- | ------------------- |
-| `comm_lifecycle/ingest`                         | Median ns per single dispatch                              | pending  | pending | pending             |
-| `comm_lifecycle/cleanup_expired_quarantine/100` | Median ms per 100-note cleanup dispatch                    | pending  | pending | pending             |
-| `comm_lifecycle/cursor_get`                     | Median ns per single get dispatch                         | pending  | pending | pending             |
-| `comm_lifecycle/cursor_commit`                  | Median ns per single commit dispatch                      | pending  | pending | pending             |
-| `comm_lifecycle/cursor_get_commit`              | Median ns per get + commit round-trip                      | pending  | pending | pending             |
-| `comm_lifecycle/mark_read/200`                  | Median ns per 200-message dispatch                         | pending  | pending | pending             |
-| `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending  | pending | pending             |
-| `comm/thread_in_busy_mailbox/2000`              | Existing Criterion estimate, compared with `comm/thread/5` | pending  | pending | pending             |
+| Group / scenario                                | Reported unit                                              | Baseline        | Commit          | Toolchain / machine |
+| ----------------------------------------------- | ---------------------------------------------------------- | --------------- | --------------- | ------------------- |
+| `comm_lifecycle/ingest`                         | Median ns per single dispatch                              | pending         | pending         | pending             |
+| `comm_lifecycle/cleanup_expired_quarantine/100` | Median ms per 100-note cleanup dispatch                    | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_get`                     | Median ns per single get dispatch                          | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_commit`                  | Median ns per single commit dispatch                       | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_get_commit`              | Median ns per get + commit round-trip                      | pending         | pending         | pending             |
+| `comm_lifecycle/mark_read/200`                  | Median ns per 200-message dispatch                         | pending         | pending         | pending             |
+| `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending         | pending         | pending             |
+| `comm/thread_in_busy_mailbox/2000`              | Existing Criterion estimate, compared with `comm/thread/5` | reference block | reference block | reference block     |

@@ -6,6 +6,8 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-code`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
 | Benchmark                                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
 | ------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
 | `khive-pack-code:code_findings/pack_code_findings/clippy_jsonl/100/median_ns`   | 2.883 ms         | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
@@ -148,10 +150,10 @@ production behavior, public API or existing correctness gate is changed.
 
 ## Baselines and execution
 
-| Group                | Commit  | Toolchain | Machine | Baseline | Producer                                    |
-| -------------------- | ------- | --------- | ------- | -------- | ------------------------------------------- |
-| `pack_code_ingest`   | pending | pending   | pending | pending  | Owning benchmark component / qualified host |
-| `pack_code_findings` | pending | pending   | pending | pending  | Owning benchmark component / qualified host |
+| Group                | Commit          | Toolchain       | Machine         | Baseline        | Producer                                    |
+| -------------------- | --------------- | --------------- | --------------- | --------------- | ------------------------------------------- |
+| `pack_code_ingest`   | reference block | reference block | reference block | reference block | Owning benchmark component / qualified host |
+| `pack_code_findings` | reference block | reference block | reference block | reference block | Owning benchmark component / qualified host |
 
 Run named targets from `crates/` on the qualified host:
 
@@ -162,7 +164,9 @@ cargo bench -p khive-pack-code --benches -- --quick --noplot
 The allocation report baseline also remains pending.
 The largest source corpus performs real per-file writes and is substantially more
 expensive than pure JSON conversion. Use one benchmark process at a time and
-record filesystem, load, exact commit and toolchain alongside results. The first
-qualified run must populate these pending cells; no local native measurements
-are implied. Workflow component wiring and `perf/guarantees.toml` belong to their
+record filesystem, load, exact commit and toolchain alongside results. The
+`pack_code_ingest` and `pack_code_findings` baselines are in the reference block at
+the top of this file, with their commit and comparison class; no local native
+measurements are implied. Workflow component wiring and `perf/guarantees.toml`
+belong to their
 separate integration/format work.
