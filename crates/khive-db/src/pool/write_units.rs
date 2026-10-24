@@ -626,22 +626,15 @@ impl<'pool> WriterGuard<'pool> {
         if unit.conn().is_autocommit() {
             return result;
         }
-        if unit
+        let rollback_proven = unit
             .writer
             .rollback_or_retire("autocommit script left its transaction open")
-            .is_err()
-        {
-            return Err(match result {
-                Err(error) => SqliteError::settlement_with_cause(
-                    &error,
-                    khive_storage::error::SqliteWriteStage::Statement,
-                ),
-                Ok(_) => SqliteError::WriterSettlementUnknown,
-            });
-        }
-        result.and(Err(SqliteError::InvalidData(
-            "pooled script left a transaction open; rolled back".into(),
-        )))
+            .is_ok();
+        settle_open_autocommit_result(
+            result,
+            rollback_proven,
+            "pooled script left a transaction open; rolled back",
+        )
     }
 
     /// Run a native SQLite fixture operation through the usual autocommit owner.
@@ -822,18 +815,12 @@ impl ConnectionPool {
         if unit.conn().is_autocommit() {
             return result;
         }
-        if !crate::connection_settlement::rollback_proves_autocommit(unit.conn()) {
-            return Err(match result {
-                Err(error) => SqliteError::settlement_with_cause(
-                    &error,
-                    khive_storage::error::SqliteWriteStage::Statement,
-                ),
-                Ok(_) => SqliteError::WriterSettlementUnknown,
-            });
-        }
-        result.and(Err(SqliteError::InvalidData(
-            "standalone script left a transaction open; rolled back".into(),
-        )))
+        let rollback_proven = crate::connection_settlement::rollback_proves_autocommit(unit.conn());
+        settle_open_autocommit_result(
+            result,
+            rollback_proven,
+            "standalone script left a transaction open; rolled back",
+        )
     }
 
     /// Run a standalone BEGIN IMMEDIATE transaction under the volume lease.
@@ -1053,6 +1040,21 @@ impl ConnectionPool {
             return Err(error);
         }
         Ok(unit)
+    }
+}
+
+fn settle_open_autocommit_result<R>(
+    result: Result<R, SqliteError>,
+    rollback_proven: bool,
+    left_open_message: &'static str,
+) -> Result<R, SqliteError> {
+    match (rollback_proven, result) {
+        (true, result) => result.and(Err(SqliteError::InvalidData(left_open_message.into()))),
+        (false, Err(error)) => Err(SqliteError::settlement_with_cause(
+            &error,
+            khive_storage::error::SqliteWriteStage::Statement,
+        )),
+        (false, Ok(_)) => Err(SqliteError::WriterSettlementUnknown),
     }
 }
 
