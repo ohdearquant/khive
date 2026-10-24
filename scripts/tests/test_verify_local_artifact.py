@@ -16,6 +16,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tomllib
 import unittest
 
 
@@ -76,6 +77,7 @@ if record:
         "home": os.environ.get("HOME"),
         "config": os.environ.get("KHIVE_CONFIG"),
         "config_was_file": config_path.is_file(),
+        "config_text": config_path.read_text() if config_path.is_file() else None,
         "db": os.environ.get("KHIVE_DB"),
         "log": os.environ.get("KHIVE_LOG"),
         "no_daemon": os.environ.get("KHIVE_NO_DAEMON"),
@@ -383,6 +385,25 @@ class VerifyLocalArtifactTests(unittest.TestCase):
         self.assertTrue(record["config_was_file"])
         self.assertEqual(Path(record["home"]).resolve(), Path(record["cwd"]).resolve())
         self.assertIsNone(record["leak"])
+
+    def test_isolated_config_declares_the_telemetry_default_carrier(self) -> None:
+        # The telemetry pack refuses to register without a declared default
+        # carrier, so an empty probe config fails every build that links it.
+        completed = self.run_probe()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        record = json.loads(self.record.read_text(encoding="utf-8"))
+        self.assertEqual(
+            tomllib.loads(record["config_text"]),
+            {"telemetry": {"default_carrier": "ephemeral"}},
+        )
+
+    def test_startup_refusal_reports_the_artifact_stderr(self) -> None:
+        # The fake exits before answering initialize, as a binary that refuses
+        # its configuration does; the reason it printed must reach the caller.
+        completed = self.run_probe("error")
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("artifact stderr: synthetic probe failure", completed.stderr)
+        self.assertFalse(self.stamp.exists())
 
     def test_every_probe_or_contract_failure_removes_stale_stamp(self) -> None:
         for mode in (
@@ -1362,6 +1383,36 @@ class MakefileGateContractTests(unittest.TestCase):
             linked - named,
             "build-local links pack(s) that FULL_PACKS does not name, so the "
             "verification gate cannot see their verbs",
+        )
+
+    def test_ci_probes_a_build_with_the_build_local_features(self) -> None:
+        """CI runs the install probe on a binary built like the operator's.
+
+        The probe's isolated config is only proven against a binary that links
+        every pack the install gate requests, so the CI build must use exactly
+        the build-local feature list and the probe must be `make fleet-check`.
+        """
+        features = re.search(r"^\s*--features (\S+) \\$", self.makefile, re.MULTILINE)
+        self.assertIsNotNone(features, "build-local --features line not found")
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        step = re.search(
+            r"- name: Probe a kkernel built with the operator feature set\n"
+            r"        run: \|\n"
+            r"          (cargo build [^\n]+)\n"
+            r"          (make [^\n]+)\n",
+            workflow,
+        )
+        self.assertIsNotNone(step, "operator feature probe step not found in ci.yml")
+        self.assertEqual(
+            step.group(1),
+            "cargo build -p kkernel --bin kkernel --locked --features "
+            + features.group(1),
+        )
+        self.assertEqual(
+            step.group(2),
+            'make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"',
         )
 
     def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
