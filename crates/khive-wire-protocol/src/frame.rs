@@ -127,7 +127,7 @@ pub struct RequestPayload {
     pub id: OperationId,
     /// The request DSL string (ADR-016's function-call or JSON form).
     pub ops: String,
-    /// Optional deadline in milliseconds, measured from server receipt
+    /// Optional positive deadline in milliseconds, measured from server receipt
     /// of this frame against the server's monotonic clock. Scopes the
     /// entire request frame (the whole DSL batch or chain).
     #[serde(
@@ -326,7 +326,7 @@ pub enum Frame {
         id: OperationId,
         /// The request DSL string (ADR-016's function-call or JSON form).
         ops: String,
-        /// Optional deadline in milliseconds, measured from server receipt
+        /// Optional positive deadline in milliseconds, measured from server receipt
         /// of this frame against the server's monotonic clock. Scopes the
         /// entire request frame (the whole DSL batch or chain).
         deadline_ms: Option<u64>,
@@ -493,7 +493,16 @@ fn validate_frame_for_serialize(frame: &Frame) -> Result<(), String> {
     match frame {
         Frame::Handshake { version } => check_version("handshake", *version)?,
         Frame::HandshakeAck { version } => check_version("handshake_ack", *version)?,
-        Frame::Request { id, .. } => check_id("request", id)?,
+        Frame::Request {
+            id, deadline_ms, ..
+        } => {
+            check_id("request", id)?;
+            if *deadline_ms == Some(0) {
+                return Err(
+                    "frame kind \"request\": deadline_ms must be a positive integer".to_string(),
+                );
+            }
+        }
         Frame::Response { id, .. } => check_id("response", id)?,
         Frame::Cancel { id } => check_id("cancel", id)?,
         Frame::Subscribe { id, .. } => check_id("subscribe", id)?,
@@ -748,6 +757,9 @@ impl<'de> Deserialize<'de> for Frame {
                     }
                     "request" => {
                         let payload: RequestPayload = parse(&object).map_err(A::Error::custom)?;
+                        if payload.deadline_ms == Some(0) {
+                            return Err(A::Error::custom("deadline_ms must be a positive integer"));
+                        }
                         Ok(Frame::Request {
                             id: payload.id,
                             ops: payload.ops,

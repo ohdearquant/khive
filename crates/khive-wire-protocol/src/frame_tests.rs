@@ -422,3 +422,76 @@ fn direct_and_codec_serialization_require_an_object_event_payload() {
         }
     }
 }
+
+#[test]
+fn direct_serde_requires_a_positive_present_request_deadline() {
+    for (member, expected) in [
+        ("", None),
+        (",\"deadline_ms\":1", Some(1_u64)),
+        (",\"deadline_ms\":18446744073709551615", Some(u64::MAX)),
+    ] {
+        let raw = format!(r#"{{"kind":"request","id":"op-1","ops":"stats()"{member}}}"#);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for frame in [
+            serde_json::from_str::<Frame>(&raw).unwrap(),
+            serde_json::from_value::<Frame>(value).unwrap(),
+        ] {
+            let Frame::Request { deadline_ms, .. } = frame else {
+                panic!("expected request")
+            };
+            assert_eq!(deadline_ms, expected);
+        }
+    }
+
+    // ADR-137's positive-integer floor rejects only zero in the u64 domain.
+    let raw = r#"{"kind":"request","id":"op-1","ops":"stats()","deadline_ms":0}"#;
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    for (entrypoint, result) in [
+        ("raw serde", serde_json::from_str::<Frame>(raw)),
+        ("Value serde", serde_json::from_value::<Frame>(value)),
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deadline_ms must be a positive integer"),
+            "zero deadline {entrypoint} returned an unrelated refusal: {error}"
+        );
+    }
+}
+
+#[test]
+fn direct_and_codec_serialization_require_positive_request_deadlines() {
+    let request = |deadline_ms| Frame::Request {
+        id: OperationId::from("op-1"),
+        ops: "stats()".to_string(),
+        deadline_ms,
+        namespace: None,
+        actor_id: None,
+        visible_namespaces: None,
+    };
+    for deadline_ms in [None, Some(1), Some(u64::MAX)] {
+        let frame = request(deadline_ms);
+        let direct = serde_json::to_vec(&frame).unwrap();
+        let wire = crate::codec::encode_frame(&frame).unwrap();
+        assert_eq!(direct, &wire[crate::codec::LENGTH_PREFIX_BYTES..]);
+        assert_eq!(serde_json::from_slice::<Frame>(&direct).unwrap(), frame);
+    }
+
+    // Construct invalid local state directly; decode refuses this shape.
+    let zero = request(Some(0));
+    let direct_error = serde_json::to_vec(&zero).unwrap_err();
+    assert!(
+        direct_error
+            .to_string()
+            .contains("deadline_ms must be a positive integer"),
+        "zero deadline direct serialization returned an unrelated refusal: {direct_error}"
+    );
+    match crate::codec::encode_frame(&zero).unwrap_err() {
+        crate::codec::CodecError::InvalidFields { kind, detail } => {
+            assert_eq!(kind, "request");
+            assert_eq!(detail, "deadline_ms must be a positive integer");
+        }
+        other => panic!("zero deadline expected typed request refusal, got {other:?}"),
+    }
+}

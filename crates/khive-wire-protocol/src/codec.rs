@@ -93,7 +93,7 @@ pub enum CodecError {
     /// documentation's "Strict field rejection" section). Encode side: an
     /// operation id field carries the empty string, which the wire grammar
     /// forbids ([`crate::frame::OperationId`]), or an Event payload is not
-    /// a JSON object (Amendment 1 Decision 10).
+    /// a JSON object (Amendment 1 Decision 10), or a Request deadline is zero.
     #[error("frame kind {kind:?}: {detail}")]
     InvalidFields { kind: String, detail: String },
 
@@ -248,8 +248,9 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 /// `error` frame whose id presence contradicts its code's terminal scope
 /// ([`CodecError::InconsistentErrorScope`]), a decoded unknown-code
 /// fallback `error` frame ([`CodecError::FallbackFrameNotEncodable`]), and
-/// a non-object Event payload ([`CodecError::InvalidFields`]) are all
-/// rejected here, so a frame this function accepts is one any
+/// a non-object Event payload or a zero Request deadline
+/// ([`CodecError::InvalidFields`]) are all rejected here, so a frame this
+/// function accepts is one any
 /// conforming decoder accepts. This keeps
 /// encode and decode symmetric: a locally constructed frame that violates
 /// the grammar can never leave this crate as wire bytes.
@@ -297,6 +298,8 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
 ///    peer sent, so this crate refuses to corrupt it.
 /// 5. An Event payload must be a JSON object (Amendment 1 Decision 10).
 ///    Response results remain arbitrary JSON.
+/// 6. A present Request deadline_ms must be positive (ADR-137, "Deadlines
+///    and cancellation"); omission leaves no frame-supplied deadline.
 fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
     use crate::error::TerminalScope;
 
@@ -335,7 +338,17 @@ fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
                 });
             }
         }
-        Frame::Request { id, .. } => check_id("request", id)?,
+        Frame::Request {
+            id, deadline_ms, ..
+        } => {
+            check_id("request", id)?;
+            if *deadline_ms == Some(0) {
+                return Err(CodecError::InvalidFields {
+                    kind: "request".to_string(),
+                    detail: "deadline_ms must be a positive integer".to_string(),
+                });
+            }
+        }
         Frame::Response { id, .. } => check_id("response", id)?,
         Frame::Cancel { id } => check_id("cancel", id)?,
         Frame::Subscribe { id, .. } => check_id("subscribe", id)?,
