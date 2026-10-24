@@ -613,3 +613,212 @@ async fn assign_json_due_timezone_refusals_preserve_masked_decoder_contract() {
         }
     }
 }
+
+async fn refuse_task_shape_with_snapshots(
+    registry: &VerbRegistry,
+    verb: &str,
+    args: Value,
+    expected: String,
+    secret: Option<&str>,
+    retained_ids: &[Value],
+) {
+    assert!(!retained_ids.is_empty(), "populated retained task fixture");
+    let mut snapshots = Vec::new();
+    for id in retained_ids {
+        assert!(
+            id.as_str().is_some_and(|id| !id.is_empty()),
+            "actual retained task identifier"
+        );
+        let snapshot = registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("complete retained task before refusal");
+        assert!(snapshot.is_object(), "actual retained task readback");
+        snapshots.push((id.clone(), snapshot));
+    }
+    // The existing helper checks the actual InvalidInput before projection and
+    // compares the complete populated gtd.tasks census after every refusal.
+    refuse(registry, verb, args, expected, secret).await;
+    for (id, before) in snapshots {
+        assert_eq!(
+            registry.dispatch("get", json!({"id": id})).await.unwrap(),
+            before,
+            "refused shape changed a complete retained task snapshot"
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_update_name_type_refusals_mask_credentials_and_preserve_snapshot() {
+    let registry = json_refusal_fixture();
+    let id = seed(&registry).await;
+    let other_id = seed(&registry).await;
+    assert_ne!(id, other_id, "two distinct actual task rows");
+    registry
+        .dispatch("update", json!({"id": id, "name": "Accepted task title"}))
+        .await
+        .expect("valid task name update");
+    let stored = registry.dispatch("get", json!({"id": id})).await.unwrap();
+    assert_eq!(stored["name"], "Accepted task title");
+    assert_eq!(stored["content"], "Original task body");
+    assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 2);
+    let retained_ids = [id.clone(), other_id];
+    let secret = credential();
+    for (value, masked) in [
+        (json!(17), false),
+        (json!({"label": "ordinary"}), false),
+        (json!(["ordinary"]), false),
+        (json!({"credential": secret.clone()}), true),
+        (json!([{"credential": secret.clone()}]), true),
+    ] {
+        let secret = masked.then_some(secret.as_str());
+        let shown = json_operand_shown(&value, secret);
+        refuse_task_shape_with_snapshots(
+            &registry,
+            "update",
+            json!({"id": id, "name": value}),
+            format!("task update field `name` must be a string; got {shown}"),
+            secret,
+            &retained_ids,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn task_update_description_type_refusals_mask_credentials_and_preserve_snapshot() {
+    let registry = json_refusal_fixture();
+    let id = seed(&registry).await;
+    let other_id = seed(&registry).await;
+    assert_ne!(id, other_id, "two distinct actual task rows");
+    registry
+        .dispatch(
+            "update",
+            json!({"id": id, "properties": {"description": "Accepted task description"}}),
+        )
+        .await
+        .expect("valid task description update");
+    let stored = registry.dispatch("get", json!({"id": id})).await.unwrap();
+    assert_eq!(stored["content"], "Accepted task description");
+    assert_eq!(
+        stored["properties"]["description"],
+        "Accepted task description"
+    );
+    assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 2);
+    let retained_ids = [id.clone(), other_id];
+    let secret = credential();
+    for (value, masked) in [
+        (json!(17), false),
+        (json!({"label": "ordinary"}), false),
+        (json!(["ordinary"]), false),
+        (json!({"credential": secret.clone()}), true),
+        (json!([{"credential": secret.clone()}]), true),
+    ] {
+        let secret = masked.then_some(secret.as_str());
+        let shown = json_operand_shown(&value, secret);
+        refuse_task_shape_with_snapshots(
+            &registry,
+            "update",
+            json!({"id": id, "properties": {"description": value}}),
+            format!("properties.description must be a string or null; got {shown}"),
+            secret,
+            &retained_ids,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn task_update_properties_type_refusals_mask_credentials_and_preserve_snapshot() {
+    let registry = json_refusal_fixture();
+    let id = seed(&registry).await;
+    let other_id = seed(&registry).await;
+    assert_ne!(id, other_id, "two distinct actual task rows");
+    registry
+        .dispatch(
+            "update",
+            json!({"id": id, "properties": {"description": "Accepted object properties"}}),
+        )
+        .await
+        .expect("object properties remains a valid task update");
+    let stored = registry.dispatch("get", json!({"id": id})).await.unwrap();
+    assert_eq!(stored["content"], "Accepted object properties");
+    assert_eq!(
+        stored["properties"]["description"],
+        "Accepted object properties"
+    );
+    assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 2);
+    let retained_ids = [id.clone(), other_id];
+    let secret = credential();
+    for (value, masked) in [
+        (json!(17), false),
+        (json!(["ordinary"]), false),
+        (json!("ordinary"), false),
+        (json!([{"credential": secret.clone()}]), true),
+        (json!(secret.clone()), true),
+    ] {
+        let secret = masked.then_some(secret.as_str());
+        let shown = json_operand_shown(&value, secret);
+        refuse_task_shape_with_snapshots(
+            &registry,
+            "update",
+            json!({"id": id, "properties": value}),
+            format!("properties on a `task` note must be patched with an object; got {shown}"),
+            secret,
+            &retained_ids,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn create_task_properties_type_refusals_mask_credentials_without_writes() {
+    let registry = json_refusal_fixture();
+    let id = seed(&registry).await;
+    registry
+        .dispatch(
+            "create",
+            json!({"kind": "task", "name": "Accepted object task", "content": "Accepted task body",
+                "properties": {"description": "Accepted task body"}}),
+        )
+        .await
+        .expect("object properties remains valid for actual task create");
+    let rows = tasks(&registry).await;
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    let created_id = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Accepted object task")
+        .expect("actual newly created task in populated census")["full_id"]
+        .clone();
+    assert_ne!(id, created_id, "healthy create wrote a distinct task");
+    let stored = registry
+        .dispatch("get", json!({"id": created_id}))
+        .await
+        .unwrap();
+    assert_eq!(stored["name"], "Accepted object task");
+    assert_eq!(stored["content"], "Accepted task body");
+    assert_eq!(stored["properties"]["description"], "Accepted task body");
+    let retained_ids = [id, created_id];
+    let secret = credential();
+    for (value, masked) in [
+        (json!(17), false),
+        (json!(["ordinary"]), false),
+        (json!("ordinary"), false),
+        (json!([{"credential": secret.clone()}]), true),
+        (json!(secret.clone()), true),
+    ] {
+        let secret = masked.then_some(secret.as_str());
+        let shown = json_operand_shown(&value, secret);
+        refuse_task_shape_with_snapshots(
+            &registry,
+            "create",
+            json!({"kind": "task", "name": "Refused object task", "content": "Safe task body", "properties": value}),
+            format!("properties must be an object or null; got {shown}"),
+            secret,
+            &retained_ids,
+        )
+        .await;
+    }
+}
