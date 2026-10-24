@@ -309,3 +309,218 @@ The implementing PR ships a runbook covering, at minimum:
 - Writes that occur mid-sync land in the next cycle (the tool syncs to the origin
   snapshot taken at start); this is the correct trade for consistency and is accounted
   for in the stated RPO.
+
+## Amendment (2026-10-24): a storage-layer database copy, registered as a named WAL holder
+
+**Status**: Proposed. Refs #1845; the scheduled tiers in #5562 build on it.
+
+### Context
+
+Tier 3 above names `VACUUM INTO`, but no storage-layer operation runs it today, and the
+two nearest surfaces do not fit:
+
+- `TopLevelMaintenance` (`crates/khive-storage/src/sql.rs:32-53`) is a closed set of
+  statements that take no parameters. Its own doc says that a command needing a caller
+  value, such as a destination path, needs a separate parameter-bound primitive.
+- `SqlWriter::execute_script_top_level` sends those statements through the single writer
+  task (`crates/khive-db/src/sql_bridge/sqlite_writer.rs:544-566`, `send_vacuum_bounded`).
+  A copy routed there would hold the only writer for the copy's whole length.
+
+The write-ahead-log holder census also has no name for a copy. The in-process half of the
+census is the open-span registry (ADR-091 Plank 0, `crates/khive-storage/src/tx_registry.rs`),
+which the checkpoint task reads when it reports what holds the WAL. A copy that does not
+register there looks like any other reader, so an operator watching the WAL grow during a
+backup cannot tell the backup from a leaked reader.
+
+#1845 asked for SQLite's stepped online backup API. This amendment takes `VACUUM INTO`
+instead, for four reasons:
+
+1. SQLite restarts a stepped backup whenever the source changes through any connection
+   other than the one running the backup (`sqlite3_backup_step`,
+   https://sqlite.org/c3ref/backup_finish.html). Every write here arrives through the
+   pool's writer connections, so on a store that keeps taking writes a stepped copy can
+   restart without bound.
+2. A backup run as a single step does not restart, but it holds one read snapshot for the
+   whole copy. `VACUUM INTO` holds exactly that, and it also writes a compacted file.
+3. khive-db builds rusqlite without the `backup` feature (`crates/khive-db/Cargo.toml:30`);
+   `VACUUM INTO` needs no new feature.
+4. This ADR already selects `VACUUM INTO` for tier 3.
+
+The issue's criterion of "bounded incremental stepping" is therefore replaced by the
+deadline in Decision 5. The copy pins the WAL for its own length and no longer.
+
+SQLite facts this amendment relies on, from https://sqlite.org/lang_vacuum.html: the INTO
+argument is "an arbitrary SQL expression that evaluates to a string"; "the file named by
+the INTO clause must not previously exist, or else it must be an empty file"; "VACUUM (but not
+VACUUM INTO) is a write operation"; a VACUUM "will fail if there is an open transaction"
+on its connection; SQLite syncs the output to disk only "if the PRAGMA synchronous setting
+of the original database is NORMAL or FULL"; and an interrupted `VACUUM INTO` can leave an
+incomplete output file.
+
+Read in the SQLite source that khive-db bundles (3.53.2, `sqlite3RunVacuum`): for `VACUUM INTO`
+the statement clears the read-only open flag for the output file only, opens a read
+transaction (not a write transaction) on the source, refuses an output file larger than zero
+bytes, and gives the output the source connection's sync level. The copy statements it runs
+write to the output, so a connection with `PRAGMA query_only` on refuses them; the pool's
+standalone read connections do not set it (it is set only on the read-only writer slot,
+`crates/khive-db/src/pool/connection_setup.rs:285`).
+
+### Decisions
+
+1. **Interface.** One new operation on `SqlAccess` in khive-storage, beside (not inside)
+   `TopLevelMaintenance`: it takes a destination path and a deadline and returns the
+   destination path and the copy's size in bytes. It sits on `SqlAccess`, not
+   `SqlWriter`, because it never uses a writer. The default implementation refuses it as
+   unsupported, and an in-memory database refuses it because there is no file to copy.
+   `TopLevelMaintenance` stays closed and parameter-free; no variant is added.
+
+2. **Connection.** The copy runs on its own standalone read connection, opened for the copy
+   and closed when it ends. It never goes through the writer task and never takes a pooled
+   reader: a pooled reader is held for one request under the request read deadline and
+   then returns to the pool, while a copy holds its connection for its whole length, which
+   can be hours.
+
+   ADR-165 Slice 2 keeps standalone reads to a closed list that "lives at the pool surface"
+   (`StandaloneReaderPurpose`, `crates/khive-db/src/pool/reader_counters.rs:16`) and makes a
+   new standalone-read call site "a reviewable event". The copy fits none of the three
+   members: it is not a raw-SQL read transaction spanning calls, not a boot-time probe, and
+   not an operator diagnostic. This amendment is that review and adds a fourth member,
+   `DatabaseCopy`, whose doc comment points here. The enum is the list ADR-165 names as the
+   authority, so ADR-165's prose, which names the members it started with, is not edited.
+
+   `DatabaseCopy` is classed as infrastructure (`is_infrastructure`, line 28), so its opens
+   are counted apart from request traffic (`record_standalone_open`, line 148) and it takes
+   no reader-admission slot. A slot held for the length of a copy would shrink the request
+   read budget for that whole time, and the copy is not request traffic. Decision 5's
+   one-copy-per-database rule bounds how many such connections exist.
+
+   The statement runs with no transaction open on that connection and never inside an
+   atomic unit. Before the statement runs, the operation reads back `PRAGMA synchronous` and
+   `PRAGMA query_only` on the copy connection, and refuses unless `synchronous` is NORMAL,
+   FULL or EXTRA and `query_only` is off. The SQLite page names NORMAL and FULL; EXTRA is the
+   level above FULL, and the bundled `sqlite3RunVacuum` gives the output the source's own
+   sync level, so EXTRA syncs the output as well.
+
+3. **Destination.** The caller names an absolute path whose parent directory exists. All of
+   the following happens before the statement runs, in this order:
+   - The operation resolves the parent directory to its canonical path and joins the final
+     name. It refuses the result if it equals the source's canonical path or that path with
+     `-wal`, `-shm` or `-journal` appended. A sidecar name may not exist yet, so an existence
+     check alone does not cover it.
+   - It refuses if anything exists at `<dest>`, `<dest>-journal`, `<dest>-wal` or
+     `<dest>-shm`, a symbolic link included. SQLite writes the output through a rollback
+     journal named `<dest>-journal`, so a journal left by an earlier copy is refused, never
+     adopted.
+   - It creates `<dest>` exclusively, as an empty file, keeps that handle open, and records
+     the file's device and inode.
+   - It opens the copy connection with `SQLITE_OPEN_NOFOLLOW`. SQLite attaches the output
+     with the connection's own open flags (`attachFunc` passes `db->openFlags`), and with
+     that flag it refuses any path element that is a symbolic link
+     (`SQLITE_CANTOPEN_SYMLINK`), so a link placed at `<dest>` is not followed. The
+     connection opens the source by its fully resolved path, which is the path SQLite itself
+     resolves the pool's open to, so the flag refuses only a link that appears after
+     resolution, and the copy reads the same `-wal` and `-shm` files as the pool.
+   - Immediately before the statement, and again after it, the operation checks that
+     `<dest>` still names the device and inode it created. A mismatch fails the copy.
+   - The path is bound as a statement parameter (`VACUUM INTO ?1`) and never spliced into
+     the SQL text.
+
+   These are separate steps, so the sequence is not atomic. A process that can rename
+   entries in the destination directory between them can still substitute a regular file.
+   The destination directory belongs to the caller and such a process is outside this
+   operation's threat model. Within it, the checks turn a substitution into a reported
+   failure, never a silent success: a file swapped in before the statement and swapped back
+   before the second identity check passes that check, but the output then went to the
+   other file, so the held handle is still empty, and the operation fails the copy unless
+   the held handle's size is non-zero after the statement.
+
+   On success the operation syncs the destination's parent directory (on Unix) and returns
+   the size read from the held handle's metadata. On any failure it removes `<dest>` only
+   if the path still names the device and inode it created, and removes `<dest>-journal`
+   if one is present (none existed when the call began). If a removal fails, the returned
+   error names the path. The identity check and the removal are two steps as well, so a
+   renamer acting between them could still have its file removed; that is the same residual
+   as above, and outside it the operation removes only files it created.
+
+   A process killed during a copy runs none of this and can leave `<dest>` and
+   `<dest>-journal` behind. A later copy to that path is refused by the existence check
+   above; only an `Ok` return marks a destination complete, and clearing a refused
+   destination is the caller's, which for the scheduled tiers is #5562.
+
+4. **Census.** The copy registers one span in the open-span registry with the source
+   database as its origin: `register_scoped(Some(label), TxOrigin::Database(id))`
+   (`crates/khive-storage/src/tx_registry.rs:122`), where `id` is the source's
+   `DbIdentity` as the pool minted it. The type's own doc names the pool as its only minting
+   point, so the span attributes to the same database as the pool's own spans. `label` is a
+   fixed constant that no other registration uses and that carries no caller value. The
+   span opens after Decision 3's checks and before the copy connection opens, and closes
+   after that connection closes. Deregistration is the handle's `Drop`
+   (`tx_registry.rs:109`), so success, error, deadline and panic all leave the census.
+
+   The registry is per process. In the process that runs the copy, the checkpoint task's
+   holder reports and the transaction-age sweep name the span by its label. Another
+   process learns the name only through the WAL-pin heartbeat: when the copying process
+   runs a sweep (the daemon's checkpoint task or a session sweep) and the copy's span is
+   that process's oldest past the warning age, the heartbeat body carries its label
+   (ADR-091 Amendment 2 Plank B, `oldest_tx_label` in `crates/khive-db/src/walpin/types.rs:24`).
+   A copying process that runs no sweep appears in the OS-level census as a holder process
+   without a name, as any cross-process reader does today.
+
+   The transaction-age sweep will report every copy longer than its thresholds: a warning
+   past `KHIVE_TX_WARN_SECS` (30 seconds by default) and an error past
+   `KHIVE_TX_MAX_AGE_SECS` (120 seconds by default), both visibility only; nothing in the
+   sweep closes a span (`crates/khive-db/src/checkpoint/config.rs:85-108`, defaults at 121-122). This amendment
+   does not exempt the copy's label from either rung. The label is what lets a reader tell
+   an expected copy from a leaked reader, and an exemption would also hide a copy that
+   never ends. Decision 5's deadline is what ends it.
+
+5. **Bound.** The copy holds one read snapshot for its whole length, so checkpoints cannot
+   backfill past it (ADR-091) and the WAL grows until it ends. The deadline is required and
+   has no default, which keeps Named invariant 2 enforceable. The caller owns the budget:
+   each scheduled sync already runs under this ADR's per-sync hard timeout, and a default
+   here would be a second, unrelated number a caller could inherit without choosing it.
+
+   On expiry the operation interrupts the statement through the copy connection's own
+   interrupt handle (`get_interrupt_handle()`, the same call
+   `crates/khive-db/src/read_cancellation.rs:322` makes for request reads), never the pool's
+   or the writer's, and without going through the request-read cancellation path or its
+   statement classifier. The copy then fails with a deadline error, followed by Decision 3's
+   removal and Decision 4's deregistration. Within one process a second copy of the same
+   database is refused while one is running, matching "at most one backup reader exists at
+   a time" above; the cross-process lock across tiers stays with the scheduled job.
+
+6. **Unchanged.** The operation performs no file operation of its own on the source's
+   `-wal` or `-shm` files: it never reads, copies or deletes them (SQLite reads committed
+   WAL content through the connection, as for any reader). Named invariant 1 is unchanged.
+   Tier scheduling, retention, off-host transfer and the drills are #5562 and this ADR's
+   existing sections, not this amendment.
+
+### Acceptance (tests in the implementing pull request)
+
+1. A copy taken while another task keeps committing passes `PRAGMA integrity_check` and
+   holds every row committed before the copy started.
+2. The writer's commits during the copy succeed: at least one commit lands inside the
+   copy's window, with no busy or admission error.
+3. The census shows the copy's label, with the source's identity as origin, while the copy
+   runs, and not after it ends, both after a success and after a failed copy.
+4. An existing `<dest>`, `<dest>-journal`, `<dest>-wal` or `<dest>-shm` is refused before
+   any work: no census entry appears, the standalone open count does not move, and the
+   existing file is unchanged.
+5. Each of the source file, `-wal`, `-shm` and `-journal` names is refused as a
+   destination, including a sidecar name that does not exist yet and a destination whose
+   parent is reached through a symbolic link.
+6. A destination whose name contains a single quote copies correctly, which shows the
+   path is bound and not spliced.
+7. A deadline that expires during the copy fails it with a deadline error, removes the
+   partial file and its journal, leaves no census entry, and the writer keeps committing.
+8. A copy connection whose `synchronous` reads below NORMAL, or whose `query_only` is on,
+   is refused before the statement runs; NORMAL, FULL and EXTRA each copy.
+9. A second copy of the same database started while the first runs is refused, and the
+   first completes.
+10. An in-memory database refuses the operation.
+11. A symbolic link substituted at `<dest>` after the exclusive create and before the
+    statement fails the copy; the link's target is unchanged and the link is not removed.
+12. A regular file substituted at `<dest>` in the same window fails the copy on the
+    identity check, and the substituted file is not removed.
+13. A regular file swapped in before the statement and swapped back before the second
+    identity check fails the copy because the held handle is still empty.
