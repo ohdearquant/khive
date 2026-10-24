@@ -983,6 +983,7 @@ struct ErrorConstructorCensus {
     source: String,
     modules: Vec<String>,
     impl_type: Option<String>,
+    failure_parts_impl: bool,
     function: String,
     function_depth: usize,
     offenders: Vec<String>,
@@ -1011,7 +1012,11 @@ impl ErrorConstructorCensus {
             && self.function_depth == 1
     }
     fn central_entry_builder(&self) -> bool {
-        self.root_function("khive-mcp/src/server/batch_types.rs", "failure_entry")
+        (self.source == "khive-runtime/src/error_projection.rs"
+            && self.modules.is_empty()
+            && self.failure_parts_impl
+            && self.function == "into_entry"
+            && self.function_depth == 1)
             || self.root_function("khive-mcp/src/server/batch_types.rs", "aborted_entry")
     }
     fn inspect_json(&mut self, parsed: &JsonSyntax) {
@@ -1401,7 +1406,13 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
                 _ => Some("<non-path-impl>".into()),
             };
             let previous = std::mem::replace(&mut self.impl_type, current);
+            let failure_parts_impl = item.trait_.is_none()
+                && matches!(item.self_ty.as_ref(), syn::Type::Path(ty)
+                    if ty.qself.is_none() && ty.path.is_ident("FailureEntryParts"));
+            let previous_failure_parts_impl =
+                std::mem::replace(&mut self.failure_parts_impl, failure_parts_impl);
             syn::visit::visit_item_impl(self, item);
+            self.failure_parts_impl = previous_failure_parts_impl;
             self.impl_type = previous;
         }
     }
@@ -1748,6 +1759,7 @@ fn a3_constructor_census_rejects_new_raw_sites_and_unclassified_variants() {
             "khive-mcp/src/server/rendering.rs",
             "khive-mcp/src/server/bridge.rs",
             "khive-mcp/src/server/batch_execution.rs",
+            "khive-runtime/src/error_projection.rs",
         ] {
             let mut census = ErrorConstructorCensus {
                 source: source.into(),
@@ -2198,5 +2210,78 @@ fn expiry_arm10_named_time_refusals_carry_rollback_proof() {
             }
         );
         assert_eq!(value["details"]["reason"], reason);
+    }
+}
+
+#[test]
+fn a3_constructor_census_limits_failure_parts_entry_privilege_to_exact_owner() {
+    use syn::visit::Visit;
+    let entry = r#"json!({"ok":false,"tool":"x","error":"classified"})"#;
+    let canonical = format!("impl FailureEntryParts {{ fn into_entry(self) {{ {entry}; }} }}");
+    for (source, body, allowed) in [
+        (
+            "khive-runtime/src/error_projection.rs",
+            canonical.clone(),
+            true,
+        ),
+        (
+            "khive-mcp/src/server/batch_types.rs",
+            canonical.clone(),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!("mod shadow {{ {canonical} }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!("impl OtherParts {{ fn into_entry(self) {{ {entry}; }} }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!("fn into_entry() {{ {entry}; }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!(
+                "impl FailureEntryParts {{ fn into_entry(self) {{ fn nested() {{ {entry}; }} }} }}"
+            ),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!("impl other::FailureEntryParts {{ fn into_entry(self) {{ {entry}; }} }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/error_projection.rs",
+            format!("impl Builder for FailureEntryParts {{ fn into_entry(self) {{ {entry}; }} }}"),
+            false,
+        ),
+        (
+            "khive-mcp/src/server/batch_types.rs",
+            format!("fn failure_entry() {{ {entry}; }}"),
+            false,
+        ),
+        (
+            "khive-mcp/src/server/batch_types.rs",
+            format!("impl DispatchFailure {{ fn into_entry(self) {{ {entry}; }} }}"),
+            false,
+        ),
+    ] {
+        let mut census = ErrorConstructorCensus {
+            source: source.into(),
+            ..Default::default()
+        };
+        census.visit_file(&syn::parse_file(&body).expect("valid exact-owner fixture"));
+        assert!(census.constructors_seen > 0);
+        assert_eq!(
+            census.offenders.is_empty(),
+            allowed,
+            "failure entry owner: {source}: {body}"
+        );
     }
 }

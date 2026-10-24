@@ -1,7 +1,7 @@
-//! Canonical structured projection of typed runtime failures.
+//! Canonical typed runtime projection and per-operation failure construction.
 //!
-//! Transport nesting limits and removal of a nested operation's domain result
-//! belong to the transport boundary, not to this lossless shared projection.
+//! The typed projection remains lossless. The shared entry builder applies the
+//! response boundary's nesting and domain-result retention rules afterwards.
 
 use khive_storage::{StorageCapability, StorageError};
 use serde_json::{json, Value};
@@ -21,6 +21,114 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         error.batch_write_disposition().unwrap_or(disposition)
     };
     runtime_error_value_inner(error, disposition)
+}
+
+/// Original input to the shared per-operation failure builder.
+pub enum FailureEntrySource {
+    /// A typed runtime failure and the original dispatch boundary's outcome.
+    Runtime {
+        error: RuntimeError,
+        boundary: DomainDisposition,
+    },
+    /// An error payload whose disposition is supplied by its caller.
+    Value {
+        error: Value,
+        disposition: DomainDisposition,
+    },
+}
+
+/// An owned normalized failure, consumable as an error or a per-operation entry.
+pub struct FailureEntryParts {
+    error: Value,
+    disposition: DomainDisposition,
+}
+
+impl FailureEntryParts {
+    /// Return the normalized error without constructing an outer entry.
+    pub fn into_error(self) -> Value {
+        self.error
+    }
+
+    /// Move the normalized error into its per-operation response entry.
+    pub fn into_entry(self, tool: impl Into<String>) -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("ok".into(), Value::Bool(false));
+        entry.insert("tool".into(), Value::String(tool.into()));
+        entry.insert(
+            "domain_disposition".into(),
+            json!(self.disposition.as_str()),
+        );
+        entry.insert("error".into(), self.error);
+        Value::Object(entry)
+    }
+}
+
+/// Read the outcome named by a canonical error payload, defaulting to uncertainty.
+///
+/// This reads an existing payload; it does not establish write provenance.
+pub fn failure_error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+/// Build the canonical failure parts shared by request executors.
+///
+/// Runtime input uses the public typed projection once. Both final disposition
+/// fields use its result. A domain result survives only when both the original
+/// boundary and projection are committed. The boundary's depth handling runs
+/// first, preserving its existing code and message replacement even when the
+/// projection subsequently removes the result. Value input always uses its
+/// caller's explicit disposition, ignoring any competing JSON claim.
+pub fn failure_entry_parts(source: FailureEntrySource) -> FailureEntryParts {
+    use crate::daemon::{drop_error_detail_iteratively, error_detail_value_within_limit};
+
+    let (error, boundary, disposition) = match source {
+        FailureEntrySource::Runtime { error, boundary } => {
+            let projected = runtime_error_value(error, boundary);
+            let disposition = failure_error_disposition(&projected);
+            (projected, boundary, disposition)
+        }
+        FailureEntrySource::Value { error, disposition } => (error, disposition, disposition),
+    };
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_error_detail_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    let committed = |value: DomainDisposition| value == DomainDisposition::Committed;
+    if let Some(result) = error.remove("domain_result") {
+        if !committed(boundary) {
+            drop_error_detail_iteratively(result);
+        } else if !error_detail_value_within_limit(&result) {
+            drop_error_detail_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else if !committed(disposition) {
+            drop_error_detail_iteratively(result);
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    FailureEntryParts {
+        error: Value::Object(error),
+        disposition,
+    }
 }
 
 // Choose operation-local proof once. Recursive projection must not promote an
