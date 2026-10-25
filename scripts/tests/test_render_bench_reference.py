@@ -483,5 +483,170 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn(message, stderr)
 
+
+class V2MirrorTests(unittest.TestCase):
+    """Synthetic renderer checks: no Git process or benchmark sampling."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.temporary = tempfile.TemporaryDirectory(prefix="bench-mirror-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+        self.fixture = Fixture(self.root)
+        self.date = mock.patch.object(renderer, "_commit_date", return_value="2026-01-02")
+        self.date.start()
+        self.addCleanup(self.date.stop)
+        self.no_process = mock.patch.object(
+            renderer.subprocess, "run", side_effect=AssertionError("unexpected subprocess")
+        )
+        self.no_process.start()
+        self.addCleanup(self.no_process.stop)
+
+    def payload(self):
+        return {
+            "schema": "bench-reference/v2",
+            "crate": self.fixture.crate,
+            "class": COMPARISON_CLASS,
+            "targets": {
+                "first": {"entries": [{
+                    "commit": "a" * 40,
+                    "benchmarks": {"shared": {"median_ns": criterion_row(1, 1)}},
+                }]},
+            },
+        }
+
+    def mirror(self, payload, target="first"):
+        import copy
+
+        metric = payload["targets"][target]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        row = copy.deepcopy(metric)
+        row.update(target=target, window={"sampler": "flat-only"}, clock_khz_median={"a": 1})
+        payload["benches"] = {"shared": row}
+        return row
+
+    def current_document(self, payload):
+        self.fixture.write_reference(payload)
+        self.fixture.write_document(f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n")
+        self.fixture.write_document(
+            renderer.render_document(self.fixture.reference, self.fixture.document, self.root)
+        )
+        self.assertEqual(quiet_main("--check", "--root", str(self.root))[0], 0)
+
+    def assert_refused_without_writes(self, payload, diagnostic):
+        self.fixture.write_reference(payload)
+        before_reference = self.fixture.reference.read_bytes()
+        before_document = self.fixture.document.read_bytes()
+        for mode in ("--check", "--write"):
+            with self.subTest(mode=mode):
+                code, stdout, stderr = quiet_main(mode, "--root", str(self.root))
+                self.assertEqual(code, 1)
+                self.assertIn(diagnostic, stderr)
+                self.assertNotIn("stale", stderr)
+                self.assertEqual(stdout, "")
+                self.assertEqual(self.fixture.reference.read_bytes(), before_reference)
+                self.assertEqual(self.fixture.document.read_bytes(), before_document)
+
+    def test_optional_partial_numeric_mirrors_and_v1_stay_valid(self):
+        payload = self.payload()
+        self.current_document(payload)  # A v2 record need not have a mirror.
+        payload["benches"] = {}
+        self.current_document(payload)
+        row = self.mirror(payload)
+        row["median_ns"] = 1.0
+        row["a"]["median_ns"] = 1.0
+        row["b"]["median_ns"] = 1.0
+        self.current_document(payload)  # Numeric values, not int/float spelling.
+        payload["targets"]["first"]["entries"][0]["benchmarks"]["other"] = {
+            "median_ns": criterion_row(2, 1)
+        }
+        self.current_document(payload)  # A mirror may cover only some metrics.
+        del payload["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]["metric"]
+        self.mirror(payload)
+        self.current_document(payload)  # A unique converted metric need not carry its name.
+        self.current_document(self.fixture.v1("a" * 40, {"v1": measured(1)}))
+
+    def test_mirror_only_timing_corruption_refuses_check_and_write(self):
+        import copy
+
+        original = self.payload()
+        metric = original["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        for arm in ("a", "b"):
+            metric[arm].update(ci_lo_ns=0, ci_hi_ns=2)
+        self.mirror(original)
+        self.current_document(original)
+        for path in (
+            ("median_ns",), ("aa_spread",), ("a", "median_ns"),
+            ("b", "median_ns"), ("a", "ci_lo_ns"), ("b", "ci_hi_ns"),
+        ):
+            with self.subTest(path=path):
+                payload = copy.deepcopy(original)
+                cursor = payload["benches"]["shared"]
+                for key in path[:-1]:
+                    cursor = cursor[key]
+                cursor[path[-1]] = 7
+                self.assert_refused_without_writes(payload, "differs from target")
+        self.current_document(original)
+
+    def test_malformed_or_incomplete_mirrors_refuse(self):
+        import copy
+
+        original = self.payload()
+        self.mirror(original)
+        self.current_document(original)
+        for bad in (None, [], {"shared": None}, {"unknown": original["benches"]["shared"]}):
+            with self.subTest(bad=bad):
+                payload = copy.deepcopy(original)
+                payload["benches"] = bad
+                self.assert_refused_without_writes(payload, "benches")
+        for field, value in (
+            ("target", "missing"), ("metric", "missing"), ("target", 1),
+            ("a", []), ("a", {"median_ns": True}), ("b", {"median_ns": "1"}),
+            ("median_ns", True), ("aa_spread", float("inf")), ("extra", 1),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = copy.deepcopy(original)
+                payload["benches"]["shared"][field] = value
+                self.assert_refused_without_writes(payload, "benches")
+        for missing in ("a", "metric"):
+            payload = copy.deepcopy(original)
+            del payload["benches"]["shared"][missing]
+            self.assert_refused_without_writes(payload, "differs from target")
+
+    def test_target_and_historical_identity_is_never_guessed(self):
+        import copy
+
+        payload = self.payload()
+        second = copy.deepcopy(payload["targets"]["first"])
+        second["entries"][0]["benchmarks"]["shared"]["median_ns"] = criterion_row(2, 1)
+        payload["targets"]["second"] = second
+        self.current_document(payload)
+        self.mirror(payload, "second")
+        self.current_document(payload)  # Same name in two targets, explicit target.
+        row = payload["benches"]["shared"]
+        row["target"] = "first"
+        self.assert_refused_without_writes(payload, "differs from target")
+        row.pop("target")
+        self.assert_refused_without_writes(payload, "found 2")
+        payload.pop("benches")
+        first = payload["targets"]["first"]
+        first["entries"].append(copy.deepcopy(first["entries"][0]))
+        first["entries"][1]["commit"] = "b" * 40
+        payload["targets"] = [{"name": name, **target} for name, target in payload["targets"].items()]
+        self.current_document(payload)  # List targets and repeated history without flat.
+        row = copy.deepcopy(first["entries"][0]["benchmarks"]["shared"]["median_ns"])
+        row["target"] = "first"
+        payload["benches"] = {"shared": row}
+        self.assert_refused_without_writes(payload, "found 2")
+
+    def test_nested_large_integer_is_not_rounded_for_comparison(self):
+        payload = self.payload()
+        metric = payload["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        metric["a"]["median_ns"] = 2**53 + 1
+        self.mirror(payload)
+        self.current_document(payload)
+        payload["benches"]["shared"]["a"]["median_ns"] = float(2**53)
+        self.assert_refused_without_writes(payload, "differs from target")
+
 if __name__ == "__main__":
     unittest.main()
