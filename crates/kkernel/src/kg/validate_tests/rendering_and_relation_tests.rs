@@ -507,3 +507,58 @@ fn fix_sort_order_keeps_canonical_serialization_when_reordered() {
         "{\"id\":\"a\"}\n{\"id\":\"b\"}\n"
     );
 }
+
+#[test]
+fn validate_fix_renders_configurable_sort_order_row_after_single_repair_detail() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    std::fs::write(
+        kg_dir.join("entities.ndjson"),
+        concat!(
+            "{\"id\":\"b\",\"kind\":\"concept\",\"name\":\"B\",\"description\":\"present\"}\n",
+            "{\"id\":\"a\",\"kind\":\"concept\",\"name\":\"A\",\"description\":\"present\"}\n",
+        ),
+    )
+    .unwrap();
+    write_edges(&kg_dir, &[]);
+    std::fs::write(
+        kg_dir.join("rules.toml"),
+        r#"
+[[rules]]
+id = "sort-order"
+severity = "warning"
+kind = "entity"
+condition = "kind=concept"
+require_field = "description"
+message = "Concept {id} missing description"
+"#,
+    )
+    .unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.no_rules = false;
+
+    let run = run_validation(&args).unwrap();
+
+    assert!(run.report.summary.passed);
+    let sort_rows: Vec<_> = run
+        .report
+        .rules
+        .iter()
+        .filter(|rule| rule.id == "sort-order")
+        .collect();
+    assert_eq!(
+        sort_rows.len(),
+        2,
+        "the configured ID is accepted alongside the built-in rule"
+    );
+    assert!(sort_rows.iter().all(|rule| rule.passed));
+    let (text, stderr) = render_fix_report(&run, &args);
+    assert_eq!(text.matches("~ sort-order: re-sorted ").count(), 1);
+    assert!(text.contains("entities.ndjson (2 lines moved)"));
+    assert_eq!(
+        text.matches("  \u{2713} sort-order\n").count(),
+        1,
+        "retain the passed configured rule row"
+    );
+    assert!(stderr.is_empty());
+}

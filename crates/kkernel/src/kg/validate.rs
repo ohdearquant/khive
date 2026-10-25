@@ -1119,8 +1119,10 @@ fn write_text_format(
 ) -> std::io::Result<()> {
     let report = &run.report;
     if !quiet {
+        let mut structural_sort_seen = false;
         for r in &report.rules {
-            if r.id == "sort-order" {
+            if r.id == "sort-order" && !structural_sort_seen {
+                structural_sort_seen = true;
                 if let Some(fixes) = &run.fixes {
                     if !fixes.files.is_empty() {
                         write_fix_details(output, fixes)?;
