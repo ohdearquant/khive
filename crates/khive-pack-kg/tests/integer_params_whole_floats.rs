@@ -1,6 +1,7 @@
 //! Integer parameters accept whole-number floats (`5.0`), as some MCP clients encode every JSON
 //! number with a decimal point, and still refuse fractional ones (`5.5`).
 
+use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
     KhiveRuntime, Namespace, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
@@ -102,6 +103,25 @@ async fn list_takes_a_whole_float_limit_as_the_integer() {
         .await
         .expect("whole-float limit");
     assert_eq!(items(&listed), 2, "{listed}");
+}
+
+#[tokio::test]
+async fn the_validated_search_request_takes_a_whole_float_limit() {
+    let registry = fixture();
+    let request = ValidatedSearchRequest::from_value(
+        json!({"kind": "entity", "query": "lighthouse keeper", "limit": 2.0}),
+        &registry,
+    )
+    .expect("whole-float limit");
+    assert_eq!(request.limit(), 2);
+    refused_as_bad_params(
+        ValidatedSearchRequest::from_value(
+            json!({"kind": "entity", "query": "lighthouse keeper", "limit": 2.5}),
+            &registry,
+        )
+        .map(|_| Value::Null),
+        "validated search request",
+    );
 }
 
 #[tokio::test]

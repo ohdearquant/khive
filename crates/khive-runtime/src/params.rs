@@ -16,7 +16,7 @@ const EXACT_FLOAT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
 /// whole-number float (`5.0`) to that integer, so a client that writes every JSON number with a
 /// decimal point decodes the same as one that does not. A fractional, non-finite or inexact float
 /// stays as sent and the decoder still refuses it; nested values and other types are untouched.
-pub(crate) fn integer_params_from_whole_floats(params: &mut Value, defs: &[ParamDef]) {
+pub fn integer_params_from_whole_floats(params: &mut Value, defs: &[ParamDef]) {
     let Value::Object(map) = params else {
         return;
     };
