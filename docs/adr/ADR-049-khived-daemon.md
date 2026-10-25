@@ -2305,7 +2305,11 @@ separate policy and is outside this procedure.
    path order. Leases have operating-system lifetime semantics, so a process that dies releases them, and they are not
    inherited across exec or by child processes. The coordinator owns exclusive maintenance admission for the entire
    store set through snapshot, migration and readiness; only its capability for this epoch and store set passes the
-   closed fence, and there is no general override. A marker check without synchronized admission is insufficient.
+   closed fence, and there is no general override. The coordinator starts the target daemon as its delegate and hands
+   it that capability at launch; the fence checks it against the declaration's epoch, store set and recorded target
+   identity. Under the coordinator's exclusive hold the fence admits the delegate's boot, migration and readiness
+   checks, and the events daemon the delegate supervises, and no other process. The capability ends at release. A
+   marker check without synchronized admission is insufficient.
    Successful migration invalidates activity admission from old runtime generations, background work included, until
    the process has refreshed; a proved pre-mutation abort may keep the predecessor generation.
 3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
@@ -2319,9 +2323,11 @@ separate policy and is outside this procedure.
    covers the exact migration range, pack plans, boot repairs and associated files. Changing journal mode or page
    size, replacing or unlinking a live database, `-wal` or `-shm`, and offline restore are excluded. The snapshot is a
    transaction-quiescent, complete store-set copy plus a restore proof with the previous binary; an online backup of
-   one database is not a substitute for that proof. From quiescence through the end of the copy the coordinator
-   holds an open connection on every store in the set, so that no client exiting in that interval can run a
-   close-time checkpoint, and the copy proves each database and `-wal` unchanged across it. The copy is then frozen
+   one database is not a substitute for that proof. The coordinator opens a connection on every store in the set
+   before it certifies quiescence, and so before the old daemons stop. These are plain connections that run no
+   schema preparation. It holds them through the end of the copy, so that no process exiting in that interval, the
+   stopped daemons included, can run a close-time checkpoint. The copy proves each database and `-wal` unchanged
+   across it. The copy is then frozen
    read-only, as read-only inspection requires (it refuses a writable `-shm`; `read_only_wal_open_target_for_path` in
    `crates/khive-db/src/pool/connection_setup.rs`), and the restore proof runs on a writable copy of it. An idle
    connection holds no WAL read mark, so it does not block the target daemon's open-time checkpoint under a
@@ -2353,16 +2359,19 @@ separate policy and is outside this procedure.
 
 1. Publish the declaration for the store set.
 2. Drill a cold client: it waits and spawns nothing.
-3. Drain activity leases until quiescence is certified.
-4. Stop the old daemon and events daemon by PID. Bridges stay running.
+3. Open the coordinator's connection on every store in the set, then drain activity leases until quiescence is
+   certified.
+4. Stop the old daemon and events daemon by PID. Bridges stay running, and the coordinator's open connections keep
+   either exit from running a close-time checkpoint.
 5. Refuse to continue while any process outside the participants holds a store file.
-6. Open the coordinator's connections, copy every database, `-wal` and `-shm` and every vector index directory of the
-   set, prove the database and `-wal` files unchanged across the copy, and freeze the copy read-only.
+6. Copy every database, `-wal` and `-shm` and every vector index directory of the set, prove the database and `-wal`
+   files unchanged across the copy, and freeze the copy read-only.
 7. Prove that a writable copy of the snapshot restores with the previous binary.
 8. Install the new executable atomically.
-9. Start the target daemon, which migrates the configured backends in place and starts the events daemon, which
-   prepares the events schema before it accepts traffic, and verify readiness.
-10. Release, leaving the completed-epoch receipt.
+9. Start the target daemon as the coordinator's delegate, holding the epoch capability. It migrates the configured
+   backends in place and starts the events daemon, which prepares the events schema before it accepts traffic. Verify
+   readiness.
+10. Release, leaving the completed-epoch receipt, and close the coordinator's connections.
 
 ### Acceptance
 
@@ -2383,8 +2392,10 @@ fails on the code at the inspected revision unless stated otherwise.
   over the same physical stores; local `exec`; direct events and admin paths. Every store-dependent entry waits or
   refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
 - **Declaration record.** A record that cannot be parsed, one that is not owner-only, and one written by a process
-  other than the epoch's coordinator each keep every entry closed and release no bridge. A `ready` receipt whose target identity does not match the installed path leaves the bridge inhibited, with
-  no exec.
+  other than the epoch's coordinator each keep every entry closed and release no bridge. A `ready` receipt whose
+  target identity does not match the installed path leaves the bridge inhibited, with no exec. During migration the
+  delegate target daemon and its events daemon are admitted. A process of the same image started without the epoch
+  capability is refused.
 - **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
   still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
   snapshot and no migration, while idle descriptors stay open.
@@ -2392,7 +2403,8 @@ fails on the code at the inspected revision unless stated otherwise.
   expected counts, and the source migrates without closing those descriptors. A fixture migration that changes the
   journal mode, and one that replaces a store file, is refused before the source is touched. A fixture client that
   exits during the copy holding what would otherwise be the last connection leaves the copied database and `-wal`
-  consistent. The frozen copy passes read-only inspection. With a WAL ceiling configured and the WAL over it, the
+  consistent. A fixture daemon that is the only other holder, stopped after quiescence, leaves the database and
+  `-wal` unchanged. The frozen copy passes read-only inspection. With a WAL ceiling configured and the WAL over it, the
   target daemon's open-time checkpoint succeeds while idle bridge descriptors are held.
 - **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
   budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
