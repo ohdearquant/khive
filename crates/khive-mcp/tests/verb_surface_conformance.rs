@@ -45,7 +45,6 @@ const CLASSIFICATIONS: &[Classification] = &[
     Classification { verb: "gtd.tasks", param: "duplicate_of", role: Role::DistinctRole("Filters a collection of duplicate judgements by its kept-task reference.") },
     Classification { verb: "gtd.tasks", param: "context_entity_id", role: Role::DistinctRole("Filters task collection membership by its stored KG context reference, including after the context is deleted.") },
     Classification { verb: "gtd.transition", param: "duplicate_of", role: Role::DistinctRole("References the kept task recorded when cancelling the separately identified transitioning task.") },
-    Classification { verb: "brain.feedback", param: "target_id", role: Role::PrimaryAlias },
     Classification { verb: "brain.emit", param: "target_id", role: Role::PrimaryAlias },
     Classification { verb: "comm.suppression_remove", param: "evidence_inbound_message_id", role: Role::DistinctRole("Supplies the inbound evidence note for removing the separately identified suppression entry.") },
     Classification { verb: "comm.send", param: "thread_id", role: Role::DistinctRole("Groups a newly created message under an existing thread root; it does not identify the new message.") },
@@ -94,18 +93,11 @@ const APPROVED_CEILING: &[LegacyPair] = &[
 ];
 
 // Shrink only. Each still-invalid pair cites the owner's actual tracking issue.
-const ACTIVE_BASELINE: &[LegacyPair] = &[
-    LegacyPair {
-        verb: "brain.feedback",
-        param: "target_id",
-        issue: 5996,
-    },
-    LegacyPair {
-        verb: "brain.emit",
-        param: "target_id",
-        issue: 5996,
-    },
-];
+const ACTIVE_BASELINE: &[LegacyPair] = &[LegacyPair {
+    verb: "brain.emit",
+    param: "target_id",
+    issue: 5996,
+}];
 
 #[derive(Clone, Copy)]
 struct ParamView {

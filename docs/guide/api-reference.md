@@ -1895,9 +1895,13 @@ request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
 
 Emit a `FeedbackExplicit` event into the shared log.
 
+Use `id` for the target record. The legacy `target_id` spelling remains
+accepted; supplying both is rejected. Successful responses retain the
+`target_id` field.
+
 | Param                  | Type   | Required | Notes                                                                                                                                              |
 | ---------------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
+| `id`                   | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
 | `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                                                              |
 | `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                                                              |
 | `serve_attribution`    | string | no       | `profile`\|`unattributed`\|`unspecified`; unattributed implicit feedback is forced to zero weight, while explicit/correction feedback is rejected. |
@@ -1906,7 +1910,7 @@ Emit a `FeedbackExplicit` event into the shared log.
 | `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                                                               |
 
 ```
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<uuid>\", signal=\"useful\")")
 ```
 
 ### `brain.auto_feedback` — Commissive
