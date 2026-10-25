@@ -223,15 +223,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive_runtime::DocumentEmbeddingOutcome` adds `provider_token_count`; direct
   struct literals must set it. `EmbeddingTruncationReport` adds `discarded_tokens`
   and `token_reporting_unavailable`; literals must set them or use `Default`.
-- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
-  `writer_admission_unavailable_reason`. Direct struct literals must set them.
+- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission`,
+  `writer_admission_unavailable_reason`, `audit_success_rows_omitted`,
+  `audit_success_rows_sampled_out` and `audit_success_rows_forced`.
+  `khive_db::diagnostics::RuntimeAuditBatchMetrics` adds the same three
+  `audit_success_rows_*` fields. Direct struct literals must set them.
 - `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
 - `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
   `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
   takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
   `WriterGuard::transaction`, which admit the write before it runs and settle the
   connection before the guard is released.
-- The public standalone writer opener is removed. Use the consuming
+- `khive_db::ConnectionPool::open_standalone_writer` is removed. Use the consuming
   `standalone_autocommit` or `standalone_transaction` operations, or the restricted
   `open_standalone_checkpoint` handle.
 - `khive_changeset::Op` adds `Restore`, and `khive_changeset::InvertError` adds
@@ -241,9 +244,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reindex batch size. Direct struct literals must set it or use `Default`.
 - `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation`. Exhaustive
   matches must handle it.
+- `khive_runtime::ConfigError` adds `BlobS3FeatureDisabled`, returned when S3 blob
+  storage is configured in a build without `blob-s3`. Exhaustive matches must handle it.
 - `kkernel::kg::ImportArgs` adds `on_conflict`, `force`, `dry_run` and
   `continue_on_error`. Direct struct literals must set them.
 - `khive_types::EventKind` adds `GrantChange`; downstream exhaustive matches must handle it.
+- `kkernel` and `khive-mcp` no longer enable `pack-agent`, `pack-telemetry` or `pack-web`
+  by default, nor the optional pack dependencies behind them. Crates that depend on
+  `kkernel` or `khive-mcp` and use those packs must enable the features.
 
 ### Upgrade note
 
