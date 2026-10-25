@@ -2284,12 +2284,17 @@ separate policy and is outside this procedure.
    elapsed-grace behavior. Expiry, owner death, `KHIVE_NO_DAEMON`, non-strict configuration and absence of a
    rendezvous never authorize local store access or daemon spawning while an epoch is closed. The store set is
    derived from the resolved configuration: the main database, each configured backend database and the derived
-   events database, each by canonical path. The declaration is one record per store set, kept beside the main
-   database, created owner-only and replaced atomically. It carries an opaque epoch; its phase (`closing`,
-   `quiescent`, `migrating`, `ready`, or a failed state that stays closed); the store set; the target installation's
-   identity and configuration; owner evidence; and bounded phase deadlines. A participant treats a record it cannot
-   parse, or one that is not owner-only, as a closed epoch, never as an absent one. The trust boundary is the user
-   that owns the stores: a process running as that user can already open the stores directly.
+   events database, each by canonical path. The declaration is one record per store set, kept in the directory of
+   the main database, owned by the user that owns the stores, created owner-only and replaced atomically. It carries
+   an opaque epoch; its phase (`closing`, `quiescent`, `migrating`, `ready`, or a failed state that stays closed);
+   the store set; the target installation's identity and configuration; owner evidence; and bounded phase deadlines.
+   The release receipt is the same record in its `ready` phase, at the same location. The coordinator is the single
+   writer: it publishes the record, advances its phases and writes the receipt, and the owner evidence names it. A
+   declaration or receipt from any other writer, or one a participant cannot attribute to its epoch's coordinator, is
+   refused: it neither opens admission nor releases a bridge, and the participant stays closed and reports it. A
+   participant likewise treats a record it cannot parse, or one that is not owner-only, as a closed epoch, never as
+   an absent one. The trust boundary is the user that owns the stores: a process running as that user can already
+   open the stores directly.
 2. Publication closes admission to new boot and local store work. Work admitted beforehand must settle under tracked
    activity leases before the coordinator certifies quiescence. Leases cover actual asynchronous completion and
    non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's session sweep, which
@@ -2377,8 +2382,8 @@ fails on the code at the inspected revision unless stated otherwise.
 - **Every entry point.** Two backends plus a derived events store; a second bridge with a different socket and `HOME`
   over the same physical stores; local `exec`; direct events and admin paths. Every store-dependent entry waits or
   refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
-- **Declaration record.** A record that cannot be parsed, and one that is not owner-only, each keep every entry
-  closed. A `ready` receipt whose target identity does not match the installed path leaves the bridge inhibited, with
+- **Declaration record.** A record that cannot be parsed, one that is not owner-only, and one written by a process
+  other than the epoch's coordinator each keep every entry closed and release no bridge. A `ready` receipt whose target identity does not match the installed path leaves the bridge inhibited, with
   no exec.
 - **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
   still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
