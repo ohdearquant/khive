@@ -163,22 +163,21 @@ async fn default_public_recall_promotes_type_two_without_a_semantic_or_recency_w
         "fixture seeding must not create semantic vectors"
     );
     let legacy_ids: Vec<String> = {
-        let pool = runtime.backend().pool().clone();
-        let writer = pool.writer().unwrap();
-        let mut stmt = writer
-            .conn()
-            .prepare(
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let rows = reader
+            .query_all(khive_storage::SqlStatement::new(
                 "SELECT subject_id FROM fts_notes WHERE fts_notes MATCH ?1 \
              AND rank MATCH 'bm25(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)' \
              AND namespace = 'local' AND record_kind = 'memory' ORDER BY rank LIMIT 150",
-            )
+                vec![khive_storage::SqlValue::Text(
+                    "type 2 diabetes with chronic kidney disease".into(),
+                )],
+            ))
+            .await
             .unwrap();
-        let rows = stmt
-            .query_map(["type 2 diabetes with chronic kidney disease"], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        rows.collect::<Result<_, _>>().unwrap()
+        rows.iter()
+            .map(|row| row.text("subject_id").unwrap().to_owned())
+            .collect()
     };
     assert_eq!(
         legacy_ids,
