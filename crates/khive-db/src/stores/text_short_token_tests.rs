@@ -362,7 +362,10 @@ async fn common_shortword_dilution_preserves_the_equal_count_limit() {
             document(
                 2,
                 "",
-                "type 2 diabetes with chronic kidney disease",
+                &format!(
+                    "type 2 diabetes with chronic kidney disease{}",
+                    " padding".repeat(256)
+                ),
                 "local",
             ),
         ],
