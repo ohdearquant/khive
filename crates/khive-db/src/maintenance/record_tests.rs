@@ -302,6 +302,21 @@ fn wire_refuses_store_digest_path_and_owner_mismatches() {
     );
 }
 
+#[test]
+fn wire_decode_refuses_foreign_expected_owner_uid() {
+    let record = sample_record(Path::new("/stores"), Phase::Ready);
+    let owner = record.coordinator().uid();
+    let encoded = record.encode_untrusted(owner).unwrap();
+    assert_eq!(
+        Declaration::parse_untrusted(&encoded, owner).unwrap(),
+        record
+    );
+    assert!(matches!(
+        Declaration::parse_untrusted(&encoded, owner.wrapping_add(1)),
+        Err(RecordRefusal::Invalid("invalid coordinator attribution"))
+    ));
+}
+
 const NEXT_EPOCH: &str = "c7b078c0-bb86-49fa-b1a9-28d7056cef77";
 const NAME: &str = "maintenance.json";
 
