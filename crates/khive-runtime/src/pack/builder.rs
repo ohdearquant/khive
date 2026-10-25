@@ -59,11 +59,10 @@ pub struct VerbRegistryBuilder {
     /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
-    /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
-    /// registry does not depend on the full `KhiveRuntime` surface — only the
-    /// audit-persistence capability is needed here.
+    /// `tracing::info!` emission. Persistence is separate from the optional
+    /// runtime binding retained for config-lock ownership.
     event_store: Option<Arc<dyn EventStore>>,
-    /// Defers the runtime sink's namespace-scoped read binding until build.
+    /// Retains runtime ownership and resolves its final namespace sink at build.
     runtime_event_store: Option<KhiveRuntime>,
     /// The configured audit backend is intentionally read-only, so dispatch
     /// omits the known-failing append and the transport surfaces an advisory.
@@ -608,7 +607,8 @@ impl VerbRegistryBuilder {
         // dispatch that produced it still reports success, and nothing here
         // distinguishes that from a healthy registry. Reject it now, with an
         // actionable message, instead of at the first audited dispatch.
-        let event_store = match self.runtime_event_store {
+        let config_lock_runtime = self.runtime_event_store;
+        let event_store = match &config_lock_runtime {
             Some(runtime) => Some(runtime.raw_events_for_namespace(&self.default_namespace)?),
             None => self.event_store,
         };
@@ -657,6 +657,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
             event_store,
+            config_lock_runtime,
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),

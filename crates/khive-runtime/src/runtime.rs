@@ -482,8 +482,6 @@ impl KhiveRuntime {
     }
 
     /// Take this runtime's pending observations for its bound audit registry.
-    // Transitional: Step 2 supplies the production caller and removes this allowance.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
         self.config_lock_ledger.drain_config_locked()
     }

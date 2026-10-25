@@ -61,8 +61,6 @@ impl ConfigLockLedger {
         }
     }
 
-    // Transitional: Step 2 connects the bound registry and removes this allowance.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
         if !self.pending.load(Ordering::Acquire) {
             return Vec::new();
@@ -77,7 +75,8 @@ impl ConfigLockLedger {
     }
 }
 
-// Transitional global lane: untouched producers and dispatch still use it.
+// Transitional global lane: unmigrated producers still enqueue here.
+// Serving dispatch now consumes only its retained runtime ledger.
 // Remove the flag, queue, free functions and legacy fixtures in complete Step 5.
 
 /// `true` once at least one pair has been enqueued and not yet drained.
@@ -103,10 +102,10 @@ pub fn record_config_locked(key: &'static str, value: impl Into<String>) {
     PENDING.store(true, Ordering::Release);
 }
 
-/// Drain every queued config-locked pair for emission as `ConfigLocked` events.
+/// Transitional drain for the old global-lane fixtures only.
 ///
-/// Crate-private: only the dispatch path that owns event-store persistence
-/// should drain this queue.
+/// Serving dispatch uses the runtime-owned drain. Remove this helper in Step 5.
+#[cfg(test)]
 pub(crate) fn drain_config_locked() -> Vec<(String, String)> {
     std::mem::take(
         &mut *LEDGER
