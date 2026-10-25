@@ -1930,7 +1930,12 @@ returns a particular Rust error variant. Within this amendment's scope, never-ma
 are part of the migration. Include caller-derived operation labels and diagnostic object keys when
 failures echo them outside the error message. Protocol keys and authoritative registered operation
 names remain trusted metadata. An unknown caller-supplied operation name is not trusted merely
-because it occupies a field named `tool`.
+because it occupies a field named `tool`. A consumer that correlates result rows with submitted
+operations by that label, such as `kkernel exec --ops-file` (`classify_ordered_chunk` in
+`crates/kkernel/src/exec/ops_file_apply.rs`), compares a failed or aborted row's label with the
+`Refusal`-masked form of the submitted label. A masked label then counts as that operation's
+failure, not as a row mismatch, and the consumer's own diagnostics and saved manifests render only
+the masked label.
 
 The scope includes pack and runtime validation, MCP request and envelope validation, `kkernel exec`
 validation, per-operation failure entries, and refusal rows inside otherwise successful results.
@@ -2002,7 +2007,14 @@ trimmed, escaped or truncated copy that no longer qualifies for masking. Such a 
 interpolate that cause's display text and rely on rescanning it. Use the parser's trusted diagnostic
 metadata and the masked original instead. `parse_event_kind` is a required instance: retain its
 parser, use the error's authoritative domain and valid variants, and replace both diagnostic value
-occurrences from the masked original without rendering the error's normalized `value`.
+occurrences from the masked original without rendering the error's normalized `value`. A call
+site's own normalized binding is the same case: `handle_review` in
+`crates/khive-pack-kg/src/handlers/proposal.rs` matches a trimmed, lowercased decision and formats
+that binding in its unknown-decision refusal, so it must format the masked original instead. When a
+diagnostic joins several caller-derived segments, such as the key path of a `$prev` substitution
+failure, each segment is a separate operand, masked before joining. The joined rendering is not the
+masking input, because low-entropy sibling segments can dilute a qualifying segment below the
+threshold.
 
 Opaque deserializer diagnostics use the same refusal surface only after establishing their operand
 and metadata handling. If a formatter can transform an operand or the added pass can erase trusted
@@ -2084,8 +2096,10 @@ and its longest alphanumeric run has 38 bytes and entropy 4.113206. None qualifi
 `/srv/BuildArtifacts/WestRegion42/QuarterlyReports/Q3-2026_v7` has entropy 4.667912 and is masked as
 one candidate. These examples assume no ordinary detector match. A short typo such as `inbxo`
 remains visible. Bare hex credentials, shorter or low-entropy values, and some encoded, split or
-diluted values remain explicit residuals. This is bounded diagnostic hygiene, not detection of every
-secret.
+diluted values remain explicit residuals. For example, the single caller value
+`aaaa/aaaa/aaaa/aaaa/aaaa/Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` is one 57-byte broad candidate with
+entropy about 4.044323, and its URL-safe and alphanumeric pieces are shorter than 24 bytes, so it
+stays visible. This is bounded diagnostic hygiene, not detection of every secret.
 
 ### Acceptance
 
@@ -2099,7 +2113,9 @@ secret.
    its shared boundary, covering every distinct output consumer. Include previously unmasked
    parameter decoders, direct echoes, MCP options and DSL errors, CLI preflight, value-based
    failures, and atom collision and deletion refusals. Check caller-derived operation labels outside
-   the error object too. Use a prefixed credential, a qualifying bare value and a benign input
+   the error object too. In `kkernel exec --ops-file`, a line naming an unknown high-entropy tool
+   counts as one failed operation, and the label appears in neither the output nor a saved manifest.
+   Use a prefixed credential, a qualifying bare value and a benign input
    wherever that branch accepts their shapes. Assert error kinds, parameter names, accepted-value
    lists, absence of every unsafe copy, and the literal canonical marker independently of the
    production masker's return value. Expected output must not call the masker under test.
@@ -2128,13 +2144,19 @@ secret.
 6. **Base64 and numeric boundaries.** Pin `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` as a single masked
    candidate, alone and inside compact JSON. Its 32 distinct bytes have entropy 5.0; its shorter
    URL-safe and alphanumeric pieces cannot satisfy the length floor. The broad class must include
-   `+`, `/` and the final `=`. A 23-distinct-byte input remains visible under the added pass; a
-   24-distinct-byte input qualifies. `ABCDEFGHIJKLMNOPQRSTUVWXABCDEFGH` has 32 bytes and entropy
-   exactly 4.5 and qualifies. Exercise whitespace, controls, non-ASCII delimiters, terminal periods,
-   ordinary early returns, all documented false positives and retained ordinary detector matches.
+   `+`, `/` and the final `=`. A 23-byte input of 23 distinct bytes, entropy log2(23) (about
+   4.523562), remains visible under the added pass because it is below the 24-byte floor; a 24-byte
+   input of 24 distinct bytes, entropy about 4.584963, qualifies.
+   `ABCDEFGHIJKLMNOPQRSTUVWXABCDEFGH` has 32 bytes and entropy exactly 4.5 and qualifies. Exercise
+   whitespace, controls, non-ASCII delimiters, terminal periods, ordinary early returns, all
+   documented false positives and retained ordinary detector matches.
 7. **Transformed diagnostics and refusal rows.** Use `AaBbCcDdEeFfGgHhJjKkLl12` in
    `parse_event_kind`: the original has entropy 4.584963, while its lowercase copy has entropy
-   3.668296. Neither copy may appear in any refusal field. Preserve authoritative valid variants and
+   3.668296. Neither copy may appear in any refusal field. Pass the same value as the `review`
+   decision; neither copy may appear in its unknown-decision refusal. In a `$prev` substitution
+   failure whose key path holds `aaaaaaaaaaaaaaaaaaaa` and then `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=`,
+   the first key stays visible and the second is masked; their dotted join, 53 bytes with entropy
+   about 4.097004, would not qualify as one candidate. Preserve authoritative valid variants and
    template punctuation. Cover trimming, escaping and truncation at affected diagnostic boundaries.
    In refused atom dry-run rows, verify the slug and message together, `identity_masked`, and any
    dynamic location. In non-refused rows and `scan` previews, pin ordinary behavior with off-trigger
