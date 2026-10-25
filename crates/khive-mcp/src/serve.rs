@@ -74,7 +74,10 @@ pub use server_build::{
 };
 
 #[cfg(unix)]
-pub use server_build::{daemon_store_paths, prepare_daemon_store_plan, DaemonStorePlan};
+pub use server_build::{
+    daemon_store_paths, maintenance_store_set, prepare_daemon_store_plan, DaemonStorePlan,
+    MaintenanceTopologyRefusal,
+};
 
 #[cfg(test)]
 pub(crate) use server_build::is_strict_actor_mode;

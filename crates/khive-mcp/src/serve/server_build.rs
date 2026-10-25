@@ -434,6 +434,93 @@ pub(super) fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Opti
         .map_err(|e| anyhow::anyhow!("backend {}: cannot resolve path: {e}", cfg.name))
 }
 
+/// A maintenance-only topology that cannot have one persistent main record.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceTopologyRefusal {
+    /// A memory main has persistent stores that must not be silently omitted.
+    MemoryMainWithPersistentStores {
+        /// Every canonical persistent member discovered in the topology.
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for MaintenanceTopologyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryMainWithPersistentStores { paths } => write!(
+                f,
+                "maintenance requires a persistent main database; memory main has persistent stores: {paths:?}"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for MaintenanceTopologyRefusal {}
+
+/// Resolve the complete physical store set without opening stores or creating paths.
+///
+/// Inputs must already be resolved, including the captured force-memory choice.
+/// Declared backends own storage instead of a HOME-derived discovery anchor.
+/// This prepares metadata only: it publishes no declaration and grants no lease.
+#[cfg(unix)]
+pub fn maintenance_store_set(
+    resolved: &RuntimeConfig,
+    config: &KhiveConfig,
+    force_memory: bool,
+) -> anyhow::Result<Option<khive_db::maintenance::StoreSet>> {
+    use super::storage_topology::{
+        effective_backend_configs, reanchor_declared_events_split, select_declared_main_db_path,
+    };
+    use std::os::unix::ffi::OsStrExt;
+
+    if force_memory {
+        return Ok(None);
+    }
+    let backends = effective_backend_configs(&config.backends, force_memory);
+    let mut normalized = resolved.clone();
+    let mut paths = Vec::new();
+    if backends.is_empty() {
+        if let Some(path) = &normalized.db_path {
+            paths.push(canonical_path_no_side_effects(path)?);
+        }
+    } else {
+        anyhow::ensure!(
+            backends
+                .iter()
+                .any(|backend| backend.name == BackendId::MAIN),
+            "maintenance topology requires a declared main backend"
+        );
+        select_declared_main_db_path(&mut normalized, &backends);
+        for backend in &backends {
+            if backend.kind == BackendKind::Sqlite {
+                let path = backend.path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("sqlite backend {} requires a path field", backend.name)
+                })?;
+                paths.push(canonical_path_no_side_effects(path)?);
+            }
+        }
+        reanchor_declared_events_split(&mut normalized, &backends);
+    }
+    if let Some(split) = &normalized.events_split {
+        paths.push(canonical_path_no_side_effects(&split.db_path)?);
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(main) = &normalized.db_path else {
+        paths.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+        paths.dedup();
+        return Err(MaintenanceTopologyRefusal::MemoryMainWithPersistentStores { paths }.into());
+    };
+    let main = canonical_path_no_side_effects(main)?;
+    Ok(Some(khive_db::maintenance::StoreSet::from_canonical(
+        main, paths,
+    )?))
+}
+
 /// Resolve the daemon's physical SQLite targets before runtime construction.
 /// The declared topology, when present, owns the actual files; the runtime's
 /// default `db_path` is then only a config-discovery anchor. A `:memory:`
