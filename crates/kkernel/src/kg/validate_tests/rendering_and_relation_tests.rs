@@ -474,9 +474,7 @@ fn validate_fix_propagates_malformed_peer_without_successful_report() {
     std::fs::write(kg_dir.join("edges.ndjson"), edges).unwrap();
     let args = fix_report_args(&tmp);
 
-    let error = run_validation(&args)
-        .err()
-        .expect("a malformed fix input must propagate refusal");
+    let error = run_validation(&args).expect_err("a malformed fix input must propagate refusal");
 
     assert!(error.to_string().contains("edges.ndjson line 2"));
     assert!(error
