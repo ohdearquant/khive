@@ -1616,7 +1616,7 @@ Each result carries `serve_attribution` (`profile`, `unattributed`, or
 means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
 Each result also carries canonical `full_id`; pass it directly to
-`memory.feedback(target_id=...)` in a later request without an extra `get`.
+`memory.feedback(id=...)` in a later request without an extra `get`.
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
@@ -1641,13 +1641,17 @@ request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3
 
 Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
 
-| Param       | Type   | Required | Notes                                                                                                                                                                           |
-| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | uuid   | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
+| Param    | Type   | Required | Notes                                                                                                                                                                           |
+| -------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`     | uuid   | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
+| `signal` | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
+
+`target_id` remains an accepted input alias for `id`. Supplying both spellings in
+one request is rejected before feedback is applied. The acknowledgement keeps its
+canonical `target_id` response field.
 
 ```
-request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="memory.feedback(id=\"<uuid>\", signal=\"useful\")")
 ```
 
 ### `memory.prune` — Commissive
