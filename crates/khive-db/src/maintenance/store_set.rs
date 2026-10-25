@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 ///
 /// Construction validates spelling only. The caller must first resolve physical
 /// aliases: this type performs no filesystem I/O or inode-based deduplication.
+///
+/// The digest deliberately includes the main path twice: once in the main role
+/// and once in the canonical member set, binding both role and membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreSet {
     main: PathBuf,
