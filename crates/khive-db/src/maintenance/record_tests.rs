@@ -317,6 +317,45 @@ fn wire_decode_refuses_foreign_expected_owner_uid() {
     ));
 }
 
+#[test]
+fn wire_decode_refuses_unsorted_store_members() {
+    let record = sample_record(Path::new("/stores"), Phase::Ready);
+    let owner = record.coordinator().uid();
+    let encoded = record.encode_untrusted(owner).unwrap();
+    assert_eq!(
+        Declaration::parse_untrusted(&encoded, owner).unwrap(),
+        record
+    );
+    let mut wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let paths = wire["stores"]["paths"].as_array_mut().unwrap();
+    assert_eq!(paths.len(), 2);
+    paths.swap(0, 1);
+    assert!(matches!(
+        Declaration::parse_untrusted(&serde_json::to_vec(&wire).unwrap(), owner),
+        Err(RecordRefusal::Invalid("noncanonical store paths"))
+    ));
+}
+
+#[test]
+fn wire_decode_refuses_duplicate_store_members() {
+    let record = sample_record(Path::new("/stores"), Phase::Ready);
+    let owner = record.coordinator().uid();
+    let encoded = record.encode_untrusted(owner).unwrap();
+    assert_eq!(
+        Declaration::parse_untrusted(&encoded, owner).unwrap(),
+        record
+    );
+    let mut wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let paths = wire["stores"]["paths"].as_array_mut().unwrap();
+    assert_eq!(paths.len(), 2);
+    let duplicate = paths.last().unwrap().clone();
+    paths.push(duplicate);
+    assert!(matches!(
+        Declaration::parse_untrusted(&serde_json::to_vec(&wire).unwrap(), owner),
+        Err(RecordRefusal::Invalid("noncanonical store paths"))
+    ));
+}
+
 const NEXT_EPOCH: &str = "c7b078c0-bb86-49fa-b1a9-28d7056cef77";
 const NAME: &str = "maintenance.json";
 

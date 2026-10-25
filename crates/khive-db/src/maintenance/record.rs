@@ -375,10 +375,11 @@ pub(super) fn decode(bytes: &[u8], owner: u32) -> Result<Declaration, RecordRefu
     if w.version != 1 {
         return Err(invalid("unsupported record version"));
     }
-    let stores = StoreSet::from_canonical(
-        path(w.stores.main),
-        w.stores.paths.into_iter().map(path).collect(),
-    )?;
+    let paths: Vec<_> = w.stores.paths.into_iter().map(path).collect();
+    let stores = StoreSet::from_canonical(path(w.stores.main), paths.clone())?;
+    if stores.paths() != paths.as_slice() {
+        return Err(invalid("noncanonical store paths"));
+    }
     if stores.digest() != &w.stores.digest {
         return Err(invalid("store digest mismatch"));
     }
