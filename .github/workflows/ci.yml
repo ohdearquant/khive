@@ -1740,7 +1740,7 @@ jobs:
       # so that refusal fails the pull request instead.
       - name: Probe a kkernel built with the operator feature set
         run: |
-          cargo build -p kkernel --bin kkernel --locked --features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
+          cargo build -p kkernel --bin kkernel --locked --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
           make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"
 
       - name: Check each optional pack independently
