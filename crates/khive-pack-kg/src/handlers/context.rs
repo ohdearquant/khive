@@ -69,16 +69,11 @@ fn note_snippet(content: &str) -> Option<String> {
     Some(out)
 }
 
-fn context_profile_enabled() -> bool {
+fn context_profile_enabled(runtime: &khive_runtime::KhiveRuntime) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("KHIVE_CONTEXT_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_CONTEXT_PROFILE",
-            enabled.to_string(),
-        );
-        enabled
-    })
+    let enabled = *ENABLED.get_or_init(|| std::env::var("KHIVE_CONTEXT_PROFILE").is_ok());
+    runtime.record_config_locked("KHIVE_CONTEXT_PROFILE", || enabled.to_string());
+    enabled
 }
 
 fn plog(call_id: u64, stage: &str, us: u128) {
@@ -449,7 +444,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let call_id = CONTEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
-        let prof = context_profile_enabled();
+        let prof = context_profile_enabled(&self.runtime);
         let mailbox_view = self
             .runtime
             .authorize_mailbox_view(token, "context", None, &params)?;

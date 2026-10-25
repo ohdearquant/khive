@@ -2696,7 +2696,7 @@ async fn recall_profile_resolution_latency_is_bounded() {
     use khive_pack_brain::BrainPack;
     use std::time::Duration;
 
-    async fn timed_recall(with_brain: bool) -> Duration {
+    async fn timed_recall(with_brain: bool) -> (Duration, u64) {
         let rt = if with_brain {
             build_full_rt_with_brain()
         } else {
@@ -2773,17 +2773,19 @@ async fn recall_profile_resolution_latency_is_bounded() {
             )
             .await
             .expect("recall");
-        start.elapsed()
+        let elapsed = start.elapsed();
+        let resolved_deadline_ms = crate::pack::recall_deadline_ms(&rt);
+        (elapsed, resolved_deadline_ms)
     }
 
-    let without_brain = timed_recall(false).await;
-    let with_brain = timed_recall(true).await;
+    let (without_brain, _) = timed_recall(false).await;
+    let (with_brain, resolved_deadline_ms) = timed_recall(true).await;
     eprintln!(
         "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
     );
     // Dispatch uses this same cached deadline when the request has no override.
-    let caller_bound = Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+    let caller_bound = Duration::from_millis(resolved_deadline_ms).saturating_mul(2);
     if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
         assert!(
             with_brain < caller_bound,
