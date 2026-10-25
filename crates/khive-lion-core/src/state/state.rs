@@ -369,7 +369,7 @@ impl State {
         State {
             kernel: KernelState {
                 key_state: self.kernel.key_state().clone(),
-                policy: self.kernel.policy().clone(),
+                policy: *self.kernel.policy(),
                 revocation: self.kernel.revocation().revoke(cap_id),
                 now: self.kernel.now(),
                 next_cap_id: self.kernel.next_cap_id(),
@@ -389,7 +389,7 @@ impl State {
         State {
             kernel: KernelState {
                 key_state: self.kernel.key_state().clone(),
-                policy: self.kernel.policy().clone(),
+                policy: *self.kernel.policy(),
                 revocation: self.kernel.revocation().revoke_transitive(cap_id),
                 now: self.kernel.now(),
                 next_cap_id: self.kernel.next_cap_id(),
@@ -441,7 +441,7 @@ impl State {
         Ok(State {
             kernel: KernelState {
                 key_state: self.kernel.key_state().clone(),
-                policy: self.kernel.policy().clone(),
+                policy: *self.kernel.policy(),
                 revocation: new_revocation,
                 now: self.kernel.now(),
                 next_cap_id: self.kernel.next_cap_id(),

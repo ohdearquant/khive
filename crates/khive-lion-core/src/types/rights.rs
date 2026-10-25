@@ -974,17 +974,26 @@ mod tests {
         // BitAnd (owned) == intersection
         assert_eq!(a & b, a.intersection(&b));
         // BitAnd (ref) == intersection
-        assert_eq!(&a & &b, a.intersection(&b));
+        assert_eq!(
+            <&Rights as std::ops::BitAnd<&Rights>>::bitand(&a, &b),
+            a.intersection(&b)
+        );
 
         // BitOr (owned) == union
         assert_eq!(a | b, a.union(&b));
         // BitOr (ref) == union
-        assert_eq!(&a | &b, a.union(&b));
+        assert_eq!(
+            <&Rights as std::ops::BitOr<&Rights>>::bitor(&a, &b),
+            a.union(&b)
+        );
 
         // Sub (owned) == difference
         assert_eq!(a - b, a.difference(&b));
         // Sub (ref) == difference
-        assert_eq!(&a - &b, a.difference(&b));
+        assert_eq!(
+            <&Rights as std::ops::Sub<&Rights>>::sub(&a, &b),
+            a.difference(&b)
+        );
 
         // Not (owned) == complement
         assert_eq!(!a, a.complement());
