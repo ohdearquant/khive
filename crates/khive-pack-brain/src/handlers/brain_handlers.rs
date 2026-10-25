@@ -199,11 +199,12 @@ impl BrainPack {
     // that invariant or overload one verb with two incompatible response
     // shapes; a second, public verb name keeps both surfaces intact.
 
-    /// Cap on events aggregated by a single `brain.event_counts` window query.
-    /// Initial window totals use storage-side Kind grouping. Payload-derived
-    /// profile, cross and cost aggregates still fold the admitted rows. A window
-    /// wider than this cap sets `truncated: true` and keeps `window_event_total`
-    /// separate from the page-scoped aggregates.
+    /// Per-part row cap for the default bounded `brain.event_counts` view.
+    /// A kind-filtered call folds at most this many events; an unfiltered call
+    /// independently admits up to this many audit and this many non-audit events,
+    /// for up to twice this cap in one call. Truncation is checked per part.
+    /// Storage-side Kind grouping counts `window_event_total` independently of
+    /// the admitted rows folded into profile, cross and cost aggregates.
     pub(super) const MAX_WINDOW_EVENTS: u32 = 50_000;
     pub(super) const EXHAUSTIVE_PAGE_SIZE: u32 = 10_000;
     pub(super) const MAX_EXHAUSTIVE_EVENTS: u64 = 40 * Self::MAX_WINDOW_EVENTS as u64;
@@ -873,6 +874,7 @@ impl BrainPack {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct FeedbackParams {
+            #[serde(rename = "id", alias = "target_id")]
             target_id: String,
             signal: String,
             served_by_profile_id: Option<String>,

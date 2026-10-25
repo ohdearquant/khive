@@ -406,12 +406,38 @@ async fn hot_path_guard_g3_warm_note_search_uses_ann_without_fallback() {
     );
 }
 
-/// ADR-166 G5: count rows at the runtime's post-fusion hydration seam,
-/// including the note-search ANN consumer's fresh-tail candidate.
+/// ADR-166 G5: count post-fusion hydration with a warm graph and a post-snapshot note.
+/// This arm installs the note-search provider without the note-mutation hook.
 #[tokio::test]
 #[serial(note_search_ann)]
 #[serial_test::serial(config_ledger)]
 async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window() {
+    // Hold any newly enqueued rebuild at its existing test barrier so even a
+    // fast worker cannot disappear before the per-model enqueue assertion.
+    struct RebuildProbe(ann::SharedAnn);
+
+    impl Drop for RebuildProbe {
+        fn drop(&mut self) {
+            self.0
+                .attempt_floor_barrier
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.0.attempt_floor_release.notify_one();
+        }
+    }
+
+    async fn assert_no_rebuild_enqueued(shared: &ann::SharedAnn, key: &ann::AnnKey) {
+        let idle = ann::wait_until_warm_idle(shared, key);
+        tokio::pin!(idle);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(idle.as_mut(), cx).is_ready(),
+                "G5 fresh-tail path must not enqueue an ANN rebuild"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let rt = runtime(&dir.path().join("g5.db"), "main", true);
     let token = rt.authorize(Namespace::local()).expect("local token");
@@ -421,7 +447,14 @@ async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window()
         seed(&rt, &token, &format!("g5 candidate note {index}")).await;
     }
     warm(&rt, &token, &pack).await;
+    let key = ann::AnnKey::new(MODEL);
+    let rebuild_probe = RebuildProbe(pack.ann.clone());
+    rebuild_probe
+        .0
+        .attempt_floor_barrier
+        .store(true, std::sync::atomic::Ordering::Release);
     seed(&rt, &token, "g5 candidate note fresh tail").await;
+    assert_no_rebuild_enqueued(&pack.ann, &key).await;
     let query = rt.embed_query("g5 candidate note").await.expect("query");
     let before = rt
         .db_diagnostics()
@@ -442,11 +475,112 @@ async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window()
         )
         .await
         .expect("warm note search");
+    assert_no_rebuild_enqueued(&pack.ann, &key).await;
 
     let after = rt.db_diagnostics().await.expect("diagnostics after search");
     let hydrated = after.search_mechanism.note_candidate_hydration_rows
         - before.search_mechanism.note_candidate_hydration_rows;
     assert_eq!(hits.len(), limit as usize);
+    assert!(
+        hydrated >= hits.len() as u64,
+        "returned notes must have been hydrated: {hydrated}"
+    );
+    let per_arm = u64::from(limit) * 4;
+    let fresh_tail = 1;
+    assert!(
+        hydrated <= per_arm * 2 + fresh_tail,
+        "post-fusion hydration exceeded two bounded arms plus fresh tail: {hydrated}"
+    );
+}
+
+/// ADR-166 G5: drain write-triggered ANN work before measuring note hydration.
+#[tokio::test]
+#[serial(note_search_ann)]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn hot_path_guard_g5_write_hook_drains_before_note_search_hydration() {
+    async fn await_tracked_background_idle() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while khive_runtime::background_task_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tracked ANN work must drain before hydration counters");
+    }
+
+    const FRESH: &str = "g5 write hook candidate fresh";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rt = runtime(&dir.path().join("g5-write-hook.db"), "main", true);
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let pack = MemoryPack::new(rt.clone());
+    pack.register_note_search_ann_provider(&rt);
+    for index in 0..40 {
+        seed(&rt, &token, &format!("g5 write hook candidate {index}")).await;
+    }
+    warm(&rt, &token, &pack).await;
+    await_tracked_background_idle().await;
+
+    pack.register_note_mutation_hook(&rt);
+    let key = ann::AnnKey::new(MODEL);
+    let generation_before = ann::generation_for_test(&pack.ann, &key).await;
+    let (fresh_note, _) = rt
+        .create_note_with_options(
+            &token,
+            "memory",
+            None,
+            FRESH,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+            khive_runtime::note_write::NoteWriteOptions::default(),
+        )
+        .await
+        .expect("create memory through its committed write hook");
+    let generation_after = ann::generation_for_test(&pack.ann, &key).await;
+    assert!(
+        generation_after > generation_before,
+        "memory note mutation hook must advance the registered model generation"
+    );
+    assert_eq!(fresh_note.kind, "memory");
+
+    // The write hook schedules warming; finish tracked work before counting hydration.
+    await_tracked_background_idle().await;
+    assert!(
+        ann::is_current(&pack.ann, &key).await,
+        "the rebuilt graph must include the write's generation"
+    );
+    let query = rt.embed_query(FRESH).await.expect("query");
+    let (ann_before, fallback_before) = khive_runtime::note_search_ann::route_totals();
+    let before = rt
+        .db_diagnostics()
+        .await
+        .expect("diagnostics before search");
+
+    let limit = 3;
+    let hits = rt
+        .search_notes(&token, FRESH, Some(query), limit, None, false, &[], None)
+        .await
+        .expect("warm note search after the write hook");
+    await_tracked_background_idle().await;
+
+    let after = rt.db_diagnostics().await.expect("diagnostics after search");
+    let (ann_after, fallback_after) = khive_runtime::note_search_ann::route_totals();
+    assert_eq!(ann_after, ann_before + 1, "the warm search must use ANN");
+    assert_eq!(
+        fallback_after, fallback_before,
+        "the warm search must not scan"
+    );
+    let hydrated = after.search_mechanism.note_candidate_hydration_rows
+        - before.search_mechanism.note_candidate_hydration_rows;
+    assert_eq!(hits.len(), limit as usize);
+    assert!(
+        hits.iter().any(|hit| hit.note_id == fresh_note.id),
+        "the committed fresh note must be searchable after warming"
+    );
     assert!(
         hydrated >= hits.len() as u64,
         "returned notes must have been hydrated: {hydrated}"

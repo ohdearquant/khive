@@ -1444,7 +1444,7 @@ approved by this amendment.
 
 ## Amendment 7 (2026-10-20): Success Rows of High-Frequency Polling Verbs
 
-**Status**: Proposed
+**Status**: Accepted (status corrected by ADR-133 Amendment 11).
 
 Decision (b) gives every dispatch one `EventKind::Audit` row, and Amendment 3 narrowed that only
 for transient admission pressure. This amendment narrows it for a second, deliberate case: the
@@ -1654,7 +1654,9 @@ For these six verbs, after this amendment:
   rows carrying `resource.sampling`), `sample_rows` (those with `selected_by = "sample"`),
   `forced_rows` (those with `selected_by = "forced"`), `unsampled_rows` (stored `Success` rows of
   the verb with no `sampling` object: rows written before this amendment or in `all` mode) and
-  `every` (the value the window's `sampling` objects carry, or null when they carry more than one).
+  `every` (the value the window's `sampling` objects carry, or null when they carry more than one
+  value or the window has no complete `sampling` object; in the second case `sample_rows` is 0 and
+  the estimate below is unaffected).
   A row whose `sampling` object lacks one of these fields or holds another value counts in `rows`
   only. The field is computed over the same authorized, filtered and fetched rows as the other
   fields (Amendment 6). When the fetch is truncated it is named `sampled_success_rows_page_scoped`,

@@ -10,7 +10,6 @@
 //! no writes.
 
 use crate::db_snapshot::open_read_only_snapshot;
-use crate::sql::sql;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +28,7 @@ use khive_runtime::{
     EntityCandidatePrepared, GateRef, IngestAuditStore, InterceptedDispatchResult, KhiveRuntime,
     Namespace, NamespaceToken, PackRegistry, RuntimeError, VerbRegistry,
 };
-use khive_storage::{Entity, Note, NoteStore, SqlStatement, SqlValue, SubstrateKind};
+use khive_storage::{Entity, Note, NoteStore, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
 /// task to exit after the last write returned. Generous relative to any
@@ -688,49 +687,39 @@ async fn dry_run_report(
     };
 
     let (backend, _snapshot_dir) = open_read_only_snapshot(db_path)?;
-    let sql = backend.sql();
-    let mut reader = sql.reader().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-
+    // A UUID collision includes tombstones and rows stamped in another namespace.
+    // Typed reads also refuse malformed stored records instead of hiding decode errors.
+    let entities = backend.entities().map_err(|e| anyhow::anyhow!("{e}"))?;
     for entity in &batch.entities {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("entities_exists").to_string(),
-                params: vec![SqlValue::Uuid(entity.id)],
-                label: Some("code-ingest dry-run entity existence".to_string()),
-            })
+        let existing = entities
+            .get_entity_including_deleted(entity.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.entities_skipped_existing += 1;
         } else {
             report.entities_created += 1;
         }
     }
+    let notes = backend.notes().map_err(|e| anyhow::anyhow!("{e}"))?;
     for note in &batch.notes {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("notes_exists").to_string(),
-                params: vec![SqlValue::Uuid(note.id)],
-                label: Some("code-ingest dry-run note existence".to_string()),
-            })
+        let existing = notes
+            .get_note_including_deleted(note.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.notes_skipped_existing += 1;
         } else {
             report.notes_created += 1;
         }
     }
+    let graph = backend.graph().map_err(|e| anyhow::anyhow!("{e}"))?;
     for edge in &batch.edges {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("graph_edges_exists").to_string(),
-                params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
-                label: Some("code-ingest dry-run edge existence".to_string()),
-            })
+        let existing = graph
+            .get_edge_including_deleted(edge.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.edges_skipped_existing += 1;
         } else {
             report.edges_created += 1;
@@ -749,6 +738,10 @@ mod entity_admission_tests;
 mod note_fields_tests;
 
 #[cfg(test)]
+#[path = "code_ingest/dry_run_collision_tests.rs"]
+mod dry_run_collision_tests;
+
+#[cfg(test)]
 mod tests {
 
     use std::sync::{Arc, Mutex};
@@ -763,6 +756,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use khive_storage::{SqlStatement, SqlValue};
 
     struct WriteQueueEnvGuard {
         previous: Option<std::ffi::OsString>,

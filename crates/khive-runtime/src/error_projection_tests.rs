@@ -531,3 +531,244 @@ fn refusal_events_do_not_invent_receipts_for_failed_or_absent_recordings() {
     assert!(actual.get("refusal_recorded").is_none());
     assert!(actual.get("refusal_events").is_none());
 }
+
+use super::{failure_entry_parts, FailureEntrySource};
+
+fn assert_failure_entry_disposition(entry: &serde_json::Value, expected: &str) {
+    assert_eq!(entry["ok"], false);
+    assert_eq!(entry["domain_disposition"], expected);
+    assert_eq!(entry["error"]["domain_disposition"], expected);
+}
+
+fn failure_entry_obligation(result: serde_json::Value) -> RuntimeError {
+    RuntimeError::AuditObligation {
+        failure: Box::new(AuditObligationFailure::new(
+            "stream.append",
+            crate::audit_batch::AuditTerminalReason::StoreFailure,
+        )),
+        domain_result: result,
+    }
+}
+
+fn failure_entry_receipt(result: serde_json::Value) -> RuntimeError {
+    RuntimeError::RefusedWithReceipt(Box::new(crate::error::ReceiptRefusal {
+        code: "exec_refused",
+        message: "operation refused".into(),
+        receipt_id: "receipt-1".into(),
+        reason: "policy".into(),
+        detail: json!({"domain_result": result}),
+    }))
+}
+
+#[test]
+fn failure_entry_string_error_keeps_exact_envelope_and_error_parts() {
+    let error = json!("operation unavailable");
+    let expected = json!({
+        "ok": false,
+        "tool": "probe",
+        "domain_disposition": "not_committed",
+        "error": {
+            "kind": "runtime_error",
+            "message": "operation unavailable",
+            "domain_disposition": "not_committed",
+        },
+    });
+    let entry = failure_entry_parts(FailureEntrySource::Value {
+        error: error.clone(),
+        disposition: DomainDisposition::NotCommitted,
+    })
+    .into_entry("probe");
+    let error_only = failure_entry_parts(FailureEntrySource::Value {
+        error,
+        disposition: DomainDisposition::NotCommitted,
+    })
+    .into_error();
+    assert_eq!(entry, expected);
+    assert_eq!(error_only, expected["error"]);
+    assert_eq!(
+        serde_json::to_vec(&entry).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+}
+
+#[test]
+fn failure_entry_non_object_error_uses_the_existing_generic_message() {
+    for error in [json!(null), json!(true), json!(17), json!(["discarded"])] {
+        let entry = failure_entry_parts(FailureEntrySource::Value {
+            error,
+            disposition: DomainDisposition::Unknown,
+        })
+        .into_entry("probe");
+        assert_eq!(
+            entry,
+            json!({
+                "ok": false,
+                "tool": "probe",
+                "domain_disposition": "unknown",
+                "error": {
+                    "kind": "runtime_error",
+                    "message": "operation failed",
+                    "domain_disposition": "unknown",
+                },
+            })
+        );
+    }
+}
+
+#[test]
+fn failure_entry_unknown_drops_a_nested_domain_result() {
+    let entry = failure_entry_parts(FailureEntrySource::Value {
+        error: json!({"kind":"obligation", "message":"unsettled", "domain_result":{"id":"nested"}}),
+        disposition: DomainDisposition::Unknown,
+    })
+    .into_entry("probe");
+    assert_failure_entry_disposition(&entry, "unknown");
+    assert_eq!(entry["error"]["kind"], "obligation");
+    assert!(
+        entry["error"].get("domain_result").is_none(),
+        "unknown outcome retained a nested domain result"
+    );
+}
+
+#[test]
+fn failure_entry_committed_boundary_and_projection_keep_the_complete_result() {
+    let expected = json!({"id":"recorded", "rows":[null,true,{"nested":[1,2]}]});
+    let entry = failure_entry_parts(FailureEntrySource::Runtime {
+        error: failure_entry_obligation(expected.clone()),
+        boundary: DomainDisposition::Committed,
+    })
+    .into_entry("probe");
+    assert_failure_entry_disposition(&entry, "committed");
+    assert_eq!(entry["error"]["kind"], "obligation");
+    assert_eq!(entry["error"]["code"], "store_failure");
+    assert_eq!(entry["error"]["domain_result"], expected);
+}
+
+#[test]
+fn failure_entry_committed_boundary_does_not_keep_a_refused_projection_result() {
+    let entry = failure_entry_parts(FailureEntrySource::Runtime {
+        error: failure_entry_receipt(json!({"id":"nested", "extra":[1,2]})),
+        boundary: DomainDisposition::Committed,
+    })
+    .into_entry("probe");
+    assert_failure_entry_disposition(&entry, "not_committed");
+    assert_eq!(entry["error"]["code"], "exec_refused");
+    assert_eq!(entry["error"]["receipt_id"], "receipt-1");
+    assert!(
+        entry["error"].get("domain_result").is_none(),
+        "a refused projection retained the nested domain result"
+    );
+}
+
+#[test]
+fn failure_entry_uncommitted_boundary_drops_a_committed_batch_projection_result() {
+    let error = RuntimeError::BatchWrite {
+        context: Box::new(crate::error::BatchWriteContext {
+            source: Box::new(failure_entry_obligation(json!({"id":"nested"}))),
+            disposition: DomainDisposition::Committed,
+            admission: None,
+        }),
+    };
+    assert_eq!(
+        error.batch_write_disposition(),
+        Some(DomainDisposition::Committed)
+    );
+    let entry = failure_entry_parts(FailureEntrySource::Runtime {
+        error,
+        boundary: DomainDisposition::NotCommitted,
+    })
+    .into_entry("probe");
+    assert_failure_entry_disposition(&entry, "committed");
+    assert_eq!(entry["error"]["kind"], "obligation");
+    assert!(
+        entry["error"].get("domain_result").is_none(),
+        "the original boundary did not permit retaining a domain result"
+    );
+}
+
+#[test]
+fn failure_entry_too_deep_replacement_precedes_projection_result_removal() {
+    for refused_projection in [false, true] {
+        let mut result = json!(true);
+        for _ in 0..crate::daemon::ERROR_DETAIL_NESTING_DEPTH_LIMIT + 1 {
+            result = serde_json::Value::Array(vec![result]);
+        }
+        assert!(!crate::daemon::error_detail_value_within_limit(&result));
+        let error = if refused_projection {
+            failure_entry_receipt(result)
+        } else {
+            failure_entry_obligation(result)
+        };
+        let entry = failure_entry_parts(FailureEntrySource::Runtime {
+            error,
+            boundary: DomainDisposition::Committed,
+        })
+        .into_entry("probe");
+        assert_failure_entry_disposition(
+            &entry,
+            if refused_projection {
+                "not_committed"
+            } else {
+                "committed"
+            },
+        );
+        assert_eq!(
+            entry["error"]["code"], "result_too_deep",
+            "too-deep committed result did not keep the existing replacement code"
+        );
+        assert_eq!(
+            entry["error"]["message"],
+            "committed domain result omitted because it exceeds the nesting depth limit"
+        );
+        assert!(entry["error"].get("domain_result").is_none());
+    }
+}
+
+#[test]
+fn failure_entry_named_refusal_uses_the_projected_disposition_on_both_fields() {
+    let error = RuntimeError::Khive(KhiveError::conflict("same rendered message").with_details(
+        Details::new([("reason", "seq_conflict"), ("extra", "retained")]),
+    ));
+    assert_eq!(error.batch_write_disposition(), None);
+    let dispatch = crate::DispatchError::after_handler(error, false);
+    assert_eq!(dispatch.disposition(), DomainDisposition::Unknown);
+    let (error, boundary) = dispatch.into_parts();
+    let entry =
+        failure_entry_parts(FailureEntrySource::Runtime { error, boundary }).into_entry("probe");
+    assert_failure_entry_disposition(&entry, "not_committed");
+    assert_eq!(entry["error"]["kind"], "conflict");
+    assert_eq!(entry["error"]["details"]["reason"], "seq_conflict");
+    assert_eq!(entry["error"]["details"]["extra"], "retained");
+}
+
+#[test]
+fn failure_entry_raw_value_cannot_override_the_supplied_disposition() {
+    for disposition in [DomainDisposition::NotCommitted, DomainDisposition::Unknown] {
+        let entry = failure_entry_parts(FailureEntrySource::Value {
+            error: json!({"kind":"runtime_error", "message":"input claim", "domain_disposition":"committed", "extra":17}),
+            disposition,
+        }).into_entry("probe");
+        assert_failure_entry_disposition(&entry, disposition.as_str());
+        assert_eq!(entry["error"]["message"], "input claim");
+        assert_eq!(entry["error"]["extra"], 17);
+    }
+}
+
+#[test]
+fn failure_entry_batch_write_proof_and_committed_boundary_keep_their_precedence() {
+    for (boundary, expected) in [
+        (DomainDisposition::Unknown, "not_committed"),
+        (DomainDisposition::Committed, "committed"),
+    ] {
+        let error = RuntimeError::InvalidInput("prewrite refusal".into()).before_requested_write();
+        assert_eq!(
+            error.batch_write_disposition(),
+            Some(DomainDisposition::NotCommitted)
+        );
+        let entry = failure_entry_parts(FailureEntrySource::Runtime { error, boundary })
+            .into_entry("probe");
+        assert_failure_entry_disposition(&entry, expected);
+        assert_eq!(entry["error"]["message"], "invalid input: prewrite refusal");
+        assert!(entry["error"].get("domain_result").is_none());
+    }
+}

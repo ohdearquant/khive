@@ -24,7 +24,7 @@ async fn upsert_atoms_rejects_reuse_of_soft_deleted_slug_cleanly() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::InvalidInput(_)),
+        matches!(err.refusal_source(), RuntimeError::InvalidInput(_)),
         "expected InvalidInput, got: {err:?}"
     );
     let msg = err.to_string();
@@ -71,7 +71,7 @@ async fn upsert_domains_rejects_reuse_of_soft_deleted_slug_cleanly() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::InvalidInput(_)),
+        matches!(err.refusal_source(), RuntimeError::InvalidInput(_)),
         "expected InvalidInput, got: {err:?}"
     );
     let msg = err.to_string();

@@ -820,7 +820,7 @@ of checkpoint cadence or pin duration.
 
 ## 2026-10-21 amendment: a config-lock row belongs to the runtime that read the value (#5901)
 
-**Status**: Proposed (this amendment only; the ADR stays Accepted).
+**Status**: Accepted 2026-10-22 (this amendment only; the ADR stays Accepted).
 
 This amendment supersedes Decision 7(a)'s process-wide pending slot, its "enqueued exactly once per
 process lifetime" cardinality, its "the very next dispatch (on any verb, from any caller) drains it"

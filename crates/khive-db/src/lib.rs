@@ -12,6 +12,8 @@
 //! and releases the lease. The process keeps running: the host decides whether
 //! to exit.
 
+/// Transaction-scoped persistence for shared authority records.
+pub mod authority;
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
 /// Periodic WAL checkpoint task.
@@ -39,6 +41,9 @@ pub mod file_identity;
 mod fts_maintenance;
 /// Read predicates and transaction assertions for the graph-lint caller.
 pub mod graph_lint;
+/// Canonical physical store sets for cooperative maintenance metadata.
+#[cfg(unix)]
+pub mod maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).

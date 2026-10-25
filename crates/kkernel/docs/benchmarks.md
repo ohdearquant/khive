@@ -1,5 +1,33 @@
 # kkernel benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `kkernel`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `kkernel:coord_locate/coord_locate/cache_hit/100/median_ns`     | 24.950 µs        | 1.016     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:coord_locate/coord_locate/cache_hit/1000/median_ns`    | 24.909 µs        | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:coord_locate/coord_locate/cache_miss/100/median_ns`    | 126.559 µs       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:coord_locate/coord_locate/cache_miss/1000/median_ns`   | 127.103 µs       | 1.007     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:coord_locate/coord_locate/unknown_uuid/100/median_ns`  | 157.517 µs       | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:coord_locate/coord_locate/unknown_uuid/1000/median_ns` | 155.792 µs       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/get_hit/1000/median_ns`                | 71.665 ns        | 1.001     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/get_hit/10000/median_ns`               | 75.500 ns        | 1.007     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/get_hit/100000/median_ns`              | 88.602 ns        | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/insert_new_lru/1000/median_ns`         | 146.668 ns       | 1.032     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/insert_new_lru/10000/median_ns`        | 190.231 ns       | 1.067     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/insert_new_lru/100000/median_ns`       | 219.721 ns       | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/purge_live/1000/median_ns`             | 58.426 ns        | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/purge_live/10000/median_ns`            | 58.424 ns        | 1.001     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `kkernel:locator/locator/purge_live/100000/median_ns`           | 59.212 ns        | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+
+<!-- bench-reference:end -->
+
 The routing benchmarks call the public `LocatorCache` and
 `SubstrateCoordinatorService` APIs. All inputs are generated, using UUID seed
 5665. They require no external database, embedding model, daemon, or network.
@@ -34,14 +62,14 @@ new performance baseline.
 
 ## Scenarios
 
-| Group          | Scenarios                            | Measurement                                                                                            | Inputs                                                               | Baseline |
-| -------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | -------- |
-| `locator`      | `get_hit/{1000,10000,100000}`        | Rotating successful public cache lookups, including the returned backend-ID clone                      | Explicit capacity equal to retained entries; all entries live        | pending  |
-| `locator`      | `insert_new_lru/{1000,10000,100000}` | A fresh UUID insertion into a full cache, including eviction; backend-ID input clone excluded          | Constant retained cardinality, new sequential UUID per call          | pending  |
-| `locator`      | `purge_live/{1000,10000,100000}`     | `purge_expired` with no expired entries                                                                | Full live cache; oldest entry checked before and after each call     | pending  |
-| `coord_locate` | `cache_hit/{100,1000}`               | Actual service lookup with a prepopulated locator key, including the backend endpoint probe            | Two independent in-memory SQLite backends, half the entities on each | pending  |
-| `coord_locate` | `cache_miss/{100,1000}`              | Actual service lookup after removing the key, including concurrent backend probes and cache population | Same two-backend fixture, rotating known entity IDs                  | pending  |
-| `coord_locate` | `unknown_uuid/{100,1000}`            | Actual service lookup of an absent UUID across both backends                                           | Same fixture; unknown ID never collides with fixture IDs             | pending  |
+| Group          | Scenarios                            | Measurement                                                                                            | Inputs                                                               | Baseline        |
+| -------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------- |
+| `locator`      | `get_hit/{1000,10000,100000}`        | Rotating successful public cache lookups, including the returned backend-ID clone                      | Explicit capacity equal to retained entries; all entries live        | reference block |
+| `locator`      | `insert_new_lru/{1000,10000,100000}` | A fresh UUID insertion into a full cache, including eviction; backend-ID input clone excluded          | Constant retained cardinality, new sequential UUID per call          | reference block |
+| `locator`      | `purge_live/{1000,10000,100000}`     | `purge_expired` with no expired entries                                                                | Full live cache; oldest entry checked before and after each call     | reference block |
+| `coord_locate` | `cache_hit/{100,1000}`               | Actual service lookup with a prepopulated locator key, including the backend endpoint probe            | Two independent in-memory SQLite backends, half the entities on each | reference block |
+| `coord_locate` | `cache_miss/{100,1000}`              | Actual service lookup after removing the key, including concurrent backend probes and cache population | Same two-backend fixture, rotating known entity IDs                  | reference block |
+| `coord_locate` | `unknown_uuid/{100,1000}`            | Actual service lookup of an absent UUID across both backends                                           | Same fixture; unknown ID never collides with fixture IDs             | reference block |
 
 In ordinary measurement mode (`--bench`, supplied by `cargo bench`), each selected
 scenario first emits one `routing_call_report` from **1,001 separately timed calls**,
@@ -82,16 +110,18 @@ hit rate; the default and explicit-capacity figures are not interchangeable.
 ## Performance guarantees
 
 These are the requested advisory measurements. Timing and memory observations are
-historical measurements, not promises. A `pending` baseline must be filled by the
-owning bench-track component on a qualified host, recording commit, toolchain,
-and machine. The API-boundary exclusions below have no measurement producer in this
+historical measurements, not promises. Recorded baselines come from the owning
+bench-track component on a qualified host and are in the reference block at the
+top of this file, with their commit and comparison class. That block records
+medians, so a p99 row has a recorded median and no recorded p99. The API-boundary
+exclusions below have no measurement producer in this
 change and must not be filled from an unrelated wrapper benchmark.
 
 | Operation                             | Input                   | Metric                 | Bound                                        | Baseline                          |
 | ------------------------------------- | ----------------------- | ---------------------- | -------------------------------------------- | --------------------------------- |
-| `LocatorCache::get`                   | 100k entries, hit       | p99 latency (ns/op)    | Advisory trend against the recorded baseline | pending                           |
-| `LocatorCache::insert`                | 100k entries pre-filled | ns/op                  | Advisory trend against the recorded baseline | pending                           |
-| `SubstrateCoordinatorService::locate` | 1k records, cache miss  | p99 latency (ns/op)    | Advisory trend against the recorded baseline | pending                           |
+| `LocatorCache::get`                   | 100k entries, hit       | p99 latency (ns/op)    | Advisory trend against the recorded baseline | median in reference block; no p99 |
+| `LocatorCache::insert`                | 100k entries pre-filled | ns/op                  | Advisory trend against the recorded baseline | reference block                   |
+| `SubstrateCoordinatorService::locate` | 1k records, cache miss  | p99 latency (ns/op)    | Advisory trend against the recorded baseline | median in reference block; no p99 |
 | `atomic_apply`                        | 256-op batch            | median latency (ns/op) | Advisory trend against the recorded baseline | not measured: private entry       |
 | `sweep_stale_fts_partitions`          | 64 partitions × 1k rows | wall-time (ns/op)      | Advisory trend against the recorded baseline | not measured: private entry       |
 | `run_code_ingest`                     | 1000 files              | throughput (files/sec) | Advisory trend against the recorded baseline | not measured: source-file premise |

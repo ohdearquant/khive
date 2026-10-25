@@ -183,8 +183,9 @@ async fn issue_2537_receipt_depth_frame_errors() {
         "stream.batch".into(),
         OpSuccess::complete(nest(limit + 1)),
     )
-    .unwrap_err();
-    assert_eq!(chain.error["kind"], "result_too_deep");
+    .unwrap_err()
+    .into_entry();
+    assert_eq!(chain["error"]["kind"], "result_too_deep");
     let parallel = present_ok_envelope_or_depth_error(
         "stream.append".into(),
         OpSuccess::complete(nest(limit + 1)),

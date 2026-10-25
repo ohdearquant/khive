@@ -24,7 +24,7 @@
     "check:showcase": "node scripts/sync-showcase-assets.mjs --check"
   },
   "dependencies": {
-    "next": "16.3.0",
+    "next": "16.4.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "zod": "^4.4.3"
@@ -45,7 +45,7 @@
     "jsdom": "^29.0.0",
     "tailwindcss": "^4",
     "typescript": "^5",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "sharp": "npm:empty-npm-package@1.0.0"

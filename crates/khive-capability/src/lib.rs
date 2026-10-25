@@ -1,12 +1,16 @@
-//! Process-local sealed grants and namespace-scoped capability validation.
+//! Sealed grants, authenticated durable envelopes and capability validation.
 //!
 //! This library preserves actor bookkeeping and explicit operation classification
 //! over one keyed capability kernel. It does not install a runtime gate or grant
 //! store. See the README for the trusted management and seal-verification boundary.
 
+#[cfg(feature = "authority-store")]
+pub mod authority_store;
+
 pub mod actor;
 pub mod capability;
 pub mod context;
+pub mod durable;
 pub mod error;
 pub mod namespace;
 pub mod validate;

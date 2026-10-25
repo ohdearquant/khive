@@ -10,61 +10,89 @@ use khive_storage::{Event, SqlStatement, SqlValue};
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use serde_json::{json, Value};
 
+pub(super) struct SubmissionRefusal {
+    pub source: RuntimeError,
+    pub field: &'static str,
+}
+
 pub(super) fn validate_submission(
-    atom_in: &AtomWrite,
+    atom: &AtomWrite,
     index: usize,
     preserve_content_whitespace: bool,
 ) -> Result<(), RuntimeError> {
+    validate_submission_located(atom, index, preserve_content_whitespace)
+        .map_err(|failure| failure.source)
+}
+
+pub(super) fn validate_submission_located(
+    atom_in: &AtomWrite,
+    index: usize,
+    preserve_content_whitespace: bool,
+) -> Result<(), SubmissionRefusal> {
+    fn at(result: Result<(), RuntimeError>, field: &'static str) -> Result<(), SubmissionRefusal> {
+        result.map_err(|source| SubmissionRefusal { source, field })
+    }
+    let record = format!("atoms[{index}]");
     let atom_in = match atom_in {
         AtomWrite::Upsert(atom_in) => atom_in,
         AtomWrite::PropertiesOnly(atom_in) => {
-            khive_runtime::secret_gate::check_json_at(
-                &atom_in.properties,
-                &format!("atoms[{index}]"),
+            at(
+                secret_gate::check_json_at(&atom_in.properties, &record, "properties"),
                 "properties",
             )?;
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(
-                &atom_in.properties,
-            ))?;
-            return Ok(());
+            return at(
+                secret_gate::reject_reserved_secret_gate_property(Some(&atom_in.properties)),
+                "properties",
+            );
         }
     };
-    let slug = atom_in.slug.trim().to_string();
+    let slug = atom_in.slug.trim();
     if slug.is_empty() {
-        return Err(RuntimeError::InvalidInput(
-            "atom slug must not be empty".into(),
-        ));
+        return Err(SubmissionRefusal {
+            source: RuntimeError::InvalidInput("atom slug must not be empty".into()),
+            field: "slug",
+        });
     }
-
     let raw_content = atom_in.content.as_deref().unwrap_or("");
     let content = if preserve_content_whitespace {
-        raw_content.to_string()
+        raw_content
     } else {
-        raw_content.trim().to_string()
+        raw_content.trim()
     };
-    validate_atom_content(&content)?;
-    // Secret gate: scan all caller-supplied text and structured fields
-    // before any reader/writer is acquired. Every refusal is located to the
-    // atom that produced it by POSITION, never by slug: the caller returns ONE
-    // original error for the whole batch, the slug is itself a scanned field, and two
-    // atoms may share a slug within one payload (#2605).
-    use khive_runtime::secret_gate;
-    let record = format!("atoms[{index}]");
-    secret_gate::check_at(&slug, &record, "slug")?;
-    secret_gate::check_at(&atom_in.name, &record, "name")?;
-    secret_gate::check_at(&content, &record, "content")?;
-    if let Some(ref tags_vec) = atom_in.tags {
-        secret_gate::check_tags_at(tags_vec, &record, "tags")?;
+    at(validate_atom_content(content), "content")?;
+    at(secret_gate::check_at(slug, &record, "slug"), "slug")?;
+    at(
+        secret_gate::check_at(&atom_in.name, &record, "name"),
+        "name",
+    )?;
+    at(
+        secret_gate::check_at(content, &record, "content"),
+        "content",
+    )?;
+    if let Some(tags) = &atom_in.tags {
+        at(secret_gate::check_tags_at(tags, &record, "tags"), "tags")?;
     }
-    if let Some(ref props) = atom_in.properties {
-        secret_gate::check_json_at(props, &record, "properties")?;
+    if let Some(properties) = &atom_in.properties {
+        at(
+            secret_gate::check_json_at(properties, &record, "properties"),
+            "properties",
+        )?;
     }
-    secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
+    at(
+        secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref()),
+        "properties",
+    )?;
     if let Some(Some(uri)) = &atom_in.source_uri {
-        secret_gate::check_at(uri, &record, "source_uri")?;
+        at(
+            secret_gate::check_at(uri, &record, "source_uri"),
+            "source_uri",
+        )?;
     }
-    if let Some(Some(st)) = &atom_in.source_type {
-        secret_gate::check_at(st, &record, "source_type")?;
+    if let Some(Some(source_type)) = &atom_in.source_type {
+        at(
+            secret_gate::check_at(source_type, &record, "source_type"),
+            "source_type",
+        )?;
     }
     Ok(())
 }
@@ -74,7 +102,7 @@ pub(super) fn validate_submission(
 pub(super) async fn refuse_batch(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    atoms: &[AtomWrite],
+    atoms: &[Option<AtomWrite>],
     mut failures: Vec<Option<RuntimeError>>,
     is_import: bool,
 ) -> RuntimeError {
@@ -101,6 +129,10 @@ pub(super) async fn refuse_batch(
     };
     let mut targets = Vec::with_capacity(atoms.len());
     for atom in atoms {
+        let Some(atom) = atom else {
+            targets.push(None);
+            continue;
+        };
         let (predicate, params) = match atom {
             AtomWrite::Upsert(input) => (
                 "a.namespace = ?1 AND a.slug = ?2",
@@ -135,7 +167,7 @@ pub(super) async fn refuse_batch(
 
     let mut recordings = Vec::new();
     for (index, (input, target)) in atoms.iter().zip(targets).enumerate() {
-        let Some(old) = target else {
+        let (Some(input), Some(old)) = (input, target) else {
             continue;
         };
         let digest = secret_gate::masked_submitted_atom_digest_v1(&candidate(input, &old));

@@ -1064,21 +1064,6 @@ mod tests {
         .await
     }
 
-    /// The in-crate test runtime carries no `VerbRegistry`, so the web
-    /// pack's own `EDGE_RULES` (`site contains page|resource`) are never
-    /// installed on it by default — a redirect-hop `link(Contains, ...)` (via
-    /// `mint_bare`) then refuses against the base allowlist alone. Register
-    /// kg+web through a throwaway registry purely to read back their
-    /// combined `all_edge_rules()`, matching `fetch.rs`'s own test helper of
-    /// the same name.
-    fn install_web_edge_rules(runtime: &KhiveRuntime) {
-        let mut builder = khive_runtime::VerbRegistryBuilder::new();
-        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-        builder.register(WebPack::new(runtime.clone()));
-        let registry = builder.build().expect("registry builds");
-        runtime.install_edge_rules(registry.all_edge_rules());
-    }
-
     async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
@@ -1091,7 +1076,7 @@ mod tests {
             ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
-        install_web_edge_rules(&runtime);
+        crate::test_support::install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
             .expect("install blob store");

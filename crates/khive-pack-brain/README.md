@@ -46,7 +46,7 @@ verbs through the MCP `request` DSL, not called directly as a Rust API:
 ```text
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
 request(ops="brain.resolve(consumer_kind=\"recall\")")
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<uuid>\", signal=\"useful\")")
 request(ops="brain.auto_feedback(query=\"why\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
 
@@ -74,7 +74,8 @@ caller/profile guards. Another scorer run is a distinct pair. Manual
 
 `brain.feedback` and `brain.auto_feedback` can target a live KG entity or note
 on another configured pack backend, including a message returned by
-`search(kind="message", query="handoff")`. Copy its full UUID into `target_id`;
+`search(kind="message", query="handoff")`. Copy its full UUID into `id` for
+`brain.feedback` or `target_id` for `brain.auto_feedback`;
 `get(id="<uuid>")` uses the same shared entity/note read resolver. For
 `auto_feedback`, the selected ID must still match exactly one supplied result.
 Normal Gate checks apply, and target lookup by ID does not filter the stored

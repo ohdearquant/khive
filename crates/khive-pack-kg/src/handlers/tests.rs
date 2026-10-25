@@ -5499,3 +5499,129 @@ async fn issue2750_entity_create_always_reports_similar_existing_and_whether_it_
         "a note create reports no dedup comparison: {note}"
     );
 }
+
+#[tokio::test]
+async fn singleton_entity_create_content_refusal_names_description() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
+
+    fn record_counts(runtime: &KhiveRuntime) -> (i64, i64) {
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .expect("fixture writer")
+            .autocommit(|conn| {
+                let entities = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let notes =
+                    conn.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get::<_, i64>(0))?;
+                Ok((entities, notes))
+            })
+            .expect("actual stored record counts")
+    }
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let pack = KgPack::new(runtime.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().expect("KG registry");
+    let before = record_counts(&runtime);
+    for kind in ["entity", "concept"] {
+        let error = pack
+            .handle_create(
+                &token,
+                json!({
+                    "kind": kind, "entity_kind": "concept", "name": "wrong substrate field",
+                    "content": "must not be silently discarded", "skip_dedup_check": true,
+                }),
+                &registry,
+            )
+            .await
+            .expect_err("singleton entity content must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("content"),
+            "refusal names content: {message}"
+        );
+        assert!(
+            message.contains("description"),
+            "refusal names the correct entity field: {message}"
+        );
+        assert_eq!(
+            record_counts(&runtime),
+            before,
+            "refusal writes neither entities nor notes"
+        );
+    }
+    // Preserve the original typed decoder error rather than replacing it with
+    // the new valid-string wrong-substrate diagnostic.
+    let malformed = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "malformed content", "content": 17,
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("non-string content still fails decoding");
+    assert!(
+        malformed.to_string().contains("invalid type"),
+        "{malformed}"
+    );
+    assert_eq!(record_counts(&runtime), before);
+
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "proper entity", "description": "entity description",
+                "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("proper description succeeds");
+    let entity_id = uuid::Uuid::parse_str(entity["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        runtime
+            .get_entity(&token, entity_id)
+            .await
+            .unwrap()
+            .description
+            .as_deref(),
+        Some("entity description")
+    );
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "note", "content": "ordinary note content", "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("note content stays valid");
+    let note_id = uuid::Uuid::parse_str(note["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(note_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "ordinary note content"
+    );
+    assert_eq!(record_counts(&runtime), (before.0 + 1, before.1 + 1));
+}

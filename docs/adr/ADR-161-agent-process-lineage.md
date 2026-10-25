@@ -1,6 +1,6 @@
 # ADR-161: Agent Process Lineage
 
-- **Status:** Proposed
+- **Status:** withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
 - **Date:** 2026-08-16
 - **Revised:** 2026-08-19 (Rev 2 — design review R2: enumeration snapshot semantics and cursor
   binding, depth truncation split from page continuation, pre-lineage records classed unknown,

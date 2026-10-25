@@ -765,7 +765,7 @@ mod tests {
             // PrefixScopedToPrimary
             (
                 "neighbors",
-                "node_id",
+                "id",
                 "no namespace check performed by this resolver",
             ),
             // FullAndPrefixScopedToPrimary
@@ -779,7 +779,7 @@ mod tests {
             // UnscopedFullUuidOnly
             (
                 "memory.feedback",
-                "target_id",
+                "id",
                 "no namespace check is performed on this parameter itself",
             ),
         ];

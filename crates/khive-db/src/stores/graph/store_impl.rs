@@ -132,7 +132,7 @@ impl GraphStore for SqlGraphStore {
     async fn insert_edge_if_absent(&self, edge: Edge) -> Result<bool, StorageError> {
         let statement = edge_insert_if_absent_statement(&edge);
         self.with_writer("insert_edge_if_absent", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
         })
@@ -148,7 +148,7 @@ impl GraphStore for SqlGraphStore {
         let statement =
             edge_replace_if_unchanged_statement(&edge, expected_updated_at, expected_deleted_at);
         self.with_writer("replace_edge_if_unchanged", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
         })
@@ -726,7 +726,7 @@ impl GraphStore for SqlGraphStore {
             DeleteMode::Hard => edge_hard_delete_statement(id),
         };
         self.with_writer("delete_edge", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
         })
@@ -1510,7 +1510,7 @@ impl GraphStore for SqlGraphStore {
         // (ADR-002 no-dangling-references, ADR-007 by-ID contract).
         let statement = purge_incident_edges_statement(node_id);
         self.with_writer("purge_incident_edges", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? as u64)
         })

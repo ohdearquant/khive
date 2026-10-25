@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "mmap")]
 use bytemuck::cast_slice;
 #[cfg(feature = "mmap")]
 use memmap2::MmapOptions;

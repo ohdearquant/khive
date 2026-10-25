@@ -21,6 +21,7 @@ pub use dispatch_trait::*;
 
 #[cfg(all(unix, feature = "fault-injection"))]
 pub use connection::handle_conn_for_test;
+#[cfg(unix)]
 use connection::*;
 
 #[cfg(unix)]
@@ -156,14 +157,15 @@ pub use config_id::{
 };
 
 mod wire_frames;
+pub use wire_frames::{
+    drop_error_detail_iteratively, error_detail_value_within_limit, CheckpointStoreMetrics,
+    DaemonDispatchError, DaemonRequestFrame, DaemonResponseFrame, MetricsSnapshot,
+    ERROR_DETAIL_NESTING_DEPTH_LIMIT,
+};
 #[cfg(unix)]
 pub use wire_frames::{read_frame, write_frame};
 #[cfg(unix)]
 use wire_frames::{read_initial_frame, take_daemon_lexical_timeout_marker};
-pub use wire_frames::{
-    CheckpointStoreMetrics, DaemonDispatchError, DaemonRequestFrame, DaemonResponseFrame,
-    MetricsSnapshot, ERROR_DETAIL_NESTING_DEPTH_LIMIT,
-};
 
 /// Returns `true` for non-empty env values that are not `"0"` or `"false"`.
 #[cfg(unix)]
