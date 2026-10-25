@@ -2288,7 +2288,8 @@ separate policy and is outside this procedure.
    the main database, owned by the user that owns the stores, created owner-only and replaced atomically. It carries
    an opaque epoch; its phase (`closing`, `quiescent`, `migrating`, `ready`, or a failed state that stays closed);
    the store set; the target installation's identity and configuration; owner evidence, which is the coordinator's
-   process ID, start time and executable identity; and bounded phase deadlines.
+   process ID, start time and executable identity; the digest of the epoch capability's secret (Decision 2); and
+   bounded phase deadlines.
    The coordinator writes `ready` only at release (procedure step 11), after the target's readiness has been verified
    while the record still reads `migrating`. `ready` is the only phase that opens admission, and that record, kept at
    the same location until the next epoch's declaration replaces it, is the release receipt. The coordinator is the single
@@ -2323,8 +2324,19 @@ separate policy and is outside this procedure.
    and neither does any other process the coordinator starts. The delegate marks it
    close-on-exec again before it starts any thread or process, and it starts processes only by spawning a new image,
    so a process the delegate starts does not inherit it; the delegate hands it on, the same way, to the events daemon
-   it supervises and to no other process. The fence checks the capability against the declaration's epoch, store set
-   and recorded target identity. Under the coordinator's exclusive hold the fence admits the delegate's boot,
+   it supervises and to no other process. The capability is an owner-only regular file that the coordinator creates
+   exclusively in the declaration's directory, opens and unlinks at once, before it publishes the declaration, so no
+   path names it and only a process holding the descriptor can read it. It holds the epoch, the canonical store
+   set, the recorded target identity and a random secret of at least 128 bits, and the declaration records the
+   secret's digest. The
+   delegate learns the descriptor's number from an option value, which names a descriptor and grants nothing. The
+   fence reads the capability through the descriptor from offset zero, so a shared file offset does not matter, and
+   admits only when the descriptor refers to an unlinked regular file owned by the stores' owner and readable by no
+   other user, the file parses, its epoch, store set and target identity equal the current declaration's, and its
+   secret's digest equals the one the declaration records. Anything else is no capability: a number that names no
+   open descriptor or names anything else, a file that still has a path, and a descriptor kept from an earlier
+   epoch, since each epoch mints a new secret. The coordinator closes its own descriptor at release. Under the
+   coordinator's exclusive hold the fence admits the delegate's boot,
    migration and readiness checks, and that events daemon, and no other process. The delegate and that events daemon
    take no admission lease while the epoch is closed: the coordinator's exclusive hold covers their store work and the
    capability is their admission, so neither waits on the hold. The capability ends at release. It
@@ -2348,11 +2360,16 @@ separate policy and is outside this procedure.
    before it certifies quiescence, and so before the old daemons stop. These are plain connections that run no
    schema preparation. It holds them at least through the end of the copy and closes them at release, so that no
    process exiting during the copy, the
-   stopped daemons included, can run a close-time checkpoint. The copy proves each database and `-wal` unchanged
-   across it. Every copy, the vector index copies and the writable restore copy included, is created owner-only, like
+   stopped daemons included, can run a close-time checkpoint. The copy proves each database, `-wal` and `-shm`
+   unchanged across it. No write transaction runs and the coordinator's idle connections hold no read transaction,
+   so no process changes a `-shm` during the copy, and each copied `-shm` is the WAL index of exactly the copied
+   `-wal`. Every copy, the vector index copies and the writable restore copy included, is created owner-only, like
    the stores. The copy is then frozen
-   read-only, as read-only inspection requires (it refuses a writable `-shm`; `read_only_wal_open_target_for_path` in
-   `crates/khive-db/src/pool/connection_setup.rs`), and the restore proof runs on a writable copy of it. An idle
+   read-only, as read-only inspection requires: it refuses a writable `-shm`, and it refuses a non-empty `-wal` with
+   no `-shm` beside it, because SQLite would then either omit committed WAL frames or create a new index
+   (`read_only_wal_open_target_for_path` in `crates/khive-db/src/pool/connection_setup.rs`). The restore proof runs
+   on a writable copy of it made without the `-shm`, so the previous binary rebuilds the WAL index from the `-wal`
+   rather than trusting the copied one. An idle
    connection holds no WAL read mark, so it does not block the target daemon's open-time checkpoint under a
    configured WAL ceiling; a read transaction does, and it is covered by a lease.
 5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
@@ -2392,7 +2409,8 @@ separate policy and is outside this procedure.
 1. Inventory non-participating executables and external holders of the store set (Decision 6). Stop each such process
    by PID or upgrade it, and do not continue while one remains. Participating bridges and the old daemons on the
    previous build are not stopped here.
-2. Publish the declaration for the store set in its `closing` phase.
+2. Create the epoch capability (Decision 2), then publish the declaration for the store set, carrying the
+   capability's digest, in its `closing` phase.
 3. Drill a cold client: it waits and spawns nothing.
 4. Open the coordinator's connection on every store in the set, then drain activity leases until quiescence is
    certified, and write `quiescent`.
@@ -2400,9 +2418,9 @@ separate policy and is outside this procedure.
    either exit from running a close-time checkpoint.
 6. If any process outside the participants holds a store file, end the epoch in a failed state, which stays closed
    until an explicit, proved recovery action (Decision 7); take no snapshot and run no migration.
-7. Copy every database, `-wal` and `-shm` and every vector index directory of the set, prove the database and `-wal`
-   files unchanged across the copy, and freeze the copy read-only.
-8. Prove that a writable copy of the snapshot restores with the previous binary.
+7. Copy every database, `-wal` and `-shm` and every vector index directory of the set, prove the database, `-wal`
+   and `-shm` files unchanged across the copy, and freeze the copy read-only.
+8. Prove that a writable copy of the snapshot, made without its `-shm`, restores with the previous binary.
 9. Install the new executable atomically.
 10. Write `migrating`, then start the target daemon as the coordinator's delegate, holding the epoch capability. It migrates the configured
     backends in place and starts the events daemon, which prepares the events schema before it accepts traffic.
@@ -2437,7 +2455,10 @@ fails on the code at the inspected revision unless stated otherwise.
   capability is refused, and so is a child the delegate starts other than its events daemon, including one started
   at the earliest point the delegate's startup allows; a process the coordinator starts other than the delegate holds
   no capability descriptor, including one started from another coordinator thread while the delegate spawns; the
-  capability appears in neither the delegate's argv nor its environment.
+  capability appears in neither the delegate's argv nor its environment. While the epoch is closed the fence refuses
+  a capability descriptor kept from an earlier epoch, a capability file that still has a path, one another user can
+  read, and a file carrying the current epoch, store set and target identity with a secret whose digest the
+  declaration does not record.
 - **Old images and holders.** A non-participating process found by the inventory (step 1) keeps the coordinator from
   publishing until it is stopped or upgraded, a bridge running the previous participating build keeps its PID through
   the window, and a fixture non-participant holding a store file at the holder check
@@ -2450,7 +2471,9 @@ fails on the code at the inspected revision unless stated otherwise.
   journal mode, and one that replaces a store file, is refused before the source is touched. A fixture client that
   exits during the copy holding what would otherwise be the last connection leaves the copied database and `-wal`
   consistent. A fixture daemon that is the only other holder, stopped after quiescence, leaves the database and
-  `-wal` unchanged. The frozen copy passes read-only inspection, and every copy is owner-only. With a WAL ceiling configured and the WAL over it, the
+  `-wal` unchanged. The frozen copy passes read-only inspection and shows the rows committed only in its `-wal`, a
+  `-shm` that changes during the copy fails the copy, the writable restore copy carries no copied `-shm`, and every
+  copy is owner-only. With a WAL ceiling configured and the WAL over it, the
   target daemon's open-time checkpoint succeeds while idle bridge descriptors are held.
 - **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
   budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
