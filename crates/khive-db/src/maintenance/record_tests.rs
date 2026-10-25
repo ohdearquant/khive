@@ -384,7 +384,7 @@ fn write_record(root: &Path, record: &Declaration) {
 
 fn verified(root: &Path) -> Declaration {
     match read_record(&location(root), &expectation(root)) {
-        ReadObservation::Verified(value) => value,
+        ReadObservation::Verified(value) => *value,
         other => panic!("expected verified record: {other:?}"),
     }
 }

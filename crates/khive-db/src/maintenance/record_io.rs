@@ -173,7 +173,7 @@ fn read_bound(
 pub fn read_record(location: &RecordLocation, expectation: &ReadExpectation) -> ReadObservation {
     match read_bound(location, expectation) {
         Ok(None) => ReadObservation::Missing,
-        Ok(Some(record)) => ReadObservation::Verified(record),
+        Ok(Some(record)) => ReadObservation::Verified(Box::new(record)),
         Err(error) => ReadObservation::Rejected(error),
     }
 }

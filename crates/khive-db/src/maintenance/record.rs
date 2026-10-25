@@ -15,7 +15,7 @@ pub const MAX_PHASE_INTERVAL_MS: u64 = 86_400_000;
 #[derive(Debug)]
 pub enum ReadObservation {
     Missing,
-    Verified(Declaration),
+    Verified(Box<Declaration>),
     Rejected(RecordRefusal),
 }
 
