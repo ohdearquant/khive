@@ -1908,3 +1908,174 @@ publication/commit/checkpoint faults; delayed cleanup/unsupported GC; and later 
 and proposal routes. Controls must reach the relevant runtime boundary after a selected normal
 passes, then fail semantically rather than through an absent API or setup error. This docs-only
 proposal supplies no executable acceptance or native verdict and selects no option for activation.
+
+## Amendment 7 (2026-10-25): masking caller values echoed in refusals
+
+**Status**: Proposed.
+
+Originating issue(s): #5897
+
+Refusals echo the caller's rejected value so the caller can repair the request. Those echoes are
+masked through `RedactionSurface::GateProbe`, whose contract describes the kg `scan` preview, and
+the canonical masker flags a high-entropy token only near a credential trigger word. A refused value
+is masked on its own, with no surrounding text, so a bare high-entropy credential pasted into a
+refused parameter comes back unmasked. Prefixed credentials are caught by the context-free prefix
+detectors. This amendment gives refusal echoes their own named surfaces and a context-free entropy
+pass. Previews keep their current behavior.
+
+### Decision
+
+Caller-value refusal echoes use `RedactionSurface::RefusalEcho`. Opaque dynamic refusal diagnostics
+use `RedactionSurface::RefusalDiagnostic`. Scanner content, identity and location previews continue
+to use `GateProbe` and ordinary masking. Git ingestion, session mirroring and MCP transport
+diagnostics keep their current policies.
+
+Both new surfaces extend the exhaustive redaction contract of Amendment 2. Their mode is
+`PermanentMaskOnly`, and their final stored target, stamp property and atomic exemption-success
+event are all absent. They consume no manifest exemption or stored-UUID admission. Caller identity,
+namespace, verb and request arguments cannot select a weaker masking policy. This amendment also
+records the existing preview-only `GateProbe` row in the closed table, which Amendment 2 required
+for any surface beyond its first three.
+
+The refusal policy retains every ordinary detector match and adds a context-free entropy pass over
+the original bounded diagnostic input. Tokenization uses maximal ASCII non-whitespace runs, with
+ASCII whitespace and non-ASCII characters as delimiters. Each run supplies its delimiter-stripped
+view and its maximal ASCII alphanumeric inner runs as candidates. Delimiter stripping removes only
+double quote, single quote, backtick, colon, equals sign, comma and semicolon from the ends.
+
+A candidate of at least 24 ASCII bytes with Shannon entropy of at least 4.5 bits per byte is masked
+regardless of nearby trigger words. These are the existing `MIN_ENTROPY_LEN` and
+`ENTROPY_THRESHOLD`, with equality at the threshold counting as a match. The added pass applies no
+structured-identifier, path, name, revision or content-hash exemption. The ordinary detectors, their
+exemptions and their constants are unchanged. The added pass is independent of their early returns;
+it does not simulate a trigger and does not alter write admission.
+
+Ordinary and added spans are collected against the same original bounded text, overlaps are merged,
+and each connected span is replaced with the canonical redaction marker. Unmatched text remains
+visible. A match does not by itself erase the whole operand or diagnostic. Existing work-budget
+fail-closed behavior is retained. No new arbitrary substring search, off-trigger fragment
+reconstruction or escape decoding is introduced.
+
+Raw caller strings are rendered through `RefusalEcho` before quoting or interpolation. When a
+non-string operand is serialized for an error, that serialization is its masking input. Every
+repeated appearance, including appearances in nested causes, is protected. Constructed errors keep
+their template text, parameter names and authoritative accepted-value lists. Opaque dynamic causes
+use `RefusalDiagnostic`; trusted metadata comes from the actual schema or formatter and is never
+inferred from the error's spelling. A route whose opaque formatting cannot meet both requirements
+repairs that formatting boundary before it is accepted.
+
+Parameter validation stays with the parameter's existing parser. A valid unknown canonical UUID, a
+valid hex prefix and an ordinary RFC 3339 value may remain visible when neither pass matches: a
+lowercase canonical UUID has entropy of at most log2(17), about 4.09, and ordinary numeric
+timestamps use a similarly small alphabet. There is no generic typed-value bypass, caller-supplied
+validity flag or exemption based on record existence, and parsing a value does not suppress an
+ordinary match. Syntax does not prove secrecy: bare hex credentials and other values below the
+threshold remain explicit residuals, including in untyped operands. This policy neither activates
+nor modifies stored-UUID admission.
+
+At revision 415e1e86, outside the charter and moodboard sources, production code holds 97
+`GateProbe` mask calls: 84 caller-value operand echoes, 10 whole error texts and 3 preview calls.
+The 84 operand sites migrate to `RefusalEcho`. Whole-error sites that can be reconstructed move
+masking before caller-value interpolation; opaque causes and deserializer errors use
+`RefusalDiagnostic`. The knowledge atom validation helper, one mask call with both preview and error
+consumers, is split by consumer: slug and location previews keep ordinary masking, and the message
+consumer receives refusal masking. The inventory is refreshed after the refactor, and a shared
+helper's primary classification never stands in for its consumers' policy. Charter and moodboard
+sources are outside this migration.
+
+Both refusal entry points use Amendment 3's shared bounded-masking primitive, `mask_bounded`.
+`MASK_WINDOW_CHARS`, the rule that drops a whitespace token straddling the window, and the existing
+truncation disclosure are unchanged. A token crossing the window is dropped in full, and a single
+oversized token yields the truncation indication. Existing smaller output caps remain; otherwise the
+retained-content cap is `MASK_WINDOW_CHARS` under the primitive's existing marker convention. The
+added pass does not scan beyond the retained window or add unbounded preprocessing. A truncated
+fragment cannot count as a successfully validated typed value. Previews and stored masking surfaces
+gain no new truncation behavior.
+
+The policy is deterministic and adds no dependency, storage schema or wire error kind. Long
+legitimate names and paths may be masked in refusals: for example
+`QuarterlyBudgetReview_2026-10-25_East_XYZ` (41 bytes, entropy about 4.57) is masked, while
+`CustomerSupportEscalationRoutingPolicy_v2.7` (43 bytes, about 4.42) and a short enum typo such as
+`inbxo` stay visible. The error kind, parameter name and accepted-value list still explain the
+failure. The policy is bounded heuristic hygiene and does not guarantee detection of every secret.
+
+### Acceptance
+
+1. **Closed contract.** An exhaustive contract test exercises every surface. Both new variants and
+   `GateProbe` report permanent mask-only mode with no durable target, stamp or exemption-success
+   event, and the git and session targets stay exact. Masking cannot consult a manifest, perform
+   UUID admission, stamp a record or emit an exemption event. Ordinary dispatch audit activity is
+   not a masking effect.
+2. **Operand routes.** Every migrated production operand route is covered, with shared table-driven
+   tests where they fit. Each covers a synthetic prefixed credential, a bare value of 24 or more
+   characters above 4.5 bits per byte, and a benign typo suited to the parameter. Detected values
+   are absent and the canonical marker is present; the error kind, parameter name and accepted-value
+   list are unchanged. Shared callers are covered, including both comm projection consumers,
+   serialized rejected JSON operands and repeated appearances.
+3. **Executed red baseline.** Before implementation acceptance, a bare high-entropy projection-field
+   witness (for example `Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0` as an unknown `comm.inbox` `fields` member, 24
+   distinct characters, entropy log2(24), about 4.58) runs against
+   f689534b642d3dd421f65b6aa89e5a52293f989b and records its failure there, then passes on the
+   implementation. A prefixed-credential-only test, a source prediction or a disabled test does not
+   meet this requirement.
+4. **Other classes.** Reconstructed diagnostics, opaque deserializer errors and the atom validation
+   helper's message consumer assert the same prefixed and bare-value protection, benign typo
+   preservation and unchanged trusted metadata, including copies inside nested causes. Both scan
+   previews and the helper's preview consumers assert ordinary behavior for a prefixed credential, a
+   bare high-entropy value with no trigger, a benign typo and a canonical UUID: the bare off-trigger
+   preview stays visible when the ordinary scanner allows it. Paired trigger-bearing inputs keep
+   ordinary detector coverage.
+5. **Typed and residual witnesses.** A valid unknown `comm.thread` `after` UUID such as
+   `ffffffff-ffff-4fff-8fff-ffffffffffff` stays quoted and unmasked, with its current error kind and
+   wording. The wrong-kind UUID and valid-prefix witnesses are retained. Tests cover successful
+   shape validation followed by a semantic refusal, failed parses, appended credentials and
+   trigger-labeled lookalikes, and a UUID-shaped value in an untyped parameter proves it grants no
+   exemption from an actual detector match. The survival of an off-trigger synthetic 32-hex value is
+   pinned and disclosed, not presented as protected. Timestamp-shaped values are covered where a
+   route actually produces an echo.
+6. **Exact candidate rule.** Tests cover the 23-byte and 24-byte boundary with distinct-symbol
+   candidates, the inclusive entropy threshold, ASCII whitespace, non-ASCII delimiters, wrapping
+   punctuation, repeated and overlapping matches, punctuation and path carriers with high-entropy
+   inner runs, structured-identifier-shaped high-entropy inputs and the ordinary content-hash early
+   return. The long-name and path false positives above are asserted. Ordinary prefix, UUID and hex
+   trigger, reconstruction and context-sensitive regressions are retained; the added pass never
+   removes an existing mask.
+7. **Bounds.** Tests cover a candidate wholly inside the window, a token straddling its boundary, an
+   input with no whitespace longer than the window, UTF-8 at the boundary, and output-cap truncation
+   with its disclosure. No dropped prefix or unmasked tail reappears through formatting, a nested
+   cause or typed rendering. Retained-window scan and work bounds are verified with the existing
+   instrumentation.
+8. **Inventory closure.** A source-derived inventory lists the production uses of `GateProbe`,
+   `RefusalEcho`, `RefusalDiagnostic` and their wrappers. Each physical call and each shared-helper
+   consumer has a classification, an intended surface and an evidence pointer. A test compares the
+   discovered population with the reviewed inventory, not only with a fixed count, and fails on
+   missing, extra, duplicate, reclassified or policy-mismatched entries. Aliases, indirect surface
+   variables and wrapper consumers are covered by that check or disallowed outside inventoried
+   helpers, so a new refusal site cannot silently select the preview surface.
+9. **Scope isolation.** Write-scanner and admission behavior and ordinary preview policy are
+   unchanged, no storage or dependency requirement is added, and charter and moodboard sources are
+   unchanged. This amendment and the exhaustive contract declaration are accepted before the
+   implementation is accepted.
+
+### Alternatives considered
+
+- **Keep prefix detection and document bare-value leakage.** Rejected for refusal operands and
+  dynamic error text, because the isolated diagnostic boundary allows the added protection without
+  changing write admission. Retained for previews, with their existing heuristic limits.
+- **Make `GateProbe` strict everywhere, or add a defaulted strict flag.** Rejected: previews share
+  that variant, and a flag obscures the closed surface contract that Amendment 2 asks for. Named
+  surfaces make the policy choice reviewable at each call.
+- **A separate unregistered refusal masker.** Rejected: it hides a new policy from the exhaustive
+  contract and allows drift. Convenience helpers may delegate to the named surfaces.
+- **Strengthen only separately formatted operands.** Rejected: whole diagnostic strings and nested
+  causes can carry the same raw value.
+- **Mask every opaque diagnostic wholesale.** Rejected: parameter names, expected values and the
+  failure explanation must stay readable, so strict masking replaces detected spans only.
+- **Lower the length floor, force trigger context, keep the structured-identifier exemption, or
+  bypass masking after a successful parse.** Rejected. At a 4.5 threshold no string of 22 or fewer
+  symbols can qualify (log2(22) is about 4.46), so a lower floor would admit only 23-character
+  candidates without addressing short passwords or hex keys. Forcing trigger context changes the
+  UUID, hex and name detector families as well. The identifier exemption would preserve the escape
+  this pass closes, and a parse-based bypass confuses syntax with secrecy.
+- **Mask all previews, or every UUID-shaped or hex-shaped value.** Deferred. Each is a different
+  product tradeoff and needs its own decision; neither follows from a refusal-specific entropy rule.
