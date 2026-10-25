@@ -11,6 +11,14 @@ pub const MAX_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_CONFIG_ID_BYTES: usize = 8192;
 pub const MAX_PHASE_INTERVAL_MS: u64 = 86_400_000;
 
+/// A closed observation is evidence, never an admission or recovery decision.
+#[derive(Debug)]
+pub enum ReadObservation {
+    Missing,
+    Verified(Declaration),
+    Rejected(RecordRefusal),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecordRefusal {
     #[error("maintenance I/O: {0}")]
@@ -19,6 +27,8 @@ pub enum RecordRefusal {
     Wire(#[from] serde_json::Error),
     #[error("maintenance record refused: {0}")]
     Invalid(&'static str),
+    #[error("exact maintenance writer attribution is unsupported on this platform")]
+    UnsupportedAttribution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +244,89 @@ impl Declaration {
             _ => Err(invalid("failure code outside failed_closed")),
         }
     }
+}
+
+/// A participant is mandatory for public reads; prior bindings only tighten checks.
+#[derive(Debug, Clone)]
+pub struct ReadExpectation {
+    pub(super) participant: Option<PathBuf>,
+    epoch: Option<String>,
+    stores: Option<StoreSet>,
+    target: Option<TargetIdentity>,
+    coordinator: Option<CoordinatorIdentity>,
+}
+
+impl ReadExpectation {
+    pub fn participant(path: PathBuf) -> Result<Self, RecordRefusal> {
+        validate_file_path(&path)?;
+        Ok(Self {
+            participant: Some(path),
+            ..Self::writer()
+        })
+    }
+    pub fn with_epoch(mut self, epoch: String) -> Result<Self, RecordRefusal> {
+        validate_uuid(&epoch)?;
+        self.epoch = Some(epoch);
+        Ok(self)
+    }
+    pub fn with_stores(mut self, stores: StoreSet) -> Self {
+        self.stores = Some(stores);
+        self
+    }
+    pub fn with_target(mut self, target: TargetIdentity) -> Self {
+        self.target = Some(target);
+        self
+    }
+    pub fn with_coordinator(mut self, coordinator: CoordinatorIdentity) -> Self {
+        self.coordinator = Some(coordinator);
+        self
+    }
+    pub(super) fn writer() -> Self {
+        Self {
+            participant: None,
+            epoch: None,
+            stores: None,
+            target: None,
+            coordinator: None,
+        }
+    }
+    pub(super) fn check(&self, record: &Declaration, parent: &Path) -> Result<(), RecordRefusal> {
+        if record.stores.main().parent() != Some(parent)
+            || self
+                .participant
+                .as_ref()
+                .is_some_and(|p| !record.stores.paths().contains(p))
+            || self.epoch.as_ref().is_some_and(|v| v != record.epoch())
+            || self.stores.as_ref().is_some_and(|v| v != record.stores())
+            || self.target.as_ref().is_some_and(|v| v != record.target())
+            || self
+                .coordinator
+                .as_ref()
+                .is_some_and(|v| v != record.coordinator())
+        {
+            return Err(invalid("record location or expected binding mismatch"));
+        }
+        Ok(())
+    }
+}
+
+/// Coordinator identity is deliberately absent: the writer captures it itself.
+#[derive(Debug)]
+pub struct EpochDraft {
+    pub epoch: String,
+    pub stores: StoreSet,
+    pub target: TargetIdentity,
+    pub capability_digest: [u8; 32],
+    pub phase_started_unix_ms: u64,
+    pub phase_deadline_unix_ms: u64,
+}
+
+#[derive(Debug)]
+pub struct PhaseAdvance {
+    pub phase: Phase,
+    pub phase_started_unix_ms: u64,
+    pub phase_deadline_unix_ms: u64,
+    pub failure_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
