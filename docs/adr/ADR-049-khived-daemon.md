@@ -2306,10 +2306,13 @@ separate policy and is outside this procedure.
    inherited across exec or by child processes. The coordinator owns exclusive maintenance admission for the entire
    store set through snapshot, migration and readiness; only its capability for this epoch and store set passes the
    closed fence, and there is no general override. The coordinator starts the target daemon as its delegate and hands
-   it that capability at launch; the fence checks it against the declaration's epoch, store set and recorded target
-   identity. Under the coordinator's exclusive hold the fence admits the delegate's boot, migration and readiness
-   checks, and the events daemon the delegate supervises, and no other process. The capability ends at release. A
-   marker check without synchronized admission is insufficient.
+   it that capability at launch on an inherited descriptor, never in argv or the environment, which other processes
+   of the same user can read. The delegate marks the descriptor close-on-exec when it takes it, so a process the
+   delegate starts does not inherit it; the delegate hands it on, the same way, to the events daemon it supervises and
+   to no other process. The fence checks the capability against the declaration's epoch, store set and recorded
+   target identity. Under the coordinator's exclusive hold the fence admits the delegate's boot, migration and
+   readiness checks, and that events daemon, and no other process. The capability ends at release. A marker check
+   without synchronized admission is insufficient.
    Successful migration invalidates activity admission from old runtime generations, background work included, until
    the process has refreshed; a proved pre-mutation abort may keep the predecessor generation.
 3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
@@ -2344,9 +2347,14 @@ separate policy and is outside this procedure.
    verb description, as a client that listed tools before any install already does. Failure to validate or exec the target inhibits work; it
    does not authorize stale local dispatch.
 6. Declaration scope is independent of `HOME` and socket. All participating boot, local and CLI paths enforce it
-   before the recovery lock and before any store opens. Old binaries and external holders are inventoried and excluded or upgraded before the
-   coordinator declares the store set protected. An advisory protocol does not control processes that do not
-   participate in it. Existing daemon singleton claims remain distinct.
+   before the recovery lock and before any store opens. The procedure starts only from an installed executable that
+   already participates; an installation older than this amendment is first upgraded by the current install path,
+   outside these guarantees. Old binaries and external holders are inventoried before publication: each one found is
+   stopped by PID or upgraded, and the coordinator does not publish while one remains. A non-participant that holds a
+   store file at the holder check of the procedure ends the epoch before any snapshot, and the copy proves the
+   database and `-wal` unchanged across it. A non-participating process that starts during the window is not
+   controlled by an advisory protocol; that limit is stated, not closed. Existing daemon singleton claims remain
+   distinct.
 7. A failed drain aborts before migration. A failed or abandoned epoch remains closed until an explicit, proved
    recovery action. A pre-mutation abort may resume the validated old service; after mutation, recovery is forward
    repair or the existing offline restore of the paired stores and binary. Transparent PID-preserving offline rollback
@@ -2395,7 +2403,11 @@ fails on the code at the inspected revision unless stated otherwise.
   other than the epoch's coordinator each keep every entry closed and release no bridge. A `ready` receipt whose
   target identity does not match the installed path leaves the bridge inhibited, with no exec. During migration the
   delegate target daemon and its events daemon are admitted. A process of the same image started without the epoch
-  capability is refused.
+  capability is refused, and so is a child the delegate starts other than its events daemon; the capability appears
+  in neither the delegate's argv nor its environment.
+- **Old images and holders.** An old-image process found by the inventory keeps the coordinator from publishing
+  until it is stopped or upgraded, and a fixture non-participant holding a store file at the holder check ends the
+  epoch with no snapshot and no migration.
 - **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
   still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
   snapshot and no migration, while idle descriptors stay open.
