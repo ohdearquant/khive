@@ -21,6 +21,7 @@ pub use dispatch_trait::*;
 
 #[cfg(all(unix, feature = "fault-injection"))]
 pub use connection::handle_conn_for_test;
+#[cfg(unix)]
 use connection::*;
 
 #[cfg(unix)]

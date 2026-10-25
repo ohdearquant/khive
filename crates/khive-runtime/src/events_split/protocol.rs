@@ -58,6 +58,7 @@ pub enum EventsRequest {
     },
 }
 
+#[cfg(unix)]
 impl EventsRequest {
     pub(super) fn protocol_version(&self) -> u32 {
         match self {
