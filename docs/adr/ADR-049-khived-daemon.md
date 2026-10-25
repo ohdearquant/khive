@@ -2252,15 +2252,23 @@ Four facts at the inspected revision shape the decision:
 
 1. A bridge runs no WAL checkpoint task, schedule ticker or channel loop; those start only in the daemon role
    (`start_host_background_tasks` in `crates/khive-mcp/src/serve/startup.rs`, the checkpoint task in
-   `crates/khive-runtime/src/daemon/boot_guard.rs`). A bridge's only background store access is the observe-only
-   session sweep, which never checkpoints.
-2. A bridge whose executable was replaced re-execs in place after its next response, keeping its PID and stdio
+   `crates/khive-runtime/src/daemon/boot_guard.rs`). Its background work beside the stores is the session sweep
+   (`run_session_sweep_task` in `crates/khive-db/src/checkpoint/lifecycle.rs`), which never checkpoints and opens no
+   SQLite transaction but writes the process's WAL-pin beacon file beside the database on every tick. A bridge also
+   holds the events database open writable in direct mode, because only daemon hosts switch the event plane to
+   socket forwarding (`enable_events_forwarding_for_daemon` in `crates/khive-mcp/src/serve/runtime_config.rs`); its
+   audit batch appends only rows that local dispatch submits (`crates/khive-runtime/src/audit_batch.rs`).
+2. A bridge checks its executable's identity on each `request` call before dispatch
+   (`crates/khive-mcp/src/server/bridge.rs`); `tools/list` does not run the check. A bridge whose executable was
+   replaced returns a retryable error and re-execs in place after that response, keeping its PID and stdio
    descriptors, on every install (`arm_executable_self_heal` in `crates/khive-mcp/src/daemon/self_heal.rs`). Only a
    protocol mismatch seen by an already resumed bridge takes the drain-and-exit path.
 3. A re-exec'd or newly started bridge runs the ordinary boot before it serves: it opens the configured backends,
-   prepares the core schema, runs the attachment cutover and applies pack schema plans
-   (`crates/khive-mcp/src/serve/runtime_config.rs`, `crates/khive-mcp/src/server/pack_setup.rs`). Boot is not
-   migration-free, so a boot inside the window would migrate or read stores mid-procedure.
+   prepares the core schema, runs the attachment cutover, applies pack schema plans in write transactions and
+   registers the configured embedding models (`crates/khive-mcp/src/serve/runtime_config.rs`,
+   `crates/khive-mcp/src/server/pack_setup.rs`, `crates/khive-runtime/src/config.rs`). Boot is neither
+   migration-free nor write-free, so a boot inside the window would migrate or write stores mid-procedure, and
+   bridges that refresh together after release serialize on those writes.
 4. A connection pool closes its writable connection last so that SQLite can checkpoint on close
    (`impl Drop for ConnectionPool` in `crates/khive-db/src/pool.rs`). A process that holds the last open connection to
    a store rewrites the database file and removes the `-wal` when it exits.
@@ -2277,30 +2285,38 @@ separate policy and is outside this procedure.
    rendezvous never authorize local store access or daemon spawning while an epoch is closed.
 2. Publication closes admission to new boot and local store work. Work admitted beforehand must settle under tracked
    activity leases before the coordinator certifies quiescence. Leases cover actual asynchronous completion and
-   non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's observe-only session
-   sweep is either taken under a lease or stopped while the epoch is closed; a read-only sweep is not exempted
-   silently. The coordinator owns exclusive maintenance admission for the entire store set through snapshot,
+   non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's session sweep, which
+   writes its WAL-pin beacon, is either taken under a lease or stopped while the epoch is closed; it is not exempted
+   as read-only. The coordinator owns exclusive maintenance admission for the entire store set through snapshot,
    migration and readiness. A marker check without synchronized admission is insufficient.
 3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
    carrying the epoch and phase within caller budgets. They do not execute local fallback or local `save_to`, refresh
-   a mounted catalog from stores, enter degraded bootstrap, or spawn a daemon. Process-only diagnostics may continue.
-   Cold clients wait before opening any configured store; there is no fabricated temporary tool catalog.
+   a mounted catalog from stores, enter degraded bootstrap, or spawn a daemon. Process-only diagnostics may continue,
+   and `tools/list` answers from the catalog already in memory. While an epoch is closed a bridge returns the
+   maintenance error before its executable-identity check and arms no exec, so an installation inside the window
+   cannot start a boot of the new image before release. Cold clients wait before opening any configured store; there
+   is no fabricated temporary tool catalog.
 4. This procedure permits existing idle connections only for a certified same-file WAL migration. Certification
    covers the exact migration range, pack plans, boot repairs and associated files. Changing journal mode or page
    size, replacing or unlinking a live database, `-wal` or `-shm`, and offline restore are excluded. The snapshot is a
    transaction-quiescent, complete store-set copy plus a restore proof with the previous binary; an online backup of
    one database is not a substitute for that proof. From quiescence through the end of the copy the coordinator
    holds an open connection on every store in the set, so that no client exiting in that interval can run a
-   close-time checkpoint, and the copy proves each database and `-wal` unchanged across it.
+   close-time checkpoint, and the copy proves each database and `-wal` unchanged across it. The copy is then frozen
+   read-only, as read-only inspection requires (it refuses a writable `-shm`; `read_only_wal_open_target_for_path` in
+   `crates/khive-db/src/pool/connection_setup.rs`), and the restore proof runs on a writable copy of it. An idle
+   connection holds no WAL read mark, so it does not block the target daemon's open-time checkpoint under a
+   configured WAL ceiling; a read transaction does, and it is covered by a lease.
 5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
    schema, configuration and protocol readiness, and leaves a completed epoch and target receipt. Before any
    stale-runtime store-sensitive work, a bridge observes that receipt and validates the installed executable's
    identity without the ordinary throttle. A changed image uses the existing response-triggered in-place exec and
    resumed handshake mode. No asynchronous park or resume exec is introduced, and the ordinary protocol-mismatch loop
-   breaker remains unchanged. Failure to validate or exec the target inhibits work; it does not authorize stale local
-   dispatch.
+   breaker remains unchanged. A `tools/list` answered before the refresh carries the previous image's tool list and
+   verb description, as a client that listed tools before any install already does. Failure to validate or exec the target inhibits work; it
+   does not authorize stale local dispatch.
 6. Declaration scope is independent of `HOME` and socket. All participating boot, local and CLI paths enforce it
-   before stores open. Old binaries and external holders are inventoried and excluded or upgraded before the
+   before the recovery lock and before any store opens. Old binaries and external holders are inventoried and excluded or upgraded before the
    coordinator declares the store set protected. An advisory protocol does not control processes that do not
    participate in it. Existing daemon singleton claims remain distinct.
 7. A failed drain aborts before migration. A failed or abandoned epoch remains closed until an explicit, proved
@@ -2319,10 +2335,11 @@ separate policy and is outside this procedure.
 4. Stop the old daemon and events daemon by PID. Bridges stay running.
 5. Refuse to continue while any process outside the participants holds a store file.
 6. Open the coordinator's connections, copy every database, `-wal` and `-shm` and every vector index directory of the
-   set, and prove the database and `-wal` files unchanged across the copy.
-7. Prove the copy restores with the previous binary.
+   set, prove the database and `-wal` files unchanged across the copy, and freeze the copy read-only.
+7. Prove that a writable copy of the snapshot restores with the previous binary.
 8. Install the new executable atomically.
-9. Start the target daemon, which migrates in place, and verify readiness.
+9. Start the target daemon, which migrates the configured backends in place and starts the events daemon, which
+   prepares the events schema before it accepts traffic, and verify readiness.
 10. Release, leaving the completed-epoch receipt.
 
 ### Acceptance
@@ -2335,7 +2352,8 @@ fails on the code at the inspected revision unless stated otherwise.
   read, a mutating call and a `save_to` call through one live bridge each return the maintenance error within budget,
   with no local result, no saved file and no new daemon PID; user data in the stores is unchanged. After release the
   next call succeeds on the new image under the same bridge PID and pipes. A second install on the same PID behaves
-  the same way. The repeated-identity exec alone works today and is a control.
+  the same way. An executable installed while the epoch is closed starts no exec before release. The
+  repeated-identity exec alone works today and is a control.
 - **Check-then-open races.** A cold boot paused just before its first SQLite open, and a warm local or `save_to` call
   paused just before store-work admission, do not cross a declaration published while they are paused. The
   coordinator cannot certify quiescence while a lease admitted earlier is outstanding.
@@ -2349,13 +2367,17 @@ fails on the code at the inspected revision unless stated otherwise.
   expected counts, and the source migrates without closing those descriptors. A fixture migration that changes the
   journal mode, and one that replaces a store file, is refused before the source is touched. A fixture client that
   exits during the copy holding what would otherwise be the last connection leaves the copied database and `-wal`
-  consistent.
+  consistent. The frozen copy passes read-only inspection. With a WAL ceiling configured and the WAL over it, the
+  target daemon's open-time checkpoint succeeds while idle bridge descriptors are held.
 - **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
   budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
   named retryable inhibition, with no grace-time fallback and no spawn.
 - **Release receipt and throttle.** A resumed bridge idle for the whole window, released inside the ordinary identity
-  throttle interval, checks the target on its first store-sensitive call, `tools/list` included, and refreshes by the
-  identity exec, not by drain-and-exit, with no new MCP `initialize`.
+  throttle interval, checks the target on its first `request` call and refreshes by the identity exec, not by
+  drain-and-exit, with no new MCP `initialize`. A `tools/list` before that call returns without an error and without
+  a store read.
+- **Refresh after release.** Several resumed bridges released together each complete the refresh, and the elapsed
+  time and writer waits of their boots are recorded. This is a measurement, not a test that fails today.
 
 Compatibility controls, which need not fail today: with no declaration, forwarding, strictness configuration,
 permitted no-socket fallback, local `save_to` manifests, in-memory operation, configuration identity, catalog
