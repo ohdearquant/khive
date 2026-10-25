@@ -2224,3 +2224,165 @@ semantics, timeouts, configured modes, full discovery and mount visibility are u
 The docs-only proposal carries no implementation or executed acceptance. Independent spec review
 and approval through the designated specification gate are required before dependent
 implementation merges; a merged Proposed text does not itself grant that acceptance.
+
+## Amendment 16 (2026-10-25): declared store maintenance with responsive stdio bridges
+
+**Status**: Proposed. **Disposition**: amends Decision §2's fallback rules, and the no-socket outcomes of Amendment
+14 Decision 2, for the time a declared maintenance epoch is closed, for #6063. The base ADR remains Accepted. This
+amendment neither accepts Amendment 15 nor restores the lazy registry that Amendment 14 withdrew, and it adds no pack
+metadata API and no mounted-catalog contract. Dependent implementation does not merge before this amendment's
+acceptance gate.
+
+**Origin**: the measurement of stdio bridges across the store-migrating upgrade of 2026-10-24, recorded in #6063,
+and the interim operator procedure decided after it. It is an engineering decision drawn from that measurement; no
+product-owner instruction prompted it.
+
+### Context
+
+An upgrade whose new build migrates the stores cannot use the in-place path a protocol bump uses. The daemon is
+stopped for a snapshot and the migration. A request that reaches a running stdio bridge in that window takes the
+no-socket path, where it may spawn a daemon or, with strict mode unset and no rendezvous on disk, dispatch locally
+against the stores being migrated. The supervisor marker (ADR-185 Amendment 1) already holds a client for up to three
+restart intervals with no spawn and no local dispatch (measured in #6063). Every running bridge, however, opens the
+configured stores read-write at boot and keeps them open while it only forwards. A procedure that requires no process
+to hold a store file therefore stops every bridge, and an MCP client that does not restart its stdio server needs a
+manual reconnect.
+
+Four facts at the inspected revision shape the decision:
+
+1. A bridge runs no WAL checkpoint task, schedule ticker or channel loop; those start only in the daemon role
+   (`start_host_background_tasks` in `crates/khive-mcp/src/serve/startup.rs`, the checkpoint task in
+   `crates/khive-runtime/src/daemon/boot_guard.rs`). A bridge's only background store access is the observe-only
+   session sweep, which never checkpoints.
+2. A bridge whose executable was replaced re-execs in place after its next response, keeping its PID and stdio
+   descriptors, on every install (`arm_executable_self_heal` in `crates/khive-mcp/src/daemon/self_heal.rs`). Only a
+   protocol mismatch seen by an already resumed bridge takes the drain-and-exit path.
+3. A re-exec'd or newly started bridge runs the ordinary boot before it serves: it opens the configured backends,
+   prepares the core schema, runs the attachment cutover and applies pack schema plans
+   (`crates/khive-mcp/src/serve/runtime_config.rs`, `crates/khive-mcp/src/server/pack_setup.rs`). Boot is not
+   migration-free, so a boot inside the window would migrate or read stores mid-procedure.
+4. A connection pool closes its writable connection last so that SQLite can checkpoint on close
+   (`impl Drop for ConnectionPool` in `crates/khive-db/src/pool.rs`). A process that holds the last open connection to
+   a store rewrites the database file and removes the `-wal` when it exits.
+
+The numbered SQL migrations at the inspected revision change no journal mode or page size and run no VACUUM or
+checkpoint. The code-map store's DELETE-journal transition (`crates/khive-db/src/code_map_vfs/transition.rs`) is a
+separate policy and is outside this procedure.
+
+### Decision
+
+1. A declared maintenance epoch is a hard admission fence over an explicit canonical physical-store set, including
+   configured secondary databases and derived event stores. It is distinct from the supervisor boot marker and its
+   elapsed-grace behavior. Expiry, owner death, `KHIVE_NO_DAEMON`, non-strict configuration and absence of a
+   rendezvous never authorize local store access or daemon spawning while an epoch is closed.
+2. Publication closes admission to new boot and local store work. Work admitted beforehand must settle under tracked
+   activity leases before the coordinator certifies quiescence. Leases cover actual asynchronous completion and
+   non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's observe-only session
+   sweep is either taken under a lease or stopped while the epoch is closed; a read-only sweep is not exempted
+   silently. The coordinator owns exclusive maintenance admission for the entire store set through snapshot,
+   migration and readiness. A marker check without synchronized admission is insufficient.
+3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
+   carrying the epoch and phase within caller budgets. They do not execute local fallback or local `save_to`, refresh
+   a mounted catalog from stores, enter degraded bootstrap, or spawn a daemon. Process-only diagnostics may continue.
+   Cold clients wait before opening any configured store; there is no fabricated temporary tool catalog.
+4. This procedure permits existing idle connections only for a certified same-file WAL migration. Certification
+   covers the exact migration range, pack plans, boot repairs and associated files. Changing journal mode or page
+   size, replacing or unlinking a live database, `-wal` or `-shm`, and offline restore are excluded. The snapshot is a
+   transaction-quiescent, complete store-set copy plus a restore proof with the previous binary; an online backup of
+   one database is not a substitute for that proof. From quiescence through the end of the copy the coordinator
+   holds an open connection on every store in the set, so that no client exiting in that interval can run a
+   close-time checkpoint, and the copy proves each database and `-wal` unchanged across it.
+5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
+   schema, configuration and protocol readiness, and leaves a completed epoch and target receipt. Before any
+   stale-runtime store-sensitive work, a bridge observes that receipt and validates the installed executable's
+   identity without the ordinary throttle. A changed image uses the existing response-triggered in-place exec and
+   resumed handshake mode. No asynchronous park or resume exec is introduced, and the ordinary protocol-mismatch loop
+   breaker remains unchanged. Failure to validate or exec the target inhibits work; it does not authorize stale local
+   dispatch.
+6. Declaration scope is independent of `HOME` and socket. All participating boot, local and CLI paths enforce it
+   before stores open. Old binaries and external holders are inventoried and excluded or upgraded before the
+   coordinator declares the store set protected. An advisory protocol does not control processes that do not
+   participate in it. Existing daemon singleton claims remain distinct.
+7. A failed drain aborts before migration. A failed or abandoned epoch remains closed until an explicit, proved
+   recovery action. A pre-mutation abort may resume the validated old service; after mutation, recovery is forward
+   repair or the existing offline restore of the paired stores and binary. Transparent PID-preserving offline rollback
+   is not promised.
+8. With no declaration and no migrating upgrade, current boot, catalogs, fallback, `save_to`, in-memory operation and
+   daemon recovery semantics remain unchanged. The existing risk that response-triggered self-heal loses a pipelined
+   stdin frame is documented separately; this amendment does not claim a lossless transport handoff.
+
+### Procedure order
+
+1. Publish the declaration for the store set.
+2. Drill a cold client: it waits and spawns nothing.
+3. Drain activity leases until quiescence is certified.
+4. Stop the old daemon and events daemon by PID. Bridges stay running.
+5. Refuse to continue while any process outside the participants holds a store file.
+6. Open the coordinator's connections, copy every database, `-wal` and `-shm` and every vector index directory of the
+   set, and prove the database and `-wal` files unchanged across the copy.
+7. Prove the copy restores with the previous binary.
+8. Install the new executable atomically.
+9. Start the target daemon, which migrates in place, and verify readiness.
+10. Release, leaving the completed-epoch receipt.
+
+### Acceptance
+
+These are obligations for the implementation, run in Linux CI with fixture binaries, a temporary `HOME` and
+temporary stores, explicit test barriers instead of sleeps, and process identity read from `/proc/<pid>/exe`. Each
+fails on the code at the inspected revision unless stated otherwise.
+
+- **Responsive bridge across the window, then two installs.** With a declaration closed and the daemon stopped, a
+  read, a mutating call and a `save_to` call through one live bridge each return the maintenance error within budget,
+  with no local result, no saved file and no new daemon PID; user data in the stores is unchanged. After release the
+  next call succeeds on the new image under the same bridge PID and pipes. A second install on the same PID behaves
+  the same way. The repeated-identity exec alone works today and is a control.
+- **Check-then-open races.** A cold boot paused just before its first SQLite open, and a warm local or `save_to` call
+  paused just before store-work admission, do not cross a declaration published while they are paused. The
+  coordinator cannot certify quiescence while a lease admitted earlier is outstanding.
+- **Every entry point.** Two backends plus a derived events store; a second bridge with a different socket and `HOME`
+  over the same physical stores; local `exec`; direct events and admin paths. Every store-dependent entry waits or
+  refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
+- **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
+  still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
+  snapshot and no migration, while idle descriptors stay open.
+- **Snapshot and migration classes.** With idle bridge connections held, the copy restores with integrity and
+  expected counts, and the source migrates without closing those descriptors. A fixture migration that changes the
+  journal mode, and one that replaces a store file, is refused before the source is touched. A fixture client that
+  exits during the copy holding what would otherwise be the last connection leaves the copied database and `-wal`
+  consistent.
+- **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
+  budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
+  named retryable inhibition, with no grace-time fallback and no spawn.
+- **Release receipt and throttle.** A resumed bridge idle for the whole window, released inside the ordinary identity
+  throttle interval, checks the target on its first store-sensitive call, `tools/list` included, and refreshes by the
+  identity exec, not by drain-and-exit, with no new MCP `initialize`.
+
+Compatibility controls, which need not fail today: with no declaration, forwarding, strictness configuration,
+permitted no-socket fallback, local `save_to` manifests, in-memory operation, configuration identity, catalog
+filtering and protocol-mismatch loop breaking are unchanged. A deterministic two-frame pipelining probe runs against
+the base and the candidate; any loss on the base is recorded, and a loss only on the candidate blocks the change.
+
+### Alternatives considered
+
+1. **Polling only, with no activity barrier.** A process can pass its check just before the declaration and then open
+   or migrate a store, and work submitted earlier can still be running. It cannot justify the copy boundary.
+2. **A permanently store-free forwarding bridge.** Static handler metadata does not describe mounted packs, replay
+   trust, `save_to` or local fallback. Removing fallback changes behavior without a declaration; lazy fallback brings
+   back the descriptors this design would avoid. The lazy registry was withdrawn in Amendment 14.
+3. **A client-lifetime fence with an exec into a parked host and a resume exec.** It reaches zero descriptors, which
+   an in-place WAL migration does not need, at the cost of transport buffering, child cleanup, a parked catalog and two
+   execs per window.
+4. **Stopping every bridge with SIGSTOP.** Open descriptors are tolerated, but a stopped bridge cannot answer with a
+   budgeted error, may be frozen inside a transaction, and does not hold back a client that starts afterwards.
+
+### Out of scope
+
+A lossless stdin handoff across exec; PID-preserving offline rollback; migrations outside the certified same-file
+WAL class; control over processes that do not participate; any change to Amendment 15.
+
+### Scope and acceptance status
+
+The docs-only proposal carries no implementation or executed acceptance. Before use, the snapshot step needs a
+measured restore on the target filesystem with idle descriptors held. Independent spec review and approval through
+the designated specification gate are required before dependent implementation merges; a merged Proposed text does
+not itself grant that acceptance.
