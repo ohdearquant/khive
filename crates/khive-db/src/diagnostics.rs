@@ -73,7 +73,9 @@ mod writer_contention;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
@@ -351,6 +353,7 @@ pub struct WalPinCensusProcessStart {
     pub process_start_time_unavailable_reason: Option<String>,
 }
 
+#[cfg(unix)]
 fn census_process_start_times(holder_pids: &[u32]) -> Vec<WalPinCensusProcessStart> {
     holder_pids
         .iter()
@@ -431,6 +434,7 @@ pub enum WalPinCensus {
 /// misbehaved. Describing both as "truncated" would make the report cry wolf
 /// on every bounded call, which is how the sentence that matters stops being
 /// read.
+#[cfg(any(unix, test))]
 fn census_truncation_cause(budget_exhausted: bool) -> String {
     if budget_exhausted {
         "the OS process walk stopped at its wall-clock budget (see          collection_cost.wal_pin_census_budget_ms)"
