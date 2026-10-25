@@ -2282,13 +2282,27 @@ separate policy and is outside this procedure.
 1. A declared maintenance epoch is a hard admission fence over an explicit canonical physical-store set, including
    configured secondary databases and derived event stores. It is distinct from the supervisor boot marker and its
    elapsed-grace behavior. Expiry, owner death, `KHIVE_NO_DAEMON`, non-strict configuration and absence of a
-   rendezvous never authorize local store access or daemon spawning while an epoch is closed.
+   rendezvous never authorize local store access or daemon spawning while an epoch is closed. The store set is
+   derived from the resolved configuration: the main database, each configured backend database and the derived
+   events database, each by canonical path. The declaration is one record per store set, kept beside the main
+   database, created owner-only and replaced atomically. It carries an opaque epoch; its phase (`closing`,
+   `quiescent`, `migrating`, `ready`, or a failed state that stays closed); the store set; the target installation's
+   identity and configuration; owner evidence; and bounded phase deadlines. A participant treats a record it cannot
+   parse, or one that is not owner-only, as a closed epoch, never as an absent one. The trust boundary is the user
+   that owns the stores: a process running as that user can already open the stores directly.
 2. Publication closes admission to new boot and local store work. Work admitted beforehand must settle under tracked
    activity leases before the coordinator certifies quiescence. Leases cover actual asynchronous completion and
    non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's session sweep, which
    writes its WAL-pin beacon, is either taken under a lease or stopped while the epoch is closed; it is not exempted
-   as read-only. The coordinator owns exclusive maintenance admission for the entire store set through snapshot,
-   migration and readiness. A marker check without synchronized admission is insufficient.
+   as read-only. Each participant takes a per-store shared admission lease before boot or local store work and reads
+   the declaration while holding it, so a check cannot be separated from the open it admits. The coordinator
+   publishes `closing`, waits for the leases admitted earlier to drain, then takes the set exclusively in canonical
+   path order. Leases have operating-system lifetime semantics, so a process that dies releases them, and they are not
+   inherited across exec or by child processes. The coordinator owns exclusive maintenance admission for the entire
+   store set through snapshot, migration and readiness; only its capability for this epoch and store set passes the
+   closed fence, and there is no general override. A marker check without synchronized admission is insufficient.
+   Successful migration invalidates activity admission from old runtime generations, background work included, until
+   the process has refreshed; a proved pre-mutation abort may keep the predecessor generation.
 3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
    carrying the epoch and phase within caller budgets. They do not execute local fallback or local `save_to`, refresh
    a mounted catalog from stores, enter degraded bootstrap, or spawn a daemon. Process-only diagnostics may continue,
@@ -2310,7 +2324,10 @@ separate policy and is outside this procedure.
 5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
    schema, configuration and protocol readiness, and leaves a completed epoch and target receipt. Before any
    stale-runtime store-sensitive work, a bridge observes that receipt and validates the installed executable's
-   identity without the ordinary throttle. A changed image uses the existing response-triggered in-place exec and
+   identity without the ordinary throttle. Identity is the existing device-and-inode identity (modification time where no
+   inode is reported) of the path the bridge started from (`BridgeExecutable` in `crates/khive-mcp/src/daemon/executable.rs`); the receipt records the target's
+   identity at that path, the bridge execs only when the installed path matches it, and the exec target is always
+   that path, never a value carried in a message. A changed image uses the existing response-triggered in-place exec and
    resumed handshake mode. No asynchronous park or resume exec is introduced, and the ordinary protocol-mismatch loop
    breaker remains unchanged. A `tools/list` answered before the refresh carries the previous image's tool list and
    verb description, as a client that listed tools before any install already does. Failure to validate or exec the target inhibits work; it
@@ -2360,6 +2377,9 @@ fails on the code at the inspected revision unless stated otherwise.
 - **Every entry point.** Two backends plus a derived events store; a second bridge with a different socket and `HOME`
   over the same physical stores; local `exec`; direct events and admin paths. Every store-dependent entry waits or
   refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
+- **Declaration record.** A record that cannot be parsed, and one that is not owner-only, each keep every entry
+  closed. A `ready` receipt whose target identity does not match the installed path leaves the bridge inhibited, with
+  no exec.
 - **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
   still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
   snapshot and no migration, while idle descriptors stay open.
