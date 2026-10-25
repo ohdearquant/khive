@@ -2288,7 +2288,9 @@ separate policy and is outside this procedure.
    the main database, owned by the user that owns the stores, created owner-only and replaced atomically. It carries
    an opaque epoch; its phase (`closing`, `quiescent`, `migrating`, `ready`, or a failed state that stays closed);
    the store set; the target installation's identity and configuration; owner evidence; and bounded phase deadlines.
-   The release receipt is the same record in its `ready` phase, at the same location. The coordinator is the single
+   The coordinator writes `ready` only at release (procedure step 11), after the target's readiness has been verified
+   while the record still reads `migrating`. `ready` is the only phase that opens admission, and that record, kept at
+   the same location until the next epoch's declaration replaces it, is the release receipt. The coordinator is the single
    writer: it publishes the record, advances its phases and writes the receipt, and the owner evidence names it. A
    declaration or receipt from any other writer, or one a participant cannot attribute to its epoch's coordinator, is
    refused: it neither opens admission nor releases a bridge, and the participant stays closed and reports it. A
@@ -2302,13 +2304,19 @@ separate policy and is outside this procedure.
    as read-only. Each participant takes a per-store shared admission lease before boot or local store work and reads
    the declaration while holding it, so a check cannot be separated from the open it admits. The coordinator
    publishes `closing`, waits for the leases admitted earlier to drain, then takes the set exclusively in canonical
-   path order. Leases have operating-system lifetime semantics, so a process that dies releases them, and they are not
-   inherited across exec or by child processes. The coordinator owns exclusive maintenance admission for the entire
+   path order. Leases have operating-system lifetime semantics, so a process that dies releases them. A lock held
+   through an open file description is shared with a child forked from its holder, so each lease descriptor is
+   created close-on-exec and a process holding a lease starts other processes only by spawning a new image: a child
+   carries the descriptor only until its own exec, so a lease ends with its holder, or at the latest when a child the
+   holder was starting at that moment execs.
+   The coordinator owns exclusive maintenance admission for the entire
    store set through snapshot, migration and readiness; only its capability for this epoch and store set passes the
    closed fence, and there is no general override. The coordinator starts the target daemon as its delegate and hands
    it that capability at launch on an inherited descriptor, never in argv, which process listings show, or in the
    environment, which every child inherits. The coordinator creates the descriptor close-on-exec and clears that flag
-   only inside the delegate's own spawn, so no other process it starts receives it. The delegate marks it
+   only in the delegate's child, after the child is created and before its exec. The coordinator's own descriptor
+   never loses the flag, so a process started from another coordinator thread at the same moment does not receive it,
+   and neither does any other process the coordinator starts. The delegate marks it
    close-on-exec again before it starts any thread or process, and it starts processes only by spawning a new image,
    so a process the delegate starts does not inherit it; the delegate hands it on, the same way, to the events daemon
    it supervises and to no other process. The fence checks the capability against the declaration's epoch, store set
@@ -2340,7 +2348,8 @@ separate policy and is outside this procedure.
    connection holds no WAL read mark, so it does not block the target daemon's open-time checkpoint under a
    configured WAL ceiling; a read transaction does, and it is covered by a lease.
 5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
-   schema, configuration and protocol readiness, and leaves a completed epoch and target receipt. Before any
+   schema, configuration and protocol readiness, and leaves the `ready` receipt of Decision 1, which records the
+   completed epoch and the target. Before any
    stale-runtime store-sensitive work, a bridge observes that receipt and validates the installed executable's
    identity without the ordinary throttle. Identity is the existing device-and-inode identity (modification time where no
    inode is reported) of the path the bridge started from (`BridgeExecutable` in `crates/khive-mcp/src/daemon/executable.rs`); the receipt records the target's
@@ -2377,15 +2386,16 @@ separate policy and is outside this procedure.
    certified.
 5. Stop the old daemon and events daemon by PID. Bridges stay running, and the coordinator's open connections keep
    either exit from running a close-time checkpoint.
-6. Refuse to continue while any process outside the participants holds a store file.
+6. If any process outside the participants holds a store file, end the epoch in a failed state, which stays closed
+   until an explicit, proved recovery action (Decision 7); take no snapshot and run no migration.
 7. Copy every database, `-wal` and `-shm` and every vector index directory of the set, prove the database and `-wal`
    files unchanged across the copy, and freeze the copy read-only.
 8. Prove that a writable copy of the snapshot restores with the previous binary.
 9. Install the new executable atomically.
 10. Start the target daemon as the coordinator's delegate, holding the epoch capability. It migrates the configured
     backends in place and starts the events daemon, which prepares the events schema before it accepts traffic.
-    Verify readiness.
-11. Release, leaving the completed-epoch receipt, and close the coordinator's connections.
+    Verify readiness while the record still reads `migrating`.
+11. Release by writing the `ready` receipt, then close the coordinator's connections.
 
 ### Acceptance
 
@@ -2407,11 +2417,14 @@ fails on the code at the inspected revision unless stated otherwise.
   refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
 - **Declaration record.** A record that cannot be parsed, one that is not owner-only, and one written by a process
   other than the epoch's coordinator each keep every entry closed and release no bridge. A `ready` receipt whose
-  target identity does not match the installed path leaves the bridge inhibited, with no exec. During migration the
+  target identity does not match the installed path leaves the bridge inhibited, with no exec. A record that still
+  reads `migrating` after the target's readiness checks pass keeps every entry closed and releases no bridge, and the
+  `ready` record written at release opens admission. During migration the
   delegate target daemon and its events daemon are admitted. A process of the same image started without the epoch
   capability is refused, and so is a child the delegate starts other than its events daemon, including one started
   at the earliest point the delegate's startup allows; a process the coordinator starts other than the delegate holds
-  no capability descriptor; the capability appears in neither the delegate's argv nor its environment.
+  no capability descriptor, including one started from another coordinator thread while the delegate spawns; the
+  capability appears in neither the delegate's argv nor its environment.
 - **Old images and holders.** An old-image process found by the inventory (step 1) keeps the coordinator from
   publishing until it is stopped or upgraded, and a fixture non-participant holding a store file at the holder check
   (step 6) ends the epoch with no snapshot and no migration.
@@ -2427,7 +2440,9 @@ fails on the code at the inspected revision unless stated otherwise.
   target daemon's open-time checkpoint succeeds while idle bridge descriptors are held.
 - **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
   budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
-  named retryable inhibition, with no grace-time fallback and no spawn.
+  named retryable inhibition, with no grace-time fallback and no spawn. A lease holder killed while a child it
+  started is still running leaves no lease held: the child carries no lease descriptor, and the coordinator
+  certifies quiescence without waiting on that child.
 - **Release receipt and throttle.** A resumed bridge idle for the whole window, released inside the ordinary identity
   throttle interval, checks the target on its first `request` call and refreshes by the identity exec, not by
   drain-and-exit, with no new MCP `initialize`. A `tools/list` before that call returns without an error and without
