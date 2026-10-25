@@ -139,6 +139,68 @@ def _v1_entry(data: dict[str, Any], root: pathlib.Path) -> Entry:
     return Entry(commit, date, tuple(rows))
 
 
+def _same_metric_value(left: Any, right: Any) -> bool:
+    """Compare JSON payloads without bool/number equality or float coercion."""
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        return (
+            isinstance(right, (int, float))
+            and not isinstance(right, bool)
+            and left == left and right == right
+            and left not in (float("inf"), float("-inf"))
+            and right not in (float("inf"), float("-inf"))
+            and left == right
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_metric_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_metric_value(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _validate_v2_benches(
+    raw: Any, candidates: dict[str, list[tuple[str, str, Any]]]
+) -> None:
+    """Check an optional legacy mirror; target entries remain authoritative."""
+    for benchmark, raw_record in _require_mapping(raw, "benches").items():
+        where = f"benches[{benchmark!r}]"
+        record = _require_mapping(raw_record, where)
+        target = _require_string(record["target"], f"{where}.target") if "target" in record else None
+        metric = _require_string(record["metric"], f"{where}.metric") if "metric" in record else None
+        matches = [
+            (name, key, value) for name, key, value in candidates.get(benchmark, [])
+            if (target is None or name == target) and (metric is None or key == metric)
+        ]
+        if len(matches) != 1:
+            raise RenderError(
+                f"{where} must match exactly one target/scenario/metric entry; found {len(matches)}"
+            )
+        target, metric, canonical = matches[0]
+        canonical = _require_mapping(canonical, f"{where} canonical metric")
+        payload = {
+            key: value for key, value in record.items()
+            if key not in ("target", "window", "clock_khz_median")
+        }
+        # The renderer already checks the selected metric. Its copied arm
+        # readings also need number checks, including booleans and finiteness.
+        for label, value in ((where, payload), (f"{where} canonical metric", canonical)):
+            for arm in ("a", "b"):
+                if arm in value:
+                    readings = _require_mapping(value[arm], f"{label}.{arm}")
+                    for field in ("median_ns", "ci_lo_ns", "ci_hi_ns", "value"):
+                        if field in readings:
+                            _require_number(readings[field], f"{label}.{arm}.{field}")
+        if not _same_metric_value(payload, canonical):
+            raise RenderError(
+                f"{where} differs from target {target!r}, scenario {benchmark!r}, metric {metric!r}"
+            )
+
+
 def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
     targets = data.get("targets")
     if not isinstance(targets, (dict, list)):
@@ -153,6 +215,7 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
         )
 
     entries: list[Entry] = []
+    mirrors: dict[str, list[tuple[str, str, Any]]] | None = {} if "benches" in data else None
     for target_name, target in target_items:
         target = _require_mapping(target, f"targets[{target_name!r}]")
         raw_entries = target.get("entries")
@@ -170,6 +233,10 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
             for benchmark in sorted(benchmarks):
                 where_benchmark = f"{where}.benchmarks[{benchmark!r}]"
                 record = _require_mapping(benchmarks[benchmark], where_benchmark)
+                if mirrors is not None:
+                    mirrors.setdefault(benchmark, []).extend(
+                        (target_name, metric, value) for metric, value in record.items()
+                    )
                 rows.extend(
                     _v2_rows(
                         record,
@@ -180,6 +247,8 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
                     )
                 )
             entries.append(Entry(commit, date, tuple(rows)))
+    if mirrors is not None:
+        _validate_v2_benches(data["benches"], mirrors)
     return entries
 
 
