@@ -723,14 +723,8 @@ fn hash_tool_binary(
         return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
     }
     #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?
-    };
+    let file = khive_fs::opened_file::open_readonly_file_nofollow(path)
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
     #[cfg(not(unix))]
     let file = std::fs::File::open(path)
         .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
