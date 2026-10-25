@@ -59,17 +59,26 @@ struct WorkspaceGraph {
     metadata_count: usize,
 }
 
-fn cargo_graph(workspace: &Path) -> WorkspaceGraph {
-    let output = Command::new(env!("CARGO"))
-        .current_dir(workspace)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-            "--locked",
-        ])
+#[derive(Clone, Copy)]
+enum WorkspaceKind {
+    Checkout,
+    ControlFixture,
+}
+
+fn cargo_graph(workspace: &Path, kind: WorkspaceKind) -> WorkspaceGraph {
+    let mut command = Command::new(env!("CARGO"));
+    command.current_dir(workspace).args([
+        "metadata",
+        "--format-version",
+        "1",
+        "--no-deps",
+        "--offline",
+    ]);
+    if matches!(kind, WorkspaceKind::Checkout) {
+        command.arg("--locked");
+    }
+    // Only the test-owned path-only fixture may create its own Cargo.lock.
+    let output = command
         .output()
         .expect("run cargo metadata with the test Cargo executable");
     assert!(
@@ -323,27 +332,40 @@ fn reverse_dependents(seed: &str, reverse: &ReverseGraph) -> BTreeSet<String> {
     visited
 }
 
-#[tokio::test]
-async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates workspace")
-        .canonicalize()
-        .expect("workspace directory");
+async fn compare_workspace(workspace: &Path, kind: WorkspaceKind) {
+    let source = match kind {
+        WorkspaceKind::Checkout => "checkout",
+        WorkspaceKind::ControlFixture => "control fixture",
+    };
     let WorkspaceGraph {
         members,
         edges: cargo,
         declared_count,
         metadata_count,
-    } = cargo_graph(&workspace);
-    qualify_project_identities(&workspace, &members);
-    // These oracle-side witnesses make the three production controls nonvacuous.
-    // A future workspace without them needs an explicit real-pipeline fixture.
-    for scope in SCOPES {
-        assert!(
-            !cargo[scope].is_empty(),
-            "parity control population requires an internal {scope} dependency"
-        );
+    } = cargo_graph(workspace, kind);
+    qualify_project_identities(workspace, &members);
+    if matches!(kind, WorkspaceKind::ControlFixture) {
+        let owner = env!("CARGO_PKG_NAME").to_string();
+        let middle = "d8-parity-middle".to_string();
+        let leaf = "d8-parity-leaf".to_string();
+        let expected = [
+            (
+                "normal",
+                EdgeSet::from([(owner.clone(), middle.clone()), (middle, leaf.clone())]),
+            ),
+            ("dev", EdgeSet::from([(owner.clone(), leaf.clone())])),
+            ("build", EdgeSet::from([(owner, leaf)])),
+        ];
+        for (scope, edges) in expected {
+            assert_eq!(
+                cargo[scope], edges,
+                "controlled fixture must declare its {scope} witness"
+            );
+            assert!(
+                !cargo[scope].is_empty(),
+                "controlled fixture has no {scope} witness"
+            );
+        }
     }
     assert!(
         cargo.values().any(|edges| edges
@@ -368,7 +390,7 @@ async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
         &runtime,
         &token,
         CodeSourceIngestOptions {
-            path: &workspace,
+            path: workspace,
             languages: BTreeSet::from(["rust"]),
             sweep_time: Utc::now(),
             enable_l1: true,
@@ -377,7 +399,7 @@ async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
         },
     )
     .await
-    .expect("ingest actual workspace manifests");
+    .expect("ingest workspace manifests");
     assert_eq!(
         report.blocked_count, 0,
         "workspace ingest blocked records: {:?}",
@@ -387,17 +409,28 @@ async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
         report.manifest_files_refused, 0,
         "workspace ingest refused manifests"
     );
+    // A fresh temporary source need not belong to a Git repository. Accept only
+    // that exact provenance warning there; every checkout/manifest warning fails.
+    let fixture_warning = format!(
+        "git metadata unavailable for {}; source revision degraded to {UNVERSIONED_REVISION}",
+        workspace.display()
+    );
+    let warnings_ok = report.warnings.is_empty()
+        || (matches!(kind, WorkspaceKind::ControlFixture)
+            && report.source_revision == UNVERSIONED_REVISION
+            && report.warnings.len() == 1
+            && report.warnings[0] == fixture_warning);
     assert!(
-        report.warnings.is_empty(),
-        "workspace ingest warnings: {:?}",
+        warnings_ok,
+        "workspace ingest warnings ({source}): {:?}",
         report.warnings
     );
     let map = map_graph(&database, token.namespace().as_str(), &members);
-    eprintln!("workspace parity population: declared={declared_count}, metadata={metadata_count}, compared={}", members.len());
+    eprintln!("workspace parity population: source={source}, declared={declared_count}, metadata={metadata_count}, compared={}", members.len());
     let mut differences = Vec::new();
     for scope in SCOPES {
         eprintln!(
-            "workspace parity edges: scope={scope}, cargo={}, map={}",
+            "workspace parity edges: source={source}, scope={scope}, cargo={}, map={}",
             cargo[scope].len(),
             map[scope].len()
         );
@@ -422,7 +455,89 @@ async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
     }
     assert!(
         differences.is_empty(),
-        "workspace dependency parity mismatch:\n{}",
+        "workspace dependency parity mismatch ({source}):\n{}",
         differences.join("\n")
     );
+}
+
+fn control_workspace() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("controlled Cargo workspace");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["owner", "middle", "leaf"]
+exclude = ["outside"]
+"#,
+    )
+    .expect("fixture workspace manifest");
+    let owner = format!(
+        r#"[package]
+name = "{}"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+renamed_middle = {{ package = "d8-parity-middle", path = "../middle", optional = true }}
+outside = {{ package = "d8-parity-outside", path = "../outside" }}
+
+[dev-dependencies]
+d8-parity-leaf = {{ path = "../leaf" }}
+
+[target.'cfg(any())'.build-dependencies]
+d8-parity-leaf = {{ path = "../leaf" }}
+"#,
+        env!("CARGO_PKG_NAME")
+    );
+    let middle = r#"[package]
+name = "d8-parity-middle"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+d8-parity-leaf = { path = "../leaf" }
+"#
+    .to_string();
+    let leaf = r#"[package]
+name = "d8-parity-leaf"
+version = "0.0.0"
+edition = "2021"
+"#
+    .to_string();
+    let outside = r#"[package]
+name = "d8-parity-outside"
+version = "0.0.0"
+edition = "2021"
+"#
+    .to_string();
+    for (name, manifest) in [
+        ("owner", owner),
+        ("middle", middle),
+        ("leaf", leaf),
+        ("outside", outside),
+    ] {
+        let package = directory.path().join(name);
+        fs::create_dir_all(package.join("src")).expect("fixture package source directory");
+        fs::write(package.join("Cargo.toml"), manifest).expect("fixture package manifest");
+        fs::write(package.join("src/lib.rs"), "pub fn fixture() {}\n")
+            .expect("fixture library target");
+    }
+    directory
+}
+
+#[tokio::test]
+async fn workspace_reverse_dependency_sets_match_cargo_metadata() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates workspace")
+        .canonicalize()
+        .expect("workspace directory");
+    compare_workspace(&workspace, WorkspaceKind::Checkout).await;
+
+    let fixture = control_workspace();
+    let workspace = fixture
+        .path()
+        .canonicalize()
+        .expect("controlled workspace directory");
+    compare_workspace(&workspace, WorkspaceKind::ControlFixture).await;
 }
