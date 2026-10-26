@@ -808,6 +808,25 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // A secondary without a BlobStore still records quarantine without owning the original.
+    let quarantine_attachment = if is_quarantined
+        && quarantine_attachment.is_some()
+        && runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN
+        && runtime.core().blob_store().is_none()
+    {
+        if let Some(properties) = props.as_object_mut() {
+            properties.remove("quarantine_content_ref");
+            properties.insert("quarantine_original_retained".into(), json!("false"));
+            properties.insert(
+                "quarantine_original_not_retained_reason".into(),
+                json!("secondary-backend"),
+            );
+        }
+        None
+    } else {
+        quarantine_attachment
+    };
+
     // Start with transport retention facts, then apply the runtime's canonical
     // owner outcome before issuing a receipt, including committed degradations.
     // Non-quarantine records emit neither retention field.

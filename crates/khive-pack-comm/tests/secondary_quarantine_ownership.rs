@@ -85,6 +85,7 @@ impl Fixture {
             metadata["quarantine_content_ref"] = json!(original.to_string());
         }
         json!({
+            "namespace": self.namespace,
             "from": "external:sender", "to": self.namespace,
             "content": "quarantined inbound message", "external_id": external_id,
             "channel_kind": "email", "channel_slug": "fixture-mailbox", "metadata": metadata,
@@ -111,13 +112,19 @@ impl Fixture {
             .runtime
             .authorize(Namespace::parse(&self.namespace).unwrap())
             .unwrap();
-        self.runtime
+        let note = self
+            .runtime
             .notes(&token)
             .unwrap()
             .get_note(id)
             .await
             .unwrap()
-            .unwrap()
+            .unwrap();
+        assert_eq!(
+            note.namespace, self.namespace,
+            "actual secondary note namespace"
+        );
+        note
     }
 
     async fn owner(&self, id: Uuid) -> Option<Attachment> {
@@ -185,6 +192,7 @@ impl Fixture {
 
     async fn cleanup(&self, mode: &str) -> Value {
         self.registry.dispatch("comm.cleanup_expired_quarantine", json!({
+            "namespace": self.namespace,
             "channel_kind": "email",
             "channel_slug": if mode == "legacy_slugless" { "" } else { "fixture-mailbox" }, "mode": mode,
             "as_of_micros": chrono::Utc::now().timestamp_micros() + 120_000_000i64,
@@ -581,23 +589,33 @@ async fn main_channel_cleanup_keeps_local_atomic_deletion() {
 async fn legacy_slugless_secondary_cleanup_still_detaches_exact_owner() {
     let fixture = Fixture::new(true);
     let original = fixture.original().await;
-    let mut legacy = Note::new(&fixture.namespace, "message", "legacy slugless quarantine")
-        .with_properties(json!({"quarantined": true, "channel_kind": "email",
-            "quarantine_content_ref": original.to_string()}));
-    legacy.created_at = chrono::Utc::now().timestamp_micros() - 120_000_000i64;
-    legacy.updated_at = legacy.created_at;
-    legacy.expires_at = Some(legacy.created_at + 60_000_000i64);
     let token = fixture
         .runtime
         .authorize(Namespace::parse(&fixture.namespace).unwrap())
         .unwrap();
-    assert!(fixture
+    let capability = ChannelIngestCapability::grant_for_direct_composition();
+    let legacy = fixture
         .runtime
-        .notes(&token)
-        .unwrap()
-        .try_insert_note(legacy.clone())
+        .try_create_note_as_trusted_ingest(
+            &capability,
+            &token,
+            "message",
+            None,
+            "legacy slugless quarantine",
+            Some(json!({"quarantined": true, "channel_kind": "email",
+                "quarantine_content_ref": original.to_string()})),
+            Some(RETENTION),
+        )
         .await
-        .unwrap());
+        .unwrap()
+        .expect("trusted seed inserts a legacy slugless message");
+    assert!(legacy
+        .properties
+        .as_ref()
+        .unwrap()
+        .get("channel_slug")
+        .is_none());
+    assert!(legacy.expires_at.is_some());
     fixture
         .runtime
         .core()
