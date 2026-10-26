@@ -214,6 +214,24 @@ pub(super) enum StdioServeMode {
     Resumed,
 }
 
+#[cfg(unix)]
+impl StdioServeMode {
+    /// Apply the same handshake state used by the stdio serving path.
+    pub(super) fn wrap_transport<T>(
+        self,
+        inner: T,
+    ) -> crate::transport::PreInitializeRequestTransport<T> {
+        crate::transport::PreInitializeRequestTransport::with_initialize_forwarded(
+            inner,
+            matches!(self, Self::Resumed),
+        )
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "server_core/stdio_serve_mode_tests.rs"]
+mod stdio_serve_mode_tests;
+
 /// Pure decision behind [`StdioServeMode`], factored out so it is
 /// unit-testable without driving real stdio I/O. `resumed_generation` is
 /// [`crate::daemon::resumed_generation`]'s return value.

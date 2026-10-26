@@ -82,20 +82,15 @@ impl KhiveMcpServer {
             )
         };
 
-        match stdio_serve_mode_for(crate::daemon::resumed_generation()) {
+        let mode = stdio_serve_mode_for(crate::daemon::resumed_generation());
+        let transport = mode.wrap_transport(build_transport(root.clone()));
+        match mode {
             StdioServeMode::Resumed => {
-                let service = rmcp::service::serve_directly_with_ct(
-                    self,
-                    build_transport(root.clone()),
-                    None,
-                    root,
-                );
+                let service = rmcp::service::serve_directly_with_ct(self, transport, None, root);
                 service.waiting().await?;
             }
             StdioServeMode::Handshake => {
-                let service = self
-                    .serve_with_ct(build_transport(root.clone()), root)
-                    .await?;
+                let service = self.serve_with_ct(transport, root).await?;
                 service.waiting().await?;
             }
         }
@@ -134,6 +129,7 @@ impl KhiveMcpServer {
                 stdio_bridge_request_obligation_ttl_from_env(),
                 stdio_bridge_max_outstanding_requests_from_env(),
             );
+        let transport = crate::transport::PreInitializeRequestTransport::new(transport);
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
