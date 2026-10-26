@@ -279,10 +279,10 @@ impl MemoryPack {
         registry: &VerbRegistry,
         hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
+        // Keep the pipeline behind its own heap boundary in both profiling paths;
+        // boxing only this wrapper at the deadline still embeds the pipeline here.
         if !super::common::recall_profile_enabled(&self.runtime) {
-            return self
-                .handle_recall(token, params, registry, hard_deadline)
-                .await;
+            return Box::pin(self.handle_recall(token, params, registry, hard_deadline)).await;
         }
 
         let call_id = RECALL_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -293,7 +293,7 @@ impl MemoryPack {
         PROF_CID
             .scope(
                 call_id,
-                self.handle_recall(token, params, registry, hard_deadline),
+                Box::pin(self.handle_recall(token, params, registry, hard_deadline)),
             )
             .await
     }
