@@ -1,6 +1,7 @@
 //! Tunable composite scoring, normalization, adjustments, and language routing.
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub use khive_text::{contains_cjk_f32 as contains_cjk, is_cjk_char};
 use serde::{Deserialize, Serialize};
@@ -773,6 +774,62 @@ pub struct ScoreInput<'a> {
     pub entity_names: &'a [String],
 }
 
+#[derive(Clone, Copy)]
+enum ScoreFallbackReason {
+    TemporalBoost,
+    SalienceBoost,
+    NonfiniteComposite,
+}
+
+impl ScoreFallbackReason {
+    fn bit(self) -> u8 {
+        match self {
+            Self::TemporalBoost => 1,
+            Self::SalienceBoost => 2,
+            Self::NonfiniteComposite => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TemporalBoost => "temporal_boost",
+            Self::SalienceBoost => "salience_boost",
+            Self::NonfiniteComposite => "nonfinite_composite",
+        }
+    }
+}
+
+struct ScoreFallbackWarnings {
+    emitted: AtomicU8,
+}
+
+impl ScoreFallbackWarnings {
+    const fn new() -> Self {
+        Self {
+            emitted: AtomicU8::new(0),
+        }
+    }
+
+    fn record(&self, reason: ScoreFallbackReason) {
+        if !tracing::enabled!(target: "khive.memory.scoring", tracing::Level::WARN) {
+            return;
+        }
+        let bit = reason.bit();
+        if self.emitted.load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        if self.emitted.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            tracing::warn!(
+                target: "khive.memory.scoring",
+                reason = reason.as_str(),
+                "Memory score arithmetic fallback returned zero"
+            );
+        }
+    }
+}
+
+static SCORE_FALLBACK_WARNINGS: ScoreFallbackWarnings = ScoreFallbackWarnings::new();
+
 /// Composite score for a single memory candidate.
 ///
 /// Formula (semantic-gate model, multiplicative):
@@ -780,7 +837,17 @@ pub struct ScoreInput<'a> {
 ///
 /// Then each `ScoreAdjustment` in `config.adjustments` is evaluated and applied in order.
 /// Non-finite results fall to zero; finite results are clamped to `[0, 1]`.
+/// Arithmetic fallbacks emit at most one WARN per reason per process while WARN
+/// is enabled; genuine finite zero scores do not emit fallback warnings.
 pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
+    calculate_score_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
+fn calculate_score_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> f32 {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
 
@@ -792,9 +859,11 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let temporal_recency = (-capped_decay * time_diff_days).exp();
 
     let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
+        reporter.record(ScoreFallbackReason::TemporalBoost);
         return 0.0;
     };
     let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
+        reporter.record(ScoreFallbackReason::SalienceBoost);
         return 0.0;
     };
 
@@ -815,6 +884,7 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     // Individually finite adjustments can overflow before a later operation
     // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
     if !score.is_finite() {
+        reporter.record(ScoreFallbackReason::NonfiniteComposite);
         return 0.0;
     }
     score.clamp(0.0, 1.0)
@@ -862,3 +932,7 @@ mod tests;
 #[cfg(test)]
 #[path = "scoring_normalization_tests.rs"]
 mod normalization_tests;
+
+#[cfg(test)]
+#[path = "scoring/fallback_warning_tests.rs"]
+mod fallback_warning_tests;
