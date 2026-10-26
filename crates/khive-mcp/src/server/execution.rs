@@ -93,9 +93,10 @@ impl KhiveMcpServer {
                 service.waiting().await?;
             }
             StdioServeMode::Handshake => {
-                let service = self
-                    .serve_with_ct(build_transport(root.clone()), root)
-                    .await?;
+                let transport = crate::transport::PreInitializeRequestTransport::new(
+                    build_transport(root.clone()),
+                );
+                let service = self.serve_with_ct(transport, root).await?;
                 service.waiting().await?;
             }
         }
@@ -134,6 +135,7 @@ impl KhiveMcpServer {
                 stdio_bridge_request_obligation_ttl_from_env(),
                 stdio_bridge_max_outstanding_requests_from_env(),
             );
+        let transport = crate::transport::PreInitializeRequestTransport::new(transport);
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
