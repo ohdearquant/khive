@@ -472,8 +472,10 @@ pub struct KhiveRuntime {
 impl KhiveRuntime {
     /// Observe a resolved config value once for this runtime construction.
     ///
-    /// The lazy value is evaluated only for a name this runtime has not seen.
-    /// Known config producers format primitives and do not reenter the ledger.
+    /// The lazy value runs outside the ledger mutex. A name already recorded
+    /// does not evaluate its lazy value. Concurrent first observers of one name
+    /// may each evaluate their closure, so value closures must have no side effects.
+    /// Only the first to insert the name after evaluation queues an observation.
     pub fn record_config_locked<F>(&self, key: &'static str, value: F)
     where
         F: FnOnce() -> String,

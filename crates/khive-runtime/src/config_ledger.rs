@@ -51,16 +51,21 @@ impl ConfigLockLedger {
     {
         #[cfg(test)]
         self.run_test_hook(TestRecordPoint::BeforeLock);
-        let mut state = self
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.seen.contains(key) {
             return;
         }
-        // Format before marking seen: an unwind leaves seen and pending intact.
-        // The production callers format primitives and never reenter this ledger.
+        drop(state);
+        // User code may reenter the ledger. An unwind makes no state change here.
         let value = value();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another first reader may have recorded this name while we formatted it.
         if state.seen.insert(key) {
             state.pending.push((key, value));
             self.pending.store(true, Ordering::Release);
@@ -115,7 +120,10 @@ mod runtime_ledger_tests {
     use std::cell::Cell;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::Duration;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn assert_state(ledger: &ConfigLockLedger, seen: usize, queued: usize) {
         let state = ledger
@@ -239,7 +247,7 @@ mod runtime_ledger_tests {
 
     #[test]
     #[serial(config_ledger)]
-    fn concurrent_same_name_observations_enqueue_and_format_once() {
+    fn concurrent_same_name_observations_enqueue_once() {
         let ledger = Arc::new(ConfigLockLedger::default());
         let start = Arc::new(Barrier::new(8));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -259,12 +267,89 @@ mod runtime_ledger_tests {
         for worker in workers {
             worker.join().expect("ledger observation worker");
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!((1..=8).contains(&calls.load(Ordering::Relaxed)));
         assert_eq!(
             ledger.drain_config_locked(),
             vec![("ledger.concurrent", "value".to_string())]
         );
         assert_state(&ledger, 1, 0);
+    }
+
+    #[test]
+    #[serial(config_ledger)]
+    fn a_runtime_formatter_can_record_a_distinct_name() {
+        let runtime = crate::KhiveRuntime::memory().expect("reentrant runtime");
+        let (finished_tx, finished_rx) = mpsc::channel();
+        // The watchdog reports the old implementation's deadlock as a test failure.
+        // Do not join: a regression must not make this test wait without a bound.
+        let _worker = std::thread::spawn(move || {
+            runtime.record_config_locked("runtime.reentrant_outer", || {
+                runtime.record_config_locked("runtime.reentrant_inner", || "inner".to_string());
+                "outer".to_string()
+            });
+            let _ = finished_tx.send(runtime.drain_config_locked());
+        });
+        let batch = finished_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("a runtime formatter must complete distinct-name reentry before the deadline");
+        assert_eq!(
+            batch,
+            vec![
+                ("runtime.reentrant_inner", "inner".to_string()),
+                ("runtime.reentrant_outer", "outer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial(config_ledger)]
+    fn concurrent_runtime_first_readers_can_both_format_but_enqueue_once() {
+        let runtime = crate::KhiveRuntime::memory().expect("concurrent runtime");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut release_senders = Vec::new();
+        for _ in 0..2 {
+            let runtime = runtime.clone();
+            let calls = calls.clone();
+            let entered = entered_tx.clone();
+            let finished = finished_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            release_senders.push(release_tx);
+            // Every gate and completion wait has a deadline; no worker is joined.
+            let _worker = std::thread::spawn(move || {
+                runtime.record_config_locked("runtime.concurrent_first", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    entered.send(()).expect("formatter barrier observer");
+                    release_rx.recv_timeout(TEST_TIMEOUT).expect(
+                        "both first-reader formatters must reach the barrier before release",
+                    );
+                    "value".to_string()
+                });
+                let _ = finished.send(());
+            });
+        }
+        drop(entered_tx);
+        drop(finished_tx);
+        // Hold both closures here before either can finish or insert the name.
+        for _ in 0..2 {
+            entered_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("both first-reader formatters must enter before either is released");
+        }
+        for release in release_senders {
+            release.send(()).expect("release a first-reader formatter");
+        }
+        for _ in 0..2 {
+            finished_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("both runtime observations must finish before the deadline");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            runtime.drain_config_locked(),
+            vec![("runtime.concurrent_first", "value".to_string())]
+        );
     }
 
     #[test]
