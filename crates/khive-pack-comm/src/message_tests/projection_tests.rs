@@ -11,7 +11,7 @@ fn promotes_from_to_subject_when_present() {
         "hello",
         Some(json!({
             "from_actor": "lambda:khive",
-            "to_actor": "lambda:leo",
+            "to_actor": "lambda:casey",
             "subject": "Status update",
             "direction": "inbound",
             "read": false,
@@ -19,7 +19,7 @@ fn promotes_from_to_subject_when_present() {
     );
     let v = note_to_message_json(&note);
     assert_eq!(v["from"], json!("lambda:khive"));
-    assert_eq!(v["to"], json!("lambda:leo"));
+    assert_eq!(v["to"], json!("lambda:casey"));
     assert_eq!(v["subject"], json!("Status update"));
     assert_eq!(v["direction"], json!("inbound"));
     assert_eq!(v["read"], json!(false));
@@ -43,7 +43,7 @@ fn from_falls_back_to_namespace_when_from_actor_absent() {
     let note = make_note(
         "legacy-ns",
         "old message",
-        Some(json!({ "to_actor": "lambda:leo" })),
+        Some(json!({ "to_actor": "lambda:casey" })),
     );
     let v = note_to_message_json(&note);
     assert_eq!(v["from"], json!("legacy-ns"));
