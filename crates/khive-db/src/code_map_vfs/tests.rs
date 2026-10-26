@@ -722,17 +722,36 @@ fn quarantine_cap_refuses_before_another_native_open() {
     let dir = fixture();
     let diagnostic_pool = crate::ConnectionPool::new(crate::PoolConfig::for_test()).unwrap();
     let production = dir.path().join("production.db");
-    let target = dir.path().join("code-map.db");
+    let mut target = dir.path().join("code-map.db");
     seed_rollback(&production);
     std::fs::copy(&production, &target).unwrap();
-    let guard =
+    let mut guard =
         CodeMapHandleGuard::new(target.clone(), Mode::Rollback, vec![main_base(&production)])
             .unwrap();
+    let global_probe_target = dir.path().join("global-cap-probe.db");
+    std::fs::copy(&production, &global_probe_target).unwrap();
+    let global_probe = CodeMapHandleGuard::new(
+        global_probe_target,
+        Mode::Rollback,
+        vec![main_base(&production)],
+    )
+    .unwrap();
     assert_eq!(super::quarantine_occupancy(), 0);
     for count in 1..=super::QUARANTINE_CAP {
         if count > 1 {
             std::fs::remove_file(&target).unwrap();
+            if matches!(count, 9 | 17 | 25) {
+                target = dir.path().join(format!("code-map-{}.db", (count - 1) / 8));
+            }
             std::fs::copy(&production, &target).unwrap();
+            if matches!(count, 9 | 17 | 25) {
+                guard = CodeMapHandleGuard::new(
+                    target.clone(),
+                    Mode::Rollback,
+                    vec![main_base(&production)],
+                )
+                .unwrap();
+            }
         }
         let swap_target = target.clone();
         let swap_production = production.clone();
@@ -760,7 +779,7 @@ fn quarantine_cap_refuses_before_another_native_open() {
     let opened = Arc::new(AtomicBool::new(false));
     let hook_opened = Arc::clone(&opened);
     super::set_before_os_open(move || hook_opened.store(true, Ordering::SeqCst));
-    let error = guard
+    let error = global_probe
         .open(Role::Main, OpenAccess::ReadWrite)
         .expect_err("quarantine cap must refuse further opens");
     assert!(matches!(&error, GuardError::QuarantineFull), "{error}");
