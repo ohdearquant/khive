@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Deterministic khive.repo.v1 repository showcase bundle exporter"
 
 [dependencies]
-khive-types = { version = "0.14.0", path = "../khive-types", default-features = false, optional = true }
+khive-types = { version = "0.15.0", path = "../khive-types", default-features = false, optional = true }
 chrono = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 rusqlite = { workspace = true, features = ["bundled"], optional = true }

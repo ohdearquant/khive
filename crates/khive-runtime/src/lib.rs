@@ -233,7 +233,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
-pub use params::deser_params;
+pub use params::{deser_params, integer_params_from_whole_floats};
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};

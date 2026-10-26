@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
-    micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind, RuntimeError, SearchSignals,
-    SearchSource, VerbRegistry,
+    integer_params_from_whole_floats, micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind,
+    RuntimeError, SearchSignals, SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, TextQueryMode};
@@ -25,6 +25,7 @@ use super::common::{
     reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
     validate_graph_read_kind, KindSpec, SearchParams,
 };
+use crate::handler_defs::KG_HANDLERS;
 use crate::KgPack;
 
 /// Canonical search ranking fields shared by KG and coordinated search.
@@ -130,7 +131,12 @@ pub struct ValidatedSearchRequest {
 
 impl ValidatedSearchRequest {
     /// Parse and validate the canonical KG search wire contract.
-    pub fn from_value(params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+    pub fn from_value(mut params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+        // Coordinated search parses the caller's arguments here without going through registry
+        // dispatch, so it applies the same whole-number float rule for integer parameters.
+        if let Some(search) = KG_HANDLERS.iter().find(|def| def.name == "search") {
+            integer_params_from_whole_floats(&mut params, search.params);
+        }
         if params.get("min_rank_score").is_some() && params.get("min_score").is_some() {
             return Err(RuntimeError::InvalidInput(
                 "supply only min_rank_score; min_score is its deprecated alias".to_string(),

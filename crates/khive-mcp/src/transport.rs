@@ -5,6 +5,13 @@
 //! transports (e.g. Streamable HTTP) register with [`TransportRegistry::register`]
 //! before serving, so the serve path never hard-codes a transport enum.
 
+mod pre_initialize;
+pub use pre_initialize::PreInitializeRequestTransport;
+
+#[cfg(test)]
+#[path = "transport/pre_initialize_tests.rs"]
+mod pre_initialize_tests;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::io;
