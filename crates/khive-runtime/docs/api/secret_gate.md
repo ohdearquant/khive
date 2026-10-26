@@ -103,6 +103,12 @@ through to explicit detection instead of being silently allowed.
   multi-fragment bridge reconstruction have all run against it — a path-shaped anchor must not be
   able to skip a chain that reconstructs a blocked credential — AND only when the token is not in
   credential-value syntax (see the clause-label guard below).
+  In plain text, an ordinary path reference also does not supply trigger words to a different
+  token. The existing path grammar is unchanged: native Windows backslash paths, drive-prefixed
+  paths and URLs do not gain this rule. Credential-valued paths and paths carrying a known
+  credential shape, credential-length/high-entropy run, normalized hex span, or reconstructed
+  hex bridge keep supplying context. Their own candidate and reconstruction checks still scan
+  the original input.
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
   marker (`commit`, `revision`, `rev`, `sha`, `head` — immediately preceding word, or
   `marker:value` / `marker=value` in one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
@@ -235,7 +241,17 @@ or a period followed by a non-alphanumeric byte ends that context; a single newl
 does not, so the common assignment shape `api key:\n<value>` remains blocked. This prevents a
 detector name or other credential vocabulary in an earlier sentence from supplying trigger
 context to an unrelated identifier on a later line. Inline assignment/label checks on the
-candidate itself remain independent of the surrounding window.
+candidate itself remain independent of the surrounding window. For plain text, complete original
+ASCII tokens are classified once before context clipping: ordinary file-path references are omitted
+only from neighboring trigger attribution, without joining the retained context slices. A temporary
+same-offset backward-clause view also neutralizes credential-label identifiers in already classified
+ordinary paths so they cannot label a later path. Other words, identifier boundaries and punctuation
+stay original, preserving sentence boundaries and progress through the clause walk's fail-closed
+budget. Credential-token assignment labels such as `refresh_token` also retain path authority;
+position/receipt labels retain their existing exclusions. A recognized nonempty line-location suffix is still a path location; a path-shaped
+credential assignment keeps its authority. The 120-byte radius, vocabulary priority, and before/
+after/inline/previous-line precedence stay unchanged. JSON objects and arrays retain their scalar
+rule below.
 
 Caller guidance names those same effective boundaries: move a non-secret candidate into a
 separate sentence or paragraph, or express a source hash as an explicit commit/revision reference.
