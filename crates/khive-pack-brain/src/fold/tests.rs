@@ -175,7 +175,7 @@ fn deterministic_replay() {
     assert_eq!(snap1.entity_posteriors, snap2.entity_posteriors);
 }
 
-// ── SemanticFeedback fold path tests (MAJ-001 coverage) ──────────────────
+// ── Semantic feedback updates fold posteriors ──────────────────────────
 
 fn make_semantic_feedback_event(signal: &str, target: Uuid) -> Event {
     let mut e = Event::new(
@@ -328,7 +328,7 @@ fn semantic_feedback_correction_updates_salience_beta_relevance_beta_and_entity_
 
 // ── Regression tests ──────────────────────────────────────────────────────
 
-// MAJ-001: salience and temporal posteriors must update after dispatch.
+// Salience and temporal posteriors must update after dispatch.
 #[test]
 fn test_355_posteriors_update_after_dispatch() {
     let fold = BalancedRecallFold::new(100);

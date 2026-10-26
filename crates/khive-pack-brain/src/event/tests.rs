@@ -219,7 +219,7 @@ fn semantic_feedback_preserves_section_signals_for_replay() {
     }
 }
 
-// ── FeedbackEventKind unit tests (MAJ-001 coverage) ──────────────────────
+// ── Feedback kinds retain their update weights and polarity ─────────────
 
 include!("tests/feedback_kind_parsing.rs");
 
