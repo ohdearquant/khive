@@ -16,6 +16,15 @@ default = true
 dims = 384
 "#;
 
+// Vocabulary caches are owned by pack management (ADR-020 §3), not init.
+const DEFAULT_SCHEMA_YAML: &str = concat!(
+    "format_version: \"2.0.0\"\n",
+    "ontology_version: \"1.0.0\"\n",
+    "khive_version: \"",
+    env!("CARGO_PKG_VERSION"),
+    "\"\nremotes: []\n",
+);
+
 const OLD_GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!khive.toml\n";
 const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!config.toml\n";
 
@@ -100,6 +109,13 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("create {}", hooks_dir.display()))?;
 
+    let schema_path = kg_dir.join("schema.yaml");
+    if create_default_schema(&schema_path)? {
+        println!("  Initialized {}", schema_path.display());
+    } else {
+        println!("  Skipped {} (already exists)", schema_path.display());
+    }
+
     for name in &["entities.ndjson", "edges.ndjson"] {
         let path = kg_dir.join(name);
         if !path.exists() {
@@ -123,7 +139,9 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
         }
     }
 
-    println!("  Initialized .khive/kg/ (entities.ndjson, edges.ndjson, hooks/pre-commit)");
+    println!(
+        "  Initialized .khive/kg/ (schema.yaml, entities.ndjson, edges.ndjson, hooks/pre-commit)"
+    );
 
     if args.ci {
         let workflow_dir = args.repo.join(".github/workflows");
@@ -179,6 +197,29 @@ fn create_default_config(path: &Path) -> Result<bool> {
                     "Configuration path {} changed during initialization; rerun kg init",
                     path.display()
                 );
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn create_default_schema(path: &Path) -> Result<bool> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(DEFAULT_SCHEMA_YAML.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            if !metadata.is_file() {
+                bail!("KG schema path {} is not a regular file", path.display());
             }
             Ok(false)
         }
@@ -424,5 +465,220 @@ mod tests {
                 .unwrap();
             assert_eq!(output.status.code(), Some(expected), "{path}");
         }
+    }
+
+    fn manifest_init_args(tmp: &TempDir) -> InitArgs {
+        InitArgs {
+            repo: tmp.path().to_path_buf(),
+            ci: false,
+            add_hooks: false,
+        }
+    }
+
+    #[test]
+    fn init_creates_versioned_schema_with_empty_remotes() {
+        let tmp = TempDir::new().unwrap();
+
+        cmd_init(manifest_init_args(&tmp)).unwrap();
+
+        let path = tmp.path().join(".khive/kg/schema.yaml");
+        assert!(path.is_file(), "kg init must create its default schema");
+        let schema = std::fs::read_to_string(&path).unwrap();
+        assert!(schema.starts_with("format_version: \"2.0.0\"\n"));
+        assert!(schema.contains("\nontology_version: \"1.0.0\"\n"));
+        assert!(schema.contains(&format!(
+            "\nkhive_version: \"{}\"\n",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(schema.ends_with("remotes: []\n"));
+        for pack_owned in [
+            "entity_kinds:",
+            "entity_types:",
+            "edge_relations:",
+            "properties:",
+            "packs:",
+        ] {
+            assert!(
+                !schema.contains(pack_owned),
+                "init must not invent a pack vocabulary cache"
+            );
+        }
+        let before = std::fs::read(&path).unwrap();
+        cmd_init(manifest_init_args(&tmp)).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn init_preserves_custom_schema_and_pins_across_reruns() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = tmp.path().join(".khive/kg");
+        std::fs::create_dir_all(&kg_dir).unwrap();
+        let path = kg_dir.join("schema.yaml");
+        let custom = concat!(
+            "# operator-owned schema and pins\n",
+            "format_version: '2.4.0'\nontology_version: '9.8.7'\nkhive_version: 'custom-writer'\n",
+            "entity_kinds: [concept]\ncustom: {answer: 42}\n",
+            "remotes:\n  - name: upstream\n    repo: example/project\n",
+            "    commit: '1111111111111111111111111111111111111111'\n",
+            "    pin: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "    ref: stable\n",
+        );
+        std::fs::write(&path, custom).unwrap();
+
+        for _ in 0..2 {
+            cmd_init(manifest_init_args(&tmp)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), custom.as_bytes());
+        }
+    }
+
+    #[test]
+    fn schema_create_preserves_an_existing_competing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        std::fs::write(&path, "# competing schema\nremotes: []\n").unwrap();
+
+        assert!(!create_default_schema(&path).unwrap());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"# competing schema\nremotes: []\n"
+        );
+    }
+
+    #[test]
+    fn schema_create_refuses_a_directory_without_replacing_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(create_default_schema(&path).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_create_refuses_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        for contents in [Some("# custom schema\n"), None] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("schema.yaml");
+            let target = tmp.path().join("operator-schema.yaml");
+            if let Some(contents) = contents {
+                std::fs::write(&target, contents).unwrap();
+            }
+            symlink(&target, &path).unwrap();
+
+            assert!(create_default_schema(&path).is_err());
+            assert_eq!(std::fs::read_link(path).unwrap(), target);
+            if let Some(contents) = contents {
+                assert_eq!(std::fs::read(&target).unwrap(), contents.as_bytes());
+            } else {
+                assert!(!target.exists());
+            }
+        }
+    }
+
+    // Owner-native fixture only: each child Git command is confined to this TempDir.
+    // Never mutate process-global environment or substitute a fake Git executable.
+    fn manifest_fixture_git(repo: &Path, args: &[&str]) -> String {
+        let empty_config = repo.join("empty-fixture.gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("GIT_")) {
+                command.env_remove(name);
+            }
+        }
+        let mut hooks = std::ffi::OsString::from("core.hooksPath=");
+        hooks.push(repo.join("no-hooks"));
+        let output = command
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", empty_config)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-c")
+            .arg(hooks)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "user.name=KG init fixture",
+                "-c",
+                "user.email=kg-init-fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn init_schema_supports_public_remote_pin_update_and_preserves_result_on_rerun() {
+        const OLD_COMMIT: &str = "1111111111111111111111111111111111111111";
+        const ARCHIVE_PIN: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tmp = TempDir::new().unwrap();
+        cmd_init(manifest_init_args(&tmp)).unwrap();
+        let schema_path = tmp.path().join(".khive/kg/schema.yaml");
+        assert!(
+            schema_path.is_file(),
+            "the real init route must produce the input schema"
+        );
+        let initial = std::fs::read_to_string(&schema_path).unwrap();
+        let metadata = initial
+            .strip_suffix("remotes: []\n")
+            .expect("init provides an empty remote sequence");
+        let configured = format!(
+            "{metadata}remotes:\n  - name: origin\n    url: ./remote.git\n    commit: '{OLD_COMMIT}'\n    ref: stable\n    pin: {ARCHIVE_PIN}\n",
+        );
+        std::fs::write(&schema_path, configured).unwrap();
+        let remote_path = tmp.path().join("remote.git");
+        std::fs::create_dir(&remote_path).unwrap();
+        manifest_fixture_git(
+            &remote_path,
+            &[
+                "init",
+                "--quiet",
+                "--object-format=sha1",
+                "--template=",
+                ".",
+            ],
+        );
+        manifest_fixture_git(&remote_path, &["symbolic-ref", "HEAD", "refs/heads/stable"]);
+        manifest_fixture_git(
+            &remote_path,
+            &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+        );
+        let expected = manifest_fixture_git(&remote_path, &["rev-parse", "--verify", "HEAD"]);
+        let remote = khive_vcs::sync::RemoteName::parse("origin").unwrap();
+
+        let result = khive_vcs::remote_pin::update_remote_pin(tmp.path(), &remote, None);
+
+        assert!(
+            result.is_ok(),
+            "init metadata plus only one remote entry must be accepted: {result:?}"
+        );
+        let receipt = result.unwrap();
+        assert!(receipt.updated);
+        assert_eq!(receipt.remote, "origin");
+        assert_eq!(receipt.requested_ref, "stable");
+        assert_eq!(receipt.previous_commit, OLD_COMMIT);
+        assert_eq!(receipt.commit, expected);
+        let pinned = std::fs::read(&schema_path).unwrap();
+        assert!(String::from_utf8_lossy(&pinned).contains(ARCHIVE_PIN));
+        let second = khive_vcs::remote_pin::update_remote_pin(tmp.path(), &remote, None).unwrap();
+        assert!(!second.updated);
+        assert_eq!(second.previous_commit, expected);
+        assert_eq!(second.commit, expected);
+        assert_eq!(std::fs::read(&schema_path).unwrap(), pinned);
+        cmd_init(manifest_init_args(&tmp)).unwrap();
+        assert_eq!(std::fs::read(schema_path).unwrap(), pinned);
     }
 }

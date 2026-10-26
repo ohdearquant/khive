@@ -286,18 +286,18 @@ impl KgPack {
                 };
                 let (entity, report) = self
                     .runtime
-                    .update_entity_with_expected_version_and_embedding_report(
-                        token,
-                        id,
-                        patch,
-                        p.expected_version,
-                    )
+                    .update_entity_with_index_report(token, id, patch, p.expected_version)
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
                 super::create::add_embedding_truncation_warning(
                     &mut response,
-                    report.any_truncated(),
+                    report.embedding.any_truncated(),
                 );
+                response["indexing"] = to_json(&report.indexing)?;
+                if !report.post_commit_degradations.is_empty() {
+                    response["post_commit_degradations"] =
+                        to_json(&report.post_commit_degradations)?;
+                }
                 Ok(response)
             }
             KindSpec::Edge => {
@@ -686,3 +686,7 @@ fn foreign_restore_target(id: &str) -> RuntimeError {
         "restore requires a tombstone in the caller's namespace: {id}"
     ))
 }
+
+#[cfg(test)]
+#[path = "update_pending_index_tests.rs"]
+mod pending_index_tests;

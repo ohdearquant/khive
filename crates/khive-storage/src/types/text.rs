@@ -139,10 +139,23 @@ pub struct TextSearchRequest {
 }
 
 /// A single ranked result from a full-text search.
+///
+/// FTS5 short-token ordering can reorder eligible rows without narrowing the query.
+/// Eligible bare query tokens of one or two ASCII alphanumeric characters match
+/// whole runs without ASCII case sensitivity, once per distinct token across title
+/// and body. Common short words can tie a discriminating numeral, retaining the
+/// old order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextSearchHit {
     pub subject_id: Uuid,
+    /// Normalized text score, non-increasing in returned order.
+    ///
+    /// When short-token ordering moves a returned row, the scores retain the
+    /// legacy BM25-normalized distribution over exactly the final selected rows
+    /// and are assigned by position. A row's score then need not be derived from
+    /// its own BM25 value. Unranked results retain uniform scores of 1.0.
     pub score: khive_score::DeterministicScore,
+    /// One-based position in the returned results, including after reordering.
     pub rank: u32,
     pub title: Option<String>,
     pub snippet: Option<String>,

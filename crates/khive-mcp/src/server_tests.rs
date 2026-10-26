@@ -5902,12 +5902,13 @@ fn chain_seam_rejects_over_limit_result_before_envelope_build() {
     let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
     let err =
         chain_ok_envelope_or_depth_error("traverse".to_string(), OpSuccess::complete(pathological))
-            .expect_err("over-limit result must be rejected, not enveloped");
-    assert_eq!(err.tool, "traverse");
-    assert_eq!(err.error["kind"], json!("result_too_deep"));
+            .expect_err("over-limit result must be rejected, not enveloped")
+            .into_entry();
+    assert_eq!(err["tool"], "traverse");
+    assert_eq!(err["error"]["kind"], json!("result_too_deep"));
     // The error payload must never embed the oversized value itself.
-    assert!(err.error.get("result").is_none());
-    assert!(err.error.get("nested").is_none());
+    assert!(err["error"].get("result").is_none());
+    assert!(err["error"].get("nested").is_none());
 }
 
 #[test]

@@ -35,6 +35,20 @@ fn event_page_window_budget_stop_roundtrips_and_defaults_when_absent() {
 }
 
 #[test]
+fn event_new_generates_uuid_v7() {
+    let event = Event::new(
+        "default",
+        "search",
+        EventKind::SearchExecuted,
+        SubstrateKind::Note,
+        "agent:test",
+    );
+
+    // The UUID version is the high nibble of byte 6.
+    assert_eq!(event.id.as_bytes()[6] >> 4, 7);
+}
+
+#[test]
 fn event_new_generates_unique_valid_uuid_v7_ids() {
     let mut ids = std::collections::HashSet::new();
     for _ in 0..64 {
@@ -57,7 +71,7 @@ fn event_new_generates_unique_valid_uuid_v7_ids() {
 
 #[test]
 fn event_serde_preserves_legacy_uuid_v4_identity() {
-    let legacy_id = Uuid::from_u128(0xf47ac10b_58cc_4372_a567_0e02b2c3d479);
+    let legacy_id = Uuid::from_u128(0xf47a_c10b_58cc_4372_a567_0e02_b2c3_d479);
     assert_eq!(legacy_id.as_bytes()[6] >> 4, 4);
     let legacy = Event {
         id: legacy_id,

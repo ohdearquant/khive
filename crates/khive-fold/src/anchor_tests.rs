@@ -118,3 +118,184 @@ fn credit_weights_are_f64() {
     let w: f64 = credits[0].1;
     assert!(w > 0.0f64 && w <= 1.0f64);
 }
+
+#[test]
+fn test_bfs_anchor_duplicate_nodes_keep_first_payload() {
+    let root = make_ref(1, "root");
+    let first = AnchorRef {
+        id: Uuid::from_u128(2),
+        kind: "first".into(),
+        stable_id: Some("first-payload".into()),
+    };
+    let duplicate = AnchorRef {
+        id: first.id,
+        kind: "later".into(),
+        stable_id: Some("later-payload".into()),
+    };
+    let outcome = make_ref(3, "outcome");
+    let mut graph = AnchorGraph::new();
+    graph.nodes = vec![root.clone(), first.clone(), duplicate, outcome.clone()];
+    graph.add_edge(root.id, first.id, "uses");
+    graph.add_edge(first.id, outcome.id, "derives_from");
+
+    assert_eq!(
+        BfsAnchor.trace(&graph, &root, 2).unwrap(),
+        vec![first.clone(), outcome.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &outcome, 2).unwrap(),
+        vec![(first, 0.5), (root, 0.25)]
+    );
+}
+
+#[test]
+fn test_bfs_anchor_keeps_edge_order_cycles_and_first_visit() {
+    let a = make_ref(10, "root");
+    let b = make_ref(20, "second");
+    let c = make_ref(30, "first");
+    let d = make_ref(40, "join");
+    let e = make_ref(50, "outcome");
+    let mut graph = AnchorGraph::new();
+    graph.nodes = vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+    for (from, to) in [
+        (a.id, c.id),
+        (a.id, b.id),
+        (a.id, c.id),
+        (a.id, a.id),
+        (c.id, d.id),
+        (b.id, d.id),
+        (d.id, a.id),
+        (d.id, e.id),
+        (c.id, e.id),
+    ] {
+        graph.add_edge(from, to, "uses");
+    }
+
+    assert_eq!(
+        BfsAnchor.trace(&graph, &a, 1).unwrap(),
+        vec![c.clone(), b.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.trace(&graph, &a, usize::MAX).unwrap(),
+        vec![c.clone(), b.clone(), d.clone(), e.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &e, 1).unwrap(),
+        vec![(d.clone(), 0.5), (c.clone(), 0.5)]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &e, usize::MAX).unwrap(),
+        vec![(d, 0.5), (c, 0.5), (b, 0.25), (a, 0.25)]
+    );
+}
+
+#[test]
+fn test_bfs_anchor_preserves_missing_node_asymmetry_and_zero_depth() {
+    let a = make_ref(100, "source");
+    let missing = make_ref(200, "missing");
+    let outcome = make_ref(300, "outcome");
+    let mut graph = AnchorGraph::new();
+    graph.nodes = vec![a.clone(), outcome.clone()];
+    graph.add_edge(a.id, missing.id, "uses");
+    graph.add_edge(missing.id, outcome.id, "derives_from");
+
+    // Trace stops at a missing node, but credit crosses it and counts both hops.
+    assert!(BfsAnchor.trace(&graph, &a, 2).unwrap().is_empty());
+    assert!(BfsAnchor.credit(&graph, &outcome, 1).unwrap().is_empty());
+    assert_eq!(
+        BfsAnchor.credit(&graph, &outcome, 2).unwrap(),
+        vec![(a.clone(), 0.25)]
+    );
+    assert!(BfsAnchor.trace(&graph, &a, 0).unwrap().is_empty());
+    assert!(BfsAnchor.credit(&graph, &outcome, 0).unwrap().is_empty());
+    for depth in [0, 2] {
+        let trace_error = BfsAnchor.trace(&graph, &missing, depth).unwrap_err();
+        let credit_error = BfsAnchor.credit(&graph, &missing, depth).unwrap_err();
+        assert!(
+            matches!(trace_error, FoldError::AnchorNotFound(id) if id == missing.id.to_string())
+        );
+        assert!(
+            matches!(credit_error, FoldError::AnchorNotFound(id) if id == missing.id.to_string())
+        );
+    }
+}
+
+#[test]
+fn test_bfs_anchor_rebuilds_after_public_vector_mutation() {
+    let root = make_ref(1, "root");
+    let old_child = make_ref(2, "old-child");
+    let leaf = make_ref(3, "leaf");
+    let mut graph = AnchorGraph::new();
+    graph.nodes = vec![root.clone(), old_child.clone()];
+    graph.add_edge(root.id, old_child.id, "uses");
+    assert_eq!(
+        BfsAnchor.trace(&graph, &root, 2).unwrap(),
+        vec![old_child.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &old_child, 2).unwrap(),
+        vec![(root.clone(), 0.5)]
+    );
+
+    let new_child = AnchorRef {
+        id: old_child.id,
+        kind: "new-first-child".into(),
+        stable_id: Some("mutated".into()),
+    };
+    graph.nodes.insert(0, new_child.clone());
+    graph.nodes.push(leaf.clone());
+    graph.edges = vec![
+        (root.id, leaf.id, "new-first-edge".into()),
+        (root.id, new_child.id, "new-second-edge".into()),
+        (leaf.id, new_child.id, "uses".into()),
+    ];
+    assert_eq!(
+        BfsAnchor.trace(&graph, &root, 2).unwrap(),
+        vec![leaf.clone(), new_child.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &new_child, 2).unwrap(),
+        vec![(root.clone(), 0.5), (leaf.clone(), 0.5)]
+    );
+
+    graph.nodes.retain(|node| node.id != leaf.id);
+    assert_eq!(
+        BfsAnchor.trace(&graph, &root, 2).unwrap(),
+        vec![new_child.clone()]
+    );
+    assert_eq!(
+        BfsAnchor.credit(&graph, &new_child, 2).unwrap(),
+        vec![(root, 0.5)]
+    );
+}
+
+#[test]
+fn test_bfs_anchor_credit_keeps_per_hop_subnormal_rounding() {
+    const HOPS: usize = 1075;
+    let mut graph = AnchorGraph::new();
+    graph.nodes = (0..=HOPS)
+        .map(|index| make_ref(1000 + index as u128, "node"))
+        .collect();
+    for index in 0..HOPS {
+        graph.add_edge(graph.nodes[index].id, graph.nodes[index + 1].id, "uses");
+    }
+    let credits = BfsAnchor.credit(&graph, &graph.nodes[HOPS], HOPS).unwrap();
+    let actual_nodes: Vec<_> = credits.iter().map(|(node, _)| node).collect();
+    let expected_nodes: Vec<_> = graph.nodes[..HOPS].iter().rev().collect();
+    assert_eq!(actual_nodes, expected_nodes);
+
+    // Exact binary64 powers at normal, subnormal and round-to-zero boundaries.
+    for (distance, bits) in [
+        (1, 0.5_f64.to_bits()),
+        (1022, 0x0010_0000_0000_0000),
+        (1023, 0x0008_0000_0000_0000),
+        (1074, 1),
+        (1075, 0),
+    ] {
+        assert_eq!(
+            credits[distance - 1].1.to_bits(),
+            bits,
+            "distance {distance}"
+        );
+    }
+}

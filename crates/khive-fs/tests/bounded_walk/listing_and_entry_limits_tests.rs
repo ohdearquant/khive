@@ -119,3 +119,123 @@ fn global_entries_count_filtered_and_non_utf8_names_before_processing() {
     assert!(result.contains(&PathBuf::from(OsStr::from_bytes(b"bad-\xff"))));
     assert!(result.contains(&PathBuf::from("dir/file")));
 }
+
+#[test]
+fn prefix_listing_repeats_and_stays_on_the_held_directory() {
+    use khive_fs::fd_relative::list_names_prefix_bounded;
+    use std::fs::File;
+
+    let scratch = Scratch::new();
+    let original = scratch.path().join("original");
+    let moved = scratch.path().join("moved");
+    fs::create_dir(&original).unwrap();
+    let held = File::open(&original).unwrap();
+    assert_eq!(
+        list_names_prefix_bounded(&held, 0).unwrap(),
+        (Vec::<String>::new(), false)
+    );
+    for name in ["z", "a", ".hidden"] {
+        fs::write(original.join(name), b"original").unwrap();
+    }
+    symlink("z", original.join("link")).unwrap();
+    assert_eq!(
+        list_names_prefix_bounded(&held, 0).unwrap(),
+        (Vec::<String>::new(), true)
+    );
+    let expected = [".hidden", "a", "link", "z"];
+    for _ in 0..2 {
+        let (mut names, truncated) = list_names_prefix_bounded(&held, 4).unwrap();
+        assert!(!truncated);
+        names.sort();
+        assert_eq!(names, expected);
+        let (names, truncated) = list_names_prefix_bounded(&held, 2).unwrap();
+        assert!(truncated);
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|name| expected.contains(&name.as_str())));
+    }
+    fs::rename(&original, &moved).unwrap();
+    fs::create_dir(&original).unwrap();
+    fs::write(original.join("replacement"), b"replacement").unwrap();
+    let (mut names, truncated) = list_names_prefix_bounded(&held, 4).unwrap();
+    names.sort();
+    assert_eq!(names, expected);
+    assert!(!truncated);
+    assert_eq!(
+        list_names_prefix_bounded(&File::open(&original).unwrap(), 1).unwrap(),
+        (vec!["replacement".to_string()], false)
+    );
+    let regular = File::open(moved.join("z")).unwrap();
+    assert_eq!(
+        list_names_prefix_bounded(&regular, 2)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENOTDIR)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prefix_listing_counts_a_real_non_utf8_name_at_zero_and_exact_cap() {
+    use khive_fs::fd_relative::list_names_prefix_bounded;
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let scratch = Scratch::new();
+    scratch.file(OsStr::from_bytes(b"raw-\xff"));
+    let held = File::open(scratch.path()).unwrap();
+    assert_eq!(
+        list_names_prefix_bounded(&held, 0).unwrap(),
+        (Vec::<String>::new(), true)
+    );
+    assert_eq!(
+        list_names_prefix_bounded(&held, 1).unwrap(),
+        (Vec::<String>::new(), false)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prefix_listing_leaves_an_independently_observed_caller_cursor_unchanged() {
+    use khive_fs::fd_relative::list_names_prefix_bounded;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+
+    struct HeldStream(*mut libc::DIR);
+    impl Drop for HeldStream {
+        fn drop(&mut self) {
+            // SAFETY: this test uniquely owns the successful fdopendir result.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let scratch = Scratch::new();
+    scratch.file("a");
+    scratch.file("z");
+    let directory = File::open(scratch.path()).unwrap();
+    let fd = directory.try_clone().unwrap().into_raw_fd();
+    // SAFETY: fd is owned here; fdopendir takes it only on success.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir failed and did not take ownership.
+        unsafe { libc::close(fd) };
+        panic!("open independent cursor oracle: {error}");
+    }
+    let stream = HeldStream(stream);
+    // SAFETY: stream owns a live DIR; the call advances its shared kernel position.
+    assert!(!unsafe { libc::readdir(stream.0) }.is_null());
+    // SAFETY: directory owns a live fd; SEEK_CUR with zero only observes its offset.
+    let before = unsafe { libc::lseek(directory.as_raw_fd(), 0, libc::SEEK_CUR) };
+    assert!(
+        before > 0,
+        "the independent cursor oracle must actually advance"
+    );
+    assert!(list_names_prefix_bounded(&directory, 1).unwrap().1);
+    assert!(!list_names_prefix_bounded(&directory, 2).unwrap().1);
+    // SAFETY: the same live fd is observed after both listings.
+    let after = unsafe { libc::lseek(directory.as_raw_fd(), 0, libc::SEEK_CUR) };
+    assert_eq!(
+        after, before,
+        "prefix listing changed the caller's directory position"
+    );
+}

@@ -127,7 +127,7 @@ design.
 Enablement is bounded to one storage topology. Every row that holds an actor-valued field (D7), other than an event row,
 lives in the designated primary store, so the mode marker, the reservation set and those rows share its transactions
 (D3). Enablement reads the runtime's storage configuration and refuses unless the designated store is its only storage
-backend, apart from a separate events backend (`crates/khive-runtime/src/events_split/daemon.rs:857`). That backend
+backend, apart from a separate events backend (`crates/khive-runtime/src/events_split/events_daemon.rs:628`). That backend
 holds the attribution of operations admitted through the designated store and serves history inspection; it holds no
 marker and no reservation, the enablement inventory reads it (D3), and its rows without a UUID are legacy (D8). A tenant
 whose actor-valued rows span several stores waits for a later decision that states how each store joins the marker and
@@ -477,18 +477,18 @@ a captured attribution.
 
 The production spawn origins in `khive-runtime` at `a1a60f3f`, and the rule for each:
 
-| Origin (under `crates/khive-runtime/src/`)                                                              | Rule                                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `audit_batch.rs` supervisor, generation and reaper                                                      | Attribution is captured per event before enqueue; a batch may hold several actors and is never stamped from one context.                               |
-| `curation/entity_curation.rs`, `curation/note_merge.rs`, and their writer-task alternatives             | They capture `EventAttribution` before dispatching work today; they carry the full sealed attribution and the admission proof.                         |
-| Embedding tasks in `operations.rs`, `operations/entity_create.rs`, `atomic_message.rs`                  | Carry the expanded token, which cold initialization may use to emit attributed events.                                                                 |
-| `runtime/embedder_init.rs`                                                                              | Keeps the initiating request's attribution; system warmup uses an explicit system context; registered work never gets the configured-runtime fallback. |
-| `embedder_registry.rs` embedding thread                                                                 | Writes no attributed row; a future attributable effect adds explicit job context.                                                                      |
-| `events_split/daemon.rs` child process, `events_split/forwarder.rs`, the events daemon's batch receiver | Envelopes carry per-row attribution and stable ids; transport trust is not request authentication.                                                     |
-| `daemon/boot_guard.rs` checkpoint task and warmup                                                       | System attribution (`daemon:checkpoint_task`), never a user's.                                                                                         |
-| `daemon/boot_guard.rs` connection processing                                                            | Context is resolved per logical operation after verified ingress, not once per connection.                                                             |
-| `daemon/load_limits.rs` deferred recall work                                                            | Keeps the request context for telemetry; a distinct protected nested write is re-admitted.                                                             |
-| `blob.rs` blob hydration task                                                                           | Serves a read already admitted for its caller and appends no attributed row; an attributable effect added later carries explicit context.              |
+| Origin (under `crates/khive-runtime/src/`)                                                                     | Rule                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `audit_batch.rs` supervisor, generation and reaper                                                             | Attribution is captured per event before enqueue; a batch may hold several actors and is never stamped from one context.                               |
+| `curation/entity_curation.rs`, `curation/note_merge.rs`, and their writer-task alternatives                    | They capture `EventAttribution` before dispatching work today; they carry the full sealed attribution and the admission proof.                         |
+| Embedding tasks in `operations.rs`, `operations/entity_create.rs`, `atomic_message.rs`                         | Carry the expanded token, which cold initialization may use to emit attributed events.                                                                 |
+| `runtime/embedder_init.rs`                                                                                     | Keeps the initiating request's attribution; system warmup uses an explicit system context; registered work never gets the configured-runtime fallback. |
+| `embedder_registry.rs` embedding thread                                                                        | Writes no attributed row; a future attributable effect adds explicit job context.                                                                      |
+| `events_split/events_daemon.rs` child process, `events_split/forwarder.rs`, the events daemon's batch receiver | Envelopes carry per-row attribution and stable ids; transport trust is not request authentication.                                                     |
+| `daemon/boot_guard.rs` checkpoint task and warmup                                                              | System attribution (`daemon:checkpoint_task`), never a user's.                                                                                         |
+| `daemon/boot_guard.rs` connection processing                                                                   | Context is resolved per logical operation after verified ingress, not once per connection.                                                             |
+| `daemon/load_limits.rs` deferred recall work                                                                   | Keeps the request context for telemetry; a distinct protected nested write is re-admitted.                                                             |
+| `blob.rs` blob hydration task                                                                                  | Serves a read already admitted for its caller and appends no attributed row; an attributable effect added later carries explicit context.              |
 
 This census covers `khive-runtime` only. Packs, scheduler replays, channels, external `Dispatcher` implementations
 and `khive-db` worker internals need their own coverage before hosted activation; the table is not a claim that all

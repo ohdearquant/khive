@@ -1,7 +1,7 @@
-//! Canonical structured projection of typed runtime failures.
+//! Canonical typed runtime projection and per-operation failure construction.
 //!
-//! Transport nesting limits and removal of a nested operation's domain result
-//! belong to the transport boundary, not to this lossless shared projection.
+//! The typed projection remains lossless. The shared entry builder applies the
+//! response boundary's nesting and domain-result retention rules afterwards.
 
 use khive_storage::{StorageCapability, StorageError};
 use serde_json::{json, Value};
@@ -15,6 +15,125 @@ use crate::{DomainDisposition, RuntimeError};
 /// without cloning or recursively serializing it; callers apply their own depth
 /// limits before any recursive operation on the returned value.
 pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    let disposition = if disposition == DomainDisposition::Committed {
+        disposition
+    } else {
+        error.batch_write_disposition().unwrap_or(disposition)
+    };
+    runtime_error_value_inner(error, disposition)
+}
+
+/// Original input to the shared per-operation failure builder.
+pub enum FailureEntrySource {
+    /// A typed runtime failure and the original dispatch boundary's outcome.
+    Runtime {
+        error: RuntimeError,
+        boundary: DomainDisposition,
+    },
+    /// An error payload whose disposition is supplied by its caller.
+    Value {
+        error: Value,
+        disposition: DomainDisposition,
+    },
+}
+
+/// An owned normalized failure, consumable as an error or a per-operation entry.
+pub struct FailureEntryParts {
+    error: Value,
+    disposition: DomainDisposition,
+}
+
+impl FailureEntryParts {
+    /// Return the normalized error without constructing an outer entry.
+    pub fn into_error(self) -> Value {
+        self.error
+    }
+
+    /// Move the normalized error into its per-operation response entry.
+    pub fn into_entry(self, tool: impl Into<String>) -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("ok".into(), Value::Bool(false));
+        entry.insert("tool".into(), Value::String(tool.into()));
+        entry.insert(
+            "domain_disposition".into(),
+            json!(self.disposition.as_str()),
+        );
+        entry.insert("error".into(), self.error);
+        Value::Object(entry)
+    }
+}
+
+/// Read the outcome named by a canonical error payload, defaulting to uncertainty.
+///
+/// This reads an existing payload; it does not establish write provenance.
+pub fn failure_error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+/// Build the canonical failure parts shared by request executors.
+///
+/// Runtime input uses the public typed projection once. Both final disposition
+/// fields use its result. A domain result survives only when both the original
+/// boundary and projection are committed. The boundary's depth handling runs
+/// first, preserving its existing code and message replacement even when the
+/// projection subsequently removes the result. Value input always uses its
+/// caller's explicit disposition, ignoring any competing JSON claim.
+pub fn failure_entry_parts(source: FailureEntrySource) -> FailureEntryParts {
+    use crate::daemon::{drop_error_detail_iteratively, error_detail_value_within_limit};
+
+    let (error, boundary, disposition) = match source {
+        FailureEntrySource::Runtime { error, boundary } => {
+            let projected = runtime_error_value(error, boundary);
+            let disposition = failure_error_disposition(&projected);
+            (projected, boundary, disposition)
+        }
+        FailureEntrySource::Value { error, disposition } => (error, disposition, disposition),
+    };
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_error_detail_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    let committed = |value: DomainDisposition| value == DomainDisposition::Committed;
+    if let Some(result) = error.remove("domain_result") {
+        if !committed(boundary) {
+            drop_error_detail_iteratively(result);
+        } else if !error_detail_value_within_limit(&result) {
+            drop_error_detail_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else if !committed(disposition) {
+            drop_error_detail_iteratively(result);
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    FailureEntryParts {
+        error: Value::Object(error),
+        disposition,
+    }
+}
+
+// Choose operation-local proof once. Recursive projection must not promote an
+// inner batch proof past an enclosing context with earlier or unknown effects.
+fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
     let sqlite_write_failure = match error.refusal_source() {
@@ -101,14 +220,14 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             // Preparation precedes all domain DML. Keep the original typed
             // refusal (including secret detector/permission receipt) and add
             // only the constituent's index; never stringify captured input.
-            let mut value = runtime_error_value(*source, DomainDisposition::NotCommitted);
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::NotCommitted);
             value["op_index"] = json!(op_index);
             value["domain_disposition"] = json!("not_committed");
             value["retryable"] = json!(false);
             return value;
         }
         RuntimeError::LintFix { source, detail } => {
-            let mut value = runtime_error_value(*source, DomainDisposition::Unknown);
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::Unknown);
             let object = value
                 .as_object_mut()
                 .expect("runtime error projection is an object");
@@ -126,7 +245,7 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
 
         RuntimeError::WithResolution { context } => {
             let crate::error::ResolutionFailureContext { source, resolution } = context;
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             let details = value
                 .as_object_mut()
                 .expect("runtime error projection is an object")
@@ -138,11 +257,35 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             details["resolution"] = json!(resolution);
             return value;
         }
+        RuntimeError::BatchWrite { context } => {
+            let crate::error::BatchWriteContext {
+                source, admission, ..
+            } = *context;
+            let mut value = runtime_error_value_inner(*source, disposition);
+            if let Some(report) = admission {
+                if report.validation_complete {
+                    if let Some(first) = report.refused.first() {
+                        if !value["details"].is_object() {
+                            value["details"] = json!({});
+                        }
+                        value["details"]["index"] = json!(first.index.to_string());
+                        value["details"]["field"] = json!(first.field);
+                        value["details"]["reason"] = json!(first.reason);
+                    }
+                } else {
+                    value["unchecked_indices"] = json!(report.unchecked_indices);
+                }
+                value["refused"] = json!(report.refused);
+                value["validation_complete"] = json!(report.validation_complete);
+            }
+            value["domain_disposition"] = json!(disposition.as_str());
+            return value;
+        }
         RuntimeError::RefusedWithEvents { context } => {
             let crate::error::RefusalEventContext { source, recordings } = context;
             // Project the source first so named dispositions, code/details,
             // detector location and refusal text retain their original meaning.
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             if !recordings.is_empty() {
                 value["refusal_recorded"] = json!(recordings.iter().all(|recording| {
                     matches!(recording, crate::RefusalEventRecording::Recorded { .. })

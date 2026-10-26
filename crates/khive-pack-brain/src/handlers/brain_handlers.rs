@@ -874,6 +874,7 @@ impl BrainPack {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct FeedbackParams {
+            #[serde(rename = "id", alias = "target_id")]
             target_id: String,
             signal: String,
             served_by_profile_id: Option<String>,

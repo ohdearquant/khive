@@ -101,7 +101,7 @@ impl Fixture {
         let codec = FrameCodec::default();
         let mut frame = Frame::Response {
             id: "bench".into(),
-            result: Value::String(String::new()),
+            result: Value::String(String::new()).into(),
         };
         let overhead = codec.encode(&frame).expect("empty result frame").len() - 4;
         let padding_len = payload_bytes
@@ -118,7 +118,7 @@ impl Fixture {
             })
             .collect();
         if let Frame::Response { result, .. } = &mut frame {
-            *result = Value::String(padding);
+            *result = Value::String(padding).into();
         } else {
             unreachable!("constructed response fixture");
         }

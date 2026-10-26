@@ -37,8 +37,6 @@ const CLASSIFICATIONS: &[Classification] = &[
     Classification { verb: "merge", param: "from_id", role: Role::DistinctRole("Identifies the consumed endpoint of a two-record merge, distinct from the survivor endpoint.") },
     Classification { verb: "link", param: "source_id", role: Role::DistinctRole("Identifies the directed edge source endpoint, paired with a separately resolved target endpoint.") },
     Classification { verb: "link", param: "target_id", role: Role::DistinctRole("Identifies the directed edge target endpoint, paired with a separately resolved source endpoint.") },
-    Classification { verb: "neighbors", param: "node_id", role: Role::PrimaryAlias },
-    Classification { verb: "traverse", param: "roots", role: Role::PrimaryAlias },
     Classification { verb: "propose", param: "parent_id", role: Role::DistinctRole("References a preexisting proposal in the ancestry of the newly created proposal; it is not the new proposal identifier.") },
     Classification { verb: "gtd.assign", param: "due", role: Role::DistinctRole("Stores the new task deadline, including date-only timezone anchoring; it is not a deferred-dispatch schedule time.") },
     Classification { verb: "gtd.assign", param: "depends_on", role: Role::DistinctRole("References blocking task records used to create dependency edges for the newly assigned task.") },
@@ -47,9 +45,6 @@ const CLASSIFICATIONS: &[Classification] = &[
     Classification { verb: "gtd.tasks", param: "duplicate_of", role: Role::DistinctRole("Filters a collection of duplicate judgements by its kept-task reference.") },
     Classification { verb: "gtd.tasks", param: "context_entity_id", role: Role::DistinctRole("Filters task collection membership by its stored KG context reference, including after the context is deleted.") },
     Classification { verb: "gtd.transition", param: "duplicate_of", role: Role::DistinctRole("References the kept task recorded when cancelling the separately identified transitioning task.") },
-    Classification { verb: "memory.feedback", param: "target_id", role: Role::PrimaryAlias },
-    Classification { verb: "brain.feedback", param: "target_id", role: Role::PrimaryAlias },
-    Classification { verb: "brain.emit", param: "target_id", role: Role::PrimaryAlias },
     Classification { verb: "comm.suppression_remove", param: "evidence_inbound_message_id", role: Role::DistinctRole("Supplies the inbound evidence note for removing the separately identified suppression entry.") },
     Classification { verb: "comm.send", param: "thread_id", role: Role::DistinctRole("Groups a newly created message under an existing thread root; it does not identify the new message.") },
     Classification { verb: "comm.inbox", param: "thread_id", role: Role::DistinctRole("Filters inbox/outbox collection membership by stored thread group before pagination.") },
@@ -97,33 +92,7 @@ const APPROVED_CEILING: &[LegacyPair] = &[
 ];
 
 // Shrink only. Each still-invalid pair cites the owner's actual tracking issue.
-const ACTIVE_BASELINE: &[LegacyPair] = &[
-    LegacyPair {
-        verb: "neighbors",
-        param: "node_id",
-        issue: 5996,
-    },
-    LegacyPair {
-        verb: "traverse",
-        param: "roots",
-        issue: 5996,
-    },
-    LegacyPair {
-        verb: "memory.feedback",
-        param: "target_id",
-        issue: 5996,
-    },
-    LegacyPair {
-        verb: "brain.feedback",
-        param: "target_id",
-        issue: 5996,
-    },
-    LegacyPair {
-        verb: "brain.emit",
-        param: "target_id",
-        issue: 5996,
-    },
-];
+const ACTIVE_BASELINE: &[LegacyPair] = &[];
 
 #[derive(Clone, Copy)]
 struct ParamView {

@@ -601,7 +601,11 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                         Err(if unsettled {
                             crate::error::unknown_write_settlement(e)
                         } else {
-                            e
+                            StorageError::WriterTaskRequestFailed {
+                                request_state:
+                                    khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                                source: Box::new(e),
+                            }
                         })
                     }
                 }

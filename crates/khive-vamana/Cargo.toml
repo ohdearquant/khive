@@ -34,7 +34,6 @@ khive-score = { version = "0.15.0", path = "../khive-score", default-features = 
 [target.'cfg(unix)'.dependencies]
 khive-fs = { version = "0.15.0", path = "../khive-fs" }
 libc = { workspace = true }
-nix = { version = "0.31", features = ["dir"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

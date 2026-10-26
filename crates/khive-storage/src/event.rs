@@ -42,7 +42,7 @@ pub struct Event {
 }
 
 impl Event {
-    /// Create a new event with a generated UUIDv7 and current timestamp.
+    /// Create a new event with a generated UUID and current timestamp.
     pub fn new(
         namespace: impl Into<String>,
         verb: impl Into<String>,
