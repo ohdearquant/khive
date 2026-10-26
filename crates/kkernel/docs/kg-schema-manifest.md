@@ -25,7 +25,7 @@ its `commit`. A Git commit pin is separate from an archive `pin` value.
 
 Rerunning init preserves every existing regular `schema.yaml` byte, including
 custom metadata, vocabulary, remotes, commit pins, archive pins and comments.
-Init uses a create-only open and never merges or resets an existing schema. A
+Init uses create-only publication and never merges or resets an existing schema. A
 directory or symlink at the schema path is refused without replacing it or
 writing its target. The hooks-only `--add-hooks` mode retains its existing
 behavior.
