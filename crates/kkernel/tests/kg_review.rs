@@ -74,7 +74,11 @@ fn entity_update(id: &str, before: &str, after: &str) -> String {
 }
 
 fn write_case(dir: &Path, family: &str, ops: &[String]) -> (PathBuf, PathBuf) {
-    let mut content = envelope(family);
+    write_case_with_envelope(dir, &envelope(family), ops)
+}
+
+fn write_case_with_envelope(dir: &Path, envelope: &str, ops: &[String]) -> (PathBuf, PathBuf) {
+    let mut content = envelope.to_owned();
     content.push('\n');
     for op in ops {
         content.push_str(op);
@@ -140,12 +144,17 @@ fn directory_entries(dir: &Path) -> BTreeSet<String> {
 #[test]
 fn json_report_is_ordered_versioned_and_read_only() {
     let temp = TempDir::new().expect("temp dir");
+    let mut golden: serde_json::Value =
+        serde_json::from_str(CHANGESET_REVIEW_GOLDEN).expect("parse shared review golden");
+    golden["change_set"]["envelope"]["schema_version"] =
+        serde_json::json!(khive_changeset::CURRENT_SCHEMA_VERSION);
+
     let alpha = "10000000-0000-4000-8000-000000000001";
     let beta = "10000000-0000-4000-8000-000000000002";
     let edge = "10000000-0000-4000-8000-000000000003";
-    let (changeset, rules) = write_case(
+    let (changeset, rules) = write_case_with_envelope(
         temp.path(),
-        "family:bob",
+        &golden["change_set"]["envelope"].to_string(),
         &[
             create(alpha, "Alpha"),
             create(beta, "Beta"),
@@ -164,11 +173,6 @@ fn json_report_is_ordered_versioned_and_read_only() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = parse_stdout(&output);
-    let mut golden: serde_json::Value =
-        serde_json::from_str(CHANGESET_REVIEW_GOLDEN).expect("parse shared review golden");
-    golden["change_set"]["envelope"]["schema_version"] =
-        serde_json::json!(khive_changeset::CURRENT_SCHEMA_VERSION);
-
     assert_eq!(
         report, golden,
         "Rust `kg review --format json` drifted from the shared khive.review.v1 changeset vector"
@@ -180,7 +184,10 @@ fn json_report_is_ordered_versioned_and_read_only() {
     assert_eq!(report["capability"]["mutability"], "read_only");
     assert_eq!(report["capability"]["no_writes"], true);
     assert_eq!(report["capability"]["wasm"], false);
-    assert_eq!(report["change_set"]["envelope"]["batch_id"], "bob-batch-7");
+    assert_eq!(
+        report["change_set"]["envelope"]["batch_id"],
+        golden["change_set"]["envelope"]["batch_id"]
+    );
 
     let operations = report["change_set"]["operations"].as_array().unwrap();
     assert_eq!(operations.len(), 3);
