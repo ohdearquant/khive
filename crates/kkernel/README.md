@@ -110,7 +110,8 @@ unresolvable ref, or non-commit object leaves the original schema intact.
 This Git `commit` is independent of the optional SHA-256 archive `pin`. Update does
 not change that pin, `khive_version`, other schema values, NDJSON, cached archives,
 or a database. Current `kg fetch` still takes explicit `--url`/`--ref`/`--pin`
-arguments; it does not load schema remotes. `kg init` does not create schema.yaml.
+arguments; it does not load schema remotes. `kg init` creates `.khive/kg/schema.yaml`
+when absent and preserves an existing regular schema and its pins.
 
 Successful edits preserve YAML values but normalize formatting and discard comments.
 An unchanged commit returns `updated: false` without rewriting any bytes. Updates
