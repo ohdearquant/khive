@@ -14,9 +14,11 @@ use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
 
+mod cohorts;
 mod fixes;
 mod render;
 
+use cohorts::RuleCohorts;
 use fixes::apply_fixes;
 use render::render_validation;
 
@@ -186,9 +188,12 @@ fn run_validation(args: &ValidateArgs) -> Result<ValidationRun> {
         &rules_path,
         &taxonomy,
     )?;
+    if args.fix {
+        report.ensure_unique_ids("original")?;
+    }
     let mut fixes = args.fix.then(FixSummary::default);
     if args.fix
-        && report.rules.iter().any(|rule| {
+        && report.rules().any(|rule| {
             rule.id == "sort-order"
                 && !rule.passed
                 && rule.violations.iter().any(|violation| violation.fixable)
@@ -203,27 +208,16 @@ fn run_validation(args: &ValidateArgs) -> Result<ValidationRun> {
             &rules_path,
             &taxonomy,
         )?;
-        let mut fixed = FixedCounts::default();
-        for (before, after) in report.rules.iter().zip(&final_report.rules) {
-            if before.id == "sort-order"
-                && before.violations.iter().any(|violation| violation.fixable)
-                && before.id == after.id
-                && before.severity == after.severity
-                && !before.passed
-                && after.passed
-            {
-                match before.severity {
-                    "error" => fixed.errors += 1,
-                    "warning" => fixed.warnings += 1,
-                    "info" => fixed.info += 1,
-                    _ => {}
-                }
-            }
-        }
+        let fixed = report
+            .fixed_counts_after(&final_report)
+            .context("reconciling rule identities after --fix (files may already have changed)")?;
         fixes = Some(FixSummary { files, fixed });
         report = final_report;
     }
-    Ok(ValidationRun { report, fixes })
+    Ok(ValidationRun {
+        report: report.into_report(),
+        fixes,
+    })
 }
 
 fn collect_validation_report(
@@ -233,30 +227,31 @@ fn collect_validation_report(
     notes_path: &Path,
     rules_path: &Path,
     taxonomy: &KgTaxonomy,
-) -> Result<ValidationReport> {
+) -> Result<RuleCohorts> {
     let entities = count_ndjson_lines(entities_path).unwrap_or(0);
     let edges = count_ndjson_lines(edges_path).unwrap_or(0);
     let notes = count_ndjson_lines(notes_path).unwrap_or(0);
 
-    let mut rule_results: Vec<RuleResult> =
-        structural_checks(entities_path, edges_path, notes_path, taxonomy);
+    let structural = structural_checks(entities_path, edges_path, notes_path, taxonomy);
+    let configurable = if !args.no_rules && rules_path.exists() {
+        configurable_rule_checks(entities_path, edges_path, notes_path, rules_path)?
+    } else {
+        Vec::new()
+    };
 
-    if !args.no_rules && rules_path.exists() {
-        let configurable =
-            configurable_rule_checks(entities_path, edges_path, notes_path, rules_path)?;
-        rule_results.extend(configurable);
-    }
-
-    let errors: usize = rule_results
+    let errors: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "error" && !r.passed)
         .count();
-    let warnings: usize = rule_results
+    let warnings: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "warning" && !r.passed)
         .count();
-    let info: usize = rule_results
+    let info: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "info" && !r.passed)
         .count();
 
@@ -276,10 +271,7 @@ fn collect_validation_report(
         passed,
     };
 
-    Ok(ValidationReport {
-        rules: rule_results,
-        summary,
-    })
+    Ok(RuleCohorts::new(structural, configurable, summary))
 }
 
 fn count_ndjson_lines(path: &Path) -> Option<usize> {
