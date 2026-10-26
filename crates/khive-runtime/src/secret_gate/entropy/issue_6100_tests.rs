@@ -50,7 +50,7 @@ fn issue_6100_clipped_windows_classify_the_complete_original_path() {
     let long_prefix = "section/".repeat(20);
     let long_suffix = "section/".repeat(20);
     for content in [
-        format!("docs/{long_prefix}secret/guide.md sha={hex}"),
+        format!("fixtures/{long_prefix}secret/guide.md sha={hex}"),
         format!("sha={hex} docs/secret/{long_suffix}guide.md"),
     ] {
         assert!(check(&content).is_ok(), "{content}: {:?}", scan(&content));

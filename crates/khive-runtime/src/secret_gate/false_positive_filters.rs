@@ -111,7 +111,7 @@ pub(super) fn is_repository_revision_reference(raw_token: &str) -> bool {
 
 #[cfg(test)]
 std::thread_local! {
-    static CLAUSE_IDENTIFIER_WORK_BYTES: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static CLAUSE_IDENTIFIER_WORK_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
