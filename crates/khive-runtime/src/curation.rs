@@ -93,6 +93,8 @@ mod merge_sql;
 use merge_sql::{merge_entity_sql, merge_note_sql};
 
 mod entity_curation;
+mod entity_pending_index;
+pub use entity_pending_index::{EntityIndexFailure, EntityIndexReport, EntityUpdateReport};
 mod merge_edges;
 
 use merge_edges::{
