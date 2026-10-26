@@ -23,6 +23,10 @@ use uuid::Uuid;
 use super::types::{ExportArgs, ImportArgs, ImportConflict, ImportFormat};
 
 pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
+    if args.ndjson {
+        return cmd_export_ndjson(args).await;
+    }
+
     let ns = Namespace::parse(&args.namespace)?;
 
     // Refuse to clobber the source database with the JSON export.
@@ -68,6 +72,217 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
     use std::io::Write as _;
     publish_export_with(&args.output, |file| file.write_all(json.as_bytes()))
         .with_context(|| format!("publish export {}", args.output.display()))
+}
+
+/// Export project leaves through the existing per-file publication boundary.
+/// The two replacements are separate: a later error may follow visible output.
+async fn cmd_export_ndjson(args: ExportArgs) -> Result<()> {
+    let ns = Namespace::parse(&args.namespace)?;
+    let kg_dir = args.output.join(".khive").join("kg");
+    let entities = kg_dir.join("entities.ndjson");
+    let edges = kg_dir.join("edges.ndjson");
+
+    // Refuse aliases before opening/migrating the source or touching either leaf.
+    guard_ndjson_destinations(&args.db, &entities, &edges)?;
+
+    let config = RuntimeConfig {
+        db_path: Some(args.db.clone()),
+        default_namespace: ns.clone(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    };
+    let runtime = KhiveRuntime::new(config)?;
+    let token = runtime.authorize(ns)?;
+    let archive = runtime
+        .export_kg(&token)
+        .await
+        .with_context(|| format!("export namespace {:?}", args.namespace))?;
+
+    std::fs::create_dir_all(&kg_dir).with_context(|| format!("create {}", kg_dir.display()))?;
+    publish_export_with(&entities, |file| {
+        khive_vcs::sync::write_entities_ndjson(&archive.entities, file)
+    })
+    .with_context(|| format!("publish NDJSON entities {}", entities.display()))?;
+    publish_export_with(&edges, |file| {
+        khive_vcs::sync::write_edges_ndjson(&archive.edges, file)
+    })
+    .with_context(|| {
+        format!(
+            "publish NDJSON edges {}; entities {} were already published",
+            edges.display(),
+            entities.display()
+        )
+    })
+}
+
+/// Resolve an absent leaf through its existing ancestors, including symlinks.
+/// This observes the current topology; it does not lock later path replacements.
+fn resolve_export_destination(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Windows drive-relative paths can replace rather than extend current_dir.
+    if !absolute.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "export destination must resolve to a fully rooted path",
+        ));
+    }
+    let mut pending: VecDeque<_> = absolute
+        .components()
+        .map(|part| part.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = std::path::PathBuf::new();
+    let mut followed_links = 0usize;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::Prefix(_)) | Some(Component::RootDir) => resolved.push(&part),
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            Some(Component::Normal(_)) => {
+                resolved.push(&part);
+                // Reinspect every component, including components reached after
+                // ".." cancels an absent directory. Never append that tail blindly.
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        followed_links += 1;
+                        if followed_links > 40 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "too many symlinks while resolving export destination",
+                            ));
+                        }
+                        let target = std::fs::read_link(&resolved)?;
+                        resolved.pop();
+                        if target.is_absolute() {
+                            resolved.clear();
+                        }
+                        for target_part in target.components().rev() {
+                            pending.push_front(target_part.as_os_str().to_os_string());
+                        }
+                    }
+                    Ok(metadata) => {
+                        if let Some(next) = pending.front().filter(|_| !metadata.is_dir()) {
+                            // Preserve the actual traversal error for an existing
+                            // nondirectory before any later component.
+                            let next = resolved.join(next);
+                            return match std::fs::canonicalize(next) {
+                                Err(error) => Err(error),
+                                Ok(_) => Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "path component changed while resolving export destination",
+                                )),
+                            };
+                        }
+                        resolved = std::fs::canonicalize(&resolved)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(resolved)
+}
+
+fn guard_ndjson_destinations(db: &Path, entities: &Path, edges: &Path) -> Result<()> {
+    let resolved_db = resolve_export_destination(db)
+        .with_context(|| format!("resolve source database {}", db.display()))?;
+    let resolved_entities = resolve_export_destination(entities)
+        .with_context(|| format!("resolve NDJSON leaf {}", entities.display()))?;
+    let resolved_edges = resolve_export_destination(edges)
+        .with_context(|| format!("resolve NDJSON leaf {}", edges.display()))?;
+    for (path, resolved) in [(entities, &resolved_entities), (edges, &resolved_edges)] {
+        if path == db || resolved == &resolved_db {
+            bail!(
+                "refusing NDJSON export: {} resolves to source database {}",
+                path.display(),
+                db.display()
+            );
+        }
+    }
+    if entities == edges || resolved_entities == resolved_edges {
+        bail!(
+            "refusing NDJSON export: {} and {} resolve to the same destination",
+            entities.display(),
+            edges.display()
+        );
+    }
+    guard_ndjson_file_identities(
+        db,
+        entities,
+        edges,
+        &resolved_db,
+        &resolved_entities,
+        &resolved_edges,
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn guard_ndjson_file_identities(
+    db: &Path,
+    entities: &Path,
+    edges: &Path,
+    resolved_db: &Path,
+    resolved_entities: &Path,
+    resolved_edges: &Path,
+) -> Result<()> {
+    use khive_db::file_identity::database_file_identity;
+
+    let identity = |path: &Path| match database_file_identity(path) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    let db_identity = identity(resolved_db)
+        .with_context(|| format!("inspect source database identity {}", db.display()))?;
+    let entity_identity = identity(resolved_entities)
+        .with_context(|| format!("inspect NDJSON leaf identity {}", entities.display()))?;
+    let edge_identity = identity(resolved_edges)
+        .with_context(|| format!("inspect NDJSON leaf identity {}", edges.display()))?;
+    for (path, file_identity) in [(entities, entity_identity), (edges, edge_identity)] {
+        if db_identity.is_some() && db_identity == file_identity {
+            bail!(
+                "refusing NDJSON export: {} is the same physical file as source database {}",
+                path.display(),
+                db.display()
+            );
+        }
+    }
+    if entity_identity.is_some() && entity_identity == edge_identity {
+        bail!(
+            "refusing NDJSON export: {} and {} are the same physical file",
+            entities.display(),
+            edges.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn guard_ndjson_file_identities(
+    _db: &Path,
+    _entities: &Path,
+    _edges: &Path,
+    _resolved_db: &Path,
+    _resolved_entities: &Path,
+    _resolved_edges: &Path,
+) -> Result<()> {
+    bail!("NDJSON export requires physical file identity support on this platform")
 }
 
 fn export_temporary_name(output: &Path) -> std::ffi::OsString {
@@ -832,6 +1047,7 @@ mod tests {
             .unwrap();
 
         let args = ExportArgs {
+            ndjson: false,
             output: output_path.clone(),
             db: db_path,
             namespace: "test-ns".to_string(),
@@ -887,6 +1103,7 @@ mod tests {
         std::os::unix::fs::symlink(&db_path, &link).unwrap();
 
         let args = ExportArgs {
+            ndjson: false,
             output: link,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -943,6 +1160,7 @@ mod tests {
         std::os::unix::fs::symlink(&db_path, &temp_path).unwrap();
 
         let args = ExportArgs {
+            ndjson: false,
             output: out,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1748,6 +1966,7 @@ mod export_publication_tests {
         std::fs::write(&output, b"old destination").unwrap();
         std::fs::write(temporary(&output), b"incumbent").unwrap();
         let error = cmd_export(ExportArgs {
+            ndjson: false,
             output: output.clone(),
             db: scratch.path().join("working.db"),
             namespace: "test-ns".into(),
@@ -1772,6 +1991,7 @@ mod export_publication_tests {
         std::os::unix::fs::symlink(&target, &output).unwrap();
         std::os::unix::fs::symlink(&target, temporary(&output)).unwrap();
         let args = || ExportArgs {
+            ndjson: false,
             output: output.clone(),
             db: scratch.path().join("working.db"),
             namespace: "test-ns".into(),
@@ -1809,6 +2029,7 @@ mod export_publication_tests {
             .path()
             .join(std::ffi::OsStr::from_bytes(b"archive-\xff.json"));
         cmd_export(ExportArgs {
+            ndjson: false,
             output: output.clone(),
             db: scratch.path().join("working.db"),
             namespace: "test-ns".into(),
