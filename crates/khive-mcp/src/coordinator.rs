@@ -208,7 +208,7 @@ pub trait CoordinatorService: Send + Sync {
     /// boundary cannot silently narrow the public wire shape.
     ///
     /// `extra_visible` is the caller's resolved extra read-visibility
-    /// namespaces beyond `namespace` itself (MAJ-3 fix) — the same
+    /// namespaces beyond `namespace` itself — the same
     /// `['local'] ∪ visible_namespaces` set the normal registry dispatch path
     /// authorizes with, or empty when the caller named an explicit
     /// `namespace=` (which intentionally narrows visibility). Implementations
