@@ -4652,13 +4652,6 @@ async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation
         }
     }
 
-    // Entry reset, not exit: a `config_ledger`-grouped test that panics
-    // after queueing a row (elsewhere in this group) would otherwise
-    // leave it for whichever test the serial lock hands off to next;
-    // this test's exact `events.len() == 1` assertion below has no
-    // tolerance for an inherited row.
-    let _ = crate::config_ledger::drain_config_locked();
-
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
     let store = Arc::new(MemoryEventStore::default());
@@ -4720,10 +4713,6 @@ async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
             Ok(GateDecision::deny("intercepted policy denied"))
         }
     }
-
-    // Entry reset, not exit — see the sibling test above for why an
-    // exact `events.len() == 1` assertion needs a clean ledger.
-    let _ = crate::config_ledger::drain_config_locked();
 
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
