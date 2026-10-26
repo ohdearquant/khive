@@ -157,6 +157,7 @@ impl KhiveRuntime {
         attachment: NewAttachment,
         retention: &mut QuarantineOriginalRetention,
     ) -> RuntimeResult<bool> {
+        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
         // Resolve the secondary note store before creating a main owner. No note
         // publication has been attempted if any setup or blob check fails.
         let notes = self.raw_notes(token)?;
