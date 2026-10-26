@@ -306,15 +306,10 @@ fn owner_insert_was_fenced(error: &StorageError) -> bool {
             owner_insert_was_fenced(source)
         }
         StorageError::WriterTaskRequestFailed {
-            request_state,
+            request_state:
+                WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack,
             source,
-        } if matches!(
-            request_state,
-            WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack
-        ) =>
-        {
-            owner_insert_was_fenced(source)
-        }
+        } => owner_insert_was_fenced(source),
         StorageError::Driver {
             capability,
             operation,
