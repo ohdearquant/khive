@@ -166,49 +166,38 @@ tokio::task_local! {
     pub(super) static PROF_CID: u64;
 }
 
-pub(super) fn recall_profile_enabled() -> bool {
+pub(super) fn recall_profile_enabled(runtime: &khive_runtime::KhiveRuntime) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("KHIVE_RECALL_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_RECALL_PROFILE",
-            enabled.to_string(),
-        );
-        enabled
-    })
+    let enabled = *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok());
+    runtime.record_config_locked("KHIVE_RECALL_PROFILE", || enabled.to_string());
+    enabled
 }
 
-pub(crate) fn ann_overfetch_max_rounds() -> usize {
+pub(crate) fn ann_overfetch_max_rounds(runtime: &khive_runtime::KhiveRuntime) -> usize {
     static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROUNDS.get_or_init(|| {
-        let rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+    let rounds = *ROUNDS.get_or_init(|| {
+        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        khive_runtime::config_ledger::record_config_locked(
-            "ANN_OVERFETCH_MAX_ROUNDS",
-            rounds.to_string(),
-        );
-        rounds
-    })
+            .unwrap_or(3)
+    });
+    runtime.record_config_locked("ANN_OVERFETCH_MAX_ROUNDS", || rounds.to_string());
+    rounds
 }
 
 /// Return the cached ANN readiness timeout, defaulting to 8 seconds.
 /// See `crates/khive-pack-memory/docs/api/configuration.md`.
-pub(super) fn ann_ready_timeout_ms() -> u64 {
+pub(super) fn ann_ready_timeout_ms(runtime: &khive_runtime::KhiveRuntime) -> u64 {
     static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| {
+    let ms = *TIMEOUT_MS.get_or_init(|| {
         const DEFAULT_ANN_READY_TIMEOUT_MS: u64 = 8_000;
-        let ms = std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
+        std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_MEMORY_ANN_READY_TIMEOUT_MS",
-            ms.to_string(),
-        );
-        ms
-    })
+            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS)
+    });
+    runtime.record_config_locked("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS", || ms.to_string());
+    ms
 }
 
 #[inline(always)]
@@ -1177,7 +1166,7 @@ impl MemoryPack {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
@@ -1347,7 +1336,7 @@ impl MemoryPack {
         const ANN_OVERFETCH_MARGIN: usize = 32;
         let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
             .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
 
         let mut ann_degraded = false;
