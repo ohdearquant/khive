@@ -289,6 +289,7 @@ impl ConnectionPool {
             write_admission,
             disk_guard_config,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
+            note_search_routes: Default::default(),
             reader_checkouts: Mutex::new(BTreeMap::new()),
             search_dispatches: Mutex::new(BTreeMap::new()),
             note_candidate_hydration_rows: AtomicU64::new(0),

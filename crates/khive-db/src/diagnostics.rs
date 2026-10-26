@@ -1541,6 +1541,10 @@ pub struct DbDiagnostics {
     /// report's database file and reset only with the serving process.
     pub note_search_ann_route_total: u64,
     pub note_search_fallback_route_total: u64,
+    /// Note-search route totals and fallback causes for this report's opened
+    /// pool. Shared by its runtime handles; reset on pool reconstruction.
+    /// Aliases report the representative pool; separate opens are not summed.
+    pub note_search_routes: crate::pool::NoteSearchRouteSnapshot,
     /// Pool-scoped, monotonic coordinator dispatch and note-candidate
     /// hydration counts used by ADR-166 G4/G5. Reset on pool reconstruction.
     pub search_mechanism: crate::pool::SearchMechanismSnapshot,
@@ -1827,6 +1831,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -1841,6 +1846,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
@@ -1904,6 +1910,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
@@ -1966,6 +1973,7 @@ fn collect_inner(
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -1979,6 +1987,7 @@ fn collect_inner(
             code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
@@ -2037,6 +2046,7 @@ fn collect_inner(
         code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(pool),

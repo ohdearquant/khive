@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use khive_db::pool::NoteSearchFallbackCause;
 use lattice_embed::{EmbeddingModel, EmbeddingRole, EmbeddingService, TokenCount, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
@@ -670,8 +671,8 @@ impl KhiveRuntime {
     }
 
     /// The note-search vector leg uses the pack-owned graph when that model
-    /// has an installed, consumer-protected bridge. Only a missing graph for
-    /// this consumer takes the existing exact sqlite-vec route.
+    /// has an installed, consumer-protected bridge. A missing model, backend
+    /// provider, or eligible graph takes the existing exact sqlite-vec route.
     pub(crate) async fn note_search_vector_search(
         &self,
         token: &NamespaceToken,
@@ -684,16 +685,19 @@ impl KhiveRuntime {
             None => self.embed_query_for_token(token, query_text).await?,
         };
         let model = self.default_embedder_name();
-        if !model.is_empty() {
-            if let Some(provider) = self.note_search_ann_provider()? {
-                if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
-                    crate::note_search_ann::record_ann_route();
-                    crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-                    return Ok(hits);
-                }
+        let fallback_cause = if model.is_empty() {
+            NoteSearchFallbackCause::NoModel
+        } else if let Some(provider) = self.note_search_ann_provider()? {
+            if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
+                crate::note_search_ann::record_ann_route(self.backend().pool());
+                crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+                return Ok(hits);
             }
-        }
-        crate::note_search_ann::record_fallback_route();
+            NoteSearchFallbackCause::NoEligibleGraph
+        } else {
+            NoteSearchFallbackCause::NoProvider
+        };
+        crate::note_search_ann::record_fallback_route(self.backend().pool(), fallback_cause);
         self.vector_search(
             token,
             Some(embedding),
