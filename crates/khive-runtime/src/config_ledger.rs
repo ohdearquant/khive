@@ -1,24 +1,9 @@
-//! Runtime-owned config ledgers are introduced alongside the transitional global lane.
-//! The legacy API below remains until all five migration steps are complete.
+//! Per-runtime config-lock observations for ADR-094.
 //!
-//! ADR-094 process-lifetime config lock ledger.
-//!
-//! Several `OnceLock`-backed config readers across packs (recall profiling,
-//! ANN overfetch rounds, context profiling, ...) resolve an environment
-//! variable exactly once per process and hold it for the process lifetime.
-//! That first resolution is itself an auditable lifecycle event ("this
-//! process locked config key K to value V"), but the `OnceLock::get_or_init`
-//! closures that produce it run synchronously, off any async/event-store
-//! context, and long before a `VerbRegistry` exists.
-//!
-//! This module bridges the two: `record_config_locked` is a plain sync
-//! function any `OnceLock` closure can call to enqueue a `(key, value)` pair
-//! into a process-wide queue. The registry's dispatch path drains the queue
-//! (`take_config_locked`) at the same gate where it already appends audit
-//! events, so `ConfigLocked` rows carry the namespace/actor of whichever
-//! dispatch happens to observe the queue non-empty first (ADR-094's accepted
-//! provenance quirk) rather than needing every `OnceLock` site to carry its
-//! own `EventStore` handle.
+//! Runtime clones share one ledger; independent constructions do not.
+//! State mutations use one blocking mutex, and pending-flag stores hold it.
+//! Dispatch takes an owned batch before awaiting the bound runtime's
+//! best-effort event appends.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +17,8 @@ use std::sync::Mutex;
 pub(crate) struct ConfigLockLedger {
     state: Mutex<State>,
     pending: AtomicBool,
+    #[cfg(test)]
+    test_hooks: Mutex<TestRecordHooks>,
 }
 
 #[derive(Default)]
@@ -40,11 +27,30 @@ struct State {
     pending: Vec<(&'static str, String)>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestRecordPoint {
+    BeforeLock,
+    AfterUnlock,
+}
+
+#[cfg(test)]
+type TestRecordHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRecordHooks {
+    before_lock: Option<TestRecordHook>,
+    after_unlock: Option<TestRecordHook>,
+}
+
 impl ConfigLockLedger {
     pub(crate) fn record_config_locked<F>(&self, key: &'static str, value: F)
     where
         F: FnOnce() -> String,
     {
+        #[cfg(test)]
+        self.run_test_hook(TestRecordPoint::BeforeLock);
         let mut state = self
             .state
             .lock()
@@ -59,6 +65,33 @@ impl ConfigLockLedger {
             state.pending.push((key, value));
             self.pending.store(true, Ordering::Release);
         }
+        drop(state);
+        #[cfg(test)]
+        self.run_test_hook(TestRecordPoint::AfterUnlock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_hook(&self, point: TestRecordPoint, hook: TestRecordHook) {
+        let mut hooks = self.test_hooks.lock().unwrap();
+        let slot = match point {
+            TestRecordPoint::BeforeLock => &mut hooks.before_lock,
+            TestRecordPoint::AfterUnlock => &mut hooks.after_unlock,
+        };
+        assert!(slot.replace(hook).is_none(), "one pause per boundary");
+    }
+
+    #[cfg(test)]
+    fn run_test_hook(&self, point: TestRecordPoint) {
+        let hook = {
+            let mut hooks = self.test_hooks.lock().unwrap();
+            match point {
+                TestRecordPoint::BeforeLock => hooks.before_lock.take(),
+                TestRecordPoint::AfterUnlock => hooks.after_unlock.take(),
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
@@ -72,112 +105,6 @@ impl ConfigLockLedger {
         let batch = std::mem::take(&mut state.pending);
         self.pending.store(false, Ordering::Release);
         batch
-    }
-}
-
-// Transitional global lane: unmigrated producers still enqueue here.
-// Serving dispatch now consumes only its retained runtime ledger.
-// Remove the flag, queue, free functions and legacy fixtures in complete Step 5.
-
-/// `true` once at least one pair has been enqueued and not yet drained.
-///
-/// Read via `swap(false, Ordering::AcqRel)` on the dispatch hot path so the
-/// overwhelmingly common empty-ledger case pays for a single atomic
-/// read-and-clear instead of locking `LEDGER`.
-pub(crate) static PENDING: AtomicBool = AtomicBool::new(false);
-
-static LEDGER: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-
-/// Enqueue a config key/value pair for later `ConfigLocked` event emission.
-///
-/// Safe to call from a synchronous `OnceLock::get_or_init` closure — this
-/// only takes a `std::sync::Mutex`, never awaits, and never fails.
-pub fn record_config_locked(key: &'static str, value: impl Into<String>) {
-    LEDGER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push((key.to_string(), value.into()));
-    // Set after enqueue so a dispatch that observes `true` is guaranteed to
-    // find the pair already in `LEDGER`.
-    PENDING.store(true, Ordering::Release);
-}
-
-/// Transitional drain for the old global-lane fixtures only.
-///
-/// Serving dispatch uses the runtime-owned drain. Remove this helper in Step 5.
-#[cfg(test)]
-pub(crate) fn drain_config_locked() -> Vec<(String, String)> {
-    std::mem::take(
-        &mut *LEDGER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    )
-}
-
-/// `true` if at least one config-locked pair is queued, without draining it.
-///
-/// Test-only observability into the atomic fast path; the dispatch path
-/// itself swaps `PENDING` directly rather than calling this.
-#[cfg(test)]
-pub(crate) fn has_pending_config_locked() -> bool {
-    PENDING.load(Ordering::Acquire)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    // `PENDING`/`LEDGER` are process-wide singletons; serialize these tests
-    // against each other so one test's queued pairs never leak into
-    // another's assertions.
-    #[test]
-    #[serial(config_ledger)]
-    fn record_then_drain_returns_queued_pairs_in_order() {
-        drain_config_locked(); // drain any leftovers from a prior test run
-        PENDING.store(false, Ordering::Release);
-        assert!(!has_pending_config_locked());
-
-        record_config_locked("recall_profile_enabled", "true");
-        record_config_locked("ann_overfetch_max_rounds", "3");
-
-        assert!(has_pending_config_locked());
-        let drained = drain_config_locked();
-        assert_eq!(
-            drained,
-            vec![
-                ("recall_profile_enabled".to_string(), "true".to_string()),
-                ("ann_overfetch_max_rounds".to_string(), "3".to_string()),
-            ]
-        );
-    }
-
-    /// Mirrors the dispatch fast path: rows drain exactly once via the atomic
-    /// swap-and-check, and a second dispatch observes no pending work without
-    /// needing to lock `LEDGER`.
-    #[test]
-    #[serial(config_ledger)]
-    fn dispatch_fast_path_drains_exactly_once_then_reports_no_pending() {
-        drain_config_locked();
-        PENDING.store(false, Ordering::Release);
-
-        record_config_locked("context_profile_enabled", "false");
-
-        assert!(PENDING.swap(false, Ordering::AcqRel));
-        let drained = drain_config_locked();
-        assert_eq!(
-            drained,
-            vec![("context_profile_enabled".to_string(), "false".to_string())]
-        );
-
-        assert!(
-            !PENDING.swap(false, Ordering::AcqRel),
-            "a second dispatch must observe the flag already cleared"
-        );
-        assert!(
-            drain_config_locked().is_empty(),
-            "nothing should be left to re-emit on a later dispatch"
-        );
     }
 }
 

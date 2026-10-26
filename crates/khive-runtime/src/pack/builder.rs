@@ -22,6 +22,10 @@ use super::{
 #[cfg(doc)]
 use super::{PackFactory, PackRegistry};
 
+#[cfg(any(test, feature = "test-internals"))]
+type RuntimeEventStoreTestWrapper =
+    Arc<dyn Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync>;
+
 /// Builder for constructing a `VerbRegistry`.
 ///
 /// Packs are registered here; once `.build()` is called the registry is
@@ -64,6 +68,8 @@ pub struct VerbRegistryBuilder {
     event_store: Option<Arc<dyn EventStore>>,
     /// Retains runtime ownership and resolves its final namespace sink at build.
     runtime_event_store: Option<KhiveRuntime>,
+    #[cfg(any(test, feature = "test-internals"))]
+    test_runtime_event_store_wrapper: Option<RuntimeEventStoreTestWrapper>,
     /// The configured audit backend is intentionally read-only, so dispatch
     /// omits the known-failing append and the transport surfaces an advisory.
     audit_store_read_only: bool,
@@ -96,6 +102,8 @@ impl VerbRegistryBuilder {
             actor_id: None,
             event_store: None,
             runtime_event_store: None,
+            #[cfg(any(test, feature = "test-internals"))]
+            test_runtime_event_store_wrapper: None,
             audit_store_read_only: false,
             dispatch_hook: None,
             audit_batch_config: None,
@@ -268,6 +276,20 @@ impl VerbRegistryBuilder {
         self.runtime_event_store = Some(runtime.clone());
         self.audit_store_read_only = false;
         Ok(self)
+    }
+
+    /// Decorate the runtime-resolved audit sink for test fixtures.
+    ///
+    /// The runtime binding and namespace resolution are retained. Explicit,
+    /// read-only, metadata and unbound sinks do not invoke this wrapper.
+    #[cfg(any(test, feature = "test-internals"))]
+    #[doc(hidden)]
+    pub fn with_runtime_event_store_test_wrapper<F>(&mut self, wrapper: F) -> &mut Self
+    where
+        F: Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync + 'static,
+    {
+        self.test_runtime_event_store_wrapper = Some(Arc::new(wrapper));
+        self
     }
 
     /// Override the ADR-133 audit-batch seam's tunables, applied when
@@ -611,6 +633,15 @@ impl VerbRegistryBuilder {
         let event_store = match &config_lock_runtime {
             Some(runtime) => Some(runtime.raw_events_for_namespace(&self.default_namespace)?),
             None => self.event_store,
+        };
+        #[cfg(any(test, feature = "test-internals"))]
+        let event_store = match (
+            &config_lock_runtime,
+            &self.test_runtime_event_store_wrapper,
+            event_store,
+        ) {
+            (Some(_), Some(wrapper), Some(store)) => Some(wrapper(store)),
+            (_, _, store) => store,
         };
         if let Some(store) = &event_store {
             if !store.supports_idempotent_audit_batch() {

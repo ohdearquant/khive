@@ -481,6 +481,15 @@ impl KhiveRuntime {
         self.config_lock_ledger.record_config_locked(key, value);
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_config_lock_test_hook(
+        &self,
+        point: crate::config_ledger::TestRecordPoint,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.config_lock_ledger.install_test_hook(point, hook);
+    }
+
     /// Take this runtime's pending observations for its bound audit registry.
     pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
         self.config_lock_ledger.drain_config_locked()
