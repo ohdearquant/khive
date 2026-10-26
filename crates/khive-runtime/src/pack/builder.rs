@@ -22,6 +22,10 @@ use super::{
 #[cfg(doc)]
 use super::{PackFactory, PackRegistry};
 
+#[cfg(any(test, feature = "test-internals"))]
+type RuntimeEventStoreTestWrapper =
+    Arc<dyn Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync>;
+
 /// Builder for constructing a `VerbRegistry`.
 ///
 /// Packs are registered here; once `.build()` is called the registry is
@@ -59,12 +63,13 @@ pub struct VerbRegistryBuilder {
     /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
-    /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
-    /// registry does not depend on the full `KhiveRuntime` surface — only the
-    /// audit-persistence capability is needed here.
+    /// `tracing::info!` emission. Persistence is separate from the optional
+    /// runtime binding retained for config-lock ownership.
     event_store: Option<Arc<dyn EventStore>>,
-    /// Defers the runtime sink's namespace-scoped read binding until build.
+    /// Retains runtime ownership and resolves its final namespace sink at build.
     runtime_event_store: Option<KhiveRuntime>,
+    #[cfg(any(test, feature = "test-internals"))]
+    test_runtime_event_store_wrapper: Option<RuntimeEventStoreTestWrapper>,
     /// The configured audit backend is intentionally read-only, so dispatch
     /// omits the known-failing append and the transport surfaces an advisory.
     audit_store_read_only: bool,
@@ -97,6 +102,8 @@ impl VerbRegistryBuilder {
             actor_id: None,
             event_store: None,
             runtime_event_store: None,
+            #[cfg(any(test, feature = "test-internals"))]
+            test_runtime_event_store_wrapper: None,
             audit_store_read_only: false,
             dispatch_hook: None,
             audit_batch_config: None,
@@ -269,6 +276,20 @@ impl VerbRegistryBuilder {
         self.runtime_event_store = Some(runtime.clone());
         self.audit_store_read_only = false;
         Ok(self)
+    }
+
+    /// Decorate the runtime-resolved audit sink for test fixtures.
+    ///
+    /// The runtime binding and namespace resolution are retained. Explicit,
+    /// read-only, metadata and unbound sinks do not invoke this wrapper.
+    #[cfg(any(test, feature = "test-internals"))]
+    #[doc(hidden)]
+    pub fn with_runtime_event_store_test_wrapper<F>(&mut self, wrapper: F) -> &mut Self
+    where
+        F: Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync + 'static,
+    {
+        self.test_runtime_event_store_wrapper = Some(Arc::new(wrapper));
+        self
     }
 
     /// Override the ADR-133 audit-batch seam's tunables, applied when
@@ -608,9 +629,19 @@ impl VerbRegistryBuilder {
         // dispatch that produced it still reports success, and nothing here
         // distinguishes that from a healthy registry. Reject it now, with an
         // actionable message, instead of at the first audited dispatch.
-        let event_store = match self.runtime_event_store {
+        let config_lock_runtime = self.runtime_event_store;
+        let event_store = match &config_lock_runtime {
             Some(runtime) => Some(runtime.raw_events_for_namespace(&self.default_namespace)?),
             None => self.event_store,
+        };
+        #[cfg(any(test, feature = "test-internals"))]
+        let event_store = match (
+            &config_lock_runtime,
+            &self.test_runtime_event_store_wrapper,
+            event_store,
+        ) {
+            (Some(_), Some(wrapper), Some(store)) => Some(wrapper(store)),
+            (_, _, store) => store,
         };
         if let Some(store) = &event_store {
             if !store.supports_idempotent_audit_batch() {
@@ -657,6 +688,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
             event_store,
+            config_lock_runtime,
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),

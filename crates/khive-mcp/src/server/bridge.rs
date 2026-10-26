@@ -28,9 +28,10 @@ pub(super) fn request_read_timeout() -> std::time::Duration {
     *TIMEOUT.get_or_init(|| {
         // The storage resolver owns the accepted range and warns on a corrected value.
         let timeout = khive_storage::request_read_timeout_from_env();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
-            timeout.as_secs().to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            value = timeout.as_secs(),
         );
         timeout
     })

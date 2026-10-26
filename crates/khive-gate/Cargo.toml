@@ -15,7 +15,7 @@ description = "Pluggable authorization gate trait + default AllowAllGate impl fo
 bench = false
 
 [dependencies]
-khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
