@@ -1,12 +1,41 @@
 use std::collections::BTreeMap;
 
+use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{NotePropertyPatch, NotePropertyPrecondition};
 use khive_storage::types::SqlValue;
-use khive_storage::{ContentRef, NewAttachment, Note};
+use khive_storage::{
+    Attachment, AttachmentStore, AttachmentSubstrate, ContentRef, NewAttachment, Note,
+    StorageCapability,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{KhiveRuntime, NamespaceToken, RuntimeResult};
+use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
+
+/// Original-byte custody chosen before a trusted message is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineOriginalRetention {
+    Retained,
+    BlobSweepActive,
+    OwnerMismatch,
+}
+
+impl QuarantineOriginalRetention {
+    pub fn not_retained_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Retained => None,
+            Self::BlobSweepActive => Some("blob-sweep-active"),
+            Self::OwnerMismatch => Some("owner-mismatch"),
+        }
+    }
+}
+
+/// Preserve retention facts even when post-commit derivation returns an error.
+/// A failed or unknown write is not a successful custody receipt.
+pub struct TrustedIngestAttachmentOutcome {
+    pub result: RuntimeResult<Option<Note>>,
+    pub retention: QuarantineOriginalRetention,
+}
 
 impl KhiveRuntime {
     /// Like [`Self::try_create_note`] but permits the caller to establish the
@@ -43,15 +72,44 @@ impl KhiveRuntime {
             true,
             None,
             expires_after,
+            None,
         )
         .await
     }
 
-    /// Publish a trusted inbound message and its original-byte attachment in
-    /// one database transaction. Channel quarantine must not advertise a
-    /// reference in note metadata before GC can see its attachment owner.
+    /// Publish a trusted message and its original. Main-backend writes remain
+    /// atomic. A secondary quarantine registers its canonical main owner before
+    /// publishing the reference, under the existing blob-sweep SQL fence.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest_with_attachment(
+        &self,
+        capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        attachment: NewAttachment,
+        expires_after: Option<std::time::Duration>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_as_trusted_ingest_with_attachment_report(
+            capability,
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            attachment,
+            expires_after,
+        )
+        .await
+        .result
+    }
+
+    /// Like the attachment entry point, retaining the exact custody outcome
+    /// alongside the original result, including a committed degradation error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_create_note_as_trusted_ingest_with_attachment_report(
         &self,
         _capability: &crate::pack::ChannelIngestCapability,
         token: &NamespaceToken,
@@ -61,18 +119,130 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         attachment: NewAttachment,
         expires_after: Option<std::time::Duration>,
-    ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(
-            token,
-            kind,
-            name,
-            content,
-            properties,
-            true,
-            Some(attachment),
-            expires_after,
-        )
-        .await
+    ) -> TrustedIngestAttachmentOutcome {
+        let mut retention = QuarantineOriginalRetention::Retained;
+        let result = self
+            .try_create_note_impl(
+                token,
+                kind,
+                name,
+                content,
+                properties,
+                true,
+                Some(attachment),
+                expires_after,
+                Some(&mut retention),
+            )
+            .await;
+        TrustedIngestAttachmentOutcome { result, retention }
+    }
+
+    #[cfg(any(test, feature = "test-internals"))]
+    #[doc(hidden)]
+    pub async fn test_insert_secondary_quarantine_note(
+        &self,
+        token: &NamespaceToken,
+        note: &mut Note,
+        attachment: NewAttachment,
+        retention: &mut QuarantineOriginalRetention,
+    ) -> RuntimeResult<bool> {
+        self.try_insert_secondary_quarantine_note(token, note, attachment, retention)
+            .await
+    }
+
+    pub(super) async fn try_insert_secondary_quarantine_note(
+        &self,
+        token: &NamespaceToken,
+        note: &mut Note,
+        attachment: NewAttachment,
+        retention: &mut QuarantineOriginalRetention,
+    ) -> RuntimeResult<bool> {
+        // Resolve the secondary note store before creating a main owner. No note
+        // publication has been attempted if any setup or blob check fails.
+        let notes = self.raw_notes(token)?;
+        let core = self.core();
+        let owners = core.attachments()?;
+        let blob = core.blob_store().ok_or_else(|| {
+            RuntimeError::Unconfigured(
+                "trusted ingest attachment requires an installed BlobStore".into(),
+            )
+        })?;
+        let created = match owners
+            .try_insert_attachment(Attachment::from_new(
+                note.id,
+                AttachmentSubstrate::Note,
+                attachment.clone(),
+                note.created_at,
+            ))
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                let existing = owners.get_attachment(note.id, &attachment.role).await?;
+                if !matches!(existing, Some(ref owner)
+                    if owner.substrate == AttachmentSubstrate::Note
+                        && owner.content_ref == attachment.content_ref)
+                {
+                    *retention = QuarantineOriginalRetention::OwnerMismatch;
+                }
+                false
+            }
+            Err(error) if owner_insert_was_fenced(&error) => {
+                *retention = QuarantineOriginalRetention::BlobSweepActive;
+                false
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if *retention == QuarantineOriginalRetention::Retained {
+            // Registration wins before this check, preventing a new GC claim.
+            // A completed earlier sweep may already have removed an old ref.
+            let published = match blob.exists(&attachment.content_ref).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(RuntimeError::InvalidInput(format!(
+                    "trusted ingest attachment refers to an unpublished blob: {}",
+                    attachment.content_ref,
+                ))),
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = published {
+                if created {
+                    release_new_owner(owners.as_ref(), note, &attachment).await?;
+                }
+                return Err(error);
+            }
+        }
+        let properties = note
+            .properties
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                RuntimeError::Internal("secondary quarantine is missing its metadata object".into())
+            })?;
+        if let Some(reason) = retention.not_retained_reason() {
+            properties.remove("quarantine_content_ref");
+            properties.insert("quarantine_original_retained".into(), json!("false"));
+            properties.insert(
+                "quarantine_original_not_retained_reason".into(),
+                json!(reason),
+            );
+        } else {
+            properties.insert(
+                "quarantine_content_ref".into(),
+                json!(attachment.content_ref.to_string()),
+            );
+            properties.insert("quarantine_original_retained".into(), json!("true"));
+            properties.remove("quarantine_original_not_retained_reason");
+        }
+        let inserted = notes.try_insert_note(note.clone()).await;
+        let known_noncommit = match &inserted {
+            Ok(false) => true,
+            Err(error) => secondary_write_did_not_commit(error),
+            Ok(true) => false,
+        };
+        if created && known_noncommit {
+            release_new_owner(owners.as_ref(), note, &attachment).await?;
+        }
+        Ok(inserted?)
     }
 
     /// Repair the original-byte reference and retention of a matching quarantined message.
@@ -125,6 +295,72 @@ impl KhiveRuntime {
             .try_patch_note_properties(id, token.namespace().as_str(), "message", &patch)
             .await?)
     }
+}
+
+// This exact native trigger message is the canonical attachment fence in
+// khive-db/sql/047-attachment-role-quarantine.sql. Generic storage failures
+// must not be misreported as a sweep or converted to successful ingestion.
+fn owner_insert_was_fenced(error: &StorageError) -> bool {
+    match error {
+        StorageError::SqliteWrite { failure, source } if !failure.settlement_unknown => {
+            owner_insert_was_fenced(source)
+        }
+        StorageError::WriterTaskRequestFailed {
+            request_state,
+            source,
+        } if matches!(
+            request_state,
+            WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack
+        ) =>
+        {
+            owner_insert_was_fenced(source)
+        }
+        StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } if *capability == StorageCapability::Attachments
+            && operation.as_ref() == "try_insert_attachment" =>
+        {
+            source
+                .to_string()
+                .contains("content_ref is reserved by an active blob sweep")
+        }
+        _ => false,
+    }
+}
+
+fn secondary_write_did_not_commit(error: &StorageError) -> bool {
+    match error {
+        StorageError::SqliteWrite { failure, source } if !failure.settlement_unknown => {
+            secondary_write_did_not_commit(source)
+        }
+        StorageError::WriterTaskRequestFailed { request_state, .. }
+        | StorageError::WriterTaskTerminated { request_state, .. } => matches!(
+            request_state,
+            WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack,
+        ),
+        StorageError::AdmissionTimeout { .. }
+        | StorageError::WriteQueueFull { .. }
+        | StorageError::WriterTaskBusy { .. }
+        | StorageError::WriterTaskNoRuntime => true,
+        // A statement/driver/timeout error alone does not establish finality.
+        _ => false,
+    }
+}
+
+async fn release_new_owner(
+    owners: &dyn AttachmentStore,
+    note: &Note,
+    attachment: &NewAttachment,
+) -> RuntimeResult<()> {
+    owners.delete_attachment_if(
+        note.id, &attachment.role, AttachmentSubstrate::Note, &attachment.content_ref,
+    ).await.map_err(|error| RuntimeError::Internal(format!(
+        "secondary quarantine note {} did not publish, but its original owner could not be released: {error}",
+        note.id,
+    )))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -205,5 +441,66 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), repaired);
+    }
+
+    #[test]
+    fn secondary_write_finality_accepts_proven_noncommit() {
+        use khive_storage::error::{StorageError, WriterTaskRequestState};
+
+        for state in [
+            WriterTaskRequestState::NotStarted,
+            WriterTaskRequestState::TransactionRolledBack,
+        ] {
+            let error = StorageError::writer_task_terminated(state);
+            assert!(
+                super::secondary_write_did_not_commit(&error),
+                "explicitly settled noncommit must permit cleanup: {error}"
+            );
+        }
+        let rolled_back = StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Internal("controlled rollback".into())),
+        };
+        assert!(super::secondary_write_did_not_commit(&rolled_back));
+    }
+
+    #[test]
+    fn secondary_write_finality_preserves_outer_unknown_and_ambiguity() {
+        use khive_storage::error::{
+            SqliteWriteFailure, SqliteWriteStage, StorageError, WriterTaskRequestState,
+        };
+
+        let outer_unknown =
+            StorageError::writer_task_terminated(WriterTaskRequestState::TransactionRolledBack)
+                .with_sqlite_write_failure(SqliteWriteFailure {
+                    stage: SqliteWriteStage::Commit,
+                    primary_code: 13,
+                    extended_code: 13,
+                    settlement_unknown: true,
+                });
+        assert!(
+            !super::secondary_write_did_not_commit(&outer_unknown),
+            "outer settlement uncertainty must preserve the owner despite nested known state"
+        );
+        for error in [
+            StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown),
+            StorageError::Timeout {
+                operation: "try_insert_note".into(),
+            },
+            StorageError::Transaction {
+                operation: "try_insert_note".into(),
+                message: "outcome not established".into(),
+            },
+            StorageError::driver(
+                khive_storage::StorageCapability::Notes,
+                "try_insert_note",
+                std::io::Error::other("outcome not established"),
+            ),
+        ] {
+            assert!(
+                !super::secondary_write_did_not_commit(&error),
+                "ambiguous write evidence must preserve ownership: {error}"
+            );
+        }
     }
 }
