@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use khive_db::pool::NoteSearchFallbackCause;
+use khive_db::ConnectionPool;
 use khive_storage::types::VectorSearchHit;
 
 use crate::{KhiveRuntime, NamespaceToken, RuntimeResult};
@@ -45,11 +47,13 @@ fn increment(counter: &AtomicU64) {
     });
 }
 
-pub(crate) fn record_ann_route() {
+pub(crate) fn record_ann_route(pool: &ConnectionPool) {
+    pool.record_note_search_ann_route();
     increment(&ANN_ROUTE_TOTAL);
 }
 
-pub(crate) fn record_fallback_route() {
+pub(crate) fn record_fallback_route(pool: &ConnectionPool, cause: NoteSearchFallbackCause) {
+    pool.record_note_search_fallback_route(cause);
     increment(&FALLBACK_ROUTE_TOTAL);
 }
 
