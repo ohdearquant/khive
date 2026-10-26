@@ -233,7 +233,7 @@ fn assert_conflict(error: RuntimeError, message: &str) {
     }
 }
 fn comparable_envelope(event: &Event) -> Value {
-    assert_eq!(event.id.get_version_num(), 4);
+    assert_eq!(event.id.get_version_num(), 7);
     assert!(event.created_at > 1_000_000);
     assert!(Utc.timestamp_micros(event.created_at).single().is_some());
     let mut value = serde_json::to_value(event).unwrap();
