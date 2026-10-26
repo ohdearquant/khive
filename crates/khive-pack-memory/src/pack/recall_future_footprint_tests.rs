@@ -7,7 +7,7 @@ use khive_runtime::{Namespace, VerbRegistryBuilder};
 fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
     // Measure on an explicitly roomy stack so the regression reports the
     // historical inline footprint instead of aborting the test process.
-    let (pipeline_bytes, deadline_bytes) = std::thread::Builder::new()
+    let (pipeline_bytes, profiled_bytes, deadline_bytes) = std::thread::Builder::new()
         .name("recall-future-footprint".to_string())
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
@@ -24,17 +24,28 @@ fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
                 &registry,
                 None,
             ));
+            let profiled_bytes = std::mem::size_of_val(&pack.handle_recall_profiled(
+                &token,
+                serde_json::json!({"query": "future footprint probe"}),
+                &registry,
+                None,
+            ));
             let deadline_bytes = std::mem::size_of_val(&pack.handle_recall_with_deadline(
                 &token,
                 serde_json::json!({"query": "future footprint probe"}),
                 &registry,
             ));
-            (pipeline_bytes, deadline_bytes)
+            (pipeline_bytes, profiled_bytes, deadline_bytes)
         })
         .expect("spawn footprint measurement")
         .join()
         .expect("footprint measurement panicked");
 
+    assert!(
+        profiled_bytes < pipeline_bytes,
+        "the profiled wrapper must hold the recall pipeline behind a pointer in both branches: \
+             wrapper={profiled_bytes}B pipeline={pipeline_bytes}B"
+    );
     assert!(
         deadline_bytes < pipeline_bytes,
         "the deadline wrapper must hold the recall pipeline behind a pointer: \

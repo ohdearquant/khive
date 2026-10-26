@@ -621,6 +621,16 @@ result (e.g. create then link with the new entity's id)."#)]
     }
 }
 
+#[cfg(any(test, feature = "test-forward-seam"))]
+impl KhiveMcpServer {
+    /// Fixture-only access to the unchanged MCP request path.
+    #[doc(hidden)]
+    pub async fn request_for_config_lock_test(&self, p: RequestParams) -> Result<String, McpError> {
+        self.request(Parameters(p), tokio_util::sync::CancellationToken::new())
+            .await
+    }
+}
+
 #[cfg(test)]
 #[path = "server/request_result_error_tests.rs"]
 mod request_result_error_tests;

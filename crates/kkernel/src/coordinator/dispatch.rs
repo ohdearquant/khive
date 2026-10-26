@@ -1635,9 +1635,10 @@ fn backend_search_timeout_ms() -> u64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_BACKEND_SEARCH_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
-            ms.to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
+            value = ms,
         );
         ms
     })

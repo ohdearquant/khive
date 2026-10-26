@@ -16,7 +16,7 @@ use super::{
 
 /// Immutable registry that dispatches verb calls to registered packs.
 ///
-/// Clone is cheap (Arc-wrapped). Constructed via `VerbRegistryBuilder`.
+/// Clone shares pack state and retains its runtime audit binding. Built by `VerbRegistryBuilder`.
 #[derive(Clone)]
 pub struct VerbRegistry {
     pub(super) packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
@@ -44,6 +44,9 @@ pub struct VerbRegistry {
     pub(super) actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     pub(super) event_store: Option<Arc<dyn EventStore>>,
+    /// Actual runtime clone whose ledger belongs to the configured audit sink.
+    /// Explicit, read-only and absent sinks retain no runtime binding.
+    pub(super) config_lock_runtime: Option<crate::KhiveRuntime>,
     /// Distinguishes ordinary tracing-only construction from a sink omitted
     /// deliberately because its configured backend is read-only.
     pub(super) audit_store_read_only: bool,
