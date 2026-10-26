@@ -292,7 +292,14 @@ async fn malformed_initialize_custom_request_does_not_end_filtering() {
         let init = initialize(json!(11));
         client.send(init.clone()).await;
         assert_same_client_message(transport.receive().await.expect("typed initialize"), &init);
-        assert_method_not_found(&client.receive().await, json!("malformed"), "initialize");
+        let invalid = client.receive().await;
+        assert_eq!(invalid["jsonrpc"], "2.0");
+        assert_eq!(invalid["id"], "malformed");
+        assert_eq!(invalid["error"]["code"], -32602);
+        assert!(invalid["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("initialize")));
+        assert!(invalid.get("result").is_none());
         assert_method_not_found(&client.receive().await, json!(10), "server/discover");
     })
     .await;
