@@ -83,7 +83,7 @@ async fn run_model(seed: u64) {
                 assert!(
                     rows.iter()
                         .all(|row| row.namespace == "local"
-                            && row.actor == "agent:same-backend-model"),
+                            && row.actor == "actor:same-backend-model"),
                     "same backend pair uses identical actual dispatch identity"
                 );
                 let actual = MODEL_KEYS

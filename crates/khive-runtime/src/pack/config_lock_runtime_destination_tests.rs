@@ -93,7 +93,7 @@ async fn handler_observation_after_a_drain_stays_pending_while_b_dispatches() {
         .await;
     let rows = a.rows().await;
     assert_eq!(rows[0].namespace, "handler-owner-a");
-    assert_eq!(rows[0].actor, "agent:handler-a");
+    assert_eq!(rows[0].actor, "actor:handler-a");
     assert!(
         b.rows().await.is_empty(),
         "B stays empty after A's later drain"

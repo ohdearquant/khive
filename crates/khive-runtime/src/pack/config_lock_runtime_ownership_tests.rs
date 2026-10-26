@@ -18,8 +18,8 @@ async fn separate_runtimes_keep_destinations_identity_and_first_values() {
     b.dispatch().await;
     b.assert_rows(&[("ownership.k", "b-first")]).await;
     for (fixture, namespace, actor) in [
-        (&a, "config-owner-a", "agent:owner-a"),
-        (&b, "config-owner-b", "agent:owner-b"),
+        (&a, "config-owner-a", "actor:owner-a"),
+        (&b, "config-owner-b", "actor:owner-b"),
     ] {
         let rows = fixture.rows().await;
         assert_eq!(rows[0].namespace, namespace);
@@ -71,7 +71,7 @@ async fn independent_same_backend_runtimes_keep_both_orders_and_pending_unbound_
         let rows = e.rows().await;
         assert!(rows
             .iter()
-            .all(|row| row.namespace == "local" && row.actor == "agent:same-backend"));
+            .all(|row| row.namespace == "local" && row.actor == "actor:same-backend"));
         assert_eq!(
             rows.len(),
             2,
@@ -108,7 +108,7 @@ async fn independent_same_backend_runtimes_keep_both_orders_and_pending_unbound_
         .rows()
         .await
         .iter()
-        .all(|row| row.namespace == "local" && row.actor == "agent:same-backend-unbound"));
+        .all(|row| row.namespace == "local" && row.actor == "actor:same-backend-unbound"));
     d.finish().await;
     e.finish().await;
 }
