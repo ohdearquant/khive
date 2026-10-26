@@ -52,7 +52,7 @@ impl Event {
     ) -> Self {
         let operation = crate::operation_context::current_operation_attribution();
         Self {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             namespace: namespace.into(),
             verb: verb.into(),
             substrate,

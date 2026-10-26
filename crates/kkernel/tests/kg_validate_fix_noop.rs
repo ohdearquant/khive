@@ -19,6 +19,7 @@ fn fixture(entities: &str, edges: &str) -> TempDir {
     directory
 }
 
+// Every invocation uses --fix; the bool controls only --strict.
 fn validate(directory: &TempDir, strict: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kkernel"));
     for (key, _) in std::env::vars_os() {
@@ -78,7 +79,7 @@ fn fix_preserves_valid_sorted_and_empty_inputs_byte_for_byte() {
         let report = report(&output);
         assert!(output.status.success(), "{report}");
         assert_eq!(report["summary"]["passed"], true);
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("applied fix"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("re-sorted "));
         assert_bytes(&directory, entities, edges);
     }
 }
@@ -93,7 +94,7 @@ fn fix_preserves_unfixable_only_failures_and_their_exit_status() {
         assert_eq!(output.status.code(), Some(1), "{report}");
         assert_eq!(report["summary"]["passed"], false);
         assert!(report["summary"]["errors"].as_u64().unwrap() > 0);
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("applied fix"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("re-sorted "));
         assert_bytes(&directory, entities, " \n");
     }
 }
@@ -101,15 +102,20 @@ fn fix_preserves_unfixable_only_failures_and_their_exit_status() {
 #[test]
 fn fix_still_sorts_violations_and_a_second_fix_preserves_the_result() {
     let directory = fixture(&format!("{BETA}\n{ALPHA}\n"), "");
-    let output = validate(&directory, false);
+    let output = validate(&directory, true);
     let initial = report(&output);
     assert!(output.status.success(), "{initial}");
     assert!(initial["rules"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|rule| { rule["id"] == "sort-order" && rule["passed"] == false }));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("applied fix"));
+        .any(|rule| { rule["id"] == "sort-order" && rule["passed"] == true }));
+    assert_eq!(initial["summary"]["passed"], true);
+    assert_eq!(initial["summary"]["warnings"], 0);
+    let details = String::from_utf8_lossy(&output.stderr);
+    assert!(details.contains("re-sorted entities.ndjson (2 lines moved)"));
+    assert!(details.contains("1 warning(s) fixed, 0 warning(s) unfixable"));
+    assert!(!details.contains("re-sorted edges.ndjson"));
     let kg = directory.path().join(".khive/kg");
     let entities = std::fs::read_to_string(kg.join("entities.ndjson")).unwrap();
     let edges = std::fs::read_to_string(kg.join("edges.ndjson")).unwrap();
@@ -133,6 +139,6 @@ fn fix_still_sorts_violations_and_a_second_fix_preserves_the_result() {
     let final_report = report(&output);
     assert!(output.status.success(), "{final_report}");
     assert_eq!(final_report["summary"]["warnings"], 0);
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("applied fix"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("re-sorted "));
     assert_bytes(&directory, &entities, &edges);
 }

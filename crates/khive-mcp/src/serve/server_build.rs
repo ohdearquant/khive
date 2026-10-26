@@ -443,6 +443,13 @@ pub enum MaintenanceTopologyRefusal {
         /// Every canonical persistent member discovered in the topology.
         paths: Vec<PathBuf>,
     },
+    /// Distinct canonical paths currently name one existing physical store.
+    HardLinkedStores {
+        /// First canonical member in raw pathname-byte order.
+        first: PathBuf,
+        /// Later canonical member with the same observed physical identity.
+        second: PathBuf,
+    },
 }
 
 #[cfg(unix)]
@@ -452,6 +459,10 @@ impl std::fmt::Display for MaintenanceTopologyRefusal {
             Self::MemoryMainWithPersistentStores { paths } => write!(
                 f,
                 "maintenance requires a persistent main database; memory main has persistent stores: {paths:?}"
+            ),
+            Self::HardLinkedStores { first, second } => write!(
+                f,
+                "maintenance store paths {first:?} and {second:?} name the same physical database; configure one canonical spelling per physical store"
             ),
         }
     }
@@ -465,6 +476,10 @@ impl std::error::Error for MaintenanceTopologyRefusal {}
 /// Inputs must already be resolved, including the captured force-memory choice.
 /// Declared backends own storage instead of a HOME-derived discovery anchor.
 /// This prepares metadata only: it publishes no declaration and grants no lease.
+/// Existing members with distinct canonical spellings but equal physical file
+/// identities are refused. Missing files remain members by spelling; discovery
+/// creates nothing. These metadata observations neither lock pathnames nor close
+/// replacement races between the observations or after this function returns.
 #[cfg(unix)]
 pub fn maintenance_store_set(
     resolved: &RuntimeConfig,
@@ -516,9 +531,49 @@ pub fn maintenance_store_set(
         return Err(MaintenanceTopologyRefusal::MemoryMainWithPersistentStores { paths }.into());
     };
     let main = canonical_path_no_side_effects(main)?;
-    Ok(Some(khive_db::maintenance::StoreSet::from_canonical(
-        main, paths,
-    )?))
+    let stores = khive_db::maintenance::StoreSet::from_canonical(main, paths)?;
+    validate_maintenance_store_identities_with(
+        &stores,
+        khive_db::file_identity::database_file_identity,
+    )?;
+    Ok(Some(stores))
+}
+
+/// Check already sorted, deduplicated members without changing their spellings.
+/// The probe is injectable for deterministic absence and I/O-error coverage.
+#[cfg(unix)]
+pub(super) fn validate_maintenance_store_identities_with<F>(
+    stores: &khive_db::maintenance::StoreSet,
+    mut identity_for: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&std::path::Path) -> std::io::Result<khive_db::file_identity::DatabaseFileIdentity>,
+{
+    use std::collections::HashMap;
+
+    use khive_db::file_identity::DatabaseFileIdentity;
+
+    let mut paths_by_identity: HashMap<DatabaseFileIdentity, PathBuf> = HashMap::new();
+    for path in stores.paths() {
+        let identity = match identity_for(path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "cannot inspect maintenance database identity at {}",
+                    path.display()
+                )));
+            }
+        };
+        if let Some(first) = paths_by_identity.insert(identity, path.clone()) {
+            return Err(MaintenanceTopologyRefusal::HardLinkedStores {
+                first,
+                second: path.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the daemon's physical SQLite targets before runtime construction.

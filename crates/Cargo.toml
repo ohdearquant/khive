@@ -100,7 +100,7 @@ thiserror = "2.0"
 zstd = "0.13.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 chrono-tz = "0.10"
 croner = { version = "4.0", default-features = false, features = ["chrono"] }
