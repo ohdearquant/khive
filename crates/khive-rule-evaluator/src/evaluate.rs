@@ -55,6 +55,13 @@ pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Select an edge record ID; a present canonical field shadows the legacy alias.
+fn edge_record_id(v: &serde_json::Value) -> Option<&str> {
+    v.get("edge_id")
+        .or_else(|| v.get("id"))
+        .and_then(|id| id.as_str())
+}
+
 /// Collect edge record IDs from edges.ndjson into a set.
 ///
 /// Edge records use `"edge_id"` as the canonical key (ADR-002 / portability
@@ -63,13 +70,7 @@ pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
 /// in either serialization form.
 pub fn collect_edge_ids(content: &str) -> std::collections::HashSet<String> {
     parsed_ndjson_values(content)
-        .filter_map(|v| {
-            // Prefer the canonical `edge_id` field; fall back to `id`.
-            v.get("edge_id")
-                .or_else(|| v.get("id"))
-                .and_then(|i| i.as_str())
-                .map(str::to_string)
-        })
+        .filter_map(|v| edge_record_id(&v).map(str::to_string))
         .collect()
 }
 
@@ -246,6 +247,7 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
     let condition: Option<(&str, &str)> = rule.condition.as_deref().and_then(|c| c.split_once('='));
 
     let sev = severity_static(&rule.severity);
+    let is_edge_rule = rule.kind == "edge";
     let mut violations = Vec::new();
 
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -259,8 +261,13 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                 let src = edge_source_id(&v).unwrap_or("");
                 let tgt = edge_target_id(&v).unwrap_or("");
                 if src == tgt {
+                    let id = if is_edge_rule {
+                        edge_record_id(&v).filter(|id| !id.is_empty())
+                    } else {
+                        Some(src)
+                    };
                     violations.push(Violation {
-                        entity_id: Some(src.to_owned()),
+                        entity_id: id.map(str::to_owned),
                         entity_name: None,
                         entity_kind: v
                             .get("relation")
@@ -268,7 +275,7 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                             .map(str::to_owned),
                         rule_id: rule.id.clone(),
                         severity: sev,
-                        message: rule.message.replace("{id}", src),
+                        message: rule.message.replace("{id}", id.unwrap_or("")),
                         fixable: false,
                     });
                 }
@@ -284,18 +291,19 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
         if let Some(req) = rule.require_field.as_deref() {
             let val = v.get(req).and_then(|f| f.as_str()).unwrap_or("");
             if val.is_empty() {
-                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let id = if is_edge_rule {
+                    edge_record_id(&v)
+                } else {
+                    v.get("id").and_then(|id| id.as_str())
+                }
+                .filter(|id| !id.is_empty());
                 violations.push(Violation {
-                    entity_id: if id.is_empty() {
-                        None
-                    } else {
-                        Some(id.to_owned())
-                    },
+                    entity_id: id.map(str::to_owned),
                     entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_owned),
                     entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_owned),
                     rule_id: rule.id.clone(),
                     severity: sev,
-                    message: rule.message.replace("{id}", id),
+                    message: rule.message.replace("{id}", id.unwrap_or("")),
                     fixable: false,
                 });
             }

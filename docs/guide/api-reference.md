@@ -1913,6 +1913,12 @@ accepted; supplying both is rejected. Successful responses retain the
 request(ops="brain.feedback(id=\"<uuid>\", signal=\"useful\")")
 ```
 
+`brain.emit` is a deprecated internal subhandler for trusted Rust registry callers.
+Use canonical `id`; legacy `target_id` remains accepted, and supplying both is
+rejected. Successful responses retain `verb: "brain.feedback"` and `target_id`;
+persisted events retain the `brain.feedback` verb and
+`originating_verb: "brain.emit"`.
+
 ### `brain.auto_feedback` — Commissive
 
 Emit caller-attributed feedback for one recall result — the convenience verb to call

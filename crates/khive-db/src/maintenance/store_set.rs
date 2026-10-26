@@ -6,8 +6,11 @@ use sha2::{Digest, Sha256};
 
 /// A resolved physical topology with an explicit main-store role.
 ///
-/// Construction validates spelling only. The caller must first resolve physical
-/// aliases: this type performs no filesystem I/O or inode-based deduplication.
+/// Construction validates spelling only. The caller must first reject or resolve
+/// physical aliases among existing files: this type performs no filesystem I/O or
+/// inode-based deduplication. Absent files have no physical identity to compare;
+/// operators must keep their configured paths physically distinct when those
+/// files are created and keep the topology stable during maintenance.
 ///
 /// The digest deliberately includes the main path twice: once in the main role
 /// and once in the canonical member set, binding both role and membership.
