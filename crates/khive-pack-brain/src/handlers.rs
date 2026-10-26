@@ -730,12 +730,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         category: khive_types::VerbCategory::Commissive,
         params: &[
             khive_types::ParamDef {
-                name: "target_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the record the \
                               feedback applies to. Prefix resolution is namespace-unfiltered \
-                              under ADR-007.",
+                              under ADR-007. Legacy `target_id` is also accepted; supplying both `id` and `target_id` is rejected.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {

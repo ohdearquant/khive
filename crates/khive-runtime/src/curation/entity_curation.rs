@@ -9,6 +9,7 @@ use super::{
     SqlStatement, SqlValue, SqliteError, SubstrateKind, Uuid, Value,
 };
 
+use super::entity_pending_index::EntityUpdateReport;
 use crate::secret_gate_finalizer::entity_admission::{
     EntityAdmission, OrdinaryEntityUpdateContext,
 };
@@ -343,6 +344,20 @@ impl KhiveRuntime {
         patch: EntityPatch,
         expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        let (entity, report) = self
+            .update_entity_with_index_report(token, id, patch, expected_version)
+            .await?;
+        report.into_legacy(entity)
+    }
+
+    /// Apply an entity patch and report committed but unfinished index targets.
+    pub async fn update_entity_with_index_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        expected_version: Option<i64>,
+    ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         crate::entity_write::validate_expected_version(expected_version)?;
         let admission = OrdinaryEntityUpdateContext::capture(token);
         let PreparedEntityUpdate {
@@ -398,7 +413,10 @@ impl KhiveRuntime {
                 {
                     Ok(AtomicRunOutcome::Committed { .. }) => {
                         entity.version = next_version;
-                        return Ok((entity, report));
+                        return Ok((
+                            entity,
+                            EntityUpdateReport::complete(report, reindex_required),
+                        ));
                     }
                     Ok(AtomicRunOutcome::RolledBack {
                         failure: AtomicOpFailure::EntityConflict(conflict),
@@ -487,16 +505,18 @@ impl KhiveRuntime {
                 crate::retrieval::EmbeddingTruncationReport::default(),
             ));
         }
-        self.persist_prepared_entity_update(
-            token,
-            entity,
-            reindex_required,
-            changed_fields,
-            expected_updated_at,
-            expected_deleted_at,
-            None,
-        )
-        .await
+        let (entity, report) = self
+            .persist_prepared_entity_update(
+                token,
+                entity,
+                reindex_required,
+                changed_fields,
+                expected_updated_at,
+                expected_deleted_at,
+                None,
+            )
+            .await?;
+        report.into_legacy(entity)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -509,7 +529,7 @@ impl KhiveRuntime {
         expected_updated_at: i64,
         expected_deleted_at: Option<i64>,
         expected_version: Option<i64>,
-    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+    ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         // This final whole-object replacement must reserve the complete
         // candidate, even if a future caller bypasses the patch preparer.
         crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
@@ -521,7 +541,14 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
         use crate::atomic_plan::{AffectedRowGuard, PlanStatement, PostCommitEffect, UpdatePlan};
         use crate::atomic_runner::{
-            run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
+            apply_plan_preserving_storage, run_prepared_atomic_unit, AtomicOpFailure, AtomicOpPlan,
+            PlanExecutionFailure, PreparedAtomicError, PreparedAtomicOp, PreparedAtomicOutcome,
+        };
+        // One immutable metadata snapshot, captured before writer admission.
+        let models = if reindex_required {
+            self.entity_index_model_snapshot()?
+        } else {
+            Vec::new()
         };
         let plan = UpdatePlan {
             target_id: id,
@@ -547,60 +574,114 @@ impl KhiveRuntime {
             note_embedding_inheritance: None,
             graph_effects: Vec::new(),
         };
-        match run_atomic_unit(
-            self.sql().as_ref(),
-            vec![AtomicOpPlan::Update(Box::new(plan))],
-        )
-        .await
-        {
-            Ok(AtomicRunOutcome::Committed { .. }) => entity.version = next_version,
-            Ok(AtomicRunOutcome::RolledBack {
-                failure: AtomicOpFailure::EntityConflict(conflict),
-                ..
-            }) => return Err(conflict.into_error().into()),
-            Ok(AtomicRunOutcome::RolledBack {
-                failure: AtomicOpFailure::GuardFailed { .. },
-                ..
-            }) => return Err(stale_entity_snapshot_error(id)),
-            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+        let captured_models = models.clone();
+        let generation = Uuid::new_v4();
+        let pending_at = chrono::Utc::now().timestamp_micros();
+        let namespace = entity.namespace.clone();
+        let op: PreparedAtomicOp<
+            Option<khive_db::pending_index::PendingEntityIndex>,
+            AtomicOpFailure,
+        > = Box::new(move |writer| {
+            Box::pin(async move {
+                let plan = AtomicOpPlan::Update(Box::new(plan));
+                match apply_plan_preserving_storage(writer, &plan, false).await {
+                    Ok(_) => {}
+                    Err(PlanExecutionFailure::Operation(failure)) => {
+                        return Err(PreparedAtomicError::Refused {
+                            message: "entity update guard refused".into(),
+                            failure,
+                        });
+                    }
+                    Err(PlanExecutionFailure::Storage { source, .. }) => {
+                        return Err(PreparedAtomicError::Storage(source));
+                    }
+                }
+                let pending = if reindex_required {
+                    Some(
+                        khive_db::pending_index::enqueue(
+                            writer,
+                            id,
+                            &namespace,
+                            next_version,
+                            &captured_models,
+                            generation,
+                            pending_at,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                Ok((pending, Vec::new()))
+            })
+        });
+        let pending = match run_prepared_atomic_unit(self.sql().as_ref(), op).await {
+            Ok(PreparedAtomicOutcome::Committed { value, .. }) => {
+                entity.version = next_version;
+                value
+            }
+            Ok(PreparedAtomicOutcome::RolledBack(AtomicOpFailure::EntityConflict(conflict))) => {
+                return Err(conflict.into_error().into());
+            }
+            Ok(PreparedAtomicOutcome::RolledBack(AtomicOpFailure::GuardFailed { .. })) => {
+                return Err(stale_entity_snapshot_error(id));
+            }
+            Ok(PreparedAtomicOutcome::RolledBack(failure)) => {
                 return Err(RuntimeError::Internal(format!(
                     "entity update rolled back: {failure:?}"
-                )))
+                )));
             }
-            Err(error) => return Err(RuntimeError::Storage(error.0)),
-        }
-
-        let event_token =
-            token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
-                RuntimeError::Internal(format!("entity namespace invalid: {error}"))
-            })?);
-        let event_store = self.events(&event_token)?;
-        let event = khive_storage::event::Event::new(
-            entity.namespace.clone(),
-            "update",
-            EventKind::EntityUpdated,
-            SubstrateKind::Entity,
-            "",
-        )
-        .with_target(entity.id)
-        .with_payload(serde_json::json!({
-            "id": entity.id,
-            "namespace": entity.namespace,
-            "changed_fields": changed_fields,
-        }));
-        let event_result = event_store.append_event(event).await.map_err(|e| {
-            RuntimeError::Internal(format!("update_entity: event store write failed: {e}"))
-        });
-
-        let embedding_report = if reindex_required {
-            self.reindex_entity(token, &entity).await?
-        } else {
-            crate::retrieval::EmbeddingTruncationReport::default()
+            // Preserve the storage owner's unknown-outcome classification unchanged.
+            Err(error) => return Err(RuntimeError::Storage(error)),
         };
 
-        event_result?;
+        let event_result: RuntimeResult<()> = async {
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
+            let event = khive_storage::event::Event::new(
+                entity.namespace.clone(),
+                "update",
+                EventKind::EntityUpdated,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(entity.id)
+            .with_payload(serde_json::json!({
+                "id": entity.id,
+                "namespace": entity.namespace,
+                "changed_fields": changed_fields,
+            }));
+            event_store
+                .append_event(event)
+                .await
+                .map(|_| ())
+                .map_err(RuntimeError::Storage)
+        }
+        .await;
 
-        Ok((entity, embedding_report))
+        let mut report = match pending {
+            Some(pending) => {
+                self.publish_pending_entity_indexes(token, &entity, &pending, &models)
+                    .await
+            }
+            None => EntityUpdateReport::complete(
+                crate::retrieval::EmbeddingTruncationReport::default(),
+                false,
+            ),
+        };
+        if event_result.is_err() {
+            report
+                .post_commit_degradations
+                .push(crate::PostCommitDegradation {
+                    stage: "event_append",
+                    error: "entity committed; event append did not return a confirmed success"
+                        .into(),
+                });
+        }
+        Ok((entity, report))
     }
 
     /// Merge `from_id` into `into_id`.

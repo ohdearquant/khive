@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tomllib
+import unicodedata
 
 
 class CensusError(ValueError):
@@ -827,6 +828,21 @@ def census(tree, revision: str) -> dict:
     }
 
 
+def escape_terminal_text(value: str) -> str:
+    parts = []
+    for character in value:
+        if unicodedata.category(character) in ("Cc", "Cf", "Zl", "Zp"):
+            codepoint = ord(character)
+            parts.append(
+                f"\\u{codepoint:04x}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08x}"
+            )
+        else:
+            parts.append(character)
+    return "".join(parts)
+
+
 def text_report(report: dict) -> str:
     lines = [f"Static SQL source census at {report['revision']} (not executed SQL)"]
     for row in report["crates"]:
@@ -853,7 +869,7 @@ def text_report(report: dict) -> str:
                 f"  {notice['path']}:{notice['line']} {notice['kind']}: {notice['detail']}"
             )
     lines.extend("limit: " + limitation for limitation in report["limits"])
-    return "\n".join(lines) + "\n"
+    return "\n".join(escape_terminal_text(line) for line in lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -878,7 +894,7 @@ def main(argv: list[str] | None = None) -> int:
             else text_report(report)
         )
     except (CensusError, OSError, UnicodeError) as error:
-        print(f"sql-source-census: {error}", file=sys.stderr)
+        print(escape_terminal_text(f"sql-source-census: {error}"), file=sys.stderr)
         return 2
     return 0
 
