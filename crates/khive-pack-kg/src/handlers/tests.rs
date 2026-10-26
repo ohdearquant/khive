@@ -2841,8 +2841,8 @@ async fn link_reports_replace_and_explicit_resurrection_with_edge_observations()
             && !event.payload["previous"]["deleted_at"].is_null()));
 }
 
-// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
-// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// ADR-087 Amendment 1 §A9: decision chains use `decision precedes decision`
+// note-to-note edges from each earlier decision to the next. KG_EDGE_RULES
 // additively extends the base entity-only `precedes` contract to
 // `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
 // `depends_on` rule.
