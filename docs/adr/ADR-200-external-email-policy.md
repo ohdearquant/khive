@@ -157,12 +157,21 @@ Policy-recipient messages carry neither header.
 
 #### 5.3 Footer
 
-`KHIVE_EMAIL_EXTERNAL_FOOTER_FILE` names a text file appended to the body of every external message.
-It must contain the placeholder `{unsubscribe}`, which the channel replaces with a plain sentence
-giving the `mailto:` instruction (and the HTTPS link when one-click is enabled). The operator owns
-the rest of the footer, including the sender identification and postal address the obligations
-above require. External admission refuses while the footer is unset, unreadable or missing the
-placeholder.
+`KHIVE_EMAIL_EXTERNAL_FOOTER_FILE` names the default footer appended to external
+messages without an exact `traffic:list` tag. It must contain the placeholder
+`{unsubscribe}`, which the channel replaces with a plain sentence giving the
+`mailto:` instruction (and the HTTPS link when one-click is enabled). The
+operator owns the rest of the footer, including the sender identification and
+postal address the obligations above require. Admission refuses messages using
+this footer while it is unset, unreadable or missing the placeholder.
+
+`KHIVE_EMAIL_LIST_FOOTER_FILE` provides a separate footer for external messages
+tagged `traffic:list`, with the same `{unsubscribe}` requirement. Both files are
+read at startup when external senders are configured. Admission requires the
+selected footer to be available; delivery checks it again under its current
+configuration. An unavailable list footer causes permanent delivery failure
+before SMTP and never falls back to the default footer. Policy-recipient
+messages remain unaffected.
 
 #### 5.4 Three entry points, one list
 
