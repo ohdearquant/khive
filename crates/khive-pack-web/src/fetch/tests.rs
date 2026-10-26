@@ -1,9 +1,8 @@
 use super::*;
 use async_trait::async_trait;
-use khive_pack_kg::KgPack;
 use khive_runtime::engine_config::WebCredentialConfig;
 
-use khive_runtime::{Namespace, VerbRegistryBuilder};
+use khive_runtime::Namespace;
 use khive_storage::{
     BlobStore, ContentRef, Direction, EntityFilter, PageRequest, StorageError, StorageResult,
 };
@@ -28,28 +27,12 @@ fn allowed_headers_keep_every_link_field_for_later_extraction() {
     assert!(kept.get("x-private").is_none());
 }
 
-/// The in-crate test runtime carries no `VerbRegistry`, so the web
-/// pack's own `EDGE_RULES` (`site contains page|resource`) are never
-/// installed on it by default — `link(EdgeRelation::Contains, ...)`
-/// then refuses every one of these tests against the base allowlist
-/// alone. Register kg+web through a throwaway registry purely to read
-/// back their combined `all_edge_rules()` and install it, matching how
-/// `khive-pack-kg`/`khive-pack-workspace` tests register their own
-/// rules.
-fn install_web_edge_rules(runtime: &KhiveRuntime) {
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(runtime.clone()));
-    builder.register(WebPack::new(runtime.clone()));
-    let registry = builder.build().expect("kg+web registry builds");
-    runtime.install_edge_rules(registry.all_edge_rules());
-}
-
 async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
         .expect("fs blob store");
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-    install_web_edge_rules(&runtime);
+    crate::test_support::install_web_edge_rules(&runtime);
     runtime
         .install_blob_store(Arc::new(store))
         .expect("install blob store");
@@ -1194,7 +1177,7 @@ impl BlobStore for FailingPutBlobStore {
 #[tokio::test]
 async fn arm29_put_failure_prevents_receipt_entities_still_minted_no_retry() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-    install_web_edge_rules(&runtime);
+    crate::test_support::install_web_edge_rules(&runtime);
     let failing_store = Arc::new(FailingPutBlobStore::new());
     runtime
         .install_blob_store(failing_store.clone() as Arc<dyn BlobStore>)

@@ -296,7 +296,6 @@ impl RevocationState {
 
     /// Helper: Find index of capability by ID using binary search
     ///
-
     /// Helper: Find insertion point for sorted insert using binary search
     ///
     /// Production version: uses binary_search_by_key with closure
@@ -309,7 +308,6 @@ impl RevocationState {
 
     /// Helper: Find insertion point for sorted insert using binary search
     ///
-
     /// Check if capability exists and is valid
     ///
     /// Corresponds to Lean: `def RevocationState.is_valid`
@@ -572,7 +570,6 @@ impl RevocationState {
 
     /// Get children of a capability from the children_index
     ///
-
     /// Add a child to the children_index (maintains sorted order)
     ///
     /// Production version: uses binary_search and Vec::insert for efficiency
@@ -591,7 +588,6 @@ impl RevocationState {
     ///
     /// Rebuilds the index using only Vec::new/push/len and array indexing.
     /// Semantically identical to the production version above.
-
     /// Revoke capability and all descendants transitively (O(k) optimized)
     ///
     /// Corresponds to Lean: `def RevocationState.revoke_transitive_fast`
@@ -774,7 +770,7 @@ impl KernelState {
             .ok_or(KernelError::CounterOverflow("time"))?;
         Ok(KernelState {
             key_state: self.key_state.clone(),
-            policy: self.policy.clone(),
+            policy: self.policy,
             revocation: self.revocation.clone(),
             now: new_now,
             next_cap_id: self.next_cap_id,
@@ -797,7 +793,7 @@ impl KernelState {
     pub fn with_rotated_key(&self, new_key: Key) -> Self {
         KernelState {
             key_state: self.key_state.rotated(new_key),
-            policy: self.policy.clone(),
+            policy: self.policy,
             revocation: self.revocation.clone(),
             now: self.now,
             next_cap_id: self.next_cap_id,
@@ -978,7 +974,6 @@ impl PluginMeta {
 
     /// Corresponds to Lean: `def PluginMeta.grant_cap`
     /// Uses while-index loops only.
-
     /// Revoke a capability from this plugin
     ///
     /// Corresponds to Lean: `def PluginMeta.revoke_cap`
@@ -1110,7 +1105,6 @@ impl KernelStateCore {
 
     /// Get plugin metadata (returns default if not found)
     ///
-
     /// Set plugin metadata (upsert)
     ///
     /// Production version: uses binary_search for O(log n) lookup.
@@ -1132,7 +1126,6 @@ impl KernelStateCore {
     }
 
     /// rebuilds the vec manually. Normalizes held_caps (sort + dedup).
-
     /// Get resource metadata (returns default if not found)
     ///
     /// Production version: uses binary_search_by_key with closure
@@ -1148,7 +1141,6 @@ impl KernelStateCore {
 
     /// Get resource metadata (returns default if not found)
     ///
-
     /// Set resource metadata (upsert)
     ///
     /// Production version: uses binary_search for O(log n) lookup
@@ -1167,7 +1159,6 @@ impl KernelStateCore {
     }
 
     /// rebuilds the vec manually
-
     /// Get plugin security level
     ///
     /// Corresponds to Lean: `def KernelStateCore.plugin_level`

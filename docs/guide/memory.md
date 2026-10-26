@@ -232,13 +232,13 @@ you intend. Omit `signal` to abstain without writing a feedback event.
 ### Manual feedback
 
 ```
-request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<full_uuid>\", signal=\"useful\")")
 ```
 
 Signals: `useful`, `not_useful`, `wrong`, `explicit_positive`,
 `explicit_negative`, `correction`.
 
-Note: `target_id` must be a full UUID (not a short prefix).
+Note: `id` accepts a full UUID or a globally unique hex prefix of at least eight characters.
 
 ## Usage patterns
 

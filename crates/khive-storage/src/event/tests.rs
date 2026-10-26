@@ -33,3 +33,17 @@ fn event_page_window_budget_stop_roundtrips_and_defaults_when_absent() {
     let legacy: EventPageWindow = serde_json::from_value(wire).unwrap();
     assert_eq!(legacy.budget_stop, None);
 }
+
+#[test]
+fn event_new_generates_uuid_v7() {
+    let event = Event::new(
+        "default",
+        "search",
+        EventKind::SearchExecuted,
+        SubstrateKind::Note,
+        "agent:test",
+    );
+
+    // The UUID version is the high nibble of byte 6.
+    assert_eq!(event.id.as_bytes()[6] >> 4, 7);
+}

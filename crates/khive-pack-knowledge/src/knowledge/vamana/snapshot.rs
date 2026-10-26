@@ -310,6 +310,12 @@ pub(crate) async fn load_and_build_from_vector_store(
         return Ok(None);
     };
     let dims = flat.len() / id_map.len();
+    // This async task builds inline. The ignored measure_inline_ann_build_tick_gap
+    // (docs/benchmarks.md) measured scan/load + build at ~2 s for 4,096 rows
+    // on 2 workers: the 10 ms ticker's largest gap was 10.37 ms versus a
+    // 10.47 ms baseline, with no extra observed stall. A single worker would
+    // be occupied during the inline CPU build; revisit if the runtime or
+    // workload changes.
     AnnBridge::build(flat, dims, id_map)
         .map(|mut bridge| {
             bridge.set_applied_seq(scan_watermark);

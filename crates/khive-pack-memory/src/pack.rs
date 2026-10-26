@@ -177,10 +177,10 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
-                name: "target_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID of the recalled entity or memory being rated. A short-prefix resolution can miss or be ambiguous and is rejected because feedback must identify one exact recalled record.",
+                description: "Full UUID of the recalled entity or memory being rated. A short-prefix resolution can miss or be ambiguous and is rejected because feedback must identify one exact recalled record. `target_id` remains accepted as an alias for `id`.",
                 resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {

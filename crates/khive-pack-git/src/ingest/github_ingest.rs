@@ -259,10 +259,13 @@ pub(super) async fn ingest_prs(
                 NAME_MAX_CHARS,
             );
 
-            let result = match crate::dispatch_from_token(
+            let created = match create_github_record(
                 registry,
                 token,
-                "create",
+                report,
+                "pull_request",
+                masked.number,
+                project_id,
                 json!({
                         "kind": "pull_request",
                         "name": name,
@@ -273,19 +276,14 @@ pub(super) async fn ingest_prs(
             )
             .await
             {
-                Ok(v) => v,
-                Err(e) => {
-                    record_write_failure(
-                        report,
-                        "create",
-                        "pull_request",
-                        format!("#{}", masked.number),
-                        e,
-                    );
+                Some(created) => created,
+                None => {
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
+            let result = created.response;
+            let stored_content = created.content;
 
             let id = result
                 .get("id")
@@ -298,7 +296,7 @@ pub(super) async fn ingest_prs(
                 }
                 new_records.push(NewRecordForRef {
                     id,
-                    text: content.clone(),
+                    text: stored_content.clone(),
                 });
             }
             report.prs_ingested += 1;
@@ -550,10 +548,13 @@ pub(super) async fn ingest_issues(
             }
             let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
-            let result = match crate::dispatch_from_token(
+            let created = match create_github_record(
                 registry,
                 token,
-                "create",
+                report,
+                "issue",
+                number,
+                project_id,
                 json!({
                         "kind": "issue",
                         "name": name,
@@ -564,13 +565,14 @@ pub(super) async fn ingest_issues(
             )
             .await
             {
-                Ok(v) => v,
-                Err(e) => {
-                    record_write_failure(report, "create", "issue", format!("#{number}"), e);
+                Some(created) => created,
+                None => {
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
+            let result = created.response;
+            let stored_content = created.content;
             let id = result
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -578,7 +580,7 @@ pub(super) async fn ingest_issues(
             if let Some(id) = id {
                 new_records.push(NewRecordForRef {
                     id,
-                    text: content.clone(),
+                    text: stored_content.clone(),
                 });
             }
 

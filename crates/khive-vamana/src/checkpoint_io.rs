@@ -157,27 +157,7 @@ impl CheckpointDirectory {
     fn scan_names_bounded(&self, max_entries: usize) -> io::Result<(Vec<String>, bool)> {
         #[cfg(unix)]
         {
-            use nix::dir::Dir;
-
-            let mut directory = Dir::from_fd(self.dir.try_clone()?.into())
-                .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-            let mut names = Vec::new();
-            let mut visited = 0;
-            for entry in directory.iter() {
-                let entry = entry.map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-                let name = entry.file_name().to_bytes();
-                if name == b"." || name == b".." {
-                    continue;
-                }
-                if visited == max_entries {
-                    return Ok((names, true));
-                }
-                visited += 1;
-                if let Ok(name) = std::str::from_utf8(name) {
-                    names.push(name.to_owned());
-                }
-            }
-            Ok((names, false))
+            khive_fs::fd_relative::list_names_prefix_bounded(&self.dir, max_entries)
         }
         #[cfg(windows)]
         {

@@ -57,7 +57,8 @@ fn optional_string_field(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{display_name} must be a string or null; got {other}"
+            "{display_name} must be a string or null; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
         ))),
     }
 }
@@ -106,7 +107,8 @@ impl TaskCreateInput {
             Some(Value::Object(_)) => args["properties"].clone(),
             Some(other) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "properties must be an object or null; got {other}"
+                    "properties must be an object or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         };
