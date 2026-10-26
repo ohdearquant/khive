@@ -2,6 +2,7 @@
 # Static synthetic-tree regressions; no SQL engine or repository scan.
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -368,6 +369,116 @@ const PRODUCTION: &str = "SELECT * FROM production";
                     CENSUS.CensusError, f"explicit build script path is {problem}"
                 ):
                     self.scan()
+
+    def test_text_report_escapes_controls_in_every_printed_string_position(self):
+        plain = {"revision": r"café 医学 \n", "crates": [], "limits": []}
+        self.assertEqual(
+            CENSUS.text_report(plain),
+            r"Static SQL source census at café 医学 \n (not executed SQL)" + "\n",
+        )
+        fields = (
+            "revision", "crate", "asset", "candidate", "shape", "head",
+            "reader", "macro", "resolution", "reader_asset", "notice",
+            "kind", "detail", "limit",
+        )
+        cases = (
+            ("Cc LF", "\n", r"\u000a"),
+            ("Cc TAB", "\t", r"\u0009"),
+            ("Cc ESC", "\x1b", r"\u001b"),
+            ("Cc DEL", "\x7f", r"\u007f"),
+            ("Cf BMP", "\u202e", r"\u202e"),
+            ("Cf astral", "\U000e0001", r"\U000e0001"),
+            ("Zl", "\u2028", r"\u2028"),
+            ("Zp", "\u2029", r"\u2029"),
+        )
+        for category, unsafe, escaped in cases:
+            with self.subTest(category=category):
+                def value(field):
+                    return f"{field}{unsafe}:café 医学" + r"\n"
+
+                report = {
+                    "revision": value("revision"),
+                    "limits": [value("limit")],
+                    "crates": [{
+                        "crate": value("crate"),
+                        "counts": {
+                            "sql_assets": 1, "inline_statement_candidates": 1,
+                            "inline_fragments": 0, "reader_references": 1,
+                            "unresolved_readers": 0, "rust_files_read": 1,
+                        },
+                        "sql_assets": [{"path": value("asset")}],
+                        "inline_candidates": [{
+                            "path": value("candidate"), "line": 2, "column": 3,
+                            "shape": value("shape"), "head": value("head"),
+                        }],
+                        "reader_references": [{
+                            "path": value("reader"), "line": 4,
+                            "macro": value("macro"),
+                            "resolution": value("resolution"),
+                            "asset": value("reader_asset"),
+                        }],
+                        "diagnostics": [{
+                            "path": value("notice"), "line": 5,
+                            "kind": value("kind"), "detail": value("detail"),
+                        }],
+                    }],
+                }
+                original = json.dumps(report, sort_keys=True)
+                text = CENSUS.text_report(report)
+                for field in fields:
+                    self.assertIn(f"{field}{escaped}:café 医学" + r"\n", text)
+                self.assertEqual(text.count("\n"), 7)
+                self.assertEqual(len(text.splitlines()), 7)
+                self.assertTrue(text.endswith("\n"))
+                if unsafe != "\n":
+                    self.assertNotIn(unsafe, text)
+                self.assertEqual(json.dumps(report, sort_keys=True), original)
+
+    def test_main_json_output_and_report_object_are_unchanged(self):
+        report = {
+            "revision": "a" * 40,
+            "crates": [],
+            "limits": ["café 医学\n\x1b\u202e\U000e0001\u2028\u2029"],
+        }
+        expected = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        original = json.dumps(report, sort_keys=True)
+        with (
+            mock.patch.object(CENSUS, "GitTree") as make_tree,
+            mock.patch.object(CENSUS, "census", return_value=report) as scan,
+            mock.patch.object(CENSUS, "text_report", side_effect=AssertionError("JSON used text rendering")),
+            mock.patch.object(CENSUS.sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            make_tree.return_value.revision = "a" * 40
+            result = CENSUS.main([
+                "--repo", "/fixture", "--revision", "a" * 40,
+                "--crate", "demo", "--format", "json",
+            ])
+            self.assertEqual(result, 0)
+            self.assertEqual(stdout.getvalue(), expected)
+            scan.assert_called_once_with(make_tree.return_value, "a" * 40)
+        self.assertEqual(json.dumps(report, sort_keys=True), original)
+
+    def test_main_caught_errors_escape_terminal_controls_on_stderr(self):
+        diagnostic = "bad\n\t\x1b\u202e\U000e0001\u2028\u2029:café 医学"
+        expected = (
+            r"sql-source-census: bad\u000a\u0009\u001b\u202e\U000e0001\u2028\u2029:café 医学"
+            + "\n"
+        )
+        for output_format in ("text", "json"):
+            with self.subTest(output_format=output_format):
+                with (
+                    mock.patch.object(CENSUS, "GitTree", side_effect=CENSUS.CensusError(diagnostic)),
+                    mock.patch.object(CENSUS.sys, "stdout", new_callable=io.StringIO) as stdout,
+                    mock.patch.object(CENSUS.sys, "stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    result = CENSUS.main([
+                        "--repo", "/fixture", "--revision", "a" * 40,
+                        "--crate", "demo", "--format", output_format,
+                    ])
+                    self.assertEqual(result, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(stderr.getvalue(), expected)
+
 
 
 if __name__ == "__main__":
