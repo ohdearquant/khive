@@ -19,10 +19,10 @@ fn kkernel_bin() -> &'static str {
 fn envelope(family: &str) -> String {
     serde_json::json!({
         "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
-        "producer": "lambda:atlas",
+        "producer": "lambda:bob",
         "producer_model_family": family,
         "staged_at": 2_000_000_u64,
-        "batch_id": "atlas-batch-7",
+        "batch_id": "bob-batch-7",
     })
     .to_string()
 }
@@ -145,7 +145,7 @@ fn json_report_is_ordered_versioned_and_read_only() {
     let edge = "10000000-0000-4000-8000-000000000003";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[
             create(alpha, "Alpha"),
             create(beta, "Beta"),
@@ -180,10 +180,7 @@ fn json_report_is_ordered_versioned_and_read_only() {
     assert_eq!(report["capability"]["mutability"], "read_only");
     assert_eq!(report["capability"]["no_writes"], true);
     assert_eq!(report["capability"]["wasm"], false);
-    assert_eq!(
-        report["change_set"]["envelope"]["batch_id"],
-        "atlas-batch-7"
-    );
+    assert_eq!(report["change_set"]["envelope"]["batch_id"], "bob-batch-7");
 
     let operations = report["change_set"]["operations"].as_array().unwrap();
     assert_eq!(operations.len(), 3);
@@ -212,7 +209,7 @@ fn same_family_reviewer_is_refused_with_machine_readable_gate() {
     let beta = "20000000-0000-4000-8000-000000000002";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[
             create(alpha, "Alpha"),
             create(beta, "Beta"),
@@ -226,7 +223,7 @@ fn same_family_reviewer_is_refused_with_machine_readable_gate() {
         ],
     );
 
-    let output = run_review(&changeset, &rules, Some("family:atlas"));
+    let output = run_review(&changeset, &rules, Some("family:bob"));
     assert!(
         !output.status.success(),
         "same-family review must fail closed"
@@ -251,8 +248,8 @@ fn strict_changeset_parse_rejects_unknown_fields() {
             "{}\n",
             serde_json::json!({
                 "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
-                "producer": "lambda:atlas",
-                "producer_model_family": "family:atlas",
+                "producer": "lambda:bob",
+                "producer_model_family": "family:bob",
                 "staged_at": 2_000_000_u64,
                 "invented": true,
             })
@@ -275,7 +272,7 @@ fn error_rule_findings_are_reported_sorted_and_block_approval() {
     let duplicate = "30000000-0000-4000-8000-000000000001";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[create(duplicate, "Alpha"), create(duplicate, "Beta")],
     );
 
@@ -302,7 +299,7 @@ fn uncovered_update_rules_fail_closed_in_partial_view() {
     let target = "40000000-0000-4000-8000-000000000001";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[entity_update(target, "Old name", "New name")],
     );
 
