@@ -968,7 +968,7 @@ impl VerbRegistry {
                                 .get("properties")
                                 .is_some_and(|properties| properties.get("namespace").is_some())
                         });
-                let params = if !handler_accepts_namespace {
+                let mut params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
                         Value::Object(map)
@@ -978,6 +978,9 @@ impl VerbRegistry {
                 } else {
                     params
                 };
+                if let Some(handler) = handler_def {
+                    crate::params::integer_params_from_whole_floats(&mut params, handler.params);
+                }
                 let dispatch_start = Instant::now();
                 let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
                     serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
