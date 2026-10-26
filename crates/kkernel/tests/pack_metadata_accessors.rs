@@ -18,11 +18,14 @@ use khive_pack_agent::AgentPack;
 use khive_pack_blob::BlobPack;
 use khive_pack_brain::BrainPack;
 use khive_pack_charter::CharterPack;
+#[cfg(feature = "pack-code")]
 use khive_pack_code::CodePack;
 use khive_pack_comm::CommPack;
+#[cfg(feature = "pack-exec")]
 use khive_pack_exec::ExecPack;
 #[cfg(feature = "pack-formal")]
 use khive_pack_formal::FormalPack;
+#[cfg(feature = "pack-git")]
 use khive_pack_git::GitPack;
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
@@ -34,9 +37,11 @@ use khive_pack_schedule::SchedulePack;
 use khive_pack_session::SessionPack;
 #[cfg(feature = "pack-telemetry")]
 use khive_pack_telemetry::TelemetryPack;
+#[cfg(feature = "pack-tool")]
 use khive_pack_tool::ToolPack;
 #[cfg(feature = "pack-web")]
 use khive_pack_web::WebPack;
+#[cfg(feature = "pack-workspace")]
 use khive_pack_workspace::WorkspacePack;
 use khive_runtime::pack::{PackRegistry, PackRuntime};
 use khive_runtime::{
@@ -201,9 +206,12 @@ fn linked_packs() -> Vec<Checked> {
         checked(&BlobPack::new(rt.clone())),
         checked_brain_install(&rt),
         checked(&CharterPack::new(rt.clone())),
+        #[cfg(feature = "pack-code")]
         checked(&CodePack::new(rt.clone())),
         checked(&CommPack::new(rt.clone())),
+        #[cfg(feature = "pack-exec")]
         checked(&ExecPack::new(rt.clone())),
+        #[cfg(feature = "pack-git")]
         checked(&GitPack::new(rt.clone())),
         checked(&GtdPack::new(rt.clone())),
         checked(&KgPack::new(rt.clone())),
@@ -213,7 +221,9 @@ fn linked_packs() -> Vec<Checked> {
         checked(&MemoryPack::new_with_index_role(rt.clone(), false)),
         checked(&SchedulePack::new(rt.clone())),
         checked(&SessionPack::new(rt.clone())),
+        #[cfg(feature = "pack-tool")]
         checked(&ToolPack::new(rt.clone())),
+        #[cfg(feature = "pack-workspace")]
         checked(&WorkspacePack::new(rt.clone())),
     ];
     #[cfg(feature = "pack-agent")]

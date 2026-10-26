@@ -333,11 +333,16 @@ mod tests {
              {unexpected:?}. Add the spelling to DECLARED only after checking it is not \
              another way to write one already there"
         );
-        assert!(
-            retired.is_empty(),
-            "DECLARED lists spellings nothing declares any more: {retired:?}. Remove them \
-             here and from the schema map, so the map stays total over what exists"
-        );
+        // DECLARED is the vocabulary of the default pack set. A build without an
+        // optional default pack (git, code) cannot exercise every spelling, so a
+        // spelling missing there is not evidence that it was retired.
+        if cfg!(all(feature = "pack-git", feature = "pack-code")) {
+            assert!(
+                retired.is_empty(),
+                "DECLARED lists spellings nothing declares any more: {retired:?}. Remove them \
+                 here and from the schema map, so the map stays total over what exists"
+            );
+        }
     }
 
     /// A derived schema must not reject a call the dispatcher accepts.
@@ -350,6 +355,7 @@ mod tests {
     /// here, and it also proves a pack-supplied schema still wins.
     #[test]
     #[serial]
+    #[cfg(feature = "pack-git")]
     fn derived_schemas_stay_open_while_authored_ones_keep_their_own_shape() {
         let (registry, _runtime) = build_registry().expect("introspection registry");
 

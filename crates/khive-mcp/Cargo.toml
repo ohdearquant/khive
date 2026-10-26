@@ -33,15 +33,15 @@ khive-pack-comm = { version = "0.14.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.14.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.14.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.14.0", path = "../khive-pack-session" }
-khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool" }
-khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
-khive-pack-git = { version = "0.14.0", path = "../khive-pack-git" }
-khive-pack-code = { version = "0.14.0", path = "../khive-pack-code" }
+khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool", optional = true }
+khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec", optional = true }
+khive-pack-git = { version = "0.14.0", path = "../khive-pack-git", optional = true }
+khive-pack-code = { version = "0.14.0", path = "../khive-pack-code", optional = true }
 khive-pack-web = { version = "0.14.0", path = "../khive-pack-web", optional = true }
 khive-pack-telemetry = { version = "0.14.0", path = "../khive-pack-telemetry", optional = true }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.14.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace" }
+khive-pack-workspace = { version = "0.14.0", path = "../khive-pack-workspace", optional = true }
 khive-pack-charter = { version = "0.14.0", path = "../khive-pack-charter" }
 uuid = { workspace = true }
 inventory = { workspace = true }
@@ -68,9 +68,17 @@ khive-channel-telegram = { version = "0.14.0", path = "../khive-channel-telegram
 
 [features]
 blob-s3 = ["khive-runtime/blob-s3"]
-# The default set links only the core packs. The agent, telemetry and web packs
+# Git and Code are optional and enabled by default. Agent, telemetry and web
 # are optional and off by default, like moodboard.
-default = []
+default = ["pack-git", "pack-code"]
+pack-git = ["dep:khive-pack-git", "khive-runtime/pack-git"]
+pack-code = ["dep:khive-pack-code", "khive-runtime/pack-code"]
+# Tool is optional and off by default.
+pack-tool = ["dep:khive-pack-tool", "khive-runtime/pack-tool"]
+# Exec is optional and also links its Tool prerequisite.
+pack-exec = ["dep:khive-pack-exec", "khive-runtime/pack-exec", "pack-tool"]
+# Workspace is optional and also links its Git prerequisite.
+pack-workspace = ["dep:khive-pack-workspace", "khive-runtime/pack-workspace", "pack-git"]
 # pack-agent, pack-telemetry, pack-web: link the agent, telemetry and web packs.
 # Without one of them the pack is neither linked nor registered, so it is absent
 # from the pack list the server reports and selecting it is refused as unknown.
@@ -137,6 +145,10 @@ required-features = ["pack-telemetry"]
 [[test]]
 name = "web_backend_routing"
 required-features = ["pack-web"]
+
+[[test]]
+name = "tool_request_notification_identity"
+required-features = ["pack-tool"]
 
 [[bench]]
 name = "serve_startup"

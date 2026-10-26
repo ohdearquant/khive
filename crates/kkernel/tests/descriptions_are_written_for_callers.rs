@@ -95,9 +95,12 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("blob", khive_pack_blob::BlobPack::HANDLERS),
         ("brain", khive_pack_brain::BrainPack::HANDLERS),
         ("charter", khive_pack_charter::CharterPack::HANDLERS),
+        #[cfg(feature = "pack-code")]
         ("code", khive_pack_code::CodePack::HANDLERS),
         ("comm", khive_pack_comm::CommPack::HANDLERS),
+        #[cfg(feature = "pack-exec")]
         ("exec", khive_pack_exec::ExecPack::HANDLERS),
+        #[cfg(feature = "pack-git")]
         ("git", khive_pack_git::GitPack::HANDLERS),
         ("gtd", khive_pack_gtd::GtdPack::HANDLERS),
         ("kg", khive_pack_kg::KgPack::HANDLERS),
@@ -105,7 +108,9 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("memory", khive_pack_memory::MemoryPack::HANDLERS),
         ("schedule", khive_pack_schedule::SchedulePack::HANDLERS),
         ("session", khive_pack_session::SessionPack::HANDLERS),
+        #[cfg(feature = "pack-tool")]
         ("tool", khive_pack_tool::ToolPack::HANDLERS),
+        #[cfg(feature = "pack-workspace")]
         ("workspace", khive_pack_workspace::WorkspacePack::HANDLERS),
     ];
     #[cfg(feature = "pack-agent")]

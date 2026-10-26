@@ -1715,15 +1715,15 @@ jobs:
       # feature-off branches are what catch a core crate linking an optional pack.
       - name: Run the pack composition tests without the optional packs
         run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
-      # The default features leave the agent, telemetry and web packs out, so the ci
-      # job runs only their feature-off branches. These three steps run the
-      # feature-on branches and the suites that need an optional pack.
+      # Exercise enabled branches of all eight frontend pack features. The
+      # independent frontend profile jobs also test core, published defaults and
+      # each singleton without cross-frontend feature unification.
       - name: Run the library tests with every optional pack
-        run: cargo test -p kkernel -p khive-mcp --features pack-agent,pack-telemetry,pack-web --lib --locked
+        run: cargo test -p kkernel -p khive-mcp --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,pack-agent,pack-telemetry,pack-web --lib --locked
       - name: Run the pack composition tests with every optional pack
-        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
+        run: cargo test -p kkernel --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
       - name: Run the server suites that need an optional pack
-        run: cargo test -p khive-mcp --features pack-agent,pack-telemetry,pack-web --locked --test mcp_mount_fixture --test mounts --test telemetry_activation --test web_backend_routing
+        run: cargo test -p khive-mcp --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,pack-agent,pack-telemetry,pack-web --locked --test mcp_mount_fixture --test mounts --test telemetry_activation --test web_backend_routing
       # kg-adapters and repo-showcase are off by default, so the ci job runs only the
       # refusal side of kg import and none of the repo commands. This step runs the
       # import adapter and repository showcase suites with both features on.
@@ -1740,7 +1740,7 @@ jobs:
       # so that refusal fails the pull request instead.
       - name: Probe a kkernel built with the operator feature set
         run: |
-          cargo build -p kkernel --bin kkernel --locked --features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
+          cargo build -p kkernel --bin kkernel --locked --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
           make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"
 
       - name: Check each optional pack independently
@@ -1748,7 +1748,7 @@ jobs:
         shell: bash
         run: |
           status=0
-          for feature in pack-agent pack-telemetry pack-web pack-formal pack-moodboard; do
+          for feature in pack-agent pack-telemetry pack-web pack-formal pack-moodboard pack-git pack-code pack-tool pack-exec pack-workspace; do
             started=$SECONDS
             if cargo check -p kkernel --no-default-features --features "$feature" --locked; then
               result=passed
@@ -1757,6 +1757,82 @@ jobs:
               status=1
             fi
             printf '%s: %s (%s seconds)\n' "$feature" "$result" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"
+
+      - name: Run the enabled Git Code Tool Exec and Workspace Kernel suites
+        if: ${{ !cancelled() }}
+        run: cargo test -p kkernel --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace --locked --test code_ingest_cli --test finding_null_clear_atomic --test entity_type_backfill_cli --test kg_import_registry_rules --test schema --test endpoint_rule_ownership
+      - name: Run the enabled Tool Exec and Workspace server suites
+        if: ${{ !cancelled() }}
+        run: cargo test -p khive-mcp --features pack-git,pack-code,pack-tool,pack-exec,pack-workspace --locked --test tool_request_notification_identity --test missing_object_errors --test namespace_move_pack_census
+
+  frontend-pack-profiles:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Frontend pack profiles (${{ matrix.package }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [kkernel, khive-mcp]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Select one frontend per Cargo invocation. This checks its own default
+      # forwarding and factory anchors instead of unifying the two frontends.
+      # Keep compile-only all-target evidence separate from executed composition.
+      - name: Independently build and test frontend pack profiles
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          PROFILE_PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          status=0
+          run_profile() {
+            local package=$1 profile=$2
+            shift 2
+            if cargo check -p "$package" "$@" --all-targets --locked; then
+              checked=passed
+            else
+              checked=failed
+              status=1
+            fi
+            local profile_log="$RUNNER_TEMP/pack-profile-$package-$profile.log"
+            if cargo test -p "$package" "$@" --locked --test optional_pack_features 2>&1 | tee "$profile_log" &&
+              ../scripts/assert-tests-ran.sh "$profile_log" 1; then
+              tested=passed
+            else
+              tested=failed
+              status=1
+            fi
+            printf '%s %s: all-targets=%s composition=%s\n' "$package" "$profile" "$checked" "$tested" >> "$GITHUB_STEP_SUMMARY"
+          }
+          package=$PROFILE_PACKAGE
+          run_profile "$package" core --no-default-features
+          run_profile "$package" default
+          for feature in pack-git pack-code pack-tool pack-exec pack-workspace pack-agent pack-telemetry pack-web; do
+            run_profile "$package" "$feature" --no-default-features --features "$feature"
           done
           exit "$status"
 
@@ -2112,6 +2188,7 @@ jobs:
       - minio-blob-compat
       - msrv-check
       - core-only
+      - frontend-pack-profiles
     if: always()
     steps:
       - name: Check aggregated job results
@@ -2134,7 +2211,7 @@ jobs:
                then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
-                     "msrv-check", "core-only"]
+                     "msrv-check", "core-only", "frontend-pack-profiles"]
                else [] end) as $docs_lane_skips
             | (.["changed-paths"].outputs.test_scope // "") as $scope
             | (if .["changed-paths"].result == "success"

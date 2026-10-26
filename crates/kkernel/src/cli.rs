@@ -18,14 +18,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "pack-code")]
+use crate::code_ingest;
 #[cfg(feature = "repo-showcase")]
 use crate::repo;
 use crate::{
-    blob, code_audit, code_ingest,
+    blob, code_audit,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, pack_introspect, reindex, sync,
-    vector,
+    engine, exec, kg, pack_introspect, reindex, sync, vector,
 };
+#[cfg(feature = "pack-git")]
+use crate::{git_annotation_repair, git_dedup, git_ingest};
 use khive_runtime::{
     runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
     RuntimeConfig,
@@ -133,16 +136,20 @@ enum Command {
 
     /// One-shot batch ingest of commit/issue/pull_request provenance notes
     /// from a local git repository (ADR-088).
+    #[cfg(feature = "pack-git")]
     GitIngest(git_ingest::GitIngestArgs),
 
     /// Preview or apply one project's historical commit annotations (ADR-088).
+    #[cfg(feature = "pack-git")]
     GitAnnotationRepair(git_annotation_repair::GitAnnotationRepairArgs),
 
     /// Preview or apply duplicate issue/PR note merges for one canonical project.
+    #[cfg(feature = "pack-git")]
     GitDedup(git_dedup::GitDedupArgs),
 
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
+    #[cfg(feature = "pack-code")]
     CodeIngest(code_ingest::CodeIngestArgs),
 }
 
@@ -722,9 +729,13 @@ pub async fn cli_main() -> Result<()> {
         }
         Command::Backend(b) => cmd_backend(b),
         Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
+        #[cfg(feature = "pack-git")]
         Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
+        #[cfg(feature = "pack-git")]
         Command::GitAnnotationRepair(a) => git_annotation_repair::run(a).await,
+        #[cfg(feature = "pack-git")]
         Command::GitDedup(a) => git_dedup::run(a).await,
+        #[cfg(feature = "pack-code")]
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
     }
 }
@@ -1455,6 +1466,56 @@ mod tests {
     use clap::CommandFactory;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn git_admin_commands_follow_the_pack_feature() {
+        let command = Args::command();
+        for name in ["git-ingest", "git-annotation-repair", "git-dedup"] {
+            assert_eq!(
+                command
+                    .get_subcommands()
+                    .any(|entry| entry.get_name() == name),
+                cfg!(feature = "pack-git"),
+                "{name} visibility must follow the Git pack"
+            );
+            let error = Args::try_parse_from(["kkernel", name, "--help"])
+                .expect_err("help or an unavailable command exits through Clap");
+            let expected = if cfg!(feature = "pack-git") {
+                clap::error::ErrorKind::DisplayHelp
+            } else {
+                clap::error::ErrorKind::InvalidSubcommand
+            };
+            assert_eq!(error.kind(), expected, "{name}: {error}");
+        }
+        assert!(command
+            .get_subcommands()
+            .any(|entry| entry.get_name() == "exec"));
+    }
+
+    #[test]
+    fn code_ingest_visibility_does_not_remove_core_admin_commands() {
+        let command = Args::command();
+        assert_eq!(
+            command
+                .get_subcommands()
+                .any(|entry| entry.get_name() == "code-ingest"),
+            cfg!(feature = "pack-code")
+        );
+        let error = Args::try_parse_from(["kkernel", "code-ingest", "--help"])
+            .expect_err("help or an unavailable command exits through Clap");
+        let expected = if cfg!(feature = "pack-code") {
+            clap::error::ErrorKind::DisplayHelp
+        } else {
+            clap::error::ErrorKind::InvalidSubcommand
+        };
+        assert_eq!(error.kind(), expected, "{error}");
+        assert!(command
+            .get_subcommands()
+            .any(|entry| entry.get_name() == "code-audit"));
+        let error = Args::try_parse_from(["kkernel", "entity-type-backfill", "--help"])
+            .expect_err("core backfill help remains available");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
 
     fn write_empty_config(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("empty-khive.toml");

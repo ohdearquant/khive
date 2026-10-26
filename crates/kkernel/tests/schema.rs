@@ -182,8 +182,44 @@ async fn default_schema_is_complete_attributed_and_does_not_write_domain_rows() 
     );
     assert!(rows.contains(&json!({"source":"*", "source_substrate":"entity", "relation":"instance_of", "target":"concept", "target_substrate":"entity", "origin":"base"})));
     assert!(rows.contains(&json!({"source":"task", "source_substrate":"note", "relation":"depends_on", "target":"task", "target_substrate":"note", "origin":"pack:gtd"})));
-    assert!(rows.iter().any(|row| row["origin"] == "pack:code"
-        && (row["source_entity_type"] == "function" || row["target_entity_type"] == "function")));
+    let code_function_rule = rows.iter().any(|row| {
+        row["origin"] == "pack:code"
+            && (row["source_entity_type"] == "function" || row["target_entity_type"] == "function")
+    });
+    assert_eq!(code_function_rule, cfg!(feature = "pack-code"));
+    if !cfg!(feature = "pack-code") {
+        assert!(rows.iter().all(|row| row["origin"] != "pack:code"));
+    }
+    assert_eq!(
+        value["entity_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workspace")),
+        cfg!(feature = "pack-workspace")
+    );
+    let workspace_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row["origin"] == "pack:workspace")
+        .collect();
+    assert_eq!(
+        workspace_rows.len(),
+        if cfg!(feature = "pack-workspace") {
+            5
+        } else {
+            0
+        }
+    );
+    if cfg!(feature = "pack-workspace") {
+        for target in ["issue", "pull_request", "commit", "task", "session"] {
+            assert!(
+                rows.contains(&json!({
+                    "source": "workspace", "source_substrate": "entity", "relation": "contains",
+                    "target": target, "target_substrate": "note", "origin": "pack:workspace"
+                })),
+                "missing workspace contains {target}"
+            );
+        }
+    }
     assert!(rows
         .iter()
         .filter(|row| row["origin"] == "base")

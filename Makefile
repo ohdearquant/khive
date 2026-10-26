@@ -114,13 +114,15 @@ build:
 # linked before they became optional. kg-adapters and repo-showcase keep the
 # non-native `kg import` formats and the `repo export` / `repo build` commands
 # in the installed binary for the same reason.
+# Explicit Git/Code/Tool/Exec/Workspace features preserve the fleet surface
+# independently of the smaller default build. FULL_PACKS remains nineteen packs.
 build-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-agent, pack-telemetry, pack-web, pack-formal, pack-moodboard, kg-adapters, repo-showcase)..."
+	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-git, pack-code, pack-tool, pack-exec, pack-workspace, pack-agent, pack-telemetry, pack-web, pack-formal, pack-moodboard, kg-adapters, repo-showcase)..."
 	@python3 scripts/build_local_artifact.py \
 		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
-		--features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase \
+		--features pack-git,pack-code,pack-tool,pack-exec,pack-workspace,channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase \
 		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
 # Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a

@@ -3,11 +3,11 @@
 //! `khive-db` cannot see a pack, so a table a pack adds can carry a `namespace`
 //! column that the move has no rule for. A source holding rows in such a table
 //! then refuses to move, and nothing fails until someone tries. This test boots
-//! the full built-in pack set into one store, runs the namespace census over it,
+//! the compiled automatic pack set into one store, runs the namespace census over it,
 //! and names every table the census finds that the move neither classifies nor
 //! excludes.
 //!
-//! It lives in `khive-mcp` because that crate links every built-in pack and boots
+//! It lives in `khive-mcp` because that frontend links the configured packs and boots
 //! them together, which no lower crate can. A pack that is not in
 //! `RuntimeConfig::built_in_packs()` is selected explicitly at run time and is
 //! outside this population.
@@ -36,18 +36,24 @@ async fn every_built_in_pack_table_has_a_move_disposition_or_an_exclusion() {
 
     // The census must contain the tables this guard exists for, or an empty
     // result below would mean the boot applied no pack schema at all.
-    for name in [
-        "exec_runs",
-        "exec_events",
-        "git_receipts",
-        "tool_policy",
-        "tool_grants",
-        "gtd_lifecycle_audit",
-        "knowledge_eval_runs",
-    ] {
+    for name in ["gtd_lifecycle_audit", "knowledge_eval_runs"] {
         assert!(
             inventory.tables.iter().any(|table| table.name == name),
             "{name} is not in the census, so the boot did not apply its pack's schema"
+        );
+    }
+
+    for (name, enabled) in [
+        ("exec_runs", cfg!(feature = "pack-exec")),
+        ("exec_events", cfg!(feature = "pack-exec")),
+        ("git_receipts", cfg!(feature = "pack-git")),
+        ("tool_policy", cfg!(feature = "pack-tool")),
+        ("tool_grants", cfg!(feature = "pack-tool")),
+    ] {
+        assert_eq!(
+            inventory.tables.iter().any(|table| table.name == name),
+            enabled,
+            "{name} must be present exactly when its pack is compiled into the automatic profile"
         );
     }
 

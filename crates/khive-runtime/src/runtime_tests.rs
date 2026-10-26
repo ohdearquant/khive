@@ -1208,32 +1208,37 @@ fn default_config_packs_loads_production_set() {
     unsafe {
         std::env::remove_var("KHIVE_PACKS");
     }
-    // The default distribution loads all production packs.
     let cfg = RuntimeConfig::default();
     assert_eq!(cfg.packs, RuntimeConfig::built_in_packs());
-    assert!(cfg.packs.contains(&"kg".to_string()));
-    assert!(cfg.packs.contains(&"gtd".to_string()));
-    assert!(cfg.packs.contains(&"memory".to_string()));
-    assert!(cfg.packs.contains(&"brain".to_string()));
-    assert!(cfg.packs.contains(&"comm".to_string()));
-    assert!(cfg.packs.contains(&"schedule".to_string()));
-    assert!(cfg.packs.contains(&"knowledge".to_string()));
-    // session loads by default so its background mirror warm-hook runs in
-    // production; its handlers are all operator-only subhandlers (0 wire verbs).
-    assert!(cfg.packs.contains(&"session".to_string()));
-    assert!(cfg.packs.contains(&"git".to_string()));
-    assert!(cfg.packs.contains(&"code".to_string()));
-    assert!(cfg.packs.contains(&"workspace".to_string()));
-    // blob loads by default; a normal file-backed boot installs a
-    // default FsBlobStore beside the database file with no config
-    // needed, so its verbs are live in default deployments too (only an
-    // in-memory backend leaves them unconfigured).
-    assert!(cfg.packs.contains(&"blob".to_string()));
-    // tool loads by default: the registry, discovery and use-policy verbs
-    // (ADR-180) are live in default deployments.
-    assert!(cfg.packs.contains(&"tool".to_string()));
-    assert!(cfg.packs.contains(&"exec".to_string()));
-    assert_eq!(cfg.packs.len(), 14);
+    let mut expected = vec![
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "blob",
+    ];
+    for (pack, enabled) in [
+        ("git", cfg!(feature = "pack-git")),
+        ("code", cfg!(feature = "pack-code")),
+        ("tool", cfg!(feature = "pack-tool")),
+        ("exec", cfg!(feature = "pack-exec")),
+        ("workspace", cfg!(feature = "pack-workspace")),
+    ] {
+        if enabled {
+            expected.push(pack);
+        }
+    }
+    expected.sort_unstable();
+    let mut actual = cfg.packs.clone();
+    actual.sort_unstable();
+    assert_eq!(
+        actual, expected,
+        "automatic selection must match compiled markers"
+    );
     if let Some(v) = prior {
         // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
         unsafe {

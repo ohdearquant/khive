@@ -270,7 +270,7 @@ async fn backfill_resolved(
     target.reverify()?;
     let config = &target.config;
     let path = &target.path;
-    let (backend, _snapshot_dir) = crate::code_ingest::open_read_only_snapshot(path)?;
+    let (backend, _snapshot_dir) = crate::db_snapshot::open_read_only_snapshot(path)?;
     target.reverify()?;
     // Validate current schema on the read-only copy before any writable open.
     backend.prepare_core_schema()?;
