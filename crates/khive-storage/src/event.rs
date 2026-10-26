@@ -42,7 +42,7 @@ pub struct Event {
 }
 
 impl Event {
-    /// Create a new event with a generated UUID and current timestamp.
+    /// Create a new event with a generated UUIDv7 and current timestamp.
     pub fn new(
         namespace: impl Into<String>,
         verb: impl Into<String>,
@@ -52,7 +52,7 @@ impl Event {
     ) -> Self {
         let operation = crate::operation_context::current_operation_attribution();
         Self {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             namespace: namespace.into(),
             verb: verb.into(),
             substrate,
