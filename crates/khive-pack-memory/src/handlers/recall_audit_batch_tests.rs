@@ -207,11 +207,18 @@ impl Fixture {
             runtime.clone(),
         ));
         let ann = pack.ann.clone();
-        let raw = runtime
-            .backend()
-            .events_for_namespace("registry-default")
-            .expect("raw SQLite sink");
-        let spy = SpyStore::new(raw);
+        // Unconfigured fixtures keep an independent spy without an audit binding.
+        // Configured fixtures create their spy only from the runtime-resolved sink.
+        let unbound_spy = if configured {
+            None
+        } else {
+            let raw = runtime
+                .backend()
+                .events_for_namespace("registry-default")
+                .expect("raw SQLite sink");
+            Some(SpyStore::new(raw))
+        };
+        let spy_slot = Arc::new(Mutex::new(unbound_spy));
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(runtime.clone()));
         builder.register(pack);
@@ -219,10 +226,23 @@ impl Fixture {
             .with_default_namespace("registry-default")
             .with_actor_id(Some("registry-actor".into()));
         if configured {
-            builder.with_event_store(spy.clone());
+            builder
+                .with_runtime_event_store(&runtime)
+                .expect("runtime audit binding");
+            let captured_spy = Arc::clone(&spy_slot);
+            builder.with_runtime_event_store_test_wrapper(
+                move |raw_store: Arc<dyn EventStore>| -> Arc<dyn EventStore> {
+                    let spy = SpyStore::new(raw_store);
+                    let mut slot = captured_spy.lock().unwrap();
+                    assert!(slot.is_none(), "runtime sink wrapped once at build");
+                    *slot = Some(Arc::clone(&spy));
+                    spy
+                },
+            );
         }
         builder.with_audit_batch_config(config);
         let registry = builder.build().expect("registry");
+        let spy = spy_slot.lock().unwrap().take().expect("fixture audit spy");
         assert!(
             runtime
                 .backend()
@@ -666,10 +686,10 @@ async fn delayed_fourth_recall_admission_keeps_one_shared_writer_generation() {
 async fn late_warm_config_is_persisted_before_shared_recall_measurement() {
     let f = Fixture::new(AuditBatchConfig::default(), false, true);
     f.warm().await;
-    khive_runtime::config_ledger::record_config_locked(
-        "test.recall.shared.late_config",
-        "literal-late-warm-value",
-    );
+    f.runtime
+        .record_config_locked("test.recall.shared.late_config", || {
+            "literal-late-warm-value".to_string()
+        });
     f.drain_warm_config().await;
     let token = f
         .runtime

@@ -15,6 +15,9 @@ mod link_audit_alias {
     include!("link_audit_alias_tests.rs");
 }
 
+#[path = "pack/config_lock_runtime_tests.rs"]
+mod config_lock_runtime;
+
 #[tokio::test]
 async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones() {
     struct HostStatePack(Arc<AtomicUsize>);
@@ -4249,25 +4252,15 @@ fn serial_census_surfaces_source_and_serial_argument_parse_failures() {
         .contains("unsupported serial attribute arguments"));
 }
 
-/// An event-backed registry can drain the process-wide config ledger at
-/// dispatch, and `record_config_locked` (and every `OnceLock` reader
-/// that wraps it — `context_profile_enabled`, `recall_profile_enabled`,
-/// `ann_overfetch_max_rounds`, `ann_ready_timeout_ms`,
-/// `recall_deadline_ms`, `request_read_timeout`,
-/// `backend_search_timeout_ms`, ... — enumerated here only as the
-/// evidence that motivated widening the seed, never as the source of
-/// truth for who counts) writes to it, so every compiled test that
-/// reaches either — directly, through a same-text wrapper, or by
-/// dispatching a verb whose handler reaches one — must join the
-/// ledger's serial group even when its own assertion is about another
-/// audit field.
+/// Keep the existing conservative serialization policy for event fixtures and
+/// runtime config producers. Runtime ledgers are separate, while the readers'
+/// process-wide OnceLock values and the audit diagnostic counters still have
+/// process lifetime. Explicit stores no longer drain any runtime ledger.
 ///
-/// The seed is deliberately just the two true seams
-/// (`with_event_store`, `record_config_locked`) rather than a
-/// hand-maintained list of every wrapper: `file_seam_names` grows the
-/// known set to a fixed point, so a future `OnceLock` reader that wraps
-/// `record_config_locked` is picked up the moment it exists, without
-/// anyone remembering to add it here.
+/// The seed stays `with_event_store` / `record_config_locked`: dot calls to
+/// the runtime method and lazy fallback closures are visible to `calls_name`.
+/// `file_seam_names` still grows wrappers to a fixed point; process-only tracing
+/// readers are not runtime-ledger producers.
 #[test]
 fn event_store_test_fixtures_are_config_ledger_serialized() {
     let sources = workspace_rust_sources();
@@ -4659,13 +4652,6 @@ async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation
         }
     }
 
-    // Entry reset, not exit: a `config_ledger`-grouped test that panics
-    // after queueing a row (elsewhere in this group) would otherwise
-    // leave it for whichever test the serial lock hands off to next;
-    // this test's exact `events.len() == 1` assertion below has no
-    // tolerance for an inherited row.
-    let _ = crate::config_ledger::drain_config_locked();
-
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
     let store = Arc::new(MemoryEventStore::default());
@@ -4727,10 +4713,6 @@ async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
             Ok(GateDecision::deny("intercepted policy denied"))
         }
     }
-
-    // Entry reset, not exit — see the sibling test above for why an
-    // exact `events.len() == 1` assertion needs a clean ledger.
-    let _ = crate::config_ledger::drain_config_locked();
 
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
@@ -5665,15 +5647,8 @@ async fn obligation_failure_reports_a_write_that_already_committed() {
 #[serial(audit_append_failures)]
 #[serial(audit_obligation_append_failures)]
 async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_it() {
-    // Deny-gate a dispatch so the only append this call makes is the
-    // immediate `ConfigLocked` drain in the gate-check block: the
-    // `GateDenied` row and the eventual `PermissionDenied` return are
-    // unaffected by the store either way (see the two `let _ =` sites
-    // above), so any failure this test observes is isolated to the
-    // pure-observability `ConfigLocked` row. The `fail_appends: true`
-    // store also fails the fire-and-forget `GateDenied` append, which
-    // now counts on the obligation counter (`#[serial(...)]` above
-    // keeps that from racing this file's exact-delta assertions on it).
+    // Refuse the bound runtime's actual ConfigLocked generation while the
+    // denial event can still commit. The dispatch keeps its own denial result.
     #[derive(Debug)]
     struct DenyGate;
     impl Gate for DenyGate {
@@ -5684,17 +5659,20 @@ async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_i
         }
     }
 
-    crate::config_ledger::record_config_locked("adr133_test_key", "adr133_test_value");
-
-    let store = Arc::new(MemoryEventStore {
-        fail_appends: true,
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_gate(Arc::new(DenyGate));
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::configured(
+        KhiveRuntime::memory().expect("runtime"),
+        "local",
+        "denied",
+        config_lock_runtime::audit_config(),
+        |builder| {
+            builder.with_gate(Arc::new(DenyGate));
+        },
+    );
+    fixture
+        .runtime
+        .record_config_locked("adr133_test_key", || "adr133_test_value".into());
+    fixture.store.refuse_config();
+    let registry = &fixture.registry;
 
     let err = registry
         .dispatch("list", Value::Null)
@@ -5713,6 +5691,9 @@ async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_i
         "the config-locked row's commit failure must be visible as degradation"
     );
     assert!(metrics.degraded_rows >= 1);
+    fixture
+        .assert_refused_once_then_recovered("adr133_test_key", true)
+        .await;
 }
 
 #[tokio::test]
@@ -5725,19 +5706,14 @@ async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_s
     // it. Only the `ConfigLocked` generation fails here — the gate
     // allows the call, so `list`'s own `DispatchSucceeded` obligation
     // row commits in a later, unaffected generation.
-    crate::config_ledger::record_config_locked(
-        "adr133_success_path_key",
-        "adr133_success_path_value",
-    );
-
-    let store = Arc::new(MemoryEventStore {
-        fail_kind: Some(EventKind::ConfigLocked),
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::new();
+    fixture
+        .runtime
+        .record_config_locked("adr133_success_path_key", || {
+            "adr133_success_path_value".into()
+        });
+    fixture.store.refuse_config();
+    let registry = &fixture.registry;
 
     let result = registry
         .dispatch("list", Value::Null)
@@ -5755,6 +5731,9 @@ async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_s
         metrics.degraded_rows >= 1,
         "the config-locked row's failure must remain visible as degradation"
     );
+    fixture
+        .assert_refused_once_then_recovered("adr133_success_path_key", false)
+        .await;
 }
 
 /// An `EventStore` that only implements the base trait — the
@@ -5840,15 +5819,12 @@ async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation
     // check regardless of allow/deny, and `list`'s deferred
     // `DispatchSucceeded` (obligation) row is appended once dispatch
     // resolves — both against the same persistently failing store.
-    crate::config_ledger::record_config_locked("adr133_diag_test_key", "adr133_diag_test_value");
-    let store = Arc::new(MemoryEventStore {
-        fail_appends: true,
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::new();
+    fixture
+        .runtime
+        .record_config_locked("adr133_diag_test_key", || "adr133_diag_test_value".into());
+    fixture.store.refuse_all();
+    let registry = &fixture.registry;
     let _ = registry.dispatch("list", Value::Null).await;
 
     let metrics = registry
@@ -5861,6 +5837,7 @@ async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation
         "the list dispatch's obligation row must count as a flush failure"
     );
 
+    fixture.finish().await;
     let rt = KhiveRuntime::memory().expect("memory runtime should create");
     let report = rt
         .db_diagnostics_with_audit_metrics(Some(metrics))
@@ -7857,40 +7834,19 @@ async fn first_event(store: &Arc<MemoryEventStore>) -> Event {
     page.items[0].clone()
 }
 
-/// A fresh `MemoryEventStore` for a test that will assert `first_event`'s
-/// exact one-event count, with the process-wide config ledger drained
-/// first.
-///
-/// `first_event` itself runs *after* dispatch, so it cannot fix this: a
-/// `config_ledger`-grouped test that panics after queueing a row (a
-/// direct `record_config_locked` call, or a `OnceLock` reader it
-/// invoked) but before its own event-backed dispatch never drains that
-/// row itself, leaving it queued for whichever test the serial lock
-/// hands off to next. If that next test builds its store with plain
-/// `Arc::new(MemoryEventStore::default())`, its own dispatch call
-/// drains the inherited row as an extra `ConfigLocked` event alongside
-/// the one it expects, and `first_event`'s exact `page.items.len() ==
-/// 1` assertion sees two. The fix has to run before dispatch, so it
-/// lives in the store constructor every exact-one-event test calls, not
-/// in the post-dispatch helper that reads the count.
+/// A fresh explicit store for exact-one-event assertions. It has no runtime
+/// binding, so constructing it neither drains nor resets another runtime.
 fn clean_ledger_event_store() -> Arc<MemoryEventStore> {
-    let _ = crate::config_ledger::drain_config_locked();
     Arc::new(MemoryEventStore::default())
 }
 
-/// Regression: a preceding
-/// `config_ledger`-grouped test that queues a row (directly, or via a
-/// `OnceLock` reader it invoked) and then panics before its own
-/// event-backed dispatch drains it leaves that row queued for whichever
-/// test the serial lock hands to next. Simulate exactly that leaked row
-/// here and prove `clean_ledger_event_store` — not `first_event` itself,
-/// which only runs after dispatch and so cannot fix a pre-dispatch race
-/// — is what keeps `first_event`'s exact one-event assertion honest.
+/// An explicit store's own event stays exact even while another live runtime
+/// has a pending observation. Binding that runtime later still delivers it.
 #[tokio::test]
 #[serial(config_ledger)]
 async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
-    let _ = crate::config_ledger::drain_config_locked();
-    crate::config_ledger::record_config_locked("simulated_leaked_key", "leaked_value");
+    let pending = KhiveRuntime::memory().expect("pending runtime");
+    pending.record_config_locked("simulated_leaked_key", || "leaked_value".into());
 
     let store = clean_ledger_event_store();
     let mut builder = VerbRegistryBuilder::new();
@@ -7911,6 +7867,17 @@ async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
 
     let ev = first_event(&store).await;
     assert_eq!(ev.outcome, EventOutcome::Success);
+    reg.audit_batch_handle()
+        .unwrap()
+        .close_and_wait_for_physical_completion()
+        .await
+        .unwrap();
+    let bound = config_lock_runtime::Fixture::from_runtime(pending, "local", "pending-owner");
+    bound.dispatch().await;
+    bound
+        .assert_rows(&[("simulated_leaked_key", "leaked_value")])
+        .await;
+    bound.finish().await;
 }
 
 #[tokio::test]
