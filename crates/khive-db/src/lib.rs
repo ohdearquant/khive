@@ -56,6 +56,8 @@ pub mod namespace_move_fixture;
 /// Feature-gated namespace-bounded FTS5 trigram prototype.
 #[cfg(feature = "namespace-trigram-proto")]
 pub mod namespace_trigram_proto;
+/// Durable deferred entity-index obligations (ADR-014 Amendment 7).
+pub mod pending_index;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
