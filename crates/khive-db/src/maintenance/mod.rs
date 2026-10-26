@@ -1,6 +1,6 @@
-//! Metadata primitives for cooperative maintenance (ADR-049 Amendment 16).
+//! Store-set metadata and declaration publication for cooperative maintenance (ADR-049 Amendment 16).
 //!
-//! These types do not open stores or grant admission.
+//! These primitives do not open stores or grant admission.
 
 mod store_set;
 
