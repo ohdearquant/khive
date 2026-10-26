@@ -5,9 +5,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use self::child_process::{complete_test_child, run_test_child};
 use super::record::{encode, path};
 use super::record_io::validate_metadata;
 use super::*;
+
+mod child_process;
 
 const EPOCH: &str = "c7b078c0-bb86-49fa-b1a9-28d7056cef76";
 
@@ -317,8 +320,7 @@ fn wire_decode_refuses_foreign_expected_owner_uid() {
     ));
 }
 
-#[test]
-fn wire_decode_refuses_unsorted_store_members() {
+fn store_members_wire_fixture() -> (u32, serde_json::Value) {
     let record = sample_record(Path::new("/stores"), Phase::Ready);
     let owner = record.coordinator().uid();
     let encoded = record.encode_untrusted(owner).unwrap();
@@ -326,7 +328,13 @@ fn wire_decode_refuses_unsorted_store_members() {
         Declaration::parse_untrusted(&encoded, owner).unwrap(),
         record
     );
-    let mut wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let wire = serde_json::from_slice(&encoded).unwrap();
+    (owner, wire)
+}
+
+#[test]
+fn wire_decode_refuses_unsorted_store_members() {
+    let (owner, mut wire) = store_members_wire_fixture();
     let paths = wire["stores"]["paths"].as_array_mut().unwrap();
     assert_eq!(paths.len(), 2);
     paths.swap(0, 1);
@@ -338,14 +346,7 @@ fn wire_decode_refuses_unsorted_store_members() {
 
 #[test]
 fn wire_decode_refuses_duplicate_store_members() {
-    let record = sample_record(Path::new("/stores"), Phase::Ready);
-    let owner = record.coordinator().uid();
-    let encoded = record.encode_untrusted(owner).unwrap();
-    assert_eq!(
-        Declaration::parse_untrusted(&encoded, owner).unwrap(),
-        record
-    );
-    let mut wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let (owner, mut wire) = store_members_wire_fixture();
     let paths = wire["stores"]["paths"].as_array_mut().unwrap();
     assert_eq!(paths.len(), 2);
     let duplicate = paths.last().unwrap().clone();
@@ -420,7 +421,17 @@ fn next(phase: Phase) -> PhaseAdvance {
 
 #[test]
 fn record_read_refuses_untrusted_entries_and_parent_metadata() {
-    let (_temp, root) = fixture();
+    const CHILD: &str = "KHIVE_RECORD_ENTRY_TEST_CHILD";
+    let Some(root) = std::env::var_os(CHILD) else {
+        let (_temp, root) = fixture();
+        run_test_child(
+            record_read_refuses_untrusted_entries_and_parent_metadata,
+            CHILD,
+            &root,
+        );
+        return;
+    };
+    let root = PathBuf::from(root);
     let record = sample_record(&root, Phase::Closing);
     write_record(&root, &record);
     assert_eq!(verified(&root), record);
@@ -466,6 +477,7 @@ fn record_read_refuses_untrusted_entries_and_parent_metadata() {
     ] {
         assert!(validate_metadata(mode, owner, uid(), directory).is_err());
     }
+    complete_test_child(&root);
 }
 
 #[test]
@@ -638,65 +650,15 @@ fn retained_ready_does_not_require_a_live_coordinator() {
         for phase in [Phase::Quiescent, Phase::Migrating, Phase::Ready] {
             writer.advance(next(phase)).unwrap();
         }
+        complete_test_child(&root);
         return;
     }
-    // Polling bounds process lifetime; only observed exit establishes ordering.
-    struct OwnedChild {
-        child: std::process::Child,
-        reaped: bool,
-    }
-    impl OwnedChild {
-        fn until(
-            &mut self,
-            deadline: std::time::Instant,
-        ) -> std::io::Result<Option<std::process::ExitStatus>> {
-            loop {
-                if let Some(status) = self.child.try_wait()? {
-                    self.reaped = true;
-                    return Ok(Some(status));
-                }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return Ok(None);
-                }
-                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
-            }
-        }
-    }
-    impl Drop for OwnedChild {
-        fn drop(&mut self) {
-            if !self.reaped {
-                // Panic/error cleanup must not introduce another blocking wait.
-                let _ = self.child.kill();
-                let _ = self.child.try_wait();
-            }
-        }
-    }
     let (_temp, root) = fixture();
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "maintenance::record_tests::retained_ready_does_not_require_a_live_coordinator",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &root)
-        .spawn()
-        .unwrap();
-    let mut child = OwnedChild {
-        child,
-        reaped: false,
-    };
-    let pid = child.child.id();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let status = match child.until(deadline).expect("poll retained-Ready child") {
-        Some(status) => status,
-        None => {
-            let killed = child.child.kill();
-            let reaped = child.until(std::time::Instant::now() + std::time::Duration::from_secs(2));
-            panic!("retained-Ready child timed out; kill={killed:?}; bounded reap={reaped:?}");
-        }
-    };
-    assert!(status.success());
+    let pid = run_test_child(
+        retained_ready_does_not_require_a_live_coordinator,
+        CHILD,
+        &root,
+    );
     let ready = verified(&root);
     assert_eq!(ready.phase(), Phase::Ready);
     assert_eq!(ready.coordinator().pid(), pid);
