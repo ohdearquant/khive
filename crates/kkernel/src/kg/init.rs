@@ -181,17 +181,11 @@ fn existing_config_file(path: &Path) -> Result<bool> {
 }
 
 fn create_default_config(path: &Path) -> Result<bool> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_KHIVE_TOML.as_bytes())
-                .with_context(|| format!("write {}", path.display()))?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(DEFAULT_KHIVE_TOML.as_bytes())
+    }) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
             if !existing_config_file(path)? {
                 bail!(
                     "Configuration path {} changed during initialization; rerun kg init",
@@ -205,17 +199,11 @@ fn create_default_config(path: &Path) -> Result<bool> {
 }
 
 fn create_default_schema(path: &Path) -> Result<bool> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_SCHEMA_YAML.as_bytes())
-                .with_context(|| format!("write {}", path.display()))?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(DEFAULT_SCHEMA_YAML.as_bytes())
+    }) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
             let metadata = std::fs::symlink_metadata(path)
                 .with_context(|| format!("inspect {}", path.display()))?;
             if !metadata.is_file() {
@@ -228,15 +216,11 @@ fn create_default_schema(path: &Path) -> Result<bool> {
 }
 
 fn update_gitignore(path: &Path) -> Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => file
-            .write_all(GITIGNORE_CONTENT.as_bytes())
-            .with_context(|| format!("write {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(GITIGNORE_CONTENT.as_bytes())
+    }) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
             // A link belongs to the operator. Do not follow it for migration.
             let metadata = std::fs::symlink_metadata(path)
                 .with_context(|| format!("inspect {}", path.display()))?;
@@ -680,5 +664,77 @@ mod tests {
         assert_eq!(std::fs::read(&schema_path).unwrap(), pinned);
         cmd_init(manifest_init_args(&tmp)).unwrap();
         assert_eq!(std::fs::read(schema_path).unwrap(), pinned);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_create_write_failure_leaves_no_final_and_allows_retry() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        const LIMITED_CHILD: &str = "KKERNEL_SCHEMA_FSIZE_CHILD";
+        const SCHEMA_PATH: &str = "KKERNEL_SCHEMA_FSIZE_PATH";
+        const WRITE_ERROR_MARKER: &str = "KKERNEL_SCHEMA_LIMIT_WRITE_ERROR_REACHED";
+        let thread = std::thread::current();
+        let name = thread.name().expect("libtest names its test threads");
+        if std::env::var(LIMITED_CHILD).ok().as_deref() == Some(name) {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(SCHEMA_PATH).expect("limited child schema path"),
+            );
+            let error = create_default_schema(&path)
+                .expect_err("zero file-size limit must refuse the nonempty schema write");
+            assert!(
+                error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
+                }),
+                "limited child must reach a file-size write failure: {error:#}"
+            );
+            println!("{WRITE_ERROR_MARKER}");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        let probe = tmp.path().join("normal-limit-control");
+        std::fs::write(&probe, DEFAULT_SCHEMA_YAML.as_bytes())
+            .expect("normal-limit parent can write the complete schema");
+        std::fs::remove_file(probe).unwrap();
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"trap '' XFSZ || exit 81; ulimit -f 0 || exit 82; exec "$@""#,
+                "schema-write-limit",
+            ])
+            .arg(std::env::current_exe().expect("current library test executable"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(LIMITED_CHILD, name)
+            .env(SCHEMA_PATH, &path)
+            // Profiling must not create a regular profraw file under the zero limit.
+            .env("LLVM_PROFILE_FILE", "/dev/null")
+            .output()
+            .expect("spawn the isolated file-size-limited test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(WRITE_ERROR_MARKER),
+            "limited child must execute exactly one passing write-failure case:\n{stdout}\n{stderr}"
+        );
+        println!("KKERNEL_SCHEMA_LIMIT_CHILD_VERIFIED");
+
+        let final_entry = std::fs::symlink_metadata(&path);
+        assert!(
+            matches!(&final_entry, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "failed schema write must leave no final directory entry: {final_entry:?}"
+        );
+        assert!(create_default_schema(&path).expect("normal-limit retry creates schema"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            DEFAULT_SCHEMA_YAML.as_bytes()
+        );
+        assert!(!create_default_schema(&path).expect("complete schema is preserved"));
     }
 }
