@@ -791,8 +791,12 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let capped_decay = input.decay_factor.min(config.decay_cap);
     let temporal_recency = (-capped_decay * time_diff_days).exp();
 
-    let temporal_boost = 1.0 + w.temporal * temporal_recency;
-    let salience_boost = 1.0 + w.salience * input.salience;
+    let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
+        return 0.0;
+    };
+    let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
+        return 0.0;
+    };
 
     let mut score = semantic_base * temporal_boost * salience_boost;
 
