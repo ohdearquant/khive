@@ -101,6 +101,8 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // Implementation
     ("project", EdgeRelation::Implements, "concept"),
     ("service", EdgeRelation::Implements, "concept"),
+    // ADR-002 amendment 2026-10-22: a code artifact realizes a concept.
+    ("artifact", EdgeRelation::Implements, "concept"),
     // Lateral
     ("concept", EdgeRelation::CompetesWith, "concept"),
     ("project", EdgeRelation::CompetesWith, "project"),

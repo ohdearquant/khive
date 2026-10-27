@@ -23,6 +23,9 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
+#[path = "text/short_tokens.rs"]
+mod short_tokens;
+
 /// Name of the sidecar rowid map for a given FTS table: `{namespace,
 /// subject_id} -> rowid`, `WITHOUT ROWID`, `PRIMARY KEY (namespace,
 /// subject_id)`.
@@ -1319,6 +1322,8 @@ impl TextSearch for Fts5TextSearch {
 
         let result = self
             .with_reader("fts_search", move |conn| {
+                let short_signals =
+                    short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
                 let match_expr = match build_filtered_match_expr(
                     &request.query,
                     request.mode,
@@ -1327,6 +1332,22 @@ impl TextSearch for Fts5TextSearch {
                     Some(expr) => expr,
                     None => return Ok(Vec::new()),
                 };
+
+                if let Some(signals) = short_signals {
+                    return short_tokens::search(
+                        conn,
+                        &table,
+                        &match_expr,
+                        short_tokens::Search {
+                            filter: request.filter.as_ref(),
+                            top_k: request.top_k,
+                            snippet_chars: request.snippet_chars,
+                            window: short_tokens::Window::Ranked,
+                        },
+                        signals,
+                        usage.as_ref(),
+                    );
+                }
 
                 // Snippet column index 3 = body in the FTS5 schema.
                 // snippet_chars == 0 is the sentinel for "no snippet" — skip the
@@ -1648,6 +1669,8 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_unranked", move |conn| {
+            let short_signals =
+                short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
             let match_expr = match build_filtered_match_expr(
                 &request.query,
                 request.mode,
@@ -1656,6 +1679,22 @@ impl Fts5TextSearch {
                 Some(expr) => expr,
                 None => return Ok(Vec::new()),
             };
+
+            if let Some(signals) = short_signals {
+                return short_tokens::search(
+                    conn,
+                    &table,
+                    &match_expr,
+                    short_tokens::Search {
+                        filter: request.filter.as_ref(),
+                        top_k: request.top_k,
+                        snippet_chars: request.snippet_chars,
+                        window: short_tokens::Window::Unranked,
+                    },
+                    signals,
+                    usage.as_ref(),
+                );
+            }
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
                 build_filter_clause(filter, &table, 3)
@@ -1723,6 +1762,8 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
+            let short_signals =
+                short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
             let match_expr = match build_filtered_match_expr(
                 &request.query,
                 request.mode,
@@ -1731,6 +1772,22 @@ impl Fts5TextSearch {
                 Some(expr) => expr,
                 None => return Ok(Vec::new()),
             };
+
+            if let Some(signals) = short_signals {
+                return short_tokens::search(
+                    conn,
+                    &table,
+                    &match_expr,
+                    short_tokens::Search {
+                        filter: request.filter.as_ref(),
+                        top_k: request.top_k,
+                        snippet_chars: request.snippet_chars,
+                        window: short_tokens::Window::Capped(gather_limit),
+                    },
+                    signals,
+                    usage.as_ref(),
+                );
+            }
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
                 build_filter_clause(filter, &table, 4)
@@ -1972,3 +2029,7 @@ mod tests;
 #[cfg(test)]
 #[path = "text_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "text_short_token_tests.rs"]
+mod short_token_tests;

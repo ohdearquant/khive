@@ -109,10 +109,26 @@ pub(super) fn is_repository_revision_reference(raw_token: &str) -> bool {
     false
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CLAUSE_IDENTIFIER_WORK_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_clause_identifier_work_bytes() -> usize {
+    CLAUSE_IDENTIFIER_WORK_BYTES.with(|count| count.replace(0))
+}
+
+fn clause_identifier_boundary(ch: char) -> bool {
+    #[cfg(test)]
+    CLAUSE_IDENTIFIER_WORK_BYTES.with(|count| count.set(count.get() + ch.len_utf8()));
+    !ch.is_ascii_alphanumeric() && ch != '_'
+}
+
 fn trailing_identifier(text: &str) -> &str {
-    let trimmed = text.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    let trimmed = text.trim_end_matches(clause_identifier_boundary);
     trimmed
-        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .rsplit(clause_identifier_boundary)
         .next()
         .unwrap_or_default()
 }
@@ -417,6 +433,33 @@ pub(super) fn has_clause_credential_label_with_inline(
     inline_trigger: bool,
     value_kind: ClauseValueKind,
 ) -> bool {
+    has_clause_credential_label(text, token_offset, inline_trigger, value_kind, false)
+}
+
+/// Path trigger attribution must retain every credential-token label recognized
+/// by assignment detection. Existing candidate exemption guards keep their
+/// original vocabulary through the wrapper above.
+pub(super) fn has_path_context_credential_label(
+    text: &str,
+    token_offset: usize,
+    inline_trigger: bool,
+) -> bool {
+    has_clause_credential_label(
+        text,
+        token_offset,
+        inline_trigger,
+        ClauseValueKind::FilePath,
+        true,
+    )
+}
+
+fn has_clause_credential_label(
+    text: &str,
+    token_offset: usize,
+    inline_trigger: bool,
+    value_kind: ClauseValueKind,
+    credential_token_labels: bool,
+) -> bool {
     if inline_trigger {
         return true;
     }
@@ -444,7 +487,9 @@ pub(super) fn has_clause_credential_label_with_inline(
         if gap.contains([':', '=']) {
             crossed_value_delimiter = true;
         }
-        if clause_label_has_credential_trigger(label) {
+        if clause_label_has_credential_trigger(label)
+            || (credential_token_labels && is_credential_token_label(&label.to_ascii_lowercase()))
+        {
             return true;
         }
         let skippable = is_label_clause_skip_word(label)
@@ -760,4 +805,53 @@ pub(super) fn normalized_hex_credential_span(token: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Attribution-only: inspect every whole-hex-run start, including subranges
+/// hidden by an earlier complete digest or a cumulative prefix above the limit.
+/// The legacy first-span detector above deliberately retains its exact grammar.
+pub(super) fn has_normalized_hex_credential_span_overlapping(
+    token: &str,
+    overlap_start: usize,
+    overlap_end: usize,
+) -> bool {
+    if overlap_start >= overlap_end {
+        return false;
+    }
+    let max_len = HEX_CREDENTIAL_LENGTHS.iter().copied().max().unwrap_or(0);
+    let mut starts = std::collections::VecDeque::<(usize, usize)>::with_capacity(max_len);
+    let mut concatenated_len = 0usize;
+    for run in token.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        if run.is_empty() {
+            continue;
+        }
+        if !is_hex_run(run) {
+            starts.clear();
+            concatenated_len = 0;
+            continue;
+        }
+        let run_start = run.as_ptr() as usize - token.as_ptr() as usize;
+        let next_len = concatenated_len + run.len();
+        while starts
+            .front()
+            .is_some_and(|&(prefix_len, _)| next_len - prefix_len > max_len)
+        {
+            starts.pop_front();
+        }
+        if run.len() <= max_len {
+            starts.push_back((concatenated_len, run_start));
+        }
+        concatenated_len = next_len;
+        let run_end = run_start + run.len();
+        if run_end <= overlap_start {
+            continue;
+        }
+        if starts.iter().any(|&(prefix_len, span_start)| {
+            span_start < overlap_end
+                && HEX_CREDENTIAL_LENGTHS.contains(&(concatenated_len - prefix_len))
+        }) {
+            return true;
+        }
+    }
+    false
 }

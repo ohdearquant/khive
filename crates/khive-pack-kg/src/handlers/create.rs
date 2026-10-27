@@ -39,7 +39,11 @@ fn required_singleton_kind(params: &Value) -> Result<String, RuntimeError> {
         None => Err(RuntimeError::InvalidInput("create requires 'kind'".into())),
         Some(Value::String(kind)) => Ok(kind.clone()),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `kind` must be a string; got {value}"
+            "create: `kind` must be a string; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
@@ -55,7 +59,11 @@ fn optional_singleton_kind_alias(
         )),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
@@ -993,6 +1001,14 @@ impl KgPack {
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
         let mut fields: CreateParams = deser(params.clone())?;
+        // Keep malformed shared-field errors at the existing typed boundary,
+        // then refuse a note-only field before hooks or any entity write.
+        // The bulk path has already returned above.
+        if matches!(&spec, KindSpec::Entity { .. }) && params.get("content").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "create: `content` is a note-only field; use `description` for an entity".into(),
+            ));
+        }
         let required_entity_type = match &spec {
             KindSpec::Entity { entity_type, .. } => entity_type.as_deref(),
             _ => None,

@@ -74,6 +74,7 @@ CRATES=(
     khive-bm25
     khive-fusion
     khive-db
+    khive-capability     # needs khive-db and khive-storage (above); no workspace crate depends on it
     khive-hnsw
     khive-query
     khive-gate

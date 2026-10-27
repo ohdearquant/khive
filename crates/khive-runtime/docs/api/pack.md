@@ -237,6 +237,28 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
 
+### Retention class
+
+Generic dispatch receipts whose kind is `Audit` and whose persisted canonical verb
+is exactly one of `comm.inbox`, `comm.cleanup_expired_quarantine`, `whoami`,
+`comm.probe`, `comm.cursor_get`, or `comm.heartbeat` carry this top-level payload
+field:
+
+```json
+{
+  "retention": {
+    "class": "expendable",
+    "policy": "poll-dispatch-v1",
+    "horizon_seconds": 604800
+  }
+}
+```
+
+The runtime assigns it at event construction, before batch admission, for success,
+denied, and error outcomes, including sampled and forced success rows. Caller
+arguments never set or change it. Readers and deletion paths do not use this
+marker yet.
+
 ### Successful search query shape
 
 Successful `search` dispatch audit payloads additionally contain `match_mode`
@@ -256,6 +278,42 @@ audit. Nested and concurrent dispatches are isolated; detached work is excluded.
 
 The fields are absent from other verbs and unsuccessful search dispatches. Ordinary
 and intercepted dispatches use the same enrichment; response shapes are unchanged.
+
+### Failed dispatch error class
+
+Non-success dispatch audit rows carry a top-level `error_class`. Its closed tokens
+come from the typed error and the dispatch boundary that raised it, never from
+message text. The class adds no error message, request contents, or new resource
+units and does not change the error returned to the caller, retry policy, or
+whether domain effects may have committed.
+
+| Class                        | Meaning                                                                                                                                                                                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gate_refusal`               | The registry gate denied the call before its handler ran.                                                                                                                                                                                           |
+| `policy_refusal`             | A handler returned `PermissionDenied` (including outbound recipient policy), secret detection, a cross-namespace write refusal, a write-budget refusal, a receipt-bearing refusal, or another typed policy refusal.                                 |
+| `invalid_params`             | Invalid or ambiguous caller arguments, an unknown verb/model/remote, query parsing/validation errors, or a caller buffer limit. This includes the existing self-send-without-flag and not-addressed message errors, which are typed `InvalidInput`. |
+| `not_found_or_not_addressed` | A typed missing record/cache or namespace mismatch; this makes no claim that an inaccessible record exists.                                                                                                                                         |
+| `deadline_exceeded`          | A typed operation, storage, audit-resolution, or read-transaction-age deadline elapsed.                                                                                                                                                             |
+| `admission_exhausted`        | A typed storage slot, writer queue, writer begin, or audit admission could not admit the request.                                                                                                                                                   |
+| `conflict`                   | A typed existing-record, precondition, guarded-write, or identity conflict.                                                                                                                                                                         |
+| `unsupported`                | A typed unsupported operation or capability.                                                                                                                                                                                                        |
+| `configuration`              | A missing or incompatible runtime/pack configuration or absent required writer runtime.                                                                                                                                                             |
+| `storage`                    | A typed storage failure, integrity mismatch, terminal writer failure, audit-store failure, or exhausted audit retry.                                                                                                                                |
+| `unavailable`                | Gate evaluation, remote fetch, embedding service, or another typed dependency-unavailable failure.                                                                                                                                                  |
+| `internal`                   | An explicitly mapped internal/fusion/driver-control failure. This is never a default for an unknown variant.                                                                                                                                        |
+
+Evidence wrappers retain their original typed cause. The runtime, storage, query,
+structured error-kind, and audit-terminal matches are exhaustive, so a new variant
+requires an explicit mapping at compile time. A gate-denied row is distinguished
+from a handler's `PermissionDenied` by its existing dispatch location, not its
+reason string.
+
+Success rows have no `error_class`. Historical rows without it keep that absence;
+readers must not invent `internal` or any other default. `brain.event_counts`
+counts recognized classes only on non-success audit rows and separately reports
+unclassified non-success rows. Unknown future tokens are unclassified too.
+This enrichment does not create audit rows for paths that previously had none,
+and cannot record a failure to persist the audit row into that same missing row.
 
 ## persist_git_digest_receipt
 

@@ -26,24 +26,6 @@ fn unknown_code_fallback_preserves_the_raw_string_with_an_id() {
 }
 
 #[test]
-fn unknown_code_fallback_preserves_the_raw_string_without_an_id() {
-    let payload = br#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#;
-    match decode_payload(payload).unwrap() {
-        Frame::Error {
-            id,
-            code,
-            unrecognized_code,
-            ..
-        } => {
-            assert_eq!(code, crate::error::WireErrorCode::Internal);
-            assert!(id.is_none());
-            assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
-        }
-        other => panic!("expected an error frame, got {other:?}"),
-    }
-}
-
-#[test]
 fn closed_set_code_never_populates_unrecognized_code() {
     // The diagnostic stays `None` for every code in the closed set: it
     // records only the serde-other fallback, never a recognized code.
@@ -97,10 +79,15 @@ fn encode_rejects_a_fallback_frame_with_an_id() {
 
 #[test]
 fn encode_rejects_a_fallback_frame_without_an_id() {
-    // Same rule for the id-less fallback shape: decode accepts it (the
-    // pairing is not enforced for an unknown code), encode rejects it.
-    let payload = br#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#;
-    let frame = decode_payload(payload).unwrap();
+    // Same rule for the id-less shape. Decode refuses an id-less unknown
+    // code, so only a caller building the frame directly can hold one;
+    // encode must still reject it.
+    let frame = Frame::Error {
+        id: None,
+        code: crate::error::WireErrorCode::Internal,
+        message: "from newer peer".to_string(),
+        unrecognized_code: Some("future_code_xyz".to_string()),
+    };
     match encode_frame(&frame).unwrap_err() {
         CodecError::FallbackFrameNotEncodable { code } => {
             assert_eq!(code, "future_code_xyz");

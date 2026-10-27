@@ -2091,7 +2091,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
 
     impl Pack for TagHookPack {
         const NAME: &'static str = "tag-update-test";
-        const NOTE_KINDS: &'static [&'static str] = &["tag-hook-note"];
+        const NOTE_KINDS: &'static [&'static str] = &["tag_hook_note"];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[];
     }
@@ -2111,7 +2111,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
             Self::HANDLERS
         }
         fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-            (kind == "tag-hook-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+            (kind == "tag_hook_note").then(|| self.0.clone() as Arc<dyn KindHook>)
         }
         async fn dispatch(
             &self,
@@ -2134,7 +2134,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
         let note = pack
             .handle_create(
                 &token,
-                json!({"kind": "tag-hook-note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                json!({"kind": "tag_hook_note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
                 &registry,
             )
             .await
@@ -2841,8 +2841,8 @@ async fn link_reports_replace_and_explicit_resurrection_with_edge_observations()
             && !event.payload["previous"]["deleted_at"].is_null()));
 }
 
-// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
-// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// ADR-087 Amendment 1 §A9: decision chains use `decision precedes decision`
+// note-to-note edges from each earlier decision to the next. KG_EDGE_RULES
 // additively extends the base entity-only `precedes` contract to
 // `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
 // `depends_on` rule.
@@ -5498,4 +5498,130 @@ async fn issue2750_entity_create_always_reports_similar_existing_and_whether_it_
             && note.get("similar_existing_unavailable_reason").is_none(),
         "a note create reports no dedup comparison: {note}"
     );
+}
+
+#[tokio::test]
+async fn singleton_entity_create_content_refusal_names_description() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
+
+    fn record_counts(runtime: &KhiveRuntime) -> (i64, i64) {
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .expect("fixture writer")
+            .autocommit(|conn| {
+                let entities = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let notes =
+                    conn.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get::<_, i64>(0))?;
+                Ok((entities, notes))
+            })
+            .expect("actual stored record counts")
+    }
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let pack = KgPack::new(runtime.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().expect("KG registry");
+    let before = record_counts(&runtime);
+    for kind in ["entity", "concept"] {
+        let error = pack
+            .handle_create(
+                &token,
+                json!({
+                    "kind": kind, "entity_kind": "concept", "name": "wrong substrate field",
+                    "content": "must not be silently discarded", "skip_dedup_check": true,
+                }),
+                &registry,
+            )
+            .await
+            .expect_err("singleton entity content must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("content"),
+            "refusal names content: {message}"
+        );
+        assert!(
+            message.contains("description"),
+            "refusal names the correct entity field: {message}"
+        );
+        assert_eq!(
+            record_counts(&runtime),
+            before,
+            "refusal writes neither entities nor notes"
+        );
+    }
+    // Preserve the original typed decoder error rather than replacing it with
+    // the new valid-string wrong-substrate diagnostic.
+    let malformed = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "malformed content", "content": 17,
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("non-string content still fails decoding");
+    assert!(
+        malformed.to_string().contains("invalid type"),
+        "{malformed}"
+    );
+    assert_eq!(record_counts(&runtime), before);
+
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "proper entity", "description": "entity description",
+                "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("proper description succeeds");
+    let entity_id = uuid::Uuid::parse_str(entity["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        runtime
+            .get_entity(&token, entity_id)
+            .await
+            .unwrap()
+            .description
+            .as_deref(),
+        Some("entity description")
+    );
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "note", "content": "ordinary note content", "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("note content stays valid");
+    let note_id = uuid::Uuid::parse_str(note["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(note_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "ordinary note content"
+    );
+    assert_eq!(record_counts(&runtime), (before.0 + 1, before.1 + 1));
 }

@@ -234,13 +234,54 @@ fn authenticated_token(plaintext: &[u8], aad: &[u8]) -> String {
     let nonce = [31_u8; 24];
     let mut body = plaintext.to_vec();
     let tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut body)
+        .encrypt_inout_detached(&XNonce::from(nonce), aad, body.as_mut_slice().into())
         .unwrap();
     let mut envelope = vec![2, 3, b'n', b'e', b'w'];
     envelope.extend_from_slice(&nonce);
     envelope.extend_from_slice(&body);
     envelope.extend_from_slice(&tag);
     URL_SAFE_NO_PAD.encode(envelope)
+}
+
+#[test]
+fn opens_frozen_0_10_1_receipt() {
+    // Frozen visibility receipt with synthetic key [19; 32] and nonce [31; 24],
+    // independently reproduced with PyNaCl/libsodium XChaCha20-Poly1305 IETF.
+    // Keep this literal and the expected fields unchanged across crypto upgrades.
+    const FROZEN_TOKEN: &str = "AgNuZXcfHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx_0oaDgfrUt5o5cB8ZnR2i2KhRGGE83fiaSYLduVGBIgBnNszAwRYYOkQ";
+
+    let receipt = sealer("new").0.open(FROZEN_TOKEN).unwrap();
+    assert_eq!(receipt.namespace, "ns");
+    assert_eq!(receipt.issued_at, 1);
+    assert_eq!(receipt.fences, vec![("x".to_owned(), 9)]);
+}
+
+#[test]
+fn frozen_0_10_1_receipt_rejects_body_tampering() {
+    // Frozen envelope: 5-byte header, 24-byte nonce, 25-byte ciphertext, 16-byte tag.
+    assert_frozen_receipt_tampering_is_refused(29..54);
+}
+
+#[test]
+fn frozen_0_10_1_receipt_rejects_tag_tampering() {
+    assert_frozen_receipt_tampering_is_refused(54..70);
+}
+
+fn assert_frozen_receipt_tampering_is_refused(offsets: std::ops::Range<usize>) {
+    // Mutate the frozen compatibility vector, never a freshly sealed token.
+    const FROZEN_TOKEN: &str = "AgNuZXcfHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx_0oaDgfrUt5o5cB8ZnR2i2KhRGGE83fiaSYLduVGBIgBnNszAwRYYOkQ";
+    let envelope = URL_SAFE_NO_PAD.decode(FROZEN_TOKEN).unwrap();
+    assert_eq!(envelope.len(), 70);
+    let (sealer, _) = sealer("new");
+    for offset in offsets {
+        let mut tampered = envelope.clone();
+        tampered[offset] ^= 1;
+        assert_eq!(
+            sealer.open(&URL_SAFE_NO_PAD.encode(tampered)).err(),
+            Some(ReceiptSealError::InvalidReceipt),
+            "frozen receipt byte {offset} was changed"
+        );
+    }
 }
 
 #[test]

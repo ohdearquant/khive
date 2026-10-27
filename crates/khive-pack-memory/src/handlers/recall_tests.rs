@@ -2109,7 +2109,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
-        actor_id: Some("leo".to_string()),
+        actor_id: Some("casey".to_string()),
         ..khive_runtime::RuntimeConfig::default()
     })
     .expect("runtime");
@@ -2117,7 +2117,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     let token = rt.authorize(ns.clone()).expect("authorize local");
     assert_eq!(
         token.actor().id,
-        "leo",
+        "casey",
         "test setup: token must carry the configured actor"
     );
 
@@ -2145,7 +2145,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     // construction-baked actor id (independent of `RuntimeConfig::actor_id`,
     // which only affects tokens minted directly via `rt.authorize`) — bake
     // the same actor here so `registry.dispatch` calls carry it too.
-    builder.with_actor_id(Some("leo".to_string()));
+    builder.with_actor_id(Some("casey".to_string()));
     let registry = builder.build().expect("registry");
 
     registry
@@ -2153,7 +2153,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             "brain.create_profile",
             serde_json::json!({
                 "namespace": ns.as_str(),
-                "name": "leo-actor-recall-v1",
+                "name": "casey-actor-recall-v1",
                 "consumer_kind": "recall",
             }),
         )
@@ -2164,7 +2164,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             "brain.activate",
             serde_json::json!({
                 "namespace": ns.as_str(),
-                "profile_id": "leo-actor-recall-v1",
+                "profile_id": "casey-actor-recall-v1",
             }),
         )
         .await
@@ -2175,8 +2175,8 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
         .dispatch(
             "brain.bind",
             serde_json::json!({
-                "actor": "leo",
-                "profile_id": "leo-actor-recall-v1",
+                "actor": "casey",
+                "profile_id": "casey-actor-recall-v1",
                 "consumer_kind": "recall",
             }),
         )
@@ -2199,7 +2199,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     assert!(!hits.is_empty(), "must find the seeded note");
     assert_eq!(
         hits[0]["served_by_profile_id"],
-        serde_json::json!("leo-actor-recall-v1"),
+        serde_json::json!("casey-actor-recall-v1"),
         "recall response must stamp the actor-bound profile, not the default"
     );
 
@@ -2223,7 +2223,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             assert!(
                 matches!(
                     row.get("served_by_profile_id"),
-                    Some(khive_storage::types::SqlValue::Text(s)) if s == "leo-actor-recall-v1"
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "casey-actor-recall-v1"
                 ),
                 "serve ledger row must carry the actor-bound profile id"
             );
@@ -2240,14 +2240,14 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     registry
         .dispatch(
             "brain.deactivate",
-            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            json!({"namespace": ns.as_str(), "profile_id": "casey-actor-recall-v1"}),
         )
         .await
         .expect("deactivate the bound profile");
     registry
         .dispatch(
             "brain.archive",
-            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            json!({"namespace": ns.as_str(), "profile_id": "casey-actor-recall-v1"}),
         )
         .await
         .expect("archive the bound profile");
@@ -2297,7 +2297,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
-        actor_id: Some("leo".to_string()),
+        actor_id: Some("casey".to_string()),
         ..khive_runtime::RuntimeConfig::default()
     })
     .expect("runtime");
@@ -2309,7 +2309,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
     let token = rt.authorize(ns.clone()).expect("authorize local");
     assert_eq!(
         token.actor().id,
-        "leo",
+        "casey",
         "test setup: token must carry the configured actor"
     );
 
@@ -2334,7 +2334,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         crate::test_support::with_receipt_credentials(rt.clone()),
     ));
     builder.register(brain);
-    builder.with_actor_id(Some("leo".to_string()));
+    builder.with_actor_id(Some("casey".to_string()));
     let registry = builder.build().expect("registry");
 
     registry
@@ -2352,7 +2352,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         .dispatch(
             "brain.bind",
             serde_json::json!({
-                "actor": "leo",
+                "actor": "casey",
                 "profile_id": "adr104-resolution-v1",
                 "consumer_kind": "recall",
             }),
@@ -2696,7 +2696,7 @@ async fn recall_profile_resolution_latency_is_bounded() {
     use khive_pack_brain::BrainPack;
     use std::time::Duration;
 
-    async fn timed_recall(with_brain: bool) -> Duration {
+    async fn timed_recall(with_brain: bool) -> (Duration, u64) {
         let rt = if with_brain {
             build_full_rt_with_brain()
         } else {
@@ -2773,17 +2773,19 @@ async fn recall_profile_resolution_latency_is_bounded() {
             )
             .await
             .expect("recall");
-        start.elapsed()
+        let elapsed = start.elapsed();
+        let resolved_deadline_ms = crate::pack::recall_deadline_ms(&rt);
+        (elapsed, resolved_deadline_ms)
     }
 
-    let without_brain = timed_recall(false).await;
-    let with_brain = timed_recall(true).await;
+    let (without_brain, _) = timed_recall(false).await;
+    let (with_brain, resolved_deadline_ms) = timed_recall(true).await;
     eprintln!(
         "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
     );
     // Dispatch uses this same cached deadline when the request has no override.
-    let caller_bound = Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+    let caller_bound = Duration::from_millis(resolved_deadline_ms).saturating_mul(2);
     if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
         assert!(
             with_brain < caller_bound,

@@ -24,7 +24,7 @@
 //!   audit-batch appends and reads are synchronous framed round-trips with
 //!   bounded timeouts, because their callers are background flushers or query
 //!   paths, never the dispatch hot path.
-//! - [`ForwardingEventStore`] — the lane-side [`EventStore`] over the socket.
+//! - [`ForwardingEventStore`] — the lane-side [`khive_storage::EventStore`] over the socket.
 //!   Preflight validation delegates to an in-memory `SqlEventStore`, so the
 //!   ADR-133 audit-batch seam keeps its pre-enqueue shape check without any
 //!   I/O on the dispatch path.
@@ -37,41 +37,14 @@
 //! path here degrades (drop + count + log, or a typed storage error for the
 //! synchronous lanes) instead of blocking the caller.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-#[cfg(unix)]
-use std::time::Duration;
-
-use async_trait::async_trait;
-use khive_db::{StorageBackend, WalCeilingPolicy};
-use khive_storage::event::{
-    EventGroupBy, EventPageQuery, EventPageWindow, IdempotentEventBatchResult,
-};
-use khive_storage::{
-    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
-    StorageResult,
-};
-use serde::{Deserialize, Serialize};
-
 #[path = "events_count_read_budget.rs"]
 mod events_count_read_budget;
-use events_count_read_budget::CountReadBudget;
 #[doc(hidden)]
 pub use events_count_read_budget::WireReadFailure;
-#[cfg(unix)]
-use events_count_read_budget::{count_storage_error_response, restore_count_read_failure};
 
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-use uuid::Uuid;
-
-#[cfg(unix)]
-use crate::daemon::{read_frame, write_frame};
-
-mod daemon;
+mod events_daemon;
+mod file_hardening;
 #[cfg(unix)]
 mod forwarder;
 mod paths;
@@ -81,24 +54,37 @@ mod registry;
 mod server;
 mod stores;
 
-pub use stores::*;
-
 #[cfg(unix)]
-pub use forwarder::*;
-
+pub use events_daemon::{
+    events_readiness, events_readiness_window, run_events_daemon, run_events_daemon_with_policies,
+    supervise_events_daemon, supervise_events_daemon_with_policies,
+    supervise_events_daemon_with_readiness, try_acquire_events_daemon_guard, EventsDaemonGuard,
+    EventsNotReady, EventsNotReadyReason, EventsReadiness, EventsReadinessSignal,
+    EVENTS_READINESS_WINDOW,
+};
 #[cfg(unix)]
-use server::*;
-
-#[cfg(not(unix))]
-use daemon::refuse_events_db_symlinks;
+pub use forwarder::{EventsForwardingMetrics, EventsSplitClient};
 #[cfg(unix)]
-pub use daemon::*;
-
-pub use protocol::*;
-
-pub use registry::*;
-
-pub use paths::*;
+use paths::absolutize;
+pub use paths::{
+    events_db_path_beside, events_socket_path_beside, EVENTS_PROTOCOL_VERSION,
+    MAX_QUERY_EVENTS_PAGE_ROWS,
+};
+#[cfg(unix)]
+pub use paths::{DEFAULT_APPEND_QUEUE_BATCHES, DEFAULT_APPEND_QUEUE_BYTES};
+pub use protocol::{EventsRequest, EventsResponse, WireWriterTaskFailure, WireWriterTaskState};
+pub(crate) use registry::direct_backend_with_policies;
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use registry::TestRegistryGuard;
+#[cfg(unix)]
+pub use registry::{client_for, forwarding_metrics};
+pub use registry::{direct_backend_for, direct_backend_read_only_for, EventsSplitConfig};
+#[cfg(unix)]
+use server::storage_error_response;
+#[cfg(unix)]
+pub use stores::ForwardingEventStore;
+pub use stores::SplitEventStore;
 
 #[cfg(unix)]
 #[path = "events_split_socket_path.rs"]
@@ -106,19 +92,9 @@ pub(crate) mod socket_path;
 #[cfg(unix)]
 pub use socket_path::validate_events_socket_path;
 
-// ---------------------------------------------------------------------------
-// Wire protocol
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Server side
-// ---------------------------------------------------------------------------
-
 #[cfg(unix)]
 #[path = "events_split_policy_entries.rs"]
 mod policy_entries;
-#[cfg(unix)]
-use policy_entries::standalone_daemon_policies;
 #[cfg(unix)]
 pub use policy_entries::{
     run_events_daemon_with_wal_ceiling, supervise_events_daemon_with_wal_ceiling,
@@ -128,19 +104,11 @@ pub use policy_entries::{
 #[path = "events_wal_policy_tests.rs"]
 mod wal_policy_tests;
 
-// ---------------------------------------------------------------------------
-// Client side
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The per-namespace EventStore handle
-// ---------------------------------------------------------------------------
-
 #[cfg(all(test, unix))]
 #[path = "events_count_read_budget_tests.rs"]
 mod count_read_budget_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "events_split_sqlite_full_tests.rs"]
 mod sqlite_full_tests;
 

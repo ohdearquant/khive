@@ -7,17 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-
-- `khive_storage::graph::CommitAnnotationCursorValue`,
-  `khive_storage::graph::CommitAnnotationGuard`, and
-  `khive_storage::graph::CommitAnnotationInsertOutcome`.
-- `khive_storage::GraphStore::insert_commit_annotation_if_absent` and
-  `khive_runtime::KhiveRuntime::link_commit_annotation_if_absent`.
-  Git reconciliation uses pack-owned predicates and the existing generic
-  create-only graph insertion instead.
-- `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
-  `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
+## [0.15.0] - 2026-10-25
 
 ### Added
 
@@ -44,6 +34,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueryMailboxScope`, filtering every note source, synthetic observation target and graph
   edge in the compiled SQL by the note store's mailbox rule. `khive_query::compile` keeps
   its unscoped behavior for callers that supply no scope.
+- Add `stream.truncate` to remove a stream prefix atomically while preserving its sequence
+  floor. `stream.read` and `stream.stat` report the floor, and empty streams retain their
+  sequence position.
+- KG archive imports now support explicit conflict handling, a dry-run preflight and forced
+  skipping of invalid edges. Dry runs report the planned counts without writing; force only
+  relaxes endpoint validation.
+- Change sets add `RestoreOp` for active entities, notes and edges, and soft-delete inversion
+  now produces restore operations. Restore cannot yet be applied, and schema-version 1
+  change sets no longer decode.
+- `attach(id, role, bytes, media_type?)` stores a role-keyed attachment on an existing entity or
+  note on the main backend, replacing any earlier attachment in that role. Representations a pack
+  protects stay with that pack, and inline input keeps the 64 MiB limit. `get` returns role-keyed
+  attachment metadata and hydrates only the roles a caller requests, with verified base64 bytes;
+  an unknown role is refused. Soft deletion keeps attachment rows and hard deletion removes them.
+- `RuntimeCloseOwner` closes a quiescent single-backend runtime slot explicitly. A successful close
+  waits for the audit tasks, drains the writer and joins the final store's timeout sink. Progress
+  survives cancellation, and while other holders keep pool, backend or audit roots alive the close
+  reports `Incomplete` with the observed strong counts so the host can release them and retry.
+  Runtimes with embeddings, ANN, blob hydration, split events, host background loops or several
+  backends are refused at preflight. Ordinary `Drop` remains best effort.
+- Add `charter.*` verbs to compile and publish workflow definitions, start and advance
+  runs from recorded or sampled observations, inspect status, and cancel open runs.
+  Definitions use registered vocabularies; `request_id` makes writes safe to retry.
+  Phase revisits include new evidence, and only declared triggers advance generation.
+- New crate `khive-capability`: sealed process-local grants, authenticated durable grant
+  envelopes and attenuating capability delegation. With its `authority-store` feature,
+  authority records, typed change history and replay receipts are stored in `khive-db`
+  transactions, and bootstrap state is written atomically.
+- `khive-db` records edge-governance decisions and invalidations in a new dormant
+  schema. The tables preserve decision history and native edge changes, without
+  activating governance checks or changing ordinary edge writes.
+- Failed dispatch audit events carry a typed `error_class`. `brain.event_counts`
+  groups recognized classes and counts missing, malformed or unknown classes as
+  unclassified, without changing caller errors or retry behavior.
+- Audit success retention supports `reduced` and `all` through
+  `KHIVE_AUDIT_SUCCESS_ROWS`. Reduced mode omits or samples successful rows for
+  selected trusted handlers; `db_diagnostics` reports the decisions and
+  `brain.event_counts` includes stored sampling metadata.
+
+### Changed
+
+- **Breaking:** `exec.events` returns every event `id` as a string: a UUID for new
+  lifecycle events and a decimal string for legacy rows. New lifecycle events use
+  the shared event store with the caller's canonical actor attribution. Legacy
+  rows remain visible in the same oldest-first list, ordered by timestamp and
+  string ID before applying the requested limit.
+- The knowledge suggest verb now admits unspaced Chinese, Japanese and Korean queries by counting
+  every two supported letters as one word, while retaining the existing whitespace-piece
+  count for other scripts.
+- Successful search audit records include the retrieval arms actually started, lexical match
+  mode, effective limit and result count, including for empty results.
+- `kkernel reindex` reads `[embed].batch_size` from the selected config file when the option
+  is omitted; `--batch-size` takes precedence and the configured value is bounded to 1 to 500.
+- Quarantined email records now retain the parsed To recipients in `quarantine_claimed_to`.
+  Empty recipient lists and malformed-message envelopes omit the field.
+- `comm.thread` renders only the selected visible message owners when building message JSON
+  and previews, avoiding rendering discarded rows.
+- Atom weights are applied to knowledge search results after embedding blending and status
+  normalization. Missing weights use 1.0, and unavailable weight reads preserve results with
+  a degradation reason.
+- Event-count cursor reads now preserve typed `Timeout` and `AdmissionTimeout` refusals from
+  storage, including failures while checking page-boundary completeness.
+- When `KHIVE_SEARCH_PROFILE` is enabled, deadline phase records now carry the same search
+  call and backend identifiers as their profile records, distinguishing timeout and late
+  completion observations.
+- Legacy quarantine cleanup now has a partial index for its typed quarantine and blank-slug
+  filters, while keeping the existing expiry-or-creation ordering.
+- MCP instructions now direct clients to the `request` tool's verb list for linked packs
+  that are not loaded.
+- MCP server instructions no longer repeat the verb catalog already present in the `request`
+  tool description.
+- Entity vector searches exclude knowledge atom vectors before candidate limits are applied,
+  so nearby atoms cannot crowd entities out of entity search results. Other vector searches
+  retain their existing populations.
+- SQLite vector batch searches now use one admitted reader and one read transaction per batch,
+  so every query sees the same snapshot. Per-query failures remain isolated.
+- Writable cached SQL queries on standalone writers and pools with the write queue disabled
+  now take write admission immediately before execution and retain the connection through
+  settlement. Queued writer queries retain their existing read-only behavior.
+- Standalone database writes now use consuming write owners that keep the connection and
+  volume lease through settlement, including when an async observer is cancelled.
+- Malformed active tool-grant rows now return an authorization error naming the row and
+  invalid column, instead of falling through to policy or the default decision.
+- Windows code-map pools can now obtain the native handle for an opened main database file,
+  allowing the post-open identity check to succeed without reopening the path.
+- Event-daemon supervision retains a child handle after transient exit-poll errors, allowing
+  a later poll to reap it and preventing a second daemon from starting beside it.
+- On Unix, dropping a volume lease explicitly unlocks its file before closing it, so a
+  duplicated descriptor cannot keep the old lease locked.
+- Refusal diagnostics now mask credential-shaped values before including them in error messages:
+  brain profile lifecycle and feedback signals; comm inbox box and status values and thread order;
+  scheduled-action `kind`, `entity_kind` and `note_kind`; session export formats, resume and export
+  ids, list timestamps and search sources and timestamps; memory types, fusion strategies and
+  feedback signals; knowledge feedback signals and section keys; knowledge import `chunk_strategy`
+  and `format`; and tool argument values. Ordinary invalid values, accepted-value lists, validation
+  order and error variants are unchanged.
+- Invalid KG search `text_mode`, `source` and `order_by` values are now named in the diagnostic,
+  masked when credential-shaped, and an invalid tool string-list argument identifies the refused
+  element.
+- `kkernel reindex` warns once when the selected configuration sets `embed.batch_size` above the
+  500 cap, naming the file, the configured value and the effective value. An explicit
+  `--batch-size`, an in-range value, a validation-only run and single-record repair do not warn.
+- Bounded FTS ranking (`RankWithinCap`) materializes the bounded candidate rows before ranking,
+  avoiding a second id lookup, and duplicate ids outside the exact filters no longer expand the
+  gather cap. Default ranked search is unchanged.
+- The default `kkernel` and `khive-mcp` builds no longer link the agent, telemetry and web
+  packs; enable `pack-agent`, `pack-telemetry` and `pack-web` to include them.
+- S3 blob storage is linked only when the `blob-s3` feature is enabled. A build
+  without that feature refuses S3 configuration during load.
+- `kkernel kg import` reads native khive archives without extra features. Enable
+  `kg-adapters` for JSON, NDJSON, CSV, TSV or BibTeX imports; unsupported formats
+  are refused before the source is read.
+- Published `kkernel` binaries strip symbol tables; panic file and line information
+  remains, while backtrace frame names are omitted.
+- Refusal diagnostics mask credential-shaped caller values across `gtd`, `blob`,
+  `memory`, `runtime`, `git`, `comm`, `schedule`, `brain`, `kg` and `knowledge`.
+  Invalid values still receive the existing validation result without echoing a
+  credential-shaped value.
+- `knowledge.suggest` and `knowledge.compose` now share the same query admission
+  counting rules.
+- `khive-fs::read_link_at_bounded` returns complete symlink target bytes within a
+  caller-supplied cap, or an explicit too-large result. `khive-pack-exec` uses this
+  shared bounded read when capturing symlink targets.
+
+### Performance
+
+- `khive-fold`: the diversity selector keeps one indexed queue per category (#5856).
+  `selector/diversity_scale` grows 7.1x from 1,000 to 5,000 candidates (scaling exponent
+  1.22, previously 2.07), with output identical to the previous selection loop.
+- `khive-db`: edge inserts and updates are faster (#5962). Against the same tree with the
+  change reverted, `edge_mutation/bulk_insert_100` takes 0.20x the time, `bulk_insert_1000`
+  0.28x, `update_weight_metadata` 0.43x and `update_endpoint` 0.44x, and the dormant
+  edge-governance triggers no longer add a measurable cost to inserts and updates (#5922).
+  Interleaved A/B, 8 rounds per arm, x86-64 Linux.
 
 ### Fixed
 
@@ -53,20 +177,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering and pagination, as `get`, `search`, `list`, `neighbors` and `context` already
   did, so another actor's message copies and quarantine records can no longer be read
   through a query. An edge whose endpoint is a hidden message is dropped.
+- Idle ANN checkpoint tasks now release their runtime and storage handles when the final
+  ANN owner is dropped, without waiting for the checkpoint interval.
+- Updates rustls-webpki and webpki-roots to patched releases addressing RUSTSEC-2026-0381
+  and RUSTSEC-2026-0382.
+- Knowledge search recovers eligible rows from the namespace index before checking FTS
+  membership when the bounded global FTS window contains foreign or ineligible rows.
+- `brain.resolve` now returns a successful absence result when a loaded consumer has no
+  eligible profile, without adding an error audit row.
+- Ordinary runtime builds no longer retain per-generation audit history that is only read by
+  instrumentation; cumulative counters and health metrics remain available.
+- Non-Unix builds no longer compile Unix-only event forwarder and server exports.
+- `RankWithinCap` text search keeps every exact filter when a candidate id occurs in more than one
+  namespace.
+- `kg.restore` refuses tool registry records, preserving the registry's retired
+  entries from restoration through the KG update path.
+- Coordinated `link` requests validate the ordinary link parameters after admission
+  and before the coordinated write. Invalid weights, resurrection types and unknown
+  arguments receive the same refusal as a direct link request.
+- Vamana medoid selection now averages the sampled rows, so ordered inputs do not
+  bias the graph's starting point toward early rows.
+- Event lookup by identifier now searches across namespaces while preserving the
+  caller's visibility rules.
+- Entity `create` refuses the note-only `content` field and directs callers to use
+  `description`; note content remains accepted.
+- Cached single-statement writes reject transaction-control SQL before choosing a
+  writer route. Use `atomic_unit` for statements that must run in one transaction.
+- Updates `ctutils` to 0.4.4 to address RUSTSEC-2026-0385.
+- Updates `tokio` to 1.53.3 to address RUSTSEC-2026-0386.
+
+### Removed
+
+- `khive_storage::graph::CommitAnnotationCursorValue`,
+  `khive_storage::graph::CommitAnnotationGuard`, and
+  `khive_storage::graph::CommitAnnotationInsertOutcome`.
+- `khive_storage::GraphStore::insert_commit_annotation_if_absent` and
+  `khive_runtime::KhiveRuntime::link_commit_annotation_if_absent`.
+  Git reconciliation uses pack-owned predicates and the existing generic
+  create-only graph insertion instead.
+- `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
+  `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
 
 ### Breaking (Rust crates)
 
 - `khive_runtime::DocumentEmbeddingOutcome` adds `provider_token_count`; direct
   struct literals must set it. `EmbeddingTruncationReport` adds `discarded_tokens`
   and `token_reporting_unavailable`; literals must set them or use `Default`.
-- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
-  `writer_admission_unavailable_reason`. Direct struct literals must set them.
+- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission`,
+  `writer_admission_unavailable_reason`, `audit_success_rows_omitted`,
+  `audit_success_rows_sampled_out` and `audit_success_rows_forced`.
+  `khive_db::diagnostics::RuntimeAuditBatchMetrics` adds the same three
+  `audit_success_rows_*` fields. Direct struct literals must set them.
 - `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
 - `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
   `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
   takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
   `WriterGuard::transaction`, which admit the write before it runs and settle the
   connection before the guard is released.
+- `khive_db::ConnectionPool::open_standalone_writer` is removed. Use the consuming
+  `standalone_autocommit` or `standalone_transaction` operations, or the restricted
+  `open_standalone_checkpoint` handle.
+- `khive_changeset::Op` adds `Restore`, and `khive_changeset::InvertError` adds
+  `InverseRestore`, which also moves the implicit discriminant of `InverseUpdate`.
+  Exhaustive matches on either enum must handle the new variant.
+- `khive_runtime::KhiveConfig` adds `embed`, the `[embed]` table that carries the
+  reindex batch size. Direct struct literals must set it or use `Default`.
+- `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation`. Exhaustive
+  matches must handle it.
+- `khive_runtime::ConfigError` adds `BlobS3FeatureDisabled`, returned when S3 blob
+  storage is configured in a build without `blob-s3`. Exhaustive matches must handle it.
+- `kkernel::kg::ImportArgs` adds `on_conflict`, `force`, `dry_run` and
+  `continue_on_error`. Direct struct literals must set them.
+- `khive_types::EventKind` adds `GrantChange`; downstream exhaustive matches must handle it.
+- `kkernel` and `khive-mcp` no longer enable `pack-agent`, `pack-telemetry` or `pack-web`
+  by default, nor the optional pack dependencies behind them. Crates that depend on
+  `kkernel` or `khive-mcp` and use those packs must enable the features.
+
+### Upgrade note
+
+- Change sets now use schema version 2. Change sets stored at schema version 1 no longer decode,
+  so a canonical proposal stored before this release must be proposed again.
+- `cargo install kkernel` now builds without the agent, telemetry and web packs, S3 blob
+  storage and the JSON, CSV and BibTeX KG import formats. To keep them, install with
+  `--features pack-agent,pack-telemetry,pack-web,blob-s3,kg-adapters`.
+- This release adds database migrations V58 to V62: the proposal archive, the legacy
+  quarantine index, the stream truncation floor, the edge-governance tables and the
+  authority store.
+
+### Known issues
+
+- Edge deletes and product merges still carry the dormant edge-governance trigger cost,
+  about 13 to 15 percent on `edge_mutation/delete_hard` and `delete_soft` and 11 to 12
+  percent on the 8-edge product merges (#6118).
 
 ## [0.14.0] - 2026-10-18
 

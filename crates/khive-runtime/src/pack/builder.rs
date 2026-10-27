@@ -16,11 +16,15 @@ use crate::error::{
 use crate::KhiveRuntime;
 
 use super::{
-    DispatchHook, EdgeEndpointRule, EntityTypeDef, HandlerDef, PackByIdResolver, PackRuntime,
-    VerbCategory, VerbRegistry, Visibility, RESERVED_ENVELOPE_ARGS,
+    AuditSuccessRowsMode, DispatchHook, EdgeEndpointRule, EntityTypeDef, HandlerDef,
+    PackByIdResolver, PackRuntime, VerbCategory, VerbRegistry, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 #[cfg(doc)]
 use super::{PackFactory, PackRegistry};
+
+#[cfg(any(test, feature = "test-internals"))]
+type RuntimeEventStoreTestWrapper =
+    Arc<dyn Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync>;
 
 /// Builder for constructing a `VerbRegistry`.
 ///
@@ -59,12 +63,13 @@ pub struct VerbRegistryBuilder {
     /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
-    /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
-    /// registry does not depend on the full `KhiveRuntime` surface — only the
-    /// audit-persistence capability is needed here.
+    /// `tracing::info!` emission. Persistence is separate from the optional
+    /// runtime binding retained for config-lock ownership.
     event_store: Option<Arc<dyn EventStore>>,
-    /// Defers the runtime sink's namespace-scoped read binding until build.
+    /// Retains runtime ownership and resolves its final namespace sink at build.
     runtime_event_store: Option<KhiveRuntime>,
+    #[cfg(any(test, feature = "test-internals"))]
+    test_runtime_event_store_wrapper: Option<RuntimeEventStoreTestWrapper>,
     /// The configured audit backend is intentionally read-only, so dispatch
     /// omits the known-failing append and the transport surfaces an advisory.
     audit_store_read_only: bool,
@@ -78,6 +83,7 @@ pub struct VerbRegistryBuilder {
     /// constructs the batch seam from `event_store`. `None` uses
     /// `AuditBatchConfig::default()`.
     audit_batch_config: Option<crate::audit_batch::AuditBatchConfig>,
+    audit_success_rows_mode: Option<AuditSuccessRowsMode>,
 }
 
 impl VerbRegistryBuilder {
@@ -96,9 +102,12 @@ impl VerbRegistryBuilder {
             actor_id: None,
             event_store: None,
             runtime_event_store: None,
+            #[cfg(any(test, feature = "test-internals"))]
+            test_runtime_event_store_wrapper: None,
             audit_store_read_only: false,
             dispatch_hook: None,
             audit_batch_config: None,
+            audit_success_rows_mode: None,
         }
     }
 
@@ -269,6 +278,20 @@ impl VerbRegistryBuilder {
         Ok(self)
     }
 
+    /// Decorate the runtime-resolved audit sink for test fixtures.
+    ///
+    /// The runtime binding and namespace resolution are retained. Explicit,
+    /// read-only, metadata and unbound sinks do not invoke this wrapper.
+    #[cfg(any(test, feature = "test-internals"))]
+    #[doc(hidden)]
+    pub fn with_runtime_event_store_test_wrapper<F>(&mut self, wrapper: F) -> &mut Self
+    where
+        F: Fn(Arc<dyn EventStore>) -> Arc<dyn EventStore> + Send + Sync + 'static,
+    {
+        self.test_runtime_event_store_wrapper = Some(Arc::new(wrapper));
+        self
+    }
+
     /// Override the ADR-133 audit-batch seam's tunables, applied when
     /// `build()` lazily constructs the batch from `event_store`.
     /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
@@ -280,6 +303,12 @@ impl VerbRegistryBuilder {
         config: crate::audit_batch::AuditBatchConfig,
     ) -> &mut Self {
         self.audit_batch_config = Some(config);
+        self
+    }
+
+    /// Override `KHIVE_AUDIT_SUCCESS_ROWS` for this registry (ADR-103 Amendment 7).
+    pub fn with_audit_success_rows_mode(&mut self, mode: AuditSuccessRowsMode) -> &mut Self {
+        self.audit_success_rows_mode = Some(mode);
         self
     }
 
@@ -458,6 +487,7 @@ impl VerbRegistryBuilder {
         validate_unique_entity_types(&ordered_packs)?;
         validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        super::declaration_validation::validate_declarations(&ordered_packs)?;
         let mut disabled_verbs = HashSet::new();
         let mut policies: Vec<_> = self.disabled_verbs.iter().collect();
         policies.sort_by_key(|(pack, _)| *pack);
@@ -515,6 +545,36 @@ impl VerbRegistryBuilder {
             }
         }
 
+        let mut audit_success_row_omitted_verbs = HashSet::new();
+        let mut audit_success_row_sampled_verbs = HashMap::new();
+        let mut success_row_owners = HashSet::new();
+        for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
+            for handler in pack.handlers() {
+                // An earlier untrusted subhandler still owns dispatch; a later
+                // trusted declaration must not lend that handler its privileges.
+                if !success_row_owners.insert(handler.name) {
+                    continue;
+                }
+                if trusted
+                    && VerbRegistry::AUDIT_SUCCESS_ROW_OMITTED_VERBS
+                        .contains(&(pack.name(), handler.name))
+                {
+                    audit_success_row_omitted_verbs.insert(handler.name);
+                }
+                if let Some(&(_, _, every, forcing)) = VerbRegistry::AUDIT_SUCCESS_ROW_SAMPLED_VERBS
+                    .iter()
+                    .find(|&&(owner, verb, _, _)| owner == pack.name() && verb == handler.name)
+                {
+                    if trusted {
+                        audit_success_row_sampled_verbs.insert(handler.name, (every, forcing));
+                    }
+                }
+            }
+        }
+        let audit_success_rows_mode = self
+            .audit_success_rows_mode
+            .unwrap_or_else(AuditSuccessRowsMode::from_env);
+
         // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
         // once here, from the trust bit the composition root recorded at
         // registration time (never from `pack.name()`'s self-report) plus
@@ -570,9 +630,19 @@ impl VerbRegistryBuilder {
         // dispatch that produced it still reports success, and nothing here
         // distinguishes that from a healthy registry. Reject it now, with an
         // actionable message, instead of at the first audited dispatch.
-        let event_store = match self.runtime_event_store {
+        let config_lock_runtime = self.runtime_event_store;
+        let event_store = match &config_lock_runtime {
             Some(runtime) => Some(runtime.raw_events_for_namespace(&self.default_namespace)?),
             None => self.event_store,
+        };
+        #[cfg(any(test, feature = "test-internals"))]
+        let event_store = match (
+            &config_lock_runtime,
+            &self.test_runtime_event_store_wrapper,
+            event_store,
+        ) {
+            (Some(_), Some(wrapper), Some(store)) => Some(wrapper(store)),
+            (_, _, store) => store,
         };
         if let Some(store) = &event_store {
             if !store.supports_idempotent_audit_batch() {
@@ -619,12 +689,16 @@ impl VerbRegistryBuilder {
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
             event_store,
+            config_lock_runtime,
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             disabled_verbs: Arc::new(disabled_verbs),
             handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
+            audit_success_rows_mode,
+            audit_success_row_omitted_verbs: Arc::new(audit_success_row_omitted_verbs),
+            audit_success_row_sampled_verbs: Arc::new(audit_success_row_sampled_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,

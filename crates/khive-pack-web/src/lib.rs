@@ -18,6 +18,8 @@ pub mod producer;
 mod receipt;
 mod refresh;
 mod search;
+#[cfg(test)]
+mod test_support;
 mod vocab;
 
 pub use pack::WebPack;

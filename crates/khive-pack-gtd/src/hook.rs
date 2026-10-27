@@ -108,7 +108,8 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
         }
         Some(other) => {
             return Err(RuntimeError::InvalidInput(format!(
-                "task update field `name` must be a string; got {other}"
+                "task update field `name` must be a string; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
             )));
         }
     };
@@ -120,13 +121,15 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
             Some(Value::String(description)) => Some(Some(description.clone())),
             Some(other) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "properties.description must be a string or null; got {other}"
+                    "properties.description must be a string or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         },
         Some(other) => {
             return Err(RuntimeError::InvalidInput(format!(
-                "properties on a `task` note must be patched with an object; got {other}"
+                "properties on a `task` note must be patched with an object; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
             )))
         }
     };
@@ -274,7 +277,10 @@ fn normalize_due_update(
     let due = due
         .as_str()
         .ok_or_else(|| {
-            RuntimeError::InvalidInput(format!("due must be an ISO-8601 string or null; got {due}"))
+            RuntimeError::InvalidInput(format!(
+                "due must be an ISO-8601 string or null; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &due.to_string())
+            ))
         })?
         .to_string();
     let zone = resolve_due_zone(runtime, note, properties)?;
@@ -323,13 +329,15 @@ fn normalize_priority_update(args: &mut Value) -> Result<(), RuntimeError> {
     } else {
         let named = priority.as_str().ok_or_else(|| {
             RuntimeError::InvalidInput(format!(
-                "priority must be one of p0, p1, p2, p3, or null; got {priority}"
+                "priority must be one of p0, p1, p2, p3, or null; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &priority.to_string())
             ))
         })?;
         let canonical = named.to_ascii_lowercase();
         if !is_valid_priority(&canonical) {
             return Err(RuntimeError::InvalidInput(format!(
-                "invalid priority {named:?} — valid: p0, p1, p2, p3"
+                "invalid priority {:?} — valid: p0, p1, p2, p3",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, named)
             )));
         }
         Some(canonical)

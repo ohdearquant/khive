@@ -87,6 +87,12 @@ impl WriterContentionDiagnostics {
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
+            audit_success_rows_omitted: runtime_audit_batch_metrics
+                .map(|m| m.audit_success_rows_omitted.into_iter().collect()),
+            audit_success_rows_sampled_out: runtime_audit_batch_metrics
+                .map(|m| m.audit_success_rows_sampled_out.into_iter().collect()),
+            audit_success_rows_forced: runtime_audit_batch_metrics
+                .map(|m| m.audit_success_rows_forced.into_iter().collect()),
         }
     }
 }

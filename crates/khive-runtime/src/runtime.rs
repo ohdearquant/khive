@@ -345,9 +345,17 @@ pub struct KhiveRuntime {
     /// main-bound runtime handle without constructing a new connection.
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
+    /// Observations belonging to this runtime construction and its clones.
+    config_lock_ledger: Arc<crate::config_ledger::ConfigLockLedger>,
+    /// A core ledger belongs to this runtime's exact backend-Arc binding.
+    /// Clones and old core handles retain the binding they already hold.
+    core_config_lock_ledger: Option<(
+        Arc<StorageBackend>,
+        Arc<crate::config_ledger::ConfigLockLedger>,
+    )>,
     config: RuntimeConfig,
     pub(crate) code_map_registry: Arc<crate::CodeMapRegistry>,
-    outbound_email_policy: crate::OutboundEmailPolicy,
+    outbound_email_policy: std::sync::Arc<crate::OutboundEmailPolicy>,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
@@ -462,6 +470,33 @@ pub struct KhiveRuntime {
 }
 
 impl KhiveRuntime {
+    /// Observe a resolved config value once for this runtime construction.
+    ///
+    /// The lazy value runs outside the ledger mutex. A name already recorded
+    /// does not evaluate its lazy value. Concurrent first observers of one name
+    /// may each evaluate their closure, so value closures must have no side effects.
+    /// Only the first to insert the name after evaluation queues an observation.
+    pub fn record_config_locked<F>(&self, key: &'static str, value: F)
+    where
+        F: FnOnce() -> String,
+    {
+        self.config_lock_ledger.record_config_locked(key, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_config_lock_test_hook(
+        &self,
+        point: crate::config_ledger::TestRecordPoint,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.config_lock_ledger.install_test_hook(point, hook);
+    }
+
+    /// Take this runtime's pending observations for its bound audit registry.
+    pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
+        self.config_lock_ledger.drain_config_locked()
+    }
+
     /// Return the code maps accepted from the configuration used to construct this runtime.
     pub fn code_map_registry(&self) -> &crate::CodeMapRegistry {
         self.code_map_registry.as_ref()
@@ -741,6 +776,8 @@ impl KhiveRuntime {
             named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
             core_named_vector_stores: None,
             core_backend: None,
+            config_lock_ledger: Arc::new(crate::config_ledger::ConfigLockLedger::default()),
+            core_config_lock_ledger: None,
             config,
             code_map_registry,
             outbound_email_policy: Default::default(),
@@ -783,6 +820,16 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if !self
+            .core_config_lock_ledger
+            .as_ref()
+            .is_some_and(|(bound, _)| Arc::ptr_eq(bound, &core))
+        {
+            self.core_config_lock_ledger = Some((
+                core.clone(),
+                Arc::new(crate::config_ledger::ConfigLockLedger::default()),
+            ));
+        }
         if self.visibility_cutover.is_bound_to(&core) {
             self.core_visibility_cutover = self.visibility_cutover.clone();
         } else if !self.core_visibility_cutover.is_bound_to(&core) {
@@ -914,6 +961,13 @@ impl KhiveRuntime {
                         .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
                     core_named_vector_stores: None,
                     core_backend: None,
+                    config_lock_ledger: self
+                        .core_config_lock_ledger
+                        .as_ref()
+                        .filter(|(bound, _)| Arc::ptr_eq(bound, main_arc))
+                        .map(|(_, ledger)| ledger.clone())
+                        .expect("core backend binding must retain its config-lock ledger"),
+                    core_config_lock_ledger: None,
                     config: core_config,
                     code_map_registry: self.code_map_registry.clone(),
                     outbound_email_policy: self.outbound_email_policy.clone(),

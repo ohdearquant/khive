@@ -6,7 +6,8 @@
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
 - **Amendments**: Amendment 1 (proposed 2026-10-14), Amendment 2 (proposed 2026-10-16), Amendment 3 (proposed
-  2026-10-16), Amendment 4 (proposed 2026-10-17) and Amendment 5 (proposed 2026-10-17), at the end of this record
+  2026-10-16), Amendment 4 (proposed 2026-10-17), Amendment 5 (proposed 2026-10-17) and Amendment 6 (proposed
+  2026-10-23) and Amendment 7 (proposed 2026-10-26), at the end of this record
 
 ## Context
 
@@ -348,7 +349,7 @@ Real request, outbox and ingest paths, with a mock transport and recorded raw me
 
 ## Amendment 1 (2026-10-14) -- Withheld originals are read through comm, and external routing is narrowed
 
-**Status**: Proposed 2026-10-14.
+**Status**: Accepted 2026-10-15. It does not change the status of the base ADR.
 
 **Trigger.** §8.3 keeps a withheld message's original bytes "for an explicit operator read" and names neither the
 read nor its callers. The first implementation keeps the original as a blob, records its content reference in the
@@ -640,3 +641,130 @@ These are required host witnesses, not results obtained by writing this draft. E
 | A36 session-scoped inbound evidence                    | A matching authenticated message first received after a committed occurrence and beyond the active session's provider boundary can authorize undo when current remote absence and every other gate hold; the committed success audit carries that evidence-session identity. Prove a positive ordinary message arriving between polls despite routine transport reconnect, with provider identity and capture continuity preserved. Pre-apply receipt with delayed ingest, receipt while apply is unsettled, same-session duplicates and reauthentication cannot advance the observation or upgrade ineligible evidence. Losing an individual capture refuses instead of recapturing. Restart with the same secret refuses old-session bindings and crash-window mail already present at the new boundary, while leaving messages readable; a genuinely new post-boundary receipt succeeds after committed state is published and all gates hold. Provider-incarnation change or capture-continuity loss starts a new session and boundary; lack of a provable boundary leaves ingestion available but mirrored undo evidence unavailable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Accept an old-session binding, stamp an extant or replayed envelope as new, use the ingestion checkpoint without proving an extant-mail boundary, recapture a lost observation, rebuild the boundary on every routine poll and reject ordinary between-polls mail, permanently refuse all evidence, omit the success-audit session identity, or treat sender-controlled headers as proof of newness.                             |
 
 Acceptance evidence includes exact source head, commands and features, pre-fix failure where applicable, post-fix results, independently applied mutation results, HTTP request and SMTP call counts, store/audit snapshots across restart, evidence-session/provider-boundary observations, positive and negative undo outcomes, and either graceful settlement/join or ADR-119 Amendment 7 witnesses of exit status 75, the exit record carrying `unsettled=` read from outside the process after it is gone, and restart refusing to act until reconciliation. Structural or source inspection alone does not close these issues.
+
+## Amendment 6 (2026-10-23) -- Quarantine records are readable only by the maintainer
+
+**Status**: Accepted 2026-10-23. It does not change the Accepted status of the base ADR or the status of Amendments 1 to 5.
+
+**Addresses**: [#5424](https://github.com/ohdearquant/khive/issues/5424).
+
+**Trigger.** Amendment 1 Decision 6 addresses a quarantine record to the maintainer at ingest and relies on the mailbox
+recipient check to keep it out of every other actor's mailbox reads. That covers only records ingested once Decision 6
+is deployed. A record stored earlier keeps the landing actor it was written with: a replay is acknowledged before a
+recipient is chosen, the duplicate retention repair sets only `channel_slug` and `quarantine_content_ref`, and no
+migration re-addresses message notes. A record ingested while the runtime had no configured actor keeps its landing
+actor too. That actor still finds these records, and their `quarantine_content_ref`, through inbox, thread, read, get
+and search. One read path is also outside the recipient check Decision 6 names: `comm.read` decides its own addressee
+(`caller_is_addressee` in `khive-pack-comm/src/handlers/read_marking.rs`) and, with `body=true`, returns the message
+fields.
+
+**Decision.**
+
+1. **Which records.** A quarantine record is a message note whose `quarantined` property is the JSON boolean `true` or
+   the string `"true"`. This is the predicate the legacy quarantine index
+   (`khive-db/sql/059-comm-legacy-quarantine-index.sql`) and the boot repair (`khive-mcp/src/legacy_quarantine.rs`)
+   already use; a number, `1` included, is not `true`. The rule keys on this property alone, not on direction, sender
+   or recipient.
+2. **Who reads them.** When the runtime has a configured actor, the maintainer (a non-empty
+   `runtime.config().actor_id`, the value ingest addresses quarantine records to and `comm.suppression_remove` checks),
+   every mailbox read admits a quarantine record only into a view whose mailbox actor is the maintainer, whatever the
+   record's stored `to_actor`. Every other view omits it: the landing actor it was stored for, any other named actor,
+   and the legacy local view. Each read answers for an omitted record as it answers today for a message outside the
+   caller's mailbox, so the answer does not say that the record is a quarantine record.
+3. **Delegated views.** A view authorized through `mailbox_readers` reads its owner's mailbox, so a delegated view of
+   the maintainer's mailbox includes quarantine records, as it includes the maintainer's other mail. A delegated view
+   of any other actor's mailbox does not.
+4. **One rule in every form.** The rule is part of the mailbox partition and is applied in each form the partition
+   takes, so that the forms cannot disagree:
+   - the row check, `permits_message_note` in `khive-runtime/src/mailbox_view.rs`, used by `comm.inbox`,
+     `comm.thread`, `comm.probe` and the generic `list`, `search`, `get`, `context`, `neighbors` and `query` reads, and
+     through `scope_permits_message_note` for cursor and key anchors;
+   - the store-side scope, `NoteMailboxScope`, compiled in `khive-db/src/stores/note.rs` and
+     `khive-query/src/compilers/mailbox.rs`, so that a scan window never holds a row the view hides;
+   - the `comm.read` addressee check and its recheck filter in `read_marking.rs`.
+
+   `NoteMailboxScope` carries the maintainer beside the view's actor, read from the runtime configuration when the view
+   is authorized.
+5. **No configured actor.** A runtime with no configured actor has no maintainer and keeps today's behaviour: a
+   quarantine record is visible to its stored `to_actor`. Once an actor is configured, the rule covers every record
+   already stored, with no migration.
+6. **Stored data unchanged.** No record is re-addressed or rewritten. Amendment 1 Decision 6 stays as written: ingest
+   still addresses new quarantine records to the maintainer, and a replay still does not re-address a stored one. This
+   amendment makes Decision 6's statement about mailbox reads hold for the records Decision 6 does not reach.
+
+**Unchanged.** Quarantine records keep `quarantine_content_ref`, their operator recovery path and their retention.
+`comm.withheld_body` already refuses a quarantined message (A16). The screening rules, outcomes and labels of §8.3 and
+§8.4 are unchanged. A content reference a landing actor read before this change is not revoked: `blob.get` reads any
+object whose reference the caller holds, and this amendment does not change that read.
+
+**Alternatives considered.**
+
+- **A one-time migration that re-addresses every quarantine record to the configured actor** (the issue's first
+  option). It needs the actor at migration time, leaves a store upgraded with no configured actor as it is, and leaves
+  the records with the wrong actor again if the configured actor later changes. It also rewrites stored rows, which a
+  read rule does not need.
+- **The migration and the read rule together.** Once the read rule holds, the migration changes no read result; it adds
+  a data rewrite and a second place that has to stay correct.
+- **Filtering quarantine records in `comm.inbox` and `comm.thread` only.** Leaves `get`, `search`, `query` and
+  `comm.read` answering the landing actor, which is the defect.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                    | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A37 stored record       | A store holds a quarantine record written before this change and addressed to a landing actor, and the runtime's configured actor is the maintainer. The landing actor finds the record through none of `comm.inbox`, `comm.thread`, `comm.read` (with and without `body`), `get`, `search`, `list`, `query`, `context` and `neighbors`, and each answers as for a message outside its mailbox; the maintainer finds it through each. The same holds for a record written while the runtime had no configured actor, once one is configured. Both spellings of `quarantined` are covered, and a record whose `quarantined` is the number `1` stays visible to its `to_actor`. |
+| A38 partition parity    | Over the A37 fixtures and the existing mailbox fixtures, the row check and the store-side scope admit the same rows, and a cursor or key anchor on a hidden quarantine record is refused as for any hidden row. A delegated view of the maintainer's mailbox includes the records; a delegated view of the landing actor's mailbox does not.                                                                                                                                                                                                                                                                                                                                  |
+| A39 no configured actor | With no configured actor, every read in A37 returns the record to its stored `to_actor`, as before this change.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+Negative controls: removing the rule from any one form (the row check, the store-side scope, `comm.read`) turns A37 or
+A38 red for that form, and matching the string `"true"` only turns the boolean fixture red. The change that implements
+this reports `comm/inbox` in `khive-pack-comm/benches/comm_bench.rs` before and after, because the store-side scope adds
+a predicate to every mailbox scan.
+
+## Amendment 7 (2026-10-26) -- A separate footer for list mail
+
+**Status**: Proposed 2026-10-26. It does not change the Accepted status of the base ADR or the status of Amendments 1 to 6.
+
+**Addresses**: [#6174](https://github.com/ohdearquant/khive/issues/6174).
+
+**Trigger.** Section 5.3 supplies one operator footer for every external send. An operator sending
+outreach and list mail from one mailbox cannot give each kind of message its own footer.
+
+**Decision.**
+
+1. **List footer configuration.** `KHIVE_EMAIL_LIST_FOOTER_FILE` names a separate UTF-8 footer file.
+   It must contain `{unsubscribe}`, with the same substitution and sender-identification obligations
+   as the external footer. Read and cache it at startup under the existing external-sender condition.
+2. **Selection.** An external message selects this list footer only when its tags contain the exact
+   string `traffic:list`. Admission uses the submitted tags; delivery selects from the outbound row's
+   stored tags. Similar spellings and non-string stored tag values do not select the list footer.
+3. **Admission.** Admission requires the selected footer to be available. For `traffic:list` sends,
+   this replaces section 5.3's rule that external admission refuses while the footer is unset,
+   unreadable or missing the placeholder: a valid list footer admits the send even when the default
+   external footer is unavailable. An unavailable list footer refuses admission; it never falls back
+   to the default footer.
+4. **Delivery.** An unavailable selected list footer causes permanent delivery failure before SMTP.
+   There is no fallback to the default footer. A valid selected list footer renders even when the
+   default footer is unavailable; its unsubscribe placeholder uses the existing verified instruction.
+5. **Other mail.** Untagged external messages retain the default footer and its existing requirements.
+   Policy-recipient mail retains its existing behavior, including when tagged `traffic:list`.
+
+**Acceptance.**
+
+- Runtime configuration: `external_constructors_record_a_named_missing_list_footer`,
+  `list_footer_selection_never_falls_back_or_requires_the_default_footer` and
+  `list_footer_file_validation_is_named_and_cached` cover missing and invalid list footers,
+  independent default/list availability, startup caching and placeholder validation.
+- Admission: `external_list_admission_requires_its_own_available_footer` and
+  `external_list_admission_uses_the_list_footer_without_requiring_the_default` cover refusal and a
+  valid selected list footer while the default is unavailable.
+- Delivery: `external_list_email_renders_stored_list_footer` and
+  `external_list_email_renders_when_default_footer_is_unavailable` cover the rendered list footer
+  and verified unsubscribe substitution, including when the default footer is unavailable.
+  `external_list_email_missing_footer_after_admission_fails_before_smtp` requires permanent failure
+  with zero SMTP calls. `external_email_requires_an_exact_stored_list_tag` checks exact selection;
+  `policy_recipient_list_tag_carries_no_external_footer` checks policy-recipient behavior. The
+  existing `external_email_carries_list_unsubscribe_header_and_footer` retains untagged behavior.
+- Control: ignore the list selector at delivery. After successful delivery, capture and unsubscribe
+  verification, `external_list_email_renders_stored_list_footer` must fail its exact rendered-body
+  assertion. A compile failure, zero-test run, timeout or earlier failure does not satisfy this control.

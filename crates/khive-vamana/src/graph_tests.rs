@@ -192,7 +192,9 @@ fn build_creates_bounded_degree_graph() {
     let mut rng = StdRng::seed_from_u64(42);
     let n = 50usize;
     let dim = 8usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -211,7 +213,9 @@ fn build_is_deterministic_for_same_input() {
     let mut rng = StdRng::seed_from_u64(77);
     let n = 30usize;
     let dim = 4usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -234,13 +238,17 @@ fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
     // connected* graph the first pass produced and finds different pruning
     // candidates. This test pins that divergence down directly so the skip
     // is not silently reintroduced.
-    // n=250 is the smallest size (of 150/200/250/300/384 probed at this dim,
-    // max_degree, and search_list_size) at which the two builds diverge;
-    // below it the first pass already converges to a fixed point.
+    // n=300 is the smallest size (of 150/200/250/300/350/384/400/450/500/600
+    // probed at this dim, max_degree, and search_list_size, with this seed's
+    // rand 0.10 stream) at which the two builds diverge, with and without
+    // default features; below it the first pass already converges to a fixed
+    // point.
     let dim = 384usize;
-    let n = 250usize;
+    let n = 300usize;
     let mut rng = StdRng::seed_from_u64(1000);
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -264,12 +272,14 @@ fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
 fn build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale() {
     // SQ8 counterpart of build_alpha_one_two_passes_are_not_idempotent_at_scale:
     // build_sq8 runs the same two-pass alpha schedule as build, so it needs the
-    // same regression guard against a reintroduced alpha==1.0 skip. Same n=250
+    // same regression guard against a reintroduced alpha==1.0 skip. Same n=300
     // divergence point established there.
     let dim = 384usize;
-    let n = 250usize;
+    let n = 300usize;
     let mut rng = StdRng::seed_from_u64(1000);
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let codec = GsSq8Codec::train_flat(&raw, dim);
@@ -331,7 +341,9 @@ fn build_reverse_adj_consistent_with_forward_adjacency() {
     let mut rng = StdRng::seed_from_u64(0x00AD_C052);
     let n = 60usize;
     let dim = 4usize;
-    let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
 
     let cfg = VamanaConfig::with_dimensions(dim)
         .with_max_degree(8)

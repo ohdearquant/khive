@@ -10,13 +10,13 @@ use crate::error::RuntimeError;
 use crate::runtime::NamespaceToken;
 
 use super::{
-    DispatchHook, EdgeEndpointRule, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime,
-    SPECIAL_RELATIONS,
+    AuditSuccessRowForcingRule, AuditSuccessRowsMode, DispatchHook, EdgeEndpointRule, EndpointKind,
+    HandlerDef, PackByIdResolver, PackRuntime, SPECIAL_RELATIONS,
 };
 
 /// Immutable registry that dispatches verb calls to registered packs.
 ///
-/// Clone is cheap (Arc-wrapped). Constructed via `VerbRegistryBuilder`.
+/// Clone shares pack state and retains its runtime audit binding. Built by `VerbRegistryBuilder`.
 #[derive(Clone)]
 pub struct VerbRegistry {
     pub(super) packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
@@ -44,6 +44,9 @@ pub struct VerbRegistry {
     pub(super) actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     pub(super) event_store: Option<Arc<dyn EventStore>>,
+    /// Actual runtime clone whose ledger belongs to the configured audit sink.
+    /// Explicit, read-only and absent sinks retain no runtime binding.
+    pub(super) config_lock_runtime: Option<crate::KhiveRuntime>,
     /// Distinguishes ordinary tracing-only construction from a sink omitted
     /// deliberately because its configured backend is read-only.
     pub(super) audit_store_read_only: bool,
@@ -64,6 +67,10 @@ pub struct VerbRegistry {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
     /// [`VerbRegistry::admission_degrade_safe`].
     pub(super) degrade_safe_verbs: Arc<HashSet<&'static str>>,
+    pub(super) audit_success_rows_mode: AuditSuccessRowsMode,
+    pub(super) audit_success_row_omitted_verbs: Arc<HashSet<&'static str>>,
+    pub(super) audit_success_row_sampled_verbs:
+        Arc<HashMap<&'static str, (u64, AuditSuccessRowForcingRule)>>,
     /// Trusted canonical public handlers classified Read by the shared effects table.
     pub(super) read_replay_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,

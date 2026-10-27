@@ -82,7 +82,7 @@ enum Command {
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
-    /// Schema migration lifecycle: migrate and check.
+    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune.
     #[command(subcommand)]
     Db(DbCommand),
 
@@ -293,6 +293,9 @@ enum DbCommand {
 
     /// Report per-backend schema state without applying changes.
     Check(DbCheckArgs),
+
+    /// Prune expendable polling-dispatch audit rows from an events store (ADR-212 §4). Dry run unless --apply.
+    EventsPrune(crate::events_prune::EventsPruneArgs),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -908,6 +911,7 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate(args) => cmd_db_migrate(args).await,
         DbCommand::Check(args) => cmd_db_check(args).await,
+        DbCommand::EventsPrune(args) => crate::events_prune::run(args).await,
     }
 }
 

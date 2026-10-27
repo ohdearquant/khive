@@ -417,6 +417,8 @@ const V58_UP: &str = include_str!("../sql/058-proposal-archive.sql");
 const V59_UP: &str = include_str!("../sql/059-comm-legacy-quarantine-index.sql");
 const V60_UP: &str = include_str!("../sql/060-note-stream-truncation.sql");
 const V61_UP: &str = include_str!("../sql/061-edge-governance.sql");
+const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
+const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
@@ -843,6 +845,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 61,
         name: "edge_governance",
         up: V61_UP,
+    },
+    VersionedMigration {
+        version: 62,
+        name: "authority_store",
+        up: V62_UP,
+    },
+    VersionedMigration {
+        version: 63,
+        name: "pending_entity_indexes",
+        up: V63_UP,
     },
 ];
 

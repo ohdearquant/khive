@@ -59,6 +59,7 @@ khive-rule-evaluator = 2
 khive-storage = 2
 khive-db = 3
 khive-hnsw = 3
+khive-capability = 4
 khive-retrieval = 4
 khive-runtime = 5
 khive-brain-core = 6
@@ -86,9 +87,9 @@ khive-pack-brain = 7
 khive-pack-exec = 7
 khive-pack-knowledge = 7
 khive-pack-memory = 7
-khive-pack-git = 8
-khive-mcp = 9
-kkernel = 10
+khive-pack-git = 6
+khive-mcp = 8
+kkernel = 9
 
 # Non-crate projects the workspace also ships and `code.ingest` resolves. The
 # npm distribution graph is a real DAG evaluated in isolation: the six

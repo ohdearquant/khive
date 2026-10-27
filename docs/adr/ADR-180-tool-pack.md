@@ -117,7 +117,8 @@ amendment closes the remaining gap on the decision side.
 
    Item 1's input set is amended for one property by [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (proposed):
    `network` joins the pinned inputs when the row carries the key, and a row without it keeps these
-   four inputs byte for byte.
+   four inputs byte for byte. [ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+   (proposed) adds `executable_digest` under the same rule, on rows that carry `network`.
 
 2. **`tool.check` resolves an active grant by id.** A `granted` row is active when it has not
    expired, its pinned id equals the id the name resolves to now, and its pinned digest equals the
@@ -693,3 +694,330 @@ the shared emission call, emitting before the gate, or dropping `caller_verb`
 must turn the corresponding acceptance arm red.
 
 Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.
+
+## Amendment 7 (2026-10-21): a unit checks the grant it holds, by id, on the writer it was handed
+
+**Status: Accepted 2026-10-22.** It does not change the status of the base ADR or of earlier amendments.
+
+`decide` (`crates/khive-pack-tool/src/policy.rs:872` at `98508c8f`) finds a live grant through
+`select_active_grant` (`:371`), which reads `tool_grants` on a pooled reader of its own,
+`rt.sql().reader()` (`:395`). An operation passed to `SqlAccess::atomic_unit`
+(`crates/khive-storage/src/sql.rs:236`) receives one writer and may only run synchronous statements
+on it, so neither function can run inside a unit. A caller that consumes something on the strength
+of a grant (an approval bound to that grant, a one-shot authorization) therefore checks the grant in
+one place and writes the consumption in another. A revocation (`set_grant_status`, `:655`, the
+`granted -> revoked` move that `validate_transition` allows, `:743`) can commit between the two, and
+the consumption then succeeds on a grant that is no longer live. Copying the predicate into the
+caller's unit closes the window but gives the predicate two homes. Issue #5906.
+
+1. **One home for the predicate.** The activity test and the parse of a selected row become one
+   crate-internal piece that takes `&mut dyn SqlReader`. The activity test is the one
+   `select_active_grant` applies today, term for term: the namespace, status `granted`, `expires_at`
+   null or later than `now`, `invalidated_by_registry_id` and `invalidated_at` both null, and the pin
+   clause (both pin columns null when no registration is given, otherwise `registry_id` and
+   `definition_digest` equal to the given pin). The parse is `GrantRow::from_active_row` (`:169`),
+   including its refusal of a selected row whose required columns are missing or mistyped.
+   `SqlWriter` extends `SqlReader` (`sql.rs:120`), so a unit passes the writer it was handed and
+   `select_active_grant` passes its pooled reader. The by-actor lookup keeps its statement, its
+   order (`requested_at DESC, id ASC`), its `LIMIT 1` and its label, and `decide` keeps calling it.
+
+2. **The entry a unit calls is by id.** The tool pack exports
+
+   ```rust
+   pub async fn grant_is_active_on(
+       reader: &mut dyn SqlReader,
+       ns: &str,
+       grant_id: &str,
+       actor: &str,
+       tool: &str,
+       now: i64,
+       registration: Option<&RegistryPin>,
+   ) -> Result<bool, RuntimeError>;
+   ```
+
+   It answers `true` exactly when the row with that id passes item 1's activity test and its `actor`
+   and `tool` patterns match the given actor and tool under the same pattern rule the by-actor
+   lookup uses (`pattern_match_sql`, `:282`). It answers `false` when no row has that id in `ns`, when the
+   row is not `granted`, has expired relative to the supplied `now`, was invalidated, carries a different
+   pin, or does not match the actor or tool. A row that has the id and fails the parse is an error naming
+   the row id,
+   never `false`, for the same reason `from_active_row` refuses it: a malformed grant must not be
+   read as either a live approval or the absence of one. `GrantRow` stays crate-private (`:150`);
+   the entry returns a boolean because the caller already holds the id.
+
+3. **Why by id and not by actor.** The by-actor lookup returns the newest live match. When two live
+   grants match the same actor and tool, it returns the newer one. A unit consuming on the strength
+   of the older grant would then either refuse a consumption whose own grant is still live or have to
+   compare ids and reason about which grant won. The by-id entry answers about the grant the caller
+   holds. It also requires that grant to match the actor and tool being consumed for, so a grant whose
+   stored patterns exclude the supplied actor or tool cannot be presented to authorize a consumption for that
+   actor or tool.
+
+4. **Inside a unit.** The entry issues one statement on the reader it is given and awaits nothing
+   else, so on a unit's writer it completes on the first poll, as `atomic_unit` requires. The tool
+   pack already reads on a unit's writer this way (`policy.rs:438`, `:510`, `:685`). The entry writes
+   nothing and appends no `tool_check_decided` event: Amendment 6 receipts record decisions that
+   `tool.check` and the `exec.run` preflight compute, and this entry computes no decision. The
+   caller's own write in the same unit is the record of the consumption.
+   A caller that opens a unit around this entry is a new `atomic_unit` caller and updates ADR-091's
+   write-transaction audit table, as `sql.rs` requires of one; this amendment adds no such caller.
+
+5. **The namespace term is the grant's scope.** Grants are namespace scoped (this record's header,
+   ADR-007), and `decide` in a namespace selects only that namespace's grants. The by-id entry keeps
+   the same term so that it and `decide` agree on every row; a grant decided in one namespace is not
+   live in another under either. This is not a by-id record operation in the sense of ADR-007 Rule 9:
+   the entry declares no wire parameter, resolves no record for the caller, and adds no comparison
+   after a fetch. The term sits in the statement beside the other activity terms, exactly where the
+   by-actor lookup already has it.
+
+6. **What this does not cover.** The entry answers for the registration pin it is handed, as
+   `decide` does; it does not resolve the tool's name. A registry change committed after the caller
+   computed its pin and before its unit opens is not seen by this check. Closing that window needs
+   the pin read inside the same unit, which this amendment does not specify. No wire verb changes,
+   and `tool.check`'s answers do not change. `now` is also a caller-prepared snapshot: expiry can pass between
+   that sample and the unit's admission to the writer, or between the check and the consumption or commit. The
+   entry serializes grant-state checks against other writers; it does not guarantee validity at consumption or
+   commit time. A consumer that needs a fresher deadline than the supplied `now` must establish it on its own
+   admitted writer.
+
+### Acceptance for Amendment 7
+
+1. For each row state, the by-id entry run on a unit's writer inside `atomic_unit` and `decide` give
+   the same answer, in a fixture where the grant under test is the only one matching its actor and
+   tool: granted and live (`true`, and `decide` answers `allow` from `grant` with that row id);
+   requested; denied; revoked; expired at `now`; invalidated by a registry change; re-pinned, meaning the
+   same actor and tool with a registration whose id or definition digest differs. Every state after the
+   first answers `false`, and `decide` answers from policy or default.
+2. A selected row with a missing or mistyped required column is an error naming the row id when the id is
+   readable, otherwise the existing `<unreadable id>` diagnostic, from both the by-id entry and `decide`;
+   neither reads it as no grant. Also place a named grant whose expiry is stored as text that still passes
+   the SQL expiry filter beside a valid live grant with the same `requested_at` and an earlier id under
+   `id ASC`: the by-id entry errors naming the malformed grant, while `decide` selects the valid one.
+3. With two live grants matching the same actor and tool, `decide` cites the newer one and the by-id
+   entry answers `true` for the older one. Revoke only the older grant in a committed unit while the newer
+   grant remains live: the by-id entry then answers `false` for the older id and `true` for the newer id,
+   while `decide` still cites the newer id. This separates a by-id check from an existence guard that would
+   answer `true` for the revoked older grant whenever any newer matching grant is live. Repeat the
+   two-grant fixture once for each other term the older grant can fail alone, the newer matching grant
+   staying live each time: the older grant still `granted` but expired at the supplied `now`; carrying only
+   `invalidated_by_registry_id`, then only `invalidated_at`, each written directly by the fixture; with a
+   registration given, a stored registry id that differs from it, then only a stored digest that differs; with
+   no registration given, carrying only a non-null registry id, then only a non-null digest, the newer grant's
+   pin columns null; and with its stored actor pattern, then its tool pattern, not
+   matching the supplied actor or tool. In each, the by-id entry answers `false` for the older id and `true`
+   for the newer id, and `decide` still cites the newer id. This separates a by-id check from one that
+   applies any activity or match term to a different grant than the one named. Repeat the revocation and
+   each of these term fixtures with the roles reversed, the newer grant failing the term alone and the older
+   matching grant kept live: the by-id entry answers `false` for the newer id and `true` for the older id,
+   and `decide` cites the older id. This separates a by-id check from one that borrows a term from an
+   earlier grant than the one named. Repeat the revocation and each term fixture once more with both grants
+   carrying the same `requested_at`, failing each id in turn under the `id ASC` tie order: the by-id entry
+   answers `false` for the failing id and `true` for the other, and `decide` cites the other id. A mutant
+   that correlates through `requested_at` instead of `id` (an equality cutoff, or a filter on the named
+   row's timestamp) turns this arm red, which distinct timestamps alone cannot show. With no registration
+   supplied, also repeat the equal-timestamp pair with both pin columns non-null on the named grant and both
+   null on the other, failing each id in turn: `false` for the named id, `true` for the other, and `decide`
+   cites the other. Every one of these cases states one rule: the by-id answer depends on the named row
+   alone. For each named-grant state in arms 1 to 3, the answer (`true`, `false`, or the error naming the
+   grant) with the named grant alone in its namespace equals the answer with a live matching grant beside it
+   at an earlier, the same, and a later `requested_at`, on either side of it under `id ASC`. A stored text
+   `requested_at` sorts after every integer, so no well-formed live companion can sit at the same or a
+   later `requested_at` beside it; for that state, keep the stored-row placements that exist and run the
+   full placement matrix by corrupting only the named row as the decoder receives it (through a supplied
+   reader), over well-typed stored ordering keys. These repetitions check independence for the listed
+   states; that every predicate term and every selected column is read from the named row alone remains a
+   code-review obligation, since a borrowed column that does not change the answer is invisible to them.
+4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
+   follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
+5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
+6. A grant id from another namespace answers `false`, as `decide` in the caller's namespace does not
+   select that grant.
+7. The tool pack's existing `decide` and `tool.check` tests pass unchanged.
+8. Mutation controls, each stated before it runs: dropping the expiry term, the invalidation term or
+   the pin clause from the shared predicate turns the corresponding arm of 1 red for both the by-id
+   entry and `decide`, which shows the predicate has one home. Replacing the shared parse with the
+   lenient `GrantRow::from_row` turns arm 2 red. Dropping the actor or tool match from the by-id
+   statement turns arm 4 red.
+9. On the single-writer path, the unit that runs the by-id entry completes without the single-poll
+   driver's pending refusal. The supplied reader is instrumented and each call issues exactly one query on it,
+   for a live grant, a missing id, an inactive id and a malformed selected row alike; a mutant that runs the
+   SELECT twice turns this arm red, which shows the entry keeps the one-statement contract rather than only
+   returning the right answer on the first poll. Also inject an error from the supplied reader on its first
+   query: exactly one query invocation occurs, the entry returns that error, and a mutant that retries the
+   query after a reader error turns this arm red. Inject a retryable error (`StorageError::Timeout`) and a
+   non-retryable one (`StorageError::Driver`) in turn: each is returned after exactly one invocation, and a
+   mutant that retries only when `is_retryable()` holds turns the retryable case red. Repeat the injection
+   once for every `StorageError` variant, `StorageError::Transaction` included: each is returned unchanged
+   after exactly one invocation, so a retry keyed on any single variant turns that variant's case red.
+   Exercise every reader-error handling branch the implementation has, including branches that depend on a
+   variant's payload or nested source: each preserves the original error after exactly one invocation. In
+   particular inject `StorageError::CapacityUnavailable` at both a retryable phase (`LockContended`) and a
+   non-retryable one (`Probe`), so a retry keyed on that variant's retryability turns one of the two red.
+
+Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
+
+## Amendment 8 (2026-10-27): an approval can cover one program run by an interpreter
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent implementation merges.** It amends
+[ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+item 1 for one property and adds fields to Amendment 6's decision event. It does not change the status of the base
+ADR or of earlier amendments.
+
+A tool whose registered executable is an interpreter (`source` `exec:/.../python3.12`, a shell, a JavaScript runtime)
+runs whatever program the caller's `args` name. A grant on that tool therefore approves every program the actor will
+ever run with it, and an approver asked to allow one weekly script has to approve all scripts or none. The registration
+today pins the executable's path, side effect, trust and schema (Amendment 1 item 1; `crates/khive-pack-tool/src/pin.rs`,
+`policy_inputs`); `exec.run` passes the caller's `args` after the registered path unchanged
+(`crates/khive-pack-exec/src/handlers.rs`, the launch in `execute`). Nothing an approver can see names the program.
+
+Amendment 4 item 7 names this question and leaves it open: a grant's `scope` is free text and decides nothing, and
+making it binding would change what rows already granted allow. This amendment answers it without touching grants.
+
+1. **The program is part of the registration.** `tool.register` takes an optional `program` object on a tool whose
+   `source` is `exec:`. It is versioned and closed:
+
+   - `version`: `1`.
+   - `fixed_args`: a non-empty array; each element is either a string (a literal argument) or `{path, content_ref}`,
+     a file in the run's input tree named by its path relative to the tree root and the content ref that file must have.
+   - `extra_args`: `"none"` (the caller may pass no `args`) or `"append"` (the caller's `args` follow the fixed ones).
+     Required; there is no default.
+   - `tree`: optional; an input tree id the run must equal exactly.
+
+   Unknown keys, an unknown version, a null, an empty `fixed_args`, a NUL byte, an element that is neither form, a
+   path that is absolute, empty or contains `.` or `..` components, and a value over the size limits fixed by the
+   implementation plan are refused at registration, each with its reason named. So is a program whose `extra_args`
+   is `"append"` and whose `fixed_args` hold no file element, because the caller's arguments would then name the
+   program. A program of literals only is accepted under `"none"`, where the whole command is fixed.
+
+2. **It joins the pinned inputs only on rows that carry it.** When a row has a `program` key, the whole stored object
+   joins Amendment 1's policy inputs, serialized by the one canonical function (Amendment 2,
+   `khive_types::canonical_json_bytes`). A row without the key keeps its four inputs byte for byte, so no stored grant
+   changes meaning: the absent key is never written as `null`, which would move every existing digest. A grant on a
+   row carrying `program` approves that program and nothing else, because the grant's pin is the row id and the digest
+   over those inputs (Amendment 1 items 1 and 2).
+
+3. **A revised program is a new registration.** Re-registering an existing name returns the stored row unchanged
+   (Decision, `tool.register`), so editing a script cannot update its approval in place. A revised script, constraint
+   or interpreter is registered under a new name and granted again, as ADR-181 Amendment 14 already rules for an
+   upgraded executable. `tool.register` on an existing name with a passed `program` that differs from the stored one
+   is refused, on both paths that return an existing row (the name lookup and the losing side of a concurrent claim),
+   before any capability is linked. An omitted `program` returns the stored row and never removes a restriction. No
+   update verb is added.
+
+4. **Every decision source is held to the program.** `exec.run` builds the run from the stored definition: the
+   registered executable, then `fixed_args` in order (a file element contributes its path as one argument), then the
+   caller's `args` only when `extra_args` is `"append"`. Before materializing anything it checks, on the entries it is
+   about to materialize: each file element names a regular file (mode 644 or 755, not a symbolic link, with no
+   symbolic link among its parent directories) whose content ref equals the stored one; `cwd` is the tree root; the
+   tree id equals `tree` when one is stored; and no `args` were passed under `"none"`. A failed check refuses the run
+   whatever answered the policy question. This matters because a grant that does not match falls through to policy
+   and then to the side-effect default (`decide` in `crates/khive-pack-tool/src/policy.rs`), so a program constraint
+   enforced only as "the grant stops matching" would let a policy `allow`, or the `read` default, run a mismatching
+   program. A run that passes the policy question and fails this check is a refusal, not a different grant search.
+
+5. **The interpreter's bytes are pinned too.** A row carrying `program` also carries `executable_digest`, and the run
+   executes the staged copy whose digest was compared, under ADR-181 Amendment 14's staging, deadline, size cap and
+   cleanup rules. This amends Amendment 14 item 1, which today requires `executable_digest` when `network` is passed
+   and refuses it otherwise: the key is required when `network` or `program` is passed and refused when neither is. A
+   `program` row without `network` gets no network and needs no network host setting; its refusals name the program
+   condition that failed, not a network one. Replacing the interpreter at its registered path would otherwise change
+   the meaning of every approved program without moving any pin.
+
+6. **The receipts say which definition approved the run.** Amendment 6's `tool_check_decided` event gains the registry
+   id and definition digest the decision was evaluated against, and for `exec.run` the run's receipt id (null for
+   `tool.check`). The exec receipt records, outside its `sandbox` block so that a preflight refusal carries it: the
+   canonical program object or a content ref to its exact bytes, its BLAKE3 digest, the input tree id, the caller's
+   `args`, the effective argument vector, each file element's expected and observed content ref and mode, the expected
+   and observed executable digest, and a validation state of `not_checked`, `matched`, `mismatch` or `invalid` with the
+   failed condition named. An `allow` event beside a refused receipt is a valid pair: the policy question and the run's
+   admission are separate answers, as ADR-181 Amendment 14 item 7 already states for networked rows.
+
+7. **Amendment 7 is unchanged.** Its by-id entry keeps its signature and predicate. Its pin now covers the program
+   when the row carries one, and its `true` still means only that the grant is live for that pin; it never asserts that
+   a particular run matches. A caller consuming on the strength of a grant validates the run separately.
+
+### What this does not cover
+
+An approval covers the registered executable's bytes and the fixed argument definition, and `exec.run` checks the
+declared files and, when stored, the whole input tree before launch. It does not identify every file, module,
+subprocess or download the program loads, prove that appended arguments are harmless, or make the run's files
+read-only. Each limit, with what shows it:
+
+- Other tree files are not pinned unless `tree` is stored: a module beside the script that the script imports changes
+  what runs. With `tree` stored the changed tree is refused, which says nothing about whether the approved tree was
+  benign.
+- Host libraries and configured read roots are outside the tree, as ADR-181 Amendment 14 states for executables (its
+  section on what a networked grant approves, item 8).
+- The caller's environment is not bound. Allowed environment keys can carry loader settings (for Python,
+  `PYTHONPATH`), and `HOME` is the run directory, so a tree can carry per-user startup files. An approver who wants an
+  interpreter's isolation mode puts its flag among `fixed_args` (for Python, `-I`); khive does not add flags, classify
+  interpreters or claim that any loader path is closed.
+- Materialized input files are writable, so the program can change a pinned file before it reads it again.
+- An interpreter that evaluates its input, or a networked row that fetches code (ADR-181 Amendment 13), runs code no pin
+  names.
+- `"append"` is broader than `"none"` by design, not certified safe: an appended argument can change what a pinned
+  program does. khive does not interpret an interpreter's argument grammar, so the refusal in item 1 closes only the
+  shape with no file element. A file element in an option position (for example a module the interpreter loads before
+  its program) still leaves the appended arguments free to name the program that runs after it. The approver reads
+  `fixed_args` and `extra_args` before granting.
+- The approval is reusable for the life of the grant. "Exactly one execution" needs a consumption protocol, which this
+  amendment does not specify.
+- Approval cardinality: one registration per program revision and invocation contract. If real traffic needs many
+  short-lived approvals of different subsets of one unchanged tool, the constraint belongs on the grant instead (a
+  nullable grant column, a run-aware selection and an Amendment 7 rule); that case would falsify the choice here and
+  reopens it.
+
+### Relation to immutable tool definitions
+
+A later grant model that keeps tool definitions as immutable, digest-addressed records and binds each grant to the
+exact definition digest takes a `program` row losslessly: the program is part of the definition, and the grant binds
+its digest. This amendment does not depend on such a model.
+
+### Acceptance for Amendment 8
+
+Each arm names its must-fail control, stated before the run. Every refusal arm has an otherwise identical passing
+control and asserts that no child process was spawned.
+
+1. Legacy bytes. Rows without `program`, and network-only rows once Amendments 13 and 14 are implemented, produce the
+   same canonical input bytes and the same decisions as before. A `program` key moves the digest; each nested field
+   (literal, path, content ref, `extra_args`, `tree`, `version`) moves it independently; key order does not, argument
+   order does. Control: write `program: null` into every row's inputs; the first assertion goes red.
+2. Registration lifecycle. A conflicting `program` on an existing name is refused, serially and on both orders of a
+   forced concurrent claim; the stored row, its grants and its capability links are unchanged. An identical or omitted
+   `program` returns the stored row. A revision under a new name gets a new registry id, and a grant on the old row does
+   not allow it. Control: compare only on the name lookup path; the concurrent arm goes red.
+3. Argument vector. A marker program receives exactly the fixed literals, the file paths and the permitted suffix;
+   arguments with spaces and quotes stay single arguments; `"none"` refuses any suffix; under `"append"` a suffix that
+   changes the fixture's behaviour runs, showing that `"append"` admits more than the fixed program. Control: spawn
+   with the caller's `args` in place of the built vector.
+4. File identity. Changed bytes at the pinned path, a missing entry, a symbolic link entry and a symbolic link parent
+   are each refused; a matching regular file runs. Control: check the path only, ignoring content ref and mode.
+5. Working directory. The root runs; a subdirectory holding a same-named different script is refused, and so is a
+   symbolic link resolving to the root. Rows without `program` keep accepting a valid subdirectory. Control: join the
+   requested `cwd` silently.
+6. Whole tree. Without `tree` an unrelated data file change runs; with `tree` it is refused; a changed pinned script is
+   refused in both. Control: ignore `tree`.
+7. Every allow source. A mismatching run is refused under a grant, an explicit policy `allow` and the `read` default.
+   Control: validate only when the decision source is `grant`; the policy and default arms go red.
+8. Interpreter bytes. A replaced interpreter before staging is refused; a replacement after staging leaves the run on
+   the compared copy; a `program` row without `network` runs with no network. Control: execute the registered path
+   after the comparison.
+9. Loading limits, per interpreter claimed. For Python: separate fixtures plant a module beside the script, a per-user
+   startup file under `HOME`, and a module on an allowed `PYTHONPATH`, each printing a marker. Each marker is first
+   shown to load without isolation on that exact interpreter, then shown absent with `-I` among `fixed_args`. An
+   interpreter or version not present is reported as not run, never as passed. Control: remove `-I`.
+10. Receipts. A grant-allowed, file-mismatching run leaves one `allow` event naming the definition and the run and a
+    correlated refused receipt in state `mismatch`; `tool.check` leaves no match state; an event append failure prevents
+    the launch; a passing run's recorded argument vector equals the spawned one and its recorded program bytes rehash to
+    its recorded digest. Control: record `matched` at the policy answer, before the file checks.
+11. Malformed state. A malformed, null or unknown-version `program`, a non-`exec` source, a bad content ref or digest,
+    an unsafe path and an argument list one over each size limit are refused at registration and again at run time when
+    written straight to storage, whatever policy answers. Controls: read a malformed `program` as absent; default
+    `extra_args` to `"append"`; remove one size limit. A program with `extra_args` `"append"` and no file element is
+    refused at registration and at run time, and the same literals under `"none"` register and run. Control: accept a
+    flag-only `"append"` row; the refusal arm goes red.
+
+The implementation stores `program` in the registry row's existing properties and adds no grant or policy column. Its
+receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
+already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
+new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.

@@ -10,7 +10,7 @@ use khive_storage::types::{Edge, VectorRecord};
 use khive_storage::{BatchWriteSummary, Entity, Note};
 use khive_types::{EdgeRelation, Namespace, SubstrateKind};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use uuid::Uuid;
 
 pub const ROWS: usize = 10_000;
@@ -133,7 +133,7 @@ impl Fixture {
                 kind: "observation".into(),
                 status: "active".into(),
                 name: Some(format!("note {i}")),
-                content: format!("{CONTENT} word{}", rng.gen_range(0..1000)),
+                content: format!("{CONTENT} word{}", rng.random_range(0..1000)),
                 salience: Some(0.5),
                 decay_factor: None,
                 expires_at: None,
@@ -201,7 +201,7 @@ impl Fixture {
             let records = (0..ROWS)
                 .map(|i| {
                     let mut vector: Vec<f32> =
-                        (0..DIMS).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                        (0..DIMS).map(|_| rng.random_range(-1.0..1.0)).collect();
                     let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
                     for value in &mut vector {
                         *value /= norm;

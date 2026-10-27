@@ -7,6 +7,15 @@ const CHILD_TEST: &str = "KKERNEL_ISOLATED_TEST";
 /// Call before fixture setup or environment changes. Only the exact child
 /// continues; unrelated tests never share its environment or recovery lock.
 pub(crate) fn run_in_child() -> bool {
+    run_in_child_with_stack(None)
+}
+
+/// Reserve extra stack only for this isolated child, without changing sibling tests.
+pub(crate) fn run_in_child_with_stack_size(stack_bytes: usize) -> bool {
+    run_in_child_with_stack(Some(stack_bytes))
+}
+
+fn run_in_child_with_stack(stack_bytes: Option<usize>) -> bool {
     let mut fixture = None;
     let in_parent = run_exact_test_in_child(CHILD_TEST, false, |command| {
         let root = tempfile::tempdir().expect("isolated test fixture");
@@ -24,6 +33,9 @@ pub(crate) fn run_in_child() -> bool {
             .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
             .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"));
+        if let Some(stack_bytes) = stack_bytes {
+            command.env("RUST_MIN_STACK", stack_bytes.to_string());
+        }
         // The fixture must outlive the child that runs inside the call.
         fixture = Some(root);
     });
@@ -45,6 +57,21 @@ pub(crate) fn run_in_child() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_stack_size_is_child_local() {
+        let original_stack = std::env::var_os("RUST_MIN_STACK");
+        const STACK_BYTES: usize = 4 * 1024 * 1024;
+        if super::run_in_child_with_stack_size(STACK_BYTES) {
+            assert_eq!(std::env::var_os("RUST_MIN_STACK"), original_stack);
+            return;
+        }
+        assert_eq!(
+            std::env::var("RUST_MIN_STACK").ok(),
+            Some(STACK_BYTES.to_string()),
+            "isolated child must receive its requested stack reservation"
+        );
+    }
+
     #[test]
     fn environment_changes_stay_in_the_child() {
         let original_home = std::env::var_os("HOME");

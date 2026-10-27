@@ -144,16 +144,17 @@ async fn load_brain_profile(
     token: &NamespaceToken,
     profile_id: &str,
 ) -> Result<Value, RuntimeError> {
-    registry
-        .dispatch_with_identity(
-            "brain.profile",
-            json!({
-                "namespace": token.namespace().as_str(),
-                "profile_id": profile_id,
-            }),
-            Some(RequestIdentity::from_token(token)),
-        )
-        .await
+    // Boxed so the recall future holds a pointer rather than the whole
+    // dispatch future, which grows with the runtime.
+    Box::pin(registry.dispatch_with_identity(
+        "brain.profile",
+        json!({
+            "namespace": token.namespace().as_str(),
+            "profile_id": profile_id,
+        }),
+        Some(RequestIdentity::from_token(token)),
+    ))
+    .await
 }
 
 fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(), RuntimeError> {
@@ -278,10 +279,10 @@ impl MemoryPack {
         registry: &VerbRegistry,
         hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
-        if !super::common::recall_profile_enabled() {
-            return self
-                .handle_recall(token, params, registry, hard_deadline)
-                .await;
+        // Keep the pipeline behind its own heap boundary in both profiling paths;
+        // boxing only this wrapper at the deadline still embeds the pipeline here.
+        if !super::common::recall_profile_enabled(&self.runtime) {
+            return Box::pin(self.handle_recall(token, params, registry, hard_deadline)).await;
         }
 
         let call_id = RECALL_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -292,7 +293,7 @@ impl MemoryPack {
         PROF_CID
             .scope(
                 call_id,
-                self.handle_recall(token, params, registry, hard_deadline),
+                Box::pin(self.handle_recall(token, params, registry, hard_deadline)),
             )
             .await
     }
@@ -347,7 +348,9 @@ impl MemoryPack {
         let wait_started = Instant::now();
         let wait_by_caller = wait_started + Duration::from_millis(timeout_ms);
         let request_deadline = hard_deadline.or_else(|| {
-            wait_started.checked_add(Duration::from_millis(crate::pack::recall_deadline_ms()))
+            wait_started.checked_add(Duration::from_millis(crate::pack::recall_deadline_ms(
+                &self.runtime,
+            )))
         });
         let wait_by_request = request_deadline
             .and_then(|deadline| deadline.checked_sub(Duration::from_secs(2)))
@@ -375,7 +378,7 @@ impl MemoryPack {
             }
         }
 
-        let prof = super::common::recall_profile_enabled();
+        let prof = super::common::recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let mut t_stage = if prof { Some(Instant::now()) } else { None };
 
@@ -514,12 +517,12 @@ impl MemoryPack {
         // Request widening policy precedes the process-wide fallback.
         let ann_overfetch_max_rounds = cfg
             .ann_overfetch_max_rounds
-            .unwrap_or_else(super::common::ann_overfetch_max_rounds);
+            .unwrap_or_else(|| super::common::ann_overfetch_max_rounds(&self.runtime));
 
         // Bound cold ANN readiness before degrading this vector leg to FTS-only.
         let ann_ready_timeout_ms = cfg
             .ann_ready_timeout_ms
-            .unwrap_or_else(super::common::ann_ready_timeout_ms);
+            .unwrap_or_else(|| super::common::ann_ready_timeout_ms(&self.runtime));
 
         // Retrieval caps all note kinds, so re-gather after hydration when non-memory rows
         // starve eligible memories; widening remains round- and server-cap bounded.

@@ -233,7 +233,7 @@ fn assert_conflict(error: RuntimeError, message: &str) {
     }
 }
 fn comparable_envelope(event: &Event) -> Value {
-    assert_eq!(event.id.get_version_num(), 4);
+    assert_eq!(event.id.get_version_num(), 7);
     assert!(event.created_at > 1_000_000);
     assert!(Utc.timestamp_micros(event.created_at).single().is_some());
     let mut value = serde_json::to_value(event).unwrap();
@@ -530,4 +530,187 @@ async fn guarded_reconciliation_rolls_back_upsert_and_retirement_then_retries_on
         before,
         "retirement-only batches must still check the complete snapshot"
     );
+}
+
+async fn seed_other_observed_edge(f: &Fixture, seed: &Edge) -> Uuid {
+    let other_id = id(60);
+    let mut other = seed.clone();
+    other.id = LinkId::from(other_id);
+    other.target_id = id(3);
+    f.runtime
+        .graph(&f.token)
+        .unwrap()
+        .upsert_edge(other)
+        .await
+        .unwrap();
+    let updated = f
+        .runtime
+        .link_observed(
+            &f.token,
+            id(1),
+            id(3),
+            EdgeRelation::LinksTo,
+            0.75,
+            spec(id(3)).metadata,
+            false,
+        )
+        .await
+        .expect("real update of the unrelated edge");
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, LinkId::from(other_id));
+    other_id
+}
+
+async fn assert_deleted_edge_is_observed(
+    f: &Fixture,
+    deleted_edge_id: Uuid,
+    other_edge_id: Uuid,
+    hard: bool,
+) {
+    assert_ne!(deleted_edge_id, other_edge_id);
+    let store = f.runtime.events(&f.token).unwrap();
+    let page = || PageRequest {
+        offset: 0,
+        limit: 100,
+    };
+    let deleted = store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::EdgeDeleted],
+                ..EventFilter::default()
+            },
+            page(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.items.len(),
+        1,
+        "real deletion must persist one event"
+    );
+    let persisted = store
+        .get_event(deleted.items[0].id)
+        .await
+        .unwrap()
+        .expect("deletion event must remain addressable after deleting its edge");
+    assert_eq!(persisted.id, deleted.items[0].id);
+    assert_eq!(persisted.target_id, Some(deleted_edge_id));
+    assert_eq!(persisted.kind, EventKind::EdgeDeleted);
+    assert_eq!(persisted.payload["id"], deleted_edge_id.to_string());
+    assert_eq!(persisted.payload["namespace"], "local");
+    assert_eq!(persisted.payload["hard"], hard);
+
+    // A real observed update on the other edge proves the filter has a
+    // different kind/referent available in this same fixture.
+    let other_updates = store
+        .query_events(
+            EventFilter {
+                observed: vec![other_edge_id],
+                kinds: vec![EventKind::EdgeUpdated],
+                ..EventFilter::default()
+            },
+            page(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_updates.items.len(), 1);
+    assert_eq!(other_updates.items[0].target_id, Some(other_edge_id));
+    assert_eq!(other_updates.items[0].kind, EventKind::EdgeUpdated);
+
+    let observed = store
+        .query_events(
+            EventFilter {
+                observed: vec![deleted_edge_id],
+                kinds: vec![EventKind::EdgeDeleted],
+                ..EventFilter::default()
+            },
+            page(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.items.len(),
+        1,
+        "observed edge plus EdgeDeleted kind must find its persisted deletion event"
+    );
+    assert_eq!(observed.items[0].id, persisted.id);
+    assert_eq!(observed.items[0].target_id, Some(deleted_edge_id));
+    assert_eq!(observed.items[0].kind, EventKind::EdgeDeleted);
+
+    let other_deletions = store
+        .query_events(
+            EventFilter {
+                observed: vec![other_edge_id],
+                kinds: vec![EventKind::EdgeDeleted],
+                ..EventFilter::default()
+            },
+            page(),
+        )
+        .await
+        .unwrap();
+    assert!(other_deletions.items.is_empty());
+    let other = f
+        .runtime
+        .get_edge(&f.token, other_edge_id)
+        .await
+        .unwrap()
+        .expect("unrelated edge must remain live");
+    assert_eq!(other.id, LinkId::from(other_edge_id));
+    assert!(other.deleted_at.is_none());
+}
+
+#[tokio::test]
+async fn soft_deleted_edge_is_observed_by_its_persisted_deletion_event() {
+    let f = Fixture::new().await;
+    let edge = f.seed().await;
+    let edge_id = id(50);
+    assert_eq!(edge.id, LinkId::from(edge_id));
+    let other_edge_id = seed_other_observed_edge(&f, &edge).await;
+    assert!(f
+        .runtime
+        .delete_edge(&f.token, edge_id, false)
+        .await
+        .expect("real soft deletion must succeed"));
+    let deleted = f
+        .runtime
+        .get_edge_including_deleted(&f.token, edge_id)
+        .await
+        .unwrap()
+        .expect("soft deletion must retain its tombstoned edge");
+    assert_eq!(deleted.id, edge.id);
+    assert!(deleted.deleted_at.is_some());
+    assert!(f
+        .runtime
+        .get_edge(&f.token, edge_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_deleted_edge_is_observed(&f, edge_id, other_edge_id, false).await;
+}
+
+#[tokio::test]
+async fn hard_deleted_edge_is_observed_by_its_persisted_deletion_event() {
+    let f = Fixture::new().await;
+    let edge = f.seed().await;
+    let edge_id = id(50);
+    assert_eq!(edge.id, LinkId::from(edge_id));
+    let other_edge_id = seed_other_observed_edge(&f, &edge).await;
+    assert!(f
+        .runtime
+        .delete_edge(&f.token, edge_id, true)
+        .await
+        .expect("real hard deletion must succeed"));
+    assert!(f
+        .runtime
+        .get_edge_including_deleted(&f.token, edge_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f
+        .runtime
+        .get_edge(&f.token, edge_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_deleted_edge_is_observed(&f, edge_id, other_edge_id, true).await;
 }

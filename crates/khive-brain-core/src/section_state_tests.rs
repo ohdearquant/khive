@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn derive_weights_sums_to_one() {
     let state = SectionPosteriorState::new();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for _ in 0..20 {
         let weights = derive_weights(&state, &mut rng);
         assert_eq!(weights.len(), SectionType::all().len());
@@ -56,7 +56,7 @@ fn deterministic_weights_sum_to_one() {
 fn epoch_zero_uses_deterministic() {
     let mut state = SectionPosteriorState::new();
     state.exploration_epoch = 0;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let w1 = derive_weights(&state, &mut rng);
     let w2 = derive_weights(&state, &mut rng);
     for st in SectionType::all() {

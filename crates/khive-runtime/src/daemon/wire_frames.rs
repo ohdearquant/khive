@@ -123,7 +123,8 @@ pub struct DaemonDispatchError {
 /// Per-field container limit, asserted equal to the request parser's bound by MCP.
 pub const ERROR_DETAIL_NESTING_DEPTH_LIMIT: usize = 64;
 
-fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
+/// Whether a JSON value fits the shared per-field container nesting limit.
+pub fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
     let mut pending = vec![(value, 0_usize)];
     while let Some((value, depth)) = pending.pop() {
         match value {
@@ -140,7 +141,8 @@ fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
     true
 }
 
-fn drop_error_detail_iteratively(value: serde_json::Value) {
+/// Discard an owned JSON value without recursing through nested containers.
+pub fn drop_error_detail_iteratively(value: serde_json::Value) {
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {

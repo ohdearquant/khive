@@ -385,12 +385,17 @@ const MEMORY_VISIBILITY_EPOCHS: &str = "memory_visibility_epochs";
 /// route in `MoveRequest`, so retain their source attribution and report it.
 /// Stream floors and open truncation permits name a stream, not a routed note;
 /// carrying them would change that stream's namespace identity.
+/// Authority epochs and records are grant state issued for the namespace they
+/// name. As with `tool_grants`, a row carried into a target would grant there
+/// what no administrator of the target issued, so both stay and are reported.
 const LEAVE_BEHIND_TABLES: &[&str] = &[
     "comm_sender_transport",
     "sessions",
     "session_messages",
     "note_stream_floors",
     "note_stream_truncations",
+    "authority_epochs",
+    "authority_records",
 ];
 
 /// What a move does with one namespace-bearing table.
@@ -489,6 +494,9 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         "ann_consumer_watermark" | "ann_consumer_pending" => ConsumerWatermark,
         "note_streams" => RefusedBySchema,
 
+        "pending_entity_indexes" => SubjectKeyed {
+            subject_column: "entity_id",
+        },
         "brain_profile_snapshots" | "brain_event_log" => NamespaceScopedAggregate,
         "brain_implicit_mass" | "brain_serve_ledger" => SubjectKeyed {
             subject_column: "target_id",
@@ -1397,6 +1405,12 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
                 move_kinded_subject(conn, &NOTE_TABLES, source, target, kind, &mut counts.rows)?
             }
             SubjectClass::Entity(kind) => {
+                let refreshed =
+                    crate::pending_index::refresh_for_namespace_move(conn, source, target, kind)?;
+                *counts
+                    .rows
+                    .entry("pending_entity_indexes".into())
+                    .or_default() += refreshed;
                 move_kinded_subject(conn, &ENTITY_TABLES, source, target, kind, &mut counts.rows)?
             }
             SubjectClass::Edge | SubjectClass::EdgeRelation(_) => {
@@ -1468,6 +1482,13 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
         if left > 0 {
             counts.left_behind.insert((*table).to_string(), left);
         }
+    }
+
+    let pending_left = count_in_namespace(conn, "pending_entity_indexes", source)?;
+    if pending_left > 0 {
+        counts
+            .left_behind
+            .insert("pending_entity_indexes".into(), pending_left);
     }
 
     // Epochs belong to the note even when its receipt is absent.

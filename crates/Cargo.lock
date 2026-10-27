@@ -10,12 +10,12 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aead"
-version = "0.5.2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
 dependencies = [
- "crypto-common 0.1.7",
- "generic-array",
+ "crypto-common 0.2.2",
+ "inout",
 ]
 
 [[package]]
@@ -389,6 +389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -482,34 +483,25 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures 0.2.17",
-]
-
-[[package]]
-name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
+ "cipher",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
 name = "chacha20poly1305"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
 dependencies = [
  "aead",
- "chacha20 0.9.1",
+ "chacha20",
  "cipher",
  "poly1305",
  "zeroize",
@@ -568,11 +560,12 @@ dependencies = [
 
 [[package]]
 name = "cipher"
-version = "0.4.4"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
- "crypto-common 0.1.7",
+ "block-buffer 0.12.1",
+ "crypto-common 0.2.2",
  "inout",
  "zeroize",
 ]
@@ -625,6 +618,12 @@ checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cobs"
@@ -815,7 +814,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
- "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -847,6 +845,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "ctutils"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
+dependencies = [
+ "cmov",
 ]
 
 [[package]]
@@ -1562,6 +1569,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -1806,11 +1814,11 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.1.4"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "generic-array",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -1977,13 +1985,13 @@ dependencies = [
 
 [[package]]
 name = "khive-bm25"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-score",
  "khive-text",
  "parking_lot",
- "rand 0.8.7",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1991,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "khive-brain-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -1999,7 +2007,7 @@ dependencies = [
  "khive-runtime",
  "khive-types",
  "lru",
- "rand 0.8.7",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2",
@@ -2007,8 +2015,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-capability"
+version = "0.15.0"
+dependencies = [
+ "blake3",
+ "hmac",
+ "khive-db",
+ "khive-lion-core",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "khive-changeset"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2020,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2036,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-email"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-imap",
  "async-native-tls",
@@ -2054,7 +2081,7 @@ dependencies = [
  "khive-types",
  "lettre",
  "mail-parser",
- "rand 0.8.7",
+ "rand 0.10.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2067,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-telegram"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2082,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2101,7 +2128,7 @@ dependencies = [
  "object_store",
  "parking_lot",
  "proc-macro2",
- "rand 0.8.7",
+ "rand 0.10.3",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2120,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2134,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2142,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -2152,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2165,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate-rego"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "khive-gate",
  "khive-types",
@@ -2177,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "khive-graph-diff"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2188,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "khive-hnsw"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2198,7 +2225,7 @@ dependencies = [
  "lattice-embed",
  "parking_lot",
  "proptest",
- "rand 0.8.7",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2220,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mcp"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2280,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mounts"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2299,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-agent"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2314,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-blob"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2336,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-brain"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2366,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-charter"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2384,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-code"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2413,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-comm"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2439,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-exec"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2464,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-formal"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2477,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-git"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2511,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-gtd"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2532,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-kg"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2563,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-knowledge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2588,7 +2615,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sha2",
  "tempfile",
@@ -2597,11 +2623,12 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]
 name = "khive-pack-memory"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2636,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-moodboard"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2666,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-schedule"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2691,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-session"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2718,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-telemetry"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2735,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-template"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2748,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-tool"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2769,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-web"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2797,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-workspace"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2815,16 +2842,16 @@ dependencies = [
 
 [[package]]
 name = "khive-quant"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
- "rand 0.8.7",
+ "rand 0.10.3",
  "rayon",
 ]
 
 [[package]]
 name = "khive-query"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2834,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "khive-repo-showcase"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2852,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "khive-request"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2862,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2878,7 +2905,7 @@ dependencies = [
  "khive-types",
  "lattice-embed",
  "parking_lot",
- "rand 0.8.7",
+ "rand 0.10.3",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2891,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "khive-rule-evaluator"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "khive-changeset",
@@ -2903,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2911,6 +2938,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
+ "cipher",
  "criterion",
  "iana-time-zone",
  "inventory",
@@ -2934,7 +2962,7 @@ dependencies = [
  "parking_lot",
  "proc-macro2",
  "quote",
- "rand 0.8.7",
+ "rand 0.10.3",
  "ring",
  "rusqlite",
  "serde",
@@ -2957,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime-production-tests"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "khive-runtime",
@@ -2969,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2979,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2996,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "khive-text"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "rust-stemmers",
@@ -3005,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "serde",
@@ -3015,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vamana"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -3026,8 +3054,7 @@ dependencies = [
  "khive-types",
  "libc",
  "memmap2",
- "nix",
- "rand 0.8.7",
+ "rand 0.10.3",
  "rayon",
  "serde",
  "serde_json",
@@ -3040,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3058,17 +3085,17 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]
 name = "khive-vcs-adapters"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "csv",
@@ -3082,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "khive-wire-protocol"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "serde",
@@ -3092,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "kkernel"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3146,7 +3173,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sha2",
  "tempfile",
@@ -3155,6 +3181,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -3266,6 +3293,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "linux-raw-sys"
@@ -3571,7 +3604,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quick-xml",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest 0.13.4",
  "rustls-pki-types",
  "serde",
@@ -3602,12 +3635,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "opaque-debug"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
@@ -3803,12 +3830,11 @@ dependencies = [
 
 [[package]]
 name = "poly1305"
-version = "0.8.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
- "cpufeatures 0.2.17",
- "opaque-debug",
+ "cpufeatures 0.3.0",
  "universal-hash",
 ]
 
@@ -3942,7 +3968,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -4019,11 +4045,11 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
- "chacha20 0.10.2",
+ "chacha20",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -4216,7 +4242,7 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "postcard",
- "rand 0.10.2",
+ "rand 0.10.3",
  "regex",
  "semver",
  "serde",
@@ -4937,7 +4963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5029,9 +5055,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.4"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -5282,12 +5308,12 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "universal-hash"
-version = "0.5.1"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
 dependencies = [
- "crypto-common 0.1.7",
- "subtle",
+ "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -5350,7 +5376,7 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",
@@ -5771,6 +5797,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5881,27 +5920,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.3.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.1+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

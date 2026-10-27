@@ -11,22 +11,81 @@ fn unrecognized_code_falls_back_to_internal() {
 
 #[test]
 fn unrecognized_code_inside_an_error_frame_falls_back_to_internal() {
-    let payload = br#"{"kind":"error","code":"bogus","message":"future code"}"#;
+    // ADR-137 Amendment 1 Decision 5 retains the with-id fallback; the
+    // previous id-less positive is replaced by the decode refusal below.
+    let payload = br#"{"kind":"error","id":"op-7","code":"bogus","message":"future code"}"#;
     let frame = crate::codec::decode_payload(payload).unwrap();
-    match frame {
+    assert_eq!(
+        frame,
         crate::frame::Frame::Error {
-            id,
-            code,
-            unrecognized_code,
-            ..
-        } => {
-            assert_eq!(code, WireErrorCode::Internal);
-            assert!(id.is_none());
-            // The raw string survives the fallback; it is not
-            // silently discarded.
-            assert_eq!(unrecognized_code.as_deref(), Some("bogus"));
+            id: Some(crate::frame::OperationId::from("op-7")),
+            code: WireErrorCode::Internal,
+            message: "future code".to_string(),
+            unrecognized_code: Some("bogus".to_string()),
         }
-        other => panic!("expected an error frame, got {other:?}"),
+    );
+    assert_eq!(
+        WireErrorCode::Internal.terminal_scope(),
+        TerminalScope::Request
+    );
+    assert_eq!(
+        crate::codec::encode_frame(&frame).unwrap_err(),
+        crate::codec::CodecError::FallbackFrameNotEncodable {
+            code: "bogus".to_string(),
+        }
+    );
+}
+
+#[test]
+fn unknown_error_code_without_an_id_is_malformed_at_decode() {
+    // These are role-agnostic decode APIs: neither a client nor a server
+    // may receive an accepted id-less unknown-code Frame from any of them.
+    for raw_code in ["bogus", "future_code_xyz", "Cancelled"] {
+        let payload = format!(r#"{{"kind":"error","code":"{raw_code}","message":"future code"}}"#);
+        let mut wire = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+        wire.extend_from_slice(payload.as_bytes());
+        let results = [
+            (
+                "decode_payload",
+                crate::codec::decode_payload(payload.as_bytes()).map(|_| ()),
+            ),
+            (
+                "decode_frame",
+                crate::codec::decode_frame(&wire, crate::codec::DEFAULT_MAX_FRAME_BYTES)
+                    .map(|_| ()),
+            ),
+            (
+                "decode_with_consumed",
+                crate::codec::FrameCodec::default()
+                    .decode_with_consumed(&wire)
+                    .map(|_| ()),
+            ),
+        ];
+        for (entrypoint, result) in results {
+            assert!(
+                result.is_err(),
+                "D5 {entrypoint} accepted an id-less unknown error code {raw_code}"
+            );
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    crate::codec::CodecError::InconsistentErrorScope { .. }
+                ),
+                "unexpected decode error for {raw_code}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("unknown error code requires an operation id"),
+                "unexpected decode error for {raw_code}: {error}"
+            );
+            assert_eq!(error.wire_code(), WireErrorCode::MalformedFrame);
+            assert_eq!(
+                error.wire_code().terminal_scope(),
+                TerminalScope::Connection
+            );
+        }
     }
 }
 

@@ -75,8 +75,8 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
         .expect("a partial refusal remains an in-band digest result");
 
     assert_eq!(
-        result["prs_ingested"], 1,
-        "the clean write must land: {result}"
+        result["prs_ingested"], 2,
+        "the clean write and successful redacted replacement must land: {result}"
     );
     assert_eq!(
         result["writes_refused"], 1,
@@ -89,6 +89,7 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
     assert_eq!(refusals[0]["verb"], "create");
     assert_eq!(refusals[0]["record_kind"], "pull_request");
     assert_eq!(refusals[0]["record_key"], "#2");
+    assert_eq!(refusals[0]["redacted"], true);
     assert!(
         refusals[0]["detector"]
             .as_str()
@@ -110,11 +111,48 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list pull requests");
-    let numbers: Vec<u64> = list_items(&stored)
+    let items = list_items(&stored);
+    let mut numbers: Vec<u64> = items
         .iter()
         .filter_map(|item| item["properties"]["number"].as_u64())
         .collect();
-    assert_eq!(numbers, vec![1], "only the clean record may persist");
+    numbers.sort_unstable();
+    assert_eq!(
+        numbers,
+        vec![1, 2],
+        "the clean record and redacted replacement must both persist"
+    );
+    let replacement_id = items
+        .iter()
+        .find(|item| item["properties"]["number"] == json!(2))
+        .expect("the actual listed replacement for #2")["id"]
+        .as_str()
+        .expect("the listed replacement has a stored note id");
+    let replacement = registry
+        .dispatch("get", json!({"id": replacement_id}))
+        .await
+        .expect("read the actual stored replacement by its returned id");
+    assert_eq!(replacement["properties"]["number"], json!(2));
+    assert_eq!(
+        replacement["content"],
+        "GitHub content was redacted after a secret-gate refusal."
+    );
+    assert_eq!(
+        replacement["properties"]["title"],
+        "GitHub content redacted"
+    );
+    assert_eq!(replacement["properties"]["created_at"], json!(null));
+    assert_eq!(replacement["properties"]["author"], json!(null));
+    assert_eq!(replacement["properties"]["base_ref"], json!(null));
+    assert_eq!(replacement["properties"]["head_ref"], json!(null));
+    assert_eq!(
+        replacement["properties"]["project_id"],
+        json!(project_id.to_string())
+    );
+    assert!(
+        !replacement.to_string().contains(CREDENTIAL),
+        "the raw fixture credential must never persist in the replacement: {replacement}"
+    );
 }
 
 /// `max_items` bounds work per call and the response is cursor-resumable:

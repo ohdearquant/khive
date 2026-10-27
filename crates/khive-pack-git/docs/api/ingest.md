@@ -195,18 +195,18 @@ two different repos' `#1`.
 
 ## `find_document_for_path`
 
-Finds an existing `document` entity whose `properties.source_uri` or
-`name` matches `path` (ADR-086 keying convention). Returns `None` when no
-match — v0 never creates documents on the ingester's behalf (skip the
-edge).
+Finds an existing `document` entity by exact `properties.source_uri`, then
+by a source-URI suffix, then by basename only for a document without
+`source_uri` (ADR-086 Amendment 1, Decision 3). Missing and JSON-null
+`source_uri` values permit the basename fallback; an empty string is still
+a present URI. Returns `None` when no match — v0 never creates documents
+on the ingester's behalf (skip the edge).
 
-Exact and suffix-`LIKE` candidates are selected in a single query/snapshot
-so a document inserted between an exact-match read and a fallback read can
-never be missed by the exact branch, and a wildcard-broadened match can
-never shadow an exact one: the `ORDER BY` ranks exact matches first, with
-`id` as a deterministic tiebreaker (PR #816 fixed a TOCTOU gap here, and a
-sibling bug where an unescaped path let `%`/`_` act as `LIKE` wildcards —
-see `find_document_for_path_tests`).
+All three candidate classes are selected in a single query/snapshot. The
+`ORDER BY` ranks exact URI matches first, suffix-`LIKE` matches second, and
+basename fallbacks third, with `id` as a deterministic tiebreaker within
+each class. This preserves the snapshot and literal `%`/`_` escaping fixes
+from PR #816; see `find_document_for_path_tests`.
 
 ## `write_cursor`
 

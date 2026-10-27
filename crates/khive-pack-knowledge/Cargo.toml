@@ -20,24 +20,24 @@ bench = false
 namespace-trigram-proto = ["khive-db/namespace-trigram-proto"]
 
 [dependencies]
-khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
-khive-brain-core = { version = "0.14.0", path = "../khive-brain-core" }
-khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
-khive-storage = { version = "0.14.0", path = "../khive-storage" }
-khive-fs = { version = "0.14.0", path = "../khive-fs" }
-khive-fold = { version = "0.14.0", path = "../khive-fold" }
-khive-fusion = { version = "0.14.0", path = "../khive-fusion" }
-khive-retrieval = { version = "0.14.0", path = "../khive-retrieval", default-features = false, features = ["ann", "persist"] }
-khive-score = { version = "0.14.0", path = "../khive-score" }
-khive-text = { version = "0.14.0", path = "../khive-text" }
-khive-vamana = { version = "0.14.0", path = "../khive-vamana" }
+khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
+khive-brain-core = { version = "0.15.0", path = "../khive-brain-core" }
+khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
+khive-storage = { version = "0.15.0", path = "../khive-storage" }
+khive-fs = { version = "0.15.0", path = "../khive-fs" }
+khive-fold = { version = "0.15.0", path = "../khive-fold" }
+khive-fusion = { version = "0.15.0", path = "../khive-fusion" }
+khive-retrieval = { version = "0.15.0", path = "../khive-retrieval", default-features = false, features = ["ann", "persist"] }
+khive-score = { version = "0.15.0", path = "../khive-score" }
+khive-text = { version = "0.15.0", path = "../khive-text" }
+khive-vamana = { version = "0.15.0", path = "../khive-vamana" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
@@ -45,13 +45,13 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
-khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["test-internals"] }
+khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
+khive-runtime = { version = "0.15.0", path = "../khive-runtime", features = ["test-internals"] }
 # Test-only: builds the two-backend (secondary + core main) runtime for the
 # ADR-073 concept-tier routing regression tests.
-khive-db = { version = "0.14.0", path = "../khive-db" }
-khive-pack-brain = { version = "0.14.0", path = "../khive-pack-brain" }
-khive-storage = { version = "0.14.0", path = "../khive-storage", features = ["test-support"] }
+khive-db = { version = "0.15.0", path = "../khive-db" }
+khive-pack-brain = { version = "0.15.0", path = "../khive-pack-brain" }
+khive-storage = { version = "0.15.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 blake3 = { workspace = true, features = ["std"] }

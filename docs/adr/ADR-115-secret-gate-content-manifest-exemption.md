@@ -1908,3 +1908,300 @@ publication/commit/checkpoint faults; delayed cleanup/unsupported GC; and later 
 and proposal routes. Controls must reach the relevant runtime boundary after a selected normal
 passes, then fail semantically rather than through an absent API or setup error. This docs-only
 proposal supplies no executable acceptance or native verdict and selects no option for activation.
+
+## Amendment 7 (2026-10-25): masking caller values echoed in refusals
+
+**Status**: Proposed.
+
+Originating issue(s): #5897
+
+Some refusal paths mask rejected values through `GateProbe`; others interpolate them without
+masking. Ordinary entropy detection requires credential context, so an isolated bare credential can
+remain visible in either case. This amendment adds bounded refusal masking without changing write
+admission or the content preview policy.
+
+### Decision
+
+**Surface and population.** Add one surface, `RedactionSurface::Refusal`. It covers
+caller-controlled text rendered in request refusals, including rejected operands, deserializer
+diagnostics, parser causes, string detail fields, and repeated copies in refusal results.
+Classification follows the value's use, not whether its current implementation calls a masker or
+returns a particular Rust error variant. Within this amendment's scope, never-masked refusal paths
+are part of the migration. Include caller-derived operation labels and diagnostic object keys when
+failures echo them outside the error message. Protocol keys and authoritative registered operation
+names remain trusted metadata. An unknown caller-supplied operation name is not trusted merely
+because it occupies a field named `tool`. A consumer that correlates result rows with submitted
+operations by that label, such as `kkernel exec --ops-file` (`classify_ordered_chunk` in
+`crates/kkernel/src/exec/ops_file_apply.rs`), compares a failed or aborted row's label with the
+`Refusal`-masked form of the submitted label. A masked label then counts as that operation's
+failure, not as a row mismatch, and the consumer's own diagnostics and saved manifests render only
+the masked label.
+
+The scope includes pack and runtime validation, MCP request and envelope validation, `kkernel exec`
+validation, per-operation failure entries, and refusal rows inside otherwise successful results.
+Charter and moodboard sources are excluded from this migration and its completeness claim. Existing
+backend transport diagnostics retain `McpDiagnostic`; an envelope parameter refusal is a request
+refusal, not a backend transport diagnostic. Successful content results and scanner previews retain
+their existing policies. This amendment does not establish a general log or persistence redactor.
+
+`Refusal` and the existing preview-only `GateProbe` extend Amendment 2's closed table explicitly:
+
+| Surface     | Mode                | Final stored target | Stamp property | Exemption-success event |
+| ----------- | ------------------- | ------------------- | -------------- | ----------------------- |
+| `Refusal`   | `PermanentMaskOnly` | None                | None           | None                    |
+| `GateProbe` | `PermanentMaskOnly` | None                | None           | None                    |
+
+The Git ingestion, session mirror and MCP diagnostic rows retain their exact contracts. Every
+surface remains permanently mask-only. Masking never consumes a manifest exemption, performs stored
+UUID admission, stamps a record, or emits an event. Existing dispatch and domain events are separate
+effects. Identity, namespace, verb and request arguments cannot select a weaker refusal policy.
+
+**Candidates and spans.** On the original retained input, retain every ordinary detector span and
+independently enumerate these three candidate classes:
+
+1. Maximal runs of printable ASCII bytes, `0x21` through `0x7e`, except double quote, single quote,
+   backtick, backslash, comma, semicolon, colon, parentheses, square brackets and braces. Remove all
+   consecutive trailing periods from each run before evaluating it. Keep internal periods and all
+   other admitted bytes, including `+`, `/`, `=`, `-` and `_`. In particular, retain base64 padding.
+2. Maximal runs matching `[A-Za-z0-9_-]+`, independently of the first class. This class isolates a
+   URL-safe credential from path separators or other punctuation even when the larger run has low
+   entropy.
+3. Maximal runs matching `[A-Za-z0-9]+`, independently of both preceding classes. This class
+   isolates an alphanumeric credential from low-entropy filler connected by hyphens or underscores.
+
+Every other byte or character terminates the corresponding run. Non-ASCII characters, whitespace and
+ASCII control characters are delimiters for all three classes. Empty candidates are discarded. There
+is no recursive splitting, arbitrary substring enumeration or escape decoding. Evaluate each
+candidate's own bytes with the existing Shannon entropy calculation. A candidate qualifies when its
+length is at least `MIN_ENTROPY_LEN`, 24 ASCII bytes, and its entropy is at least
+`ENTROPY_THRESHOLD`, 4.5 bits per byte. Equality qualifies. The added pass has no trigger
+requirement and no path, structured-identifier, name, revision, content-hash or typed-value
+exemption. Ordinary detectors, their constants and exemptions are unchanged; their early returns
+cannot skip this pass.
+
+Each qualifying candidate contributes exactly its own half-open byte interval in the original
+retained input. An inner-run hit never contributes its enclosing token. A qualifying larger
+candidate still contributes its full interval, even if it contains a qualifying smaller candidate.
+Deduplicate intervals, sort by start offset, and union overlapping or directly adjacent intervals
+from both ordinary and added detection. Replace each resulting interval once with `***MASKED***`.
+All other bytes remain unchanged. Never detect on the other pass's already-masked output.
+
+The added intervals exclude structural wrappers and removed terminal periods. Thus they preserve the
+quotes, brackets and punctuation around an isolated candidate in compact JSON or prose. They can
+still cover a complete path or name when that larger candidate qualifies. Ordinary detectors retain
+their existing, sometimes wider intervals, including their fail-closed tail behavior. This amendment
+does not narrow those intervals to preserve punctuation. Constructed refusal metadata must therefore
+remain outside caller-value masking inputs wherever its boundaries are known.
+
+**Rendering and transformed copies.** Pass the raw caller string to the bounded refusal helper
+before diagnostic quoting, escaping, normalization or additional truncation. Keep validation with
+the parameter's existing parser. When a rejected non-string JSON operand is displayed as JSON, its
+compact serialization is the masking input; do not replace the enclosing array or object merely
+because a contained candidate qualifies. The existing parsing and serialization costs are not new
+bounds on request processing.
+
+Build constructed errors from trusted template text, parameter names, authoritative accepted-value
+lists and masked caller operands. Preserve the error kind, parameter names and accepted-value lists.
+Every repeated occurrence must use the sanitized operand. A parser cause can contain a case-folded,
+trimmed, escaped or truncated copy that no longer qualifies for masking. Such a route must not
+interpolate that cause's display text and rely on rescanning it. Use the parser's trusted diagnostic
+metadata and the masked original instead. `parse_event_kind` is a required instance: retain its
+parser, use the error's authoritative domain and valid variants, and replace both diagnostic value
+occurrences from the masked original without rendering the error's normalized `value`. A call
+site's own normalized binding is the same case: `handle_review` in
+`crates/khive-pack-kg/src/handlers/proposal.rs` matches a trimmed, lowercased decision and formats
+that binding in its unknown-decision refusal, so it must format the masked original instead. When a
+diagnostic joins several caller-derived segments, such as the key path of a `$prev` substitution
+failure, each segment is a separate operand, masked before joining. The joined rendering is not the
+masking input, because low-entropy sibling segments can dilute a qualifying segment below the
+threshold.
+
+Opaque deserializer diagnostics use the same refusal surface only after establishing their operand
+and metadata handling. If a formatter can transform an operand or the added pass can erase trusted
+metadata, adapt that formatting boundary to retain the rejected original and trusted metadata
+separately. Internal diagnostic types or adapters may carry those parts. Do not guess trusted spans
+from words such as `expected`, and do not recover operand boundaries by parsing an error's prose.
+Keep leaf parsers independent of the runtime; consuming boundaries apply the masking policy. No
+route may retain an unsafe raw cause as a fallback. This requires no wire or stored schema change.
+
+For `knowledge.upsert_atoms`, mask slug operands in both the domain-mirror collision and
+deleted-slug refusals. In a dry-run row with `would_refuse: true`, every caller-derived diagnostic
+field, including `slug`, `message` and any dynamic location, uses refusal rendering.
+`identity_masked` reflects whether the displayed identity was masked or truncated. A non-refused
+row's identity and the `scan` content preview retain ordinary `GateProbe` behavior. A strict message
+beside an ordinary unmasked copy of the same slug in a refused row does not satisfy this contract.
+Reuse a constructed message already assembled from sanitized parts without rescanning its trusted
+template.
+
+**Bounded call path.** Production refusal rendering enters a shared helper which calls
+`mask_bounded(Refusal, text, MASK_WINDOW_CHARS, output_cap_chars)`. Use an existing smaller output
+cap where one exists; otherwise use `MASK_WINDOW_CHARS`, currently 4,096 characters. The helper
+returns `BoundedMask`. Callers render its sanitized `text` and consume its flags without restoring
+the original value. Direct production calls to `mask_for_redaction_surface(Refusal, raw_text)` are
+not permitted outside the bounded path.
+
+`mask_bounded` alone owns input windowing, conservative removal back to whitespace on truncated
+input, `trailing_bridge_fragment_cut`, output capping and the existing ellipsis marker. Preserve
+that backward fragment removal even when no trigger is visible. It then calls
+`mask_for_redaction_surface(Refusal, retained_window)` exactly once. That canonical entry collects
+ordinary spans and the added refusal spans on the retained window; it neither calls `mask_bounded`
+nor applies another window. Other surfaces keep their existing dispatch behavior.
+
+A single oversized whitespace token leaves only the existing truncation marker. A bounded result
+already includes that marker when truncated; do not append a duplicate. Preserve any separate
+transport disclosure once at its existing boundary. `truncated` remains a reason never to restore
+raw text, independently of `redacted`. Do not scan beyond the window to complete a token, decode an
+escape or recover a dropped cause. Do not treat a retained fragment as a successfully parsed value.
+
+The new candidate pass performs bounded linear enumeration over the retained input, with at most
+three candidate evaluations per byte across the three classes and interval storage bounded by that
+input. Retain the ordinary scan-work budget and fail-closed behavior. Instrument the ordinary scan,
+boundary fragment handling and new candidate work separately. The existing one-tokenization
+assertion for `mask_secrets` does not imply one tokenization for an entire truncated `mask_bounded`
+call, which also tokenizes for its backward fragment cut.
+
+**Migration evidence.** Derive the inventory from refusal construction and output sites at the
+implementation revision, independently of existing redaction references. Include runtime and domain
+error constructors, fallible parameter decoders, conversions that render causes, MCP errors, CLI
+refusal output, value-based per-operation failures and refusal-bearing result rows. Record static
+operand-free sites as such, with evidence. Trace aliases, wrappers and shared-helper consumers;
+unrecognized dynamic construction is an inventory gap, not an exemption.
+
+Each entry identifies its source location and construction, output consumers, caller-derived fields,
+transformations, reachable input shapes, intended policy and acceptance witness or a
+source-supported reason a particular witness cannot reach it. Discover redaction references as a
+second cross-check so a refusal cannot silently retain `GateProbe` or call the canonical refusal
+entry without bounding. The refreshed source population, including construction changes and helper
+expansion, is what the closure check compares with the classified inventory. The census at 415e1e86
+predates the implementation base and is only a starting list, never the checked population or a
+required final count.
+
+No blanket masking pass is added to `runtime_error_value`. Typed runtime failures commonly use it,
+but MCP parse and envelope errors, CLI preflight errors, value-based failure entries and successful
+dry-run results can bypass it. It also cannot repair an already transformed cause or protect an
+earlier log or persistence copy. Source rendering is the enforcement point for this amendment.
+
+**Tradeoffs and limits.** The rule is deterministic and adds no dependency or storage change.
+Parameter syntax and record existence grant no masking bypass. Lowercase canonical UUIDs have the
+upper bound `log2(17)`, about 4.087463 bits per byte; this is not an attainable maximum for their
+fixed hyphen layout. For a 36-byte mixed-case canonical UUID, four hyphens leave 32 positions over
+22 hex symbols. The maximizing counts have ten hex symbols occurring twice and twelve once, giving
+about 4.392147 bits per byte. Both bounds are below 4.5. Pure mixed-case hex is bounded by
+`log2(22)`, about 4.459432. These observations explain useful surviving diagnostics, not secrecy.
+
+False positives remain intentional. `QuarterlyBudgetReview_2026-10-25_East_XYZ` has 41 bytes and
+entropy 4.570609, so its whole candidate is masked. `CustomerSupportEscalationRoutingPolicy_v2.7`
+has 43 bytes and entropy 4.423488; its longest URL-safe candidate has 41 bytes and entropy 4.305859,
+and its longest alphanumeric run has 38 bytes and entropy 4.113206. None qualifies. The 60-byte path
+`/srv/BuildArtifacts/WestRegion42/QuarterlyReports/Q3-2026_v7` has entropy 4.667912 and is masked as
+one candidate. These examples assume no ordinary detector match. A short typo such as `inbxo`
+remains visible. Bare hex credentials, shorter or low-entropy values, and some encoded, split or
+diluted values remain explicit residuals. For example, the single caller value
+`aaaa/aaaa/aaaa/aaaa/aaaa/Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` is one 57-byte broad candidate with
+entropy about 4.044323, and its URL-safe and alphanumeric pieces are shorter than 24 bytes, so it
+stays visible. This is bounded diagnostic hygiene, not detection of every secret.
+
+### Acceptance
+
+1. **Closed contract and isolation.** Exhaustively exercise the surface table, including `Refusal`
+   and `GateProbe`. All surfaces remain permanently mask-only; existing durable targets stay exact.
+   Masking cannot consult an exemption, perform admission, stamp a record or emit an event. Write
+   scanning, accepted parameter syntax, ordinary previews and backend diagnostic policy remain
+   unchanged. Charter and moodboard sources are unchanged. Accept this amendment and its contract
+   declaration before accepting the dependent implementation.
+2. **Refusal population.** Exercise each dynamic inventory route through a reachable public path or
+   its shared boundary, covering every distinct output consumer. Include previously unmasked
+   parameter decoders, direct echoes, MCP options and DSL errors, CLI preflight, value-based
+   failures, and atom collision and deletion refusals. Check caller-derived operation labels outside
+   the error object too. In `kkernel exec --ops-file`, a line naming an unknown high-entropy tool
+   counts as one failed operation, and the label appears in neither the output nor a saved manifest.
+   Use a prefixed credential, a qualifying bare value and a benign input
+   wherever that branch accepts their shapes. Assert error kinds, parameter names, accepted-value
+   lists, absence of every unsafe copy, and the literal canonical marker independently of the
+   production masker's return value. Expected output must not call the masker under test.
+3. **Reachability.** Record the guards for the no-prefix-match branch in `resolve_uuid_or_prefix`,
+   the corresponding memory `source_id` branch, and the `comm.thread.after` not-a-message branch.
+   Their UUID or pure-hex shapes cannot supply the general qualifying bare or prefixed credential
+   witnesses. Exercise reachable unknown, wrong-kind and prefix values there, and exercise secrets
+   through the sibling shape-rejection routes. Do not claim an unexecuted branch or require deletion
+   of a masking call to fail behaviorally when masking is a no-op for all reachable inputs.
+4. **Executed red baseline.** Pass `Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0` as an unknown `comm.inbox` projection
+   field against f689534b642d3dd421f65b6aa89e5a52293f989b. It has 24 distinct ASCII bytes and
+   entropy 4.584963. The independent non-disclosure assertion must fail there and pass on the
+   implementation. Retain the same test input and assertions in both runs. Record both source
+   revisions, the test patch or its digest, command, exit status and relevant assertion output in
+   the implementation's acceptance evidence. A compilation failure, ignored test, source prediction
+   or implementation-only run does not establish this result. Cover `comm.thread` as the other
+   projection-helper consumer.
+5. **Candidate discrimination.** Pin literal outputs for compact arrays and objects containing the
+   bare witness, quotes and a following period, repeated matches, and overlapping classes. Require
+   `["***MASKED***"]` and `{"k":"***MASKED***"}` for the respective compact forms. Require
+   `["aaaaaaaaaaaaaaaaaaaaaaaaaaaa","***MASKED***"]` for the compact array whose second item is
+   `Ab3Cd4Ef5Gh6-Jk7Lm8Np9Qr0`. Require `aaaa/aaaa/aaaa/aaaa/aaaa/***MASKED***` for that same value
+   after the path prefix. For `aaaaaaaaaaaaaaaaaaaaaaaaaaaa_Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0`, retain the
+   filler and underscore and replace only the alphanumeric value. These inputs distinguish the
+   URL-safe and alphanumeric classes from enclosing-run masking.
+6. **Base64 and numeric boundaries.** Pin `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` as a single masked
+   candidate, alone and inside compact JSON. Its 32 distinct bytes have entropy 5.0; its shorter
+   URL-safe and alphanumeric pieces cannot satisfy the length floor. The broad class must include
+   `+`, `/` and the final `=`. A 23-byte input of 23 distinct bytes, entropy log2(23) (about
+   4.523562), remains visible under the added pass because it is below the 24-byte floor; a 24-byte
+   input of 24 distinct bytes, entropy about 4.584963, qualifies.
+   `ABCDEFGHIJKLMNOPQRSTUVWXABCDEFGH` has 32 bytes and entropy exactly 4.5 and qualifies. Exercise
+   whitespace, controls, non-ASCII delimiters, terminal periods, ordinary early returns, all
+   documented false positives and retained ordinary detector matches.
+7. **Transformed diagnostics and refusal rows.** Use `AaBbCcDdEeFfGgHhJjKkLl12` in
+   `parse_event_kind`: the original has entropy 4.584963, while its lowercase copy has entropy
+   3.668296. Neither copy may appear in any refusal field. Pass the same value as the `review`
+   decision; neither copy may appear in its unknown-decision refusal. In a `$prev` substitution
+   failure whose key path holds `aaaaaaaaaaaaaaaaaaaa` and then `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=`,
+   the first key stays visible and the second is masked; their dotted join, 53 bytes with entropy
+   about 4.097004, would not qualify as one candidate. Preserve authoritative valid variants and
+   template punctuation. Cover trimming, escaping and truncation at affected diagnostic boundaries.
+   In refused atom dry-run rows, verify the slug and message together, `identity_masked`, and any
+   dynamic location. In non-refused rows and `scan` previews, pin ordinary behavior with off-trigger
+   bare values, prefixed credentials, benign text and UUIDs.
+8. **Typed values and limits.** Preserve the quoted unknown canonical UUID
+   `ffffffff-ffff-4fff-8fff-ffffffffffff` and current `comm.thread.after` refusal wording. Retain
+   wrong-kind and valid-prefix witnesses and add uppercase and mixed-case canonical UUID cases.
+   Cover failed parsing, appended credentials and trigger-labeled lookalikes. Pin the survival of an
+   off-trigger synthetic 32-hex value as a disclosed residual, including in an untyped operand.
+   Exercise timestamps only where a reachable refusal actually renders them.
+9. **Bounds and work.** Exercise inputs below, at and above `MASK_WINDOW_CHARS`, a straddling token,
+   a single oversized token, complete bridge fragments removed at the truncated tail without a
+   visible trigger, UTF-8 boundaries, and smaller output caps. Verify the exact ellipsis and flags,
+   with no restored raw tail or duplicate disclosure. Check the acyclic call path and bounded work
+   for ordinary scanning, fragment removal and each added candidate class. Keep the existing
+   ordinary-masker tokenization regression; do not apply its count to the whole bounded wrapper.
+10. **Inventory closure.** Regenerate discovery at the implementation revision and compare
+    identities, constructions, consumers and policies, not only totals. Fail for missing, extra,
+    duplicate or changed entries without corresponding classification. Positive controls must
+    discover an added unmasked error constructor, a raw deserializer conversion, a new wrapper
+    consumer, a refusal row inside a success result, and a refusal routed through `GateProbe`. Cover
+    aliases and indirect surfaces or prohibit them outside classified helpers. The historical census
+    is not acceptance evidence for the refreshed population.
+
+### Alternatives considered
+
+- **Two refusal variants.** Rejected because operands and opaque diagnostics use the same masking
+  and exemption contract. The inventory records their different construction and provenance needs
+  without duplicating the runtime policy.
+- **Projection backstop plus a smaller migration.** Rejected for this amendment. A typed projection
+  is useful for failures that reach it, but cannot replace the bypass and source-rendering work.
+  Generic projected error kinds also group refusals with operational failures. Scanning them all
+  would mask unrelated diagnostics and trusted metadata; selecting them by message spelling is not a
+  stable contract. A future backstop needs an explicit typed population and bounded field policy.
+- **Migrate only existing `GateProbe` calls and defer never-masked routes.** Rejected because direct
+  echoes, deserializer errors and refused-row siblings expose the same caller values now. Existing
+  masker references do not define the refusal population.
+- **One broad candidate class or only alphanumeric candidates.** Rejected. A broad run alone can
+  dilute a path-embedded value below threshold; alphanumeric runs alone miss punctuation-split
+  URL-safe and base64 values. The three explicit classes close those cases without arbitrary
+  substring search. Masking an enclosing token on an inner hit unnecessarily loses surrounding text.
+- **Strict `GateProbe`, forced trigger context or a successful-parse bypass.** Rejected because they
+  respectively change previews, activate other detector families, or confuse syntax with secrecy. No
+  new shape exemption or lower entropy threshold is introduced.
+- **Keep current masking or erase every diagnostic wholesale.** Rejected for request refusals. The
+  former retains the demonstrated bare-value leakage; the latter removes parameter metadata needed
+  to repair a request. Existing ordinary preview behavior and the stated heuristic residuals remain
+  deliberate limits.

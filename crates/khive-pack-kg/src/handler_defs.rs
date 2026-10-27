@@ -1023,7 +1023,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
-                    implements: project->concept, service->concept. \
+                    implements: project->concept, service->concept, artifact->concept. \
                     competes_with (symmetric): concept<->concept, project<->project, service<->service, org<->org. \
                     composed_with (symmetric): concept<->concept, project<->project. \
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
@@ -1113,7 +1113,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "node_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
@@ -1193,13 +1193,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "roots",
+                name: "ids",
                 param_type: "array of uuid",
                 required: true,
                 description: "Starting node complete UUIDs, unique 8+ hex prefixes, or entity \
                               names (maximum 100; aliases resolving to the same UUID are \
                               de-duplicated). Prefix and name resolution search the caller's \
-                              primary namespace.",
+                              primary namespace. `roots` and `start_ids` remain accepted aliases for `ids`.",
                 resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {

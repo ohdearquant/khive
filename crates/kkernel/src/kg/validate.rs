@@ -14,6 +14,17 @@ use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
 
+mod cohorts;
+mod fixes;
+mod render;
+
+use cohorts::RuleCohorts;
+use fixes::apply_fixes;
+use render::render_validation;
+
+#[cfg(test)]
+use fixes::fix_sort_order;
+
 /// Taxonomy sets derived from the loaded pack registry; `pub(super)` so
 /// `kg::commit` (ADR-102) can reuse them. See
 /// `crates/kkernel/docs/kg-rules.md#build_taxonomy--strict-actor-mode-exemption`.
@@ -106,7 +117,54 @@ impl std::fmt::Display for RulesSyntaxOrFormatError {
     }
 }
 
+#[derive(Debug)]
+struct SortFix {
+    file: &'static str,
+    moved: usize,
+}
+
+#[derive(Debug, Default)]
+struct FixedCounts {
+    errors: usize,
+    warnings: usize,
+    info: usize,
+}
+
+#[derive(Debug, Default)]
+struct FixSummary {
+    files: Vec<SortFix>,
+    fixed: FixedCounts,
+}
+
+#[derive(Debug)]
+struct ValidationRun {
+    report: ValidationReport,
+    fixes: Option<FixSummary>,
+}
+
 pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
+    let run = match run_validation(&args) {
+        Ok(run) => run,
+        Err(error) if error.is::<RulesSyntaxOrFormatError>() => {
+            eprintln!("Error: {error:?}");
+            std::process::exit(2);
+        }
+        Err(error) => return Err(error),
+    };
+    render_validation(
+        &run,
+        &args,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )?;
+    if !run.report.summary.passed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The command and its tests share the complete check/fix/recheck pipeline.
+fn run_validation(args: &ValidateArgs) -> Result<ValidationRun> {
     let kg_dir = args.repo.join(".khive/kg");
     if !kg_dir.exists() {
         bail!(
@@ -114,44 +172,86 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
             kg_dir.display()
         );
     }
-
     let entities_path = kg_dir.join("entities.ndjson");
     let edges_path = kg_dir.join("edges.ndjson");
     let notes_path = kg_dir.join("notes.ndjson");
-
-    let entities = count_ndjson_lines(&entities_path).unwrap_or(0);
-    let edges = count_ndjson_lines(&edges_path).unwrap_or(0);
-    let notes = count_ndjson_lines(&notes_path).unwrap_or(0);
-
-    let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.toml"));
-
+    let rules_path = args
+        .rules
+        .clone()
+        .unwrap_or_else(|| kg_dir.join("rules.toml"));
     let taxonomy = build_taxonomy()?;
-    let mut rule_results: Vec<RuleResult> =
-        structural_checks(&entities_path, &edges_path, &notes_path, &taxonomy);
-
-    if !args.no_rules && rules_path.exists() {
-        let configurable =
-            match configurable_rule_checks(&entities_path, &edges_path, &notes_path, &rules_path) {
-                Ok(results) => results,
-                Err(error) if error.is::<RulesSyntaxOrFormatError>() => {
-                    eprintln!("Error: {error:?}");
-                    std::process::exit(2);
-                }
-                Err(error) => return Err(error),
-            };
-        rule_results.extend(configurable);
+    let mut report = collect_validation_report(
+        args,
+        &entities_path,
+        &edges_path,
+        &notes_path,
+        &rules_path,
+        &taxonomy,
+    )?;
+    if args.fix {
+        report.ensure_unique_ids("original")?;
     }
+    let mut fixes = args.fix.then(FixSummary::default);
+    if args.fix
+        && report.rules().any(|rule| {
+            rule.id == "sort-order"
+                && !rule.passed
+                && rule.violations.iter().any(|violation| violation.fixable)
+        })
+    {
+        let files = apply_fixes(&args.repo)?;
+        let final_report = collect_validation_report(
+            args,
+            &entities_path,
+            &edges_path,
+            &notes_path,
+            &rules_path,
+            &taxonomy,
+        )?;
+        let fixed = report
+            .fixed_counts_after(&final_report)
+            .context("reconciling rule identities after --fix (files may already have changed)")?;
+        fixes = Some(FixSummary { files, fixed });
+        report = final_report;
+    }
+    Ok(ValidationRun {
+        report: report.into_report(),
+        fixes,
+    })
+}
 
-    let errors: usize = rule_results
+fn collect_validation_report(
+    args: &ValidateArgs,
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    rules_path: &Path,
+    taxonomy: &KgTaxonomy,
+) -> Result<RuleCohorts> {
+    let entities = count_ndjson_lines(entities_path).unwrap_or(0);
+    let edges = count_ndjson_lines(edges_path).unwrap_or(0);
+    let notes = count_ndjson_lines(notes_path).unwrap_or(0);
+
+    let structural = structural_checks(entities_path, edges_path, notes_path, taxonomy);
+    let configurable = if !args.no_rules && rules_path.exists() {
+        configurable_rule_checks(entities_path, edges_path, notes_path, rules_path)?
+    } else {
+        Vec::new()
+    };
+
+    let errors: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "error" && !r.passed)
         .count();
-    let warnings: usize = rule_results
+    let warnings: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "warning" && !r.passed)
         .count();
-    let info: usize = rule_results
+    let info: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "info" && !r.passed)
         .count();
 
@@ -171,33 +271,7 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
         passed,
     };
 
-    let report = ValidationReport {
-        rules: rule_results,
-        summary,
-    };
-
-    match args.format {
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&report).expect("serialize ValidationReport");
-            println!("{json}");
-        }
-        OutputFormat::Github => print_github_format(&report),
-        OutputFormat::Text => print_text_format(&report, args.verbose, args.quiet),
-    }
-
-    if args.fix
-        && report
-            .rules
-            .iter()
-            .any(|rule| !rule.passed && rule.violations.iter().any(|violation| violation.fixable))
-    {
-        apply_fixes(&args.repo)?;
-    }
-
-    if !report.summary.passed {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(RuleCohorts::new(structural, configurable, summary))
 }
 
 fn count_ndjson_lines(path: &Path) -> Option<usize> {
@@ -908,148 +982,6 @@ fn check_citation_date_lint(
         cfg,
         chrono::Utc::now(),
     )
-}
-
-fn apply_fixes(repo: &std::path::Path) -> Result<()> {
-    let kg_dir = repo.join(".khive/kg");
-    fix_sort_order(&kg_dir.join("entities.ndjson"), "id")?;
-    fix_sort_order_edges(&kg_dir.join("edges.ndjson"))?;
-    eprintln!("~ sort-order: applied fix to entities.ndjson and edges.ndjson");
-    Ok(())
-}
-
-pub(super) fn fix_sort_order(path: &Path, sort_key: &str) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut lines: Vec<serde_json::Value> = Vec::new();
-    for (idx, l) in content
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
-    {
-        let v = serde_json::from_str(l).with_context(|| {
-            format!(
-                "{} line {}: refusing to apply --fix over malformed JSON; run `kg validate` for details",
-                path.display(),
-                idx + 1
-            )
-        })?;
-        lines.push(v);
-    }
-    lines.sort_by(|a, b| {
-        let ak = a.get(sort_key).and_then(|v| v.as_str()).unwrap_or("");
-        let bk = b.get(sort_key).and_then(|v| v.as_str()).unwrap_or("");
-        ak.cmp(bk)
-    });
-    let out: String = lines
-        .iter()
-        .map(|v| serde_json::to_string(v).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(path, out + "\n").with_context(|| format!("write {}", path.display()))
-}
-
-fn fix_sort_order_edges(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut lines: Vec<serde_json::Value> = Vec::new();
-    for (idx, l) in content
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
-    {
-        let v = serde_json::from_str(l).with_context(|| {
-            format!(
-                "{} line {}: refusing to apply --fix over malformed JSON; run `kg validate` for details",
-                path.display(),
-                idx + 1
-            )
-        })?;
-        lines.push(v);
-    }
-    lines.sort_by(|a, b| {
-        let ak = (
-            edge_source_id(a).unwrap_or(""),
-            edge_target_id(a).unwrap_or(""),
-            a.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
-        );
-        let bk = (
-            edge_source_id(b).unwrap_or(""),
-            edge_target_id(b).unwrap_or(""),
-            b.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
-        );
-        ak.cmp(&bk)
-    });
-    let out: String = lines
-        .iter()
-        .map(|v| serde_json::to_string(v).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(path, out + "\n").with_context(|| format!("write {}", path.display()))
-}
-
-fn print_text_format(report: &ValidationReport, verbose: bool, quiet: bool) {
-    if !quiet {
-        for r in &report.rules {
-            let symbol = if r.passed {
-                "\u{2713}"
-            } else if r.severity == "error" {
-                "\u{2717}"
-            } else {
-                "\u{26a0}"
-            };
-            if r.violations.is_empty() {
-                println!("  {symbol} {}", r.id);
-            } else {
-                println!("  {symbol} {}: {} violation(s)", r.id, r.violations.len());
-                let shown = if verbose {
-                    r.violations.len()
-                } else {
-                    2.min(r.violations.len())
-                };
-                for v in &r.violations[..shown] {
-                    let prefix = record_prefix(v.entity_id.as_deref(), v.entity_name.as_deref());
-                    // Include record identifier when not already in the message.
-                    if prefix.is_empty() || v.message.starts_with(prefix.trim()) {
-                        println!("    - {}", v.message);
-                    } else {
-                        println!("    - {}{}", prefix, v.message);
-                    }
-                }
-                if !verbose && r.violations.len() > 2 {
-                    println!("    + {} more (run with --verbose)", r.violations.len() - 2);
-                }
-            }
-        }
-    }
-    let s = &report.summary;
-    let empty = if s.empty { "; empty graph" } else { "" };
-    println!(
-        "\nSummary: {} error(s), {} warning(s), {} entities, {} edges{empty}",
-        s.errors, s.warnings, s.entities, s.edges
-    );
-}
-
-fn print_github_format(report: &ValidationReport) {
-    if report.summary.empty {
-        println!("::notice ::Empty graph: no entity, edge, or note records read");
-    }
-    for r in &report.rules {
-        for v in &r.violations {
-            let level = if r.severity == "error" {
-                "error"
-            } else {
-                "warning"
-            };
-            println!("::{level} ::{}", v.message);
-        }
-    }
 }
 
 #[cfg(test)]

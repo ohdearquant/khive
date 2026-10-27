@@ -12,9 +12,7 @@ use serde_json::{json, Value};
 
 use crate::coordinator::CoordinatorService;
 
-use super::batch_types::{
-    error_disposition, error_with_disposition, failure_entry, DispatchFailure,
-};
+use super::batch_types::{failure_entry, DispatchFailure};
 use super::search_diagnostics::{
     backend_errors_value, search_arm_participation_value, search_incomplete_error, OpSuccess,
     SearchDegradation, SearchStatus,
@@ -336,8 +334,8 @@ pub(super) async fn dispatch_via_coordinator_inner(
     }
 }
 
-/// Resolve the coordinator search boundary's extra read-visibility set
-/// (MAJ-3 fix), mirroring the normal registry dispatch path's default-case
+/// Resolve the coordinator search boundary's extra read-visibility set,
+/// mirroring the normal registry dispatch path's default-case
 /// widening to `['local'] ∪ visible_namespaces`
 /// (`khive_runtime::pack::VerbRegistry::dispatch_with_identity`,
 /// `crates/khive-runtime/src/pack.rs`). Without this, `fan_out_search`
@@ -389,12 +387,13 @@ pub(super) fn coordinator_search_visibility(
 /// Apply MCP transport limits after the shared typed projection. The boundary's
 /// original disposition decides whether an obligation result may be retained;
 /// named error overrides remain exactly as emitted by the shared projection.
+#[cfg(test)]
 pub(super) fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
-    let projected = khive_runtime::runtime_error_value(error, disposition);
-    let projected_disposition = error_disposition(&projected);
-    let mut value = error_with_disposition(projected, disposition);
-    value["domain_disposition"] = json!(projected_disposition.as_str());
-    value
+    khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Runtime {
+        error,
+        boundary: disposition,
+    })
+    .into_error()
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
@@ -403,7 +402,7 @@ pub(super) fn runtime_error_value(error: RuntimeError, disposition: DomainDispos
 /// recursive `Value` operation (clone, serialize, presentation transform)
 /// touches it — see `crates/khive-mcp/docs/design.md` (Result depth guard).
 pub(super) fn result_within_depth_limit(result: &Value) -> bool {
-    khive_request::value_nesting_within_limit(result, khive_request::NESTING_DEPTH_LIMIT)
+    khive_runtime::daemon::error_detail_value_within_limit(result)
 }
 
 /// Per-op error payload for a handler result that failed
@@ -496,14 +495,7 @@ pub(super) fn ok_envelope(tool: String, success: OpSuccess) -> Value {
 /// onto an explicit heap-allocated worklist keeps each removal O(1) on the
 /// call stack regardless of nesting depth.
 pub(super) fn drop_value_iteratively(value: Value) {
-    let mut stack = vec![value];
-    while let Some(v) = stack.pop() {
-        match v {
-            Value::Array(items) => stack.extend(items),
-            Value::Object(map) => stack.extend(map.into_values()),
-            _ => {}
-        }
-    }
+    khive_runtime::daemon::drop_error_detail_iteratively(value);
 }
 
 /// Builds a `substitution_error` payload for a `$prev` argument that failed

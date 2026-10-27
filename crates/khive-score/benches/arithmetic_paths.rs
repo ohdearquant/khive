@@ -203,9 +203,38 @@ fn weight_paths(c: &mut Criterion) {
     group.finish();
 }
 
+fn weighted_mean_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("named_weighted_mean");
+    for (count, pair, expected) in [
+        (2usize, [0.25, 0.625], 0.5_f64),
+        (8, [0.0, 0.375], 0.25),
+        (32, [0.5, 0.875], 0.75),
+    ] {
+        let configured: HashMap<usize, f64> = (0..count)
+            .map(|key| (key, if key % 2 == 0 { 1.0 } else { 2.0 }))
+            .collect();
+        let weights = NamedWeights::try_new(configured).expect("valid configured weights");
+        let features: Vec<_> = (0..count).map(|key| (key, pair[key % 2])).collect();
+        // Each weight pair is (1, 2); its exact mean is respectively 1/2, 1/4, 3/4.
+        // Max-scaled weights, feature products and accumulated sums are dyadic here.
+        assert_eq!(
+            weights
+                .weighted_mean(&features)
+                .expect("finite unique keyed features")
+                .to_bits(),
+            expected.to_bits()
+        );
+        // Time the whole method, including its duplicate-check HashSet and validation.
+        group.bench_function(BenchmarkId::new("keys", count), |b| {
+            b.iter(|| black_box(black_box(&weights).weighted_mean(black_box(features.as_slice()))));
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(20).warm_up_time(Duration::from_secs(1)).measurement_time(Duration::from_secs(3));
-    targets = strict_cosine, one_based_rrf, decay_paths, band_paths, weight_paths
+    targets = strict_cosine, one_based_rrf, decay_paths, band_paths, weight_paths, weighted_mean_paths
 }
 criterion_main!(benches);

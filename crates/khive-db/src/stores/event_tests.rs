@@ -682,3 +682,89 @@ async fn weighted_rerank_without_model_projects_candidates_and_selected() {
         payload
     );
 }
+
+#[tokio::test]
+async fn legacy_v4_event_identity_survives_append_get_and_paged_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_event_identity.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(EVENTS_DDL).unwrap();
+    }
+    let store = SqlEventStore::new_scoped(pool, true, "default");
+
+    let legacy_id = Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").unwrap();
+    assert_eq!(legacy_id.get_version_num(), 4);
+    let mut legacy = make_event("default");
+    legacy.id = legacy_id;
+    legacy.created_at = 10;
+    store.append_event(legacy.clone()).await.unwrap();
+
+    let mut current = make_event("default");
+    assert_eq!(current.id.get_version_num(), 7);
+    current.created_at = 20;
+    store.append_event(current.clone()).await.unwrap();
+
+    let mut excluded = make_event("default");
+    excluded.actor = "agent:excluded".into();
+    excluded.created_at = 30;
+    store.append_event(excluded).await.unwrap();
+
+    assert_eq!(
+        store.get_event(legacy_id).await.unwrap(),
+        Some(legacy.clone())
+    );
+    assert_eq!(
+        store.get_event(current.id).await.unwrap(),
+        Some(current.clone())
+    );
+
+    let filter = EventFilter {
+        actors: vec!["agent:test".into()],
+        kinds: vec![EventKind::SearchExecuted],
+        ..EventFilter::default()
+    };
+    let expected = vec![current, legacy.clone()];
+    let queried = store
+        .query_events(
+            filter.clone(),
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queried.items, expected);
+
+    for (offset, event) in (0..2).zip(expected) {
+        let page = store
+            .query_events(filter.clone(), PageRequest { limit: 1, offset })
+            .await
+            .unwrap();
+        assert_eq!(page.items, vec![event]);
+    }
+
+    let by_legacy_id = store
+        .query_events(
+            EventFilter {
+                ids: vec![legacy_id],
+                ..EventFilter::default()
+            },
+            PageRequest {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_legacy_id.items, vec![legacy]);
+}

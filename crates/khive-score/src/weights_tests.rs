@@ -181,3 +181,12 @@ fn named_keys_need_no_clone_bound() {
     let weights = NamedWeights::try_new(HashMap::from([(Key(1), 2.0)])).unwrap();
     assert_eq!(weights.weighted_mean(&[(Key(1), 3.0)]).unwrap(), 3.0);
 }
+
+#[test]
+fn duplicate_keys_precede_active_nonfinite_feature_errors() {
+    let weights = NamedWeights::try_new(HashMap::from([("a", 1.0), ("b", 1.0)])).unwrap();
+    assert_eq!(
+        weights.weighted_mean(&[("a", f64::NAN), ("b", 0.5), ("b", 1.0)]),
+        Err(ArithmeticError::DuplicateKey)
+    );
+}

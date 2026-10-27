@@ -15,8 +15,8 @@ struct Fixture {
 fn rows(count: usize, levels: Option<u32>, rng: &mut StdRng) -> Vec<f32> {
     (0..count * DIM)
         .map(|_| match levels {
-            Some(l) => rng.gen_range(0..l) as f32 / l as f32,
-            None => rng.gen_range(-1.0f32..1.0),
+            Some(l) => rng.random_range(0..l) as f32 / l as f32,
+            None => rng.random_range(-1.0f32..1.0),
         })
         .collect()
 }
@@ -27,7 +27,7 @@ fn fixture(n: usize, levels: Option<u32>, seed: u64) -> Fixture {
     let adjacency = (0..n)
         .map(|node| {
             let mut neighbors: Vec<u32> = (0..8)
-                .map(|_| rng.gen_range(0..n as u32))
+                .map(|_| rng.random_range(0..n as u32))
                 .filter(|&v| v != node as u32)
                 .collect();
             neighbors.sort_unstable();

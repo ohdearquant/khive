@@ -46,6 +46,20 @@ pub(super) fn masked_audit_event(
     audit
 }
 
+/// Closed retention assignment for the generic dispatch producer only.
+fn expendable_dispatch_audit(kind: EventKind, verb: &str) -> bool {
+    kind == EventKind::Audit
+        && matches!(
+            verb,
+            "comm.inbox"
+                | "comm.cleanup_expired_quarantine"
+                | "whoami"
+                | "comm.probe"
+                | "comm.cursor_get"
+                | "comm.heartbeat"
+        )
+}
+
 /// Build a v1-shape audit storage event from a gate check outcome.
 /// See `docs/api/pack.md#build_audit_storage_event` for the `resource` payload contract.
 pub(super) fn build_audit_storage_event(
@@ -72,12 +86,39 @@ pub(super) fn build_audit_storage_event(
     )
     .with_outcome(outcome)
     .with_payload(audit_data);
+    if expendable_dispatch_audit(storage_event.kind, &storage_event.verb) {
+        if let Value::Object(ref mut payload) = storage_event.payload {
+            payload.insert(
+                "retention".into(),
+                serde_json::json!({
+                    "class": "expendable",
+                    "policy": "poll-dispatch-v1",
+                    "horizon_seconds": 604800
+                }),
+            );
+        }
+    }
     storage_event.op_index = audit.op_index;
     storage_event.ref_resolution = audit.ref_resolution;
     if let Some(target_id) = target_id_from_args(&gate_req.verb, &gate_req.args) {
         storage_event = storage_event.with_target(target_id);
     }
+    if outcome == EventOutcome::Denied {
+        stamp_error_class(
+            &mut storage_event,
+            crate::audit_error::AuditErrorClass::GateRefusal,
+        );
+    }
     storage_event
+}
+
+/// Add one closed failure token; never copy error text or stamp success rows.
+pub(super) fn stamp_error_class(event: &mut Event, class: crate::audit_error::AuditErrorClass) {
+    if event.outcome != EventOutcome::Success {
+        if let Value::Object(ref mut payload) = event.payload {
+            payload.insert("error_class".into(), Value::from(class.as_str()));
+        }
+    }
 }
 
 /// Add the three ADR-174 truncation facts to the existing successful audit.
@@ -791,3 +832,7 @@ pub fn resolve_explicit_namespace(
 #[cfg(test)]
 #[path = "stream_truncate_audit_tests.rs"]
 mod stream_truncate_tests;
+
+#[cfg(test)]
+#[path = "audit_retention_tests.rs"]
+mod retention_tests;

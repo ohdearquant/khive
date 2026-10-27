@@ -67,18 +67,87 @@ pub(super) fn calls_name(text: &str, name: &str) -> bool {
 /// Prepared once per eligible body, then reused for every callee probe and
 /// fixed-point pass. This is local to one closure calculation, never a
 /// cache of filesystem contents.
-struct PreparedCallText(String);
+struct PreparedCallText {
+    text: String,
+    parameter_names: Vec<String>,
+    qualified_call_names: std::collections::HashSet<String>,
+}
+
+// Only a valid whole function establishes parameter shadowing. Unsupported
+// snippets and parameter patterns retain the old conservative name matching.
+fn function_call_context(text: &str) -> (Vec<String>, std::collections::HashSet<String>) {
+    use quote::ToTokens as _;
+
+    let Ok(function) = syn::parse_str::<syn::ItemFn>(text) else {
+        return (Vec::new(), std::collections::HashSet::new());
+    };
+    let parameter_names = function
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::FnArg::Typed(argument) => match argument.pat.as_ref() {
+                syn::Pat::Ident(binding) => Some(binding.ident.to_string()),
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let mut qualified_call_names = std::collections::HashSet::new();
+    collect_qualified_call_names(function.block.to_token_stream(), &mut qualified_call_names);
+    (parameter_names, qualified_call_names)
+}
+
+// Tokenization removes intervening comments. Requiring a following argument
+// group distinguishes a call from a method/associated-function reference.
+fn collect_qualified_call_names(
+    tokens: proc_macro2::TokenStream,
+    names: &mut std::collections::HashSet<String>,
+) {
+    use proc_macro2::{Delimiter, TokenTree};
+
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if let TokenTree::Group(group) = token {
+            collect_qualified_call_names(group.stream(), names);
+        }
+        let TokenTree::Ident(name) = token else {
+            continue;
+        };
+        let Some(TokenTree::Group(arguments)) = tokens.get(index + 1) else {
+            continue;
+        };
+        if arguments.delimiter() != Delimiter::Parenthesis {
+            continue;
+        }
+        let punct = |at, expected| matches!(tokens.get(at), Some(TokenTree::Punct(punct)) if punct.as_char() == expected);
+        let qualified = (index >= 1 && punct(index - 1, '.'))
+            || (index >= 2 && punct(index - 1, ':') && punct(index - 2, ':'));
+        if qualified {
+            let spelling = name.to_string();
+            if let Some(unraw) = spelling.strip_prefix("r#") {
+                names.insert(unraw.to_owned());
+            }
+            names.insert(spelling);
+        }
+    }
+}
 
 impl PreparedCallText {
     fn new(text: &str) -> Self {
-        Self(strip_string_literals(text))
+        let (parameter_names, qualified_call_names) = function_call_context(text);
+        Self {
+            text: strip_string_literals(text),
+            parameter_names,
+            qualified_call_names,
+        }
     }
 
     fn contains_call(&self, name: &str) -> bool {
         fn is_ident_byte(b: u8) -> bool {
             b.is_ascii_alphanumeric() || b == b'_'
         }
-        let text = &self.0;
+        let text = &self.text;
         let bytes = text.as_bytes();
         let mut search_from = 0usize;
         while let Some(rel) = text[search_from..].find(name) {
@@ -91,7 +160,15 @@ impl PreparedCallText {
             }
             let after_ok = j < bytes.len() && bytes[j] == b'(';
             let is_definition = text[..idx].ends_with("fn ");
-            if before_ok && after_ok && !is_definition {
+            if before_ok
+                && after_ok
+                && !is_definition
+                && (!self
+                    .parameter_names
+                    .iter()
+                    .any(|parameter| parameter == name)
+                    || self.qualified_call_names.contains(name))
+            {
                 return true;
             }
             search_from = idx + 1;
@@ -339,5 +416,77 @@ mod tests {
             assert!(known.iter().any(|candidate| candidate == name), "{name}");
         }
         assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn function_callback_parameter_does_not_reach_an_unrelated_same_name_helper() {
+        let callback = concat!(
+            "pub async fn daemon<D, F>(dispatcher: D, start: F)\n",
+            "where D: Dispatcher, F: FnOnce(&D) + Send {\n",
+            "    invoke(|dispatcher| start(dispatcher));\n",
+            "}",
+        );
+        assert!(!calls_name(callback, "start"));
+
+        let producer = "fn start() { runtime.record_config_locked(item); }";
+        let bodies = [callback, producer].map(super::super::fn_bodies);
+        let known = crate_seam_names(&bodies, &["record_config_locked"]);
+        assert!(known.iter().any(|name| name == "start"));
+        assert!(!known.iter().any(|name| name == "daemon"));
+    }
+
+    #[test]
+    fn qualified_and_unshadowed_calls_survive_parameter_projection() {
+        for text in [
+            "fn boot(start: Callback) { Self::start(); }",
+            "fn boot(start: Callback) { module::start(); }",
+            "fn boot(start: Callback) { ::start(); }",
+            "fn boot(start: Callback) { object.start(); }",
+            "fn boot(start: Callback) { object .\n start(); }",
+            "fn boot(start: Callback) { module ::\n start(); }",
+            "fn boot(start: Callback) { object. /* context */ start(); }",
+            "fn boot(start: Callback) { object.r#start(); }",
+            "fn boot(start: Callback) { module::r#start(); }",
+            "fn boot(start: Callback) { module:: /* context */ start(); }",
+            "fn boot(start: Callback) { Self:: /* context */ start(); }",
+            "fn boot(start: Callback) { :: /* context */ start(); }",
+            "fn boot(start: Callback) { object. // context\n start(); }",
+            "fn boot(start: Callback) { invoke!(object. /* context */ start()); }",
+            "fn boot(callback: Callback) { start(); }",
+            "fn boot() { supplied.unwrap_or_else(|| start()); }",
+        ] {
+            assert!(calls_name(text, "start"), "{text}");
+        }
+        assert!(calls_name(
+            "fn observe(record_config_locked: Callback) { runtime.record_config_locked(item); }",
+            "record_config_locked",
+        ));
+        assert!(calls_name(
+            "fn observe() { supplied.unwrap_or_else(|| runtime.record_config_locked(item)); }",
+            "record_config_locked",
+        ));
+    }
+
+    #[test]
+    fn unparsed_function_snippets_keep_conservative_name_matching() {
+        for text in [
+            "fn boot(start: Callback) { start(dispatcher);",
+            "start(dispatcher);",
+            "fn boot(start: Callback) start(dispatcher);",
+            "fn boot((start, _): (Callback, ())) { start(); }",
+        ] {
+            assert!(calls_name(text, "start"), "{text}");
+        }
+    }
+
+    #[test]
+    fn qualified_field_references_do_not_rescue_a_shadowed_callback() {
+        for text in [
+            "fn boot(start: Callback) { let callback = object.start; start(); }",
+            "fn boot(start: Callback) { let callback = module::start; start(); }",
+            "fn boot(start: Callback) { let callback = object. /* context */ start; start(); }",
+        ] {
+            assert!(!calls_name(text, "start"), "{text}");
+        }
     }
 }

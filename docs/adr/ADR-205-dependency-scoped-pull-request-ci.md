@@ -131,7 +131,7 @@ Phase 1 has landed: the map registry loaded from configuration (#5612) and `code
 
 Phase 2 has landed in part (#5638): the classifier script and the Classify job's `test_scope` output (D1 to D4), the scoped `ci` job (D5), the gate reading the scope (D6), the debug `kkernel` artifact published by `main` push runs, and the retirement of the integration-only lane (D7). #5717 adds a full-suite rule for a changed file that another crate includes. The escape audit issue is #5637 (D8).
 
-Not implemented: the D3a mechanical range check for `main` pushes, and the D8 parity test against `cargo metadata`. D9's acceptance has not been read. The status stays Proposed until it is.
+D8's parity test landed in #6123 (`crates/khive-pack-code/src/source_ingest/workspace_parity_tests.rs`) and reached `main` with the merge from `dev/khive` of 2026-10-26; it runs in the full suite. Amendment 3 withdraws D3a, so no decision in D1 to D8 is waiting on code. D9's acceptance has not been read, and the status stays Proposed until it is.
 
 ## Amendment 1: Scope integration-branch pushes, and narrow three full-suite triggers (2026-10-18)
 
@@ -353,3 +353,54 @@ an arm of its check, and each named mutation must turn the arm it names red.
    `b` alone omits `a`); a link present at the base and removed at the head runs the full suite; a range with no link
    in either tree is unaffected. Mutations: read modes of the changed paths only (the unchanged-link arm fails); read
    the head tree only (the removed-link arm fails).
+
+## Amendment 3: Pushes to `main` always run the full suite, and D3a is withdrawn (2026-10-27)
+
+**Status**: Proposed (2026-10-27)
+
+### Context
+
+D3a lets a push to `main` run the dependents closure instead of the full suite when every commit since the newest
+full-suite run on `main` is the squash merge of a pull request labeled `mechanical`. Three facts at `main` a789c1b6
+make it a rule that never applies:
+
+1. It was never built. The scope step in `ci.yml` scopes pull requests and pushes to `integration/**` only; every other
+   run prints "runs on <ref> are never scoped" and takes the full suite. The workflow tests pin that scheduled,
+   dispatched and other-branch runs get no comparison base, which leaves the scope at full
+   (`test_job_other_events_run_the_full_suite`). The repository has no `mechanical` label.
+2. Its input no longer reaches `main`. Feature work, moves and renames land on the `dev/khive` integration branch and
+   reach `main` in merge commits from that branch. A range that contains such a merge commit fails D3a's test by
+   construction, because a merge commit is not the squash merge of a labeled pull request. The pull requests that still
+   squash-merge into `main` directly are dependency updates, releases and fixes: of the twelve newest first-parent
+   commits on `main`, eight are squash merges of that kind and four are merges from `dev/khive`, and none is a move.
+3. D9 makes it a condition of acceptance ("a mechanical push to `main` whose range spans at least two merges has run
+   its closure"). With no mechanical pull request reaching `main`, that condition cannot be met, so this record cannot
+   be accepted as written.
+
+Every push to `main` therefore runs the full suite today, which is the outcome D3a falls back to.
+
+### Decision
+
+1. D3a is withdrawn. Every push to `main` runs the full suite, and D3's first sentence reads "on every push to `main`"
+   with no exception.
+2. Runs other than pull requests keep recording the scope their suites ran (`test-scope-full`, `test-scope-scoped`,
+   `test-scope-docs`), and Amendment 1's tested-base lookup keeps reading that record. Every successful run on `main`
+   records `full`.
+3. D8's escape definition loses its mechanical-range clause and its last sentence. An escape remains a `main` push run
+   that fails in a crate outside the scope of the pull request that produced it, the integration-push case Amendment 1
+   adds, or a run that fails the coverage ratchet after a scoped pull request merged.
+4. D9 loses the mechanical-range condition. The rest of D9 stands: 20 consecutive pull-request runs with runner-minutes
+   read beside the baseline, the parity test green on `main`, one deliberately scoped run refused by the gate, and no
+   escape.
+5. Phase 2 no longer includes the D3a range check.
+
+If code moves reach `main` again as direct squash merges, a later amendment can restore a range rule. It counts toward
+acceptance only once the label exists and the range check is built.
+
+### Verify by
+
+1. The newest successful push run on `main` lists `test-scope-full` among its artifact names (run 40371397780 at
+   057244cc does). Control, run in the same read: an integration push run whose scope was a closure lists
+   `test-scope-scoped` (run 39843379071, `integration/train-193`, does), so the read can tell the two apart.
+2. `test_job_other_events_run_the_full_suite` stays green and gains a push to `refs/heads/main` among its cases.
+   Mutation: let the scope step take the integration branch's path for `refs/heads/main`; the new case fails.

@@ -31,6 +31,16 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
+COMPARISON_CLASS = {
+    "cores": "2,3",
+    "cpu": "Example CPU 8C",
+    "cpufreq": {"governor": ["performance"]},
+    "kernel": "6.8.0-1-generic",
+    "profile": "bench",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+}
+
+
 class Fixture:
     def __init__(self, root):
         self.root = pathlib.Path(root)
@@ -65,6 +75,7 @@ class Fixture:
         return {
             "schema": "bench-reference/v1",
             "crate": self.crate,
+            "class": COMPARISON_CLASS,
             "sha": sha,
             "benches": benches,
         }
@@ -80,6 +91,18 @@ def measured(median_ns, aa_spread=1.001):
 
 def unmeasured():
     return {"verdict": "UNMEASURED"}
+
+
+def criterion_row(median_ns, aa_spread):
+    return {
+        "a": {"median_ns": median_ns},
+        "aa_spread": aa_spread,
+        "b": {"median_ns": median_ns},
+        "kind": "criterion",
+        "median_ns": median_ns,
+        "metric": "median_ns",
+        "verdict": "MEASURED",
+    }
 
 
 def quiet_main(*args):
@@ -132,6 +155,38 @@ class RendererTests(unittest.TestCase):
         self.assertIn(self.sha, text)
         self.assertIn("2026-01-02", text)
         self.assertNotIn("old", text)
+
+    def test_block_names_the_comparison_class(self):
+        self.fixture.write_document(
+            f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        )
+        self.write_block(
+            self.fixture.v1(self.sha, {"search/query": measured(1000.0)})
+        )
+        self.assertIn(
+            "Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, "
+            "Example CPU 8C, cores 2,3, kernel 6.8.0-1-generic.",
+            self.fixture.document.read_text(),
+        )
+
+    def test_reference_without_a_complete_comparison_class_is_refused(self):
+        document = f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        incomplete = {key: value for key, value in COMPARISON_CLASS.items() if key != "kernel"}
+        for label, payload, expected in (
+            ("no class", {"class": None}, "class must be"),
+            ("no kernel", {"class": incomplete}, "class.kernel"),
+        ):
+            with self.subTest(label):
+                self.fixture.write_document(document)
+                reference = self.fixture.v1(self.sha, {"search/query": measured(1000.0)})
+                reference.update(payload)
+                if reference["class"] is None:
+                    del reference["class"]
+                self.fixture.write_reference(reference)
+                code, _, stderr = quiet_main("--write", "--root", str(self.root))
+                self.assertEqual(code, 1)
+                self.assertIn(expected, stderr)
+                self.assertEqual(self.fixture.document.read_text(), document)
 
     def test_unmeasured_row_is_never_rendered_as_a_number(self):
         self.fixture.write_document(
@@ -254,6 +309,25 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("aa_spread", stderr)
 
+    def v2(self, entries):
+        return {
+            "schema": "bench-reference/v2",
+            "crate": self.fixture.crate,
+            "class": COMPARISON_CLASS,
+            "targets": {
+                "khive-example:bench_target": {"entries": entries},
+                "khive-example:not_run": {"absence": "excluded", "reason": "excluded by the job"},
+            },
+        }
+
+    def rows(self, prefix):
+        text = self.fixture.document.read_text()
+        return [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in text.splitlines()
+            if line.startswith(f"| `{prefix}")
+        ]
+
     def test_v2_entries_use_each_entry_commit_and_target(self):
         self.fixture.write_reference(
             {"schema": "bench-reference/v1", "crate": self.fixture.crate, "sha": self.sha, "benches": {}}
@@ -263,118 +337,316 @@ class RendererTests(unittest.TestCase):
             f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
         )
         self.write_block(
-            {
-                "schema": "bench-reference/v2",
-                "crate": self.fixture.crate,
-                "targets": {
-                    "bench_target": {
-                        "entries": [
-                            {
-                                "commit": self.sha,
-                                "benchmarks": {
-                                    "scenario": {
-                                        "disposition": "MEASURED",
-                                        "median_ns": 1234.0,
-                                        "aa_spread": 1.002,
-                                    }
-                                },
-                            },
-                            {
-                                "commit": second_sha,
-                                "benchmarks": {
-                                    "scenario": {
-                                        "disposition": "UNMEASURED",
-                                        "reason": "withheld",
-                                    }
-                                },
-                            },
-                        ]
-                    }
-                },
-            }
+            self.v2(
+                [
+                    {"commit": self.sha, "benchmarks": {"scenario": {"median_ns": criterion_row(1234.0, 1.002)}}},
+                    {
+                        "commit": second_sha,
+                        "benchmarks": {
+                            "scenario": {
+                                "median_ns": {
+                                    "kind": "criterion",
+                                    "metric": "median_ns",
+                                    "verdict": "UNMEASURED",
+                                    "reasons": ["A/A spread 1.200 > 1.1"],
+                                }
+                            }
+                        },
+                    },
+                ]
+            )
         )
         text = self.fixture.document.read_text()
-        self.assertIn(self.sha, text)
-        self.assertIn(second_sha, text)
         self.assertIn("2026-01-02", text)
         self.assertIn("2026-02-03", text)
-        rows = [line for line in text.splitlines() if "`bench_target/scenario`" in line]
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(
-            [cell.strip() for cell in rows[0].strip("|").split("|")][1:3],
-            ["1.234 µs", "1.002"],
-        )
-        self.assertEqual(
-            [cell.strip() for cell in rows[1].strip("|").split("|")][1:3],
-            ["unmeasured", "unmeasured"],
-        )
+        self.assertNotIn("not_run", text)
+        rows = self.rows("khive-example:bench_target/scenario/median_ns`")
+        self.assertEqual([row[1:5] for row in rows], [
+            ["1.234 µs", "1.002", f"`{self.sha}`", "2026-01-02"],
+            ["unmeasured", "unmeasured", f"`{second_sha}`", "2026-02-03"],
+        ])
 
-    def test_v2_benchmarks_keyed_by_scenario_then_metric(self):
-        self.fixture.write_reference(
-            {"schema": "bench-reference/v1", "crate": self.fixture.crate, "sha": self.sha, "benches": {}}
-        )
+    def test_v2_renders_every_record_kind_the_producer_writes(self):
         self.fixture.write_document(
             f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
         )
+        # The first two records are copied from a reference file the producer wrote.
         self.write_block(
-            {
-                "schema": "bench-reference/v2",
-                "crate": self.fixture.crate,
-                "targets": {
-                    "bench_target": {
-                        "entries": [
-                            {
-                                "commit": self.sha,
-                                "benchmarks": {
-                                    "scenario": {
-                                        "median": {
-                                            "disposition": "MEASURED",
-                                            "median_ns": 2500.0,
-                                            "aa_spread": 1.004,
-                                        },
-                                        "allocations": {
-                                            "disposition": "MEASURED",
-                                            "value": 17.0,
-                                            "unit": "allocs/op",
-                                            "aa_spread": 1.0,
-                                        },
-                                        "rss": {
-                                            "disposition": "UNMEASURED",
-                                            "reason": "not repeatable",
-                                        },
-                                    }
-                                },
-                            }
-                        ]
+            self.v2(
+                [
+                    {
+                        "commit": self.sha,
+                        "benchmarks": {
+                            "changeset_invert/entity_create/1": {
+                                "median_ns": {
+                                    "a": {"ci_hi_ns": 500.8366205434031, "ci_lo_ns": 500.08121625861315,
+                                          "median_ns": 500.34433984370423},
+                                    "aa_spread": 1.0613,
+                                    "b": {"ci_hi_ns": 472.20940399838946, "ci_lo_ns": 469.99217542146573,
+                                          "median_ns": 471.4651172854575},
+                                    "kind": "criterion",
+                                    "median_ns": 485.905,
+                                    "metric": "median_ns",
+                                    "verdict": "MEASURED",
+                                }
+                            },
+                            "p95_gate/synthetic-v1/m1": {
+                                "p95_ns": {
+                                    "a": {"value": 4635000.0},
+                                    "aa_spread": 1.0047,
+                                    "b": {"value": 4657000.0},
+                                    "kind": "bench-json",
+                                    "metric": "p95_ns",
+                                    "n": 200,
+                                    "statistic": "p95_ns",
+                                    "value": 4646000.0,
+                                    "verdict": "MEASURED",
+                                }
+                            },
+                            "quality/recall": {
+                                "recall_at_10": {
+                                    "a": {"value": 0.95},
+                                    "b": {"value": 0.95},
+                                    "kind": "bench-json",
+                                    "metric": "recall_at_10",
+                                    "n": 200,
+                                    "statistic": "recall_at_10",
+                                    "value": 0.95,
+                                    "verdict": "MEASURED",
+                                }
+                            },
+                            "classify_allocations": {
+                                "report": {
+                                    "kind": "allocation",
+                                    "metric": "report",
+                                    "report": {"allocations": 0, "calls": 1000000, "scenario": "classify_allocations"},
+                                    "verdict": "MEASURED",
+                                }
+                            },
+                            "legacy/converted": {
+                                "median_ns": {"a": {}, "aa_spread": 1.0005, "b": {}, "median_ns": 39475054.485,
+                                              "verdict": "MEASURED"}
+                            },
+                        },
                     }
-                },
-            }
-        )
-        text = self.fixture.document.read_text()
-        rows = {
-            cells[0].strip("`"): cells[1:]
-            for cells in (
-                [cell.strip() for cell in line.strip("|").split("|")]
-                for line in text.splitlines()
-                if line.startswith("| `bench_target/scenario/")
+                ]
             )
-        }
-        self.assertEqual(
-            set(rows),
-            {
-                "bench_target/scenario/allocations",
-                "bench_target/scenario/median",
-                "bench_target/scenario/rss",
-            },
         )
-        self.assertEqual(rows["bench_target/scenario/median"][0:2], ["2.500 µs", "1.004"])
-        self.assertEqual(
-            rows["bench_target/scenario/allocations"][0:2], ["17.000 allocs/op", "1.000"]
-        )
-        self.assertEqual(
-            rows["bench_target/scenario/rss"][0:2], ["unmeasured", "unmeasured"]
-        )
+        rows = {row[0].strip("`"): row[1:3] for row in self.rows("khive-example:bench_target/")}
+        prefix = "khive-example:bench_target/"
+        self.assertEqual(rows, {
+            prefix + "changeset_invert/entity_create/1/median_ns": ["485.905 ns", "1.061"],
+            prefix + "p95_gate/synthetic-v1/m1/p95_ns": ["4.646 ms", "1.005"],
+            prefix + "quality/recall/recall_at_10": ["0.95", "n/a"],
+            prefix + "classify_allocations/report": ["allocations=0, calls=1000000", "n/a"],
+            prefix + "legacy/converted/median_ns": ["39.475 ms", "1.000"],
+        })
 
+    def test_v2_record_without_a_verdict_is_refused(self):
+        self.fixture.write_document(
+            f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        )
+        record = criterion_row(1234.0, 1.002)
+        record["disposition"] = record.pop("verdict")
+        self.fixture.write_reference(
+            self.v2([{"commit": self.sha, "benchmarks": {"scenario": {"median_ns": record}}}])
+        )
+        code, _, stderr = quiet_main("--check", "--root", str(self.root))
+        self.assertEqual(code, 1)
+        self.assertIn("['median_ns'].verdict must be MEASURED or UNMEASURED", stderr)
+
+    def test_v2_record_not_keyed_by_metric_is_refused(self):
+        self.fixture.write_document(
+            f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+        )
+        self.fixture.write_reference(
+            self.v2([{"commit": self.sha, "benchmarks": {"scenario": criterion_row(1234.0, 1.002)}}])
+        )
+        code, _, stderr = quiet_main("--check", "--root", str(self.root))
+        self.assertEqual(code, 1)
+        self.assertIn("['scenario'] must be keyed by metric", stderr)
+
+    def test_v2_timing_without_aa_ratio_and_unknown_kind_are_refused(self):
+        timing = {"kind": "bench-json", "metric": "p95_ns", "n": 200, "statistic": "p95_ns",
+                  "value": 4646000.0, "verdict": "MEASURED"}
+        unknown = {"kind": "flamegraph", "metric": "report", "verdict": "MEASURED"}
+        for record, message in ((timing, "['p95_ns'].aa_spread must be a number"),
+                                (unknown, "kind 'flamegraph' is not criterion, bench-json or allocation")):
+            with self.subTest(message=message):
+                self.fixture.write_document(
+                    f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n"
+                )
+                self.fixture.write_reference(
+                    self.v2([{"commit": self.sha, "benchmarks": {"scenario": {record["metric"]: record}}}])
+                )
+                code, _, stderr = quiet_main("--check", "--root", str(self.root))
+                self.assertEqual(code, 1)
+                self.assertIn(message, stderr)
+
+
+class V2MirrorTests(unittest.TestCase):
+    """Synthetic renderer checks: no Git process or benchmark sampling."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.temporary = tempfile.TemporaryDirectory(prefix="bench-mirror-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+        self.fixture = Fixture(self.root)
+        self.date = mock.patch.object(renderer, "_commit_date", return_value="2026-01-02")
+        self.date.start()
+        self.addCleanup(self.date.stop)
+        self.no_process = mock.patch.object(
+            renderer.subprocess, "run", side_effect=AssertionError("unexpected subprocess")
+        )
+        self.no_process.start()
+        self.addCleanup(self.no_process.stop)
+
+    def payload(self):
+        return {
+            "schema": "bench-reference/v2",
+            "crate": self.fixture.crate,
+            "class": COMPARISON_CLASS,
+            "targets": {
+                "first": {"entries": [{
+                    "commit": "a" * 40,
+                    "benchmarks": {"shared": {"median_ns": criterion_row(1, 1)}},
+                }]},
+            },
+        }
+
+    def mirror(self, payload, target="first"):
+        import copy
+
+        metric = payload["targets"][target]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        row = copy.deepcopy(metric)
+        row.update(target=target, window={"sampler": "flat-only"}, clock_khz_median={"a": 1})
+        payload["benches"] = {"shared": row}
+        return row
+
+    def current_document(self, payload):
+        self.fixture.write_reference(payload)
+        self.fixture.write_document(f"{renderer.BEGIN_MARKER}\n{renderer.END_MARKER}\n")
+        self.fixture.write_document(
+            renderer.render_document(self.fixture.reference, self.fixture.document, self.root)
+        )
+        self.assertEqual(quiet_main("--check", "--root", str(self.root))[0], 0)
+
+    def assert_refused_without_writes(self, payload, diagnostic):
+        self.fixture.write_reference(payload)
+        before_reference = self.fixture.reference.read_bytes()
+        before_document = self.fixture.document.read_bytes()
+        for mode in ("--check", "--write"):
+            with self.subTest(mode=mode):
+                code, stdout, stderr = quiet_main(mode, "--root", str(self.root))
+                self.assertEqual(code, 1)
+                self.assertIn(diagnostic, stderr)
+                self.assertNotIn("stale", stderr)
+                self.assertEqual(stdout, "")
+                self.assertEqual(self.fixture.reference.read_bytes(), before_reference)
+                self.assertEqual(self.fixture.document.read_bytes(), before_document)
+
+    def test_optional_partial_numeric_mirrors_and_v1_stay_valid(self):
+        payload = self.payload()
+        self.current_document(payload)  # A v2 record need not have a mirror.
+        payload["benches"] = {}
+        self.current_document(payload)
+        row = self.mirror(payload)
+        row["median_ns"] = 1.0
+        row["a"]["median_ns"] = 1.0
+        row["b"]["median_ns"] = 1.0
+        self.current_document(payload)  # Numeric values, not int/float spelling.
+        payload["targets"]["first"]["entries"][0]["benchmarks"]["other"] = {
+            "median_ns": criterion_row(2, 1)
+        }
+        self.current_document(payload)  # A mirror may cover only some metrics.
+        del payload["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]["metric"]
+        self.mirror(payload)
+        self.current_document(payload)  # A unique converted metric need not carry its name.
+        self.current_document(self.fixture.v1("a" * 40, {"v1": measured(1)}))
+
+    def test_mirror_only_timing_corruption_refuses_check_and_write(self):
+        import copy
+
+        original = self.payload()
+        metric = original["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        for arm in ("a", "b"):
+            metric[arm].update(ci_lo_ns=0, ci_hi_ns=2)
+        self.mirror(original)
+        self.current_document(original)
+        for path in (
+            ("median_ns",), ("aa_spread",), ("a", "median_ns"),
+            ("b", "median_ns"), ("a", "ci_lo_ns"), ("b", "ci_hi_ns"),
+        ):
+            with self.subTest(path=path):
+                payload = copy.deepcopy(original)
+                cursor = payload["benches"]["shared"]
+                for key in path[:-1]:
+                    cursor = cursor[key]
+                cursor[path[-1]] = 7
+                self.assert_refused_without_writes(payload, "differs from target")
+        self.current_document(original)
+
+    def test_malformed_or_incomplete_mirrors_refuse(self):
+        import copy
+
+        original = self.payload()
+        self.mirror(original)
+        self.current_document(original)
+        for bad in (None, [], {"shared": None}, {"unknown": original["benches"]["shared"]}):
+            with self.subTest(bad=bad):
+                payload = copy.deepcopy(original)
+                payload["benches"] = bad
+                self.assert_refused_without_writes(payload, "benches")
+        for field, value in (
+            ("target", "missing"), ("metric", "missing"), ("target", 1),
+            ("a", []), ("a", {"median_ns": True}), ("b", {"median_ns": "1"}),
+            ("median_ns", True), ("aa_spread", float("inf")), ("extra", 1),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = copy.deepcopy(original)
+                payload["benches"]["shared"][field] = value
+                self.assert_refused_without_writes(payload, "benches")
+        for missing in ("a", "metric"):
+            payload = copy.deepcopy(original)
+            del payload["benches"]["shared"][missing]
+            self.assert_refused_without_writes(payload, "differs from target")
+
+    def test_target_and_historical_identity_is_never_guessed(self):
+        import copy
+
+        payload = self.payload()
+        second = copy.deepcopy(payload["targets"]["first"])
+        second["entries"][0]["benchmarks"]["shared"]["median_ns"] = criterion_row(2, 1)
+        payload["targets"]["second"] = second
+        self.current_document(payload)
+        self.mirror(payload, "second")
+        self.current_document(payload)  # Same name in two targets, explicit target.
+        row = payload["benches"]["shared"]
+        row["target"] = "first"
+        self.assert_refused_without_writes(payload, "differs from target")
+        row.pop("target")
+        self.assert_refused_without_writes(payload, "found 2")
+        payload.pop("benches")
+        first = payload["targets"]["first"]
+        first["entries"].append(copy.deepcopy(first["entries"][0]))
+        first["entries"][1]["commit"] = "b" * 40
+        payload["targets"] = [{"name": name, **target} for name, target in payload["targets"].items()]
+        self.current_document(payload)  # List targets and repeated history without flat.
+        row = copy.deepcopy(first["entries"][0]["benchmarks"]["shared"]["median_ns"])
+        row["target"] = "first"
+        payload["benches"] = {"shared": row}
+        self.assert_refused_without_writes(payload, "found 2")
+
+    def test_nested_large_integer_is_not_rounded_for_comparison(self):
+        payload = self.payload()
+        metric = payload["targets"]["first"]["entries"][0]["benchmarks"]["shared"]["median_ns"]
+        metric["a"]["median_ns"] = 2**53 + 1
+        self.mirror(payload)
+        self.current_document(payload)
+        payload["benches"]["shared"]["a"]["median_ns"] = float(2**53)
+        self.assert_refused_without_writes(payload, "differs from target")
 
 if __name__ == "__main__":
     unittest.main()

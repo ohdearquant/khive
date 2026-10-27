@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use khive_pack_tool::policy;
 use khive_runtime::engine_config::GitWriteRepositoryConfig;
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -309,7 +308,7 @@ impl GitPack {
         verb: &str,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let actor = policy::actor_label(token);
+        let actor = token.actor().label();
         let mut receipt = Receipt::new(
             token.namespace().as_str(),
             &actor,

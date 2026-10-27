@@ -147,6 +147,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           HEAD_REF: ${{ github.head_ref }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -155,7 +156,8 @@ jobs:
           # whether that commit is tested. A range that cannot be compared counts as such a change.
           classifiers_changed() {
             local changed
-            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
               echo "full suite: the path classifiers could not be compared with $1"
               return 0
             fi
@@ -168,7 +170,15 @@ jobs:
           docs_only=false
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
-            if ! classifiers_changed "$base"; then
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+            if ! classifiers_changed "$classifier_base"; then
               docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
             fi
           elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
@@ -226,8 +236,8 @@ jobs:
             docs_only=false
           fi
           echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
-      # The path rules run first, on the changed paths alone (--paths-only prints `full` or `map`). Only a
-      # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
+      # After the classifier guard, the path rules use changed paths alone (--paths-only prints `full` or `map`).
+      # Only a change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
       # successful push run on main published, which ingests this checkout's map and resolves the changed
       # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
       # and every event other than a pull request or an integration push writes `full`. An integration push
@@ -241,6 +251,7 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           TESTED_BASE: ${{ steps.classify.outputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -249,7 +260,8 @@ jobs:
           # whether that commit is tested. A range that cannot be compared counts as such a change.
           classifiers_changed() {
             local changed
-            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
               echo "full suite: the path classifiers could not be compared with $1"
               return 0
             fi
@@ -271,11 +283,22 @@ jobs:
           else
             echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
           fi
-          if [[ -n "$base" ]] && classifiers_changed "$base"; then
+          classifier_base="$base"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+          fi
+          if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then
             base=""
           fi
           if [[ -n "$base" ]]; then
-            mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            mode=$(timeout 60 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
             if [[ "$mode" == "map" ]]; then
               binary=""
               runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
@@ -293,7 +316,7 @@ jobs:
               if [[ -z "$binary" ]]; then
                 echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
               else
-                test_scope=$(timeout 300 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                test_scope=$(timeout 300 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
                   || test_scope=full
               fi
             fi
@@ -856,6 +879,30 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
       - name: Install browser for repository dogfood
         run: timeout 120 npx playwright install chromium || timeout 120 npx playwright install chromium
+      # The OS dependency install downloads about 26 MB of archives from the
+      # Ubuntu mirror on every run, and a slow mirror can spend the whole step
+      # bound on that download while still making progress. Keep the archives
+      # between runs. apt checks every restored file against the current index
+      # and downloads only what is missing or changed, so a stale entry costs a
+      # download, never a wrong package. The key carries the runner image,
+      # whose preinstalled packages decide which archives are needed, and the
+      # lock file, which pins the Playwright version that names them.
+      - name: Resolve the browser OS dependency cache key
+        id: apt-cache-key
+        run: echo "image=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore browser OS dependency archives
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: playwright-apt-${{ runner.os }}-${{ steps.apt-cache-key.outputs.image }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
+          restore-keys: |
+            playwright-apt-${{ runner.os }}-
+      - name: Stage restored archives for apt
+        run: |
+          mkdir -p ~/.cache/playwright-apt-archives
+          find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' -exec sudo cp -t /var/cache/apt/archives/ {} +
+          echo "apt archive cache: $(find /var/cache/apt/archives -maxdepth 1 -name '*.deb' | wc -l)"
       - name: Install browser OS dependencies
         # Deliberately NO timeout(1) wrapper: killing the wrapper mid-install
         # orphans apt-get with the dpkg lock held (the unsound pattern the
@@ -868,6 +915,23 @@ jobs:
         # package downloads can exceed the former four-minute backstop.
         timeout-minutes: 8
         run: npx playwright install-deps chromium || npx playwright install-deps chromium
+      # Save only after a successful install and only on an exact-key miss, so
+      # a cache entry always holds a complete set. An empty set is never saved:
+      # it would occupy the exact key and stop the next run from filling it.
+      - name: Collect browser OS dependency archives
+        id: apt-archives
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        run: |
+          find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp -t ~/.cache/playwright-apt-archives/ {} +
+          count=$(find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' | wc -l)
+          echo "collected archives: $count"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Save browser OS dependency archives
+        if: steps.apt-cache.outputs.cache-hit != 'true' && steps.apt-archives.outputs.count != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: Repository showcase dogfood
         run: npx playwright test
 
@@ -1634,6 +1698,17 @@ jobs:
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
       - name: Compile every target without the optional packs
         run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
+      - name: Keep Git's normal dependency graph independent of Exec and Tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p khive-pack-git --edges normal --target all --prefix none --format '{p}' > "$RUNNER_TEMP/git-normal-deps.txt"
+          awk '{print $1}' "$RUNNER_TEMP/git-normal-deps.txt" > "$RUNNER_TEMP/git-normal-packages.txt"
+          grep -Fxq 'khive-pack-git' "$RUNNER_TEMP/git-normal-packages.txt"
+          if grep -Ex 'khive-pack-exec|khive-pack-tool' "$RUNNER_TEMP/git-normal-packages.txt"; then
+            echo 'Git must not normally depend on Exec or Tool; dev fixtures may use both' >&2
+            exit 1
+          fi
       - name: Run the library tests without the optional packs
         run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
       # These integration tests assert which packs are linked and selectable. Their
@@ -1659,6 +1734,14 @@ jobs:
       # step runs the S3 store, configuration and server library tests.
       - name: Run the S3 blob store library tests
         run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
+      # The install gate probes the operator build with an isolated config, and a pack
+      # that refuses to register under that config fails every install. This step
+      # builds kkernel with the build-local feature set and runs the same probe on it,
+      # so that refusal fails the pull request instead.
+      - name: Probe a kkernel built with the operator feature set
+        run: |
+          cargo build -p kkernel --bin kkernel --locked --features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
+          make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}

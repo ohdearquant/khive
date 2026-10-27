@@ -1,5 +1,6 @@
 //! Core message primitives: ID helpers and the dual-write delivery function.
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -77,6 +78,7 @@ pub(crate) fn validate_message_projection_fields(
         .iter()
         .find(|field| !MESSAGE_PROJECTION_FIELDS.contains(&field.as_str()))
     {
+        let unknown = mask_for_redaction_surface(RedactionSurface::GateProbe, unknown);
         return Err(RuntimeError::InvalidInput(format!(
             "{verb}: unknown projection field {unknown:?}; expected one of: {}",
             MESSAGE_PROJECTION_FIELDS.join(", ")
@@ -489,9 +491,10 @@ pub(crate) async fn dual_write_message_with_identity(
             if recent_count >= cap {
                 return Err(external_email_denied(verb, "daily external cap reached"));
             }
-            // ADR-200 §1 condition 4: the external footer must be configured before a fresh
+            // ADR-200 §1 condition 4: the selected footer must be configured before a fresh
             // external message is admitted. A policy-recipient send never reaches this branch.
-            if let Some(Err(reason)) = policy.external_footer() {
+            let is_list = tags.is_some_and(|tags| tags.iter().any(|tag| tag == "traffic:list"));
+            if let Some(Err(reason)) = policy.external_footer_for_list(is_list) {
                 return Err(external_email_denied(
                     verb,
                     &format!("external email footer is unavailable: {reason}"),

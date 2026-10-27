@@ -22,18 +22,18 @@ test-internals = ["khive-db/test-support"]
 bench = false
 
 [dependencies]
-khive-changeset = { version = "0.14.0", path = "../khive-changeset" }
-khive-channel = { version = "0.14.0", path = "../khive-channel" }
-khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde", "blake3"] }
-khive-storage = { version = "0.14.0", path = "../khive-storage" }
-khive-score = { version = "0.14.0", path = "../khive-score" }
-khive-fusion = { version = "0.14.0", path = "../khive-fusion" }
-khive-fold = { version = "0.14.0", path = "../khive-fold" }
-khive-fs = { version = "0.14.0", path = "../khive-fs" }
-khive-db = { version = "0.14.0", path = "../khive-db", features = ["vectors"] }
-khive-query = { version = "0.14.0", path = "../khive-query" }
-khive-gate = { version = "0.14.0", path = "../khive-gate" }
-khive-retrieval = { version = "0.14.0", path = "../khive-retrieval", features = ["ann"] }
+khive-changeset = { version = "0.15.0", path = "../khive-changeset" }
+khive-channel = { version = "0.15.0", path = "../khive-channel" }
+khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde", "blake3"] }
+khive-storage = { version = "0.15.0", path = "../khive-storage" }
+khive-score = { version = "0.15.0", path = "../khive-score" }
+khive-fusion = { version = "0.15.0", path = "../khive-fusion" }
+khive-fold = { version = "0.15.0", path = "../khive-fold" }
+khive-fs = { version = "0.15.0", path = "../khive-fs" }
+khive-db = { version = "0.15.0", path = "../khive-db", features = ["vectors"] }
+khive-query = { version = "0.15.0", path = "../khive-query" }
+khive-gate = { version = "0.15.0", path = "../khive-gate" }
+khive-retrieval = { version = "0.15.0", path = "../khive-retrieval", features = ["ann"] }
 inventory = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -55,7 +55,9 @@ anyhow = { workspace = true }
 unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 ring = "0.17.14"
-chacha20poly1305 = "=0.10.1"
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+# Preserve wiping of buffered receipt keystream on drop.
+cipher = { version = "0.5", default-features = false, features = ["zeroize"] }
 zeroize = "1.9.0"
 base64 = { workspace = true }
 rand = { workspace = true }
@@ -65,8 +67,8 @@ signal-hook-registry = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
-khive-request = { version = "0.14.0", path = "../khive-request" }
+khive-db = { version = "0.15.0", path = "../khive-db", features = ["test-support"] }
+khive-request = { version = "0.15.0", path = "../khive-request" }
 # Self dev-dependency: requests this crate's own `fault-injection` and
 # `test-internals` features for its `tests/` integration binaries. Those link
 # the lib as an external crate, so items gated on `any(test, feature =
@@ -76,8 +78,8 @@ khive-request = { version = "0.14.0", path = "../khive-request" }
 # tests (e.g. `tests/adr133_audit_batch.rs`,
 # `tests/read_verb_admission_exhaustion.rs`) with no extra `--features` flag.
 khive-runtime = { path = ".", features = ["fault-injection", "test-internals"] }
-khive-gate-rego = { version = "0.14.0", path = "../khive-gate-rego" }
-khive-storage = { version = "0.14.0", path = "../khive-storage", features = ["test-support"] }
+khive-gate-rego = { version = "0.15.0", path = "../khive-gate-rego" }
+khive-storage = { version = "0.15.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

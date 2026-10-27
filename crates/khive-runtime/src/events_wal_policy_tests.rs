@@ -1,8 +1,13 @@
 use std::ffi::OsString;
 
-use super::*;
+use super::events_daemon::events_daemon_command;
+use super::policy_entries::run_events_daemon_with_wal_ceiling;
+use super::registry::{direct_backend_with_policies, EventsSplitConfig};
 use crate::RuntimeError;
 use khive_db::{SqliteError, WalCeilingSource};
+use khive_db::{StorageBackend, WalCeilingPolicy};
+use std::path::Path;
+use std::sync::Arc;
 
 #[test]
 fn supervisor_argv_preserves_zero_and_nonzero_policy_sources() {
