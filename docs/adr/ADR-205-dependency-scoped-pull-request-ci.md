@@ -137,13 +137,13 @@ D8's parity test landed in #6123 (`crates/khive-pack-code/src/source_ingest/work
 
 Amendment 3 removes the mechanical-range condition, so D9 has four conditions.
 
-1. **Runner-minutes beside the baseline.** The population is the 20 newest completed pull-request runs of `ci.yml` at 2026-10-27T09:21Z, consecutive in creation order (created 03:41Z to 09:21Z; 13 succeeded, 2 failed, 5 were cancelled). Each run's runner-minutes are read as the baseline was: the sum over its jobs of completed minus started time, with skipped jobs contributing nothing. Each run's scope is the last `test_scope` line the Classify job printed. The baseline is 148 minutes over 20 completed runs (Context), so the first line is the comparable one:
-   - all 20 completed runs: median 141.2 (mean 150.0);
-   - the 13 that succeeded: median 194.2;
-   - the 12 that ran the full suite: median 196.1;
-   - the 8 that ran a closure: median 137.1.
+1. **Runner-minutes beside the baseline.** The population is the 20 newest completed pull-request runs of `ci.yml`, read at 2026-10-27T10:10Z, consecutive in creation order (created 03:41Z to 09:21Z; 13 succeeded, 2 failed, 5 were cancelled). Each run's runner-minutes are read as the baseline was: the sum over its jobs of completed minus started time, with skipped jobs contributing nothing. Each run's scope is the last `test_scope` line the Classify job printed. The 148-minute baseline (Context) is a mean: 2961 runner-minutes over 20 runs sampled on 2026-10-15, all of which ran to a conclusion (19 succeeded, 1 failed, none was cancelled); their median is 149.5. A cancelled run stops early, so the comparable line is the first, over the 15 runs that ran to a conclusion:
+   - the 15 that succeeded or failed: mean 176.2 (median 176.0);
+   - the 8 of those that ran the full suite: mean 215.2 (median 217.1);
+   - the 7 of those that ran a closure: mean 131.6 (median 139.7);
+   - all 20, the 5 cancelled runs included: mean 150.0 (median 141.2).
 
-   No saving is claimed. A run that ran the full suite costs more than the baseline, and a scoped run costs less. On the 13 runs that succeeded, the core-only feature-set build took 31.0 to 44.4 minutes (11 in the baseline), and it was the longest job on each of the 7 scoped runs that finished; D5 does not scope it.
+   No saving is claimed: the comparable mean is 28 minutes above the baseline. A run that ran the full suite costs more than the baseline, and a scoped run costs less. On the 13 runs that succeeded, the core-only feature-set build took 31.0 to 44.4 minutes (11 in the baseline), and it was the longest job on each of the 7 scoped runs that finished; D5 does not scope it.
 2. **Parity test green on `main`.** `workspace_reverse_dependency_sets_match_cargo_metadata` passed on the Linux and macOS first shards of push run 40464282546 at a789c1b6, which ran the full suite.
 3. **A deliberately scoped run refused.** A draft pull request (#6215, closed unmerged) added one always-failing test to `khive-wire-protocol`, a crate with no dependents. Its run 40494562745 scoped the suite to that crate. The test failed and the gate failed the run.
 4. **No escape.** The read covers the runs on `main` from #5638's merge (2026-10-17T22:24Z) to 2026-10-27T12:00Z: 228 push runs and 10 scheduled runs. Each of the 6 failed runs was classified, and none is an escape. The 183 cancelled runs were read job by job, and none has a failed test job. The count is posted on #5637, and the weekly D8 count runs from Monday 2026-11-02.
@@ -167,7 +167,7 @@ Markdown. Run over the 60 newest commits on `main` up to `fb10dc43`, the classif
 such as a new target or bench.
 
 In this amendment the _tested base_ of a push is the newest commit on `main` whose push or scheduled CI run concluded
-successfully as a whole, ran the full suite (its recorded scope is `full`, as D3a requires of its range start), passed
+successfully as a whole, ran the full suite (its recorded scope is `full`), passed
 Linux test shard 1, and is an ancestor of the pushed head. The documentation lane already looks up this base for pushes
 to `main` (`ci.yml`, Classify step). Runs on `main` record `full`, or `docs` for a push that took the documentation
 lane, and never `scoped` (Amendment 3); the lookup takes the newest successful run that records `full` and skips the
