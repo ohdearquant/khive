@@ -62,7 +62,7 @@ fn open_code_map(
         protected_main,
         protected_events,
         crate::DiskGuardEnvironment::default()
-            .resolve(Some(0), Some(100))
+            .resolve(Some(0), None)
             .unwrap(),
         crate::PoolConfig::for_test()
             .volume_lock_dir
