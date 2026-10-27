@@ -8,9 +8,13 @@ The three primary weights are relevance `0.70`, salience `0.20`, and temporal `0
 
 Retrieval defaults include a candidate multiplier of 20, optional explicit candidate limit, RRF fusion with `k = 10`, score floor zero, salience floor zero, and breakdowns disabled. Weighted fusion (vector `0.7`, text `0.3`) remains selectable per call via `fusion_strategy: "weighted"`; an explicit `fusion_strategy: "rrf"` request fuses with the configured `k` (10 by default) and uses `k = 60` only when the configured fusion is not RRF.
 
-A tuning sweep of 116 configurations on the synthetic contract corpus produced the same recall@10 (`0.9333`) for every configuration and supplied no evidence either way. A later live-corpus golden-suite sweep (2026-07-21, adversarial-paraphrase and holdout suites) did discriminate: the weighted default regressed paraphrase recall relative to RRF `k = 10`, which was restored as the calibrated default.
-
 `validate()` returns `RuntimeError::InvalidInput` for inconsistent values. `try_from_value()` deserializes JSON and validates in one operation.
+
+### Default selection rationale
+
+The historical 2026-05-25 tuning sweep evaluated 116 configurations on the synthetic contract corpus and produced the same recall@10 (`0.9333`) for every configuration. That flat landscape cannot empirically distinguish the parameters; `tests/khive-contract/tune/README.md` retains the limitation and the need for a harder corpus with embeddings, synonym queries, and partial matches.
+
+The 2026-07-21 live-corpus golden-suite sweep did distinguish the strategies. The weighted default (vector `0.7`, text `0.3`) regressed adversarial-paraphrase hit@5 from `0.471` to `0.353` and MRR from `0.321` to `0.153`, while RRF `k = 10` held the holdout suite at its best tier and was restored as the calibrated default. Min-max weighted fusion lets a keyword-only text hit outrank paraphrase hits visible only to the vector leg; rank-based RRF avoids that magnitude mismatch. Salience still contributes through the composite score weights.
 
 ## Candidate and ANN controls
 
@@ -26,12 +30,12 @@ A tuning sweep of 116 configurations on the synthetic contract corpus produced t
 
 Decay operates on raw salience and age in days:
 
-| Variant | Formula |
-| --- | --- |
-| `Exponential` | `salience * exp(-decay_factor * age_days)` |
-| `Hyperbolic` | `salience / (1 + decay_factor * age_days)` |
-| `PowerLaw` | `salience * half_life / (half_life + age_days)` |
-| `None` | raw salience |
+| Variant       | Formula                                         |
+| ------------- | ----------------------------------------------- |
+| `Exponential` | `salience * exp(-decay_factor * age_days)`      |
+| `Hyperbolic`  | `salience / (1 + decay_factor * age_days)`      |
+| `PowerLaw`    | `salience * half_life / (half_life + age_days)` |
+| `None`        | raw salience                                    |
 
 Exponential and hyperbolic use the note's own decay factor. Power-law uses its configured half-life override. The independent temporal recency component uses `temporal_half_life_days`; it does not replace the note's salience decay.
 
@@ -53,6 +57,8 @@ The hint names a profile, a result boost (default `1.3`), and a posterior thresh
 
 `ScoreBreakdown` reports raw relevance, raw and decayed salience, temporal recency, weighted contributions, total score, profile weight projection, and the optional per-entity posterior mean.
 
-`profile_component` is the ratio of projected-weight score to default-weight score. It is `1.0` when no profile served the request or the default score is effectively zero. `entity_posterior_mean` is absent without a learned posterior; when present, the score has also received the bounded entity multiplier documented in `crates/khive-pack-memory/docs/api/scoring.md`.
+`profile_component` is the ratio of projected-weight score to default-weight score. It is `1.0` when no profile served the request or the default score is effectively zero.
+
+`entity_posterior_mean` reports the serving profile's per-entity Beta posterior mean for the hit's UUID. It is absent when no profile served the request or no posterior exists beyond the uninformative prior. The value also feeds the bounded rank-score multiplier `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` (ADR-104 §3). `None` and a mean of `0.5` are neutral; other means adjust `rank_score` by up to ±15% relative to the same candidate under a profile without a posterior for it. The scoring context is documented in `crates/khive-pack-memory/docs/api/scoring.md`.
 
 `total()` sums the three weighted contributions. Profile and entity components describe later multiplicative effects and are not added to that sum.
