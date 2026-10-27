@@ -2827,6 +2827,7 @@ name = "khive-pack-workspace"
 version = "0.15.0"
 dependencies = [
  "async-trait",
+ "globset",
  "inventory",
  "khive-pack-git",
  "khive-pack-gtd",
