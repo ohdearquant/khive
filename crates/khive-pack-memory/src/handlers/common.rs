@@ -589,14 +589,7 @@ pub(crate) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
 /// Default decay_factor for semantic memories (~139-day half-life).
 pub(crate) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
 
-/// `memory.recall` requests whose total handler time reaches this are logged at WARN
-/// with a duration/result-shape breakdown, unconditionally (unlike the opt-in
-/// `KHIVE_RECALL_PROFILE` per-stage eprintln profiler). Matches the threshold and
-/// rationale established for `knowledge.compose` (#887 / PR #915): well above a
-/// healthy recall (sub-second in the common case) but comfortably inside the
-/// end-to-end `recall_deadline_ms` budget (30s default), so a slow-but-completing
-/// recall is visible in the daemon log before it ever risks tripping the deadline
-/// or a client-side timeout (#30 / originally #889).
+/// Warn on recalls reaching 10 seconds; see `docs/api/recall-pipeline.md#slow-request-stage-telemetry`.
 pub(super) const RECALL_SLOW_THRESHOLD_MS: u64 = 10_000;
 
 pub(super) fn compute_score(
@@ -1497,11 +1490,8 @@ impl MemoryPack {
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
 
-            // Per-model ANN/sqlite-vec resolution is independent I/O (durable-epoch
-            // check, warm-cache search, possible detached ensure-wait, possible
-            // exact-scan fallback) — fan the models out concurrently instead of
-            // paying their latency serially. Mirrors the embed step's 1/2/N
-            // dispatch immediately above.
+            // Resolve independent model I/O concurrently.
+            // See `docs/api/recall-pipeline.md#vector-candidate-collection`.
             let per_model_results: Vec<PerModelAnnHits> = match query_vecs.len() {
                 0 => Vec::new(),
                 1 => {
@@ -1857,11 +1847,8 @@ pub(super) async fn collect_model_ann_hits(
     }
 }
 
-/// Split out of `collect_recall_vector_hits` so per-model units — each with independent
-/// durable-epoch checks, warm-cache search, possible detached ensure-wait, and possible
-/// exact-scan fallback — can run concurrently instead of serially. All error paths
-/// propagate via `?`; the [`collect_model_ann_hits`] wrapper converts them into a
-/// degraded outcome for this model rather than aborting every engine's recall.
+/// Propagate errors to the wrapper for per-model degradation (ADR-031).
+/// See `docs/api/recall-pipeline.md#vector-candidate-collection`.
 #[allow(clippy::too_many_arguments)]
 async fn collect_model_ann_hits_inner(
     runtime: &khive_runtime::KhiveRuntime,
