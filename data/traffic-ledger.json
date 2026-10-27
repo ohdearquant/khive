@@ -533,13 +533,91 @@
       "unique_clones": 302,
       "views": 196,
       "unique_views": 2
+    },
+    "2026-10-14": {
+      "clones": 4825,
+      "unique_clones": 502,
+      "views": 30,
+      "unique_views": 5
+    },
+    "2026-10-15": {
+      "clones": 4701,
+      "unique_clones": 428,
+      "views": 72,
+      "unique_views": 2
+    },
+    "2026-10-16": {
+      "clones": 4571,
+      "unique_clones": 486,
+      "views": 66,
+      "unique_views": 2
+    },
+    "2026-10-17": {
+      "clones": 4372,
+      "unique_clones": 645,
+      "views": 56,
+      "unique_views": 3
+    },
+    "2026-10-18": {
+      "clones": 4820,
+      "unique_clones": 433,
+      "views": 59,
+      "unique_views": 2
+    },
+    "2026-10-19": {
+      "clones": 2972,
+      "unique_clones": 254,
+      "views": 60,
+      "unique_views": 6
+    },
+    "2026-10-20": {
+      "clones": 3781,
+      "unique_clones": 334,
+      "views": 45,
+      "unique_views": 5
+    },
+    "2026-10-21": {
+      "clones": 3491,
+      "unique_clones": 287,
+      "views": 52,
+      "unique_views": 4
+    },
+    "2026-10-22": {
+      "clones": 2236,
+      "unique_clones": 189,
+      "views": 3,
+      "unique_views": 1
+    },
+    "2026-10-23": {
+      "clones": 4461,
+      "unique_clones": 264,
+      "views": 23,
+      "unique_views": 1
+    },
+    "2026-10-24": {
+      "clones": 4137,
+      "unique_clones": 217,
+      "views": 163,
+      "unique_views": 55
+    },
+    "2026-10-25": {
+      "clones": 2331,
+      "unique_clones": 166,
+      "views": 22,
+      "unique_views": 5
+    },
+    "2026-10-26": {
+      "clones": 2524,
+      "unique_clones": 167,
+      "views": 56,
+      "unique_views": 5
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-10-14T10:20:05Z",
-    "clones_14d": 47536,
-    "unique_clones_14d": 2529,
-    "views_14d": 3083,
-    "unique_views_14d": 57
+    "taken_at": "2026-10-27T10:41:16Z",
+    "clones_14d": 52763,
+    "unique_clones_14d": 3014,
+    "views_14d": 903,
+    "unique_views_14d": 84
   }
 }
