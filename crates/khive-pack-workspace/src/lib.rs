@@ -1,6 +1,7 @@
 //! Workspace entity vocabulary, creation validation, and typed membership rules.
 
 mod config;
+pub mod cursor;
 mod hook;
 mod pack;
 mod vocab;
