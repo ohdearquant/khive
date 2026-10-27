@@ -522,7 +522,10 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
         "daemon:ann_warm",
     )
     .with_payload(payload_value);
-    if let Err(err) = store.append_event(event).await {
+    let append = store.append_event(event);
+    #[cfg(test)]
+    let append = super::finalization_timeout_tests::observe_append(append);
+    if let Err(err) = append.await {
         tracing::warn!(
             error = %err,
             event_kind = %kind.name(),

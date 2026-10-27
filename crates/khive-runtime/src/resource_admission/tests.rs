@@ -7,6 +7,13 @@ fn deadline() -> Instant {
     Instant::now().checked_add(Duration::from_secs(5)).unwrap()
 }
 fn root(warm: usize, maintenance: usize) -> BackgroundRoot {
+    root_with_cleanup(
+        warm,
+        maintenance,
+        CleanupPolicy::new(Duration::from_secs(2)),
+    )
+}
+fn root_with_cleanup(warm: usize, maintenance: usize, cleanup: CleanupPolicy) -> BackgroundRoot {
     // Bound even the synchronous constructor's startup rendezvous. The helper
     // owns no observer join obligation; on timeout the receiver drops and any
     // eventual returned root drops/closes when send fails. This is fixture
@@ -15,7 +22,7 @@ fn root(warm: usize, maintenance: usize) -> BackgroundRoot {
     let initializer = std::thread::spawn(move || {
         let result = BackgroundRoot::start_inner(
             WorkClassLimits::validate(warm, maintenance).unwrap(),
-            CleanupPolicy::new(Duration::from_secs(2)),
+            cleanup,
             Some(1),
         );
         let _ = ready_tx.send(result);
@@ -332,43 +339,83 @@ async fn caller_drop_keeps_supervisor_alive_for_one_terminal_attempt() {
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[tokio::test]
 async fn pending_finalization_observes_shortened_domain_deadline() {
-    let root = root(1, 1);
+    // Keep the legitimate local cleanup deadline well beyond the bounded test.
+    // No elapsed-time threshold is used to distinguish it from the shared cutoff.
+    let root = root_with_cleanup(1, 1, CleanupPolicy::new(Duration::from_secs(3600)));
     let handle = root.handle();
     let tracking = TrackedJob::register("resource_test_deadline_shortening");
     let job = bounded(handle.admit(WorkClass::Warm, &tracking))
         .await
         .unwrap();
     drop(tracking);
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let task = handle
-        .spawn_supervised(job, move |job| async move {
-            let result = job
-                .finalize(async {
-                    let _ = entered_tx.send(());
-                    std::future::pending::<()>().await
-                })
-                .await;
-            JobOutcome::Completed(result)
-        })
-        .unwrap();
-    bounded(entered_rx).await.unwrap();
-    // Shutdown may hard-drop the supervisor at the same deadline. Either a
-    // returned timeout or a hard cancellation is acceptable only with an
-    // incomplete-finalization diagnostic and no duplicate append.
-    let report = bounded(root.control().shutdown(Instant::now()))
-        .await
-        .unwrap();
-    let result = bounded(task.join()).await;
-    assert!(matches!(
-        result,
-        Ok(JobOutcome::Completed(FinalizationOutcome::AttemptTimedOut))
-            | Err(BackgroundJoinError::Cancelled)
-    ));
-    assert_settled(&root).await;
-    assert!(
-        report.incomplete_finalizations > 0
-            || root.owner.domain.incomplete.load(Ordering::SeqCst) > 0
+    job.request_cancel();
+    let requested_deadline = (*lock(&job.lease.cancel.deadline))
+        .expect("request cancellation must publish its cleanup deadline");
+    assert!(job.is_cancelled());
+    let append_starts = Arc::new(AtomicUsize::new(0));
+    let observed_starts = append_starts.clone();
+    // Poll the real finalizer on this test's runtime. Isolated-worker shutdown
+    // cannot substitute a hard-dropped supervisor for the deadline observation.
+    // Count first entry into one append body, not its wake-driven re-polls.
+    let mut finalizer = Box::pin(job.finalize(async move {
+        observed_starts.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }));
+    let initial = bounded(std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(finalizer.as_mut().poll(cx))
+    }))
+    .await;
+    assert_eq!(
+        initial,
+        std::task::Poll::Pending,
+        "fixture must enter the actual pending finalization attempt"
     );
+    assert_eq!(append_starts.load(Ordering::SeqCst), 1);
+    let original_deadline = (*lock(&job.lease.cancel.deadline))
+        .expect("the actual finalizer retains its local deadline");
+    assert_eq!(
+        original_deadline, requested_deadline,
+        "the pending finalizer must retain the real cancellation request deadline"
+    );
+    assert!(
+        original_deadline > Instant::now(),
+        "fixture local cleanup deadline expired before the shortening probe"
+    );
+
+    let shortened = Instant::now();
+    root.control().close(shortened);
+    assert_eq!(lock(&root.owner.domain.gate).deadline, Some(shortened));
+    // One explicit poll, rather than waiting for the original grace to expire:
+    // the already-expired shared cutoff must win while the local one is future.
+    let result = bounded(std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(finalizer.as_mut().poll(cx))
+    }))
+    .await;
+    assert!(
+        original_deadline > Instant::now(),
+        "fixture local cleanup deadline expired during the shortening probe"
+    );
+    assert_eq!(
+        result,
+        std::task::Poll::Ready(FinalizationOutcome::AttemptTimedOut),
+        "pending finalizer must use the shortened shared deadline on its next poll"
+    );
+    assert_eq!(
+        *lock(&job.lease.cancel.deadline),
+        Some(original_deadline),
+        "shared shortening must not restart the local cleanup deadline"
+    );
+    assert_eq!(
+        append_starts.load(Ordering::SeqCst),
+        1,
+        "pending finalization must start exactly one append attempt"
+    );
+    assert_eq!(job.lease.cancel.finalization.load(Ordering::SeqCst), 3);
+    assert_eq!(root.owner.domain.incomplete.load(Ordering::SeqCst), 1);
+    drop(finalizer);
+    drop(job);
+    assert_settled(&root).await;
+    assert_eq!(root.owner.domain.incomplete.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

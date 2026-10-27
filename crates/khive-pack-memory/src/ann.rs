@@ -440,7 +440,19 @@ async fn finalize_ann_attempt(
             }
         }
     };
+    #[cfg(test)]
+    finalization_timeout_tests::before_terminal().await;
     let finalization = job.finalize(terminal).await;
+    // A bounded telemetry attempt can expire while ordinary work is still
+    // allowed. Its incomplete counter is recorded by finalize; keep the body
+    // result so success still schedules a checkpoint and rechecks generation.
+    // Domain closure and explicit job cancellation retain the shutdown outcome.
+    if matches!(finalization, FinalizationOutcome::AttemptTimedOut)
+        && !job.is_cancelled()
+        && matches!(&outcome, JobOutcome::Completed(_))
+    {
+        return outcome;
+    }
     if matches!(
         finalization,
         FinalizationOutcome::AttemptTimedOut
@@ -611,3 +623,7 @@ async fn prepare_ann_for_model(
         _guard: guard,
     })
 }
+
+#[cfg(test)]
+#[path = "ann/finalization_timeout_tests.rs"]
+mod finalization_timeout_tests;
