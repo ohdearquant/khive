@@ -855,3 +855,164 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    non-retryable one (`Probe`), so a retry keyed on that variant's retryability turns one of the two red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
+
+## Amendment 8 (2026-10-27): an approval can cover one program run by an interpreter
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent implementation merges.** It amends
+[ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+item 1 for one property and adds fields to Amendment 6's decision event. It does not change the status of the base
+ADR or of earlier amendments.
+
+A tool whose registered executable is an interpreter (`source` `exec:/.../python3.12`, a shell, a JavaScript runtime)
+runs whatever program the caller's `args` name. A grant on that tool therefore approves every program the actor will
+ever run with it, and an approver asked to allow one weekly script has to approve all scripts or none. The registration
+today pins the executable's path, side effect, trust and schema (Amendment 1 item 1; `crates/khive-pack-tool/src/pin.rs`,
+`policy_inputs`); `exec.run` passes the caller's `args` after the registered path unchanged
+(`crates/khive-pack-exec/src/handlers.rs`, the launch in `execute`). Nothing an approver can see names the program.
+
+Amendment 4 item 7 names this question and leaves it open: a grant's `scope` is free text and decides nothing, and
+making it binding would change what rows already granted allow. This amendment answers it without touching grants.
+
+1. **The program is part of the registration.** `tool.register` takes an optional `program` object on a tool whose
+   `source` is `exec:`. It is versioned and closed:
+
+   - `version`: `1`.
+   - `fixed_args`: a non-empty array; each element is either a string (a literal argument) or `{path, content_ref}`,
+     a file in the run's input tree named by its path relative to the tree root and the content ref that file must have.
+   - `extra_args`: `"none"` (the caller may pass no `args`) or `"append"` (the caller's `args` follow the fixed ones).
+     Required; there is no default.
+   - `tree`: optional; an input tree id the run must equal exactly.
+
+   Unknown keys, an unknown version, a null, an empty `fixed_args`, a NUL byte, an element that is neither form, a
+   path that is absolute, empty or contains `.` or `..` components, and a value over the size limits fixed by the
+   implementation plan are refused at registration, each with its reason named.
+
+2. **It joins the pinned inputs only on rows that carry it.** When a row has a `program` key, the whole stored object
+   joins Amendment 1's policy inputs, serialized by the one canonical function (Amendment 2,
+   `khive_types::canonical_json_bytes`). A row without the key keeps its four inputs byte for byte, so no stored grant
+   changes meaning: the absent key is never written as `null`, which would move every existing digest. A grant on a
+   row carrying `program` approves that program and nothing else, because the grant's pin is the row id and the digest
+   over those inputs (Amendment 1 items 1 and 2).
+
+3. **A revised program is a new registration.** Re-registering an existing name returns the stored row unchanged
+   (Decision, `tool.register`), so editing a script cannot update its approval in place. A revised script, constraint
+   or interpreter is registered under a new name and granted again, as ADR-181 Amendment 14 already rules for an
+   upgraded executable. `tool.register` on an existing name with a passed `program` that differs from the stored one
+   is refused, on both paths that return an existing row (the name lookup and the losing side of a concurrent claim),
+   before any capability is linked. An omitted `program` returns the stored row and never removes a restriction. No
+   update verb is added.
+
+4. **Every decision source is held to the program.** `exec.run` builds the run from the stored definition: the
+   registered executable, then `fixed_args` in order (a file element contributes its path as one argument), then the
+   caller's `args` only when `extra_args` is `"append"`. Before materializing anything it checks, on the entries it is
+   about to materialize: each file element names a regular file (mode 644 or 755, not a symbolic link, with no
+   symbolic link among its parent directories) whose content ref equals the stored one; `cwd` is the tree root; the
+   tree id equals `tree` when one is stored; and no `args` were passed under `"none"`. A failed check refuses the run
+   whatever answered the policy question. This matters because a grant that does not match falls through to policy
+   and then to the side-effect default (`decide` in `crates/khive-pack-tool/src/policy.rs`), so a program constraint
+   enforced only as "the grant stops matching" would let a policy `allow`, or the `read` default, run a mismatching
+   program. A run that passes the policy question and fails this check is a refusal, not a different grant search.
+
+5. **The interpreter's bytes are pinned too.** A row carrying `program` also carries `executable_digest`, and the run
+   executes the staged copy whose digest was compared, under ADR-181 Amendment 14's staging, deadline, size cap and
+   cleanup rules. This amends Amendment 14 item 1, which today requires `executable_digest` when `network` is passed
+   and refuses it otherwise: the key is required when `network` or `program` is passed and refused when neither is. A
+   `program` row without `network` gets no network and needs no network host setting; its refusals name the program
+   condition that failed, not a network one. Replacing the interpreter at its registered path would otherwise change
+   the meaning of every approved program without moving any pin.
+
+6. **The receipts say which definition approved the run.** Amendment 6's `tool_check_decided` event gains the registry
+   id and definition digest the decision was evaluated against, and for `exec.run` the run's receipt id (null for
+   `tool.check`). The exec receipt records, outside its `sandbox` block so that a preflight refusal carries it: the
+   canonical program object or a content ref to its exact bytes, its BLAKE3 digest, the input tree id, the caller's
+   `args`, the effective argument vector, each file element's expected and observed content ref and mode, the expected
+   and observed executable digest, and a validation state of `not_checked`, `matched`, `mismatch` or `invalid` with the
+   failed condition named. An `allow` event beside a refused receipt is a valid pair: the policy question and the run's
+   admission are separate answers, as ADR-181 Amendment 14 item 7 already states for networked rows.
+
+7. **Amendment 7 is unchanged.** Its by-id entry keeps its signature and predicate. Its pin now covers the program
+   when the row carries one, and its `true` still means only that the grant is live for that pin; it never asserts that
+   a particular run matches. A caller consuming on the strength of a grant validates the run separately.
+
+### What this does not cover
+
+An approval covers the registered executable's bytes and the fixed argument definition, and `exec.run` checks the
+declared files and, when stored, the whole input tree before launch. It does not identify every file, module,
+subprocess or download the program loads, prove that appended arguments are harmless, or make the run's files
+read-only. Each limit, with what shows it:
+
+- Other tree files are not pinned unless `tree` is stored: a module beside the script that the script imports changes
+  what runs. With `tree` stored the changed tree is refused, which says nothing about whether the approved tree was
+  benign.
+- Host libraries and configured read roots are outside the tree, as ADR-181 Amendment 14 states for executables (its
+  section on what a networked grant approves, item 8).
+- The caller's environment is not bound. Allowed environment keys can carry loader settings (for Python,
+  `PYTHONPATH`), and `HOME` is the run directory, so a tree can carry per-user startup files. An approver who wants an
+  interpreter's isolation mode puts its flag among `fixed_args` (for Python, `-I`); khive does not add flags, classify
+  interpreters or claim that any loader path is closed.
+- Materialized input files are writable, so the program can change a pinned file before it reads it again.
+- An interpreter that evaluates its input, or a networked row that fetches code (ADR-181 Amendment 13), runs code no pin
+  names.
+- A row whose `fixed_args` hold only interpreter flags and no file element, with `extra_args` `"append"`, lets the
+  caller name the program again, which is the case this amendment exists to close. khive does not refuse that shape;
+  the approver reads `fixed_args` and `extra_args` before granting. More generally, an appended argument can change
+  what a pinned program does; `"append"` is broader than `"none"` by design, not certified safe.
+- The approval is reusable for the life of the grant. "Exactly one execution" needs a consumption protocol, which this
+  amendment does not specify.
+- Approval cardinality: one registration per program revision and invocation contract. If real traffic needs many
+  short-lived approvals of different subsets of one unchanged tool, the constraint belongs on the grant instead (a
+  nullable grant column, a run-aware selection and an Amendment 7 rule); that case would falsify the choice here and
+  reopens it.
+
+### Relation to immutable tool definitions
+
+A later grant model that keeps tool definitions as immutable, digest-addressed records and binds each grant to the
+exact definition digest takes a `program` row losslessly: the program is part of the definition, and the grant binds
+its digest. This amendment does not depend on such a model.
+
+### Acceptance for Amendment 8
+
+Each arm names its must-fail control, stated before the run. Every refusal arm has an otherwise identical passing
+control and asserts that no child process was spawned.
+
+1. Legacy bytes. Rows without `program`, and network-only rows once Amendments 13 and 14 are implemented, produce the
+   same canonical input bytes and the same decisions as before. A `program` key moves the digest; each nested field
+   (literal, path, content ref, `extra_args`, `tree`, `version`) moves it independently; key order does not, argument
+   order does. Control: write `program: null` into every row's inputs; the first assertion goes red.
+2. Registration lifecycle. A conflicting `program` on an existing name is refused, serially and on both orders of a
+   forced concurrent claim; the stored row, its grants and its capability links are unchanged. An identical or omitted
+   `program` returns the stored row. A revision under a new name gets a new registry id, and a grant on the old row does
+   not allow it. Control: compare only on the name lookup path; the concurrent arm goes red.
+3. Argument vector. A marker program receives exactly the fixed literals, the file paths and the permitted suffix;
+   arguments with spaces and quotes stay single arguments; `"none"` refuses any suffix; under `"append"` a suffix that
+   changes the fixture's behaviour runs, showing that `"append"` admits more than the fixed program. Control: spawn
+   with the caller's `args` in place of the built vector.
+4. File identity. Changed bytes at the pinned path, a missing entry, a symbolic link entry and a symbolic link parent
+   are each refused; a matching regular file runs. Control: check the path only, ignoring content ref and mode.
+5. Working directory. The root runs; a subdirectory holding a same-named different script is refused, and so is a
+   symbolic link resolving to the root. Rows without `program` keep accepting a valid subdirectory. Control: join the
+   requested `cwd` silently.
+6. Whole tree. Without `tree` an unrelated data file change runs; with `tree` it is refused; a changed pinned script is
+   refused in both. Control: ignore `tree`.
+7. Every allow source. A mismatching run is refused under a grant, an explicit policy `allow` and the `read` default.
+   Control: validate only when the decision source is `grant`; the policy and default arms go red.
+8. Interpreter bytes. A replaced interpreter before staging is refused; a replacement after staging leaves the run on
+   the compared copy; a `program` row without `network` runs with no network. Control: execute the registered path
+   after the comparison.
+9. Loading limits, per interpreter claimed. For Python: separate fixtures plant a module beside the script, a per-user
+   startup file under `HOME`, and a module on an allowed `PYTHONPATH`, each printing a marker. Each marker is first
+   shown to load without isolation on that exact interpreter, then shown absent with `-I` among `fixed_args`. An
+   interpreter or version not present is reported as not run, never as passed. Control: remove `-I`.
+10. Receipts. A grant-allowed, file-mismatching run leaves one `allow` event naming the definition and the run and a
+    correlated refused receipt in state `mismatch`; `tool.check` leaves no match state; an event append failure prevents
+    the launch; a passing run's recorded argument vector equals the spawned one and its recorded program bytes rehash to
+    its recorded digest. Control: record `matched` at the policy answer, before the file checks.
+11. Malformed state. A malformed, null or unknown-version `program`, a non-`exec` source, a bad content ref or digest,
+    an unsafe path and an argument list one over each size limit are refused at registration and again at run time when
+    written straight to storage, whatever policy answers. Controls: read a malformed `program` as absent; default
+    `extra_args` to `"append"`; remove one size limit.
+
+The implementation stores `program` in the registry row's existing properties and adds no grant or policy column. Its
+receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
+already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
+new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
