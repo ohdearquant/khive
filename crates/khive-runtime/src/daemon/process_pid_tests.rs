@@ -112,7 +112,9 @@ async fn stale_cleanup_preserves_live_incumbent_without_reachable_socket() {
         "the stale-listener fixture must run alone in its child process"
     );
     for socket_exists in [false, true] {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir()
+            .expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
         if socket_exists {
@@ -161,7 +163,9 @@ async fn live_foreign_pid_does_not_block_daemon_startup() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let pid_file = dir.path().join("khived.pid");
     std::env::set_var("KHIVE_SOCKET", &sock);
@@ -246,7 +250,9 @@ async fn second_start_refuses_while_pid_file_is_locked_before_bind() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let pid_file = dir.path().join("khived.pid");
     std::env::set_var("KHIVE_SOCKET", &sock);

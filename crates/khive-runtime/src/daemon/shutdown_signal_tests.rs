@@ -27,7 +27,11 @@ fn wait_for_child_marker(child: &mut SignalChild, path: &std::path::Path) {
             "child exited before marker {}",
             path.display()
         );
-        assert!(Instant::now() < deadline, "missing marker {}", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "missing marker {}",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -71,7 +75,7 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
     for mode in ["drain", "cleanup"] {
         for first in [libc::SIGTERM, libc::SIGINT] {
             for second in [libc::SIGTERM, libc::SIGINT] {
-                let dir = tempfile::Builder::new()
+                let dir = crate::test_process::private_tempdir_builder()
                     .prefix("kh-signal-")
                     .tempdir_in("/tmp")
                     .expect("isolated short socket directory");
@@ -89,9 +93,10 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
                             "--test-threads=1",
                         ])
                         .env_clear()
-                        .envs(std::env::vars_os().filter(|(key, _)| {
-                            !key.to_string_lossy().starts_with("KHIVE_")
-                        }))
+                        .envs(
+                            std::env::vars_os()
+                                .filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
+                        )
                         .env("KHIVE_SOCKET", &sock)
                         .env("KHIVE_PID", &pid_path)
                         .env("KHIVE_LOCK", &lock_path)
@@ -124,7 +129,9 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
                     .expect("write readiness length");
                 stream.write_all(&request).expect("write readiness body");
                 let mut length = [0; 4];
-                stream.read_exact(&mut length).expect("read readiness length");
+                stream
+                    .read_exact(&mut length)
+                    .expect("read readiness length");
                 let length = u32::from_be_bytes(length) as usize;
                 assert!(length <= MAX_FRAME_BYTES, "bounded readiness response");
                 let mut body = vec![0; length];
@@ -190,9 +197,8 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
 async fn shutdown_signal_child() {
     let mode = std::env::var("KHIVE_SIGNAL_TEST_MODE").expect("isolated child mode");
     assert!(matches!(mode.as_str(), "drain" | "cleanup"));
-    let marker = PathBuf::from(
-        std::env::var_os("KHIVE_SIGNAL_TEST_MARKER").expect("isolated child marker"),
-    );
+    let marker =
+        PathBuf::from(std::env::var_os("KHIVE_SIGNAL_TEST_MARKER").expect("isolated child marker"));
     let _sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install child SIGTERM handler");
     let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -242,7 +248,11 @@ fn idle_child() -> SignalChild {
 
 /// Binds a socket path and leaves `listen` to the caller: the window a readiness connect must
 /// ride out. The directory and the socket stay alive for as long as the caller holds them.
-fn unlistened_socket() -> (tempfile::TempDir, std::path::PathBuf, tokio::net::UnixSocket) {
+fn unlistened_socket() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    tokio::net::UnixSocket,
+) {
     let dir = tempfile::Builder::new()
         .prefix("kh-signal-")
         .tempdir_in("/tmp")
