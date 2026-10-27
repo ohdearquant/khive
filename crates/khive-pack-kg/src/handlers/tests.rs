@@ -2091,7 +2091,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
 
     impl Pack for TagHookPack {
         const NAME: &'static str = "tag-update-test";
-        const NOTE_KINDS: &'static [&'static str] = &["tag-hook-note"];
+        const NOTE_KINDS: &'static [&'static str] = &["tag_hook_note"];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[];
     }
@@ -2111,7 +2111,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
             Self::HANDLERS
         }
         fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-            (kind == "tag-hook-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+            (kind == "tag_hook_note").then(|| self.0.clone() as Arc<dyn KindHook>)
         }
         async fn dispatch(
             &self,
@@ -2134,7 +2134,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
         let note = pack
             .handle_create(
                 &token,
-                json!({"kind": "tag-hook-note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                json!({"kind": "tag_hook_note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
                 &registry,
             )
             .await

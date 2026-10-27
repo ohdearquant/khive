@@ -1,6 +1,6 @@
 //! `kkernel kg init` and `kkernel kg hook` — initialization and hook management.
 
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
 
 use super::types::{HookCommand, HookStatus, InitArgs};
@@ -62,6 +62,13 @@ jobs:
 "#;
 
 pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
+    cmd_init_with_hook_prompt(args, prompt_hook_install)
+}
+
+fn cmd_init_with_hook_prompt(
+    args: InitArgs,
+    prompt: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     if args.add_hooks {
         return hook_install(&args.repo);
     }
@@ -155,6 +162,40 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
         }
     }
 
+    prompt(&args.repo)?;
+    Ok(())
+}
+
+fn prompt_hook_install(repo: &Path) -> Result<()> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Ok(());
+    }
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout();
+    prompt_hook_install_with_io(repo, true, &mut input, &mut output)
+}
+
+fn prompt_hook_install_with_io<R: BufRead, W: Write>(
+    repo: &Path,
+    stdin_is_terminal: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<()> {
+    if !stdin_is_terminal {
+        return Ok(());
+    }
+    write!(output, "  Install pre-commit hook? [y/N]: ")
+        .context("write hook installation prompt")?;
+    output.flush().context("flush hook installation prompt")?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .context("read hook installation answer")?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        hook_install(repo)?;
+    }
     Ok(())
 }
 
@@ -334,6 +375,14 @@ mod tests {
 
     use super::*;
 
+    fn init_noninteractive(args: InitArgs) -> Result<()> {
+        let mut input = std::io::empty();
+        let mut output = std::io::sink();
+        cmd_init_with_hook_prompt(args, |repo| {
+            prompt_hook_install_with_io(repo, false, &mut input, &mut output)
+        })
+    }
+
     #[test]
     fn init_creates_expected_files() {
         let tmp = TempDir::new().unwrap();
@@ -342,7 +391,7 @@ mod tests {
             ci: false,
             add_hooks: false,
         };
-        cmd_init(args).unwrap();
+        init_noninteractive(args).unwrap();
 
         assert!(tmp.path().join(".khive/kg/entities.ndjson").exists());
         assert!(tmp.path().join(".khive/kg/edges.ndjson").exists());
@@ -362,7 +411,7 @@ mod tests {
             ci: false,
             add_hooks: false,
         };
-        cmd_init(args).unwrap();
+        init_noninteractive(args).unwrap();
 
         let content = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(content, "# custom\n", "should not overwrite existing toml");
@@ -390,7 +439,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&init.stderr)
         );
-        cmd_init(InitArgs {
+        init_noninteractive(InitArgs {
             repo: tmp.path().to_path_buf(),
             ci: false,
             add_hooks: false,
@@ -463,7 +512,7 @@ mod tests {
     fn init_creates_versioned_schema_with_empty_remotes() {
         let tmp = TempDir::new().unwrap();
 
-        cmd_init(manifest_init_args(&tmp)).unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
 
         let path = tmp.path().join(".khive/kg/schema.yaml");
         assert!(path.is_file(), "kg init must create its default schema");
@@ -488,7 +537,7 @@ mod tests {
             );
         }
         let before = std::fs::read(&path).unwrap();
-        cmd_init(manifest_init_args(&tmp)).unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
@@ -510,7 +559,7 @@ mod tests {
         std::fs::write(&path, custom).unwrap();
 
         for _ in 0..2 {
-            cmd_init(manifest_init_args(&tmp)).unwrap();
+            init_noninteractive(manifest_init_args(&tmp)).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), custom.as_bytes());
         }
     }
@@ -609,7 +658,7 @@ mod tests {
         const ARCHIVE_PIN: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let tmp = TempDir::new().unwrap();
-        cmd_init(manifest_init_args(&tmp)).unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
         let schema_path = tmp.path().join(".khive/kg/schema.yaml");
         assert!(
             schema_path.is_file(),
@@ -662,7 +711,7 @@ mod tests {
         assert_eq!(second.previous_commit, expected);
         assert_eq!(second.commit, expected);
         assert_eq!(std::fs::read(&schema_path).unwrap(), pinned);
-        cmd_init(manifest_init_args(&tmp)).unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
         assert_eq!(std::fs::read(schema_path).unwrap(), pinned);
     }
 
@@ -738,3 +787,7 @@ mod tests {
         assert!(!create_default_schema(&path).expect("complete schema is preserved"));
     }
 }
+
+#[cfg(test)]
+#[path = "init_prompt_tests.rs"]
+mod prompt_tests;
