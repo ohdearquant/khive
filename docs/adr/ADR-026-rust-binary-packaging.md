@@ -1,8 +1,10 @@
 # ADR-026: Rust Binary Packaging via Per-Platform npm Subpackages
 
-**Status**: accepted\
+**Status**: deprecated\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
+
+2026-10-27: The npm packages are no longer built or published; this ADR remains as the record of the design.
 
 ## Context
 

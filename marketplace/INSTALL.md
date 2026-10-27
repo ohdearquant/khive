@@ -18,8 +18,7 @@ all over the one `kkernel mcp` server.
 cargo install kkernel
 ```
 
-`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface (the npm
-package additionally installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`). Add the
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. Add the
 MCP server config (Step 2), and you are ready to go.
 
 Verify:

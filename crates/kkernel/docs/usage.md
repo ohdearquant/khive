@@ -751,16 +751,19 @@ kkernel kg --help                          # KG validation, init, pre-commit hoo
 
 ## Distribution model
 
-`kkernel` is the only published binary. The npm package `khive` ships per-platform
-`@khive-ai/kernel-<platform>` subpackages that each contain `bin/kkernel`. Two command
-names route to it:
+`kkernel` is the only published binary. Install it from crates.io:
 
-- `khive <cmd>` → `kkernel <cmd>` (and `khive mcp` → `kkernel mcp`)
-- `khive-mcp [args]` → `kkernel mcp [args]` (compat alias for existing MCP configs)
+```bash
+cargo install kkernel
+```
 
-Binary resolution order (npm shims and `cli/lib/kernel.ts` agree): `KKERNEL_BINARY`
-env override → `@khive-ai/kernel-<platform>/bin/kkernel` → monorepo
-`crates/target/{release,debug}/kkernel`.
+Or install from a checkout at the repository root:
+
+```bash
+cargo install --path crates/kkernel
+```
+
+Configure MCP clients to run `kkernel mcp` directly.
 
 ### Local development
 

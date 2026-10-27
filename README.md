@@ -274,21 +274,6 @@ kkernel --version   # confirms the binary and version you just installed
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
 MCP client discovers the `request` tool with the full 160-verb catalog.
 
-### Alternative: npm
-
-An npm-distributed `khive` package also exists, but the published version there can lag behind
-the latest crates.io release. Check `khive --version` (or `khive-mcp --version`) after install
-and compare it to the [crates.io version](https://crates.io/crates/khive-mcp) before relying on
-features documented here.
-
-```bash
-npm install -g khive
-```
-
-```json
-{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
-```
-
 ### Build from source
 
 ```bash

@@ -22,10 +22,6 @@ git clone https://github.com/ohdearquant/khive.git && cd khive
 cd crates && cargo build --release -p kkernel
 ```
 
-The npm package `khive` installs a thin `khive` / `khive-mcp` shim that forwards to
-`kkernel mcp` for users who prefer `npm install -g khive` over Rust tooling; the two
-install paths produce the same binary underneath.
-
 ## Usage
 
 Point an MCP client at the binary's `mcp` subcommand:

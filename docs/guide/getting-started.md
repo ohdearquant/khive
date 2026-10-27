@@ -22,19 +22,6 @@ cargo install kkernel
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
 surface.
 
-### From npm
-
-```bash
-npm install -g khive
-# or
-npm install -g @khive-ai/cli
-```
-
-The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`. The npm
-release can lag the crates.io release, so run `khive --version` after install and compare against
-[crates.io/crates/khive-mcp](https://crates.io/crates/khive-mcp) if you need the latest verbs
-documented here.
-
 ### From source
 
 ```bash
