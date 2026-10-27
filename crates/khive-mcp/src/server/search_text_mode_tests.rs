@@ -317,7 +317,7 @@ mod note_status_disclosure_tests {
             for index in 1..5 { absent(&response["results"][index]); }
             assert_eq!(response["results"][3]["ok"], false);
             let chain = status_request(&server,
-                format!("search(kind=\"note\", query=\"{STATUS_QUERY}\", source=\"text\") | get(id=$prev.0.id)"),
+                format!("search(kind=\"note\", query=\"{STATUS_QUERY}\", source=\"text\") | get(id=$prev[0].id)"),
                 "verbose", "json").await;
             disclosure(&chain["results"][0], "active", 2);
             assert_eq!(chain["results"][1]["ok"], true, "array-indexed $prev must remain usable: {chain}");
