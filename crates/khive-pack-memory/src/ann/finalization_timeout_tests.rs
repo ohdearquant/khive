@@ -1,4 +1,4 @@
-//! Real append-contention regressions; no fixture or native run is claimed here.
+//! Real append-contention regressions using a retained physical writer guard.
 use super::resource_admission_tests::{CloseOnDrop, WallClock};
 use super::*;
 use khive_runtime::resource_admission::{BackgroundRoot, CleanupPolicy, WorkClassLimits};
@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 struct TerminalGate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
-    append_pending: tokio::sync::Notify,
+    append_observed: tokio::sync::Notify,
+    append_returned: AtomicBool,
+    store: std::sync::Mutex<Option<Arc<dyn khive_storage::EventStore>>>,
     armed: AtomicBool,
     pending_polls: AtomicUsize,
     cancel_on_pending: std::sync::Mutex<Option<AdmittedJob>>,
@@ -20,13 +22,37 @@ tokio::task_local! {
 
 // Setup precedes finalize's first deadline calculation. No short-grace race
 // with acquiring the test writer or constructing its dirty bridge is required.
-pub(super) async fn before_terminal() {
+pub(super) async fn before_terminal(rt: &KhiveRuntime, token: &NamespaceToken) {
     let gate = TERMINAL_GATE.try_with(Arc::clone).ok();
     if let Some(gate) = gate {
+        let store = crate::store_access::acquire_store("memory.ann.event_store", {
+            let runtime = rt.clone();
+            let token = token.clone();
+            move || runtime.events(&token)
+        })
+        .await
+        .expect("terminal fixture event-store acquisition task")
+        .expect("terminal fixture real token-scoped event store");
+        *gate.store.lock().unwrap() = Some(store);
         gate.entered.notify_one();
         gate.release.notified().await;
         gate.armed.store(true, Ordering::SeqCst);
     }
+}
+
+// Only the armed terminal append uses the prepared real store. Start events and
+// every other fixture retain ordinary acquisition and attribution behavior.
+pub(super) fn terminal_store() -> Option<Arc<dyn khive_storage::EventStore>> {
+    TERMINAL_GATE
+        .try_with(|gate| {
+            if gate.armed.load(Ordering::SeqCst) {
+                gate.store.lock().unwrap().clone()
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 // Observe the REAL append future. Never replace its result, force Pending,
@@ -45,12 +71,33 @@ pub(super) async fn observe_append<F: Future>(append: F) -> F::Output {
                     job.request_cancel();
                 }
                 gate.pending_polls.fetch_add(1, Ordering::SeqCst);
-                gate.append_pending.notify_one();
+                gate.append_observed.notify_one();
             }
+        } else if let Some(gate) = &gate {
+            gate.append_returned.store(true, Ordering::SeqCst);
+            gate.append_observed.notify_one();
         }
         result
     })
     .await
+}
+
+// On success or unwind, release the real writer before any blocking-holder or
+// infrastructure join. No wait occurs inside an AtomicUnitOp callback.
+struct ReleaseWriter(Option<std::sync::mpsc::Sender<()>>);
+
+impl ReleaseWriter {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl Drop for ReleaseWriter {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +192,14 @@ async fn append_timeout_case(case: Case) {
                     .await
             })
             .unwrap();
-        gate.entered.notified().await;
+        let joined = background.join();
+        tokio::pin!(joined);
+        tokio::select! {
+            result = &mut joined => {
+                panic!("ANN supervisor completed before terminal fixture entry: {result:?}");
+            }
+            () = gate.entered.notified() => {}
+        }
         assert!(!control.is_closed());
         assert!(!rt_control.is_closed());
         assert!(!probe.is_cancelled());
@@ -163,18 +217,63 @@ async fn append_timeout_case(case: Case) {
         bridge.last_checkpoint = Instant::now();
         ann.indexes.write().await.insert(key.clone(), bridge);
         assert!(!ann.checkpoint_timers.lock().unwrap().contains(&key));
-        let sql = rt.sql();
-        let writer = sql.writer().await.unwrap();
+        // An in-memory SqlWriter facade retains only an Arc, not exclusion.
+        // The public pool guard retains the physical writer on this blocking
+        // thread, after the actual token-scoped event store is ready.
+        let holder_view = rt.background_view();
+        let (writer_ready, ready) = tokio::sync::oneshot::channel();
+        let (writer_release, release) = std::sync::mpsc::channel();
+        let mut release_writer = ReleaseWriter(Some(writer_release));
+        let writer_held = Arc::new(AtomicBool::new(false));
+        let held = writer_held.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            let backend = holder_view.backend();
+            let pool = backend.pool();
+            let writer = pool.writer().expect("physical fixture writer guard");
+            held.store(true, Ordering::SeqCst);
+            writer_ready.send(()).expect("fixture still awaits writer readiness");
+            // Same ten-second ceiling as the existing WallClock; no unbounded
+            // blocking job can survive cancellation of the async fixture.
+            let released = release.recv_timeout(Duration::from_secs(10));
+            held.store(false, Ordering::SeqCst);
+            drop(writer);
+            released.expect("physical writer must be released before its wall-clock ceiling");
+        });
+        tokio::select! {
+            result = ready => result.expect("physical writer holder reached its ready barrier"),
+            result = &mut joined => {
+                panic!("ANN supervisor completed before writer holder readiness: {result:?}");
+            }
+        }
+        assert!(writer_held.load(Ordering::SeqCst));
         if matches!(case, Case::JobCancelled) {
             *gate.cancel_on_pending.lock().unwrap() = Some(probe.clone());
         }
         gate.release.notify_one();
-        gate.append_pending.notified().await;
+        tokio::select! {
+            biased;
+            () = gate.append_observed.notified() => {}
+            result = &mut joined => {
+                panic!("ANN supervisor completed before observing its actual terminal append: {result:?}");
+            }
+        }
+        assert!(
+            !gate.append_returned.load(Ordering::SeqCst),
+            "actual terminal append returned while the physical writer was retained"
+        );
         assert!(
             gate.pending_polls.load(Ordering::SeqCst) > 0,
             "must poll the actual append Pending under the held writer"
         );
-        let outcome = background.join().await.unwrap();
+        let outcome = joined.await.unwrap();
+        assert!(
+            writer_held.load(Ordering::SeqCst),
+            "physical writer must remain held through terminal finalization"
+        );
+        assert!(
+            !gate.append_returned.load(Ordering::SeqCst),
+            "actual terminal append must still be pending when finalization ends"
+        );
         match case {
             Case::Success => {
                 assert!(!probe.is_cancelled());
@@ -217,7 +316,9 @@ async fn append_timeout_case(case: Case) {
                 assert!(!ann.checkpoint_timers.lock().unwrap().contains(&key));
             }
         }
-        drop(writer);
+        release_writer.release();
+        holder.await.expect("physical writer holder exited after explicit release");
+        assert!(!writer_held.load(Ordering::SeqCst));
         drop((probe, tracking));
         // Cleanup is inside the same WallClock budget; no timer or child is
         // allowed to stand in for a test oracle by hanging the runner.

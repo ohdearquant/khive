@@ -493,12 +493,20 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
         return;
     }
     // A missing event store means auditing is unconfigured, not that warming failed.
-    let result = crate::store_access::acquire_store("memory.ann.event_store", {
+    let acquire = crate::store_access::acquire_store("memory.ann.event_store", {
         let runtime = rt.clone();
         let token = token.clone();
         move || runtime.events(&token)
-    })
-    .await;
+    });
+    // The timeout fixture prepares this real token-scoped store before taking
+    // its physical writer guard; constructor contention is not append contention.
+    #[cfg(test)]
+    let result = match super::finalization_timeout_tests::terminal_store() {
+        Some(store) => Ok(Ok(store)),
+        None => acquire.await,
+    };
+    #[cfg(not(test))]
+    let result = acquire.await;
     let Ok(Ok(store)) = result else {
         return;
     };

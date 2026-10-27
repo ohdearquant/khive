@@ -441,7 +441,7 @@ async fn finalize_ann_attempt(
         }
     };
     #[cfg(test)]
-    finalization_timeout_tests::before_terminal().await;
+    finalization_timeout_tests::before_terminal(rt, token).await;
     let finalization = job.finalize(terminal).await;
     // A bounded telemetry attempt can expire while ordinary work is still
     // allowed. Its incomplete counter is recorded by finalize; keep the body
