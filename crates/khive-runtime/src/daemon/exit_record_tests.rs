@@ -1,9 +1,9 @@
 // Included by daemon::tests::exit_records (ADR-185 Amendment 5).
 
+use super::*;
 use super::super::exit_record::{
     exit_record_path, read_previous, ExitReason, ExitRecord, PreviousExit, SENDER_CAPTURE_LATE,
 };
-use super::*;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -31,10 +31,7 @@ fn the_previous_record_is_classified() {
 
     let exited = "exited pid=7 reason=signal SIGTERM sender_pid=9 at=2026-10-13T00:00:00.000Z";
     std::fs::write(&record, format!("{exited}\n")).unwrap();
-    assert_eq!(
-        read_previous(&record),
-        PreviousExit::Exited(exited.to_owned())
-    );
+    assert_eq!(read_previous(&record), PreviousExit::Exited(exited.to_owned()));
 
     std::fs::write(&record, "running pid=42 started=2026-10-13T00:00:00.000Z\n").unwrap();
     assert_eq!(
@@ -86,9 +83,7 @@ fn only_the_pid_file_owner_writes_the_record_and_each_write_is_whole() {
     record.exiting(ExitReason::Idle);
     let exited = std::fs::read_to_string(&record_path).unwrap();
     assert!(
-        exited.starts_with(&format!(
-            "exited pid={me} reason=idle sender_pid=unknown at="
-        )),
+        exited.starts_with(&format!("exited pid={me} reason=idle sender_pid=unknown at=")),
         "{exited:?}"
     );
     assert_eq!(
