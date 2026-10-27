@@ -2549,12 +2549,12 @@ async fn missing_ann_hydration_is_dropped_and_reported() {
     }];
 
     let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
-    assert_eq!(failures, 1);
+    assert_eq!(failures, 0);
     assert!(hits.is_empty(), "unhydrated shells must never be returned");
 
     let mut response = json!({"results": [], "total": 0});
     attach_hydration_degradation(&mut response, failures);
-    assert_eq!(response["degraded"]["hydration_failures"], 1);
+    assert!(response.get("degraded").is_none());
 }
 
 #[test]

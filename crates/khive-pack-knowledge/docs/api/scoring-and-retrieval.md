@@ -128,12 +128,17 @@ exhausted. Exhaustion is measured on the ANN prefix before fresh-tail deletes ar
 live vector-store count is not used as a hard serving-bridge bound, so a newly deleted leading
 candidate cannot make a full prefix look exhausted. Ineligible candidates therefore neither
 consume returned slots nor distort eligible RRF ranks. Hydration queries are chunked below
-SQLite's portable bind-variable ceiling. A stale id
-or storage-read failure degrades the candidate pool but does not discard a valid lexical response.
-Unresolved shells are never returned, and a partial response reports the number under
-`degraded.hydration_failures`. The field is omitted when the count is zero. This diagnostic
-composes with `knowledge.suggest`'s existing ANN-unavailable degradation object and is propagated
-through auto-`knowledge.compose` when its internal suggestion is degraded.
+SQLite's portable bind-variable ceiling. An ANN id proved absent from both canonical tables is an
+index miss: it is dropped and refill continues without `degraded.hydration_failures`. The internal
+presence check reads IDs only, including deleted rows and all namespaces; it never hydrates foreign
+content. An existing row that cannot hydrate, or a read that cannot establish absence, still
+contributes to `degraded.hydration_failures`. Unresolved shells are never returned. The field is
+omitted when its count is zero, composes with `knowledge.suggest`'s existing ANN-unavailable object,
+and propagates through auto-`knowledge.compose`. Separate hydration and presence reads do not
+constitute a shared snapshot. One operator INFO event on `khive_pack_knowledge::knowledge::search`
+records `request_class` and `stale_ann_dropped`, including zero for a clean request. The count is
+unique per request across refill prefixes; auto-compose is attributed to `knowledge.compose` once.
+The event contains no candidate IDs or content and adds no counter to the caller response.
 
 Eligibility refill does not override caller-requested score semantics: `min_score` is reapplied
 after status multipliers and learned atom weights, so a genuine score-floor rejection may still

@@ -104,6 +104,7 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.search");
         khive_storage::ensure_request_read_active("knowledge.search")?;
         let p: SearchParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -281,6 +282,7 @@ impl KnowledgeHandlers {
                     search_core(&ctx, &raw_query, LexicalPass::Full).await
                 }
             },
+            &mut stale,
         )
         .await?;
 
@@ -436,6 +438,7 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.suggest");
         let (out, _) = Self::suggest_with_query_embedding(
             runtime,
             token,
@@ -443,6 +446,7 @@ impl KnowledgeHandlers {
             ann,
             QueryEmbeddingCache::default(),
             SuggestCandidateCohort::RequestedLimit,
+            &mut stale,
         )
         .await?;
         Ok(out)
@@ -458,6 +462,7 @@ impl KnowledgeHandlers {
         ann: &vamana::SharedAnn,
         query_embedding: QueryEmbeddingCache,
         cohort: SuggestCandidateCohort,
+        stale: &mut super::hydration::StaleAnnDiagnostics,
     ) -> Result<(Value, QueryEmbeddingCache), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
@@ -529,6 +534,7 @@ impl KnowledgeHandlers {
                 operation: "knowledge.suggest",
             },
             search_core(&ctx, &raw_query, LexicalPass::Full),
+            stale,
         )
         .await?;
 
@@ -837,6 +843,7 @@ impl KnowledgeHandlers {
         ann: &vamana::SharedAnn,
         type_weights: HashMap<String, f32>,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.compose");
         let p: ComposeParams = deser(params)?;
 
         // Registry dispatch already mints an exact token for an explicit
@@ -932,6 +939,7 @@ impl KnowledgeHandlers {
                 ann,
                 std::mem::take(&mut query_embedding),
                 SuggestCandidateCohort::AutoCompose,
+                &mut stale,
             )
             .await;
             try_or_finish!(khive_storage::ensure_request_read_active(
