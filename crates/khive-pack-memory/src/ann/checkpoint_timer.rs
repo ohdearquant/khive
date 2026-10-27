@@ -95,20 +95,12 @@ fn spawn_checkpoint(rt: &KhiveRuntime, timer: CheckpointTimer) -> tokio::task::J
     })
 }
 
-// Preserve the existing deterministic timer test entry without double-registering
-// production timers. The production caller lends its synchronous registration.
-#[cfg(test)]
-async fn run_timer(
-    rt: &KhiveRuntime,
-    timer: CheckpointTimer,
-    shutdown: CancellationToken,
-) -> Option<SharedAnn> {
-    let tracking = TrackedJob::register("memory_ann_checkpoint");
-    run_timer_tracked(rt, timer, shutdown, &tracking).await
-}
-
 /// A weak claim sleeps without admission. Queue Maintenance before upgrading
 /// the owner; keep the original registration/claim through the supervised attempt.
+///
+/// Only a newer checkpoint that moves a still-dirty deadline into the future
+/// returns the owner for rescheduling. An unchanged deadline or a failed attempt
+/// never schedules an automatic retry.
 async fn run_timer_tracked(
     rt: &KhiveRuntime,
     timer: CheckpointTimer,
@@ -219,6 +211,17 @@ fn finish_checkpoint_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Preserve the existing deterministic timer test entry without double-registering
+    // production timers. The production caller lends its synchronous registration.
+    async fn run_timer(
+        rt: &KhiveRuntime,
+        timer: CheckpointTimer,
+        shutdown: CancellationToken,
+    ) -> Option<SharedAnn> {
+        let tracking = TrackedJob::register("memory_ann_checkpoint");
+        run_timer_tracked(rt, timer, shutdown, &tracking).await
+    }
 
     #[test]
     fn deadline_uses_remaining_interval_and_skips_clean_or_disabled_bridges() {
