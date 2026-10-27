@@ -291,3 +291,28 @@ fn weight_map_insertion_order_does_not_change_the_score_bits() {
         }
     }
 }
+
+#[test]
+fn negative_unvalidated_weight_does_not_reduce_the_denominator() {
+    let f = RerankFeatures {
+        relevance: 1.0,
+        salience: 1.0,
+        ..Default::default()
+    };
+    let weights = [("relevance".into(), 1.0), ("salience".into(), -0.5)]
+        .into_iter()
+        .collect();
+    assert_eq!(weighted_rerank(&f, &weights).to_bits(), 0.5_f64.to_bits());
+}
+
+#[test]
+fn active_nonfinite_features_keep_unchecked_nan_propagation() {
+    let weights = [("relevance".into(), 1.0)].into_iter().collect();
+    for relevance in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let f = RerankFeatures {
+            relevance,
+            ..Default::default()
+        };
+        assert!(weighted_rerank(&f, &weights).is_nan());
+    }
+}
