@@ -487,6 +487,7 @@ impl VerbRegistryBuilder {
         validate_unique_entity_types(&ordered_packs)?;
         validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        super::declaration_validation::validate_declarations(&ordered_packs)?;
         let mut disabled_verbs = HashSet::new();
         let mut policies: Vec<_> = self.disabled_verbs.iter().collect();
         policies.sort_by_key(|(pack, _)| *pack);
