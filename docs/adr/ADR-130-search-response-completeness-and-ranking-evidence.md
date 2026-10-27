@@ -1154,10 +1154,16 @@ array contract this ADR keeps on every route.
 1. **Fields.** Every successful MCP `search` operation on the note substrate carries, beside `status` and `result`:
    - `note_status`: the effective selector, `"active"`, `"archived"` or `"any"`. An omitted or null selector reports
      `"active"`.
-   - `note_status_dropped`: an unsigned integer, the number of gathered candidates that hydration excluded because
-     their note status did not match the effective selector. It is present on every successful note search, zero
-     included, so its absence never means none. Under `"any"` it is always 0. On coordinated dispatch it is the sum
-     over the backend legs that completed; a failed leg contributes nothing, and §1's `partial` rules are unchanged.
+   - `note_status_dropped`: an unsigned integer, the number of distinct candidate notes that hydration excluded
+     because their note status did not match the effective selector. The unit is one note: hydration reads the
+     candidates after the text and vector arms are fused, so a note both arms gathered counts once. A candidate counts
+     only when every other predicate of the same hydration pass admits it: not deleted, permitted by mailbox
+     authorization, and matching the request's kind, tag and properties filters. A candidate those predicates exclude
+     is not counted whatever its status, so the count never reports a note the caller could not otherwise receive.
+     The superseded-note filter, which runs after hydration, is not consulted. The field is present on every
+     successful note search, zero included, so its absence never means none. Under `"any"` it is always 0. On
+     coordinated dispatch it is the sum over the backend legs that completed; a failed leg contributes nothing, and
+     §1's `partial` rules are unchanged.
 
 2. **Placement.** The fields belong to each successful operation, never to the aggregate batch wrapper, a hit row or
    the hit array. The `result` array keeps its exact bytes on each route: no metadata row, wrapping object, field
@@ -1176,7 +1182,7 @@ array contract this ADR keeps on every route.
    so mailbox authorization, filters and ranking stay where they are. The count is never derived from the hit array or
    its length, and no generic sidecar mechanism is added.
 
-4. **Meaning.** `note_status_dropped` says how many gathered candidates the selector removed. It is not a count of
+4. **Meaning.** `note_status_dropped` says how many candidate notes the selector removed. It is not a count of
    non-matching notes in the store, and it does not promise that a repeat with `"any"` returns that many more hits:
    fusion, filters and the limit still apply. A short page with `note_status_dropped = 0` is a short answer.
 
@@ -1197,10 +1203,13 @@ Each control names its mutation, stated before it runs.
    `result` bytes for note fixtures, populated and empty, are identical with and without the new fields under the same
    serializer and presentation. Mutations: the count inserted as a hit-array row fails byte identity; a metadata object
    substituted for an empty array fails the array-shape and empty-hit controls.
-2. Semantics. A fixture whose gather admits archived rows: the default returns the short page with
-   `note_status_dropped` equal to the archived rows gathered; `"any"` returns them with 0; `"archived"` counts the active
-   rows dropped. Mutations: counting before the status filter, or computing the count from the array's length, fails
-   this fixture.
+2. Semantics. A fixture whose gather admits archived notes: the default returns the short page with
+   `note_status_dropped` equal to the distinct archived notes the other hydration predicates admit; `"any"` returns them
+   with 0; `"archived"` counts the active notes dropped. The fixture includes an archived note both arms gather, which
+   counts once, an archived message note the caller's mailbox does not permit, and an archived note outside the
+   request's tag filter, neither of which counts. Mutations: counting per arm, counting before the mailbox or filter
+   predicates, counting before the status filter, or computing the count from the array's length, each fails this
+   fixture.
 3. Always present. A healthy-empty note search reports `note_status` and `note_status_dropped = 0`. Mutation: omitting
    a zero count fails.
 4. Absence. Entity search, help, `search_incomplete`, frame-budget `ok=false` and non-search siblings in a mixed batch
