@@ -186,3 +186,99 @@ The original ledger follows unchanged, including its original caveats.
   tokens are consumed per call. If allocation-free timing is needed, switch to `iter_batched`.
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Advisory CI observation — 2026-10-27 UTC (#5671)
+
+The earlier “awaiting qualified measurement” and “no measured baseline” statements
+predate this observation. This appendix records an existing CI artifact for the
+measured scenes; it leaves the generated fixed-reference/A/A block and historical
+release entry unchanged. Timing remains advisory, with no cross-host improvement,
+rolling-reference ratio, hard latency bound, or full-workflow acceptance inferred.
+
+### Provenance and observed coverage
+
+- Source: commit `a72ad862cbfc57b6063fa26a1d7dfcebd0749c91`, tree
+  `ae5b6ef2b3fde51324783e963302fff4b4d1c8fe`; the recorded tree is also the train
+  head `a8aaafaf104d76f3dd67a3232246b94900744efe` tree. The measured khive-text
+  providers match frozen dev `f7524e536512c6a57b039933be034bbc5b75c4d3` byte-for-byte.
+- [CI job](https://github.com/ohdearquant/khive/actions/runs/40430486230/job/121947482310),
+  run `40430486230`, job `121947482310`, attempt 1;
+  [artifact `12702217093`](https://github.com/ohdearquant/khive/actions/runs/40430486230/artifacts/12702217093),
+  SHA-256 `2879796e358155b3e1d6e90ae30356da5a93f89d724d820a80f73a5a989a5544`.
+- Machine record: Linux `x86_64`, 4 reported CPUs, GitHub Actions runner
+  `1000462429`. Actual toolchain: `rustc 1.95.0 (59807616e 2026-04-14)`,
+  `x86_64-unknown-linux-gnu`, optimized `bench` profile, `CARGO_INCREMENTAL=0`.
+- The component selected khive-score, khive-fusion, khive-retrieval, khive-text and
+  khive-bm25. Its compile phase exited 0 in 325 seconds and Criterion phase exited
+  0 in 90 seconds; these are whole-component phase durations.
+
+The logged commands, from `crates`, expanded the selected package list as follows:
+
+```bash
+cargo bench -p khive-score -p khive-fusion -p khive-retrieval -p khive-text -p khive-bm25 --benches --no-run
+cargo bench -p khive-score -p khive-fusion -p khive-retrieval -p khive-text -p khive-bm25 --benches -- --quick --noplot
+```
+
+The run contains 31 unique khive-text Criterion IDs: the 21 existing scenes and
+10 additional scenes below. It compiled and ran `text_bench` and `text_additional`.
+It did not enable `unicode`; `text_unicode` and the three
+`tokenize_additional/unicode_word/{200,2000,20000}` scenes are absent from the log
+and artifact. Their baselines and complete #5671 feature-enabled coverage remain
+pending. The successful component phases do not establish that acceptance item.
+
+Each table's Criterion median is the exact `median.point_estimate` from the
+corresponding `crates/target/criterion/<directory_name>/new/estimates.json`, in
+**nanoseconds per operation**. IDs come from `benchmark.json.full_id`, not the
+filesystem spelling. Every cited quick-profile `sample.json` contains **2 actual
+iteration/time samples**, not the source's configured 100/200 samples or the
+separate 101-call report. No tail percentile is inferred.
+
+### Additional tokenizer observations
+
+| Criterion full ID                      | Scalar characters | Criterion median (ns/op) | Console throughput point (Elements/s) |
+| -------------------------------------- | ----------------- | ------------------------ | ------------------------------------- |
+| `tokenize_additional/keyword/200`      | 200               | 41.95300769805908        | 4.7792 Gelem/s                        |
+| `tokenize_additional/keyword/2000`     | 2,000             | 106.68834590911865       | 18.802 Gelem/s                        |
+| `tokenize_additional/keyword/20000`    | 20,000            | 633.6586380004883        | 31.720 Gelem/s                        |
+| `tokenize_additional/identifier/204`   | 204               | 7856.1612548828125       | 25.921 Melem/s                        |
+| `tokenize_additional/identifier/2006`  | 2,006             | 88009.5947265625         | 22.742 Melem/s                        |
+| `tokenize_additional/identifier/20026` | 20,026            | 863765.9921875           | 23.191 Melem/s                        |
+
+One declared Element is one Unicode scalar character, so the reported throughput
+is characters/second, not UTF-8 bytes/second or tokens/second. The throughput
+column transcribes the console's central `thrpt` estimate; it is not a rate
+recomputed from the separate median column. Tokenization and result allocation
+are timed; fixture setup, exact token-vector witnesses and returned-vector
+destruction remain outside the timer as described above.
+
+### Additional language observations
+
+| Criterion full ID                                 | Criterion median (ns/op) | Logged 101-call single-call median (ns) |
+| ------------------------------------------------- | ------------------------ | --------------------------------------- |
+| `language_additional/legacy_meaningful/normal`    | 751.9421081542969        | 781                                     |
+| `language_additional/legacy_meaningful/gibberish` | 227.3451976776123        | 280                                     |
+| `language_additional/contains_cjk_f32/latin`      | 38.88330602645874        | 90                                      |
+| `language_additional/contains_cjk_f32/mixed`      | 31.53233551979065        | 80                                      |
+
+The last column is the separately logged middle duration of 101 individually
+timed calls, including clock, black-box and function-pointer overhead. It is not
+the Criterion statistic. The legacy rows call deprecated `is_meaningful_query`,
+which forwards to `is_meaningful_text_query`; the f32 rows call
+`contains_cjk_f32`. Language rows declare no throughput unit.
+
+### Existing guarantee-row context
+
+| Criterion full ID                        | Actual measured API / metric                                             | Criterion median (ns/op) |
+| ---------------------------------------- | ------------------------------------------------------------------------ | ------------------------ |
+| `tokenize/whitespace/long`               | `WhitespaceTokenizer::tokenize`; latency only, no throughput declaration | 7889.766784667969        |
+| `lang_detect/is_meaningful_query/normal` | `is_meaningful_text_query`; the ID retains the older name                | 835.3163909912109        |
+| `lang_detect/contains_cjk/mixed`         | `contains_cjk`; mixed-CJK latency                                        | 141.82712841033936       |
+
+The `lang_detect/is_meaningful_query/normal` ID measures the canonical text
+function, while `language_additional/legacy_meaningful/normal` measures its
+compatibility entry point; these distinct IDs are not duplicate measurements of
+a second query policy. The whitespace guarantee's characters/second baseline
+remains pending because its measured target declares no throughput. The old
+long-fixture size label is not promoted into a current scalar-character count.
+This CI appendix supplies observed context for the other measured rows without
+replacing the fixed A/A reference or claiming a comparable-host trend.
