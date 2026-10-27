@@ -428,12 +428,19 @@ class GitleaksConfigTests(unittest.TestCase):
         def repo_git(*args):
             return subprocess.run(["git", "-C", str(REPO_ROOT), *args], capture_output=True,
                                   text=True, timeout=60, check=False)
+        # A failed read must fail here, never pass as "the path has no history".
         shallow = repo_git("rev-parse", "--is-shallow-repository")
-        if shallow.returncode != 0 or shallow.stdout.strip() != "false":
+        self.assertEqual(shallow.returncode, 0, shallow.stderr)
+        if shallow.stdout.strip() == "true":
             self.skipTest("needs a full-history checkout")
-        commits = repo_git("log", "--all", "--format=%H", "--", HPKE_VECTOR_PATH).stdout.split()
+        log = repo_git("log", "--all", "--format=%H", "--", HPKE_VECTOR_PATH)
+        self.assertEqual(log.returncode, 0, log.stderr)
+        commits = log.stdout.split()
         self.assertTrue(commits, f"no commit touches {HPKE_VECTOR_PATH}; remove the exemption")
-        contents = [repo_git("show", f"{commit}:{HPKE_VECTOR_PATH}").stdout for commit in commits]
+        # The commit that deleted the file has no blob at the path, so only readable versions count.
+        shows = [repo_git("show", f"{commit}:{HPKE_VECTOR_PATH}") for commit in commits]
+        contents = [show.stdout for show in shows if show.returncode == 0]
+        self.assertTrue(contents, f"no version of {HPKE_VECTOR_PATH} in history could be read")
         for value in HPKE_VECTOR_VALUES:
             self.assertTrue(
                 any(value in text for text in contents),
