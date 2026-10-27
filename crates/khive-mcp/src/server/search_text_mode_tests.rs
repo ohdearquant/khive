@@ -510,6 +510,14 @@ mod note_status_disclosure_tests {
         disclosure: Option<(khive_storage::note::NoteStatusSelector, u64)>,
     }
 
+    impl khive_types::Pack for BrokenDisclosurePack {
+        const NAME: &'static str = "broken-search-disclosure";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] =
+            <FrameBudgetCategoryTestPack as khive_types::Pack>::HANDLERS;
+    }
+
     #[async_trait::async_trait]
     impl khive_runtime::PackRuntime for BrokenDisclosurePack {
         fn name(&self) -> &str {

@@ -22,6 +22,9 @@ use khive_storage::EdgeRelation;
 use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
 use super::search_profile;
 
+type ScopedSearchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(CoordSearchResult, u64), RuntimeError>> + Send + 'a>>;
+
 /// `CoordinatorService` wrapper around a [`SubstrateCoordinator`].
 ///
 /// `KhiveMcpServer` holds `Option<Arc<dyn CoordinatorService>>` — it holds
@@ -74,8 +77,7 @@ impl SubstrateCoordinatorService {
         token: &'a NamespaceToken,
         args: &'a serde_json::Value,
         extra_visible: &'a [Namespace],
-    ) -> Pin<Box<dyn Future<Output = Result<(CoordSearchResult, u64), RuntimeError>> + Send + 'a>>
-    {
+    ) -> ScopedSearchFuture<'a> {
         Box::pin(async move {
             if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
                 return Ok((
