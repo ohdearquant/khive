@@ -322,7 +322,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
+        description: "List live records with optional filtering; note lists default to active notes, with note_status=archived or any for explicit access. This verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool, \"has_more\": bool}; clients advance offset by \
                       items.length, while M discloses the server cap and is not a guaranteed row \
@@ -351,6 +351,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_status", param_type: "string", required: false, description: "Notes only: active (default), archived, or any, selecting the note status before pagination. Omitted/null selects active. Any includes every stored note status while soft-deleted rows stay excluded. Separate from scheduled-event workflow status.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "status", param_type: "string", required: false, description: "For scheduled_event notes only (kind=scheduled_event or kind=note with note_kind=scheduled_event): exact property status, applied before pagination. Valid: provisioning, pending, firing, fired, cancelled, missed, failed. Omitted/null imposes no constraint. Proposal lists retain their separate proposal-status filter; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_by_actor", param_type: "string", required: false, description: "Scheduled_event notes only: exact, case-sensitive, non-blank creator display metadata, applied before pagination. May name any creator; never an authorization check or verified attribution. No implicit self-filter or wildcard. Omitted/null imposes no constraint; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {

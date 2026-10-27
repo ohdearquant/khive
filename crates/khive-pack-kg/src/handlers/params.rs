@@ -101,6 +101,8 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    /// Substrate notes.status selection, separate from workflow status below.
+    pub(crate) note_status: Option<khive_storage::note::NoteStatusSelector>,
     pub(crate) status: Option<String>,
     pub(crate) created_by_actor: Option<String>,
     pub(crate) key_prefix: Option<String>,
