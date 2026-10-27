@@ -55,6 +55,7 @@ pub struct RecordLocation {
     pub(super) directory: File,
     pub(super) uid: u32,
     pub(super) slot: RecordSlot,
+    #[cfg(test)]
     pub(super) faults: Faults,
 }
 
@@ -86,6 +87,7 @@ impl RecordLocation {
             directory,
             uid,
             slot,
+            #[cfg(test)]
             faults: Faults::default(),
         };
         result.validate()?;
@@ -94,6 +96,22 @@ impl RecordLocation {
     fn validate(&self) -> Result<(), RecordRefusal> {
         let stat = stat_fd(&self.directory)?;
         validate_metadata(stat.st_mode, stat.st_uid, self.uid, true)
+    }
+
+    fn sync_publication_directory(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.faults.publish_sync_error {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        self.directory.sync_all()
+    }
+
+    fn sync_reconciliation_directory(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.faults.reconcile_sync_error {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        self.directory.sync_all()
     }
 }
 
@@ -128,8 +146,17 @@ struct Blob {
     identity: FileIdentity,
 }
 
+#[allow(clippy::unnecessary_cast)] // Unix field widths and signedness vary.
+fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
+    FileIdentity {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    }
+}
+
 fn read_bytes(location: &RecordLocation) -> Result<Option<Blob>, RecordRefusal> {
     location.validate()?;
+    #[cfg(test)]
     location.faults.before_read()?;
     let file = match open_at(&location.directory, &location.slot.final_name, false) {
         Ok(file) => file,
@@ -138,7 +165,7 @@ fn read_bytes(location: &RecordLocation) -> Result<Option<Blob>, RecordRefusal> 
     };
     let stat = stat_fd(&file)?;
     validate_metadata(stat.st_mode, stat.st_uid, location.uid, false)?;
-    let identity = FileIdentity::of(&file)?;
+    let identity = identity_from_stat(&stat);
     if identity != FileIdentity::at(&location.directory, &location.slot.final_name)? {
         return Err(invalid("record entry changed during open"));
     }
@@ -223,10 +250,16 @@ fn refused(phase: PublishPhase, error: RecordRefusal) -> PublishFailure {
     }
 }
 fn atomic_error(phase: AtomicPublishPhase, error: io::Error) -> PublishFailure {
-    let visibility = if phase == AtomicPublishPhase::SyncDirectory {
-        Visibility::DestinationMayBeVisible
-    } else {
-        Visibility::Unchanged
+    let visibility = match phase {
+        AtomicPublishPhase::ValidateNames
+        | AtomicPublishPhase::InspectTmp
+        | AtomicPublishPhase::RefuseTmp
+        | AtomicPublishPhase::RemoveTmp
+        | AtomicPublishPhase::CreateTmp
+        | AtomicPublishPhase::WriteTmp
+        | AtomicPublishPhase::SyncTmp
+        | AtomicPublishPhase::Rename => Visibility::Unchanged,
+        AtomicPublishPhase::SyncDirectory => Visibility::DestinationMayBeVisible,
     };
     PublishFailure {
         phase: PublishPhase::Atomic(phase),
@@ -390,8 +423,7 @@ impl DeclarationWriter {
             cause: e.into(),
         })?;
         self.location
-            .faults
-            .sync_directory(&self.location.directory, true)
+            .sync_reconciliation_directory()
             .map_err(|e| PublishFailure {
                 phase: PublishPhase::ReconcileSync,
                 visibility: Visibility::DestinationMayBeVisible,
@@ -450,6 +482,7 @@ impl DeclarationWriter {
                 mode: 0o600,
             },
             |file| {
+                #[cfg(test)]
                 self.location.faults.before_write()?;
                 identity = Some(FileIdentity::of(file)?);
                 file.write_all(&bytes)
@@ -469,8 +502,7 @@ impl DeclarationWriter {
             identity: identity.expect("staged file identity"),
         });
         self.location
-            .faults
-            .sync_directory(&self.location.directory, false)
+            .sync_publication_directory()
             .map_err(|e| atomic_error(AtomicPublishPhase::SyncDirectory, e))?;
         self.pending = None;
         self.current = Some(record.clone());
@@ -483,7 +515,8 @@ impl DeclarationWriter {
 fn validate_claim(location: &RecordLocation, claim: &File) -> Result<(), RecordRefusal> {
     let stat = stat_fd(claim)?;
     validate_metadata(stat.st_mode, stat.st_uid, location.uid, false)?;
-    if FileIdentity::of(claim)? != FileIdentity::at(&location.directory, &location.slot.claim_name)?
+    if identity_from_stat(&stat)
+        != FileIdentity::at(&location.directory, &location.slot.claim_name)?
     {
         return Err(invalid("stable claim entry changed"));
     }
@@ -491,42 +524,26 @@ fn validate_claim(location: &RecordLocation, claim: &File) -> Result<(), RecordR
 }
 
 // Per-location seams are private and absent from release-build state.
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct Faults {
-    #[cfg(test)]
     pub read_error: Option<io::ErrorKind>,
-    #[cfg(test)]
     pub write_error: bool,
-    #[cfg(test)]
     pub publish_sync_error: bool,
-    #[cfg(test)]
     pub reconcile_sync_error: bool,
 }
+#[cfg(test)]
 impl Faults {
     fn before_read(&self) -> io::Result<()> {
-        #[cfg(test)]
         if let Some(kind) = self.read_error {
             return Err(io::Error::from(kind));
         }
         Ok(())
     }
     fn before_write(&self) -> io::Result<()> {
-        #[cfg(test)]
         if self.write_error {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         Ok(())
-    }
-    fn sync_directory(&self, directory: &File, reconcile: bool) -> io::Result<()> {
-        #[cfg(test)]
-        if if reconcile {
-            self.reconcile_sync_error
-        } else {
-            self.publish_sync_error
-        } {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
-        }
-        let _ = reconcile;
-        directory.sync_all()
     }
 }

@@ -40,6 +40,8 @@ FTS uses the unified `fts_notes` table and filters `kind = "memory"` plus visibl
 
 Every selected model is embedded concurrently. The vector leg prefers the global ANN graph and uses sqlite-vec as an exact fallback when ANN cannot serve.
 
+Per-model vector collection also runs concurrently. Each model independently checks its durable epoch, searches a warm cache, may wait for detached readiness work, and may fall back to an exact scan. Running these independent I/O paths concurrently avoids paying their latency serially, using the same single-model versus multiple-model dispatch pattern as query embedding. A retrieval failure degrades the affected model rather than aborting recall across every engine (ADR-031 engine-failure isolation).
+
 On a current warm graph, search begins with an over-fetch window. ANN results cover all namespaces, so IDs are hydrated and post-filtered to the token's visible set before returning. The initial window is `max(candidate_limit * 4, candidate_limit + 32)` and is capped by corpus size.
 
 When too few visible candidates survive, the loop doubles the fetch window per retry for a configured number of rounds, bounded by corpus exhaustion rather than a candidate cap. Widening only runs when the installed graph contains namespaces outside the caller's visible set; otherwise a larger search cannot recover namespace-filtered candidates. The loop also stops at corpus exhaustion. `ann_overfetch_max_rounds = 1` disables widening.
@@ -127,6 +129,8 @@ the maximum ANN and fresh-tail duration. Sequential handler-level widening
 rounds and their hydration passes are accumulated. The opt-in
 `KHIVE_RECALL_PROFILE` stream remains available for higher-volume local
 profiling and is not required for this production warning.
+
+The ten-second threshold follows the `knowledge.compose` precedent (#887 / PR #915). The selection rationale placed it above the expected subsecond common recall path and inside the default thirty-second recall deadline, so slow but completing requests would become visible in the daemon log before a deadline or client timeout.
 
 ## Per-call stage timings
 

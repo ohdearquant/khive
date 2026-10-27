@@ -104,7 +104,7 @@ async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
     assert!(!report.history_exhausted, "{report:?}");
 }
 
-/// The commit walker's post-walk cursor-write failure (round-2 finding 4):
+/// The commit walker's post-walk cursor-write failure is reported in-band:
 /// the walk records `completed` and THEN the final cursor write fails (here
 /// via the same sabotage trigger the issue-side test uses). The call site
 /// must handle that in-band exactly like the gh walkers — downgrade to
@@ -189,7 +189,7 @@ async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
 }
 
 /// Sources not requested by `include` serialize as JSON `null` in
-/// `IngestReport.sources` (round-2 finding 6): `Option<IngestSourceState>`
+/// `IngestReport.sources`: `Option<IngestSourceState>`
 /// with serde's default `None` encoding, asserted explicitly so a future
 /// `skip_serializing_if` or repr change cannot silently drop the
 /// distinction between "not requested" and "requested but state lost".

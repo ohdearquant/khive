@@ -276,13 +276,12 @@ fn write_heartbeat_refuses_symlinked_target() {
     assert_eq!(fs::read_to_string(&real).unwrap(), "nope");
 }
 
-/// Regression for the review-round-2 finding: the resolver used to
-/// convert the sidecar directory's final `OsStr` component via
-/// `to_string_lossy()` before `openat`, so two distinct non-UTF-8
-/// database names (which differ only in their invalid byte) both
-/// lossy-collapsed to the same `U+FFFD`-bearing name and cross-
-/// contaminated attribution onto one physical sidecar directory. This
-/// project explicitly supports non-UTF-8 database paths (see
+/// The resolver must pass the sidecar directory's final `OsStr` component
+/// byte-for-byte to `openat`. Converting through `to_string_lossy()` would
+/// collapse distinct non-UTF-8 database names that differ only in their
+/// invalid byte to the same `U+FFFD`-bearing name, cross-contaminating
+/// attribution onto one physical sidecar directory. Non-UTF-8 database
+/// paths are supported (see
 /// `pool.rs`'s `mint_db_identity_non_utf8_path_round_trips`), so the
 /// sidecar resolver must preserve that same byte-exact distinctness.
 #[cfg(unix)]

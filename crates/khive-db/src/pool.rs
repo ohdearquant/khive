@@ -6,6 +6,7 @@ mod construction;
 mod external_writer_fixture;
 mod guards;
 mod identity;
+mod note_search_routes;
 mod pool_impl;
 mod reader_counters;
 mod standalone_checkpoint;
@@ -36,6 +37,8 @@ pub use crate::timeout_sink::{TimeoutSinkCloseError, TimeoutSinkCloseHandle};
 use guards::{PooledReader, ReaderLease};
 pub(crate) use guards::{ReaderAdmission, SharedReaderTransactionGuard};
 pub use guards::{ReaderGuard, ReaderRow};
+use note_search_routes::NoteSearchRouteCounters;
+pub use note_search_routes::{NoteSearchFallbackCause, NoteSearchRouteSnapshot};
 use reader_counters::ReaderAcquisitionCounters;
 pub use reader_counters::ReaderAcquisitionSnapshot;
 pub(crate) use reader_counters::StandaloneReaderPurpose;
@@ -314,6 +317,8 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    /// Note-search route counters belong to this opened pool, not a logical ID.
+    note_search_routes: NoteSearchRouteCounters,
     reader_checkouts: Mutex<BTreeMap<Instant, usize>>,
     /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
     /// backend. Backend IDs remain separate even when aliases share a pool.

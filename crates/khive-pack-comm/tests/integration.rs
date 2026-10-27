@@ -4191,7 +4191,8 @@ async fn t1_send_within_namespace_unchanged() {
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -4206,10 +4207,10 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4251,7 +4252,8 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -4271,10 +4273,10 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4353,7 +4355,8 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -4365,10 +4368,10 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4604,7 +4607,7 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
-    let (_registry_leo, rt_leo) = build_crossns_registry(
+    let (_registry_leo, rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
         "lambda:leo",
         vec![Namespace::parse("lambda:khive").unwrap()],
@@ -4612,12 +4615,12 @@ async fn t7_with_namespace_token_scoping() {
     let (_registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let leo_tok = rt_leo
+    let sender_tok = rt_sender
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
-    let sender_note = rt_leo
+    let sender_note = rt_sender
         .create_note(
-            &leo_tok,
+            &sender_tok,
             "observation",
             None,
             "sender-ns note",
@@ -4645,9 +4648,9 @@ async fn t7_with_namespace_token_scoping() {
         .expect("T7: create recipient note");
 
     let recipient_tok: NamespaceToken =
-        leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
+        sender_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    let can_see_sender = rt_leo
+    let can_see_sender = rt_sender
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
     match can_see_sender {
@@ -4682,7 +4685,8 @@ async fn t7_with_namespace_token_scoping() {
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -4694,10 +4698,10 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4714,7 +4718,7 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .map(|n| n.id)
         .expect("T8: must find inbound note in local ns (ADR-007 all-local)");
 
-    let can_read = rt_leo
+    let can_read = rt_sender
         .get_note_including_deleted(&local_tok, inbound_id)
         .await;
     match can_read {
@@ -4859,7 +4863,8 @@ async fn t10_reply_cross_ns_denied_when_empty() {
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
 
     let result = registry_leo
         .dispatch(
@@ -4872,10 +4877,10 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         "T11: actor-addressed send must succeed; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4892,7 +4897,8 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_leo, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -4907,10 +4913,10 @@ async fn t12_allowlist_is_one_directional() {
         "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
     );
 
-    let local_tok_leo = rt_leo
+    let local_tok_leo = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_local_notes = rt_leo
+    let leo_local_notes = rt_sender
         .list_notes(&local_tok_leo, Some("message"), 100, 0)
         .await
         .unwrap();

@@ -24,8 +24,8 @@ pub struct MockCoordinator {
     pub last_search_request: std::sync::Mutex<Option<ValidatedSearchRequest>>,
     /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
     pub last_limit: std::sync::atomic::AtomicU32,
-    /// The `extra_visible` slice `fan_out_search` was last called with
-    /// (MAJ-3 visibility-scope regression coverage).
+    /// The `extra_visible` slice passed to `fan_out_search`, preserving
+    /// the caller's resolved extra read-visibility scope.
     pub last_extra_visible: std::sync::Mutex<Vec<Namespace>>,
 }
 

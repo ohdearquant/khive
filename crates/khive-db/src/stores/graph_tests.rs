@@ -1912,10 +1912,10 @@ async fn upsert_edge_cross_namespace_accepted() {
     let tgt = Uuid::new_v4();
     let now = Utc::now();
 
-    // Edge carries "lambda:leo" — different from store's "default".
+    // Edge carries "lambda:alice" — different from store's "default".
     let edge = Edge {
         id: Uuid::new_v4().into(),
-        namespace: "lambda:leo".to_string(),
+        namespace: "lambda:alice".to_string(),
         source_id: src,
         target_id: tgt,
         relation: EdgeRelation::Extends,
@@ -1939,7 +1939,7 @@ async fn upsert_edge_cross_namespace_accepted() {
     );
     let stored = stored.unwrap();
     assert_eq!(
-        stored.namespace, "lambda:leo",
+        stored.namespace, "lambda:alice",
         "namespace column must be preserved as stored"
     );
 }
