@@ -885,7 +885,9 @@ making it binding would change what rows already granted allow. This amendment a
 
    Unknown keys, an unknown version, a null, an empty `fixed_args`, a NUL byte, an element that is neither form, a
    path that is absolute, empty or contains `.` or `..` components, and a value over the size limits fixed by the
-   implementation plan are refused at registration, each with its reason named.
+   implementation plan are refused at registration, each with its reason named. So is a program whose `extra_args`
+   is `"append"` and whose `fixed_args` hold no file element, because the caller's arguments would then name the
+   program. A program of literals only is accepted under `"none"`, where the whole command is fixed.
 
 2. **It joins the pinned inputs only on rows that carry it.** When a row has a `program` key, the whole stored object
    joins Amendment 1's policy inputs, serialized by the one canonical function (Amendment 2,
@@ -953,10 +955,11 @@ read-only. Each limit, with what shows it:
 - Materialized input files are writable, so the program can change a pinned file before it reads it again.
 - An interpreter that evaluates its input, or a networked row that fetches code (ADR-181 Amendment 13), runs code no pin
   names.
-- A row whose `fixed_args` hold only interpreter flags and no file element, with `extra_args` `"append"`, lets the
-  caller name the program again, which is the case this amendment exists to close. khive does not refuse that shape;
-  the approver reads `fixed_args` and `extra_args` before granting. More generally, an appended argument can change
-  what a pinned program does; `"append"` is broader than `"none"` by design, not certified safe.
+- `"append"` is broader than `"none"` by design, not certified safe: an appended argument can change what a pinned
+  program does. khive does not interpret an interpreter's argument grammar, so the refusal in item 1 closes only the
+  shape with no file element. A file element in an option position (for example a module the interpreter loads before
+  its program) still leaves the appended arguments free to name the program that runs after it. The approver reads
+  `fixed_args` and `extra_args` before granting.
 - The approval is reusable for the life of the grant. "Exactly one execution" needs a consumption protocol, which this
   amendment does not specify.
 - Approval cardinality: one registration per program revision and invocation contract. If real traffic needs many
@@ -1010,7 +1013,9 @@ control and asserts that no child process was spawned.
 11. Malformed state. A malformed, null or unknown-version `program`, a non-`exec` source, a bad content ref or digest,
     an unsafe path and an argument list one over each size limit are refused at registration and again at run time when
     written straight to storage, whatever policy answers. Controls: read a malformed `program` as absent; default
-    `extra_args` to `"append"`; remove one size limit.
+    `extra_args` to `"append"`; remove one size limit. A program with `extra_args` `"append"` and no file element is
+    refused at registration and at run time, and the same literals under `"none"` register and run. Control: accept a
+    flag-only `"append"` row; the refusal arm goes red.
 
 The implementation stores `program` in the registry row's existing properties and adds no grant or policy column. Its
 receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
