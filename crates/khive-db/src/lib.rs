@@ -33,6 +33,11 @@ mod disk_guard_config;
 pub mod env;
 /// Error types for the SQLite layer.
 pub mod error;
+
+/// Bounded prune of expendable polling-dispatch audit rows (ADR-212 §4, operator maintenance).
+pub mod events_prune;
+#[cfg(test)]
+mod events_prune_tests;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
 /// Physical file identity shared by pool admission and backend alias routing.

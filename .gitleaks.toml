@@ -41,3 +41,16 @@ condition = "AND"
 regexTarget = "secret"
 regexes = ['''^04dc45cdbcefd4a719ecf0c58b31ec795288097ed994e1a8b106405f6e502a48$''']
 paths = ['''^docs/adr/ADR-105-cross-node-comm-transport\.md$''']
+
+# RFC 9180 Appendix A.2.3 publishes an auth-mode HPKE test vector for DHKEM(X25519, HKDF-SHA256)
+# with ChaCha20-Poly1305, and the node crate kept it as a test fixture until the file left the
+# tree, so only history scans see it. Its shared secret is a specification value derived from the
+# seeds the RFC also publishes, not a credential. Exempted by value and by path, as above.
+[[rules.allowlists]]
+description = "The HPKE shared secret in RFC 9180's published auth-mode X25519 test vector, a node test fixture in history"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^d2d67828c8bc9fa661cf15a31b3ebf1febe0cafef7abfaaca580aaf6d471e3eb$''']
+paths = [
+  '''^crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha\.json$''',
+]

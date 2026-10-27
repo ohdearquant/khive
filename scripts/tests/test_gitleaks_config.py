@@ -25,6 +25,9 @@ GATE_HISTORY_PATH = "crates/khive-runtime/src/secret_gate.rs"
 GATE_PATH = "crates/khive-runtime/src/secret_gate_tests.rs"
 GATE_PATHS = (GATE_HISTORY_PATH, GATE_PATH)
 GATE_VALUES = ("a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4", "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh")
+# A published specification value that stays in history after its fixture left the tree.
+HPKE_VECTOR_PATH = "crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha.json"
+HPKE_VECTOR_VALUES = ("d2d67828c8bc9fa661cf15a31b3ebf1febe0cafef7abfaaca580aaf6d471e3eb",)
 GITLEAKS = shutil.which("gitleaks")
 
 
@@ -337,6 +340,111 @@ class GitleaksConfigTests(unittest.TestCase):
             self.assertIn(
                 value, source,
                 f"exempt constant no longer present in {GATE_PATH}; remove the exemption",
+            )
+
+    def without_hpke_vector_entry(self):
+        """The checked-in config with the HPKE vector's allowlist entry, and only that one, removed."""
+        blocks = CONFIG.read_text().split("[[rules.allowlists]]")
+        kept = [block for block in blocks if HPKE_VECTOR_PATH.replace(".", r"\.") not in block]
+        self.assertEqual(len(blocks) - len(kept), 1, "expected exactly one entry naming the vector's path")
+        return "[[rules.allowlists]]".join(kept)
+
+    def test_hpke_vector_is_exempt_at_its_fixture_path(self):
+        self.write_values(HPKE_VECTOR_PATH, HPKE_VECTOR_VALUES)
+        baseline = self.baseline_findings()
+        self.assertEqual({row["File"] for row in baseline}, {HPKE_VECTOR_PATH},
+                         "control: without the exemption the vector must report")
+        self.assertEqual(self.scan(expected_exit=0), [])
+
+    def test_hpke_vector_is_not_exempt_at_other_paths(self):
+        paths = (
+            "crates/khive-channel-node/tests/fixtures/rfc9180-base-x25519-chacha.json",
+            "docs/adr/ADR-105-cross-node-comm-transport.md",
+            "prefix/" + HPKE_VECTOR_PATH,
+            HPKE_VECTOR_PATH + ".bak",
+        )
+        for path in (*paths, HPKE_VECTOR_PATH):
+            self.write_values(path, HPKE_VECTOR_VALUES)
+        baseline = self.baseline_findings()
+        self.assertEqual(
+            {row["File"] for row in baseline}, {*paths, HPKE_VECTOR_PATH},
+            "control: without the exemption every path must report, or this arm proves nothing",
+        )
+        findings = self.scan(expected_exit=1)
+        self.assertEqual({row["File"] for row in findings}, set(paths))
+        self.assertEqual(
+            {row["Fingerprint"] for row in findings},
+            {row["Fingerprint"] for row in baseline if row["File"] != HPKE_VECTOR_PATH},
+            "the exemption must remove the fixture path's finding and nothing else",
+        )
+
+    def test_neighbouring_values_at_the_hpke_vector_path_are_not_exempt(self):
+        value = HPKE_VECTOR_VALUES[0]
+        self.write_values(HPKE_VECTOR_PATH, (value + "ff", "ff" + value, "".join(reversed(value))))
+        baseline = self.baseline_findings()
+        self.assertEqual(len(baseline), 3, "control: all three neighbours must be reportable")
+        findings = self.scan(expected_exit=1)
+        self.assertEqual(
+            {row["Fingerprint"] for row in findings},
+            {row["Fingerprint"] for row in baseline},
+            "a value that merely resembles the vector must still be reported",
+        )
+
+    def test_hpke_exemption_covers_history_after_the_fixture_left_the_tree(self):
+        self.git("init", "--quiet")
+        hooks = self.root / "empty-hooks"
+        hooks.mkdir()
+        self.git("config", "core.hooksPath", str(hooks))
+        self.git("config", "commit.gpgsign", "false")
+        self.write_values(HPKE_VECTOR_PATH, HPKE_VECTOR_VALUES, padding=15)
+        added = self.commit_fixture("add the published vector", HPKE_VECTOR_PATH)
+        (self.source / HPKE_VECTOR_PATH).unlink()
+        self.git("rm", "--quiet", "--cached", "--", HPKE_VECTOR_PATH)
+        self.git("commit", "--quiet", "-m", "remove the fixture from the tree")
+
+        self.assertEqual(self.scan(expected_exit=0), [], "the tree no longer holds the fixture")
+        self.assertEqual(self.scan(expected_exit=0, history="--all"), [])
+
+        # Control: dropping this one entry brings back exactly the history finding.
+        self.config.write_text(self.without_hpke_vector_entry())
+        findings = self.scan(expected_exit=1, history="--all")
+        self.assertEqual(
+            {(row["File"], row["Commit"], row["StartLine"]) for row in findings},
+            {(HPKE_VECTOR_PATH, added, 16)},
+        )
+
+    def test_hpke_vector_at_its_path_still_matches_a_different_rule(self):
+        self.config.write_text(CONFIG.read_text() + "\n" + "\n".join([
+            "[[rules]]", 'id = "fixture-other-vector-rule"',
+            "regex = '''(" + "|".join(HPKE_VECTOR_VALUES) + ")'''",
+        ]) + "\n")
+        self.write_values(HPKE_VECTOR_PATH, HPKE_VECTOR_VALUES)
+        findings = self.scan(expected_exit=1)
+        self.assertEqual({row["RuleID"] for row in findings}, {"fixture-other-vector-rule"})
+        self.assertEqual({row["File"] for row in findings}, {HPKE_VECTOR_PATH})
+
+    def test_the_exempt_hpke_vector_is_still_in_the_fixture_history(self):
+        # The fixture left the tree, so the check that keeps this entry from going stale reads history.
+        def repo_git(*args):
+            return subprocess.run(["git", "-C", str(REPO_ROOT), *args], capture_output=True,
+                                  text=True, timeout=60, check=False)
+        # A failed read must fail here, never pass as "the path has no history".
+        shallow = repo_git("rev-parse", "--is-shallow-repository")
+        self.assertEqual(shallow.returncode, 0, shallow.stderr)
+        if shallow.stdout.strip() == "true":
+            self.skipTest("needs a full-history checkout")
+        log = repo_git("log", "--all", "--format=%H", "--", HPKE_VECTOR_PATH)
+        self.assertEqual(log.returncode, 0, log.stderr)
+        commits = log.stdout.split()
+        self.assertTrue(commits, f"no commit touches {HPKE_VECTOR_PATH}; remove the exemption")
+        # The commit that deleted the file has no blob at the path, so only readable versions count.
+        shows = [repo_git("show", f"{commit}:{HPKE_VECTOR_PATH}") for commit in commits]
+        contents = [show.stdout for show in shows if show.returncode == 0]
+        self.assertTrue(contents, f"no version of {HPKE_VECTOR_PATH} in history could be read")
+        for value in HPKE_VECTOR_VALUES:
+            self.assertTrue(
+                any(value in text for text in contents),
+                f"exempt value not found in the history of {HPKE_VECTOR_PATH}; remove the exemption",
             )
 
 if __name__ == "__main__":

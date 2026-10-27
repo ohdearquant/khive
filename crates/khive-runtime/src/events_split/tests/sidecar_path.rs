@@ -93,7 +93,9 @@ fn planted_symlink_at_the_sidecar_path_is_refused() {
     // The sidecar path is derived, never user-chosen, so a pre-existing
     // symlink there is a planted redirect: following it would tighten
     // permissions on and write event rows into the link's target.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"victim-bytes").unwrap();

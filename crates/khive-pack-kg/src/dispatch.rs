@@ -158,6 +158,21 @@ async fn run_kg_embedder_warm(
 impl PackRuntime for KgPack {
     khive_runtime::pack_runtime_metadata!();
 
+    async fn dispatch_search_intercepted(
+        &self,
+        params: serde_json::Value,
+        registry: &khive_runtime::pack::VerbRegistry,
+        token: &khive_runtime::NamespaceToken,
+    ) -> Result<
+        khive_runtime::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        khive_runtime::RuntimeError,
+    > {
+        self.handle_search_with_metadata(token, params, registry)
+            .await
+    }
+
     async fn warm(&self) {
         let runtime = self.runtime.background_view();
         let domain = runtime.background_domain();

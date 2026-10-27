@@ -1419,6 +1419,7 @@ checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
 dependencies = [
  "aho-corasick",
  "bstr",
+ "log",
  "regex-automata",
  "regex-syntax",
 ]
@@ -2827,6 +2828,7 @@ name = "khive-pack-workspace"
 version = "0.15.0"
 dependencies = [
  "async-trait",
+ "globset",
  "inventory",
  "khive-pack-git",
  "khive-pack-gtd",
