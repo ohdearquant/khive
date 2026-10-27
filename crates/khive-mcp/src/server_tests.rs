@@ -6902,7 +6902,7 @@ async fn single_backend_search_reports_status_complete() {
     );
 }
 
-// ── MAJ-3: explicit-namespace narrowing arm of `coordinator_search_visibility` ──
+// ── Explicit-namespace narrowing arm of `coordinator_search_visibility` ──
 
 fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();

@@ -6,7 +6,7 @@ fn variable_length_or_across_endpoints_rejected() {
     let result = compile(&q, &opts());
     assert!(
         matches!(result, Err(QueryError::Unsupported(_))),
-        "MAJ-1: OR spanning both endpoints must return Unsupported; got {result:?}"
+        "OR spanning both endpoints must return Unsupported; got {result:?}"
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(

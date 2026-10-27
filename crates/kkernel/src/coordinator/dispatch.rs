@@ -221,7 +221,7 @@ pub struct SubstrateCoordinator {
     #[cfg(test)]
     pub(super) panic_backend_id: Option<String>,
     /// Test-only: named backend's fan-out search task never resolves,
-    /// simulating a hung backend (MAJ-2 timeout regression coverage).
+    /// simulating a hung backend whose search must time out.
     #[cfg(test)]
     pub(super) hang_backend_ids: Vec<String>,
     /// Test-only: delay a backend result past the shared absolute deadline.
@@ -236,7 +236,7 @@ pub struct SubstrateCoordinator {
         Option<(String, khive_storage::request_context::SearchPhase)>,
     /// Test-only: when set, a backend's entity fan-out task returns this
     /// list verbatim instead of calling `hybrid_search`, so RRF-merge
-    /// regression tests can pin exact ranks/UUIDs (MAJ-4).
+    /// tests can pin exact ranks/UUIDs for RRF merge ordering.
     #[cfg(test)]
     pub(super) entity_hits_override: Option<HashMap<String, Vec<SearchHit>>>,
     /// Test-only: same as `entity_hits_override`, for the note substrate.
@@ -739,7 +739,7 @@ impl SubstrateCoordinator {
     }
 
     /// Same as [`Self::fan_out_search`], but authorizes each backend token
-    /// with an explicit extra read-visibility set (MAJ-3 fix).
+    /// with an explicit extra read-visibility set.
     ///
     /// `extra_visible` mirrors the normal registry dispatch path's
     /// `['local'] ∪ visible_namespaces` widening
@@ -869,7 +869,7 @@ impl SubstrateCoordinator {
                     return (vec![], vec![], vec![backend_result]);
                 }
             };
-            // MAJ-2 (r2 follow-up): the single-backend early return has no
+            // The single-backend early return has no
             // spawned task to bound with the fan-out timeout loop below, so
             // both awaits are wrapped directly in the same
             // `backend_search_timeout_ms()` budget — an unbounded await here
@@ -1254,7 +1254,7 @@ impl SubstrateCoordinator {
                     panic!("injected backend search panic");
                 }
                 if should_hang {
-                    // Never resolves — exercises the fan-out timeout (MAJ-2).
+                    // Never resolves — exercises the fan-out timeout.
                     std::future::pending::<()>().await;
                     unreachable!("a pending future never resolves");
                 }
@@ -1333,7 +1333,7 @@ impl SubstrateCoordinator {
                         .await;
                     match result {
                         // Full search_limit-bounded window is retained here —
-                        // truncating to the caller's limit per backend (MAJ-4)
+                        // truncating to the caller's limit per backend
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
                         // Finalization applies the floor and requested order
@@ -1375,7 +1375,7 @@ impl SubstrateCoordinator {
                         .await;
                     match result {
                         // See the note-substrate arm above: no per-backend
-                        // truncation before RRF merge (MAJ-4).
+                        // truncation before RRF merge.
                         Ok(outcome) => (backend_id, Ok(outcome.hits), None, outcome.vector_error),
                         Err(e) => (backend_id, Err(e), None, None),
                     }
@@ -1619,7 +1619,7 @@ async fn search_with_deadline_snapshot<F: std::future::Future>(
     (search.await, Some(snapshot))
 }
 
-/// Per-backend fan-out search timeout (MAJ-2 fix): bounds how long a single
+/// Per-backend fan-out search timeout: bounds how long a single
 /// backend's search task may run before the coordinator gives up on it and
 /// reports a timeout-specific error for that backend, so one hung backend
 /// cannot block the whole fan-out from returning healthy siblings' results.
@@ -2181,7 +2181,7 @@ mod search_phase_trace_tests {
     }
 }
 
-/// Per-backend fan-out over-fetch bound for RRF merge fairness (MAJ-4 fix).
+/// Per-backend fan-out over-fetch bound for RRF merge fairness.
 ///
 /// Each backend must contribute more than just the caller's `limit` worth of
 /// ranked candidates, or a candidate that ranks #2+ on multiple backends can

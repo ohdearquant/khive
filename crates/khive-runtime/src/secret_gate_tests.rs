@@ -3565,7 +3565,7 @@ fn mask_secrets_redacts_entropy_token_whose_trigger_is_left_of_earlier_secret() 
 
 #[test]
 fn allows_high_entropy_file_path_near_secret_word() {
-    let content = "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
+    let content = "workspace path field-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
     assert!(
         check(content).is_ok(),
         "structured file path in technical prose must pass; got {:?}",
@@ -3659,7 +3659,7 @@ fn hyphenated_random_secret_is_not_a_structured_identifier() {
 #[test]
 fn structured_identifier_true_for_repro_paths() {
     let paths = [
-        "fable-ops/ADR-DRAFT-adr079-slices234.md",
+        "field-ops/ADR-DRAFT-adr079-slices234.md",
         "internal/workspaces/20260701/adr079-slices234/PACKET.md",
         "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
         "release_notes_v2.md",
@@ -4104,7 +4104,7 @@ fn allows_fp_paths_whose_full_token_entropy_is_already_below_threshold() {
 
 #[test]
 fn allows_adr_draft_path_near_trigger() {
-    let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
+    let content = "api_key handling in field-ops/ADR-DRAFT-adr079-slices234.md";
     assert!(
         check(content).is_ok(),
         "ADR-DRAFT path in technical prose must pass; got {:?}",

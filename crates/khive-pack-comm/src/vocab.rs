@@ -197,7 +197,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                 name: "to",
                 param_type: "string",
                 required: true,
-                description: "Actor label to send to (e.g. \"lambda:leo\"). Both copies land in the caller's namespace; no cross-namespace write occurs.",
+                description: "Actor label to send to (e.g. \"lambda:casey\"). Both copies land in the caller's namespace; no cross-namespace write occurs.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -883,7 +883,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                 name: "actor",
                 param_type: "string",
                 required: true,
-                description: "Actor label whose inbound queue is probed, e.g. \"lambda:leo\".",
+                description: "Actor label whose inbound queue is probed, e.g. \"lambda:casey\".",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

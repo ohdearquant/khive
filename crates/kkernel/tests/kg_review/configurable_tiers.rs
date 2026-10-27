@@ -9,7 +9,7 @@ fn case(relation: &str, weight: f64) -> (TempDir, PathBuf, PathBuf) {
     let temp = TempDir::new().expect("tier case");
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[
             create(ALPHA, "Alpha"),
             create(BETA, "Beta"),
@@ -124,7 +124,7 @@ fn configured_entity_update_keeps_the_real_coverage_blocker() {
     let temp = TempDir::new().unwrap();
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[entity_update(ALPHA, "Old", "New")],
     );
     std::fs::write(
