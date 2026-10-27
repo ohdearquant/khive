@@ -5,8 +5,9 @@
 - Depends on: ADR-006 (deterministic scoring), ADR-012 (retrieval composition),
   ADR-029 (substrate coordinator), ADR-033 (recall pipeline),
   ADR-045 (verb response presentation)
-- Proposed amendment: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14).
-  Existing decisions remain accepted; Amendment 5 is unsigned and requires
+- Proposed amendments: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14)
+  and [Amendment 8, note-status disclosure on successful MCP note search](#amendment-8-proposed-note-status-disclosure-on-successful-mcp-note-search-2026-10-27).
+  Existing decisions remain accepted; Amendments 5 and 8 are unsigned and require
   acceptance before dependent implementation merges.
 
 ## Context
@@ -1127,3 +1128,84 @@ capture, and the MCP mode report must fail their matching fixtures. The
 coordinator-report mutation must be observed on an any-term response. These
 controls are acceptance requirements, not an assertion that a particular run
 has passed.
+
+## Amendment 8 (proposed): note-status disclosure on successful MCP note search (2026-10-27)
+
+**Status**: proposed and unsigned. Acceptance is required before dependent implementation merges. This amendment adds
+two fields to successful MCP note `search` operation envelopes. It changes no hit array, no raw registry dispatch, no
+entity search and no error envelope. It does not depend on Amendment 5's acceptance: the placement rules it needs are
+stated here in full, and they agree with Amendment 5's.
+
+### Context
+
+Issue #6095 leaves archived notes out of ordinary note queries. KG note search gains a note-status selector for it:
+`active` (the default), `archived` or `any`, bound to the note's lifecycle status and distinct from the workflow
+`status` property. The selector is applied when gathered candidates are hydrated. The gather is bounded: the KG handler
+asks for a window equal to the limit, widened under a filter or a time order (`ValidatedSearchRequest::candidate_limit`),
+and the runtime's note search collects four times that window per arm
+(`crates/khive-runtime/src/operations/note_search.rs`, the `candidates` window). Gathered rows whose status does not
+match the selector are dropped at hydration. Under the default, a page can therefore come back shorter than its limit
+while matching active notes exist past the gather window, or empty while archived matches exist. The hit array alone
+cannot tell either case from a genuinely short answer, and a count cannot ride inside the array without breaking the
+array contract this ADR keeps on every route.
+
+### Decision
+
+1. **Fields.** Every successful MCP `search` operation on the note substrate carries, beside `status` and `result`:
+   - `note_status`: the effective selector, `"active"`, `"archived"` or `"any"`. An omitted or null selector reports
+     `"active"`.
+   - `note_status_dropped`: an unsigned integer, the number of gathered candidates that hydration excluded because
+     their note status did not match the effective selector. It is present on every successful note search, zero
+     included, so its absence never means none. Under `"any"` it is always 0. On coordinated dispatch it is the sum
+     over the backend legs that completed; a failed leg contributes nothing, and §1's `partial` rules are unchanged.
+
+2. **Placement.** The fields belong to each successful operation, never to the aggregate batch wrapper, a hit row or
+   the hit array. The `result` array keeps its exact bytes on each route: no metadata row, wrapping object, field
+   addition or reordering. Raw `VerbRegistry` search dispatch returns the exact hit array and neither field; result-only
+   accessors and chain `$prev` bind `result` only. Entity searches carry neither field. Help, authorization, validation
+   and execution errors and non-search operations never carry them. An operation that ends `ok=false`
+   (`search_incomplete`, or frame-budget or depth omission under Amendment 4) carries neither, including under
+   `error.search`.
+
+3. **Sources.** `note_status` comes from the validated request, as Amendment 7's `mode` does: the route that reports it
+   derives it from `ValidatedSearchRequest`, and no other parser decides it. `note_status_dropped` is an execution count.
+   It travels from hydration to the envelope through one typed carrier, the metadata of the existing intercepted
+   dispatch result (`khive_runtime::pack::InterceptedDispatchResult`). The registry route adopts that intercept for
+   note search, as the coordinator route already uses it for fan-out, so authorization still runs before handler-level
+   validation. The intercepted call runs the KG pack's own note-search code, not a second copy of it in the transport,
+   so mailbox authorization, filters and ranking stay where they are. The count is never derived from the hit array or
+   its length, and no generic sidecar mechanism is added.
+
+4. **Meaning.** `note_status_dropped` says how many gathered candidates the selector removed. It is not a count of
+   non-matching notes in the store, and it does not promise that a repeat with `"any"` returns that many more hits:
+   fusion, filters and the limit still apply. A short page with `note_status_dropped = 0` is a short answer.
+
+### What this does not cover
+
+- Status-aware gathering (continuing past the window until the page fills) is out of scope. The count discloses the
+  window's cost; a workload that shows frequent short pages with a non-zero count would justify that change.
+- comm, gtd, session and schedule verbs keep their active-only defaults with no disclosure field in this amendment.
+  Archived and any notes are reached through the generic KG `list` and `search`. A later need for the selector on a
+  specialized verb is its own change.
+- `knowledge.search` and `memory.recall` are not governed here.
+
+### Acceptance
+
+Each control names its mutation, stated before it runs.
+
+1. Byte identity. On each route (registry single, parallel and chain; coordinator single, parallel and chain), the
+   `result` bytes for note fixtures, populated and empty, are identical with and without the new fields under the same
+   serializer and presentation. Mutations: the count inserted as a hit-array row fails byte identity; a metadata object
+   substituted for an empty array fails the array-shape and empty-hit controls.
+2. Semantics. A fixture whose gather admits archived rows: the default returns the short page with
+   `note_status_dropped` equal to the archived rows gathered; `"any"` returns them with 0; `"archived"` counts the active
+   rows dropped. Mutations: counting before the status filter, or computing the count from the array's length, fails
+   this fixture.
+3. Always present. A healthy-empty note search reports `note_status` and `note_status_dropped = 0`. Mutation: omitting
+   a zero count fails.
+4. Absence. Entity search, help, `search_incomplete`, frame-budget `ok=false` and non-search siblings in a mixed batch
+   carry neither field; chain `$prev` binds the array. Mutation: emitting the fields on entity search fails.
+5. Coordinator sum. Two backends that each drop rows report the sum; a failed leg adds nothing. Mutation: reporting one
+   leg's count fails.
+6. Presentation. Every supported Agent, Human and Verbose and JSON, Auto and Table path preserves both fields on
+   successful note searches, zero included, while result rendering and elision stay as they are.
