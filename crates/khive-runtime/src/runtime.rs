@@ -355,7 +355,7 @@ pub struct KhiveRuntime {
     )>,
     config: RuntimeConfig,
     pub(crate) code_map_registry: Arc<crate::CodeMapRegistry>,
-    outbound_email_policy: crate::OutboundEmailPolicy,
+    outbound_email_policy: std::sync::Arc<crate::OutboundEmailPolicy>,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
