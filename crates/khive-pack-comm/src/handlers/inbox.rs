@@ -230,7 +230,8 @@ pub(crate) async fn handle_inbox(
         order_by: None, // preserves existing created_at DESC ordering
         min_created_at: since_micros,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
     let store = runtime.notes(token)?;
     let deadline = (wait_ms > 0)
         .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms));
@@ -530,6 +531,7 @@ async fn count_unread_messages(
             order_by: None,
             ..Default::default()
         }
+        .with_default_note_status(khive_storage::note::NoteStatusSelector::Active)
     };
     // Anonymous fallback views count addressed and missing/null partitions in
     // one snapshot. Named/delegated views count only the typed exact partition;
@@ -560,4 +562,90 @@ async fn count_unread_messages(
         cap,
         saturated: counts.iter().any(|count| count.saturated) || observed > cap,
     })
+}
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    async fn fixture() -> (KhiveRuntime, NamespaceToken) {
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            actor_id: Some("actor:archive-reader".into()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let token = runtime
+            .authorize(khive_runtime::Namespace::local())
+            .unwrap();
+        let store = runtime.notes(&token).unwrap();
+        for direction in ["inbound", "outbound"] {
+            for (status, timestamp) in [("archived", 20), ("active", 10)] {
+                let mut note =
+                    khive_storage::Note::new("local", "message", format!("{status} {direction}"));
+                note.status = status.into();
+                note.created_at = timestamp;
+                note.updated_at = timestamp;
+                note.properties = Some(json!({
+                    "direction": direction,
+                    "from_actor": if direction == "inbound" { "actor:other" } else { "actor:archive-reader" },
+                    "to_actor": if direction == "inbound" { "actor:archive-reader" } else { "actor:other" },
+                    "read": false, "subject": "archive needle",
+                }));
+                store.upsert_note(note).await.unwrap();
+            }
+        }
+        drop(store);
+        (runtime, token)
+    }
+
+    #[tokio::test]
+    async fn inbox_active_default_precedes_pagination_and_post_filters() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (runtime, token) = fixture().await;
+            let signal = InboxSignal::new();
+            for (mailbox, direction) in [("inbox", "inbound"), ("sent", "outbound")] {
+                for post_filter in [false, true] {
+                    let mut params = json!({"box": mailbox, "limit": 1});
+                    if mailbox == "inbox" {
+                        params["status"] = json!("all");
+                    }
+                    if post_filter {
+                        params["subject_contains"] = json!("needle");
+                    }
+                    let result = handle_inbox(&runtime, &signal, &token, params)
+                        .await
+                        .unwrap();
+                    assert_eq!(result["count"], 1);
+                    assert_eq!(
+                        result["messages"][0]["content"],
+                        format!("active {direction}"),
+                        "ordinary inbox selection must omit archived rows before pagination"
+                    );
+                    assert_eq!(result["has_more"], false);
+                    if mailbox == "inbox" {
+                        assert_eq!(result["unread_count"], 1);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("bounded actual comm inbox regression");
+    }
+
+    #[tokio::test]
+    async fn unread_snapshot_counts_only_active_unread_inbound_notes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (runtime, token) = fixture().await;
+            let result = handle_unread(&runtime, &token, json!({})).await.unwrap();
+            assert_eq!(
+                result["count"], 1,
+                "unread snapshot must exclude archived messages"
+            );
+            assert_eq!(result["count_cap"], UNREAD_COUNT_CAP);
+            assert_eq!(result["count_saturated"], false);
+            assert_eq!(result["actor"], "actor:archive-reader");
+        })
+        .await
+        .expect("bounded actual comm unread regression");
+    }
 }

@@ -81,7 +81,8 @@ pub(crate) async fn handle_list(
         property_filters,
         min_created_at,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
 
     let core = runtime.core();
     let page = core
@@ -108,3 +109,34 @@ pub(crate) async fn handle_list(
 #[cfg(test)]
 #[path = "list_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_active_default_shapes_items_total_and_offsets() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime.authorize(khive_runtime::Namespace::local()).unwrap();
+            let mut active_ids = Vec::new();
+            for (index, status) in ["archived", "active", "archived", "active"].into_iter().enumerate() {
+                let mut note = khive_storage::note::Note::new("local", SESSION_KIND, "session archive fixture");
+                note.status = status.into();
+                note.created_at = 40 - index as i64 * 10;
+                note.updated_at = note.created_at;
+                note.properties = Some(serde_json::json!({"provider": "fixture-provider", "agent_id": "fixture-agent"}));
+                if status == "active" { active_ids.push(note.id.to_string()); }
+                runtime.core().notes(&token).unwrap().upsert_note(note).await.unwrap();
+            }
+            for offset in [0usize, 1] {
+                let result = handle_list(&runtime, &token, serde_json::json!({
+                    "limit": 1, "offset": offset, "provider": "fixture-provider", "agent_id": "fixture-agent",
+                })).await.unwrap();
+                assert_eq!(result["count"], 1);
+                assert_eq!(result["sessions"][0]["full_id"], active_ids[offset], "session list must default active before offset");
+                assert_eq!(result["total"], 2, "counted population must use the same active predicate");
+            }
+        }).await.expect("bounded actual session list regression");
+    }
+}
