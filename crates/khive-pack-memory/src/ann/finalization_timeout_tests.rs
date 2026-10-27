@@ -77,7 +77,7 @@ async fn append_timeout_case(case: Case) {
         .await
         .unwrap();
         let _close_rt = CloseOnDrop::new(&rt);
-        assert!(rt.backend().canonical_path().is_none());
+        assert!(rt.backend().pool().canonical_path().is_none());
         let control = root.control();
         let rt_control = rt.background_domain().control();
         let token = rt.authorize(Namespace::local()).unwrap();
