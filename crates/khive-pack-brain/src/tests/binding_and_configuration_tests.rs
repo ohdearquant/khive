@@ -1,5 +1,5 @@
-// Regression test for MAJ-002: unbind with multiple filters must use AND semantics,
-// removing only the binding that satisfies ALL supplied criteria.
+// Unbind combines supplied filters with AND semantics and removes only
+// the binding that satisfies every criterion.
 #[tokio::test]
 async fn dispatch_unbind_uses_and_not_or() {
     let (pack, rt) = make_pack();

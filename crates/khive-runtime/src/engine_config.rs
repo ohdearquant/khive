@@ -284,7 +284,7 @@ impl ConfigError {
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:leo"                          # attribution identity (required)
+/// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// ```

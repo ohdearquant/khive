@@ -334,8 +334,8 @@ pub(super) async fn dispatch_via_coordinator_inner(
     }
 }
 
-/// Resolve the coordinator search boundary's extra read-visibility set
-/// (MAJ-3 fix), mirroring the normal registry dispatch path's default-case
+/// Resolve the coordinator search boundary's extra read-visibility set,
+/// mirroring the normal registry dispatch path's default-case
 /// widening to `['local'] ∪ visible_namespaces`
 /// (`khive_runtime::pack::VerbRegistry::dispatch_with_identity`,
 /// `crates/khive-runtime/src/pack.rs`). Without this, `fan_out_search`

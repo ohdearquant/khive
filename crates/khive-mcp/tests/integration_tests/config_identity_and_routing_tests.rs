@@ -107,11 +107,11 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
     cfg_ab.default_namespace = Namespace::parse("out-a").unwrap();
     cfg_ab.allowed_outbound_namespaces = vec![
         Namespace::parse("lambda:khive").unwrap(),
-        Namespace::parse("lambda:leo").unwrap(),
+        Namespace::parse("lambda:alice").unwrap(),
     ];
     let cfg_ba = RuntimeConfig {
         allowed_outbound_namespaces: vec![
-            Namespace::parse("lambda:leo").unwrap(),
+            Namespace::parse("lambda:alice").unwrap(),
             Namespace::parse("lambda:khive").unwrap(),
         ],
         ..cfg_ab.clone()
@@ -119,7 +119,7 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
     let cfg_dup = RuntimeConfig {
         allowed_outbound_namespaces: vec![
             Namespace::parse("lambda:khive").unwrap(),
-            Namespace::parse("lambda:leo").unwrap(),
+            Namespace::parse("lambda:alice").unwrap(),
             Namespace::parse("lambda:khive").unwrap(), // duplicate
         ],
         ..cfg_ab.clone()
@@ -251,13 +251,13 @@ fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_f
 ///
 ///   (a) with `default_namespace = local`, a plain `create` lands in `"local"`.
 ///
-///   (b) an explicit `create(namespace="lambda:leo")` lands in `"lambda:leo"` —
+///   (b) an explicit `create(namespace="lambda:alice")` lands in `"lambda:alice"` —
 ///       the caller deliberately targeting a namespace (Rule 1).  This is exactly
 ///       what #159's unconditional `Namespace::local()` hard-pin wrongly collapsed
 ///       to `"local"`.
 ///
-///   (c) a default `list` (local) sees the local entity but NOT the lambda:leo one,
-///       and `list(namespace="lambda:leo")` sees the lambda:leo entity but NOT the
+///   (c) a default `list` (local) sees the local entity but NOT the lambda:alice one,
+///       and `list(namespace="lambda:alice")` sees the lambda:alice entity but NOT the
 ///       local one — multi-record reads filter by the supplied namespace.
 ///
 /// Regression sensitivity: if dispatch reverts to pinning `Namespace::local()`,
@@ -330,10 +330,10 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
         .expect("create result must carry 'id'")
         .to_string();
 
-    // ── (b) EXPLICIT CREATE: namespace="lambda:leo" is honored ───────────────
+    // ── (b) EXPLICIT CREATE: namespace="lambda:alice" is honored ───────────────
     let named_res = dispatch_op(
         &server,
-        r#"create(kind="concept", name="NamedProbe", namespace="lambda:leo")"#,
+        r#"create(kind="concept", name="NamedProbe", namespace="lambda:alice")"#,
     )
     .await;
     assert_eq!(
@@ -343,8 +343,8 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     );
     assert_eq!(
         named_res["result"]["namespace"].as_str().unwrap_or(""),
-        "lambda:leo",
-        "create(namespace=\"lambda:leo\") must land in 'lambda:leo', not be collapsed to \
+        "lambda:alice",
+        "create(namespace=\"lambda:alice\") must land in 'lambda:alice', not be collapsed to \
          'local' (ADR-007 Rev 2 Rule 1 — explicit namespace is honored); got: {named_res}"
     );
     let named_id = named_res["result"]["id"]
@@ -352,7 +352,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
         .expect("create result must carry 'id'")
         .to_string();
 
-    // ── (c) LIST scoping: default(local) vs explicit(lambda:leo) ─────────────
+    // ── (c) LIST scoping: default(local) vs explicit(lambda:alice) ─────────────
     let local_ids = list_ids(&dispatch_op(&server, r#"list(kind="entity")"#).await);
     assert!(
         local_ids.contains(&default_id),
@@ -360,17 +360,17 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     );
     assert!(
         !local_ids.contains(&named_id),
-        "default(local) list must NOT see the lambda:leo entity; got: {local_ids:?}"
+        "default(local) list must NOT see the lambda:alice entity; got: {local_ids:?}"
     );
 
     let leo_ids =
-        list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="lambda:leo")"#).await);
+        list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="lambda:alice")"#).await);
     assert!(
         leo_ids.contains(&named_id),
-        "list(namespace=lambda:leo) must see the lambda:leo entity; got: {leo_ids:?}"
+        "list(namespace=lambda:alice) must see the lambda:alice entity; got: {leo_ids:?}"
     );
     assert!(
         !leo_ids.contains(&default_id),
-        "list(namespace=lambda:leo) must NOT see the local entity; got: {leo_ids:?}"
+        "list(namespace=lambda:alice) must NOT see the local entity; got: {leo_ids:?}"
     );
 }

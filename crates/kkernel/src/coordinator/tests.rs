@@ -1187,7 +1187,7 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
     );
 }
 
-// ---- MAJ-2: per-backend fan-out search timeout ----
+// ---- Per-backend fan-out search timeout ----
 
 #[test]
 fn backend_search_failure_classifies_typed_runtime_timeouts_without_message_matching() {
@@ -1364,17 +1364,11 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
     }
 }
 
-/// Same guarantee as the spawned multi-backend hung-backend test above, but
-/// for the single-backend early-return path (`entries.len() == 1`), which
-/// has no spawned task for the fan-out timeout loop above to bound — the
-/// `hybrid_search` await there is now wrapped in its own
-/// `tokio::time::timeout` directly (r2 follow-up to MAJ-2).
-///
-/// RED before the fix: the single-entry branch awaited `hybrid_search`
-/// directly with no timeout at all, so a hung single backend blocked
-/// `fan_out_search` forever — this test would never resolve rather than
-/// merely asserting the wrong thing (see the mutation-control note in the
-/// implementation report for how this was verified as load-bearing).
+/// The single-backend early-return path (`entries.len() == 1`) must bound
+/// each `hybrid_search` await directly with `tokio::time::timeout`.
+/// It has no spawned task for the multi-backend fan-out timeout loop to bound.
+/// A hung backend must therefore return the same timeout result as in the
+/// multi-backend path, rather than blocking `fan_out_search` indefinitely.
 #[tokio::test(start_paused = true)]
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate() {
@@ -1575,7 +1569,7 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     );
 }
 
-// ---- MAJ-3: caller visibility scope must reach the fan-out authorization ----
+// ---- Caller visibility scope must reach the fan-out authorization ----
 
 /// Single-backend coordinator path: a row stored under a namespace visible
 /// to the caller only through `extra_visible` (not the primary namespace)
@@ -1809,7 +1803,7 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     );
 }
 
-// ---- MAJ-4: RRF merge must see each backend's full candidate window ----
+// ---- RRF merge must see each backend's full candidate window ----
 
 /// `alpha` ranks `[X, W, Y]` (`Y` at #3); `beta` ranks `[Z, V, Y]` (`Y` at
 /// #3). `Y`'s fused RRF score (2×1/63 ≈ 0.03175, appearing on both backends)

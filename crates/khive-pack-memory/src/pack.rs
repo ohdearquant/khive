@@ -782,7 +782,7 @@ mod receipt_custody_tests;
 #[path = "pack/read_only_warm_tests.rs"]
 mod read_only_warm_tests;
 
-// ── MAJ-1 regression test: second recall routes through warm ANN ──────────────
+// ── A second recall routes through warm ANN ─────────────────────────────────
 
 #[cfg(test)]
 #[path = "pack/ann_route_tests.rs"]
