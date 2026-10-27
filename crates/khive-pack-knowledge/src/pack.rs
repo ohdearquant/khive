@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
+use khive_runtime::resource_admission::{
+    AdmittedJob, BodyOutcome, FinalizationOutcome, JobOutcome, TrackedJob, WorkClass,
+};
 use khive_runtime::{
     KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, VerbRegistry,
 };
@@ -96,6 +99,132 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
 
 inventory::submit! { khive_runtime::PackRegistration(&KnowledgePackFactory) }
 
+// The supervisor outlives its control handle so cancellation can finalize telemetry.
+async fn run_knowledge_embedder_warm(
+    runtime: KhiveRuntime,
+    token: Option<NamespaceToken>,
+    job: AdmittedJob,
+) -> JobOutcome<Result<Vec<f32>, RuntimeError>> {
+    let phase_entry = std::time::Instant::now();
+    let entry_cpu = khive_runtime::process_resource_usage();
+    let mut start_attempted = false;
+    let start_finished = if let Some(token) = &token {
+        match job
+            .run_body(async {
+                // Set on the future's first poll, after run_body's pre-start check.
+                start_attempted = true;
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseStarted,
+                    PhaseStartedPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        corpus_size: None,
+                    },
+                )
+                .await;
+            })
+            .await
+        {
+            BodyOutcome::Finished(()) => true,
+            BodyOutcome::Cancelled => false,
+        }
+    } else {
+        true
+    };
+    if !start_finished && !start_attempted {
+        // No phase append was even polled, so do not invent a terminal pair.
+        return JobOutcome::Cancelled;
+    }
+    let (phase_start, cpu_start, result) = if start_finished {
+        // Preserve the ordinary timing boundary after the start append returns.
+        let phase_start = std::time::Instant::now();
+        let cpu_start = khive_runtime::process_resource_usage();
+        let result = job
+            .run_body(runtime.embed("__khive_knowledge_warm__"))
+            .await;
+        (phase_start, cpu_start, result)
+    } else {
+        tracing::warn!(
+            phase = "knowledge_embedder_warm",
+            start_attempted,
+            start_finished,
+            start_append_persistence = "unknown",
+            "warm start append was interrupted before returning",
+        );
+        (phase_entry, entry_cpu, BodyOutcome::Cancelled)
+    };
+    let cancelled = match &result {
+        BodyOutcome::Cancelled => true,
+        BodyOutcome::Finished(Err(error)) => khive_runtime::is_benign_shutdown_cancellation(error),
+        BodyOutcome::Finished(Ok(_)) => false,
+    };
+    if let BodyOutcome::Finished(Err(error)) = &result {
+        tracing::warn!(error = %error, "knowledge_embedder_warm: warm operation returned an error");
+    }
+    let finalization = if let Some(token) = &token {
+        let wall_us = phase_start.elapsed().as_micros() as i64;
+        let cpu_us =
+            khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
+        // Select the terminal once; cancellation only shortens its append budget.
+        job.finalize(async {
+            if cancelled {
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseCancelled,
+                    PhaseCancelledPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        wall_us,
+                        cpu_us,
+                    },
+                )
+                .await;
+            } else {
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseCompleted,
+                    PhaseCompletedPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        wall_us,
+                        cpu_us,
+                    },
+                )
+                .await;
+            }
+        })
+        .await
+    } else {
+        job.no_telemetry()
+    };
+    match finalization {
+        FinalizationOutcome::AttemptTimedOut
+        | FinalizationOutcome::NoAttemptBeforeDeadline
+        | FinalizationOutcome::DeadlineOverflow => {
+            tracing::warn!(
+                ?finalization,
+                "knowledge_embedder_warm: terminal append attempt did not finish"
+            );
+            return JobOutcome::FinalizationTimedOut;
+        }
+        FinalizationOutcome::AlreadyFinalized => {
+            tracing::warn!("knowledge_embedder_warm: terminal finalization was already claimed");
+        }
+        FinalizationOutcome::AttemptReturned | FinalizationOutcome::NoTelemetryToken => {}
+    }
+    match result {
+        BodyOutcome::Finished(result) => JobOutcome::Completed(result),
+        BodyOutcome::Cancelled => JobOutcome::Cancelled,
+    }
+}
+
 #[async_trait]
 impl PackRuntime for KnowledgePack {
     khive_runtime::pack_runtime_metadata!();
@@ -109,84 +238,35 @@ impl PackRuntime for KnowledgePack {
             crate::knowledge::vamana::start_rotation_watcher(&self.runtime, &self.ann);
         }
         if !self.runtime.default_embedder_name().is_empty() {
-            let runtime = self.runtime.clone();
-            // ADR-103 Amendment 1 Part 2: the phase span brackets ONLY this
-            // configured-embedder branch's spawned embed call, not the
-            // unconditional `warm_known_snapshots` above -- an unconditional
-            // span would record a phase for an embedder warmup that never
-            // ran whenever no embedder is configured. Minted here (before
-            // spawn) rather than inside the task: `authorize` is cheap and
-            // synchronous, and minting outside keeps the same shape as
-            // KgPack::warm's unconditional case.
+            let runtime = self.runtime.background_view();
+            let domain = runtime.background_domain();
+            // Register synchronously before queueing, without a second tracked task.
+            let tracking = TrackedJob::register("knowledge_embedder_warm");
             let token = match runtime.authorize(khive_runtime::Namespace::local()) {
                 Ok(token) => Some(token),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "knowledge_embedder_warm: failed to mint ADR-103 phase-span \
-                         attribution token; warmup proceeds without telemetry"
-                    );
+                Err(error) => {
+                    tracing::warn!(error = %error, "knowledge_embedder_warm: warmup proceeds without telemetry");
                     None
                 }
             };
+            // This ambient task does admission/handoff only. The phase and embed
+            // body run on the isolated domain after admission, never on this task.
             tokio::spawn(async move {
-                if let Some(token) = &token {
-                    khive_runtime::emit_phase_event(
-                        &runtime,
-                        token,
-                        "knowledge.embedder_warm",
-                        EventKind::PhaseStarted,
-                        PhaseStartedPayload {
-                            work_class: "warm".into(),
-                            phase: "knowledge_embedder_warm".into(),
-                            corpus_size: None,
-                        },
-                    )
-                    .await;
-                }
-                let phase_start = std::time::Instant::now();
-                let cpu_start = khive_runtime::process_resource_usage();
-                let result = runtime.embed("__khive_knowledge_warm__").await;
-                if let Some(token) = &token {
-                    let wall_us = phase_start.elapsed().as_micros() as i64;
-                    let cpu_us = khive_runtime::cpu_delta_us(
-                        cpu_start,
-                        khive_runtime::process_resource_usage(),
-                    );
-                    match &result {
-                        Err(e) if khive_runtime::is_benign_shutdown_cancellation(e) => {
-                            khive_runtime::emit_phase_event(
-                                &runtime,
-                                token,
-                                "knowledge.embedder_warm",
-                                EventKind::PhaseCancelled,
-                                PhaseCancelledPayload {
-                                    work_class: "warm".into(),
-                                    phase: "knowledge_embedder_warm".into(),
-                                    wall_us,
-                                    cpu_us,
-                                },
-                            )
-                            .await;
-                        }
-                        _ => {
-                            khive_runtime::emit_phase_event(
-                                &runtime,
-                                token,
-                                "knowledge.embedder_warm",
-                                EventKind::PhaseCompleted,
-                                PhaseCompletedPayload {
-                                    work_class: "warm".into(),
-                                    phase: "knowledge_embedder_warm".into(),
-                                    wall_us,
-                                    cpu_us,
-                                },
-                            )
-                            .await;
-                        }
+                let admitted = match domain.admit(WorkClass::Warm, &tracking).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "knowledge_embedder_warm: admission refused");
+                        return;
+                    }
+                };
+                match domain.spawn_supervised(admitted, move |job| {
+                    run_knowledge_embedder_warm(runtime, token, job)
+                }) {
+                    Ok(task) => task.detach(),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "knowledge_embedder_warm: supervisor submission refused");
                     }
                 }
-                let _ = result;
             });
         }
     }
@@ -567,3 +647,7 @@ impl PackByIdResolver for KnowledgePack {
 #[cfg(test)]
 #[path = "pack_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "warm_admission_tests.rs"]
+mod warm_admission_tests;
