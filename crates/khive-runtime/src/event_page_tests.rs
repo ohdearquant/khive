@@ -486,7 +486,9 @@ async fn split_duplicate_key_refuses_before_a_limit_one_page_can_skip_its_twin()
 #[cfg(unix)]
 #[tokio::test]
 async fn cross_namespace_plane_duplicate_refuses_before_global_page_truncation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry = crate::events_split::TestRegistryGuard::new(dir.path());
     let lane_path = dir.path().join("lane.db");
     let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
@@ -540,7 +542,9 @@ async fn aggregate_budget_refuses_when_two_planes_fill_sixteen_namespaces() {
     const SERIALIZED_BOUND: usize = 32 * 1024 * 1024;
     const _: () = assert!(NAMESPACES <= MAX_NAMESPACES);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry = crate::events_split::TestRegistryGuard::new(dir.path());
     let lane_path = dir.path().join("lane.db");
     let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
@@ -670,7 +674,9 @@ mod socket {
 
     #[tokio::test]
     async fn socket_split_matches_direct_order_and_wire_guards_still_refuse() {
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir_in("/tmp")
+            .unwrap();
         let (socket, _server) = daemon(&dir).await;
         let forwarded = Arc::new(ForwardingEventStore::new(
             "local",
@@ -747,7 +753,9 @@ mod socket {
         assert!(
             serde_json::from_value::<OldRead>(serde_json::json!({"op":"query_events"})).is_ok()
         );
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir_in("/tmp")
+            .unwrap();
         let path = dir.path().join("old.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let peer = tokio::spawn(async move {
@@ -789,7 +797,9 @@ mod socket {
 #[cfg(unix)]
 #[tokio::test]
 async fn readonly_page_never_creates_missing_lane_and_reads_an_existing_lane() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry = crate::events_split::TestRegistryGuard::new(dir.path());
     let main = dir.path().join("main.db");
     let lane = dir.path().join("events.db");

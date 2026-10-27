@@ -2,12 +2,16 @@ use super::*;
 
 #[test]
 fn fixture_registry_cleanup_preserves_other_roots() {
-    let live_dir = tempfile::tempdir().unwrap();
+    let live_dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _live_guard = TestRegistryGuard::new(live_dir.path());
     let live_path = live_dir.path().join("events.db");
     let live_backend = direct_backend_for(&live_path).unwrap();
 
-    let finished_dir = tempfile::tempdir().unwrap();
+    let finished_dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let finished_backend = {
         let _finished_guard = TestRegistryGuard::new(finished_dir.path());
         let backend = direct_backend_for(&finished_dir.path().join("events.db")).unwrap();
@@ -55,7 +59,9 @@ fn deep_symlink_chains_within_the_kernel_bound_derive_the_target_sidecar() {
     // therefore opens fine, so it must ALSO derive the target's sidecar
     // — a resolver stopping short would split audit records between the
     // alias and target spellings of one database.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let real = dir.path().join("real.db");
     let mut prev = real.clone();
     for i in 0..35 {
@@ -92,7 +98,9 @@ fn unopened_check_refuses_same_mode_regular_file_replacement() {
     // a regular 0600 file. Creating it before rename guarantees a different
     // live inode, without relying on inode reuse after unlink or on timing.
     for target_index in 0..3 {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir()
+            .unwrap();
         let db = dir.path().join("events.db");
         let targets = events_db_targets(&db);
         for path in &targets {
@@ -123,7 +131,9 @@ fn unopened_check_refuses_same_mode_regular_file_replacement() {
 #[cfg(unix)]
 #[test]
 fn unopened_check_accepts_sidecars_missing_at_check_time() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = dir.path().join("events.db");
     let targets = events_db_targets(&db);
     for path in &targets {
@@ -141,7 +151,9 @@ fn unopened_check_accepts_sidecars_missing_at_check_time() {
 #[cfg(unix)]
 #[test]
 fn unopened_check_refuses_main_database_removed_after_sqlite_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = dir.path().join("events.db");
     ensure_events_db_owner_only(&db).unwrap();
     let before_open = harden_events_db_sidecars(&db).unwrap();
@@ -163,7 +175,9 @@ fn unopened_check_refuses_main_database_removed_after_sqlite_open() {
 #[cfg(unix)]
 #[test]
 fn unopened_check_accepts_fresh_sqlite_sidecars_and_unchanged_main() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = dir.path().join("new.events.db");
     assert!(!db.exists());
     ensure_events_db_owner_only(&db).unwrap();
@@ -364,7 +378,9 @@ fn store_pair(dir: &Path) -> (Arc<dyn EventStore>, Arc<dyn EventStore>) {
 async fn idempotent_retry_of_legacy_resident_rows_does_not_duplicate() {
     use khive_storage::event::EventAppendDisposition;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let (legacy, lane) = store_pair(dir.path());
 
@@ -418,7 +434,9 @@ async fn idempotent_retry_of_legacy_resident_rows_does_not_duplicate() {
 /// the refusal names the cursor remedy, and the bound itself is usable.
 #[tokio::test]
 async fn merged_offset_window_is_bounded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let (legacy, lane) = store_pair(dir.path());
     let split = SplitEventStore::new(legacy, lane);
@@ -493,7 +511,9 @@ async fn writer_task_states_cross_the_wire_verbatim() {
     // TransactionRolledBack crossed as a generic non-retryable refusal
     // and came back as terminal InvalidInput — a broken retry contract.
     use khive_storage::WriterTaskRequestState as S;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let client =
         EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
     let store = ForwardingEventStore::new("test", client);
@@ -533,7 +553,9 @@ async fn writer_task_states_cross_the_wire_verbatim() {
 async fn native_write_stages_survive_direct_and_request_error_frames() {
     use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
     use khive_storage::WriterTaskRequestState;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
     let store = ForwardingEventStore::new("test", client);
     for (stage, extended) in [
@@ -611,7 +633,9 @@ async fn native_write_stages_survive_direct_and_request_error_frames() {
 async fn terminal_native_evidence_keeps_unknown_outcome_precedence() {
     use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
     use khive_storage::WriterTaskRequestState;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
     let store = ForwardingEventStore::new("test", client);
     for terminal in [false, true] {
@@ -668,7 +692,9 @@ async fn terminal_native_evidence_keeps_unknown_outcome_precedence() {
 #[tokio::test]
 async fn poisoned_commit_evidence_does_not_claim_definite_failure() {
     use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
     let store = ForwardingEventStore::new("test", client);
     let failure = SqliteWriteFailure {
@@ -700,7 +726,9 @@ async fn poisoned_commit_evidence_does_not_claim_definite_failure() {
 async fn proven_rollback_round_trips_as_non_terminal_request_failure() {
     use khive_storage::WriterTaskRequestState as S;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let client =
         EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
     let store = ForwardingEventStore::new("test", client);
@@ -730,7 +758,9 @@ async fn proven_rollback_round_trips_as_non_terminal_request_failure() {
 #[test]
 fn direct_backend_hardens_preexisting_db_and_sidecars() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let db = dir.path().join("pre-existing.events.db");
     let wal = dir.path().join("pre-existing.events.db-wal");
@@ -885,7 +915,9 @@ async fn forwarder_abandons_hung_delivery() {
     // A daemon that accepts the connection and then never responds must
     // not park the forwarder forever: the delivery deadline fires, the
     // batch is dropped and counted, and the task stays live.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let socket = dir.path().join("hung.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     // Accept and hold connections open without ever reading or replying.
@@ -993,7 +1025,9 @@ async fn boot_daemon(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
 /// merge both sides into one event plane.
 #[tokio::test]
 async fn split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let legacy_backend = direct_backend_for(&dir.path().join("legacy.db")).expect("legacy backend");
     let lane_backend = direct_backend_for(&dir.path().join("lane.db")).expect("lane backend");
@@ -1095,7 +1129,9 @@ async fn split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads(
 async fn raw_sql_consumers_of_the_legacy_events_table_still_see_plain_appends() {
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let legacy_backend =
         direct_backend_for(&dir.path().join("legacy-guard.db")).expect("legacy backend");
@@ -1163,7 +1199,9 @@ async fn raw_sql_consumers_of_the_legacy_events_table_still_see_plain_appends() 
 #[cfg(unix)]
 #[tokio::test]
 async fn idempotent_append_round_trips_through_the_daemon() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let (_db, socket) = boot_daemon(&dir).await;
     let client = EventsSplitClient::new(socket).expect("client");
     let store = ForwardingEventStore::new("local", client);
@@ -1201,7 +1239,9 @@ async fn idempotent_append_round_trips_through_the_daemon() {
 #[cfg(unix)]
 #[tokio::test]
 async fn fire_and_forget_append_lands_in_the_daemon_store() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let (_db, socket) = boot_daemon(&dir).await;
     let client = EventsSplitClient::new(socket).expect("client");
     let store = ForwardingEventStore::new("local", Arc::clone(&client));
@@ -1243,7 +1283,9 @@ async fn fire_and_forget_append_lands_in_the_daemon_store() {
 #[cfg(unix)]
 #[tokio::test]
 async fn queue_overflow_drops_and_counts_but_never_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let dead_socket = dir.path().join("nobody-home.sock");
     let client = EventsSplitClient::new_with_queue_depth(dead_socket, 2).expect("client");
     let store = ForwardingEventStore::new("local", Arc::clone(&client));
@@ -1267,7 +1309,9 @@ async fn queue_overflow_drops_and_counts_but_never_errors() {
 #[cfg(unix)]
 #[tokio::test]
 async fn dead_socket_reads_fail_typed_and_preflight_stays_local() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let dead_socket = dir.path().join("nobody-home.sock");
     let client = EventsSplitClient::new(dead_socket).expect("client");
     let store = ForwardingEventStore::new("local", client);
@@ -1294,7 +1338,9 @@ async fn dead_socket_reads_fail_typed_and_preflight_stays_local() {
 #[cfg(unix)]
 #[tokio::test]
 async fn connected_events_peer_closing_without_response_is_not_unreachable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let socket = dir.path().join("closes-after-request.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
@@ -1320,7 +1366,9 @@ async fn connected_events_peer_closing_without_response_is_not_unreachable() {
 #[cfg(unix)]
 #[tokio::test]
 async fn query_page_over_frame_cap_returns_typed_size_refusal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let socket = dir.path().join("large-query.sock");
     let backend = Arc::new(StorageBackend::memory().unwrap());
     let event_store = backend.events_for_namespace("local").unwrap();
@@ -1379,7 +1427,9 @@ async fn query_page_over_frame_cap_returns_typed_size_refusal() {
 #[cfg(unix)]
 #[tokio::test]
 async fn forwarding_queue_enforces_serialized_byte_and_frame_limits_with_drop_metrics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let socket = dir.path().join("stalled-forwarder.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
@@ -1432,7 +1482,9 @@ async fn forwarding_queue_enforces_serialized_byte_and_frame_limits_with_drop_me
 #[cfg(unix)]
 #[tokio::test]
 async fn protocol_version_skew_is_a_typed_refusal() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let (_db, socket) = boot_daemon(&dir).await;
 
     let mut stream = UnixStream::connect(&socket).await.expect("connect");
@@ -1463,7 +1515,9 @@ async fn protocol_version_skew_is_a_typed_refusal() {
 #[cfg(unix)]
 #[test]
 fn events_daemon_guard_is_exclusive_then_reusable() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let socket = dir.path().join("events.sock");
     let first = match acquire_events_daemon_guard_outcome(&socket) {
         EventsDaemonGuardAcquisition::Held(guard) => guard,
@@ -1497,7 +1551,9 @@ fn events_daemon_guard_is_exclusive_then_reusable() {
 #[cfg(unix)]
 #[test]
 fn events_daemon_guard_open_failure_is_not_contention() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let clean = dir.path().join("clean.sock");
     assert!(matches!(
         acquire_events_daemon_guard_outcome(&clean),
@@ -1540,7 +1596,9 @@ fn events_daemon_guard_open_failure_is_not_contention() {
 async fn read_only_runtime_never_creates_an_events_db() {
     use crate::{KhiveRuntime, Namespace, RuntimeConfig};
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let main_db = dir.path().join("main.db");
     // Materialize + migrate the main database with a writable runtime.
@@ -1611,7 +1669,9 @@ async fn read_only_runtime_never_creates_an_events_db() {
 /// `events.db` without any daemon.
 #[tokio::test]
 async fn direct_mode_appends_and_reads_without_a_daemon() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let db = dir.path().join("events.db");
     let backend = direct_backend_for(&db).expect("direct backend");
