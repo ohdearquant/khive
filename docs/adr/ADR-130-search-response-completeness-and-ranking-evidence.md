@@ -1217,5 +1217,9 @@ Each control names its mutation, stated before it runs.
    carry neither field; chain `$prev` binds the array. Mutation: emitting the fields on entity search fails.
 5. Coordinator sum. Two backends that each drop rows report the sum; a failed leg adds nothing. Mutation: reporting one
    leg's count fails.
-6. Presentation. Every supported Agent, Human and Verbose and JSON, Auto and Table path preserves both fields on
-   successful note searches, zero included, while result rendering and elision stay as they are.
+6. Presentation. Under every presentation (Agent, Human, Verbose) and every format (JSON, Auto, Table), both fields
+   stay structured fields of the operation entry, beside `status` and `result`, where `arm_participation` sits today.
+   Presentation and format apply to `result` only: Auto and Table render the hit array into the `result` string,
+   which never carries the two fields, and no summary line is added. Each path's expected output is the JSON path's
+   entry with `result` replaced by that path's rendering of the same hits, both fields present with equal values,
+   zero included. Mutations: dropping the fields on one path, or writing them into the rendered `result`, fails.
