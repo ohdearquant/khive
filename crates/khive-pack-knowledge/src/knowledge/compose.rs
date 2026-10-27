@@ -238,6 +238,10 @@ pub(super) fn score_sections(
 
 // ─── BM25 over candidate set ──────────────────────────────────────────────────
 
+// Keep candidate-local BM25: khive-bm25 caps TF at 255 and lacks a request
+// deadline hook. The separate TF-IDF field scorer also has a bigram bonus
+// with no shared-index counterpart (#4492).
+
 #[derive(Clone, Copy)]
 enum Bm25Work {
     TokenVisit,
