@@ -194,7 +194,7 @@ owning component.
 | `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending         | pending         | pending             |
 | `comm/thread_in_busy_mailbox/2000`              | Existing Criterion estimate, compared with `comm/thread/5` | reference block | reference block | reference block     |
 
-## CI observation — 2026-10-27 (UTC)
+## CI observation, 2026-10-27 (UTC)
 
 The seven lifecycle rows marked pending above predate this run; their first measured values are recorded below. The generated fixed-reference/A/A block and historical release ledger remain unchanged. These quick-profile timings are advisory, without cross-machine improvement or scaling claims.
 
