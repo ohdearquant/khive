@@ -163,6 +163,7 @@ impl EmbeddingService for Service {
 }
 fn configured(gated: bool, fail_build: bool) -> (KhiveRuntime, Arc<Probe>) {
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
         engines: Some(vec![EngineConfig {
             name: MODEL.into(),
             weight: 1.0,

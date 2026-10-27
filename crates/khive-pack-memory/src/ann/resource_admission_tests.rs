@@ -192,7 +192,10 @@ async fn maintenance_attempt_uses_one_lease_but_keeps_warm_payload_and_actor() {
         );
         for row in rows {
             assert_eq!(row.verb, "memory.ann_warm");
-            assert_eq!(row.actor, "daemon:ann_warm");
+            assert_eq!(
+                row.actor,
+                format!("{}:{}", token.actor().kind, token.actor().id)
+            );
             assert_eq!(row.payload["work_class"], "warm");
             assert_eq!(row.payload["phase"], "ann_warm");
         }
