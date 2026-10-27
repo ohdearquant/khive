@@ -1074,7 +1074,8 @@ pub(crate) async fn handle_agenda(
         order_by_instant: true,
         after_instant,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
 
     const PAGE_SIZE: u32 = 64;
     let mut events = Vec::with_capacity(limit as usize);
@@ -1368,5 +1369,63 @@ mod reservation_tests {
         let after = store.get_note(id).await.expect("read row").expect("row");
         assert_eq!(after.properties, Some(planted), "row changed");
         assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    }
+}
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agenda_excludes_archived_pending_notes_before_instant_order_and_limit() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut expected = None;
+            for (status, trigger) in [
+                ("archived", "2099-01-01T00:00:00Z"),
+                ("active", "2099-01-02T00:00:00Z"),
+            ] {
+                let mut note = Note::new(
+                    "local",
+                    "scheduled_event",
+                    format!("{status} pending event"),
+                );
+                note.status = status.into();
+                note.properties = Some(json!({"status": "pending", "trigger_at": trigger}));
+                if status == "active" {
+                    expected = Some(note.id.to_string());
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let result = handle_agenda(
+                &runtime,
+                &token,
+                json!({
+                    "limit": 1, "from": "2098-01-01T00:00:00Z", "to": "2100-01-01T00:00:00Z",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(
+                result["events"][0]["full_id"],
+                expected.unwrap(),
+                "agenda must omit archived pending events before its limit"
+            );
+            assert_eq!(
+                result["events"][0]["properties"]["status"], "pending",
+                "workflow state remains unchanged"
+            );
+        })
+        .await
+        .expect("bounded actual schedule agenda regression");
     }
 }

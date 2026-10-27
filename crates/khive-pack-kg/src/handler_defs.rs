@@ -322,7 +322,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
+        description: "List live records with optional filtering; note lists default to active notes, with note_status=archived or any for explicit access. This verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool, \"has_more\": bool}; clients advance offset by \
                       items.length, while M discloses the server cap and is not a guaranteed row \
@@ -351,6 +351,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_status", param_type: "string", required: false, description: "Notes only: active (default), archived, or any, selecting the note status before pagination. Omitted/null selects active. Any includes every stored note status while soft-deleted rows stay excluded. Separate from scheduled-event workflow status.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "status", param_type: "string", required: false, description: "For scheduled_event notes only (kind=scheduled_event or kind=note with note_kind=scheduled_event): exact property status, applied before pagination. Valid: provisioning, pending, firing, fired, cancelled, missed, failed. Omitted/null imposes no constraint. Proposal lists retain their separate proposal-status filter; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_by_actor", param_type: "string", required: false, description: "Scheduled_event notes only: exact, case-sensitive, non-blank creator display metadata, applied before pagination. May name any creator; never an authorization check or verified attribution. No implicit self-filter or wildcard. Omitted/null imposes no constraint; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
@@ -857,7 +858,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. Note searches default to active lifecycle status; note_status=archived or any provides explicit access, separately from workflow properties.status. Successful MCP note searches report note_status and note_status_dropped beside result, including zero; the count describes distinct gathered notes excluded by status after the other hydration predicates, not a corpus total or a promise of extra Any hits. Raw registry results remain hit arrays. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -908,6 +909,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 param_type: "string",
                 required: false,
                 description: "Filter search results to a specific note kind (kind=\"note\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "note_status",
+                param_type: "string",
+                required: false,
+                description: "Notes only: active (default for omitted/null), archived, or any, selecting the note lifecycle status at hydration. The bounded gather may return a short page. Separate from workflow properties.status. Entity searches reject this parameter.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

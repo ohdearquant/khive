@@ -31,6 +31,21 @@ inventory::submit! { khive_runtime::PackRegistration(&KgPackFactory) }
 impl PackRuntime for KgPack {
     khive_runtime::pack_runtime_metadata!();
 
+    async fn dispatch_search_intercepted(
+        &self,
+        params: serde_json::Value,
+        registry: &khive_runtime::pack::VerbRegistry,
+        token: &khive_runtime::NamespaceToken,
+    ) -> Result<
+        khive_runtime::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        khive_runtime::RuntimeError,
+    > {
+        self.handle_search_with_metadata(token, params, registry)
+            .await
+    }
+
     async fn warm(&self) {
         // ADR-103 Amendment 1 Part 2: mint an attribution token for daemon-startup
         // telemetry (see docs/api/pack-lifecycle.md#warm-telemetry-adr-103-amendment-1-part-2); a mint failure

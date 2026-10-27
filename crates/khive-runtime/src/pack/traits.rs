@@ -339,6 +339,23 @@ pub trait PackRuntime: Send + Sync {
         self.dispatch(verb, params, registry, token).await
     }
 
+    /// Typed note-search interception. Packs without the feature fail closed.
+    async fn dispatch_search_intercepted(
+        &self,
+        _params: serde_json::Value,
+        _registry: &crate::pack::VerbRegistry,
+        _token: &crate::NamespaceToken,
+    ) -> Result<
+        crate::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        crate::RuntimeError,
+    > {
+        Err(crate::RuntimeError::Internal(
+            "registered search owner does not support intercepted search".into(),
+        ))
+    }
+
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged

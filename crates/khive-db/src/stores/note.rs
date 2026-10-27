@@ -17,7 +17,7 @@ use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::StorageError;
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NotePropertyPatch,
-    NoteSeekAfter, NoteTagMode, NoteTimeOrder, NoteVisibility, SortDir,
+    NoteSeekAfter, NoteStatusSelector, NoteTagMode, NoteTimeOrder, NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -867,6 +867,23 @@ fn json_type_expr(path: &str) -> String {
     format!("json_type(properties, '{path}')")
 }
 
+fn validate_note_mutation_status(
+    filter: &NoteFilter,
+    operation: &'static str,
+) -> Result<(), StorageError> {
+    if matches!(
+        filter.note_status,
+        Some(NoteStatusSelector::Active | NoteStatusSelector::Archived)
+    ) {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: "note_status is a read-only selector".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_note_time_order(
     filter: &NoteFilter,
     operation: &'static str,
@@ -1466,11 +1483,27 @@ fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static st
     }
 }
 
+/// Add status only at the filtered-read boundary. The neutral compiler stays
+/// shared with guarded mutations, whose new nonneutral inputs are refused.
+fn build_note_filter_read_where(
+    namespace: &str,
+    filter: &NoteFilter,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
+    let (mut where_sql, mut params) = build_note_filter_where(namespace, filter)?;
+    if let Some(status) = filter.note_status {
+        if status != NoteStatusSelector::Any {
+            params.push(Box::new(status.as_str().to_owned()));
+            where_sql.push_str(&format!(" AND status = ?{}", params.len()));
+        }
+    }
+    Ok((where_sql, params))
+}
+
 fn build_note_filter_read_clause(
     namespace: &str,
     filter: &NoteFilter,
 ) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
-    let (where_sql, params) = build_note_filter_where(namespace, filter)?;
+    let (where_sql, params) = build_note_filter_read_where(namespace, filter)?;
     let index_clause = comm_filter_index_clause(filter, &where_sql);
     Ok((format!("{index_clause}{where_sql}"), params))
 }
@@ -1791,7 +1824,7 @@ impl NoteStore for SqlNoteStore {
         let prefix = prefix.to_owned();
         let after = after.cloned();
         self.with_reader("query_keyed_notes", move |conn| {
-            let (mut clause, mut params) = build_note_filter_where(&namespace, &filter)?;
+            let (mut clause, mut params) = build_note_filter_read_where(&namespace, &filter)?;
             params.push(Box::new(prefix.clone()));
             clause.push_str(&format!(" AND key IS NOT NULL AND key >= ?{}", params.len()));
             if let Some(upper) = note_key_prefix_successor(&prefix) {
@@ -1905,6 +1938,7 @@ impl NoteStore for SqlNoteStore {
         value: serde_json::Value,
         updated_at: i64,
     ) -> Result<bool, StorageError> {
+        validate_note_mutation_status(filter, "try_patch_note_property")?;
         validate_note_time_order(filter, "try_patch_note_property", false)?;
         for property in &filter.property_filters {
             validate_json_path(&property.json_path)?;
@@ -1954,6 +1988,7 @@ impl NoteStore for SqlNoteStore {
         value: serde_json::Value,
         updated_at: i64,
     ) -> Result<(), StorageError> {
+        validate_note_mutation_status(filter, "patch_note_property_atomic")?;
         validate_note_time_order(filter, "patch_note_property_atomic", false)?;
         for property in &filter.property_filters {
             validate_json_path(&property.json_path)?;
@@ -2714,7 +2749,7 @@ impl NoteStore for SqlNoteStore {
         let limit_usize = limit as usize;
         let probe_limit_i64 = i64::from(limit) + 1;
         self.with_reader("query_notes_filtered_after", move |conn| {
-            let (mut where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
+            let (mut where_sql, mut params) = build_note_filter_read_where(&namespace, &filter)?;
             if let Some(cursor) = after {
                 params.push(Box::new(cursor.sequence));
                 where_sql.push_str(&format!(" AND notes_seq.seq > ?{}", params.len()));
