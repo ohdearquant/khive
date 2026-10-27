@@ -441,6 +441,31 @@ that is not a valid JSON-RPC message receives Invalid Request; the oversized-lin
 sentinel uses that category. The limits and recovery behavior are documented in
 [the CLI usage guide](../crates/kkernel/docs/usage.md).
 
+## Observing process-scoped configuration
+
+These three settings describe the bridge or coordinator process rather than a
+single runtime's store:
+
+| Setting                               | Scope                                                                  |
+| ------------------------------------- | ---------------------------------------------------------------------- |
+| `KHIVE_REQUEST_READ_TIMEOUT_SECS`     | Bridge transport, including requests forwarded without local dispatch. |
+| `KHIVE_SEARCH_PROFILE`                | Search coordinator across multiple runtimes.                           |
+| `KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS` | Search coordinator, read before fan-out across multiple runtimes.      |
+
+On the first read through each cached accessor, the setting is reported once per
+process as an INFO tracing record with target `khive::config_lock` and fields
+`name` and `value`. Later reads use the cached value and do not repeat that record.
+If you need evidence of these effective settings, capture and retain that target
+at INFO from the first accessor read; enabling capture afterward does not replay
+it. Settings whose accessors are not used need not emit a record.
+
+These process-scoped names do not produce `ConfigLocked` rows in any store.
+Runtime-scoped settings instead use the runtime's own config-lock ledger and its
+bound registry's best-effort append path. Store event history is therefore not a
+complete inventory of process configuration. See
+[ADR-094's accepted 2026-10-21 config-lock amendment](adr/ADR-094-lifecycle-telemetry-events.md#2026-10-21-amendment-a-config-lock-row-belongs-to-the-runtime-that-read-the-value-5901),
+Decision 4.
+
 ## Troubleshooting a connect failure
 
 **Symptom:** an MCP client (Claude Code, Claude Desktop, Codex, Gemini) reports
