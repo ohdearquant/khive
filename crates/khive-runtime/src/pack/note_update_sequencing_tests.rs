@@ -82,7 +82,7 @@ struct ProbePack(Arc<SequencerProbeHook>);
 
 impl Pack for ProbePack {
     const NAME: &'static str = "sequencer-probe";
-    const NOTE_KINDS: &'static [&'static str] = &["probe-note"];
+    const NOTE_KINDS: &'static [&'static str] = &["probe_note"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[];
 }
@@ -102,7 +102,7 @@ impl PackRuntime for ProbePack {
         Self::HANDLERS
     }
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-        (kind == "probe-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+        (kind == "probe_note").then(|| self.0.clone() as Arc<dyn KindHook>)
     }
     async fn dispatch(
         &self,
@@ -140,7 +140,7 @@ async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_ca
     builder.register(ProbePack(hook.clone()));
     let registry = builder.build().expect("registry builds");
 
-    let note = khive_storage::Note::new("local", "probe-note", "body");
+    let note = khive_storage::Note::new("local", "probe_note", "body");
     let mut args = serde_json::json!({"raw_marker": true});
 
     let result = registry
@@ -193,7 +193,7 @@ async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_ca
     builder.register(ProbePack(hook.clone()));
     let registry = builder.build().expect("registry builds");
 
-    let note = khive_storage::Note::new("local", "probe-note", "body");
+    let note = khive_storage::Note::new("local", "probe_note", "body");
     let mut args = serde_json::json!({"raw_marker": false});
 
     registry
@@ -223,7 +223,7 @@ async fn effects_fixture() -> (
     let mut builder = VerbRegistryBuilder::new();
     builder.register(ProbePack(hook.clone()));
     let registry = builder.build().unwrap();
-    let note = khive_storage::Note::new("local", "probe-note", "before");
+    let note = khive_storage::Note::new("local", "probe_note", "before");
     let id = note.id;
     runtime
         .notes(&token)
