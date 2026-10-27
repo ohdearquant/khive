@@ -10762,9 +10762,17 @@ async fn update_note_fans_out_to_all_registered_models() {
 async fn get_entity_cross_namespace_succeeds() {
     let rt = rt();
     // Create under "lambda:alice".
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
-        .create_entity(&leo_tok, "concept", None, "Peer-Entity", None, None, vec![])
+        .create_entity(
+            &alice_tok,
+            "concept",
+            None,
+            "Peer-Entity",
+            None,
+            None,
+            vec![],
+        )
         .await
         .unwrap();
     assert_eq!(entity.namespace, "lambda:alice");
@@ -10783,10 +10791,10 @@ async fn get_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn update_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Update",
@@ -10815,10 +10823,10 @@ async fn update_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn delete_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Delete",
@@ -10846,10 +10854,10 @@ async fn delete_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn namespace_preserved_on_entity_after_cross_namespace_get() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "NS-Preserved",
