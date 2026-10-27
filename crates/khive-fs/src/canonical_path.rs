@@ -15,11 +15,11 @@ pub fn canonicalize_allow_missing(path: &Path) -> std::io::Result<std::path::Pat
     use std::collections::VecDeque;
     use std::path::Component;
 
-    match std::fs::canonicalize(path) {
+    let original_not_found = match std::fs::canonicalize(path) {
         Ok(resolved) => return Ok(resolved),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => error,
         Err(error) => return Err(error),
-    }
+    };
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -69,15 +69,13 @@ pub fn canonicalize_allow_missing(path: &Path) -> std::io::Result<std::path::Pat
                     }
                     Ok(metadata) => {
                         if let Some(next) = pending.front().filter(|_| !metadata.is_dir()) {
-                            // Preserve the actual traversal error for an existing
-                            // nondirectory before any later component.
+                            // Keep a native traversal error when the next step fails.
+                            // If a nondirectory/.. reprobe succeeds, retain the original
+                            // whole-input NotFound instead of synthesizing an error.
                             let next = resolved.join(next);
                             return match std::fs::canonicalize(next) {
                                 Err(error) => Err(error),
-                                Ok(_) => Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "path component changed while resolving export destination",
-                                )),
+                                Ok(_) => Err(original_not_found),
                             };
                         }
                         resolved = std::fs::canonicalize(&resolved)?;
