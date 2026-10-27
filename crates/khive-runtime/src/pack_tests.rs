@@ -1791,8 +1791,8 @@ fn note_kind_duplicate_rejected_at_build_time() {
         "error must name the duplicate kind: {msg}"
     );
     assert!(
-        msg.contains("alpha") || msg.contains("dup"),
-        "error must name one of the conflicting packs: {msg}"
+        msg.contains("alpha") && msg.contains("dup"),
+        "error must name both conflicting packs: {msg}"
     );
 }
 
