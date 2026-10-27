@@ -860,7 +860,11 @@ impl KgPack {
                 Value::Array(items) => items.clone(),
                 other => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `items` must be an array; got {other}"
+                        "create: `items` must be an array; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -875,7 +879,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `atomic` must be a boolean; got {other}"
+                        "create: `atomic` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -884,7 +892,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `verbose` must be a boolean; got {other}"
+                        "create: `verbose` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };

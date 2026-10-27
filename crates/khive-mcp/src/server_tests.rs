@@ -3778,6 +3778,7 @@ fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
     let envelope = ok_envelope(
         "search".to_string(),
         OpSuccess {
+            note_status_disclosure: None,
             result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
             degradation: forward,
         },
@@ -5960,6 +5961,7 @@ fn parallel_seam_accepts_shallow_result_and_applies_presentation() {
 #[test]
 fn success_envelope_requires_typed_degradation_and_preserves_it_through_presentation() {
     let success = OpSuccess {
+        note_status_disclosure: None,
         result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
         degradation: SearchDegradation {
             status: Some(SearchStatus::Partial),

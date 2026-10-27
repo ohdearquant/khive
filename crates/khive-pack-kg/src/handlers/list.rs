@@ -36,10 +36,9 @@ fn validate_list_filter_scope(
             "entity_kind" | "entity_type" => {
                 (matches!(spec, KindSpec::Entity { .. }), "entity lists")
             }
-            "note_kind" | "key_prefix" | "after_key" | "created_after" | "updated_after"
-            | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read" | "delivered" => {
-                (matches!(spec, KindSpec::Note { .. }), "note lists")
-            }
+            "note_kind" | "note_status" | "key_prefix" | "after_key" | "created_after"
+            | "updated_after" | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read"
+            | "delivered" => (matches!(spec, KindSpec::Note { .. }), "note lists"),
             "created_by_actor" => (
                 matches!(spec, KindSpec::Note { .. }),
                 "scheduled_event note lists",

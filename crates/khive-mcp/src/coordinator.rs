@@ -243,6 +243,20 @@ pub trait CoordinatorService: Send + Sync {
             .await)
     }
 
+    /// Scoped note search with the number of otherwise eligible notes excluded
+    /// by the effective status selector. Unavailable implementations fail closed.
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        _request: &ValidatedSearchRequest,
+        _token: &NamespaceToken,
+        _args: &serde_json::Value,
+        _extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        Err(RuntimeError::Internal(
+            "this coordinator does not support note search status disclosure".into(),
+        ))
+    }
+
     /// True when only one backend is registered (zero-change invariant check).
     fn is_single_backend(&self) -> bool;
 }

@@ -212,7 +212,9 @@ async fn secondary_only_checkpoint_topology_emits_lifecycle_outcome() {
         inner: inner_event_store,
         first_append: std::sync::Mutex::new(Some(first_append_tx)),
     });
-    let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
+    let secondary_dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("secondary tempdir");
     let secondary_backend =
         khive_db::StorageBackend::sqlite_for_test(secondary_dir.path().join("secondary.db"))
             .expect("file-backed secondary backend");
@@ -278,7 +280,9 @@ async fn secondary_only_checkpoint_topology_emits_lifecycle_outcome() {
         "the designated secondary owner must emit CheckpointOutcomeRecorded"
     );
 
-    let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
+    let file_main_dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("file-backed main tempdir");
     let file_main = khive_db::StorageBackend::sqlite_for_test(file_main_dir.path().join("main.db"))
         .expect("file-backed main backend");
     let tasks = checkpoint_task_specs(
@@ -539,7 +543,9 @@ async fn expired_accepted_deadline_refuses_a_frame_ready_on_first_poll() {
 /// a bound socket) must still be recognized by the protocol probe.
 #[tokio::test]
 async fn socket_speaks_khived_protocol_accepts_a_real_khived() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock_path = dir.path().join("real.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind real listener");
     let dispatcher = MockDispatch {
@@ -574,7 +580,9 @@ include!("daemon/probe_listener_tests.rs");
 /// have been misclassified as "alive" and refused a legitimate boot.
 #[tokio::test]
 async fn socket_speaks_khived_protocol_rejects_a_non_ack_or_mismatched_response() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock_path = dir.path().join("mismatched.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
     let accept_task = tokio::spawn(async move {
@@ -623,7 +631,9 @@ async fn socket_speaks_khived_protocol_rejects_a_non_ack_or_mismatched_response(
 /// `request_id.is_none()` conjunct.
 #[tokio::test]
 async fn socket_speaks_khived_protocol_rejects_a_metrics_only_response() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock_path = dir.path().join("metrics-only.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
     let accept_task = tokio::spawn(async move {
@@ -670,7 +680,9 @@ async fn socket_speaks_khived_protocol_rejects_a_metrics_only_response() {
 /// different, non-probe request.
 #[tokio::test]
 async fn socket_speaks_khived_protocol_rejects_a_response_with_request_id() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock_path = dir.path().join("request-id.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
     let accept_task = tokio::spawn(async move {
@@ -942,7 +954,9 @@ async fn daemon_peer_disconnect_signals_request_read_cancellation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_disconnect_interrupts_pooled_stats_count() {
     use khive_storage::{SqlAccess, SqlStatement, SqlValue};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let pool = Arc::new(
         ConnectionPool::new(khive_db::PoolConfig {
             path: Some(dir.path().join("disconnect-count.db")),
@@ -1210,7 +1224,9 @@ async fn metrics_only_frame_returns_snapshot_without_dispatching() {
 /// every other process using that directory.
 #[test]
 fn shared_writable_socket_dirs_are_refused_without_being_modified() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     for (name, mode) in [("open", 0o777u32), ("sticky-tmp", 0o1777u32)] {
         let shared = dir.path().join(name);
         std::fs::create_dir(&shared).expect("create");
@@ -1243,7 +1259,9 @@ fn shared_writable_socket_dirs_are_refused_without_being_modified() {
 /// whose tempdirs live under the platform temp root.
 #[test]
 fn writable_non_sticky_ancestor_is_refused() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let open_mid = dir.path().join("open-mid");
     std::fs::create_dir(&open_mid).expect("create mid");
     let inner = open_mid.join("private");
@@ -1271,7 +1289,9 @@ fn writable_non_sticky_ancestor_is_refused() {
 /// time.
 #[test]
 fn symlink_component_to_untrusted_directory_is_refused() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let open = dir.path().join("open-target");
     std::fs::create_dir(&open).expect("create target");
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
@@ -1291,8 +1311,7 @@ fn symlink_component_to_untrusted_directory_is_refused() {
 include!("daemon/socket_path_tests.rs");
 
 /// Directories this daemon can trust end to end are served as found:
-/// owner-only, and the umask-default 0755 every `tempfile::tempdir` and
-/// test runner produces (readable/traversable but writable only by the
+/// owner-only and 0755 (readable/traversable but writable only by the
 /// owner). On macOS these fixtures also implicitly exercise the
 /// symlink-accept arm, since the platform temp root itself resolves
 /// through root-owned symlinks. Foreign ownership of a directory is
@@ -1300,7 +1319,9 @@ include!("daemon/socket_path_tests.rs");
 /// foreign ownership without requiring a privileged chown operation.
 #[test]
 fn trusted_socket_dirs_are_accepted_unmodified() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     for (name, mode) in [("private", 0o700), ("listable", 0o755)] {
         let d = dir.path().join(name);
         std::fs::create_dir(&d).expect("create");
@@ -1319,7 +1340,7 @@ fn trusted_socket_dirs_are_accepted_unmodified() {
 
 #[test]
 fn pid_directory_owned_by_another_uid_is_refused() {
-    let dir = tempfile::Builder::new()
+    let dir = crate::test_process::private_tempdir_builder()
         .prefix("khive-pid-owner-")
         .tempdir()
         .expect("tempdir");
@@ -1482,7 +1503,9 @@ async fn request_id_echoed_on_success_and_error_arms() {
 
 #[test]
 fn shutdown_cleanup_removes_paths_it_still_owns() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let pid_file = dir.path().join("khived.pid");
 
@@ -1506,7 +1529,9 @@ fn shutdown_cleanup_removes_paths_it_still_owns() {
 
 #[test]
 fn shutdown_cleanup_skips_when_pid_file_names_a_different_process() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let pid_file = dir.path().join("khived.pid");
 
@@ -1532,7 +1557,9 @@ fn shutdown_cleanup_skips_when_pid_file_names_a_different_process() {
 
 #[test]
 fn shutdown_cleanup_skips_when_socket_was_rebound_by_a_replacement() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let original_sock = dir.path().join("original.sock");
     let pid_file = dir.path().join("khived.pid");
@@ -1589,7 +1616,9 @@ fn shutdown_cleanup_skips_when_socket_was_rebound_by_a_replacement() {
 
 #[test]
 fn shutdown_cleanup_preserves_atomically_renamed_successor() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("khived.sock");
     let staged_sock = dir.path().join("next.sock");
     let pid_file = dir.path().join("khived.pid");
@@ -1674,7 +1703,9 @@ fn recovery_lock_serializes_two_concurrent_boot_sequences() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let lock_file = dir.path().join("khived.recovery.lock");
     std::env::set_var("KHIVE_LOCK", &lock_file);
 
@@ -1720,7 +1751,9 @@ fn acquire_daemon_boot_guard_returns_guard_when_lock_available() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let lock_file = dir.path().join("khived.recovery.lock");
     std::env::set_var("KHIVE_LOCK", &lock_file);
 
@@ -1741,7 +1774,9 @@ fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     // Point KHIVE_LOCK at a directory, not a file: opening a directory
     // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`
     // returns `None` here — the exact failure mode
@@ -1763,7 +1798,9 @@ fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
 
 #[test]
 fn write_pid_file_exclusive_creates_new_file_with_own_pid() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let pid_file = dir.path().join("khived.pid");
     write_pid_file_exclusive(&pid_file).expect("first writer must win");
     let contents = std::fs::read_to_string(&pid_file).expect("read pid file");
@@ -1772,7 +1809,9 @@ fn write_pid_file_exclusive_creates_new_file_with_own_pid() {
 
 #[test]
 fn write_pid_file_exclusive_refuses_to_overwrite_an_existing_file() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let pid_file = dir.path().join("khived.pid");
     std::fs::write(&pid_file, "999999").expect("seed an existing pid file");
 
@@ -1799,7 +1838,9 @@ fn write_pid_file_exclusive_refuses_to_overwrite_an_existing_file() {
 // clobber the winner's content.
 #[test]
 fn two_concurrent_writers_converge_on_exactly_one_pid_file_owner() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let pid_file = std::sync::Arc::new(dir.path().join("khived.pid"));
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
@@ -1853,7 +1894,9 @@ fn two_concurrent_writers_converge_on_exactly_one_pid_file_owner() {
 /// decision function would not catch that.
 #[tokio::test]
 async fn peer_uid_reports_the_connecting_process_uid() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
     let sock = dir.path().join("peer.sock");
     let listener = UnixListener::bind(&sock).expect("bind");
 

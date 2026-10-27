@@ -22,6 +22,9 @@ use khive_storage::EdgeRelation;
 use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
 use super::search_profile;
 
+type ScopedSearchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(CoordSearchResult, u64), RuntimeError>> + Send + 'a>>;
+
 /// `CoordinatorService` wrapper around a [`SubstrateCoordinator`].
 ///
 /// `KhiveMcpServer` holds `Option<Arc<dyn CoordinatorService>>` — it holds
@@ -68,18 +71,20 @@ impl SubstrateCoordinatorService {
         })
     }
 
-    fn search_scoped<'a>(
+    fn search_scoped_with_count<'a>(
         &'a self,
         request: &'a ValidatedSearchRequest,
         token: &'a NamespaceToken,
         args: &'a serde_json::Value,
         extra_visible: &'a [Namespace],
-    ) -> Pin<Box<dyn Future<Output = Result<CoordSearchResult, RuntimeError>> + Send + 'a>> {
+    ) -> ScopedSearchFuture<'a> {
         Box::pin(async move {
             if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
-                return Ok(self
-                    .fan_out_search(request, token.gate_namespace(), extra_visible)
-                    .await);
+                return Ok((
+                    self.fan_out_search(request, token.gate_namespace(), extra_visible)
+                        .await,
+                    0,
+                ));
             }
             let mailbox = if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Note {
                 self.inner
@@ -89,9 +94,9 @@ impl SubstrateCoordinatorService {
             } else {
                 None
             };
-            let (entity_hits, note_hits, per_backend) = self
+            let (entity_hits, note_hits, per_backend, dropped) = self
                 .inner
-                .fan_out_search_with_token(request, token, args, extra_visible)
+                .fan_out_search_with_token_and_count(request, token, args, extra_visible)
                 .await;
             let started = search_profile::start();
             let result = self
@@ -105,7 +110,7 @@ impl SubstrateCoordinatorService {
                 )
                 .await;
             search_profile::stage("hydrate", started, &[]);
-            Ok(result)
+            Ok((result, dropped))
         })
     }
 
@@ -313,10 +318,248 @@ impl CoordinatorService for SubstrateCoordinatorService {
         args: &serde_json::Value,
         extra_visible: &[Namespace],
     ) -> Result<CoordSearchResult, RuntimeError> {
-        search_profile::profiled(self.search_scoped(request, token, args, extra_visible)).await
+        search_profile::profiled(async {
+            self.search_scoped_with_count(request, token, args, extra_visible)
+                .await
+                .map(|(result, _)| result)
+        })
+        .await
+    }
+
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        search_profile::profiled(self.search_scoped_with_count(request, token, args, extra_visible))
+            .await
     }
 
     fn is_single_backend(&self) -> bool {
         self.inner.is_single_backend()
+    }
+}
+
+#[cfg(test)]
+mod note_status_count_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
+    use khive_storage::note::{Note, NoteStore};
+    use khive_storage::types::TextDocument;
+    use serde_json::{json, Value};
+
+    use crate::coordinator::BackendRegistry;
+
+    const QUERY: &str = "coordinatorstatusfixture";
+
+    // This bounds all cooperative setup, search and cleanup awaits in each case.
+    // It does not preempt synchronous native code.
+    async fn bounded(future: impl Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(20), future)
+            .await
+            .expect("coordinator status fixture exceeded its async budget");
+    }
+
+    fn runtime() -> Arc<KhiveRuntime> {
+        Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+    }
+
+    fn search_request(
+        runtime: &KhiveRuntime,
+        status: Option<Value>,
+    ) -> (ValidatedSearchRequest, Value) {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(runtime.config().gate.clone());
+        builder.with_default_namespace(runtime.config().default_namespace.as_str());
+        builder.with_actor_id(runtime.config().actor_id.clone());
+        PackRegistry::register_packs(&["kg".to_string()], runtime.clone(), &mut builder)
+            .expect("register KG pack");
+        let registry = builder.build().expect("KG registry");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        let mut args = json!({"kind": "note", "query": QUERY, "limit": 10});
+        if let Some(status) = status {
+            args["note_status"] = status;
+        }
+        let request = ValidatedSearchRequest::from_value(args.clone(), &registry)
+            .expect("canonical note search");
+        (request, args)
+    }
+
+    async fn seed(runtime: &KhiveRuntime, id: Uuid, status: &str) {
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("fixture token");
+        let mut note = Note::new("local", "observation", QUERY);
+        note.id = id;
+        note.status = status.into();
+        // Isolated backend seeding makes lifecycle states explicit while the
+        // search still uses real storage, text retrieval and runtime hydration.
+        runtime
+            .backend()
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+        runtime
+            .text_for_notes(&token)
+            .expect("note text store")
+            .upsert_document(TextDocument {
+                subject_id: id,
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("observation".into()),
+                namespace: "local".into(),
+                title: None,
+                body: QUERY.into(),
+                tags: vec![],
+                metadata: None,
+                updated_at: std::time::SystemTime::now().into(),
+            })
+            .await
+            .expect("index note");
+    }
+
+    #[tokio::test]
+    async fn direct_leg_preserves_selector_and_counts_every_excluded_status() {
+        bounded(async {
+            let runtime = runtime();
+            let active = Uuid::new_v4();
+            let archived = Uuid::new_v4();
+            let custom = Uuid::new_v4();
+            seed(&runtime, active, "active").await;
+            seed(&runtime, archived, "archived").await;
+            seed(&runtime, custom, "snoozed").await;
+            let token = runtime.authorize(Namespace::local()).expect("search token");
+            let service = SubstrateCoordinatorService::new(SubstrateCoordinator::single(
+                Arc::clone(&runtime),
+            ));
+            for (status, expected_count, mut expected_ids) in [
+                (None, 2, vec![active]),
+                (Some(Value::Null), 2, vec![active]),
+                (Some(json!("active")), 2, vec![active]),
+                (Some(json!("archived")), 2, vec![archived]),
+                (Some(json!("any")), 0, vec![active, archived, custom]),
+            ] {
+                let (request, args) = search_request(&runtime, status);
+                let (result, dropped) = service
+                    .fan_out_note_search_scoped_with_count(&request, &token, &args, &[])
+                    .await
+                    .expect("scoped count search");
+                assert_eq!(dropped, expected_count, "direct selector exclusion count");
+                let mut actual_ids: Vec<_> =
+                    result.note_hits.iter().map(|hit| hit.note_id).collect();
+                actual_ids.sort();
+                expected_ids.sort();
+                assert_eq!(actual_ids, expected_ids);
+                assert_eq!(result.per_backend.len(), 1);
+                assert!(result.per_backend[0].error.is_none());
+                assert!(!result.partial);
+                assert!(result.entity_hits.is_empty());
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spawned_legs_sum_counts_even_when_excluded_uuid_is_shared() {
+        bounded(async {
+            let left = runtime();
+            let right = runtime();
+            let shared_archived = Uuid::new_v4();
+            let left_active = Uuid::new_v4();
+            let right_active = Uuid::new_v4();
+            seed(&left, shared_archived, "archived").await;
+            seed(&right, shared_archived, "archived").await;
+            seed(&right, Uuid::new_v4(), "snoozed").await;
+            seed(&left, left_active, "active").await;
+            seed(&right, right_active, "active").await;
+            let token = left.authorize(Namespace::local()).expect("search token");
+            let (request, args) = search_request(&left, None);
+            let mut backends = BackendRegistry::new();
+            backends.register(BackendId::main(), Arc::clone(&left));
+            backends.register(BackendId::parse("secondary").unwrap(), right);
+            let service = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backends));
+            let (result, dropped) = service
+                .fan_out_note_search_scoped_with_count(&request, &token, &args, &[])
+                .await
+                .expect("fan-out count search");
+            assert_eq!(
+                dropped, 3,
+                "completed backend counts must sum without UUID union"
+            );
+            let mut actual_ids: Vec<_> = result.note_hits.iter().map(|hit| hit.note_id).collect();
+            actual_ids.sort();
+            let mut expected_ids = vec![left_active, right_active];
+            expected_ids.sort();
+            assert_eq!(actual_ids, expected_ids);
+            assert_eq!(result.per_backend.len(), 2);
+            assert!(result.per_backend.iter().all(|leg| leg.error.is_none()));
+            assert!(!result.partial);
+            let (any_request, any_args) = search_request(&left, Some(json!("any")));
+            let (any_result, any_dropped) = service
+                .fan_out_note_search_scoped_with_count(&any_request, &token, &any_args, &[])
+                .await
+                .expect("fan-out Any search");
+            assert_eq!(any_dropped, 0, "Any must not exclude any gathered note");
+            assert_eq!(any_result.note_hits.len(), 4);
+            assert!(!any_result.partial);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn failed_leg_contributes_neither_hits_nor_count() {
+        bounded(async {
+            let healthy = runtime();
+            let failed = runtime();
+            let active = Uuid::new_v4();
+            seed(&healthy, active, "active").await;
+            seed(&healthy, Uuid::new_v4(), "archived").await;
+            seed(&failed, Uuid::new_v4(), "archived").await;
+            seed(&failed, Uuid::new_v4(), "snoozed").await;
+            let failed_token = failed
+                .authorize(Namespace::local())
+                .expect("failed fixture token");
+            let (failed_request, failed_args) = search_request(&failed, None);
+            let (_, prepared_count) =
+                SubstrateCoordinatorService::new(SubstrateCoordinator::single(Arc::clone(&failed)))
+                    .fan_out_note_search_scoped_with_count(
+                        &failed_request,
+                        &failed_token,
+                        &failed_args,
+                        &[],
+                    )
+                    .await
+                    .expect("positive failed-backend premise");
+            assert_eq!(prepared_count, 2, "failed fixture has two real exclusions");
+            let token = healthy.authorize(Namespace::local()).expect("search token");
+            let (request, args) = search_request(&healthy, None);
+            let mut backends = BackendRegistry::new();
+            backends.register(BackendId::main(), Arc::clone(&healthy));
+            backends.register(BackendId::parse("failed").unwrap(), failed);
+            let service = SubstrateCoordinatorService::new(
+                SubstrateCoordinator::new(backends).with_failing_backend("failed"),
+            );
+            let (result, dropped) = service
+                .fan_out_note_search_scoped_with_count(&request, &token, &args, &[])
+                .await
+                .expect("partial count search");
+            assert_eq!(dropped, 1, "failed backend must not publish a status count");
+            assert_eq!(result.note_hits.len(), 1);
+            assert_eq!(result.note_hits[0].note_id, active);
+            assert!(result.partial);
+            let failed = result
+                .per_backend
+                .iter()
+                .find(|leg| leg.backend_id.as_str() == "failed")
+                .expect("failed leg");
+            assert!(failed.error.is_some());
+            assert!(failed.note_hits.is_empty());
+        })
+        .await;
     }
 }

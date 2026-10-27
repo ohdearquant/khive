@@ -1,7 +1,9 @@
 //! Keyed note pagination is distinct from the ordinary insertion-sequence walk.
 
 use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError};
-use khive_storage::note::{FilterOp, NoteFilter, NoteKeyCursor, PropertyFilter};
+use khive_storage::note::{
+    FilterOp, NoteFilter, NoteKeyCursor, NoteStatusSelector, PropertyFilter,
+};
 use khive_storage::{PageRequest, SqlValue};
 use serde_json::Value;
 
@@ -62,13 +64,15 @@ pub(super) fn note_filter(p: &ListParams, kind: Option<&str>) -> Result<NoteFilt
     }
     Ok(NoteFilter {
         kind: kind.map(str::to_owned),
+        note_status: p.note_status,
         property_filters,
         min_created_at: timestamp(p.created_after.as_deref(), "created_after")?,
         min_updated_at: timestamp(p.updated_after.as_deref(), "updated_after")?,
         tags: p.tags.clone().unwrap_or_default(),
         tag_mode: p.tag_mode.unwrap_or_default(),
         ..Default::default()
-    })
+    }
+    .with_default_note_status(NoteStatusSelector::Active))
 }
 
 fn encode_cursor(cursor: &NoteKeyCursor) -> Result<String, RuntimeError> {
@@ -101,6 +105,9 @@ pub(super) async fn list_keyed_notes(
     requested: u32,
     limit: u32,
 ) -> Result<Value, RuntimeError> {
+    let filter = filter
+        .clone()
+        .with_default_note_status(NoteStatusSelector::Active);
     let prefix = p.key_prefix.as_deref().expect("keyed list has a prefix");
     if prefix.contains('\0') {
         return Err(RuntimeError::InvalidInput(
@@ -155,7 +162,7 @@ pub(super) async fn list_keyed_notes(
             .notes(token)?
             .query_keyed_notes(
                 token.namespace().as_str(),
-                filter,
+                &filter,
                 prefix,
                 boundary.as_ref(),
                 PageRequest {
