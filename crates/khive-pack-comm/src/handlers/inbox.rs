@@ -570,6 +570,7 @@ mod archive_visibility_tests {
 
     async fn fixture() -> (KhiveRuntime, NamespaceToken) {
         let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
             actor_id: Some("actor:archive-reader".into()),
             ..khive_runtime::RuntimeConfig::no_embeddings()
         })

@@ -1119,22 +1119,28 @@ mod status_tests {
     }
 
     struct FixtureEmbedder {
+        name: String,
+        dimensions: usize,
         fail: bool,
     }
     struct FixtureService {
+        dimensions: usize,
         fail: bool,
     }
 
     #[async_trait]
     impl EmbedderProvider for FixtureEmbedder {
         fn name(&self) -> &str {
-            "search-status-fixture"
+            &self.name
         }
         fn dimensions(&self) -> usize {
-            4
+            self.dimensions
         }
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
-            Ok(Arc::new(FixtureService { fail: self.fail }))
+            Ok(Arc::new(FixtureService {
+                dimensions: self.dimensions,
+                fail: self.fail,
+            }))
         }
     }
 
@@ -1150,7 +1156,10 @@ mod status_tests {
                     "search status fixture vector failure".into(),
                 ))
             } else {
-                Ok(texts.iter().map(|_| vec![1.0_f32; 4]).collect())
+                Ok(texts
+                    .iter()
+                    .map(|_| vec![1.0_f32; self.dimensions])
+                    .collect())
             }
         }
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -1164,9 +1173,19 @@ mod status_tests {
     #[tokio::test]
     async fn same_archived_note_from_both_arms_counts_once() {
         bounded(async {
-            let runtime = KhiveRuntime::memory().unwrap();
+            let model = EmbeddingModel::AllMiniLmL6V2;
+            let runtime = KhiveRuntime::new(crate::RuntimeConfig {
+                db_path: None,
+                embedding_model: Some(model),
+                ..crate::RuntimeConfig::no_embeddings()
+            })
+            .unwrap();
             let token = NamespaceToken::local();
-            runtime.register_embedder(FixtureEmbedder { fail: false });
+            runtime.register_embedder(FixtureEmbedder {
+                name: model.to_string(),
+                dimensions: model.dimensions(),
+                fail: false,
+            });
             let mut row = runtime
                 .create_note(&token, "observation", None, QUERY, None, None, vec![])
                 .await
@@ -1187,7 +1206,7 @@ mod status_tests {
                 .search_notes_with_text_mode_and_status(
                     &token,
                     QUERY,
-                    Some(vec![1.0_f32; 4]),
+                    Some(vec![1.0_f32; model.dimensions()]),
                     10,
                     None,
                     true,
@@ -1212,7 +1231,13 @@ mod status_tests {
     #[tokio::test]
     async fn tolerant_selector_keeps_text_and_count_when_strict_vector_fails() {
         bounded(async {
-            let runtime = KhiveRuntime::memory().unwrap();
+            let model = EmbeddingModel::AllMiniLmL6V2;
+            let runtime = KhiveRuntime::new(crate::RuntimeConfig {
+                db_path: None,
+                embedding_model: Some(model),
+                ..crate::RuntimeConfig::no_embeddings()
+            })
+            .unwrap();
             let token = NamespaceToken::local();
             let ns = token.namespace().as_str();
             let active = seed(
@@ -1231,7 +1256,11 @@ mod status_tests {
                 "observation",
             )
             .await;
-            runtime.register_embedder(FixtureEmbedder { fail: true });
+            runtime.register_embedder(FixtureEmbedder {
+                name: model.to_string(),
+                dimensions: model.dimensions(),
+                fail: true,
+            });
             let error = runtime
                 .search_notes_with_text_mode_and_status(
                     &token,
