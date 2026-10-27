@@ -12,6 +12,8 @@
 //! `tree_discovery` adds breadth-first discovery with progress and failure reports on every
 //! platform, retaining parent-directory capabilities for selected files on Unix.
 
+/// Complete create-only publication, preserving competing final entries.
+pub mod atomic_create;
 #[cfg(unix)]
 pub mod atomic_publish;
 #[cfg(unix)]
