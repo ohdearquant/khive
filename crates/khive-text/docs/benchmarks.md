@@ -187,7 +187,7 @@ The original ledger follows unchanged, including its original caveats.
 
 Last reviewed: v0.2.8 (2026-06-08)
 
-## Advisory CI observation — 2026-10-27 UTC (#5671)
+## Advisory CI observation, 2026-10-27 UTC (#5671)
 
 The earlier “awaiting qualified measurement” and “no measured baseline” statements
 predate this observation. This appendix records an existing CI artifact for the

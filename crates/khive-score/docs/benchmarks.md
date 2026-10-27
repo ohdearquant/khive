@@ -225,7 +225,7 @@ The earlier release ledger remains a historical observation only.
 
 Last reviewed: v0.2.8 (2026-06-08)
 
-## CI observation — 2026-10-27 (UTC)
+## CI observation, 2026-10-27 (UTC)
 
 The “Current baseline status” section above predates this observation: the rows below supply measured quick-mode trends for the requested families. Qualified-host/A/A calibration for the new workloads remains pending. The existing generated fixed-reference/A/A block and release ledger remain unchanged; these observations imply no cross-machine improvement, scaling result or fixed latency guarantee.
 
