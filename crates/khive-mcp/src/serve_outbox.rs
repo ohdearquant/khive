@@ -706,7 +706,11 @@ async fn prepare_email(
     let mut external_list_unsubscribe: Option<String> = None;
     let mut external_footer: Option<String> = None;
     if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
-        let footer = match email_policy.external_footer() {
+        let is_list = props
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("traffic:list")));
+        let footer = match email_policy.external_footer_for_list(is_list) {
             Some(Ok(text)) => text.to_string(),
             Some(Err(reason)) => {
                 let last_error = format!("external email footer is unavailable: {reason}");

@@ -941,3 +941,6 @@ async fn mailto_unsubscribe_entry_refuses_the_next_send_to_that_recipient() {
     assert_eq!(snapshot(&runtime).await, before);
     assert_eq!(signal.snapshot(), 0);
 }
+
+#[path = "email_admission_list_footer_tests.rs"]
+mod list_footer_tests;
