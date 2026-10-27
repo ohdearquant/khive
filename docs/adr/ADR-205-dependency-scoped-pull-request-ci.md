@@ -354,9 +354,9 @@ an arm of its check, and each named mutation must turn the arm it names red.
    in either tree is unaffected. Mutations: read modes of the changed paths only (the unchanged-link arm fails); read
    the head tree only (the removed-link arm fails).
 
-## Amendment 3: Pushes to `main` always run the full suite, and D3a is withdrawn (2026-10-27)
+## Amendment 3: Pushes to `main` are never scoped, and D3a is withdrawn (2026-10-27)
 
-**Status**: Proposed (2026-10-27)
+**Status**: Accepted 2026-10-27. It does not change the status of the base ADR.
 
 ### Context
 
@@ -377,15 +377,18 @@ make it a rule that never applies:
    its closure"). With no mechanical pull request reaching `main`, that condition cannot be met, so this record cannot
    be accepted as written.
 
-Every push to `main` therefore runs the full suite today, which is the outcome D3a falls back to.
+No push to `main` is therefore scoped to a closure today. Each runs the full suite, the outcome D3a falls back to, unless
+every path changed since its tested base is Markdown that the documentation lane admits; such a push takes that lane,
+which D3a never changed (Consequences, Neutral: "`docs_only` and the documentation lane are unchanged").
 
 ### Decision
 
-1. D3a is withdrawn. Every push to `main` runs the full suite, and D3's first sentence reads "on every push to `main`"
-   with no exception.
+1. D3a is withdrawn. No push to `main` is scoped to a dependents closure, and D3's first sentence reads "on every push
+   to `main`" with no exception. A push to `main` runs the full suite unless every path changed since its tested base is
+   Markdown that the documentation lane admits (D2), in which case it takes that lane, as it did before this amendment.
 2. Runs other than pull requests keep recording the scope their suites ran (`test-scope-full`, `test-scope-scoped`,
    `test-scope-docs`), and Amendment 1's tested-base lookup keeps reading that record. Every successful run on `main`
-   records `full`.
+   records `full`, or `docs` for a push that took the documentation lane; none records `scoped`.
 3. D8's escape definition loses its mechanical-range clause and its last sentence. An escape remains a `main` push run
    that fails in a crate outside the scope of the pull request that produced it, the integration-push case Amendment 1
    adds, or a run that fails the coverage ratchet after a scoped pull request merged.
@@ -399,8 +402,16 @@ acceptance only once the label exists and the range check is built.
 
 ### Verify by
 
-1. The newest successful push run on `main` lists `test-scope-full` among its artifact names (run 40371397780 at
-   057244cc does). Control, run in the same read: an integration push run whose scope was a closure lists
-   `test-scope-scoped` (run 39843379071, `integration/train-193`, does), so the read can tell the two apart.
-2. `test_job_other_events_run_the_full_suite` stays green and gains a push to `refs/heads/main` among its cases.
-   Mutation: let the scope step take the integration branch's path for `refs/heads/main`; the new case fails.
+1. Every successful push run on `main` that carries a scope record lists `test-scope-full` or `test-scope-docs` among
+   its artifact names, and none lists `test-scope-scoped`. Read on 2026-10-27 over the 49 successful push runs on
+   `main` since #5638 merged (2026-10-17): 33 list `test-scope-full`, 1 lists `test-scope-docs` (run 39378323211 at
+   2caac4ad), none lists `test-scope-scoped`, and the 15 with no record all ran before the first recorded run
+   (39231651652, 2026-10-19). Control, run in the same read: an integration push run whose scope was a closure lists
+   `test-scope-scoped` (run 39843379071, `integration/train-193`, does), so the read can tell them apart.
+2. Two workflow tests stay green. `test_a_main_push_is_never_scoped_even_with_a_tested_base`: the Scope step keeps
+   `full` for a push to `refs/heads/main` that has a tested base and crate changes, and prints why.
+   `test_job_main_push_compares_with_the_newest_fully_tested_main_commit`: the Classify step sends such a push to the
+   documentation lane when only Markdown changed since its tested base, and to the full suite when code did. Mutation:
+   let the Scope step take the integration branch's path for `refs/heads/main`; the first test fails and the second
+   stays green. (`test_job_other_events_run_the_full_suite` gives no comparison base to any of its runs, so a push to
+   `refs/heads/main` added there would pass without reaching either decision.)
