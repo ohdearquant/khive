@@ -161,7 +161,6 @@ impl AnnBuildContext for InteractiveAnn {
                     error,
                 ))
             })?
-            .map_err(Into::into)
     }
 }
 
@@ -227,9 +226,7 @@ impl AnnBuildContext for BackgroundAnn<'_> {
             })
             .map_err(ann_submission_error)?;
         match child.join().await {
-            Ok(JobOutcome::Completed(result)) => {
-                result.map_err(|error| AnnBackgroundError::Runtime(error.into()))
-            }
+            Ok(JobOutcome::Completed(result)) => result.map_err(AnnBackgroundError::Runtime),
             Ok(JobOutcome::Cancelled) | Err(BackgroundJoinError::Cancelled) => {
                 Err(AnnBackgroundError::Cancelled)
             }
@@ -409,6 +406,7 @@ struct AnnAfterStart {
     release: tokio::sync::Notify,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_ann_attempt(
     rt: &KhiveRuntime,
     token: &NamespaceToken,

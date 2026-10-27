@@ -555,6 +555,7 @@ pub(super) async fn ensure_ann_for_model_inner(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn ensure_ann_for_model_inner_with_context<C: AnnBuildContext>(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
