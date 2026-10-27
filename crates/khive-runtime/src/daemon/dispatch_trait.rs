@@ -11,6 +11,11 @@ use super::*;
 #[cfg(unix)]
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
+    /// Explicit host-owned background domain, absent for registry-only test dispatchers.
+    fn background_resources(&self) -> Option<crate::resource_admission::BackgroundDomainControl> {
+        None
+    }
+
     /// Named retained resources or unknown inventory that prevents idle exit.
     /// An implementor must explicitly account for its resources before retiring.
     fn idle_retirement_blockers(&self) -> Vec<String> {
@@ -324,7 +329,7 @@ pub(super) async fn wait_for_idle<D: DaemonDispatch>(dispatcher: &D, lifecycle: 
     }
 }
 
-pub(super) struct BackgroundTaskGuard {
+pub(crate) struct BackgroundTaskGuard {
     pub(super) counter: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) name: &'static str,
 }
@@ -361,16 +366,22 @@ where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    register_background_task_name(name);
-    let guard = BackgroundTaskGuard {
-        counter: background_tasks().clone(),
-        name,
-    };
+    let guard = register_background_task(name);
     tokio::spawn(async move {
         let _guard = guard;
         fut.await
     })
+}
+
+/// Register one real tracked job before its executor/queue handoff.
+/// Shared wrappers may hold this same RAII guard through actual child exit.
+pub(crate) fn register_background_task(name: &'static str) -> BackgroundTaskGuard {
+    background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    register_background_task_name(name);
+    BackgroundTaskGuard {
+        counter: background_tasks().clone(),
+        name,
+    }
 }
 
 /// Spawn a fire-and-forget task through [`spawn_tracked_task`].

@@ -263,6 +263,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    KhiveRuntime::validated_background_limits(&base_config)?;
     base_config.prepare_engines()?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let PreparedStorageTopology {

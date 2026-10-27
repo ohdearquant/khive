@@ -70,7 +70,9 @@ pub(super) fn spawn_rebuild_task_inner(
         ann: ann.clone(),
         key: key.clone(),
     };
-    khive_runtime::track_named_background_task("memory_ann_rebuild", async move {
+    let tracking = TrackedJob::register("memory_ann_rebuild");
+    let rt = rt.background_view();
+    drop(tokio::spawn(async move {
         if chained {
             tokio::time::sleep(rebuild_chain_debounce()).await;
         }
@@ -97,19 +99,22 @@ pub(super) fn spawn_rebuild_task_inner(
                     ann.attempt_floor_release.notified().await;
                 }
             }
-            match ensure_ann_for_model(&rt, &token, &ann, &model).await {
-                Ok(status) => {
+            match submit_ann_attempt(&rt, &ann, &model, token, &tracking).await {
+                JobOutcome::Completed(Ok(status)) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
                 }
-                Err(e) if is_benign_shutdown_cancellation(&e) => {
+                JobOutcome::Completed(Err(e)) if is_benign_shutdown_cancellation(&e) => {
                     // Runtime teardown cancellation is expected, not a backend failure.
                     tracing::debug!(error = %e, model = %model, "memory ANN background warm cancelled at shutdown");
-                    break;
+                    return;
                 }
-                Err(e) => {
+                JobOutcome::Completed(Err(e)) => {
                     tracing::warn!(error = %e, model = %model, "memory ANN background build failed");
                     break;
                 }
+                JobOutcome::Cancelled
+                | JobOutcome::FinalizationTimedOut
+                | JobOutcome::Refused(_) => return,
             }
             let now_generation = current_generation(&ann, &key).await;
             if now_generation <= attempt_floor {
@@ -129,29 +134,37 @@ pub(super) fn spawn_rebuild_task_inner(
         }
         // Release BEFORE the final generation check so a raced write can claim a new task.
         drop(warming_guard);
-        if current_generation(&ann, &key).await > attempt_floor
+        if !rt.background_domain().control().is_closed()
+            && current_generation(&ann, &key).await > attempt_floor
             && try_take_warming_guard(&ann, &key)
         {
             // Chained re-enqueue is debounced rather than immediately respawned.
             spawn_rebuild_task_inner(rt, ann, model, key, true);
         }
-    });
+    }));
 }
 
 /// Warm the global per-model ANN indexes at startup — skips already-loaded keys.
 pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &SharedAnn) {
+    if rt.is_read_only() {
+        return;
+    }
     let models = rt.registered_embedding_model_names();
     for model in &models {
         let token = match rt.authorize(Namespace::local()) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        match ensure_ann_for_model(rt, &token, ann, model).await {
-            Ok(status) => {
+        let tracking = TrackedJob::register("memory_ann_startup");
+        match submit_ann_attempt(rt, ann, model, token, &tracking).await {
+            JobOutcome::Completed(Ok(status)) => {
                 tracing::debug!(?status, model = %model, "memory ANN warm complete");
             }
-            Err(e) => {
+            JobOutcome::Completed(Err(e)) => {
                 tracing::warn!(error = %e, model = %model, "memory ANN warm failed");
+            }
+            JobOutcome::Cancelled | JobOutcome::FinalizationTimedOut | JobOutcome::Refused(_) => {
+                return
             }
         }
     }
@@ -365,97 +378,16 @@ pub(crate) async fn ensure_ann_for_model(
     ann: &SharedAnn,
     model: &str,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
-    if model.is_empty() {
-        return Ok(AnnEnsureStatus::EmptyCorpus);
-    }
-    let key = AnnKey::from_token(model);
-
-    // Cross-process registry state is checked before the in-memory fast
-    // path: a peer compactor can retire a pending row, after which an
-    // already-loaded bridge is no longer protected and must not be served.
-    let mut force_full_rebuild = match read_own_watermark(rt, model).await {
-        Ok(Some(watermark)) if watermark >= 0 => false,
-        Ok(Some(PENDING_WATERMARK)) => {
-            evict_unprotected_index(ann, &key).await;
-            true
-        }
-        Ok(Some(watermark)) => {
-            evict_unprotected_index(ann, &key).await;
-            tracing::warn!(
-                model,
-                watermark,
-                "memory ANN registry is in a closed recovery state; refusing stale serve"
-            );
-            return Err(RuntimeError::Internal(format!(
-                "memory ANN registry for {model} is in unsupported recovery state {watermark}"
-            )));
-        }
-        Ok(None) => {
-            evict_unprotected_index(ann, &key).await;
-            register_consumer(rt, model)
-                .await
-                .map_err(RuntimeError::Internal)?;
-            true
-        }
-        Err(error) => {
-            evict_unprotected_index(ann, &key).await;
-            return Err(RuntimeError::Internal(format!(
-                "memory ANN registry read failed before serve: {error}"
-            )));
-        }
-    };
-    // A graph published before Slice 3 has no note_search protection. Its
-    // old tail may already have been compacted under the memory row, so only
-    // a new full scan may activate this second consumer. Keep the memory
-    // bridge available while that work runs.
-    force_full_rebuild |= note_search_requires_full_rebuild(rt, ann, model).await;
-
-    // Read generation BEFORE any fast path or corpus snapshot to close the write race.
-    let target_generation = current_generation(ann, &key).await;
-
-    // Fast path: no lock needed if already warm AND fresh enough.
-    if !force_full_rebuild
-        && installed_is_fresh(ann, &key, target_generation).await
-        && !checkpoint_due(ann, &key).await
-    {
-        return Ok(AnnEnsureStatus::AlreadyLoaded);
-    }
-
-    let lock = model_warm_lock(ann, &key).await;
-    let _single_flight_guard = lock.lock().await;
-
-    // A concurrent caller may have activated the pending registration and
-    // satisfied our generation while we waited. Re-read durable state before
-    // accepting its bridge; local presence alone cannot prove protection.
-    match read_own_watermark(rt, model).await {
-        Ok(Some(watermark)) if watermark >= 0 => {
-            force_full_rebuild = note_search_requires_full_rebuild(rt, ann, model).await;
-            if !force_full_rebuild
-                && installed_is_fresh(ann, &key, target_generation).await
-                && !checkpoint_due(ann, &key).await
-            {
-                return Ok(AnnEnsureStatus::AlreadyLoaded);
-            }
-        }
-        Ok(Some(PENDING_WATERMARK)) => force_full_rebuild = true,
-        Ok(None) => {
-            register_consumer(rt, model)
-                .await
-                .map_err(RuntimeError::Internal)?;
-            force_full_rebuild = true;
-        }
-        Ok(Some(watermark)) => {
-            return Err(RuntimeError::Internal(format!(
-                "memory ANN registry for {model} is in unsupported recovery state {watermark}"
-            )));
-        }
-        Err(error) => {
-            return Err(RuntimeError::Internal(format!(
-                "memory ANN registry revalidation failed: {error}"
-            )));
-        }
-    }
-    force_full_rebuild |= note_search_requires_full_rebuild(rt, ann, model).await;
+    let (key, target_generation, force_full_rebuild, _single_flight_guard) =
+        match prepare_ann_for_model(rt, ann, model).await? {
+            AnnPreparation::Finished(status) => return Ok(status),
+            AnnPreparation::Attempt {
+                key,
+                target_generation,
+                force_full_rebuild,
+                _guard,
+            } => (key, target_generation, force_full_rebuild, _guard),
+        };
 
     let phase_start = std::time::Instant::now();
     // Process CPU is cumulative, so phase attribution requires entry and exit snapshots.
@@ -556,13 +488,25 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
     kind: khive_types::EventKind,
     payload: P,
 ) {
+    // Snapshot inspection returns before store acquisition or payload serialization.
+    if rt.is_read_only() {
+        return;
+    }
     // A missing event store means auditing is unconfigured, not that warming failed.
-    let result = crate::store_access::acquire_store("memory.ann.event_store", {
+    let acquire = crate::store_access::acquire_store("memory.ann.event_store", {
         let runtime = rt.clone();
         let token = token.clone();
         move || runtime.events(&token)
-    })
-    .await;
+    });
+    // The timeout fixture prepares this real token-scoped store before taking
+    // its physical writer guard; constructor contention is not append contention.
+    #[cfg(test)]
+    let result = match super::finalization_timeout_tests::terminal_store() {
+        Some(store) => Ok(Ok(store)),
+        None => acquire.await,
+    };
+    #[cfg(not(test))]
+    let result = acquire.await;
     let Ok(Ok(store)) = result else {
         return;
     };
@@ -586,7 +530,10 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
         "daemon:ann_warm",
     )
     .with_payload(payload_value);
-    if let Err(err) = store.append_event(event).await {
+    let append = store.append_event(event);
+    #[cfg(test)]
+    let append = super::finalization_timeout_tests::observe_append(append);
+    if let Err(err) = append.await {
         tracing::warn!(
             error = %err,
             event_kind = %kind.name(),
@@ -603,9 +550,33 @@ pub(super) async fn ensure_ann_for_model_inner(
     ann: &SharedAnn,
     model: &str,
     target_generation: u64,
-    mut force_full_rebuild: bool,
+    force_full_rebuild: bool,
     details: &mut AnnWarmDetails,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
+    ensure_ann_for_model_inner_with_context(
+        rt,
+        token,
+        ann,
+        model,
+        target_generation,
+        force_full_rebuild,
+        details,
+        InteractiveAnn,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn ensure_ann_for_model_inner_with_context<C: AnnBuildContext>(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+    target_generation: u64,
+    mut force_full_rebuild: bool,
+    details: &mut AnnWarmDetails,
+    context: C,
+) -> Result<AnnEnsureStatus, C::Error> {
     let ns = "global";
     let key = AnnKey::new(model);
 
@@ -688,7 +659,14 @@ pub(super) async fn ensure_ann_for_model_inner(
         .get(&key)
         .map(MaintenanceFence::capture);
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
-    match load_and_build_from_vector_store(rt, token, model).await {
+    let built = if C::IS_INTERACTIVE {
+        load_and_build_from_vector_store(rt, token, model)
+            .await
+            .map_err(C::Error::from)
+    } else {
+        load_and_build_from_vector_store_with_context(rt, token, model, context).await
+    };
+    match built {
         Ok(Some(bridge)) => {
             let fp_after = compute_memory_fingerprint(rt, token, model).await;
             // If fingerprint changed during the scan, the corpus raced; discard.
@@ -754,15 +732,7 @@ pub(super) async fn ensure_ann_for_model_inner(
             tracing::debug!(namespace = %ns, model = %model, "memory ANN: no note vectors to build");
             Ok(AnnEnsureStatus::EmptyCorpus)
         }
-        Err(e) if is_benign_shutdown_cancellation(&e) => {
-            // Downgrade here before background-warm handling sees the same cancellation.
-            tracing::debug!(error = %e, namespace = %ns, model = %model, "memory ANN build cancelled at shutdown");
-            Err(e)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, namespace = %ns, model = %model, "memory ANN build failed");
-            Err(e)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -809,6 +779,24 @@ pub(super) async fn load_and_build_from_vector_store(
     token: &NamespaceToken,
     model: &str,
 ) -> Result<Option<AnnBridge>, RuntimeError> {
+    let result =
+        load_and_build_from_vector_store_with_context(rt, token, model, InteractiveAnn).await;
+    match &result {
+        Err(error) if is_benign_shutdown_cancellation(error) => {
+            tracing::debug!(%error, model, "memory ANN build cancelled at shutdown")
+        }
+        Err(error) => tracing::warn!(%error, model, "memory ANN build failed"),
+        _ => {}
+    }
+    result
+}
+
+pub(super) async fn load_and_build_from_vector_store_with_context<C: AnnBuildContext>(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+    context: C,
+) -> Result<Option<AnnBridge>, C::Error> {
     let result = crate::store_access::acquire_store("memory.ann.vector_store", {
         let runtime = rt.clone();
         let token = token.clone();
@@ -883,17 +871,8 @@ pub(super) async fn load_and_build_from_vector_store(
         return Ok(None);
     }
 
-    // SQ8 training and Vamana construction are CPU-bound; keep them off Tokio workers.
-    let mut built =
-        tokio::task::spawn_blocking(move || AnnBridge::build(flat, dims, id_map, namespace_set))
-            .await
-            .map_err(|e| {
-                RuntimeError::Storage(StorageError::driver(
-                    khive_storage::StorageCapability::Vectors,
-                    "memory_ann_build",
-                    e,
-                ))
-            })??;
+    // Same admitted lease/tracker lives in the actual controlled CPU closure.
+    let mut built = context.build(flat, dims, id_map, namespace_set).await?;
     built.set_applied_seq(scan_watermark);
     Ok(Some(built))
 }
