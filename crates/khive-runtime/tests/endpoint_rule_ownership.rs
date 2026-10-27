@@ -18,7 +18,7 @@ struct SecondPack;
 
 impl Pack for FirstPack {
     const NAME: &'static str = "first";
-    const NOTE_KINDS: &'static [&'static str] = &[];
+    const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[];
     const EDGE_RULES: &'static [EdgeEndpointRule] = &[RULE, RULE];
