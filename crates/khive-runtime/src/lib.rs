@@ -98,6 +98,7 @@ pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
 pub mod resource;
+pub mod resource_admission;
 pub mod retrieval;
 pub mod runtime;
 pub mod search_audit;
