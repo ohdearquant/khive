@@ -60,7 +60,7 @@ fn assert_refused(db: &Path, entities: &Path, edges: &Path, category: &str) {
 
 #[test]
 #[cfg(unix)]
-fn c4_canceled_missing_parent_reinspects_db_alias() {
+fn canceled_missing_parent_reinspects_db_alias() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -89,7 +89,7 @@ fn c4_canceled_missing_parent_reinspects_db_alias() {
 
 #[test]
 #[cfg(unix)]
-fn c5_dangling_ancestor_aliases_are_rejected() {
+fn dangling_ancestor_aliases_are_rejected() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -117,7 +117,7 @@ fn c5_dangling_ancestor_aliases_are_rejected() {
 
 #[test]
 #[cfg(unix)]
-fn c5_dangling_leaf_aliases_absent_source() {
+fn dangling_leaf_aliases_absent_source() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -134,7 +134,7 @@ fn c5_dangling_leaf_aliases_absent_source() {
 }
 
 #[test]
-fn c7_literal_source_alias_is_rejected() {
+fn literal_source_alias_is_rejected() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");
@@ -147,7 +147,7 @@ fn c7_literal_source_alias_is_rejected() {
 }
 
 #[test]
-fn c7_literal_leaf_alias_is_rejected() {
+fn literal_leaf_alias_is_rejected() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");
@@ -160,7 +160,7 @@ fn c7_literal_leaf_alias_is_rejected() {
 
 #[test]
 #[cfg(unix)]
-fn c7_resolved_symlink_aliases_are_rejected() {
+fn resolved_symlink_aliases_are_rejected() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -189,7 +189,7 @@ fn c7_resolved_symlink_aliases_are_rejected() {
 
 #[test]
 #[cfg(unix)]
-fn c7_source_hardlink_alias_is_rejected() {
+fn source_hardlink_alias_is_rejected() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");
@@ -220,7 +220,7 @@ fn c7_source_hardlink_alias_is_rejected() {
 
 #[test]
 #[cfg(unix)]
-fn c7_leaf_hardlink_alias_is_rejected() {
+fn leaf_hardlink_alias_is_rejected() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");
@@ -241,7 +241,7 @@ fn c7_leaf_hardlink_alias_is_rejected() {
 
 #[test]
 #[cfg(any(unix, windows))]
-fn c7_distinct_destinations_preserve_all_originals() {
+fn distinct_destinations_preserve_all_originals() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");
@@ -266,7 +266,7 @@ fn c7_distinct_destinations_preserve_all_originals() {
 
 #[test]
 #[cfg(not(any(unix, windows)))]
-fn c7_unsupported_identity_platform_fails_closed() {
+fn unsupported_identity_platform_fails_closed() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let db = root.join("source.db");

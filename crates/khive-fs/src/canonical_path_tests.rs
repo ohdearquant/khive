@@ -57,7 +57,7 @@ fn assert_absent(path: &Path) {
 }
 
 #[test]
-fn c1_existing_endpoints_equal_native_canonicalization() {
+fn existing_endpoints_equal_native_canonicalization() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let file = root.join("source");
@@ -76,7 +76,7 @@ fn c1_existing_endpoints_equal_native_canonicalization() {
 
 #[test]
 #[cfg(unix)]
-fn c1_existing_symlinks_equal_native_canonicalization() {
+fn existing_symlinks_equal_native_canonicalization() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -98,7 +98,7 @@ fn c1_existing_symlinks_equal_native_canonicalization() {
 }
 
 #[test]
-fn c2_fresh_nested_tail_is_not_created() {
+fn fresh_nested_tail_is_not_created() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let input = root.join("fresh").join("deep").join("leaf");
@@ -111,7 +111,7 @@ fn c2_fresh_nested_tail_is_not_created() {
 }
 
 #[test]
-fn c2_relative_fresh_tail_uses_cwd_without_chdir() {
+fn relative_fresh_tail_uses_cwd_without_chdir() {
     let cwd = std::env::current_dir().unwrap();
     let scratch = Scratch::in_dir(&cwd);
     let input = PathBuf::from(scratch.path.file_name().unwrap())
@@ -128,7 +128,7 @@ fn c2_relative_fresh_tail_uses_cwd_without_chdir() {
 
 #[test]
 #[cfg(unix)]
-fn c3_existing_directory_links_keep_fresh_tail() {
+fn existing_directory_links_keep_fresh_tail() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -152,7 +152,7 @@ fn c3_existing_directory_links_keep_fresh_tail() {
 
 #[test]
 #[cfg(unix)]
-fn c3_multicomponent_relative_target_uses_link_parent() {
+fn multicomponent_relative_target_uses_link_parent() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -180,7 +180,7 @@ fn c3_multicomponent_relative_target_uses_link_parent() {
 
 #[test]
 #[cfg(unix)]
-fn c4_canceled_missing_parent_reinspects_symlink() {
+fn canceled_missing_parent_reinspects_symlink() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -205,7 +205,7 @@ fn c4_canceled_missing_parent_reinspects_symlink() {
 
 #[test]
 #[cfg(unix)]
-fn c5_dangling_links_normalize_missing_targets() {
+fn dangling_links_normalize_missing_targets() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -241,7 +241,7 @@ fn c5_dangling_links_normalize_missing_targets() {
 }
 
 #[test]
-fn c6_nondirectory_child_keeps_native_error() {
+fn nondirectory_child_keeps_native_error() {
     let scratch = Scratch::new();
     let file = scratch.root().join("file");
     fs::write(&file, b"file bytes").unwrap();
@@ -256,7 +256,7 @@ fn c6_nondirectory_child_keeps_native_error() {
 
 #[test]
 #[cfg(unix)]
-fn c6_parent_cannot_erase_nondirectory_traversal() {
+fn parent_cannot_erase_nondirectory_traversal() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let file = root.join("file");
@@ -273,7 +273,7 @@ fn c6_parent_cannot_erase_nondirectory_traversal() {
 
 #[test]
 #[cfg(unix)]
-fn c6_fallback_nondirectory_child_keeps_native_error() {
+fn fallback_nondirectory_child_keeps_native_error() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let file = root.join("file");
@@ -321,7 +321,7 @@ fn assert_chain_unchanged(links: &[(PathBuf, PathBuf)]) {
 
 #[test]
 #[cfg(unix)]
-fn c8_fallback_accepts_exactly_forty_finite_links() {
+fn fallback_accepts_exactly_forty_finite_links() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let links = link_chain(&root, "link", 40, "fresh-target");
@@ -344,7 +344,7 @@ fn c8_fallback_accepts_exactly_forty_finite_links() {
 
 #[test]
 #[cfg(unix)]
-fn c8_fallback_refuses_forty_first_finite_link() {
+fn fallback_refuses_forty_first_finite_link() {
     let scratch = Scratch::new();
     let root = scratch.root();
     let links = link_chain(&root, "link", 41, "fresh-target");
@@ -369,7 +369,7 @@ fn c8_fallback_refuses_forty_first_finite_link() {
 
 #[test]
 #[cfg(unix)]
-fn c8_existing_and_fallback_cycles_keep_distinct_errors() {
+fn existing_and_fallback_cycles_keep_distinct_errors() {
     use std::os::unix::fs::symlink;
 
     let scratch = Scratch::new();
@@ -397,7 +397,6 @@ fn c8_existing_and_fallback_cycles_keep_distinct_errors() {
     assert_eq!(fs::read_link(&first).unwrap(), Path::new("second"));
     assert_eq!(fs::read_link(&second).unwrap(), Path::new("first"));
     assert_absent(&root.join("missing"));
-    // A cap-removal timeout is not semantic mutation-kill evidence.
 }
 
 #[cfg(windows)]
@@ -417,7 +416,7 @@ fn current_disk() -> (PathBuf, u8) {
 
 #[test]
 #[cfg(windows)]
-fn c9_windows_rooted_and_root_relative_missing_paths() {
+fn windows_rooted_and_root_relative_missing_paths() {
     use std::path::Component;
 
     let (cwd, _) = current_disk();
@@ -442,7 +441,7 @@ fn c9_windows_rooted_and_root_relative_missing_paths() {
 
 #[test]
 #[cfg(windows)]
-fn c9_windows_missing_drive_relative_is_refused() {
+fn windows_missing_drive_relative_is_refused() {
     let (cwd, disk) = current_disk();
     let scratch = Scratch::in_dir(&cwd);
     let mut spelling = OsString::from(format!("{}:", char::from(disk)));
@@ -467,7 +466,7 @@ fn c9_windows_missing_drive_relative_is_refused() {
 
 #[test]
 #[cfg(windows)]
-fn c10_windows_existing_drive_relative_uses_fast_path() {
+fn windows_existing_drive_relative_uses_fast_path() {
     let (cwd, disk) = current_disk();
     let input = PathBuf::from(format!("{}:.", char::from(disk)));
     assert!(!input.is_absolute());
@@ -478,7 +477,7 @@ fn c10_windows_existing_drive_relative_uses_fast_path() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn c11_linux_missing_tail_preserves_non_utf8_bytes() {
+fn linux_missing_tail_preserves_non_utf8_bytes() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     let scratch = Scratch::new();

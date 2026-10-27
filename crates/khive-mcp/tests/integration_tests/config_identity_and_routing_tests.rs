@@ -363,14 +363,14 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
         "default(local) list must NOT see the lambda:alice entity; got: {local_ids:?}"
     );
 
-    let leo_ids =
+    let alice_ids =
         list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="lambda:alice")"#).await);
     assert!(
-        leo_ids.contains(&named_id),
-        "list(namespace=lambda:alice) must see the lambda:alice entity; got: {leo_ids:?}"
+        alice_ids.contains(&named_id),
+        "list(namespace=lambda:alice) must see the lambda:alice entity; got: {alice_ids:?}"
     );
     assert!(
-        !leo_ids.contains(&default_id),
-        "list(namespace=lambda:alice) must NOT see the local entity; got: {leo_ids:?}"
+        !alice_ids.contains(&default_id),
+        "list(namespace=lambda:alice) must NOT see the local entity; got: {alice_ids:?}"
     );
 }
