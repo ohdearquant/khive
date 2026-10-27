@@ -507,11 +507,18 @@ did before, and the values are ignored entirely.
   is a decimal integer 0-255, no duplicate ids, and `key` is hex key material
   of at least 32 bytes. The highest id mints new unsubscribe tokens; every
   retired id keeps verifying so an older link keeps working)
-- `KHIVE_EMAIL_EXTERNAL_FOOTER_FILE` (path to a text file appended to every
-  external message. It must exist, be readable and contain the placeholder
-  `{unsubscribe}`, which the channel replaces with the mailto opt-out
-  instruction. External admission is refused while it is unset, unreadable or
-  missing the placeholder; policy-recipient messages are unaffected)
+- `KHIVE_EMAIL_EXTERNAL_FOOTER_FILE` (path to the default footer for external
+  messages without an exact `traffic:list` tag. It must exist, be readable and
+  contain the placeholder `{unsubscribe}`, which the channel replaces with the
+  mailto opt-out instruction. Admission using this footer is refused while it is
+  unset, unreadable or missing the placeholder; policy-recipient messages are
+  unaffected)
+- `KHIVE_EMAIL_LIST_FOOTER_FILE` (a separate footer for external messages tagged
+  `traffic:list`, with the same placeholder requirement. An unavailable list
+  footer refuses admission and causes permanent delivery failure before SMTP; it
+  never falls back to the default footer. Both footer files are read at startup
+  when external senders are configured, and delivery chooses from the outbound
+  row's stored tags)
 - `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` (optional; an `https://` URL that
   answers the complete set of one-click opt-outs as
   `{"as_of": "<RFC 3339>", "count": N, "recipient_keys": [...]}`. When set,
