@@ -2749,6 +2749,7 @@ mod background_resource_tests {
 
     fn config() -> RuntimeConfig {
         RuntimeConfig {
+            db_path: None,
             warm_concurrency: 3,
             maintenance_concurrency: 2,
             ..RuntimeConfig::no_embeddings()
@@ -2774,13 +2775,17 @@ mod background_resource_tests {
     fn assigned_backend_and_rebound_core_keep_the_main_domain() {
         let main = KhiveRuntime::new(config()).expect("main runtime");
         let root = main.background_root().unwrap();
+        let secondary_config = RuntimeConfig {
+            backend_id: BackendId::parse("secondary").expect("secondary backend id"),
+            ..config()
+        };
         let secondary = KhiveRuntime::try_from_backend_in_domain(
             Arc::new(StorageBackend::memory().unwrap()),
-            config(),
+            secondary_config,
             root.clone(),
         )
         .unwrap()
-        .with_core_backend(main.backend().clone());
+        .with_core_backend(Arc::clone(&main.backend));
         assert!(root.same_domain(&secondary.background_root().unwrap()));
         assert!(root.same_domain(&secondary.core().background_root().unwrap()));
     }

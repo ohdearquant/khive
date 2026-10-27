@@ -686,11 +686,12 @@ impl BackgroundDomainHandle {
         }
         let cancel = job.lease.cancel.clone();
         self.domain.supervisors.fetch_add(1, Ordering::SeqCst);
-        let mut guard = SupervisorGuard {
+        let guard = SupervisorGuard {
             cancel: cancel.clone(),
             finished: false,
         };
         let task = self.executor.spawn(async move {
+            let mut guard = guard;
             let execution_hold = job.clone();
             let outcome = match start_decision(&job.lease.cancel) {
                 Ok(()) => make(job).await,

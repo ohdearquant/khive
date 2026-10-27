@@ -929,3 +929,52 @@ async fn exit_observation_does_not_close_an_open_domain_or_stamp_cleanup() {
     drop((admitted, tracking));
     assert_settled(&root).await;
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[tokio::test]
+async fn whole_supervisor_guard_stays_counted_until_actual_task_completion() {
+    let root = root(1, 1);
+    let handle = root.handle();
+    let tracking = TrackedJob::register("resource_test_whole_supervisor_guard");
+    let job = bounded(handle.admit(WorkClass::Warm, &tracking))
+        .await
+        .unwrap();
+    drop(tracking);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let task = handle
+        .spawn_supervised(job, move |job| async move {
+            let _ = entered_tx.send(());
+            // Sender Drop on assertion unwinding is also a cleanup release.
+            // A rendezvous timeout is fixture failure, not a passing control.
+            let _ = bounded(release_rx).await;
+            job.no_telemetry();
+            JobOutcome::Completed(())
+        })
+        .unwrap();
+    bounded(entered_rx)
+        .await
+        .expect("actual supervisor entered");
+
+    // The actual body is still blocked and has not finalized. These counters,
+    // not merely child execution or successful join, detect disjoint capture.
+    assert_eq!(
+        root.owner.domain.supervisors.load(Ordering::SeqCst),
+        1,
+        "pending actual supervisor must retain its entire Drop guard"
+    );
+    assert_eq!(
+        root.owner.domain.incomplete.load(Ordering::SeqCst),
+        0,
+        "a blocked live supervisor is not incomplete finalization"
+    );
+
+    release_tx.send(()).expect("supervisor is still waiting");
+    assert!(matches!(
+        bounded(task.join()).await.unwrap(),
+        JobOutcome::Completed(())
+    ));
+    assert_eq!(root.owner.domain.supervisors.load(Ordering::SeqCst), 0);
+    assert_eq!(root.owner.domain.incomplete.load(Ordering::SeqCst), 0);
+    assert_settled(&root).await;
+}
