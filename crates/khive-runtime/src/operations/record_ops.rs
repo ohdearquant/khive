@@ -1,4 +1,4 @@
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteFilter, NoteStatusSelector};
 use khive_storage::types::{DeleteMode, Page, PageRequest, SeekCursor};
 use khive_storage::{Entity, EntityFilter, Event, EventFilter};
 use khive_types::KhiveError;
@@ -469,11 +469,11 @@ impl KhiveRuntime {
             .map_err(Into::into)
     }
 
-    /// List notes visible to the token, optionally filtered by kind.
+    /// List active notes visible to the token, optionally filtered by kind.
     ///
     /// When the token carries a multi-namespace visible set, notes from all
     /// visible namespaces are returned. When the visible set is `[primary]`
-    /// (the default) this behaves identically to the pre-visibility behaviour.
+    /// (the default), reads stay in the primary namespace.
     pub async fn list_notes(
         &self,
         token: &NamespaceToken,
@@ -483,12 +483,17 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<Note>> {
         let visible = token.visible_namespaces();
         if visible.len() == 1 {
-            // Fast path: single namespace — use the dedicated query_notes method.
+            // Keep the primary-only route, applying status before pagination.
+            let filter = NoteFilter {
+                kind: kind.map(str::to_owned),
+                ..Default::default()
+            }
+            .with_default_note_status(NoteStatusSelector::Active);
             let page = self
                 .notes(token)?
-                .query_notes_count_free(
+                .query_notes_filtered_count_free(
                     token.namespace().as_str(),
-                    kind,
+                    &filter,
                     PageRequest {
                         offset: offset.into(),
                         limit,
@@ -498,13 +503,13 @@ impl KhiveRuntime {
             return Ok(page.items);
         }
         // Multi-namespace path: use query_notes_filtered with the visible set.
-        use khive_storage::note::NoteFilter;
         let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
         let filter = NoteFilter {
             kind: kind.map(|k| k.to_string()),
             namespaces: ns_strs,
             ..Default::default()
-        };
+        }
+        .with_default_note_status(NoteStatusSelector::Active);
         let page = self
             .notes(token)?
             .query_notes_filtered_count_free(
@@ -519,7 +524,7 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// List an immutable insertion-sequence page of visible notes.
+    /// List an immutable insertion-sequence page of active visible notes.
     ///
     /// Soft-deleting the prior page's last note does not invalidate the
     /// cursor because the boundary is resolved including tombstones. A hard
@@ -556,7 +561,8 @@ impl KhiveRuntime {
                 .map(|namespace| namespace.as_str().to_owned())
                 .collect(),
             ..Default::default()
-        };
+        }
+        .with_default_note_status(NoteStatusSelector::Active);
         let page = store
             .query_notes_filtered_after(token.namespace().as_str(), &filter, after, limit)
             .await?;

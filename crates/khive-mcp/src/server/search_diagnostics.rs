@@ -470,6 +470,7 @@ pub(super) fn search_diagnostic_wire_len(degradation: &SearchDegradation) -> usi
 pub(super) struct OpSuccess {
     pub(super) result: Value,
     pub(super) degradation: SearchDegradation,
+    pub(super) note_status_disclosure: Option<(khive_storage::note::NoteStatusSelector, u64)>,
 }
 
 impl OpSuccess {
@@ -477,6 +478,7 @@ impl OpSuccess {
         Self {
             result,
             degradation: SearchDegradation::default(),
+            note_status_disclosure: None,
         }
     }
 }
@@ -495,6 +497,7 @@ pub(super) fn op_success_from_registry_result(
 ) -> OpSuccess {
     if tool == "search" && !is_help {
         OpSuccess {
+            note_status_disclosure: None,
             degradation: SearchDegradation::complete(&result, vector_selected)
                 .with_text_mode(text_mode),
             result,

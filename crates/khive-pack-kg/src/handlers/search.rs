@@ -121,6 +121,7 @@ pub struct ValidatedSearchRequest {
     kind_filter: Option<String>,
     entity_type: Option<String>,
     include_superseded: bool,
+    note_status: Option<khive_storage::note::NoteStatusSelector>,
     properties: Option<Value>,
     tags: Vec<String>,
     source: Option<SearchSource>,
@@ -147,6 +148,7 @@ impl ValidatedSearchRequest {
         } else {
             "min_score"
         };
+        let note_status_present = params.get("note_status").is_some();
         let p: SearchParams = deser(params)?;
         let text_mode = match p.text_mode.as_deref() {
             None | Some("all_terms") => TextQueryMode::Plain,
@@ -229,6 +231,11 @@ impl ValidatedSearchRequest {
                     "include_superseded",
                     SearchSubstrate::Entity,
                 )?;
+                if note_status_present {
+                    return Err(RuntimeError::InvalidInput(
+                        "note_status is only valid when kind resolves to note".into(),
+                    ));
+                }
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
@@ -252,6 +259,7 @@ impl ValidatedSearchRequest {
                     kind_filter,
                     entity_type,
                     include_superseded: false,
+                    note_status: None,
                     properties,
                     tags,
                     source,
@@ -285,6 +293,7 @@ impl ValidatedSearchRequest {
                     kind_filter,
                     entity_type: None,
                     include_superseded: p.include_superseded.unwrap_or(false),
+                    note_status: Some(p.note_status.unwrap_or(khive_storage::note::NoteStatusSelector::Active)),
                     properties,
                     tags,
                     source,
@@ -345,6 +354,11 @@ impl ValidatedSearchRequest {
     /// Canonical entity subtype filter; always `None` for note searches.
     pub fn entity_type(&self) -> Option<&str> {
         self.entity_type.as_deref()
+    }
+
+    /// Effective lifecycle selector for note searches; absent for entity searches.
+    pub fn note_status(&self) -> Option<khive_storage::note::NoteStatusSelector> {
+        self.note_status
     }
 
     /// Whether notes targeted by a `supersedes` edge remain eligible.
@@ -425,6 +439,23 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        self.handle_search_with_metadata(token, params, registry)
+            .await
+            .map(|outcome| outcome.result)
+    }
+
+    /// Execute the same search core while retaining note-only operation metadata.
+    pub(crate) async fn handle_search_with_metadata(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<
+        khive_runtime::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        RuntimeError,
+    > {
         let search_start = Instant::now();
         let request = ValidatedSearchRequest::from_value(params.clone(), registry)?;
         match request.substrate() {
@@ -568,6 +599,7 @@ impl KgPack {
                     search_start.elapsed().as_micros() as i64,
                 );
                 to_json(&result)
+                    .map(|result| khive_runtime::pack::InterceptedDispatchResult::new(result, None))
             }
             SearchSubstrate::Note => {
                 let mailbox = self
@@ -576,9 +608,12 @@ impl KgPack {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let source_filter = request.source();
-                let mut hits = self
+                let note_status = request.note_status().ok_or_else(|| {
+                    RuntimeError::Internal("validated note search has no lifecycle selector".into())
+                })?;
+                let (mut hits, note_status_dropped) = self
                     .runtime
-                    .search_notes_with_text_mode(
+                    .search_notes_with_text_mode_and_status(
                         token,
                         request.query(),
                         None,
@@ -588,6 +623,8 @@ impl KgPack {
                         tag_filter.unwrap_or(&[]),
                         props_filter,
                         request.text_mode(),
+                        note_status,
+                        Some(&mailbox),
                     )
                     .await?;
                 hits.retain(|hit| hit.score >= request.min_rank_score());
@@ -708,7 +745,12 @@ impl KgPack {
                     &result,
                     search_start.elapsed().as_micros() as i64,
                 );
-                to_json(&result)
+                to_json(&result).map(|result| {
+                    khive_runtime::pack::InterceptedDispatchResult::new(
+                        result,
+                        Some((note_status, note_status_dropped)),
+                    )
+                })
             }
         }
     }
@@ -801,3 +843,7 @@ async fn emit_search_executed_event(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "search_note_status_tests.rs"]
+mod note_status_tests;

@@ -75,6 +75,72 @@ pub(super) fn note_content_scope(
 }
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
+/// Preserve normal registry read scope while carrying note disclosure through
+/// the existing single authorization/audit intercept. None retains normal
+/// registry dispatch for disabled verbs or an absent static search owner.
+pub(super) async fn dispatch_registry_search_inner(
+    registry: &VerbRegistry,
+    tool: &str,
+    args_value: &Value,
+    identity: Option<&khive_runtime::RequestIdentity>,
+    vector_selected: bool,
+) -> Option<Result<OpSuccess, DispatchFailure>> {
+    if tool != "search" || args_value.get("help").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let result = registry
+        .dispatch_search_with_registry_scope(args_value, identity, |owner, token| async move {
+            // Root's registry entrypoint has already authorized the original
+            // arguments and projected the normal registry token. Only now parse.
+            let mut handler_args = args_value.clone();
+            if let Some(fields) = handler_args.as_object_mut() {
+                fields.remove("namespace");
+            }
+            let request = ValidatedSearchRequest::from_value(handler_args.clone(), registry)?;
+            let text_mode = request.text_mode_name();
+            let outcome =
+                if request.substrate() == SearchSubstrate::Note {
+                    let selector = request.note_status().ok_or_else(|| {
+                        RuntimeError::Internal("validated note search omitted its selector".into())
+                    })?;
+                    let outcome = owner
+                        .dispatch_search_intercepted(handler_args, registry, &token)
+                        .await?;
+                    match outcome.metadata {
+                        Some((actual, _)) if actual == selector => {}
+                        _ => return Err(RuntimeError::Internal(
+                            "registered note search owner omitted or mismatched status disclosure"
+                                .into(),
+                        )),
+                    }
+                    outcome
+                } else {
+                    let result = owner
+                        .dispatch("search", handler_args, registry, &token)
+                        .await?;
+                    InterceptedDispatchResult::new(result, None)
+                };
+            Ok(InterceptedDispatchResult::new(
+                outcome.result,
+                (text_mode, outcome.metadata),
+            ))
+        })
+        .await?;
+    Some(
+        result
+            .map(|outcome| {
+                let (text_mode, note_status_disclosure) = outcome.metadata;
+                OpSuccess {
+                    degradation: SearchDegradation::complete(&outcome.result, vector_selected)
+                        .with_text_mode(text_mode),
+                    result: outcome.result,
+                    note_status_disclosure,
+                }
+            })
+            .map_err(|error| DispatchFailure::from_dispatch(tool, error)),
+    )
+}
+
 /// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
 /// parallel/single closure in `run_parsed`). Returns `Some(Ok(OpSuccess))` when
 /// the coordinator handled the op, `Some(Err(DispatchFailure))` on a
@@ -204,9 +270,35 @@ pub(super) async fn dispatch_via_coordinator_inner(
                         // already authorized this namespace before handler-level
                         // search validation runs inside the intercepted closure.
                         let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
-                        let coord_result = coord
-                            .fan_out_search_scoped(&request, &token, args_value, &extra_visible)
-                            .await?;
+                        let (coord_result, note_status_disclosure) =
+                            if request.substrate() == SearchSubstrate::Note {
+                                let selector = request.note_status().ok_or_else(|| {
+                                    RuntimeError::Internal(
+                                        "validated note search omitted its selector".into(),
+                                    )
+                                })?;
+                                let (result, count) = coord
+                                    .fan_out_note_search_scoped_with_count(
+                                        &request,
+                                        &token,
+                                        args_value,
+                                        &extra_visible,
+                                    )
+                                    .await?;
+                                (result, Some((selector, count)))
+                            } else {
+                                (
+                                    coord
+                                        .fan_out_search_scoped(
+                                            &request,
+                                            &token,
+                                            args_value,
+                                            &extra_visible,
+                                        )
+                                        .await?,
+                                    None,
+                                )
+                            };
                         khive_storage::ensure_request_read_active("search")?;
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
@@ -297,12 +389,16 @@ pub(super) async fn dispatch_via_coordinator_inner(
                             request.text_mode_name(),
                         );
 
-                        Ok(InterceptedDispatchResult::new(result_val, degradation))
+                        Ok(InterceptedDispatchResult::new(
+                            result_val,
+                            (degradation, note_status_disclosure),
+                        ))
                     },
                 )
                 .await;
             Some(match result {
                 Ok(outcome) => {
+                    let (degradation, note_status_disclosure) = outcome.metadata;
                     let is_empty = outcome
                         .result
                         .as_array()
@@ -313,8 +409,8 @@ pub(super) async fn dispatch_via_coordinator_inner(
                     // failed operation, not a successful empty result — the
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
-                    if outcome.metadata.is_partial() && is_empty {
-                        let mut error = search_incomplete_error(outcome.metadata);
+                    if degradation.is_partial() && is_empty {
+                        let mut error = search_incomplete_error(degradation);
                         error
                             .as_object_mut()
                             .expect("structured search error")
@@ -323,7 +419,8 @@ pub(super) async fn dispatch_via_coordinator_inner(
                     } else {
                         Ok(OpSuccess {
                             result: outcome.result,
-                            degradation: outcome.metadata,
+                            degradation,
+                            note_status_disclosure,
                         })
                     }
                 }
@@ -427,6 +524,7 @@ pub(super) fn ok_envelope(tool: String, success: OpSuccess) -> Value {
     let OpSuccess {
         result,
         degradation,
+        note_status_disclosure,
     } = success;
     let SearchDegradation {
         status,
@@ -438,7 +536,8 @@ pub(super) fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         backend_errors_omitted,
     } = degradation;
     let is_partial = status == Some(SearchStatus::Partial);
-    let extra_fields = usize::from(status.is_some())
+    let extra_fields = usize::from(note_status_disclosure.is_some()) * 2
+        + usize::from(status.is_some())
         + usize::from(arm_participation.is_some())
         + if is_partial {
             3 + usize::from(backend_errors_omitted > 0) * 2
@@ -449,6 +548,10 @@ pub(super) fn ok_envelope(tool: String, success: OpSuccess) -> Value {
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
+    if let Some((selector, count)) = note_status_disclosure {
+        map.insert("note_status".to_string(), json!(selector.as_str()));
+        map.insert("note_status_dropped".to_string(), json!(count));
+    }
     // ADR-130 §1: `status` is present on every successful search envelope
     // (complete or partial); absent for every other verb.
     if let Some(status) = status {
