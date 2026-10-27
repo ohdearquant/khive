@@ -987,7 +987,12 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
     needs: resolve-revision
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The nightly run scans every ref and a replay scans its commit's whole history. Measured on the
+    # scheduled runs: the full-history checkout took 2.5 to 4.2 minutes; the scan finished 12,304
+    # commits in 5m50s on the one night it completed and was still running at 6m00s to 6m50s on the
+    # nights the 10-minute limit cancelled it (9 of 10). Pull request and push runs scan their own
+    # range whenever one resolves, and keep 10.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 10 }}
     steps:
       - uses: actions/checkout@v7
         with:
