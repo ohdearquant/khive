@@ -86,6 +86,12 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         self.events_readiness_gate()
     }
 
+    fn background_resources(
+        &self,
+    ) -> Option<khive_runtime::resource_admission::BackgroundDomainControl> {
+        crate::server::KhiveMcpServer::background_resources_control(self)
+    }
+
     async fn warm_all(&self) {
         crate::server::KhiveMcpServer::warm_all(self).await;
     }

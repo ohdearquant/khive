@@ -320,7 +320,7 @@ pub(super) async fn pid_file_names_a_reachable_daemon(
         && socket_speaks_khived_protocol(sock, expected_config_id).await
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) async fn drain(active: &std::sync::atomic::AtomicUsize) -> bool {
     drain_with_timeout(active, drain_timeout()).await
 }

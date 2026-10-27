@@ -148,6 +148,32 @@ impl CoordinatorService for MockCoordinator {
             .await)
     }
 
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        // This routing-only fixture contains exactly one active observation
+        // candidate when nonempty, and no excluded candidates otherwise. Real
+        // hydration/backend-sum semantics are tested by the concrete service.
+        let selector = request.note_status().ok_or_else(|| {
+            RuntimeError::Internal("note routing fixture requires a note selector".into())
+        })?;
+        let mut result = self
+            .fan_out_search_scoped(request, token, args, extra_visible)
+            .await?;
+        let count =
+            if selector == khive_storage::note::NoteStatusSelector::Archived && !self.empty_hits {
+                result.note_hits.clear();
+                1
+            } else {
+                0
+            };
+        Ok((result, count))
+    }
+
     async fn locate(&self, _id: Uuid) -> Option<BackendId> {
         Some(BackendId::main())
     }
@@ -1748,4 +1774,155 @@ async fn multi_backend_link_admission_still_precedes_parameter_validation() {
         1
     );
     assert!(!coord.link_called.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+// Signed ADR-130 Am8 r2 transport fixtures. These use the routing mock's
+// explicit one-active-note population, not a fake production count fallback.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn note_disclosure_coordinator_single_parallel_chain_and_partial_empty() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        for (selector, count, expected_len) in [("active", 0, 1), ("archived", 1, 0), ("any", 0, 1)] {
+            let mut expected_result_bytes = None;
+            for ops in [
+                json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string(),
+                json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}, {"tool":"stats","args":{}}]).to_string(),
+                format!("search(kind=\"note\", query=\"x\", note_status=\"{selector}\") | stats()"),
+            ] {
+                let response = server.dispatch_request_local(RequestParams {
+                    ops, presentation: Some("verbose".into()), format: Some("json".into()),
+                    ..Default::default()
+                }).await.unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                let entry = &response["results"][0];
+                assert_eq!(entry["ok"], true, "{entry}");
+                assert_eq!(entry["note_status"], selector);
+                assert_eq!(entry["note_status_dropped"].as_u64(), Some(count));
+                assert_eq!(entry["result"].as_array().unwrap().len(), expected_len);
+                let expected_rows = if expected_len == 0 { json!([]) } else {
+                    let ranking = khive_pack_kg::handlers::search_rank_fields(
+                        Default::default(), khive_runtime::RankScoreKind::Vector,
+                        khive_runtime::SearchSignals::default(),
+                    );
+                    let mut row = json!({
+                        "id": Uuid::from_u128(1).to_string(), "kind": "observation",
+                        "note_kind": "observation", "name": "note result", "source": "vector",
+                        "title": "note result", "snippet": null,
+                        "created_at": khive_runtime::micros_to_iso(1_700_000_000_000_000),
+                        "updated_at": khive_runtime::micros_to_iso(1_700_000_000_000_000), "version": 1,
+                    });
+                    row.as_object_mut().unwrap().extend(ranking.as_object().unwrap().clone());
+                    json!([row])
+                };
+                assert_eq!(serde_json::to_vec(&entry["result"]).unwrap(),
+                    serde_json::to_vec(&expected_rows).unwrap(), "canonical mock hit array must remain byte-identical");
+                let bytes = serde_json::to_vec(&entry["result"]).unwrap();
+                if let Some(expected) = &expected_result_bytes { assert_eq!(&bytes, expected); }
+                else { expected_result_bytes = Some(bytes); }
+                for sibling in response["results"].as_array().unwrap().iter().skip(1) {
+                    assert!(sibling.get("note_status").is_none());
+                    assert!(sibling.get("note_status_dropped").is_none());
+                }
+                assert!(response.get("note_status").is_none());
+                assert!(response.get("note_status_dropped").is_none());
+            }
+        }
+        let response = server.dispatch_request_local(RequestParams {
+            ops: json!([
+                {"tool":"search","args":{"kind":"entity","query":"x"}},
+                {"tool":"search","args":{"help":true}},
+                {"tool":"search","args":{"kind":"note","query":"x","note_status":"invalid"}}
+            ]).to_string(), presentation: Some("verbose".into()), format: Some("json".into()),
+            ..Default::default()
+        }).await.unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        for entry in response["results"].as_array().unwrap() {
+            assert!(entry.get("note_status").is_none());
+            assert!(entry.get("note_status_dropped").is_none());
+        }
+        assert_eq!(response["results"][2]["ok"], false);
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::degraded_multi_backend("missing-status-leg");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(coord as Arc<dyn CoordinatorService>);
+        for selector in ["active", "archived"] {
+            let response = server.dispatch_request_local(RequestParams {
+                ops: json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string(),
+                presentation: Some("verbose".into()), format: Some("json".into()), ..Default::default()
+            }).await.unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            let entry = &response["results"][0];
+            if selector == "active" {
+                assert_eq!(entry["ok"], true);
+                assert_eq!(entry["status"], "partial");
+                assert_eq!(entry["note_status"], "active");
+                assert_eq!(entry["note_status_dropped"].as_u64(), Some(0));
+            } else {
+                assert_eq!(entry["ok"], false);
+                assert_eq!(entry["error"]["kind"], "search_incomplete");
+                assert!(entry.get("note_status").is_none());
+                assert!(entry.get("note_status_dropped").is_none());
+                assert!(entry.pointer("/error/search/note_status").is_none());
+                assert!(entry.pointer("/error/search/note_status_dropped").is_none());
+            }
+        }
+    }).await.expect("coordinator note transport fixture exceeded async budget");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn coordinator_note_disclosure_all_presentations_format_result_only() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(coord as Arc<dyn CoordinatorService>);
+        for (selector, count) in [("active", 0_u64), ("archived", 1), ("any", 0)] {
+            let ops = json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string();
+            for (name, presentation) in [
+                ("agent", khive_runtime::PresentationMode::Agent),
+                ("human", khive_runtime::PresentationMode::Human),
+                ("verbose", khive_runtime::PresentationMode::Verbose),
+            ] {
+                let json_response = server.dispatch_request_local(RequestParams {
+                    ops: ops.clone(), presentation: Some(name.into()), format: Some("json".into()),
+                    ..Default::default()
+                }).await.unwrap();
+                let json_response: Value = serde_json::from_str(&json_response).unwrap();
+                let json_entry = &json_response["results"][0];
+                for (format_name, format) in [
+                    ("json", khive_runtime::OutputFormat::Json),
+                    ("auto", khive_runtime::OutputFormat::Auto),
+                    ("table", khive_runtime::OutputFormat::Table),
+                ] {
+                    let response = server.dispatch_request_local(RequestParams {
+                        ops: ops.clone(), presentation: Some(name.into()), format: Some(format_name.into()),
+                        ..Default::default()
+                    }).await.unwrap();
+                    let response: Value = serde_json::from_str(&response).unwrap();
+                    let entry = &response["results"][0];
+                    assert_eq!(entry["ok"], true);
+                    assert_eq!(entry["note_status"], selector);
+                    assert_eq!(entry["note_status_dropped"].as_u64(), Some(count));
+                    let mut expected = json_entry.clone();
+                    if format != khive_runtime::OutputFormat::Json {
+                        expected["result"] = Value::String(khive_runtime::presentation::render_format_with_note_content(
+                            json_entry["result"].clone(), format, presentation,
+                            khive_runtime::presentation::NoteContentScope::None,
+                        ));
+                        assert!(!entry["result"].as_str().unwrap().contains("note_status"));
+                    }
+                    let mut actual = entry.clone();
+                    // Execution counters are measured per request, independently of presentation.
+                    expected.as_object_mut().unwrap().remove("usage");
+                    actual.as_object_mut().unwrap().remove("usage");
+                    assert_eq!(actual, expected, "{name}/{format_name}");
+                }
+            }
+        }
+    }).await.expect("coordinator presentation fixture exceeded async budget");
 }
