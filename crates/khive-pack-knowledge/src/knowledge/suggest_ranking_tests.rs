@@ -524,7 +524,7 @@ async fn seed_compose_cohort(runtime: &KhiveRuntime, registry: &VerbRegistry) {
         registry.dispatch("knowledge.upsert_domains", json!({ "domains": [{
             "slug": &slug,
             "name": format!("{COMPOSE_COHORT_MARKER}{index:02} inference"),
-            "description": format!("LLM_SERVING serving latency acceleration for large language models. {}", "inference ".repeat(index + 1)),
+            "description": format!("LLM_SERVING serving latency acceleration for large language models. Additional background supplies ordinary context for readers across common topics and examples. {}", "inference ".repeat(index + 1)),
         }] })).await.expect("publish cohort domain");
         cohort_statement(
             runtime,

@@ -101,10 +101,8 @@ fn candidate_presence_statement(ids: &[String]) -> SqlStatement {
         .collect::<Vec<_>>()
         .join(",");
     SqlStatement {
-        sql: format!(
-            "SELECT id FROM knowledge_atoms WHERE id IN ({placeholders}) \
-             UNION SELECT id FROM knowledge_domains WHERE id IN ({placeholders})"
-        ),
+        sql: khive_runtime::sql!("knowledge_search_candidate_presence")
+            .replace("/* ids */ ?1", &placeholders),
         // Both UNION arms reuse these numbered binds, preserving the chunk ceiling.
         params: ids.iter().cloned().map(SqlValue::Text).collect(),
         label: None,

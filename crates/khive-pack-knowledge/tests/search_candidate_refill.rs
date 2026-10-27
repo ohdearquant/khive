@@ -788,9 +788,9 @@ async fn stale_domain_fixture(stale: bool) -> Fixture {
             "knowledge.upsert_domains",
             json!({"domains": [
                 {"slug": "operator-stale-domain", "name": "Operator Stale Domain",
-                 "description": STALE_DOMAIN_QUERY, "members": []},
+                 "description": format!("{STALE_DOMAIN_QUERY} Additional background supplies ordinary context for readers across common topics and examples."), "members": []},
                 {"slug": "operator-live-domain", "name": "Operator Live Domain",
-                 "description": STALE_DOMAIN_QUERY, "members": []}
+                 "description": format!("{STALE_DOMAIN_QUERY} Additional background supplies ordinary context for readers across common topics and examples."), "members": []}
             ]}),
         )
         .await
