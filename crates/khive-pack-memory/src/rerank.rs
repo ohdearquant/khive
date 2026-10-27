@@ -54,31 +54,7 @@ pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>
         ),
     ];
     // Unknown feature names remain ignored, including in the scale.
-    let scale = weighted_features
-        .iter()
-        .map(|(w, _)| *w)
-        .fold(0.0_f64, f64::max);
-    if scale == 0.0 {
-        return 0.0;
-    }
-    let feature_scale = weighted_features
-        .iter()
-        .filter(|(weight, _)| *weight != 0.0)
-        .map(|(_, value)| value.abs())
-        .fold(1.0_f64, f64::max);
-    let mut numerator = 0.0_f64;
-    let mut weight_sum = 0.0_f64;
-    for (weight, feature_value) in weighted_features {
-        if weight == 0.0 {
-            continue;
-        }
-        let normalized_weight = weight / scale;
-        numerator += normalized_weight * (feature_value / feature_scale);
-        if normalized_weight > 0.0 {
-            weight_sum += normalized_weight;
-        }
-    }
-    (numerator / weight_sum).clamp(-1.0, 1.0) * feature_scale
+    khive_score::scaled_weighted_mean(weighted_features.iter().copied())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
