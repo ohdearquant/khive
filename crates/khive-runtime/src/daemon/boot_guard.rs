@@ -690,8 +690,10 @@ mod background_setup_refusal_tests {
         let control = retained.root.control();
         assert!(!control.is_closed());
         let process_was_cancelled = daemon_shutdown_token().is_cancelled();
-        let mut options = DaemonOptions::default();
-        options.idle_interval = Duration::ZERO;
+        let options = DaemonOptions {
+            idle_interval: Duration::ZERO,
+            ..Default::default()
+        };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
             run_daemon_with_options_and_boot_guard_and_start(dispatcher, None, options, |_| {
