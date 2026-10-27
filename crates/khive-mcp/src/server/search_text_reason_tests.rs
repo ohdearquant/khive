@@ -36,10 +36,17 @@ mod search_text_reason_tests {
     fn reasons(test: &str, rows: Vec<(String, Value, bool)>) {
         eprintln!("{test}: legacy-controls-passed; reason rows={}", rows.len());
         for (label, arms, _) in rows.iter().filter(|(_, _, expected)| !expected) {
-            assert!(arms["text"].get("reason").is_none(), "{label}: unexpected text reason");
+            assert!(
+                arms["text"].get("reason").is_none(),
+                "{label}: unexpected text reason"
+            );
         }
         for (label, arms, _) in rows.iter().filter(|(_, _, expected)| *expected) {
-            assert_eq!(arms["text"].get("reason"), Some(&json!(REASON)), "{label}: exact reason");
+            assert_eq!(
+                arms["text"].get("reason"),
+                Some(&json!(REASON)),
+                "{label}: exact reason"
+            );
         }
     }
 
@@ -56,21 +63,32 @@ mod search_text_reason_tests {
                 (Some(raw_score), Some(mcp_score)) => {
                     let raw_number = raw_score.as_f64().expect("numeric raw keyword score");
                     let mcp_number = mcp_score.as_f64().expect("numeric MCP keyword score");
-                    assert!(raw_number.is_finite() && raw_number >= 0.0, "raw keyword score {index} must be finite and nonnegative");
-                    assert!(mcp_number.is_finite() && mcp_number >= 0.0, "MCP keyword score {index} must be finite and nonnegative");
+                    assert!(
+                        raw_number.is_finite() && raw_number >= 0.0,
+                        "raw keyword score {index} must be finite and nonnegative"
+                    );
+                    assert!(
+                        mcp_number.is_finite() && mcp_number >= 0.0,
+                        "MCP keyword score {index} must be finite and nonnegative"
+                    );
                     // These are independent FTS searches. BM25 normalization can round
                     // its f64 evidence by one ULP; every other hit field remains exact.
                     assert!(
                         raw_number.to_bits().abs_diff(mcp_number.to_bits()) <= 1,
                         "keyword score {index} changed beyond one ULP: raw={raw_number:?}, MCP={mcp_number:?}"
                     );
-                    *mcp_hit.pointer_mut("/signals/keyword_score").expect("MCP keyword score") = raw_score.clone();
+                    *mcp_hit
+                        .pointer_mut("/signals/keyword_score")
+                        .expect("MCP keyword score") = raw_score.clone();
                 }
                 (None, None) => {}
                 _ => panic!("keyword score {index} presence changed"),
             }
         }
-        assert_eq!(&normalized_mcp, raw, "complete canonical hit array changed outside keyword rounding");
+        assert_eq!(
+            &normalized_mcp, raw,
+            "complete canonical hit array changed outside keyword rounding"
+        );
     }
 
     #[test]
@@ -84,11 +102,18 @@ mod search_text_reason_tests {
         for (text_status, text_name) in statuses {
             for count in [0, 1, 2] {
                 for (vector_status, vector_name) in statuses {
-                    let arms = crate::server::search_arm_participation_value(SearchArmParticipation {
-                        text: SearchArmEvidence { status: text_status, candidate_count: count },
-                        vector: SearchArmEvidence { status: vector_status, candidate_count: 0 },
-                        text_mode: "all_terms",
-                    });
+                    let arms =
+                        crate::server::search_arm_participation_value(SearchArmParticipation {
+                            text: SearchArmEvidence {
+                                status: text_status,
+                                candidate_count: count,
+                            },
+                            vector: SearchArmEvidence {
+                                status: vector_status,
+                                candidate_count: 0,
+                            },
+                            text_mode: "all_terms",
+                        });
                     legacy_arms(&arms, text_name, count, vector_name, 0);
                     rows.push((
                         format!("text={text_name}/{count}, vector={vector_name}/0"),
@@ -104,16 +129,26 @@ mod search_text_reason_tests {
 
     async fn search_pair(server: &KhiveMcpServer, query: &str, limit: u32) -> (Value, Value) {
         let args = json!({"kind": "entity", "query": query, "limit": limit});
-        let raw = server.registry.dispatch("search", args.clone()).await.expect("raw pack search");
+        let raw = server
+            .registry
+            .dispatch("search", args.clone())
+            .await
+            .expect("raw pack search");
         assert!(raw.is_array(), "raw pack shape must remain an array");
-        let response = server.dispatch_request_local(RequestParams {
-            ops: json!([{"tool": "search", "args": args}]).to_string(),
-            presentation: Some("verbose".to_string()),
-            format: Some("json".to_string()),
-            ..Default::default()
-        }).await.expect("MCP search dispatch");
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: json!([{"tool": "search", "args": args}]).to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("MCP search dispatch");
         let envelope: Value = serde_json::from_str(&response).expect("JSON envelope");
-        assert_eq!(envelope["summary"], json!({"total": 1, "succeeded": 1, "failed": 0, "aborted": 0}));
+        assert_eq!(
+            envelope["summary"],
+            json!({"total": 1, "succeeded": 1, "failed": 0, "aborted": 0})
+        );
         assert_eq!(envelope["results"].as_array().expect("results").len(), 1);
         let entry = envelope["results"][0].clone();
         assert_eq!(entry["ok"], true);
@@ -137,7 +172,9 @@ mod search_text_reason_tests {
         rows.push(("empty corpus".to_string(), arms, true));
 
         let runtime = server.runtime.as_ref().expect("single runtime");
-        let token = runtime.authorize(Namespace::local()).expect("local namespace");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("local namespace");
         let entity = runtime
             .create_entity_with_embedding_report(
                 &token,
@@ -178,16 +215,21 @@ mod search_text_reason_tests {
         // Typed coordinator inputs exercise classification and the shared
         // serializer, independently of the real retrieval fixture below.
         let mut vector_only = degraded_search_result([(
-            "archive".to_string(), BackendSearchFailure::backend("storage unavailable"),
+            "archive".to_string(),
+            BackendSearchFailure::backend("storage unavailable"),
         )]);
         vector_only.partial = false;
         vector_only.per_backend[0].error = None;
         vector_only.per_backend[0].vector_selected = true;
         vector_only.per_backend[0].vector_error = Some("embedding unavailable".to_string());
-        let vector_entry = ok_envelope("search".to_string(), OpSuccess {
-            result: json!([]),
-            degradation: SearchDegradation::from_result(&vector_only, &json!([]), "all_terms"),
-        });
+        let vector_entry = ok_envelope(
+            "search".to_string(),
+            OpSuccess {
+                note_status_disclosure: None,
+                result: json!([]),
+                degradation: SearchDegradation::from_result(&vector_only, &json!([]), "all_terms"),
+            },
+        );
         assert_eq!(vector_entry["ok"], true);
         assert_eq!(vector_entry["status"], "complete");
         assert_eq!(vector_entry["result"], json!([]));
@@ -196,25 +238,40 @@ mod search_text_reason_tests {
         legacy_arms(&vector_entry["arm_participation"], "ran", 0, "error", 0);
 
         let mut failed = degraded_search_result([(
-            "archive".to_string(), BackendSearchFailure::backend("storage unavailable"),
+            "archive".to_string(),
+            BackendSearchFailure::backend("storage unavailable"),
         )]);
         failed.per_backend[0].vector_selected = true;
         let surviving = json!([{"id": "11111111-1111-1111-1111-111111111111", "source": "vector"}]);
-        let partial = ok_envelope("search".to_string(), OpSuccess {
-            result: surviving.clone(),
-            degradation: SearchDegradation::from_result(&failed, &surviving, "all_terms"),
-        });
+        let partial = ok_envelope(
+            "search".to_string(),
+            OpSuccess {
+                note_status_disclosure: None,
+                result: surviving.clone(),
+                degradation: SearchDegradation::from_result(&failed, &surviving, "all_terms"),
+            },
+        );
         assert_eq!(partial["ok"], true);
         assert_eq!(partial["result"], surviving);
         assert_eq!(partial["status"], "partial");
         assert_eq!(partial["partial"], true);
         assert_eq!(partial["missing_backends"], json!(["archive"]));
-        assert_eq!(partial["backend_errors"], json!({"archive": {"kind": "backend_error", "message": "storage unavailable"}}));
+        assert_eq!(
+            partial["backend_errors"],
+            json!({"archive": {"kind": "backend_error", "message": "storage unavailable"}})
+        );
         legacy_arms(&partial["arm_participation"], "error", 0, "error", 1);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&failed, &json!([]), "all_terms"));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &failed,
+            &json!([]),
+            "all_terms",
+        ));
         assert_eq!(diagnostic["kind"], "search_incomplete");
-        assert_eq!(diagnostic["message"], "no-match was not established because selected backends failed");
+        assert_eq!(
+            diagnostic["message"],
+            "no-match was not established because selected backends failed"
+        );
         assert_eq!(diagnostic["retryable"], false);
         assert!(diagnostic.get("retry_after_ms").is_none());
         assert_eq!(diagnostic["missing_backends"], partial["missing_backends"]);
@@ -225,13 +282,35 @@ mod search_text_reason_tests {
             &frame_budget_category_test_registry(),
         );
         assert_eq!(omitted["ok"], false);
-        assert_eq!(omitted["error"], diagnostic, "typed incomplete error is retained whole");
-        reasons("T3", vec![
-            ("whole-backend partial".to_string(), partial["arm_participation"].clone(), false),
-            ("whole-backend incomplete".to_string(), diagnostic["arm_participation"].clone(), false),
-            ("omitted incomplete".to_string(), omitted["error"]["arm_participation"].clone(), false),
-            ("vector-only failure".to_string(), vector_entry["arm_participation"].clone(), true),
-        ]);
+        assert_eq!(
+            omitted["error"], diagnostic,
+            "typed incomplete error is retained whole"
+        );
+        reasons(
+            "T3",
+            vec![
+                (
+                    "whole-backend partial".to_string(),
+                    partial["arm_participation"].clone(),
+                    false,
+                ),
+                (
+                    "whole-backend incomplete".to_string(),
+                    diagnostic["arm_participation"].clone(),
+                    false,
+                ),
+                (
+                    "omitted incomplete".to_string(),
+                    omitted["error"]["arm_participation"].clone(),
+                    false,
+                ),
+                (
+                    "vector-only failure".to_string(),
+                    vector_entry["arm_participation"].clone(),
+                    true,
+                ),
+            ],
+        );
     }
 
     #[test]
@@ -239,10 +318,18 @@ mod search_text_reason_tests {
     fn presentation_and_frame_omission() {
         let registry = frame_budget_category_test_registry();
         let mut rows = Vec::new();
-        for mode in [PresentationMode::Agent, PresentationMode::Verbose, PresentationMode::Human] {
+        for mode in [
+            PresentationMode::Agent,
+            PresentationMode::Verbose,
+            PresentationMode::Human,
+        ] {
             let entry = present_ok_envelope_or_depth_error(
                 "search".to_string(),
-                OpSuccess { result: json!([]), degradation: SearchDegradation::complete(&json!([]), false) },
+                OpSuccess {
+                    note_status_disclosure: None,
+                    result: json!([]),
+                    degradation: SearchDegradation::complete(&json!([]), false),
+                },
                 mode,
                 0,
                 khive_types::VerbPresentationPolicy::Standard,
@@ -263,10 +350,27 @@ mod search_text_reason_tests {
             assert_eq!(omitted["error"]["retryable"], false);
             assert_eq!(omitted["error"]["recoverable"], "read_outcome");
             assert_eq!(omitted["error"]["search"]["status"], "complete");
-            assert_eq!(omitted["error"]["search"]["arm_participation"], entry["arm_participation"]);
-            legacy_arms(&omitted["error"]["search"]["arm_participation"], "ran", 0, "skipped", 0);
-            rows.push((format!("{mode:?} success"), entry["arm_participation"].clone(), true));
-            rows.push((format!("{mode:?} omission"), omitted["error"]["search"]["arm_participation"].clone(), true));
+            assert_eq!(
+                omitted["error"]["search"]["arm_participation"],
+                entry["arm_participation"]
+            );
+            legacy_arms(
+                &omitted["error"]["search"]["arm_participation"],
+                "ran",
+                0,
+                "skipped",
+                0,
+            );
+            rows.push((
+                format!("{mode:?} success"),
+                entry["arm_participation"].clone(),
+                true,
+            ));
+            rows.push((
+                format!("{mode:?} omission"),
+                omitted["error"]["search"]["arm_participation"].clone(),
+                true,
+            ));
         }
         assert_eq!(rows.len(), 6);
         reasons("T4", rows);
@@ -279,6 +383,7 @@ mod search_text_reason_tests {
         let entry = present_ok_envelope_or_depth_error(
             "search".to_string(),
             OpSuccess {
+                note_status_disclosure: None,
                 result: json!([]),
                 degradation: SearchDegradation::complete(&json!([]), false)
                     .with_text_mode("any_term"),
@@ -313,38 +418,63 @@ mod search_text_reason_tests {
         use std::collections::BTreeSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct LocalEmbeddingService { dimensions: usize, calls: Arc<AtomicUsize> }
+        struct LocalEmbeddingService {
+            dimensions: usize,
+            calls: Arc<AtomicUsize>,
+        }
 
         #[async_trait::async_trait]
         impl EmbeddingService for LocalEmbeddingService {
-            async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>, EmbedError> {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
                 self.calls.fetch_add(texts.len(), Ordering::SeqCst);
-                Ok(texts.iter().map(|text| {
-                    let mut vector = vec![0.0; self.dimensions];
-                    let (x, y) = if text.contains("companion") {
-                        (0.8, 0.6)
-                    } else if text.contains("archival reference") {
-                        (0.6, 0.8)
-                    } else {
-                        (1.0, 0.0)
-                    };
-                    vector[0] = x;
-                    vector[1] = y;
-                    vector
-                }).collect())
+                Ok(texts
+                    .iter()
+                    .map(|text| {
+                        let mut vector = vec![0.0; self.dimensions];
+                        let (x, y) = if text.contains("companion") {
+                            (0.8, 0.6)
+                        } else if text.contains("archival reference") {
+                            (0.6, 0.8)
+                        } else {
+                            (1.0, 0.0)
+                        };
+                        vector[0] = x;
+                        vector[1] = y;
+                        vector
+                    })
+                    .collect())
             }
-            fn supports_model(&self, _model: EmbeddingModel) -> bool { true }
-            fn name(&self) -> &'static str { "search-text-reason-local-fixture" }
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+            fn name(&self) -> &'static str {
+                "search-text-reason-local-fixture"
+            }
         }
 
-        struct LocalEmbeddingProvider { name: String, dimensions: usize, calls: Arc<AtomicUsize> }
+        struct LocalEmbeddingProvider {
+            name: String,
+            dimensions: usize,
+            calls: Arc<AtomicUsize>,
+        }
 
         #[async_trait::async_trait]
         impl EmbedderProvider for LocalEmbeddingProvider {
-            fn name(&self) -> &str { &self.name }
-            fn dimensions(&self) -> usize { self.dimensions }
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn dimensions(&self) -> usize {
+                self.dimensions
+            }
             async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
-                Ok(Arc::new(LocalEmbeddingService { dimensions: self.dimensions, calls: Arc::clone(&self.calls) }))
+                Ok(Arc::new(LocalEmbeddingService {
+                    dimensions: self.dimensions,
+                    calls: Arc::clone(&self.calls),
+                }))
             }
         }
 
@@ -359,16 +489,28 @@ mod search_text_reason_tests {
                 embedding_model: Some(model),
                 packs: vec!["kg".to_string()],
                 ..RuntimeConfig::no_embeddings()
-            }).expect("in-memory fixture runtime");
+            })
+            .expect("in-memory fixture runtime");
             // Runtime construction registers metadata and lazy providers only.
             // Replace the provider before server construction or any embed call.
             runtime.register_embedder(LocalEmbeddingProvider {
-                name: model.to_string(), dimensions: model.dimensions(), calls: Arc::clone(&calls),
+                name: model.to_string(),
+                dimensions: model.dimensions(),
+                calls: Arc::clone(&calls),
             });
-            assert_eq!(runtime.embedder(&model.to_string()).await.expect("local provider").name(), "search-text-reason-local-fixture");
+            assert_eq!(
+                runtime
+                    .embedder(&model.to_string())
+                    .await
+                    .expect("local provider")
+                    .name(),
+                "search-text-reason-local-fixture"
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             let server = KhiveMcpServer::new(runtime.clone()).expect("fixture MCP server");
-            let token = runtime.authorize(Namespace::local()).expect("local namespace");
+            let token = runtime
+                .authorize(Namespace::local())
+                .expect("local namespace");
             let names = [
                 "khive ADR-061 Pack-Extensible by-ID Resolution",
                 "khive ADR-061 Pack-Extensible by-ID Resolution companion",
@@ -397,7 +539,11 @@ mod search_text_reason_tests {
                 ids.push(entity.id);
             }
             assert_eq!(ids.len(), 3);
-            assert_eq!(calls.load(Ordering::SeqCst), 3, "every record used the local embedder");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                3,
+                "every record used the local embedder"
+            );
             let mut rows = Vec::new();
             for (query, text_count, sources) in [
                 ("khive ADR-061", 2, ["both", "both", "vector"]),
@@ -481,7 +627,10 @@ mod search_text_reason_tests {
                 rows.push((query.to_string(), arms, text_count == 0));
             }
             assert_eq!(rows.len(), 4);
-            assert!(calls.load(Ordering::SeqCst) >= 11, "seed and both dispatch paths used the local embedder");
+            assert!(
+                calls.load(Ordering::SeqCst) >= 11,
+                "seed and both dispatch paths used the local embedder"
+            );
             reasons("T5", rows);
         }
     }

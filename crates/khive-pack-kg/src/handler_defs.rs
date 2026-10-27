@@ -858,7 +858,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. Note searches default to active lifecycle status; note_status=archived or any provides explicit access, separately from workflow properties.status. Successful MCP note searches report note_status and note_status_dropped beside result, including zero; the count describes distinct gathered notes excluded by status after the other hydration predicates, not a corpus total or a promise of extra Any hits. Raw registry results remain hit arrays. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -909,6 +909,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 param_type: "string",
                 required: false,
                 description: "Filter search results to a specific note kind (kind=\"note\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "note_status",
+                param_type: "string",
+                required: false,
+                description: "Notes only: active (default for omitted/null), archived, or any, selecting the note lifecycle status at hydration. The bounded gather may return a short page. Separate from workflow properties.status. Entity searches reject this parameter.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

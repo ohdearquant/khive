@@ -238,6 +238,7 @@ pub(crate) struct SearchParams {
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) note_kind: Option<String>,
+    pub(crate) note_status: Option<khive_storage::note::NoteStatusSelector>,
     pub(crate) include_superseded: Option<bool>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
