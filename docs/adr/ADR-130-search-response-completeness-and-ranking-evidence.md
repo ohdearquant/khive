@@ -1184,7 +1184,8 @@ array contract this ADR keeps on every route.
 
 4. **Meaning.** `note_status_dropped` says how many candidate notes the selector removed. It is not a count of
    non-matching notes in the store, and it does not promise that a repeat with `"any"` returns that many more hits:
-   fusion, filters and the limit still apply. A short page with `note_status_dropped = 0` is a short answer.
+   fusion, filters and the limit still apply. A short page with `note_status_dropped = 0` was not shortened by the
+   status selector; it says nothing about the gather window or the other hydration predicates.
 
 ### What this does not cover
 
