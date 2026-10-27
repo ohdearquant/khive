@@ -41,7 +41,9 @@ fn assert_store_refusal(message: &str, db: &Path, component: &Path) {
 
 #[test]
 fn direct_store_open_reports_database_parent_without_changing_permissions() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(root.path());
     for mode in [0o775, 0o777, 0o1777] {
         let parent = root.path().join(format!("mode-{mode:o}"));
@@ -71,7 +73,9 @@ fn direct_store_open_reports_database_parent_without_changing_permissions() {
 
 #[test]
 fn direct_store_open_reports_first_bad_ancestor_and_warns_more_may_follow() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(root.path());
     let first = root.path().join("first");
     let second = first.join("second");
@@ -118,7 +122,9 @@ fn direct_store_open_reports_first_bad_ancestor_and_warns_more_may_follow() {
 
 #[test]
 fn store_trust_keeps_private_parents_and_sticky_ancestors_acceptable() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let ancestor = root.path().join("sticky");
     std::fs::create_dir(&ancestor).unwrap();
     std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -139,7 +145,9 @@ fn store_trust_keeps_private_parents_and_sticky_ancestors_acceptable() {
 
 #[test]
 fn missing_store_parent_reports_database_and_metadata_failure() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let parent = root.path().join("missing");
     let db = parent.join("events.db");
     let message = ensure_events_db_parent_trusted(&db)
@@ -152,7 +160,9 @@ fn missing_store_parent_reports_database_and_metadata_failure() {
 
 #[test]
 fn socket_and_pid_refusals_keep_their_exact_parent_and_ancestor_diagnostics() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let parent = root.path().join("writable");
     let inner = parent.join("private");
     std::fs::create_dir_all(&inner).unwrap();
