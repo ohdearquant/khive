@@ -425,6 +425,36 @@ def feedback_events(br: Bridge, actors: list[str], profile: str, since: str, unt
     return rows
 
 
+def spread(items: list, n: int) -> list:
+    """n items evenly spaced over the list, first and last included; all of them when n >= len(items)."""
+    if n >= len(items):
+        return list(items)
+    if n <= 1:
+        return items[-1:] if n == 1 else []
+    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
+
+
+def served_queries(br: Bridge, actors: list[str], profile: str, since: str, until: str, n: int) -> tuple[list, int]:
+    """n distinct queries the profile served in [since, until), spread over time, as calibration cases."""
+    seen = {}
+    for actor in actors:
+        after = None
+        while True:
+            page = br.one(op("brain.event_page", since=since, until=until, kind="recall_executed", actor=actor,
+                             limit=1000, after=after))
+            for e in page.get("events", []):
+                if e.get("outcome") != "success" or dig(e, ("served_by_profile_id",)) != profile:
+                    continue
+                q = dig(e, ("query",))
+                if isinstance(q, str) and q.strip() and q not in seen:
+                    seen[q] = {"case_id": f"recall-{e.get('id')}", "query": q, "created_at": e.get("created_at")}
+            if not page.get("has_more"):
+                break
+            after = page.get("next_after")
+    ordered = sorted(seen.values(), key=lambda c: parse_instant(c["created_at"]))
+    return spread(ordered, n), len(ordered)
+
+
 def replay(br: Bridge, events: list[dict], into: str) -> dict:
     counts = {"replayed": 0, "refused": 0, "refused_by_signal": {}}
     for i in range(0, len(events), 8):
@@ -453,12 +483,12 @@ def cmd_check_bank(args) -> int:
 
 
 def start(args, run_id: str, scratch: Path):
-    meta, cases = load_bank(Path(args.bank))
+    meta, cases = load_bank(Path(args.bank)) if args.bank else ({"bank_id": None, "version": None}, [])
     db, env, manifest = stage(args, scratch)
     br = Bridge(args.kkernel, db, env, scratch / "kkernel-mcp.err")
     try:
         br.handshake()
-        ready_s = wait_ready(br, cases[0]["query"], args.ready_max_s)
+        ready_s = wait_ready(br, cases[0]["query"] if cases else "store ready probe", args.ready_max_s)
         ctl = control(br, args.control_id)
         br.one(op("brain.profile", profile_id=args.profile))
     except BaseException:
@@ -472,7 +502,8 @@ def start(args, run_id: str, scratch: Path):
 def scratch_dir(args, run_id: str) -> Path:
     if os.environ.get("KHIVE_DB"):
         raise BankError("refusing to run with KHIVE_DB set in the caller's environment; unset it")
-    load_bank(Path(args.bank))
+    if args.bank:
+        load_bank(Path(args.bank))
     return Path(tempfile.mkdtemp(prefix=f"khive-question-bank-{run_id}-", dir=args.scratch_parent))
 
 
@@ -581,8 +612,15 @@ def cmd_calibrate_replay(args) -> int:
         twin = f"bench-replay-{run_id}"
         br.one(op("brain.create_profile", name=twin, description="question-bank calibration: full feedback replay"))
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        events = feedback_events(br, [a for a in args.feedback_actors.split(",") if a], args.profile,
-                                 args.feedback_since, now)
+        actors = [a for a in args.feedback_actors.split(",") if a]
+        if args.queries_from_events:
+            cases, distinct = served_queries(br, actors, args.profile, args.feedback_since, now, args.n)
+            if not cases:
+                raise BankError(f"no recall_executed event served by {args.profile} for {actors}: nothing to compare")
+            base["query_source"] = {"kind": "recall_executed", "profile": args.profile, "actors": actors,
+                                    "distinct_queries": distinct, "sampled": len(cases)}
+            base["population"] = len(cases)
+        events = feedback_events(br, actors, args.profile, args.feedback_since, now)
         counts = replay(br, events, twin)
         rows = []
         for c in cases[: args.n]:
@@ -645,6 +683,8 @@ def self_test() -> int:
           refused(check_served, [{"serve_attribution": "profile", "served_by_profile_id": "q"}], "x", "p", "t"))
     check("live store: a file under the live directory is refused, a sibling directory is not",
           under(Path("/h/.khive/khive.db"), Path("/h/.khive")) and not under(Path("/h/.khive-stage/khive.db"), Path("/h/.khive")))
+    check("spread: first and last kept, evenly spaced", spread(list(range(10)), 4) == [0, 3, 6, 9])
+    check("spread: short lists come back whole", spread([1, 2], 5) == [1, 2] and spread([1, 2, 3], 0) == [])
     check("dig: finds a nested field", dig({"payload": {"data": {"signal": "useful"}}}, ("signal",)) == "useful")
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -678,7 +718,7 @@ def main() -> int:
     for name in ("run", "calibrate-replay"):
         p = sub.add_parser(name)
         p.add_argument("--kkernel", default="kkernel")
-        p.add_argument("--bank", required=True)
+        p.add_argument("--bank", required=(name == "run"))
         p.add_argument("--store-main", required=True, help="the staged copy's main store file")
         p.add_argument("--store-events", required=True, help="the staged copy's events store file")
         p.add_argument("--snapshot-id", required=True, help="written into every row")
@@ -698,6 +738,8 @@ def main() -> int:
             p.add_argument("--out", required=True, help="a new directory: <arm>.jsonl per arm and run.json")
         else:
             p.add_argument("--n", type=int, default=50)
+            p.add_argument("--queries-from-events", action="store_true",
+                           help="compare on n distinct queries the profile served (recall_executed), not a bank")
             p.add_argument("--out", required=True, help="the calibration report (JSON)")
     sub.add_parser("self-test")
     args = ap.parse_args()
@@ -705,6 +747,8 @@ def main() -> int:
         return cmd_check_bank(args)
     if args.cmd == "self-test":
         return self_test()
+    if args.cmd == "calibrate-replay" and bool(args.bank) == args.queries_from_events:
+        raise BankError("calibrate-replay takes exactly one of --bank and --queries-from-events")
     if (args.cmd == "calibrate-replay" or "feedback_asof" in args.arms.split(",")) and not args.feedback_actors:
         raise BankError("--feedback-actors is required to replay feedback events; an empty list would replay none")
     return cmd_run(args) if args.cmd == "run" else cmd_calibrate_replay(args)
