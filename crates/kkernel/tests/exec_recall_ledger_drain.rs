@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::process::Command;
 
+// The CLI actor is a raw ID; event filters use the caller's stamped label.
 const ACTOR: &str = "actor:recall-drain-fixture";
+const STAMPED_ACTOR: &str = "actor:actor:recall-drain-fixture";
 const SINCE: &str = "2000-01-01T00:00:00Z";
 const QUERY: &str = "violet saffron atlas recall canary";
 const WATCHDOG: Duration = Duration::from_secs(60);
@@ -116,7 +118,7 @@ impl Fixture {
         let mut cursors = HashSet::new();
         for _ in 0..100 {
             let mut args = json!({
-                "since": SINCE, "kind": "recall_executed", "actor": ACTOR, "limit": 1
+                "since": SINCE, "kind": "recall_executed", "actor": STAMPED_ACTOR, "limit": 1
             });
             // The cursor retains the first page's frozen until bound.
             if let Some(cursor) = after.as_ref() {
@@ -155,6 +157,7 @@ async fn exec_recall_event_is_stored_before_child_exit() {
     // 390-392 at 014e2ff0); this is a source premise, not a parent snapshot.
     let identity = fixture.exec("whoami", json!({})).await;
     assert_eq!(identity["actor_id"], ACTOR);
+    assert_eq!(identity["actor_kind"], "actor");
     assert_eq!(identity["unattributed"], false);
 
     let seed = fixture
@@ -184,7 +187,7 @@ async fn exec_recall_event_is_stored_before_child_exit() {
         .collect();
     assert_eq!(new_events.len(), 1, "one new actor-scoped recall event");
     let event = new_events[0];
-    assert_eq!(event["actor"], ACTOR);
+    assert_eq!(event["actor"], STAMPED_ACTOR);
     assert_eq!(event["verb"], "memory.recall");
     assert_eq!(event["payload"]["query"], QUERY);
     assert!(
