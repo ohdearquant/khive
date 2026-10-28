@@ -614,7 +614,6 @@ PUBLISHED_NAMES = (
     "README.md",
     "AGENTS.md",
     "CLAUDE.md",
-    "npm/README.md",
     "cli/main.ts",
     "cli/tests/golden/help_toplevel.txt",
 )

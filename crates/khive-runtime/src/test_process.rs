@@ -4,10 +4,25 @@ use khive_storage::test_support::run_exact_test_in_child;
 
 const CHILD_TEST: &str = "KHIVE_RUNTIME_ISOLATED_TEST";
 
+/// Create fixture roots without inheriting group/other write access on Unix.
+/// Callers retain the builder's parent, prefix and cleanup options.
+pub(crate) fn private_tempdir_builder() -> tempfile::Builder<'static, 'static> {
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = builder;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        builder
+    };
+    builder
+}
+
 pub(crate) fn run_in_child() -> bool {
     let mut child_fixture = None;
     let in_parent = run_exact_test_in_child(CHILD_TEST, false, |command| {
-        let fixture = tempfile::Builder::new()
+        let fixture = private_tempdir_builder()
             .prefix("kh-rt-")
             .tempdir()
             .expect("runtime child fixture");

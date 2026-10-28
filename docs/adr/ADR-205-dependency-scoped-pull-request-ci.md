@@ -1,6 +1,6 @@
 # ADR-205: Dependency-Scoped Pull-Request CI from the Code Map
 
-- **Status:** Proposed
+- **Status:** Accepted 2026-10-27
 - **Date:** 2026-10-16
 
 ## Context
@@ -131,7 +131,22 @@ Phase 1 has landed: the map registry loaded from configuration (#5612) and `code
 
 Phase 2 has landed in part (#5638): the classifier script and the Classify job's `test_scope` output (D1 to D4), the scoped `ci` job (D5), the gate reading the scope (D6), the debug `kkernel` artifact published by `main` push runs, and the retirement of the integration-only lane (D7). #5717 adds a full-suite rule for a changed file that another crate includes. The escape audit issue is #5637 (D8).
 
-Not implemented: the D3a mechanical range check for `main` pushes, and the D8 parity test against `cargo metadata`. D9's acceptance has not been read. The status stays Proposed until it is.
+D8's parity test landed in #6123 (`crates/khive-pack-code/src/source_ingest/workspace_parity_tests.rs`) and reached `main` with the merge from `dev/khive` of 2026-10-26; it runs in the full suite. Amendment 3 withdraws D3a, so no decision in D1 to D8 is waiting on code. D9's acceptance was read on 2026-10-27, below, and the record is Accepted.
+
+### D9 acceptance read (2026-10-27)
+
+Amendment 3 removes the mechanical-range condition, so D9 has four conditions.
+
+1. **Runner-minutes beside the baseline.** The population is the 20 newest completed pull-request runs of `ci.yml`, read at 2026-10-27T10:10Z, consecutive in creation order (created 03:41Z to 09:21Z; 13 succeeded, 2 failed, 5 were cancelled). Each run's runner-minutes are read as the baseline was: the sum over its jobs of completed minus started time, with skipped jobs contributing nothing. Each run's scope is the last `test_scope` line the Classify job printed. The 148-minute baseline (Context) is a mean: 2961 runner-minutes over 20 runs sampled on 2026-10-15, all of which ran to a conclusion (19 succeeded, 1 failed, none was cancelled); their median is 149.5. A cancelled run stops early, so the comparable line is the first, over the 15 runs that ran to a conclusion:
+   - the 15 that succeeded or failed: mean 176.2 (median 176.0);
+   - the 8 of those that ran the full suite: mean 215.2 (median 217.1);
+   - the 7 of those that ran a closure: mean 131.6 (median 139.7);
+   - all 20, the 5 cancelled runs included: mean 150.0 (median 141.2).
+
+   No saving is claimed: the comparable mean is 28 minutes above the baseline. A run that ran the full suite costs more than the baseline, and a scoped run costs less. On the 13 runs that succeeded, the core-only feature-set build took 31.0 to 44.4 minutes (11 in the baseline), and it was the longest job on each of the 7 scoped runs that finished; D5 does not scope it.
+2. **Parity test green on `main`.** `workspace_reverse_dependency_sets_match_cargo_metadata` passed on the Linux and macOS first shards of push run 40464282546 at a789c1b6, which ran the full suite.
+3. **A deliberately scoped run refused.** A draft pull request (#6215, closed unmerged) added one always-failing test to `khive-wire-protocol`, a crate with no dependents. Its run 40494562745 scoped the suite to that crate. The test failed and the gate failed the run.
+4. **No escape.** The read covers the runs on `main` from #5638's merge (2026-10-17T22:24Z) to 2026-10-27T12:00Z: 228 push runs and 10 scheduled runs. Each of the 6 failed runs was classified, and none is an escape. The 183 cancelled runs were read job by job, and none has a failed test job. The count is posted on #5637, and the weekly D8 count runs from Monday 2026-11-02.
 
 ## Amendment 1: Scope integration-branch pushes, and narrow three full-suite triggers (2026-10-18)
 
@@ -152,11 +167,11 @@ Markdown. Run over the 60 newest commits on `main` up to `fb10dc43`, the classif
 such as a new target or bench.
 
 In this amendment the _tested base_ of a push is the newest commit on `main` whose push or scheduled CI run concluded
-successfully as a whole, ran the full suite (its recorded scope is `full`, as D3a requires of its range start), passed
+successfully as a whole, ran the full suite (its recorded scope is `full`), passed
 Linux test shard 1, and is an ancestor of the pushed head. The documentation lane already looks up this base for pushes
-to `main` (`ci.yml`, Classify step). Until D3a's range check is implemented every run on `main` runs the full suite, so
-the newest successful run qualifies; once runs on `main` can be scoped, the lookup skips a run whose recorded scope is
-not `full`.
+to `main` (`ci.yml`, Classify step). Runs on `main` record `full`, or `docs` for a push that took the documentation
+lane, and never `scoped` (Amendment 3); the lookup takes the newest successful run that records `full` and skips the
+rest.
 
 ### Decision
 
@@ -353,3 +368,65 @@ an arm of its check, and each named mutation must turn the arm it names red.
    `b` alone omits `a`); a link present at the base and removed at the head runs the full suite; a range with no link
    in either tree is unaffected. Mutations: read modes of the changed paths only (the unchanged-link arm fails); read
    the head tree only (the removed-link arm fails).
+
+## Amendment 3: Pushes to `main` are never scoped, and D3a is withdrawn (2026-10-27)
+
+**Status**: Accepted 2026-10-27. It does not change the status of the base ADR.
+
+### Context
+
+D3a lets a push to `main` run the dependents closure instead of the full suite when every commit since the newest
+full-suite run on `main` is the squash merge of a pull request labeled `mechanical`. Three facts at `main` a789c1b6
+make it a rule that never applies:
+
+1. It was never built. The scope step in `ci.yml` scopes pull requests and pushes to `integration/**` only; every other
+   run prints "runs on <ref> are never scoped" and takes the full suite. The workflow tests pin that scheduled,
+   dispatched and other-branch runs get no comparison base, which leaves the scope at full
+   (`test_job_other_events_run_the_full_suite`). The repository has no `mechanical` label.
+2. Its input no longer reaches `main`. Feature work, moves and renames land on the `dev/khive` integration branch and
+   reach `main` in merge commits from that branch. A range that contains such a merge commit fails D3a's test by
+   construction, because a merge commit is not the squash merge of a labeled pull request. The pull requests that still
+   squash-merge into `main` directly are dependency updates, releases and fixes: of the twelve newest first-parent
+   commits on `main`, eight are squash merges of that kind and four are merges from `dev/khive`, and none is a move.
+3. D9 makes it a condition of acceptance ("a mechanical push to `main` whose range spans at least two merges has run
+   its closure"). With no mechanical pull request reaching `main`, that condition cannot be met, so this record cannot
+   be accepted as written.
+
+No push to `main` is therefore scoped to a closure today. Each runs the full suite, the outcome D3a falls back to, unless
+every path changed since its tested base is Markdown that the documentation lane admits; such a push takes that lane,
+which D3a never changed (Consequences, Neutral: "`docs_only` and the documentation lane are unchanged").
+
+### Decision
+
+1. D3a is withdrawn. No push to `main` is scoped to a dependents closure, and D3's first sentence reads "on every push
+   to `main`" with no exception. A push to `main` runs the full suite unless every path changed since its tested base is
+   Markdown that the documentation lane admits (D2), in which case it takes that lane, as it did before this amendment.
+2. Runs other than pull requests keep recording the scope their suites ran (`test-scope-full`, `test-scope-scoped`,
+   `test-scope-docs`), and Amendment 1's tested-base lookup keeps reading that record. Every successful run on `main`
+   records `full`, or `docs` for a push that took the documentation lane; none records `scoped`.
+3. D8's escape definition loses its mechanical-range clause and its last sentence. An escape remains a `main` push run
+   that fails in a crate outside the scope of the pull request that produced it, the integration-push case Amendment 1
+   adds, or a run that fails the coverage ratchet after a scoped pull request merged.
+4. D9 loses the mechanical-range condition. The rest of D9 stands: 20 consecutive pull-request runs with runner-minutes
+   read beside the baseline, the parity test green on `main`, one deliberately scoped run refused by the gate, and no
+   escape.
+5. Phase 2 no longer includes the D3a range check.
+
+If code moves reach `main` again as direct squash merges, a later amendment can restore a range rule. It counts toward
+acceptance only once the label exists and the range check is built.
+
+### Verify by
+
+1. Every successful push run on `main` that carries a scope record lists `test-scope-full` or `test-scope-docs` among
+   its artifact names, and none lists `test-scope-scoped`. Read on 2026-10-27 over the 49 successful push runs on
+   `main` since #5638 merged (2026-10-17): 33 list `test-scope-full`, 1 lists `test-scope-docs` (run 39378323211 at
+   2caac4ad), none lists `test-scope-scoped`, and the 15 with no record all ran before the first recorded run
+   (39231651652, 2026-10-19). Control, run in the same read: an integration push run whose scope was a closure lists
+   `test-scope-scoped` (run 39843379071, `integration/train-193`, does), so the read can tell them apart.
+2. Two workflow tests stay green. `test_a_main_push_is_never_scoped_even_with_a_tested_base`: the Scope step keeps
+   `full` for a push to `refs/heads/main` that has a tested base and crate changes, and prints why.
+   `test_job_main_push_compares_with_the_newest_fully_tested_main_commit`: the Classify step sends such a push to the
+   documentation lane when only Markdown changed since its tested base, and to the full suite when code did. Mutation:
+   let the Scope step take the integration branch's path for `refs/heads/main`; the first test fails and the second
+   stays green. (`test_job_other_events_run_the_full_suite` gives no comparison base to any of its runs, so a push to
+   `refs/heads/main` added there would pass without reaching either decision.)

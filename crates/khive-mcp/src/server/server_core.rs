@@ -375,3 +375,14 @@ pub(super) fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::t
     }
     Ok(std::time::Duration::from_secs(secs))
 }
+
+impl KhiveMcpServer {
+    /// Lifecycle control for the shared domain retained by the serving root.
+    pub(crate) fn background_resources_control(
+        &self,
+    ) -> Option<khive_runtime::resource_admission::BackgroundDomainControl> {
+        self.runtime
+            .as_ref()
+            .map(KhiveRuntime::background_resources_control)
+    }
+}

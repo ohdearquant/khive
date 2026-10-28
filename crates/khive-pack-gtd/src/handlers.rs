@@ -676,7 +676,8 @@ async fn fetch_all_matching_tasks(
         property_filters,
         namespaces,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
     let store = runtime.notes(token)?;
 
     let notes = store
@@ -1612,7 +1613,8 @@ impl GtdPack {
             tags: p.tags.unwrap_or_default(),
             tag_mode: p.tag_mode.unwrap_or_default(),
             ..Default::default()
-        };
+        }
+        .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
         let page = self
             .runtime()
             .notes(token)?
@@ -1820,3 +1822,67 @@ impl GtdPack {
 #[cfg(test)]
 #[path = "handlers_lifecycle_snapshot_tests.rs"]
 mod lifecycle_snapshot_tests;
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tasks_and_next_preserve_workflow_filters_but_exclude_archived_notes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(GtdPack::new(runtime.clone()));
+            let registry = builder.build().expect("actual GTD schema and hooks");
+            runtime.install_edge_rules(registry.all_edge_rules());
+            let mut expected = None;
+            for (status, priority, timestamp) in [("archived", "p0", 20), ("active", "p2", 10)] {
+                let mut note =
+                    khive_storage::note::Note::new("local", "task", format!("{status} task"));
+                note.status = status.into();
+                note.created_at = timestamp;
+                note.updated_at = timestamp;
+                note.properties =
+                    Some(json!({"status": "next", "priority": priority, "depends_on": []}));
+                if status == "active" {
+                    expected = Some(note.id);
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let expected = expected.unwrap().to_string();
+            let pack = GtdPack::new(runtime);
+            let next = pack.handle_next(&token, json!({"limit": 1})).await.unwrap();
+            let next = next.as_array().unwrap();
+            assert_eq!(next.len(), 1);
+            assert_eq!(
+                next[0]["full_id"], expected,
+                "next must not prioritize an archived actionable task"
+            );
+            let tasks = pack
+                .handle_tasks(&token, json!({"status": "next", "limit": 1}))
+                .await
+                .unwrap();
+            let tasks = tasks.as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0]["full_id"], expected,
+                "tasks must apply active note status before pagination"
+            );
+            assert_eq!(
+                tasks[0]["status"], "next",
+                "workflow status remains distinct"
+            );
+        })
+        .await
+        .expect("bounded actual GTD ordinary-query regression");
+    }
+}
