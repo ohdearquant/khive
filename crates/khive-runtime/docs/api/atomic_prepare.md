@@ -49,9 +49,9 @@ this module's own tests, and as defense in depth.
 Mirrors `khive-runtime::operations::KhiveRuntime::update_edge`'s patch semantics exactly:
 `relation`/`weight`/`properties` are the only applicable fields
 (`reject_inapplicable_update_fields`'s `"edge"` arm enforces this before any mutation), a changed
-`relation` is endpoint-validated first, `weight` is range-checked, and `properties` REPLACES
-`metadata` wholesale (no merge — `update_edge` does `edge.metadata = Some(props)`, unlike the
-entity/note branches' `merge_properties`).
+`relation` is endpoint-validated first, `weight` is range-checked, and `properties` merges
+into `metadata` at the top level with the same `merge_properties` helper the entity and note
+branches use: patch fields win, omitted fields are kept, and a `null` value is stored as `null`.
 
 DML shape:
 

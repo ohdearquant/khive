@@ -4950,3 +4950,108 @@ async fn atomic_update_edge_properties_shallow_merge_preserves_omitted_metadata(
         "atomic properties update must preserve omitted metadata keys"
     );
 }
+
+#[tokio::test]
+async fn update_edge_properties_null_value_is_stored_literally() {
+    let runtime = scratch_runtime();
+    let token = runtime
+        .authorize(Namespace::parse("local").expect("ns"))
+        .expect("authorize");
+    let entities = runtime.entities(&token).expect("entities store");
+    let a = khive_storage::Entity::new("local", "concept", "DirectNullA");
+    let b = khive_storage::Entity::new("local", "concept", "DirectNullB");
+    let (a_id, b_id) = (a.id, b.id);
+    entities.upsert_entity(a).await.expect("seed a");
+    entities.upsert_entity(b).await.expect("seed b");
+    let edge = runtime
+        .link(
+            &token,
+            a_id,
+            b_id,
+            EdgeRelation::Extends,
+            0.4,
+            Some(json!({"source": "old", "quote": "old quote", "round": 7, "lane": "keep"})),
+        )
+        .await
+        .expect("link edge with four metadata keys");
+    let edge_id = Uuid::from(edge.id);
+
+    runtime
+        .update_edge(
+            &token,
+            edge_id,
+            crate::curation::EdgePatch {
+                properties: Some(json!({"source": "new", "quote": null})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("direct properties update");
+    let persisted = runtime
+        .get_edge(&token, edge_id)
+        .await
+        .expect("read updated edge")
+        .expect("edge remains present");
+    assert_eq!(
+        persisted.metadata,
+        Some(json!({"source": "new", "quote": null, "round": 7, "lane": "keep"})),
+        "direct properties update must store literal null and preserve omitted metadata keys"
+    );
+}
+
+#[tokio::test]
+async fn atomic_update_edge_properties_null_value_is_stored_literally() {
+    let runtime = scratch_runtime();
+    let token = runtime
+        .authorize(Namespace::parse("local").expect("ns"))
+        .expect("authorize");
+    let entities = runtime.entities(&token).expect("entities store");
+    let a = khive_storage::Entity::new("local", "concept", "AtomicNullA");
+    let b = khive_storage::Entity::new("local", "concept", "AtomicNullB");
+    let (a_id, b_id) = (a.id, b.id);
+    entities.upsert_entity(a).await.expect("seed a");
+    entities.upsert_entity(b).await.expect("seed b");
+    let edge = runtime
+        .link(
+            &token,
+            a_id,
+            b_id,
+            EdgeRelation::Extends,
+            0.4,
+            Some(json!({"source": "old", "quote": "old quote", "round": 7, "lane": "keep"})),
+        )
+        .await
+        .expect("link edge with four metadata keys");
+    let edge_id = Uuid::from(edge.id);
+    let plan = prepare_update(
+        &runtime,
+        &token,
+        &json!({
+            "id": edge_id.to_string(),
+            "properties": {"source": "new", "quote": null},
+        }),
+        None,
+    )
+    .await
+    .expect("prepare atomic properties update");
+    let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+        .await
+        .expect("run atomic properties update");
+    assert!(
+        matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ),
+        "expected a clean metadata update commit: {outcome:?}"
+    );
+    let persisted = runtime
+        .get_edge(&token, edge_id)
+        .await
+        .expect("read updated edge")
+        .expect("edge remains present");
+    assert_eq!(
+        persisted.metadata,
+        Some(json!({"source": "new", "quote": null, "round": 7, "lane": "keep"})),
+        "atomic properties update must store literal null and preserve omitted metadata keys"
+    );
+}
