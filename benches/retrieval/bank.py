@@ -385,6 +385,17 @@ def adopt(args, scratch: Path, live: Path) -> list[dict]:
     return manifest
 
 
+def link_models(home: Path, models: Path) -> None:
+    """Link home/.lattice/models to models; a staged home reused by a later run keeps a link that already points there."""
+    link = home / ".lattice" / "models"
+    link.parent.mkdir(exist_ok=True)
+    if link.is_symlink() and Path(os.readlink(link)) == models:
+        return
+    if link.is_symlink() or link.exists():
+        raise BankError(f"{link} exists and is not a link to {models}")
+    os.symlink(models, link)
+
+
 def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
     """Copy the store into scratch/home/.khive (or adopt a transferred copy there), write the bench config, return
     (main db path, env, manifest rows)."""
@@ -414,8 +425,7 @@ def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
         manifest.append({"source": str(src), "staged_as": name, "bytes": dest.stat().st_size,
                          "source_mtime_ns": mtime, "sha256": sha256_file(dest)})
     if args.models_dir:
-        (home / ".lattice").mkdir()
-        os.symlink(Path(args.models_dir).resolve(), home / ".lattice" / "models")
+        link_models(home, Path(args.models_dir).resolve())
     engines = Path(args.engines_file).read_text()
     for line in engines.splitlines():
         s = line.strip()
@@ -879,6 +889,14 @@ def self_test() -> int:
         check("adopt: a staged home under the live store directory is refused", refused(adopt, a, d, (d / "home").resolve()))
         check("adopt: --remove-scratch is refused for a staged home", refused(
             scratch_dir, types.SimpleNamespace(staged_home=str(d), remove_scratch=True, bank=None), "t"))
+        models, other = d / "models", d / "other-models"
+        models.mkdir()
+        other.mkdir()
+        link_models(d / "home", models)
+        check("models: a reused home keeps a link to the same models directory",
+              not refused(link_models, d / "home", models)
+              and os.readlink(d / "home" / ".lattice" / "models") == str(models))
+        check("models: a reused home whose link points elsewhere is refused", refused(link_models, d / "home", other))
     check("spread: first and last kept, evenly spaced", spread(list(range(10)), 4) == [0, 3, 6, 9])
     check("spread: short lists come back whole", spread([1, 2], 5) == [1, 2] and spread([1, 2, 3], 0) == [])
     check("dig: finds a nested field", dig({"payload": {"data": {"signal": "useful"}}}, ("signal",)) == "useful")
