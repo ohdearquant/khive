@@ -75,19 +75,6 @@ pub enum NoteKeyAssignOutcome {
     NotFound,
 }
 
-#[cfg(test)]
-mod note_key_validation_tests {
-    use super::note_key_is_valid;
-
-    #[test]
-    fn key_limit_counts_utf8_bytes_and_rejects_nul() {
-        assert!(note_key_is_valid(""));
-        assert!(note_key_is_valid(&"é".repeat(256)));
-        assert!(!note_key_is_valid(&"a".repeat(513)));
-        assert!(!note_key_is_valid("before\0after"));
-    }
-}
-
 const fn initial_note_version() -> i64 {
     1
 }

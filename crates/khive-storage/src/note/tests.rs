@@ -382,3 +382,11 @@ async fn bounded_snapshot_count_default_is_fail_closed_without_query_fallback() 
         "bounded snapshot count must not compose independent page queries"
     );
 }
+
+#[test]
+fn key_limit_counts_utf8_bytes_and_rejects_nul() {
+    assert!(note_key_is_valid(""));
+    assert!(note_key_is_valid(&"é".repeat(256)));
+    assert!(!note_key_is_valid(&"a".repeat(513)));
+    assert!(!note_key_is_valid("before\0after"));
+}
