@@ -556,11 +556,13 @@ async fn mirror_non_utf8_diagnostic_masks_credential_path() {
             relative,
             "non-UTF8 diagnostic must be masked"
         );
-        assert!(
-            summary.skipped_non_utf8[0]
-                .starts_with(std::path::Path::new(".khive").join("notes"))
-                && shown.ends_with(".md"),
-            "non-UTF8 diagnostic must retain its safe relative prefix and suffix"
+        assert_eq!(
+            shown,
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+                &relative,
+            ),
+            "non-UTF8 diagnostic must use the canonical whole-path mask"
         );
         assert!(!format!("{summary:?}").contains(SECRET));
     })
@@ -604,11 +606,13 @@ async fn mirror_link_diagnostic_masks_credential_path() {
             relative,
             "link diagnostic must be masked"
         );
-        assert!(
-            summary.skipped_entries[0]
-                .starts_with(std::path::Path::new(".khive").join("notes"))
-                && shown.ends_with(".md"),
-            "link diagnostic must retain its safe relative prefix and suffix"
+        assert_eq!(
+            shown,
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+                &relative,
+            ),
+            "link diagnostic must use the canonical whole-path mask"
         );
         assert!(!format!("{summary:?}").contains(SECRET));
         assert!(!format!("{:?}", mirror_documents(&runtime, &token).await)
@@ -668,11 +672,13 @@ async fn mirror_no_current_diagnostic_masks_credential_path() {
             relative,
             "no-current diagnostic must be masked"
         );
-        assert!(
-            summary.skipped_no_current[0]
-                .starts_with(std::path::Path::new(".khive").join("notes"))
-                && shown.ends_with(".md"),
-            "no-current diagnostic must retain its safe relative prefix and suffix"
+        assert_eq!(
+            shown,
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+                &relative,
+            ),
+            "no-current diagnostic must use the canonical whole-path mask"
         );
         assert!(!format!("{summary:?}").contains(SECRET));
         assert_eq!(
