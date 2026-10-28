@@ -714,7 +714,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 name: "properties",
                 param_type: "object",
                 required: false,
-                description: "Properties to merge in (shallow merge).",
+                description: "Properties to merge in at the top level: each patch key replaces the stored value, omitted keys are kept, and a null value is stored as null. No key is removed through update.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

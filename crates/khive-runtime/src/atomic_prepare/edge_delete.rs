@@ -12,6 +12,18 @@ use super::{
     UpdatePlan, Uuid, Value,
 };
 
+impl KhiveRuntime {
+    /// Merge an edge properties patch; omitted keys survive and null stays literal.
+    pub(crate) fn merge_edge_properties(metadata: &Option<Value>, patch: Value) -> Option<Value> {
+        crate::curation::merge_properties(
+            metadata,
+            &Some(patch),
+            crate::curation::EntityDedupMergePolicy::PreferFrom,
+        )
+        .0
+    }
+}
+
 /// Edge branch of `prepare_update`. Mirrors `KhiveRuntime::update_edge`'s
 /// patch semantics: `relation`/`weight`/`properties` are the only applicable
 /// fields, a changed `relation` is endpoint-validated first, `weight` is
@@ -79,13 +91,7 @@ pub(super) async fn prepare_update_edge(
         changed_fields.push("weight");
     }
     if let Some(p) = properties {
-        let incoming = Some(p);
-        let (merged, _) = crate::curation::merge_properties(
-            &edge.metadata,
-            &incoming,
-            crate::curation::EntityDedupMergePolicy::PreferFrom,
-        );
-        edge.metadata = merged;
+        edge.metadata = KhiveRuntime::merge_edge_properties(&edge.metadata, p);
         changed_fields.push("properties");
     }
 
