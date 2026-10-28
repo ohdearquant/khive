@@ -134,21 +134,22 @@ mod tests {
             ),
             "the fixture producer must still be held at return"
         );
-        let captured = events.lock().unwrap();
-        let matching: Vec<_> = captured
-            .iter()
-            .filter(|fields| {
-                fields
-                    .text
-                    .contains("exec: recall ledger producers did not settle before audit shutdown")
-            })
-            .collect();
-        assert_eq!(matching.len(), 1, "expected exactly one drain warning");
-        assert!(
-            matches!(matching[0].pending, Some(count) if count > 0),
-            "warning must report a positive pending count"
-        );
-        drop(captured);
+        {
+            let captured = events.lock().unwrap();
+            let matching: Vec<_> = captured
+                .iter()
+                .filter(|fields| {
+                    fields.text.contains(
+                        "exec: recall ledger producers did not settle before audit shutdown",
+                    )
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "expected exactly one drain warning");
+            assert!(
+                matches!(matching[0].pending, Some(count) if count > 0),
+                "warning must report a positive pending count"
+            );
+        }
         drop(release);
         tokio::time::timeout(Duration::from_secs(2), finished_rx)
             .await
