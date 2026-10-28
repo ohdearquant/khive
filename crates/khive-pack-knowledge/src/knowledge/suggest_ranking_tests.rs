@@ -414,19 +414,21 @@ tokio::task_local! {
 }
 
 fn cohort_vector(text: &str) -> Vec<f32> {
+    let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
     // These nonce terms occur in no fixture name/content. The semantic query
     // remains nonzero even if the provider adds a role prefix to the text.
     if text.contains(COMPOSE_COHORT_QUERY) {
-        let mut query = vec![0.0; DIM.max(10)];
+        let mut query = vec![0.0; dimensions];
         query[0] = 1.0;
         return query;
     }
     let Some(marker) = text.find(COMPOSE_COHORT_MARKER) else {
-        let topic = text_to_vector(text);
+        let mut topic = text_to_vector(text);
         if topic.iter().any(|value| *value != 0.0) {
+            topic.resize(dimensions, 0.0);
             return topic;
         }
-        let mut neutral = vec![0.0; DIM.max(10)];
+        let mut neutral = vec![0.0; dimensions];
         neutral[2] = 1.0;
         return neutral;
     };
@@ -435,7 +437,7 @@ fn cohort_vector(text: &str) -> Vec<f32> {
         .and_then(|digits| digits.parse::<usize>().ok())
         .expect("fixture domain ordinal");
     assert!(ordinal < COMPOSE_COHORT_DOMAINS);
-    let mut vector = vec![0.0; DIM.max(10)];
+    let mut vector = vec![0.0; dimensions];
     vector[0] = 1.0;
     vector[1] = (COMPOSE_COHORT_DOMAINS - ordinal) as f32 / COMPOSE_COHORT_DOMAINS as f32;
     vector
@@ -481,7 +483,7 @@ impl EmbedderProvider for CohortEmbedProvider {
     }
 
     fn dimensions(&self) -> usize {
-        DIM.max(10)
+        EmbeddingModel::AllMiniLmL6V2.dimensions()
     }
 
     async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
@@ -597,7 +599,21 @@ async fn compose_presentation_limit_preserves_rerank_cohort_and_selected_prefix(
         ..RuntimeConfig::no_embeddings()
     })
     .expect("cohort in-memory runtime");
-    runtime.register_embedder(CohortEmbedProvider);
+    runtime
+        .try_register_embedder(CohortEmbedProvider)
+        .expect("register deterministic cohort provider before first resolution");
+    // Probe the same generic embedding boundary used by fresh reranking before
+    // seeding/indexing; this query has no marker and runs outside capture scope.
+    let probe_texts = vec![COMPOSE_COHORT_QUERY.to_owned()];
+    let probe_vectors = runtime
+        .embed_batch(&probe_texts)
+        .await
+        .expect("deterministic cohort provider probe");
+    assert_eq!(
+        probe_vectors,
+        vec![cohort_vector(COMPOSE_COHORT_QUERY)],
+        "cohort fixture must use the registered deterministic provider"
+    );
     let seed_registry = build_registry(&runtime);
     seed_compose_cohort(&runtime, &seed_registry).await;
     let index_result = seed_registry
