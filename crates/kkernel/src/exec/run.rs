@@ -581,7 +581,7 @@ const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// the joins) plus `code_ingest.rs`'s reason for awaiting a
 /// writer-task join at all before returning:
 ///
-/// 1. Drain the ADR-133 audit-batch supervisor first
+/// 1. After the bounded recall wait, drain the ADR-133 audit-batch supervisor
 ///    (`KhiveMcpServer::shutdown_audit_batch`), following the shutdown
 ///    order `VerbRegistry::shutdown_audit_batch` documents. The supervisor
 ///    is a detached task that holds a clone of the audit `EventStore`
@@ -614,6 +614,7 @@ const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// a read-only reader, so the last real closer can always take the
 /// EXCLUSIVE lock SQLite needs to checkpoint.
 async fn settle_exec_storage_before_return(server: KhiveMcpServer) {
+    super::recall_drain::wait_for_pending(EXEC_STORAGE_SETTLE_TIMEOUT).await;
     if let Err(reason) = server.shutdown_audit_batch().await {
         tracing::warn!(
             target: "kkernel::exec",
