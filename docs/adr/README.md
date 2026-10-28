@@ -336,6 +336,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-014 Amendment 8](ADR-014-curation-operations.md#amendment-8-edge-property-updates-merge-at-the-top-level-6243) (2026-10-28): proposed top-level merge of an edge `update`'s `properties` into the stored metadata on the direct and prepared atomic paths, with the rule entity and note updates use; a `null` value is stored as `null` (#6243).
 - [ADR-015 amendment: live entity list indexes](ADR-015-schema-migrations.md#proposed-amendment-live-entity-list-indexes-2026-10-04) (2026-10-04): proposed V50 live entity namespace/order and namespace/type/order indexes, bounded eligible first-page plans, and one unforced retry for a missing index (#3689).
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
 - [ADR-031 Amendment 5](ADR-031-multi-engine-retrieval.md#amendment-5-2026-10-08-ordered-peer-engines-and-explicit-retrieval-strategies) (2026-10-08): proposed ordered peer `[[engines]]`, a per-query retrieval strategy that is always resolved and disclosed, weighted reciprocal rank fusion, and a shared executor in khive-retrieval.
