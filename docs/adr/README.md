@@ -374,6 +374,7 @@ Amendments to accepted records:
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
 - [ADR-180 Amendment 8](ADR-180-tool-pack.md#amendment-8-2026-10-27-an-approval-can-cover-one-program-run-by-an-interpreter) (2026-10-27): proposed program definition on interpreter registrations: fixed arguments (literals and input-tree files with their content refs), an explicit suffix policy and an optional tree id, joined to the pinned inputs only on rows that carry them; a revised program is a new registration; `exec.run` builds the argument vector from the stored definition and refuses a mismatch whatever answered the policy question; program rows pin and stage the interpreter; amends ADR-181 Amendment 14 item 1 for one property.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
+- [ADR-212 Amendment 1](ADR-212-expendable-event-retention-class.md#amendment-1-2026-10-28----an-interim-historical-prune-before-implementation) (2026-10-28): proposed record of the interim historical prune run before implementation, its edge-writer precondition and compensating read; it authorizes no further interim run.
 
 Amendments inside records whose own status is Proposed:
 
