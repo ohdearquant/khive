@@ -3,8 +3,9 @@
 //! Main-assigned runtimes only. Each file commits document/lexical index/edge
 //! and cursor together; post-commit effect failures remain committed outcomes.
 //! Tree reads are synchronous, streamed, and not an adversarial snapshot.
+//! A `from_backend` runtime uses the same SQLite backend for typed stores,
+//! the head query and the writer fence; secondary assignments are refused.
 
-use std::collections::HashSet;
 use std::fmt;
 #[cfg(not(unix))]
 use std::fs;
@@ -16,16 +17,13 @@ use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_runtime::{BackendId, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::types::{
-    EdgeFilter, EdgeSortField, PageRequest, SortDirection, SortOrder, StorageResult,
-};
-use khive_storage::{
-    EntityFilter, SqlStatement, SqlValue, SqlWriter, StorageCapability, StorageError,
-};
+use khive_storage::types::StorageResult;
+use khive_storage::{SqlStatement, SqlValue, SqlWriter, StorageCapability, StorageError};
 use khive_types::{EdgeRelation, Hash32, Id128};
 
 use crate::{cursor, WorkspaceMirrorConfig};
 
+#[cfg(test)]
 pub(crate) const HISTORY_PAGE_SIZE: u32 = 50;
 
 /// Confirmed commits, unchanged files, and included paths skipped for invalid UTF-8.
@@ -55,8 +53,8 @@ fn masked_diagnostic(path: &Path) -> PathBuf {
     )
 }
 
-#[derive(Clone, Copy)]
-enum PreviousDocument {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreviousDocument {
     Absent,
     Ambiguous,
     Current(Id128),
@@ -196,99 +194,90 @@ pub(crate) fn cursor_key(namespace: &str, source_uri: &str) -> String {
     format!("{}:{namespace}{source_uri}", namespace.len())
 }
 
-fn next_offset(offset: u64, count: usize) -> Result<u64, RuntimeError> {
-    offset
-        .checked_add(
-            u64::try_from(count)
-                .map_err(|_| invalid("workspace mirror history offset overflow"))?,
-        )
-        .filter(|next| *next <= i64::MAX as u64)
-        .ok_or_else(|| invalid("workspace mirror history offset overflow"))
-}
-
-/// Lookup work is linear in this source URI's history, per file, per pass.
+/// Capture history presence and current-head cardinality in one read snapshot.
+/// The row result is bounded to one; identifying heads may still inspect this
+/// source URI's complete history and its matching supersedes edges.
 async fn previous_document(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     uri: &str,
+    #[cfg(test)] hook: Option<&mut HeadReadHook>,
 ) -> Result<PreviousDocument, RuntimeError> {
     let namespace = token.namespace().as_str();
-    let store = runtime.entities(token)?;
-    let filter = EntityFilter {
-        kinds: vec!["document".to_owned()],
-        namespaces: vec![namespace.to_owned()],
-        ..EntityFilter::default()
-    }
-    .property_eq(
-        "$.source_uri",
-        khive_storage::types::SqlValue::Text(uri.to_owned()),
-    );
-    let mut history = HashSet::new();
-    let mut offset = 0;
-    loop {
-        let page = store
-            .query_entities(
-                namespace,
-                filter.clone(),
-                PageRequest {
-                    offset,
-                    limit: HISTORY_PAGE_SIZE,
-                },
-            )
-            .await?;
-        if page.items.is_empty() {
-            break;
+    // Preserve the typed entity accessor's namespace/access check.
+    let _ = runtime.entities(token)?;
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: include_str!("../sql/workspace_mirror_previous_document.sql").into(),
+            params: vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text("$.source_uri".to_owned()),
+                SqlValue::Text(uri.to_owned()),
+                SqlValue::Text(EdgeRelation::Supersedes.to_string()),
+            ],
+            label: Some("workspace_mirror_previous_document".into()),
+        })
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::Internal("workspace mirror head query returned no row".into())
+        })?;
+    drop(reader);
+
+    // The test-only seam holds a completed observation before any write attempt.
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        if let Some(reached) = hook.reached.take() {
+            let _ = reached.send(());
         }
-        offset = next_offset(offset, page.items.len())?;
-        history.extend(page.items.into_iter().map(|entity| entity.id));
+        if let Some(release) = hook.release.take() {
+            release.await.map_err(|_| {
+                RuntimeError::Internal("workspace mirror head test release dropped".into())
+            })?;
+        }
     }
-    if history.is_empty() {
+
+    let history = match row.get("has_history") {
+        Some(SqlValue::Integer(value)) if *value == 0 || *value == 1 => *value,
+        _ => {
+            return Err(RuntimeError::Internal(
+                "workspace mirror head query returned invalid history".into(),
+            ))
+        }
+    };
+    if history == 0 {
         return Ok(PreviousDocument::Absent);
     }
-    let targets: Vec<_> = history.iter().copied().collect();
-    let mut heads = history;
-    let graph = runtime.graph(token)?;
-    let namespaces = vec![namespace.to_owned()];
-    for chunk in targets.chunks(HISTORY_PAGE_SIZE as usize) {
-        let filter = EdgeFilter {
-            ids: vec![],
-            source_ids: vec![],
-            target_ids: chunk.to_vec(),
-            relations: vec![EdgeRelation::Supersedes],
-            min_weight: None,
-            max_weight: None,
-            created_at: None,
-        };
-        let mut offset = 0;
-        loop {
-            let page = graph
-                .query_edges_in_namespaces(
-                    &namespaces,
-                    filter.clone(),
-                    vec![SortOrder {
-                        field: EdgeSortField::CreatedAt,
-                        direction: SortDirection::Asc,
-                    }],
-                    PageRequest {
-                        offset,
-                        limit: HISTORY_PAGE_SIZE,
-                    },
-                )
-                .await?;
-            if page.items.is_empty() {
-                break;
-            }
-            offset = next_offset(offset, page.items.len())?;
-            for edge in page.items {
-                heads.remove(&edge.target_id);
-            }
+    // Preserve the typed graph accessor's check for nonempty history.
+    let _ = runtime.graph(token)?;
+    match (row.get("head_count"), row.get("head_id")) {
+        (Some(SqlValue::Integer(1)), Some(SqlValue::Text(id))) => {
+            let id = id.parse::<Id128>().map_err(|_| {
+                RuntimeError::Internal("workspace mirror head has an invalid id".into())
+            })?;
+            Ok(PreviousDocument::Current(id))
         }
+        (Some(SqlValue::Integer(0 | 2)), _) => Ok(PreviousDocument::Ambiguous),
+        _ => Err(RuntimeError::Internal(
+            "workspace mirror head query returned invalid cardinality".into(),
+        )),
     }
-    if heads.len() != 1 {
-        return Ok(PreviousDocument::Ambiguous);
-    }
-    let id = heads.into_iter().next().expect("one current head");
-    Ok(PreviousDocument::Current(Id128::from_bytes(*id.as_bytes())))
+}
+
+#[cfg(test)]
+pub(crate) struct HeadReadHook {
+    pub reached: Option<tokio::sync::oneshot::Sender<()>>,
+    pub release: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+pub(crate) async fn previous_document_for_test(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    uri: &str,
+) -> Result<PreviousDocument, RuntimeError> {
+    previous_document(runtime, token, uri, None).await
 }
 
 struct CursorAdvance {
@@ -455,7 +444,8 @@ pub async fn mirror_directory_once(
 ) -> Result<MirrorPassSummary, MirrorPassError> {
     #[cfg(test)]
     {
-        mirror_directory_once_inner(runtime, registry, token, project_root, config, None).await
+        mirror_directory_once_inner(runtime, registry, token, project_root, config, None, None)
+            .await
     }
     #[cfg(not(test))]
     {
@@ -472,7 +462,37 @@ pub(crate) async fn mirror_directory_once_with_hook(
     config: &WorkspaceMirrorConfig,
     hook: &mut (dyn FnMut(&Path) + Send),
 ) -> Result<MirrorPassSummary, MirrorPassError> {
-    mirror_directory_once_inner(runtime, registry, token, project_root, config, Some(hook)).await
+    mirror_directory_once_inner(
+        runtime,
+        registry,
+        token,
+        project_root,
+        config,
+        Some(hook),
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn mirror_directory_once_with_head_hook(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    project_root: &Path,
+    config: &WorkspaceMirrorConfig,
+    hook: &mut HeadReadHook,
+) -> Result<MirrorPassSummary, MirrorPassError> {
+    mirror_directory_once_inner(
+        runtime,
+        registry,
+        token,
+        project_root,
+        config,
+        None,
+        Some(hook),
+    )
+    .await
 }
 
 async fn mirror_directory_once_inner(
@@ -482,6 +502,7 @@ async fn mirror_directory_once_inner(
     project_root: &Path,
     config: &WorkspaceMirrorConfig,
     #[cfg(test)] mut before_open: Option<&mut (dyn FnMut(&Path) + Send)>,
+    #[cfg(test)] mut head_hook: Option<&mut HeadReadHook>,
 ) -> Result<MirrorPassSummary, MirrorPassError> {
     let mut progress = MirrorPassSummary::default();
     if runtime.backend_id().as_str() != BackendId::MAIN {
@@ -711,16 +732,13 @@ async fn mirror_directory_once_inner(
                 )
             })?
         };
-        let previous = previous_document(runtime, token, &uri)
-            .await
-            .map_err(|error| {
-                MirrorPassError::runtime(
-                    &progress,
-                    Some(&path),
-                    FileCommitState::NotAttempted,
-                    error,
-                )
-            })?;
+        #[cfg(test)]
+        let previous = previous_document(runtime, token, &uri, head_hook.as_deref_mut()).await;
+        #[cfg(not(test))]
+        let previous = previous_document(runtime, token, &uri).await;
+        let previous = previous.map_err(|error| {
+            MirrorPassError::runtime(&progress, Some(&path), FileCommitState::NotAttempted, error)
+        })?;
         let previous = match previous {
             PreviousDocument::Ambiguous => {
                 progress

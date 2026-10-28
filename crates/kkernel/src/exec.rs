@@ -72,6 +72,7 @@ mod args;
 mod ops_file_apply;
 mod ops_file_validate;
 mod plan;
+mod recall_drain;
 mod refusal;
 mod run;
 
