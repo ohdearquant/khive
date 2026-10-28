@@ -1454,63 +1454,110 @@ fn writer_stage_backend_key_preserves_non_utf8_path_bytes() {
     );
 }
 
-/// #1849: a deliberately slow transaction body with no queue backlog or
-/// lock contention must be attributed to `body`, not flattened into one
-/// opaque send-to-reply duration.
-#[tokio::test]
-async fn writer_stage_sample_attributes_a_slow_body() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("writer_stage_sample.db");
-    // A lock directory of its own keeps this deliberate writer hold off the
-    // volume lease the other tests in this process share.
-    let pool = ConnectionPool::new(PoolConfig {
-        path: Some(path.clone()),
-        volume_lock_dir: Some(dir.path().join("volume-locks")),
-        ..PoolConfig::for_test()
-    })
-    .expect("pool open");
-    {
-        let writer = pool.try_writer().unwrap();
-        writer
-            .conn()
-            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-            .unwrap();
+// A clock belongs to one request, so parallel tests cannot affect its samples.
+struct ControlledWriterClock {
+    origin: std::time::Instant,
+    micros: std::sync::atomic::AtomicU64,
+}
+
+impl TestWriterStageClock for ControlledWriterClock {
+    fn now(&self) -> std::time::Instant {
+        self.origin + Duration::from_micros(self.micros.load(Ordering::SeqCst))
     }
-    let handle = spawn(&pool, 8).unwrap();
 
-    // The delay must dwarf a COMMIT on a slow disk (an fsync of a few
-    // hundred milliseconds has been observed on shared runners), or the
-    // commit-stage comparison below reads the disk instead of the body.
-    handle
-        .send(|conn| {
-            std::thread::sleep(Duration::from_millis(400));
-            conn.execute("INSERT INTO t VALUES (1)", [])
-                .map_err(|error| StorageError::Pool {
-                    operation: "writer_stage_sample".into(),
-                    message: error.to_string(),
-                })
-        })
-        .await
+    fn at_commit(&self) {
+        self.micros.fetch_add(11_000, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
-
-    let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
-    assert!(
-        sample.body_micros >= 350_000,
-        "the synthetic delay must land in the body stage: {sample:?}"
+    let dir = tempfile::tempdir().unwrap();
+    // Used only as a unique observation key; no database is opened at this path.
+    let key = Some(dir.path().join("observation"));
+    let clock = Arc::new(ControlledWriterClock {
+        origin: std::time::Instant::now(),
+        micros: std::sync::atomic::AtomicU64::new(0),
+    });
+    let body_clock = Arc::clone(&clock);
+    let mut telemetry =
+        WriteTelemetry::new(key.clone(), "test".into(), 0, None, SubmitLabels::None);
+    telemetry.test_clock = Some(clock);
+    let (reply_tx, mut reply_rx) = oneshot::channel();
+    let request = WriteRequest {
+        op: Box::new(move |conn| {
+            body_clock.micros.fetch_add(37_000, Ordering::SeqCst);
+            conn.execute("INSERT INTO t VALUES (1)", [])
+                .map_err(|e| StorageError::Pool {
+                    operation: "controlled_body".into(),
+                    message: e.to_string(),
+                })
+        }),
+        reply: reply_tx,
+        top_level: false,
+        checkpoint_bypass: false,
+        vacuum_copy_headroom: false,
+        telemetry,
+        admission: None,
+    };
+    let terminal = sealed::Sealed::execute_and_reply_reporting_terminal(
+        Box::new(request),
+        &conn,
+        None,
+        Duration::from_micros(7_000),
+        Duration::from_micros(13_000),
     );
-    assert!(
-        sample.body_micros > sample.queue_wait_micros,
-        "fast queueing must not receive the body's delay: {sample:?}"
-    );
-    assert!(
-        sample.body_micros > sample.transaction_acquire_micros,
-        "an uncontended BEGIN must not receive the body's delay: {sample:?}"
-    );
-    assert!(
-        sample.body_micros > sample.commit_micros,
-        "a fast COMMIT must not receive the body's delay: {sample:?}"
-    );
+    assert!(terminal.is_none());
+    assert_eq!(reply_rx.try_recv().unwrap().unwrap(), 1);
+    assert!(conn.is_autocommit());
+    let sample = writer_stage_observations()
+        .lock()
+        .unwrap()
+        .remove(&key)
+        .unwrap();
+    assert_eq!(sample.queue_wait_micros, 7_000);
+    assert_eq!(sample.transaction_acquire_micros, 13_000);
+    assert_eq!(sample.body_micros, 37_000);
+    assert_eq!(sample.commit_micros, 11_000);
     assert!(sample.observed_at_unix_ms > 0);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn wrapped_transaction_synthetic_commit_and_rollback() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+        .unwrap();
+    let (result, terminal) = execute_wrapped_transaction(&conn, "test_commit", |conn| {
+        conn.execute("INSERT INTO t VALUES (1)", [])
+            .map_err(|e| StorageError::Pool {
+                operation: "test_insert".into(),
+                message: e.to_string(),
+            })
+    });
+    assert_eq!(result.unwrap(), 1);
+    assert!(terminal.is_none());
+    assert!(conn.is_autocommit());
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (result, terminal) = execute_wrapped_transaction(&conn, "test_commit", |conn| {
+        conn.execute_batch("INSERT INTO t VALUES (2)").unwrap();
+        Err::<(), _>(StorageError::Internal("synthetic failure".into()))
+    });
+    assert!(result.is_err());
+    assert!(terminal.is_none());
+    assert!(conn.is_autocommit());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 /// #1849: bounded-channel queue wait ends when the drain loop receives
