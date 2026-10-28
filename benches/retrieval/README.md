@@ -157,8 +157,11 @@ source under the caller's `~/.khive` is refused, and so is one with a non-empty 
 no process writes it. A source whose inode, size or modification time changes during its copy stops the run. The
 run starts only at normal memory pressure, read before the copy and again before the server starts. The scratch
 home is kept by default, and the record names its path and the staged files' sha256 before and after the run;
-`--remove-scratch` removes it. Every recall passes `created_before = T`, and a hit created at or after `T` stops the
-run.
+`--remove-scratch` removes it. On another machine, `--staged-home <dir>` serves a copy already placed at
+`<dir>/home/.khive/` by a guarded transfer instead of copying it again: `<dir>/transfer.json` must carry verdict
+`ok`, the same snapshot id, and each file's size and sha256, which are checked before anything is written, and a copy
+with a `-wal` or `-shm` sidecar (one a server has already opened) is refused. That directory is never removed.
+Every recall passes `created_before = T`, and a hit created at or after `T` stops the run.
 Arms: three fusion strategies with configured
 defaults (no binding row), a named profile against configured defaults, a profile with no feedback events, a profile
 fed the named profile's explicit feedback events created before each case's `T`, and a fusion of recall with

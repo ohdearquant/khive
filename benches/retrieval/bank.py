@@ -76,6 +76,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -354,14 +355,49 @@ def require_normal_pressure(when: str) -> dict:
     return p
 
 
+def adopt(args, scratch: Path, live: Path) -> list[dict]:
+    """Verify a store copy a guarded transfer already placed at scratch/home/.khive, in place; return manifest rows."""
+    kdir = scratch / "home" / ".khive"
+    if under(kdir.resolve(), live):
+        raise BankError(f"refusing {kdir}: it is under the caller's live store directory {live}")
+    try:
+        rec = json.loads((scratch / "transfer.json").read_text())
+    except (OSError, ValueError) as e:
+        raise BankError(f"--staged-home needs its transfer record {scratch / 'transfer.json'}: {e!r}")
+    if rec.get("verdict") != "ok":
+        raise BankError(f"the transfer record's verdict is {rec.get('verdict')!r}, not 'ok'")
+    if rec.get("snapshot_id") != args.snapshot_id:
+        raise BankError(f"--snapshot-id {args.snapshot_id} is not the transfer's {rec.get('snapshot_id')}")
+    rows = {f.get("staged_as"): f for f in rec.get("files", [])}
+    manifest = []
+    for name in ("khive.db", "khive.db.events.db"):
+        f, row = kdir / name, rows.get(name)
+        if row is None:
+            raise BankError(f"the transfer record has no {name}")
+        for side in ("-wal", "-shm"):
+            if Path(str(f) + side).exists():
+                raise BankError(f"refusing {f}: {name}{side} exists, so a server has opened this copy and it is no "
+                                "longer the transferred snapshot")
+        if not f.is_file() or f.stat().st_size != row["bytes"] or sha256_file(f) != row["sha256"]:
+            raise BankError(f"refusing {f}: it is not the {row['bytes']}-byte file with sha256 {row['sha256']} the "
+                            "transfer recorded")
+        manifest.append({**row, "adopted_in_place": str(f)})
+    return manifest
+
+
 def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
-    """Copy the store into scratch/home/.khive, write the bench config, return (main db path, env, manifest rows)."""
+    """Copy the store into scratch/home/.khive (or adopt a transferred copy there), write the bench config, return
+    (main db path, env, manifest rows)."""
     live = Path(os.path.expanduser("~/.khive")).resolve()
     home = scratch / "home"
     kdir = home / ".khive"
-    (kdir / "vol-locks").mkdir(parents=True)
-    manifest = []
-    for src, name in ((args.store_main, "khive.db"), (args.store_events, "khive.db.events.db")):
+    if args.staged_home:
+        manifest, sources = adopt(args, scratch, live), ()
+        (kdir / "vol-locks").mkdir(exist_ok=True)
+    else:
+        (kdir / "vol-locks").mkdir(parents=True)
+        manifest, sources = [], ((args.store_main, "khive.db"), (args.store_events, "khive.db.events.db"))
+    for src, name in sources:
         src = Path(src).resolve()
         if under(src, live):
             raise BankError(f"refusing {src}: it is under the caller's live store directory {live}")
@@ -413,7 +449,7 @@ def finish_scratch(args, scratch: Path, record: dict) -> None:
     """Record where the scratch home is and what it holds now; remove it only under --remove-scratch."""
     kdir = scratch / "home" / ".khive"
     holds_store = any((kdir / n).exists() for n in ("khive.db", "khive.db.events.db"))
-    record["scratch"] = {"path": str(scratch), "kept": holds_store and not args.remove_scratch}
+    record["scratch"] = {"path": str(scratch), "kept": bool(args.staged_home) or (holds_store and not args.remove_scratch)}
     if record["scratch"]["kept"]:
         record["scratch"]["after_run"] = staged_state(scratch)
     else:
@@ -590,6 +626,10 @@ def scratch_dir(args, run_id: str) -> Path:
         raise BankError("refusing to run with KHIVE_DB set in the caller's environment; unset it")
     if args.bank:
         load_bank(Path(args.bank))
+    if args.staged_home:
+        if args.remove_scratch:
+            raise BankError("--remove-scratch does not apply to --staged-home: the runner did not make that copy")
+        return Path(args.staged_home).resolve()
     return Path(tempfile.mkdtemp(prefix=f"khive-question-bank-{run_id}-", dir=args.scratch_parent))
 
 
@@ -809,6 +849,36 @@ def self_test() -> int:
             check("copy: a source that grows during its copy is refused", refused(copy_at_rest, src, Path(d) / "d2.db"))
         finally:
             shutil.copyfile = real_copy
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        kdir = d / "home" / ".khive"
+        kdir.mkdir(parents=True)
+        files = []
+        for name, body in (("khive.db", b"m" * 4096), ("khive.db.events.db", b"e" * 8192)):
+            (kdir / name).write_bytes(body)
+            files.append({"source": f"/src/{name}", "staged_as": name, "bytes": len(body), "source_mtime_ns": 1,
+                          "sha256": sha256_file(kdir / name)})
+        record = {"verdict": "ok", "snapshot_id": "snap", "files": files}
+        (d / "transfer.json").write_text(json.dumps(record))
+        a = types.SimpleNamespace(snapshot_id="snap", staged_home=str(d), remove_scratch=False)
+        live = d / "elsewhere" / ".khive"
+        rows = adopt(a, d, live)
+        check("adopt: a copy matching its transfer record is used in place",
+              [r["adopted_in_place"] for r in rows] == [str(kdir / "khive.db"), str(kdir / "khive.db.events.db")])
+        check("adopt: a snapshot id other than the transfer's is refused",
+              refused(adopt, types.SimpleNamespace(snapshot_id="other", staged_home=str(d)), d, live))
+        (kdir / "khive.db.events.db").write_bytes(b"E" * 8192)
+        check("adopt: a same-size copy whose bytes differ is refused", refused(adopt, a, d, live))
+        (kdir / "khive.db.events.db").write_bytes(b"e" * 8192)
+        (kdir / "khive.db-wal").write_bytes(b"")
+        check("adopt: a copy a server has opened (a sidecar exists) is refused", refused(adopt, a, d, live))
+        (kdir / "khive.db-wal").unlink()
+        (d / "transfer.json").write_text(json.dumps({**record, "verdict": "refused"}))
+        check("adopt: a transfer whose own verdict is not ok is refused", refused(adopt, a, d, live))
+        (d / "transfer.json").write_text(json.dumps(record))
+        check("adopt: a staged home under the live store directory is refused", refused(adopt, a, d, (d / "home").resolve()))
+        check("adopt: --remove-scratch is refused for a staged home", refused(
+            scratch_dir, types.SimpleNamespace(staged_home=str(d), remove_scratch=True, bank=None), "t"))
     check("spread: first and last kept, evenly spaced", spread(list(range(10)), 4) == [0, 3, 6, 9])
     check("spread: short lists come back whole", spread([1, 2], 5) == [1, 2] and spread([1, 2, 3], 0) == [])
     check("dig: finds a nested field", dig({"payload": {"data": {"signal": "useful"}}}, ("signal",)) == "useful")
@@ -845,8 +915,11 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--kkernel", default="kkernel")
         p.add_argument("--bank", required=(name == "run"))
-        p.add_argument("--store-main", required=True, help="the staged copy's main store file")
-        p.add_argument("--store-events", required=True, help="the staged copy's events store file")
+        p.add_argument("--store-main", default=None, help="the staged copy's main store file")
+        p.add_argument("--store-events", default=None, help="the staged copy's events store file")
+        p.add_argument("--staged-home", default=None,
+                       help="a directory holding home/.khive/{khive.db,khive.db.events.db} and transfer.json from a "
+                            "guarded transfer; verified and used in place instead of copied, and never removed")
         p.add_argument("--snapshot-id", required=True, help="written into every row")
         p.add_argument("--engines-file", required=True, help="the [[engines]] tables the store was embedded with")
         p.add_argument("--models-dir", default=None, help="linked as the scratch home's ~/.lattice/models")
@@ -874,6 +947,9 @@ def main() -> int:
         return cmd_check_bank(args)
     if args.cmd == "self-test":
         return self_test()
+    if bool(args.staged_home) == bool(args.store_main or args.store_events) or (
+            not args.staged_home and not (args.store_main and args.store_events)):
+        raise BankError("take either --staged-home, or both --store-main and --store-events")
     if args.cmd == "calibrate-replay" and bool(args.bank) == args.queries_from_events:
         raise BankError("calibrate-replay takes exactly one of --bank and --queries-from-events")
     if (args.cmd == "calibrate-replay" or "feedback_asof" in args.arms.split(",")) and not args.feedback_actors:
