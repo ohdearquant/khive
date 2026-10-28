@@ -92,19 +92,21 @@ pub(super) fn hydrate_domains_statement(ns: &str, ids: &[String]) -> SqlStatemen
     }
 }
 
-/// Presence only: no foreign content is read or admitted into caller-visible hits.
-fn candidate_presence_statement(ids: &[String]) -> SqlStatement {
+/// Presence of live IDs in the caller's namespace only; no content is read.
+fn candidate_presence_statement(ns: &str, ids: &[String]) -> SqlStatement {
     let placeholders = ids
         .iter()
         .enumerate()
-        .map(|(index, _)| format!("?{}", index + 1))
+        .map(|(index, _)| format!("?{}", index + 2))
         .collect::<Vec<_>>()
         .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(ids.iter().cloned().map(SqlValue::Text));
     SqlStatement {
         sql: khive_runtime::sql!("knowledge_search_candidate_presence")
-            .replace("/* ids */ ?1", &placeholders),
-        // Both UNION arms reuse these numbered binds, preserving the chunk ceiling.
-        params: ids.iter().cloned().map(SqlValue::Text).collect(),
+            .replace("/* ids */ ?2", &placeholders),
+        // Both UNION arms reuse the namespace and ID binds below SQLite's ceiling.
+        params,
         label: None,
     }
 }
@@ -156,8 +158,8 @@ pub(super) fn phase_b_hydration_statement(
 
 /// Hydrate ANN-only hit shells from the canonical corpus tables.
 ///
-/// Proven-absent IDs are index misses. Existing or unreadable rows that cannot
-/// hydrate remain failures. Every unresolved shell is removed.
+/// IDs absent from the caller's live canonical rows are index misses. Live local
+/// or unreadable rows that cannot hydrate remain failures. Every unresolved shell is removed.
 #[cfg(test)]
 pub(super) async fn hydrate_empty_hits(
     runtime: &KhiveRuntime,
@@ -306,8 +308,11 @@ async fn hydrate_empty_hits_recording(
     let mut absent = HashSet::new();
     for chunk in unresolved.chunks(HYDRATION_ID_CHUNK) {
         // Failed or malformed evidence is not absence. Preserve degradation and
-        // do not expose the global query or its IDs through an error payload.
-        if let Ok(rows) = reader.query_all(candidate_presence_statement(chunk)).await {
+        // do not expose the presence query or its IDs through an error payload.
+        if let Ok(rows) = reader
+            .query_all(candidate_presence_statement(ns, chunk))
+            .await
+        {
             let present = rows
                 .iter()
                 .map(|row| row_str(row, "id"))

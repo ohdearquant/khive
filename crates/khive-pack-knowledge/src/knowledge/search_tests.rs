@@ -2803,8 +2803,8 @@ async fn hydrate_atoms_statement_still_scopes_by_namespace() {
 
     let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
     assert_eq!(
-        failures, 1,
-        "the other-namespace row must be reported as an unhydrated candidate"
+        failures, 0,
+        "the other-namespace row is an index miss, not a hydration failure"
     );
     assert_eq!(hits.len(), 2, "only the local-namespace rows may hydrate");
     assert!(

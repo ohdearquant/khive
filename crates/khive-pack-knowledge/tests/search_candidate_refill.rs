@@ -169,7 +169,9 @@ fn runtime_with_embedder() -> KhiveRuntime {
         ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
-    runtime.register_embedder(RefillVectorProvider);
+    runtime
+        .try_register_embedder(RefillVectorProvider)
+        .expect("register deterministic refill provider before first resolution");
     runtime
 }
 
@@ -634,13 +636,25 @@ async fn auto_compose_propagates_suggest_hydration_degradation() {
         .expect("ANN index builds");
     assert_eq!(index["indexed"], 2, "index response: {index}");
 
-    // Leave the loaded ANN slot intact while making its canonical id stale.
+    // Keep the indexed ID live and local, but leave its required hydration slug empty.
     fixture
-        .execute("UPDATE knowledge_atoms SET deleted_at = 1 WHERE slug = 'stale-compose-domain'")
+        .execute("UPDATE knowledge_atoms SET slug = '' WHERE slug = 'stale-compose-domain'")
         .await;
     fixture
-        .execute("UPDATE knowledge_domains SET deleted_at = 1 WHERE slug = 'stale-compose-domain'")
+        .execute("UPDATE knowledge_domains SET slug = '' WHERE slug = 'stale-compose-domain'")
         .await;
+    {
+        let access = fixture.runtime.sql();
+        let mut reader = access.reader().await.expect("reader");
+        let live_rows = reader.query_scalar(SqlStatement {
+            sql: "SELECT (SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = 'local' AND slug = '' AND deleted_at IS NULL) + (SELECT COUNT(*) FROM knowledge_domains WHERE namespace = 'local' AND slug = '' AND deleted_at IS NULL)".into(),
+            params: Vec::new(), label: None,
+        }).await.expect("read back live local unhydratable rows");
+        assert!(
+            matches!(&live_rows, Some(SqlValue::Integer(2))),
+            "both indexed canonical rows remain live and local: {live_rows:?}"
+        );
+    }
 
     let response = fixture
         .dispatch(
@@ -843,7 +857,7 @@ async fn absent_ann_id_is_dropped_without_hydration_failure() {
 }
 
 #[tokio::test]
-async fn mixed_hidden_and_absent_ann_ids_report_only_hidden_failure() {
+async fn mixed_hidden_and_absent_ann_ids_are_index_misses() {
     bounded_stale_fixture(async {
         let fixture = stale_atom_fixture(true).await;
         let (response, events) = capture_stale_request(
@@ -854,9 +868,9 @@ async fn mixed_hidden_and_absent_ann_ids_report_only_hidden_failure() {
             }),
         )
         .await;
-        assert_eq!(
-            response["degraded"]["hydration_failures"], 1,
-            "mixed hidden and absent IDs must count only the hidden row: {response}"
+        assert!(
+            response.pointer("/degraded/hydration_failures").is_none(),
+            "foreign and absent IDs are both index misses: {response}"
         );
         assert_eq!(
             result_slugs(&response),
@@ -867,7 +881,7 @@ async fn mixed_hidden_and_absent_ann_ids_report_only_hidden_failure() {
             !response.to_string().contains("hidden fixture payload"),
             "foreign content stays private"
         );
-        assert_stale_event(&events, "knowledge.search", 1);
+        assert_stale_event(&events, "knowledge.search", 2);
     })
     .await;
 }
@@ -897,14 +911,25 @@ async fn stale_ann_operator_events_are_scoped_to_public_request_class() {
     .await;
 }
 
-#[tokio::test]
-async fn ann_refill_skips_absent_prefix_without_hydration_degradation() {
+async fn assert_ann_refill_after_canonical_mutation(mutation: &str) {
     bounded_stale_fixture(async {
         let fixture = Fixture::with_runtime(runtime_with_embedder());
 
+        let query = "annstatus blocker lexical query";
+        let mut query_vector = vec![0.0; EMBEDDING_DIMENSIONS];
+        query_vector[0] = 1.0;
+        assert_eq!(
+            fixture
+                .runtime
+                .embed_query(query)
+                .await
+                .expect("refill query probe"),
+            query_vector,
+            "refill fixture must use its deterministic provider"
+        );
         // The current fixed cohort starts at k=100, containing the stale leader and drafts only.
         // Five reviewed records are later in the actual deterministic ANN order.
-        // Canonical deletion leaves the stale ID in each widened serving prefix.
+        // Canonical mutation leaves the stale ID in each widened serving prefix.
         fixture
             .execute(
                 "INSERT INTO knowledge_atoms ( \
@@ -959,11 +984,24 @@ async fn ann_refill_skips_absent_prefix_without_hydration_degradation() {
             .expect("ANN index builds");
         assert_eq!(index["indexed"], 130, "index response: {index}");
 
-        fixture
-            .execute(
-                "DELETE FROM knowledge_atoms WHERE id = '50000000-0000-0000-0000-000000000000'",
-            )
-            .await;
+        fixture.execute(mutation).await;
+        {
+            let access = fixture.runtime.sql();
+            let mut reader = access.reader().await.expect("reader");
+            reader
+                .query_all(SqlStatement {
+                    sql: include_str!("../sql/knowledge_search_candidate_presence.sql").into(),
+                    params: vec![
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text("50000000-0000-0000-0000-000000000000".into()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect(
+                    "presence query must accept namespace and ID binds before semantic assertions",
+                );
+        }
         let (response, events) = capture_stale_request(
             &fixture,
             "knowledge.search",
@@ -996,4 +1034,22 @@ async fn ann_refill_skips_absent_prefix_without_hydration_degradation() {
         assert_stale_event(&events, "knowledge.search", 1);
     })
     .await;
+}
+
+#[tokio::test]
+async fn ann_refill_skips_absent_prefix_without_hydration_degradation() {
+    assert_ann_refill_after_canonical_mutation(
+        "DELETE FROM knowledge_atoms WHERE id = '50000000-0000-0000-0000-000000000000'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ann_refill_skips_soft_deleted_prefix_without_hydration_degradation() {
+    assert_ann_refill_after_canonical_mutation("UPDATE knowledge_atoms SET deleted_at = 1 WHERE id = '50000000-0000-0000-0000-000000000000'").await;
+}
+
+#[tokio::test]
+async fn ann_refill_skips_foreign_prefix_without_hydration_degradation() {
+    assert_ann_refill_after_canonical_mutation("UPDATE knowledge_atoms SET namespace = 'tenant-b' WHERE id = '50000000-0000-0000-0000-000000000000'").await;
 }

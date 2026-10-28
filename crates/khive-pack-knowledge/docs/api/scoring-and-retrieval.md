@@ -128,11 +128,11 @@ exhausted. Exhaustion is measured on the ANN prefix before fresh-tail deletes ar
 live vector-store count is not used as a hard serving-bridge bound, so a newly deleted leading
 candidate cannot make a full prefix look exhausted. Ineligible candidates therefore neither
 consume returned slots nor distort eligible RRF ranks. Hydration queries are chunked below
-SQLite's portable bind-variable ceiling. An ANN id proved absent from both canonical tables is an
-index miss: it is dropped and refill continues without `degraded.hydration_failures`. The internal
-presence check reads IDs only, including deleted rows and all namespaces; it never hydrates foreign
-content. An existing row that cannot hydrate, or a read that cannot establish absence, still
-contributes to `degraded.hydration_failures`. Unresolved shells are never returned. The field is
+SQLite's portable bind-variable ceiling. An ANN id without a live row in the caller's namespace
+in either canonical table is an index miss: it is dropped and refill continues without
+`degraded.hydration_failures`. The internal presence check reads IDs only, scoped to the caller's
+namespace and excluding soft-deleted rows. A live local row that cannot hydrate, or a read that
+cannot establish absence, still contributes to `degraded.hydration_failures`. Unresolved shells are never returned. The field is
 omitted when its count is zero, composes with `knowledge.suggest`'s existing ANN-unavailable object,
 and propagates through auto-`knowledge.compose`. Separate hydration and presence reads do not
 constitute a shared snapshot. One operator INFO event on `khive_pack_knowledge::knowledge::search`
