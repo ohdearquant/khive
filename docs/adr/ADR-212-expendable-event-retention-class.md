@@ -554,14 +554,16 @@ per-row recheck and stops on a control mismatch. It implements §4's predicate a
 
 The tool's edge-reference check reads the edge stores on their own connections, so it cannot share a transaction with
 the delete; §3 closes that window with main-writer reservations, which the tool does not implement, so the tool
-requires that no process write edges to the named stores during the apply (`events_prune.rs:17-24`). The 2026-10-28
+requires that no process write edges to the named stores during the apply, a precondition stated in its header and
+not checked by the tool (`events_prune.rs:17-24`). The 2026-10-28
 run did not meet this precondition: the deployment's daemon served requests throughout. §4's writer-quiesced capture
 boundary (line 199) was not met either; rows written during the run were all younger than the cutoff and outside the
 candidate set.
 
 The compensating read: after the apply, the plan runs read-only on the backup copy, which holds the pre-apply rows,
 against the live edge stores at the same cutoff. The apply is complete only when the candidate count equals the
-backup plan's, the digest equals the authorized digest, and no candidate is retained as edge-referenced. This shows
+backup plan's, taken before the apply, the digest equals the authorized digest, and no candidate is retained as
+edge-referenced; an edge written during the window moves its candidate to edge-referenced and lowers the count. This shows
 that no edge existing at the time of the read names a removed row. It does not cover an edge written and deleted again
 inside the window. For the 2026-10-28 run the read found 4,229,195 candidates, the authorized digest, and no
 edge-referenced retention.
