@@ -141,7 +141,7 @@ For each occurrence, compute the deadline from its immutable `scheduled_for`. At
 
 `0` means **no admission observed after the scheduled instant**, with no hidden tick-width allowance or integer-second rounding. It will normally miss on a polling scheduler, including after slow preparation. The polling floor is stated beside it: the daemon tick defaults to 60 seconds and is configurable (`crates/khive-mcp/src/pending_events.rs:554`), so a zero bound admits only an occurrence whose pass reads its clock at the scheduled instant, and is never a real-time start promise. It does not promise physical process start at that instant: the OS can schedule the wrapper or child later. A product requirement for a hard actual-start deadline remains unsupported and must be refused, not described using this weaker guarantee. Increasing timer precision is a separate availability improvement, not permission to start late.
 
-The literal “never late” requirement must be ratified with this boundary. A practical caller may instead choose a small positive explicit bound. Do not silently choose that bound on its behalf.
+Issue 5931 states the requirement at this boundary: "`max_lateness: 0` means a missed instant is never run", and its acceptance counts a missed instant as an outcome with its own message. Neither caller in the issue asks for physical process start at an exact instant. A practical caller may instead choose a small positive explicit bound. Do not silently choose that bound on its behalf.
 
 ### D8. Every due occurrence has durable identity, outcome and replay rules
 
@@ -233,7 +233,7 @@ These are required future checks; none was executed for this design-only proposa
 ## Known limits and open decisions
 
 - **Credential route:** decided in D4. Credentials stay outside the child; credential-bearing rows wait for the broker amendment. The unchanged SSH caller is not supported by this proposal alone.
-- **Deadline wording required:** the proposed zero-lateness guarantee ends at final admission. If the requirement is actual process start at an exact instant, this backend is insufficient.
+- **Deadline boundary:** the zero-lateness guarantee ends at final admission, which is how issue 5931 defines it (a missed instant is never run). A requirement for actual process start at an exact instant is not met by this backend and is refused, never described with this guarantee.
 - **Containment:** same-user unsandboxed processes, mutable live inputs, external effects and detached descendants remain outside stronger claims. A stored grant and a file digest cannot repair those boundaries.
 - **Network qualification:** proposed tree-profile measurements do not establish exact destination filtering or the new combined host profile. No raw-key/outbound path activates on an unmeasured assumption.
 - **Rows left outside:** the 2 repository-poll rows, and the credential rows that need the GitHub CLI token store or the keychain helper, stay on the local scheduler for the reasons their requirement rows state. Under D4, every credential row stays there until the broker lands.
