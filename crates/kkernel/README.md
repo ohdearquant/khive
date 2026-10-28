@@ -9,17 +9,11 @@ persistent Unix-socket daemon); the rest of the subcommand tree covers everythin
 operator needs outside of agent dispatch — schema migrations, KG sync/validate/fetch,
 pack introspection, embedding-model lifecycle, and reindexing.
 
-## Install
-
-```bash
-cargo install kkernel
-```
-
-or build from source:
+## Install from source
 
 ```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
+cargo install --path crates/kkernel
 ```
 
 ## Usage

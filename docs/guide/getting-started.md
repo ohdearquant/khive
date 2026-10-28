@@ -13,12 +13,6 @@ through 160 verbs across 14 packs, dispatched through a single MCP tool.
 
 ## Install
 
-### From crates.io (Rust)
-
-```bash
-cargo install kkernel
-```
-
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
 surface.
 
@@ -26,9 +20,8 @@ surface.
 
 ```bash
 git clone https://github.com/ohdearquant/khive
-cd khive/crates
-cargo build --release -p kkernel
-# Binary at target/release/kkernel (relative to crates/)
+cd khive
+cargo install --path crates/kkernel
 ```
 
 For the guarded developer install, run from the repository root:

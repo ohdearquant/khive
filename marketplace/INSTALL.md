@@ -12,10 +12,11 @@ correctly to a running `kkernel mcp` server.
 `khive` is a single umbrella plugin — one pattern skill per pack plus the kg stewardship agents,
 all over the one `kkernel mcp` server.
 
-## Step 1 — Install kkernel
+## Step 1 — Install kkernel from source
 
 ```bash
-cargo install kkernel
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cargo install --path crates/kkernel
 ```
 
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. Add the
@@ -218,7 +219,7 @@ All examples should report `invalid=0`.
 
 | Symptom                          | Fix                                                           |
 | -------------------------------- | ------------------------------------------------------------- |
-| `kkernel: command not found`     | Run `cargo install kkernel` or add `~/.cargo/bin` to `PATH`   |
+| `kkernel: command not found`     | Run `cargo install --path crates/kkernel` from the repository root or add `~/.cargo/bin` to `PATH`   |
 | MCP tool not appearing in Claude | Check `.mcp.json` is in the project root; restart Claude Code |
 | `Unknown verb` error             | Confirm `--pack` flag includes the right pack for the verb    |
 | `Pack not loaded` error          | Verify `kkernel --version` matches the plugin version         |
