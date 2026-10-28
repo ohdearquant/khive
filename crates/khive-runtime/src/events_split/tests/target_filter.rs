@@ -60,7 +60,9 @@ async fn target_query_rejects_pre_filter_protocol_before_opening_a_store() {
 
 #[tokio::test]
 async fn exact_target_filter_crosses_socket_and_merges_both_event_stores() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let (_db, socket) = boot_daemon(&dir).await;
     let client = EventsSplitClient::new(socket).unwrap();
@@ -122,7 +124,9 @@ async fn exact_target_filter_crosses_socket_and_merges_both_event_stores() {
 
 #[tokio::test]
 async fn grouped_counts_cross_socket_and_merge_without_row_paging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let (_db, socket) = boot_daemon(&dir).await;
     let client = EventsSplitClient::new(socket).unwrap();
