@@ -570,6 +570,7 @@ async fn mirror_lexical_rows(runtime: &KhiveRuntime) -> (i64, i64) {
 
 fn mirror_no_cursor<'w>(
     _writer: &'w mut dyn khive_storage::SqlWriter,
+    _created_id: khive_types::Id128,
 ) -> std::pin::Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'w>> {
     Box::pin(async { Ok(()) })
 }

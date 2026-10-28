@@ -30,10 +30,7 @@ fn claimed_entity_create_event(entity: &Entity) -> Event {
 }
 
 impl KhiveRuntime {
-    /// Called only by the workspace mirror pass. `document`: (name, masked_content); `source`: (URI, type, checksum).
-    /// `previous` must be the URI's unique current document as found by the caller; this method does not re-check it.
-    /// Cursor tail: same-writer first-poll-ready reads/DML. Outer Ok commits; inner Err is a post-commit failure.
-    /// Outer Err can retain an unknown commit state.
+    /// Mirror document=(name,masked_content), source=(URI,type,checksum), previous=caller-resolved URI head; first-poll-ready cursor(writer,new_id) rechecks head/fence. Outer Ok commits; inner Err is post-commit; outer Err may be unknown.
     pub async fn create_workspace_document_with_cursor<F>(
         &self,
         registry: &crate::VerbRegistry,
@@ -44,7 +41,10 @@ impl KhiveRuntime {
         cursor: F,
     ) -> crate::RuntimeResult<(khive_types::Id128, crate::RuntimeResult<()>)>
     where
-        F: for<'w> FnOnce(&'w mut dyn SqlWriter) -> BoxFuture<'w, StorageResult<()>>
+        F: for<'w> FnOnce(
+                &'w mut dyn SqlWriter,
+                khive_types::Id128,
+            ) -> BoxFuture<'w, StorageResult<()>>
             + Send
             + 'static,
     {
@@ -166,7 +166,7 @@ impl KhiveRuntime {
                         }
                     }
                 }
-                cursor(writer).await.map_err(Storage)?;
+                cursor(writer, id).await.map_err(Storage)?;
                 Ok(((), effects))
             })
         });

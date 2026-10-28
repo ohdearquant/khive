@@ -17,7 +17,9 @@ use khive_runtime::{BackendId, KhiveRuntime, NamespaceToken, RuntimeError, VerbR
 use khive_storage::types::{
     EdgeFilter, EdgeSortField, PageRequest, SortDirection, SortOrder, StorageResult,
 };
-use khive_storage::{EntityFilter, SqlWriter, StorageCapability, StorageError};
+use khive_storage::{
+    EntityFilter, SqlStatement, SqlValue, SqlWriter, StorageCapability, StorageError,
+};
 use khive_types::{EdgeRelation, Hash32, Id128};
 
 use crate::{cursor, WorkspaceMirrorConfig};
@@ -270,6 +272,8 @@ async fn previous_document(
 
 struct CursorAdvance {
     key: String,
+    namespace: String,
+    uri: String,
     expected: Option<cursor::CursorRow>,
     hash: String,
     mtime: i64,
@@ -279,6 +283,7 @@ struct CursorAdvance {
 fn advance_cursor<'w>(
     writer: &'w mut dyn SqlWriter,
     update: CursorAdvance,
+    created_id: Id128,
 ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'w>> {
     Box::pin(async move {
         let current = cursor::get_on_writer(writer, &update.key).await?;
@@ -287,6 +292,26 @@ fn advance_cursor<'w>(
                 capability: StorageCapability::Sql,
                 operation: "workspace mirror cursor fence".into(),
                 message: "workspace mirror cursor changed before commit".to_owned(),
+            });
+        }
+        let head = writer
+            .query_scalar(SqlStatement {
+                sql: khive_runtime::sql!("workspace_mirror_current_head").into(),
+                params: vec![
+                    SqlValue::Text(update.namespace),
+                    SqlValue::Text("$.source_uri".into()),
+                    SqlValue::Text(update.uri),
+                    SqlValue::Text(created_id.to_string()),
+                    SqlValue::Text(EdgeRelation::Supersedes.to_string()),
+                ],
+                label: None,
+            })
+            .await?;
+        if !matches!(head, Some(SqlValue::Integer(1))) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "workspace mirror head fence".into(),
+                message: "workspace mirror source URI head changed before commit".to_owned(),
             });
         }
         cursor::upsert_on_writer(
@@ -492,6 +517,8 @@ pub async fn mirror_directory_once(
         };
         let update = CursorAdvance {
             key,
+            namespace: token.namespace().as_str().to_owned(),
+            uri: uri.clone(),
             expected,
             hash: checksum.clone(),
             mtime: seconds(modified).map_err(|error| {
@@ -526,7 +553,7 @@ pub async fn mirror_directory_once(
                 (name, masked.as_ref()),
                 (&uri, source_type, &checksum),
                 previous,
-                move |writer| advance_cursor(writer, update),
+                move |writer, created_id| advance_cursor(writer, update, created_id),
             )
             .await
             .map_err(|error| {

@@ -238,4 +238,225 @@ mod tests {
         .await;
         mirror_done(NAME);
     }
+
+    fn mirror_uri_heads(
+        documents: &[serde_json::Value],
+        edges: &[serde_json::Value],
+        uri: &str,
+    ) -> Vec<serde_json::Value> {
+        documents
+            .iter()
+            .filter(|document| document["properties"]["source_uri"] == uri)
+            .filter(|document| !edges.iter().any(|edge| edge["target_id"] == document["id"]))
+            .cloned()
+            .collect()
+    }
+
+    async fn mirror_assert_head_and_cursor(
+        runtime: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+        uri: &str,
+        key: &str,
+        expected_edges: usize,
+        expected_cursors: usize,
+    ) {
+        let documents = mirror_documents(runtime, token).await;
+        let edges = mirror_edges(runtime, token).await;
+        assert_eq!(
+            documents.len(),
+            2,
+            "exactly one additional document version"
+        );
+        assert_eq!(edges.len(), expected_edges, "exact supersedes edge count");
+        let heads = mirror_uri_heads(&documents, &edges, uri);
+        assert_eq!(heads.len(), 1, "the URI must have exactly one current head");
+        let cursor = read(runtime, key).await.expect("current file cursor");
+        assert_eq!(
+            cursor.last_hash,
+            heads[0]["properties"]["checksum"]
+                .as_str()
+                .map(str::to_owned),
+            "cursor must match the unique current document"
+        );
+        assert_eq!(rows(runtime).await.len(), expected_cursors);
+        assert_eq!(mirror_lexical_rows(runtime).await, (2, 2));
+    }
+
+    #[tokio::test]
+    async fn mirror_concurrent_changed_passes_keep_one_current_head() {
+        const NAME: &str = "mirror_concurrent_changed_passes_keep_one_current_head";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            let tree = MirrorTree::new();
+            let relative = ".khive/notes/concurrent.md";
+            tree.write(relative, "initial concurrent mirror body");
+            let (runtime, registry, token) = mirror_fixture();
+            let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+            let baseline = crate::mirror::mirror_directory_once(
+                &runtime, &registry, &token, &tree.0, &config,
+            ).await.expect("positive concurrent-pass baseline");
+            assert_eq!(baseline.committed, 1);
+            assert_eq!(mirror_documents(&runtime, &token).await.len(), 1);
+            assert_eq!(mirror_lexical_rows(&runtime).await, (1, 1));
+            assert!(mirror_edges(&runtime, &token).await.is_empty());
+            let (uri, key) = mirror_slot(&tree, relative, &token);
+            assert!(read(&runtime, &key).await.is_some());
+            tree.write(relative, "changed concurrent mirror body");
+            let (left, right) = tokio::join!(
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config),
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config),
+            );
+            let mut committed = 0;
+            for result in [left, right] {
+                match result {
+                    Ok(summary) => {
+                        assert!(summary.skipped_non_utf8.is_empty());
+                        assert_eq!(summary.committed + summary.unchanged, 1);
+                        committed += summary.committed;
+                    }
+                    Err(error) => {
+                        let pre_unit = error.commit_state == crate::mirror::FileCommitState::NotAttempted
+                            && matches!(error.runtime_error(),
+                                Some(khive_runtime::RuntimeError::InvalidInput(message))
+                                if message == "workspace mirror source URI has no unique current document");
+                        let cursor_fence = error.commit_state == crate::mirror::FileCommitState::Unconfirmed
+                            && matches!(error.runtime_error(), Some(khive_runtime::RuntimeError::Storage(_)))
+                            && error.to_string().contains("workspace mirror cursor changed before commit");
+                        assert!(pre_unit || cursor_fence, "unexpected concurrent-pass failure: {error}");
+                    }
+                }
+            }
+            assert_eq!(committed, 1, "one actual changed-file commit is required");
+            mirror_assert_head_and_cursor(&runtime, &token, &uri, &key, 1, 1).await;
+        }).await;
+        mirror_done(NAME);
+    }
+
+    async fn mirror_competing_head_case(existing: bool) {
+        let tree = MirrorTree::new();
+        let relative = ".khive/notes/competing.md";
+        let baseline_path = if existing {
+            relative
+        } else {
+            ".khive/notes/baseline.md"
+        };
+        tree.write(baseline_path, "positive head-check baseline body");
+        let (runtime, registry, token) = mirror_fixture();
+        let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+        let baseline =
+            crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                .await
+                .expect("positive current-head baseline before trigger");
+        assert_eq!(baseline.committed, 1);
+        assert_eq!(mirror_documents(&runtime, &token).await.len(), 1);
+        assert_eq!(mirror_lexical_rows(&runtime).await, (1, 1));
+        assert!(mirror_edges(&runtime, &token).await.is_empty());
+        assert_eq!(rows(&runtime).await.len(), 1);
+        tree.write(relative, "new competing-head target body");
+        let (uri, key) = mirror_slot(&tree, relative, &token);
+        let before_cursor = read(&runtime, &key).await;
+        assert_eq!(before_cursor.is_some(), existing, "target cursor premise");
+        let documents = mirror_documents(&runtime, &token).await;
+        let edges = mirror_edges(&runtime, &token).await;
+        let lexical = mirror_lexical_rows(&runtime).await;
+        let cursors = rows(&runtime).await;
+        assert_eq!(
+            mirror_uri_heads(&documents, &edges, &uri).len(),
+            usize::from(existing),
+            "target head premise"
+        );
+        let escaped_uri = uri.replace('\'', "''");
+        let competitor = "62350000-0000-4000-8000-000000000001";
+        mirror_script(&runtime, &format!(
+            "CREATE TRIGGER mirror_competing_head AFTER INSERT ON entities \
+             WHEN NEW.kind='document' AND NEW.id<>'{competitor}' \
+               AND json_extract(NEW.properties, '$.source_uri')='{escaped_uri}' \
+             BEGIN INSERT INTO entities \
+               (id,namespace,kind,entity_type,name,description,properties,tags,created_at,updated_at,deleted_at,merged_into,merge_event_id) \
+               VALUES ('{competitor}',NEW.namespace,'document',NULL,'Competing mirror head',NEW.description,NEW.properties,NEW.tags,NEW.created_at,NEW.updated_at,NULL,NULL,NULL); END;"
+        )).await;
+        let error =
+            crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                .await
+                .expect_err("competing current head must abort before cursor commit");
+        assert!(
+            matches!(
+                error.runtime_error(),
+                Some(khive_runtime::RuntimeError::Storage(_))
+            ),
+            "head refusal must keep storage error type: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("workspace mirror source URI head changed before commit"),
+            "wrong head-refusal stage: {error}"
+        );
+        assert_eq!(
+            error.commit_state,
+            crate::mirror::FileCommitState::Unconfirmed
+        );
+        assert_eq!(
+            read(&runtime, &key).await,
+            before_cursor,
+            "head refusal must preserve existing/absent cursor"
+        );
+        assert_eq!(
+            rows(&runtime).await,
+            cursors,
+            "head refusal must preserve all cursor rows"
+        );
+        assert_eq!(
+            mirror_documents(&runtime, &token).await,
+            documents,
+            "head refusal must roll back both inserted documents"
+        );
+        assert_eq!(
+            mirror_edges(&runtime, &token).await,
+            edges,
+            "head refusal must roll back supersedes edge"
+        );
+        assert_eq!(
+            mirror_lexical_rows(&runtime).await,
+            lexical,
+            "head refusal must roll back real document FTS writes"
+        );
+        mirror_script(&runtime, "DROP TRIGGER mirror_competing_head;").await;
+        let retry =
+            crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                .await
+                .expect("retry after removing competing-head trigger");
+        assert_eq!(retry.committed, 1);
+        mirror_assert_head_and_cursor(
+            &runtime,
+            &token,
+            &uri,
+            &key,
+            usize::from(existing),
+            if existing { 1 } else { 2 },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mirror_competing_head_during_update_rolls_back_and_retries() {
+        const NAME: &str = "mirror_competing_head_during_update_rolls_back_and_retries";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(mirror_competing_head_case(true)).await;
+        mirror_done(NAME);
+    }
+
+    #[tokio::test]
+    async fn mirror_competing_head_during_first_version_rolls_back_and_retries() {
+        const NAME: &str = "mirror_competing_head_during_first_version_rolls_back_and_retries";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(mirror_competing_head_case(false)).await;
+        mirror_done(NAME);
+    }
 }
