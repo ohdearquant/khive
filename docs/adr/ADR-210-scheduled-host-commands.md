@@ -93,6 +93,10 @@ The system resolver socket grants more than DNS lookups: the ADR reports service
 
 ### D4. Credential and version-control exceptions are explicit; credentials stay outside the child
 
+The project maintainer's instruction of 2026-10-27 17:55 UTC, verbatim. It was given for the khive OS layout's credential design and is applied here to scheduled host commands:
+
+> yeah let's worry about external tooling later, I know we have that khive-tool for agent to use external toolings, which gates action as well, as of where the crediential live or which one which agent carry, I feel like we shouldn't think too deep into env-var handover yet. sure daemon side works i guess, but if we think of capability and each process carrying those, we can just think of capability as right to access, yeah but you are right, let's not over complicate stuff for now, not even consider the case of subagent also using khive first, that might be better idea, because subagent won't be introduced until lionagi app is made anyway
+
 Retain ADR-181's current git/gh/`git-*` denials for ordinary tree execution and host registrations without an exception. For an explicitly approved host registration, permit only the declared canonical executable paths and required helpers through a separately rendered profile. Keep the operator's `never` set authoritative. No blanket removal of `git-*` denials; the helper closure must be exercised under the actual profile. A wrapper that calls denied paths fails, and a renamed binary is not treated as an approved exception (`crates/khive-pack-exec/src/sandbox.rs:202`; `docs/adr/ADR-181-exec-verb-sandboxed-run.md:419`).
 
 For public remote reads, recommend a fixed git invocation with credential helpers, prompts and ambient global/system configuration disabled. The caller's measured use does not establish that a credential is necessary for a public read. `gh`, its token store, the user's whole home and an inherited credential-helper environment remain unavailable. If authenticated HTTPS is actually needed, declare it as a new credential-use requirement rather than granting home access to make a helper succeed.
