@@ -431,8 +431,8 @@ underscore when `underscore_is_word_char` is `true` — are treated as word char
 
 ## Named redaction surfaces
 
-ADR-115 Amendment 2 declares three permanent mask-only surfaces through the public
-`RedactionSurface` enum and `redaction_surface_contract`:
+The public `RedactionSurface` enum and `redaction_surface_contract` expose named permanent
+mask-only surfaces:
 
 - `GitIngest` stores masked commit/issue/pull-request entity and note fields.
 - `SessionMirror` stores masked `session_messages.text`, `session_messages.raw`, `sessions.cwd`,
@@ -440,6 +440,9 @@ ADR-115 Amendment 2 declares three permanent mask-only surfaces through the publ
   title/slug field (ChatGPT export `title`, Claude Code `slug`, claude.ai export `name`/`summary`),
   not just the message body columns. `cwd`/`git_branch` are session-keyed, not message-keyed:
   `session_messages` carries no columns of its own for them.
+- `WorkspaceMirror` stores masked workspace document `description` values. Source URI, source
+  type, and the raw-content checksum remain separate metadata fields.
+- `GateProbe` returns the kg `scan` verb's masked preview and has no durable stored target.
 - `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend
   error message masking and backend-id/key masking both go through `mask_bounded`
   (see [Bounded masking](#bounded-masking) below): the masker's own input is capped to
@@ -457,9 +460,9 @@ stamp property, and no atomic exemption-success event. The wrapper has no manife
 return an exemption outcome. The Git and session surfaces persist only their masked values; MCP
 diagnostics are response data and are not durable records. Adding an admission mode is an ADR-level
 contract change, not a caller-selectable sensitivity option. `redaction_surface_contract` sources its
-`final_stored_target` strings from the `GIT_INGEST_STORED_TARGET` and `SESSION_MIRROR_STORED_TARGET`
-constants, and the contract test compares against those same constants rather than a second copy of
-the prose.
+`final_stored_target` strings from the `GIT_INGEST_STORED_TARGET`, `SESSION_MIRROR_STORED_TARGET`,
+and `WORKSPACE_MIRROR_STORED_TARGET` constants, and the contract test compares against those same
+constants rather than a second copy of the prose.
 
 ## Bounded masking
 

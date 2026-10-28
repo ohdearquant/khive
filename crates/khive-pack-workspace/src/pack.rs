@@ -26,6 +26,15 @@ impl Pack for WorkspacePack {
     const HANDLERS: &'static [HandlerDef] = &[];
     const EDGE_RULES: &'static [EdgeEndpointRule] = &WORKSPACE_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg", "git", "gtd", "session"];
+    const SCHEMA_PLAN: Option<khive_types::PackSchemaPlan> = Some(khive_types::PackSchemaPlan {
+        pack: "workspace",
+        statements: &["CREATE TABLE IF NOT EXISTS workspace_mirror_cursor (
+            path TEXT PRIMARY KEY,
+            last_mtime INTEGER,
+            last_hash TEXT,
+            last_synced_at INTEGER
+        )"],
+    });
 }
 
 impl WorkspacePack {
