@@ -1785,7 +1785,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
-      # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
+      # compile on x86_64-pc-windows-msvc.
       # Not (yet) a required check in branch protection — plain `cargo check`
       # (no --all-targets) keeps this fast while the Windows lane is new;
       # widen once it has proven stable.

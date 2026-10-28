@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The npm distribution is no longer built or published. Use [khive cloud](https://khive.ai)
+  or build `kkernel` from source.
+
 ## [0.15.0] - 2026-10-25
 
 ### Added
