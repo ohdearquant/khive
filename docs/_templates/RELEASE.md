@@ -45,7 +45,7 @@
 From the repository root of a source checkout for this release:
 
 ```bash
-cargo install --path crates/kkernel
+cargo install --path crates/kkernel --locked
 ```
 
 ## MCP configuration

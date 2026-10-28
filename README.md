@@ -258,7 +258,7 @@ For local development, install Rust via [rustup](https://rustup.rs) if needed, t
 
 ```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cargo install --path crates/kkernel
+cargo install --path crates/kkernel --locked
 ```
 
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.

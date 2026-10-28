@@ -21,7 +21,7 @@ surface.
 ```bash
 git clone https://github.com/ohdearquant/khive
 cd khive
-cargo install --path crates/kkernel
+cargo install --path crates/kkernel --locked
 ```
 
 For the guarded developer install, run from the repository root:

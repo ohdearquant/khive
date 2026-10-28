@@ -754,7 +754,7 @@ kkernel kg --help                          # KG validation, init, pre-commit hoo
 `kkernel` is the single shipped binary. Install from a checkout at the repository root:
 
 ```bash
-cargo install --path crates/kkernel
+cargo install --path crates/kkernel --locked
 ```
 
 Configure MCP clients to run `kkernel mcp` directly.

@@ -13,7 +13,7 @@ pack introspection, embedding-model lifecycle, and reindexing.
 
 ```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cargo install --path crates/kkernel
+cargo install --path crates/kkernel --locked
 ```
 
 ## Usage
