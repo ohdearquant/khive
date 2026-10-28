@@ -249,23 +249,28 @@ touching consumers.
 
 ## Quick start
 
-**1. Install** (from [crates.io](https://crates.io/crates/kkernel)):
+Use [khive cloud](https://khive.ai) for the hosted service.
+
+### Run it locally from source
+
+For local development, install Rust via [rustup](https://rustup.rs) if needed, then install
+`kkernel` from a source checkout:
 
 ```bash
-cargo install kkernel
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cargo install --path crates/kkernel --locked
 ```
 
-`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. If you
-don't have Rust, install it first via [rustup](https://rustup.rs).
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
 
-**2. Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
+**Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
 global):
 
 ```json
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
 
-**3. Verify:**
+**Verify:**
 
 ```bash
 kkernel --version   # confirms the binary and version you just installed
@@ -273,29 +278,6 @@ kkernel --version   # confirms the binary and version you just installed
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
 MCP client discovers the `request` tool with the full 160-verb catalog.
-
-### Alternative: npm
-
-An npm-distributed `khive` package also exists, but the published version there can lag behind
-the latest crates.io release. Check `khive --version` (or `khive-mcp --version`) after install
-and compare it to the [crates.io version](https://crates.io/crates/khive-mcp) before relying on
-features documented here.
-
-```bash
-npm install -g khive
-```
-
-```json
-{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
-```
-
-### Build from source
-
-```bash
-git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
-# binary at crates/target/release/kkernel
-```
 
 ### Usage
 

@@ -1,7 +1,7 @@
 name: pages
 
 # Builds a static docs site from docs/guide/*.md and README.md using Jekyll's
-# GitHub Pages Actions build (no bundled framework, no npm/node toolchain).
+# GitHub Pages Actions build (no bundled framework).
 #
 # Layout: remote_theme just-the-docs (GitHub-Pages-compatible via the
 # jekyll-remote-theme gem bundled in the github-pages gem group that

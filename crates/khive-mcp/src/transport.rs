@@ -841,7 +841,7 @@ pub trait Transport: Send + Sync {
     async fn serve(&self, server: KhiveMcpServer, opts: &ServeOptions) -> anyhow::Result<()>;
 }
 
-/// MCP over stdio — the default transport, used by the deno/npm wrapper.
+/// MCP over stdio, the default transport.
 pub struct StdioTransport;
 
 #[async_trait]
