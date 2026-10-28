@@ -215,7 +215,11 @@ Deno.test("kkernelPath preserves development candidate precedence", async functi
     const moduleRelease = candidate(fixture.moduleRoot, "release", fixture.exe);
     const moduleDebug = candidate(fixture.moduleRoot, "debug", fixture.exe);
     const scenarios = [
-      { repo: fixture.repoRoot, files: [release, debug, moduleRelease, moduleDebug], want: release },
+      {
+        repo: fixture.repoRoot,
+        files: [release, debug, moduleRelease, moduleDebug],
+        want: release,
+      },
       { repo: fixture.repoRoot, files: [debug, moduleRelease, moduleDebug], want: debug },
       { repo: undefined, files: [moduleRelease, moduleDebug], want: moduleRelease },
       { repo: fixture.repoRoot, files: [moduleDebug], want: moduleDebug },
@@ -243,7 +247,11 @@ Deno.test("kkernelPath exhaustion has no retired platform probes", async functio
       candidate(fixture.moduleRoot, "debug", fixture.exe),
     ];
     const positions = expected.map((path) => message.indexOf(path));
-    assertEquals(positions.every((position) => position >= 0), true, "all candidates must be listed");
+    assertEquals(
+      positions.every((position) => position >= 0),
+      true,
+      "all candidates must be listed",
+    );
     assertEquals(positions.every((position, i) => i === 0 || positions[i - 1] < position), true);
     assertEquals(message.includes("KKERNEL_BINARY"), true);
     assertEquals(message.includes("(npm install)"), false);
