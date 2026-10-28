@@ -56,7 +56,10 @@ Subcommands:
     check-bank        validate a bank directory and print its population
     run               score the chosen arms and write <out>/<arm>.jsonl plus <out>/run.json
     calibrate-replay  replay the --profile profile's whole explicit feedback history into a fresh profile and compare
-                      the two on the bank's queries (top-10 overlap, rank-score differences on shared ids)
+                      the two on the bank's queries (top-10 overlap, rank-score differences on shared ids). Each query
+                      is recalled live, then by the replayed profile, then live again, and the two live answers are
+                      compared the same way: that A/A floor bounds how much of the live/replay difference is the
+                      recall's own run-to-run variation rather than the replay
     self-test         the measure, fusion, bank-check and response-parsing arms, no kkernel needed
 
 Standard library only.
@@ -736,6 +739,36 @@ def run_arms(args, arms, run_id, cases, br, base, out, summary) -> None:
         print(json.dumps({"arm": arm, "n": n, **agg}), flush=True)
 
 
+def compare(x: list[dict], y: list[dict]) -> dict:
+    """Top-10 overlap relative to x, whether the two lists are the same ids in the same order, and the largest
+    rank-score gap on a shared id."""
+    rx = {hit_id(h, "calibrate"): h.get("rank_score") for h in x}
+    ry = {hit_id(h, "calibrate"): h.get("rank_score") for h in y}
+    shared = [i for i in rx if i in ry]
+    diffs = [abs(rx[i] - ry[i]) for i in shared if isinstance(rx[i], (int, float)) and isinstance(ry[i], (int, float))]
+    return {"overlap@10": len(shared) / max(len(rx), 1), "same_order": list(rx) == list(ry),
+            "max_abs_rank_score_diff": max(diffs, default=0.0)}
+
+
+def aggregate(rows: list[dict]) -> dict:
+    n = len(rows)
+    return {"mean_overlap@10": round(sum(r["overlap@10"] for r in rows) / n, 4),
+            "same_order_share": round(sum(r["same_order"] for r in rows) / n, 4),
+            "max_abs_rank_score_diff": max(r["max_abs_rank_score_diff"] for r in rows)}
+
+
+def calibrate_case(br, case: dict, live: str, replayed: str) -> dict:
+    """One query recalled live, then by the replayed profile, then live again (A B A). The first live answer is the
+    reference for both comparisons, so the A/A row and the replay row share it."""
+    def recall_top10(profile):
+        return hit_list(br.one(op("memory.recall", query=case["query"], top_k=10, profile_id=profile)), "calibrate")
+    a = recall_top10(live)
+    b = recall_top10(replayed)
+    a2 = recall_top10(live)
+    return {"query_id": case["case_id"], **compare(a, b), "aa": compare(a, a2),
+            "replayed_vs_second_live": compare(a2, b)}
+
+
 def cmd_calibrate_replay(args) -> int:
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
     out = Path(args.out)
@@ -762,22 +795,11 @@ def cmd_calibrate_replay(args) -> int:
             events = feedback_events(br, actors, args.profile, args.feedback_since, now)
             report["events_found"] = len(events)
             report.update(replay(br, events, twin))
-            rows = []
-            for c in cases[: args.n]:
-                a = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=args.profile)),
-                             "calibrate")
-                b = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=twin)), "calibrate")
-                ra = {hit_id(h, "calibrate"): h.get("rank_score") for h in a}
-                rb = {hit_id(h, "calibrate"): h.get("rank_score") for h in b}
-                shared = [i for i in ra if i in rb]
-                diffs = [abs(ra[i] - rb[i]) for i in shared
-                         if isinstance(ra[i], (int, float)) and isinstance(rb[i], (int, float))]
-                rows.append({"query_id": c["case_id"], "overlap@10": len(shared) / max(len(ra), 1),
-                             "same_order": list(ra) == list(rb), "max_abs_rank_score_diff": max(diffs, default=0.0)})
-            n = len(rows)
-            report.update({"queries": n, "mean_overlap@10": round(sum(r["overlap@10"] for r in rows) / n, 4),
-                           "same_order_share": round(sum(r["same_order"] for r in rows) / n, 4),
-                           "max_abs_rank_score_diff": max(r["max_abs_rank_score_diff"] for r in rows), "rows": rows})
+            rows = [calibrate_case(br, c, args.profile, twin) for c in cases[: args.n]]
+            report.update({"queries": len(rows), "recall_order": "live, replayed, live", **aggregate(rows),
+                           "aa": aggregate([r["aa"] for r in rows]),
+                           "replayed_vs_second_live": aggregate([r["replayed_vs_second_live"] for r in rows]),
+                           "rows": rows})
             report["status"] = "complete"
         finally:
             br.close()
@@ -920,6 +942,37 @@ def self_test() -> int:
         (d / "bank.json").write_text(json.dumps({"bank_id": "b", "version": 2,
                                                  "cases_sha256": sha256_file(d / "cases.jsonl")}))
         check("bank: a short id in needed_info is refused", refused(load_bank, d))
+
+    def hits(*pairs):
+        return [{"id": u[i], "rank_score": s} for i, s in pairs]
+
+    check("compare: identical lists overlap 1.0 in the same order with no rank gap",
+          compare(hits((0, .9), (1, .8)), hits((0, .9), (1, .8)))
+          == {"overlap@10": 1.0, "same_order": True, "max_abs_rank_score_diff": 0.0})
+    sw = compare(hits((0, .9), (1, .8)), hits((1, .85), (0, .7)))
+    check("compare: the same set reordered keeps overlap 1.0, loses order, gap 0.2 on a shared id",
+          sw["overlap@10"] == 1.0 and not sw["same_order"] and abs(sw["max_abs_rank_score_diff"] - 0.2) < 1e-9)
+    check("compare: an unshared hit halves overlap and adds no rank gap",
+          compare(hits((0, .9), (1, .8)), hits((0, .9), (2, .1)))
+          == {"overlap@10": 0.5, "same_order": False, "max_abs_rank_score_diff": 0.0})
+    ag = aggregate([{"overlap@10": 1.0, "same_order": True, "max_abs_rank_score_diff": 0.1},
+                    {"overlap@10": 0.5, "same_order": False, "max_abs_rank_score_diff": 0.3}])
+    check("aggregate: mean overlap, share in the same order, largest gap",
+          ag == {"mean_overlap@10": 0.75, "same_order_share": 0.5, "max_abs_rank_score_diff": 0.3})
+
+    class ScriptedBridge:
+        def __init__(self, answers):
+            self.answers, self.calls = list(answers), []
+
+        def one(self, text):
+            self.calls.append(text)
+            return self.answers.pop(0)
+
+    sb = ScriptedBridge([hits((0, .9), (1, .8)), hits((0, .9), (1, .8)), hits((1, .9), (0, .8))])
+    row = calibrate_case(sb, {"case_id": "q1", "query": "q"}, "live-p", "twin-p")
+    check("calibrate: live, replayed, live; the replay row reads the first live answer, the A/A row both live answers",
+          ['profile_id="live-p"' in c for c in sb.calls] == [True, False, True] and 'profile_id="twin-p"' in sb.calls[1]
+          and row["same_order"] and not row["aa"]["same_order"] and not row["replayed_vs_second_live"]["same_order"])
     print("SELF-TEST " + ("PASS" if not fails else f"FAIL ({len(fails)})"))
     return 1 if fails else 0
 

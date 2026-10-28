@@ -169,7 +169,10 @@ fed the named profile's explicit feedback events created before each case's `T`,
 time filter). The served profile is checked on every hit. Each run writes one JSONL file per arm and `run.json` with
 the bank version, population, store snapshot id, kkernel version, the staged files' sha256 and the control result.
 `calibrate-replay` measures how closely a profile rebuilt from replayed feedback events reproduces the original
-(top-10 overlap and rank-score differences), which bounds what the as-of-`T` arm can claim. Its queries come from a
+(top-10 overlap and rank-score differences), which bounds what the as-of-`T` arm can claim. Each query is recalled
+live, then by the rebuilt profile, then live again; the two live answers are compared the same way and reported as
+`aa`, a floor for the recall's own run-to-run variation (recency is read from the clock at each request, for one)
+that the live/rebuilt difference has to clear before it counts against the replay. Its queries come from a
 bank, or with `--queries-from-events` from n distinct queries the profile served, read from the copy's
 `recall_executed` events and spread over time; those events undercount recalls made through `kkernel exec`
 (#6259).
