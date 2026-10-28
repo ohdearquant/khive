@@ -719,6 +719,108 @@ fn a_row_an_edge_names_after_selection_survives_its_batch() {
     assert!(fixture.ids().contains(&b));
 }
 
+fn append_ledger(state_dir: &Path, lines: &[Value]) {
+    let path = state_dir.join("expended-ids.ndjson");
+    let mut text = std::fs::read_to_string(&path).expect("ledger");
+    for line in lines {
+        text.push_str(&format!("{line}\n"));
+    }
+    std::fs::write(&path, text).expect("write ledger");
+}
+
+fn ledger_ids(ids: &[&String]) -> Vec<Value> {
+    ids.iter()
+        .map(|id| json!({"id": id, "verb": "comm.probe", "namespace": "local", "created_at": 0}))
+        .collect()
+}
+
+/// Four candidates, one committed batch of two, then an interruption. Returns the fixture, the options and the two
+/// candidates still present.
+fn interrupted_after_one_batch() -> (Fixture, ApplyOptions, events_prune::Plan, Vec<String>) {
+    let fixture = Fixture::new();
+    let ids: Vec<String> = (0..4)
+        .map(|i| fixture.generic("comm.probe", OLD_US - i))
+        .collect();
+    let plan = plan(&fixture);
+    assert_eq!(plan.candidates, 4);
+    let receipt = fixture.backup(&plan, "backup.db");
+    let mut options = fixture.options(&plan.digest, receipt, "state");
+    options.max_batches = Some(1);
+    let error =
+        events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 1).unwrap_err();
+    assert!(matches!(error, PruneError::Interrupted(_)), "{error}");
+    let present = fixture.ids();
+    let left: Vec<String> = ids.into_iter().filter(|id| present.contains(id)).collect();
+    assert_eq!(left.len(), 2);
+    options.max_batches = None;
+    (fixture, options, plan, left)
+}
+
+#[test]
+fn a_resume_after_a_skipped_row_keeps_the_authorized_digest() {
+    let (fixture, options, plan, left) = interrupted_after_one_batch();
+    let (gone, kept) = (&left[0], &left[1]);
+    // A second invocation's batch removed one row and skipped the other, which an edge named after selection.
+    fixture.edge(kept, &Uuid::new_v4().to_string(), false);
+    fixture
+        .conn()
+        .execute("DELETE FROM events WHERE id = ?1", [gone])
+        .unwrap();
+    append_ledger(
+        &options.state_dir,
+        &[
+            json!({"type": "intent", "digest": plan.digest, "batch": 2, "ids": ledger_ids(&[gone, kept])}),
+            json!({"type": "commit", "digest": plan.digest, "batch": 2, "removed": [gone],
+                   "skipped": [[kept, "edge_referenced"]], "at_us": 0}),
+        ],
+    );
+
+    let report = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2)
+        .expect("a resume after a skip continues");
+    assert_eq!(report.removed, 0);
+    assert_eq!(
+        report.removed_total, 3,
+        "the skipped row is not counted as removed"
+    );
+    assert_eq!(fixture.ids(), [kept.clone()].into_iter().collect());
+}
+
+#[test]
+fn a_resume_after_a_killed_batch_whose_row_gained_an_edge_keeps_the_authorized_digest() {
+    let (fixture, options, plan, left) = interrupted_after_one_batch();
+    let (still, named) = (&left[0], &left[1]);
+    // A batch was killed before its delete committed, and an edge named one of its rows before the next start.
+    append_ledger(
+        &options.state_dir,
+        &[
+            json!({"type": "intent", "digest": plan.digest, "batch": 2, "ids": ledger_ids(&[still, named])}),
+        ],
+    );
+    fixture.edge(named, &Uuid::new_v4().to_string(), false);
+
+    let report = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2)
+        .expect("a resume after a killed batch continues");
+    assert_eq!(report.reconciled, 0, "both rows were still present");
+    assert_eq!(report.removed, 1);
+    assert_eq!(report.removed_total, 3);
+    assert_eq!(fixture.ids(), [named.clone()].into_iter().collect());
+}
+
+#[test]
+fn a_resume_refuses_when_a_new_row_joins_the_selection() {
+    let (fixture, options, _plan, _left) = interrupted_after_one_batch();
+    fixture.generic("comm.probe", OLD_US);
+    let before = fixture.ids();
+    let error =
+        events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2).unwrap_err();
+    assert!(
+        matches!(error, PruneError::DigestMismatch { .. }),
+        "{error}"
+    );
+    assert_eq!(error.exit_code(), 4);
+    assert_eq!(fixture.ids(), before);
+}
+
 #[test]
 fn a_falling_control_count_stops_the_run() {
     let key = |rows_before_cutoff, rows| KeyCount {

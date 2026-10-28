@@ -104,7 +104,7 @@ pub enum PruneError {
     DigestMismatch {
         /// The digest passed to the apply.
         expected: String,
-        /// The digest of the set selected now, together with the ids already removed by this run.
+        /// The digest of the set selected now, together with the ids this run already put in a batch.
         actual: String,
         /// Counts behind the recomputed digest.
         detail: String,
@@ -966,8 +966,10 @@ pub fn apply(target: &PruneTarget, options: &ApplyOptions) -> Result<ApplyReport
 
 /// Run the delete phase with an explicit start.
 ///
-/// The selection is recomputed against the pinned cutoff; the ids still selected, together with the ids this run's
-/// expended-ID file records as removed, must produce the authorized digest, or nothing is deleted. Each batch writes
+/// The selection is recomputed against the pinned cutoff; the ids still selected, together with every id this run's
+/// expended-ID file shows in a batch (removed, skipped at delete time, or still present after a killed batch), must
+/// produce the authorized digest, or nothing is deleted. A batched row that no longer qualifies stays out of the
+/// selection and is not deleted; a row that was never authorized still changes the digest. Each batch writes
 /// an intent line, then deletes inside one immediate transaction whose statements recheck the whole predicate, the
 /// payload bytes and the edge references per row; a row that changed since selection is skipped and counted. After
 /// the commit a commit line follows. An intent line without its commit line (a run killed mid-batch) is settled at
@@ -997,6 +999,10 @@ pub fn apply_at(
     let ledger_path = options.state_dir.join("expended-ids.ndjson");
     let mut intents: BTreeMap<u64, Vec<LedgerId>> = BTreeMap::new();
     let mut removed_ids: HashSet<Uuid> = HashSet::new();
+    // Every id an earlier invocation of this run put in a batch. Each came from a selection that matched the
+    // authorized digest, so it stays in the digest even after it stops qualifying (skipped, or present after a
+    // killed batch); without it a resume after a skip recomputes a different digest and refuses.
+    let mut batched_ids: HashSet<Uuid> = HashSet::new();
     let mut last_batch = 0_u64;
     if ledger_path.exists() {
         for line in BufReader::new(fs::File::open(&ledger_path)?).lines() {
@@ -1019,6 +1025,11 @@ pub fn apply_at(
             last_batch = last_batch.max(batch);
             match entry {
                 Ledger::Intent { batch, ids, .. } => {
+                    for entry in &ids {
+                        batched_ids.insert(Uuid::parse_str(&entry.id).map_err(|_| {
+                            PruneError::Invalid(format!("ledger id {} is not a UUID", entry.id))
+                        })?);
+                    }
                     intents.insert(batch, ids);
                 }
                 Ledger::Commit { batch, removed, .. }
@@ -1075,16 +1086,18 @@ pub fn apply_at(
             .selected
             .iter()
             .map(|candidate| candidate.id)
-            .chain(removed_ids.iter().copied()),
+            .chain(removed_ids.iter().copied())
+            .chain(batched_ids.iter().copied()),
     );
     if recomputed != options.digest {
         return Err(PruneError::DigestMismatch {
             expected: options.digest.clone(),
             actual: recomputed,
             detail: format!(
-                "{} selected now, {} removed earlier by this run",
+                "{} selected now, {} removed and {} batched earlier by this run",
                 planned.selected.len(),
-                removed_ids.len()
+                removed_ids.len(),
+                batched_ids.len()
             ),
         });
     }
