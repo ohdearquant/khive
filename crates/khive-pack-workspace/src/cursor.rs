@@ -159,7 +159,7 @@ mod tests {
                 assert!(result.skipped_non_utf8.is_empty());
             }
             let tree = MirrorTree::new();
-            let invalid = tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
+            tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
             tree.write(".khive/notes/valid.md", "valid mixed-tree prose");
             let (runtime, registry, token) = mirror_fixture();
             let summary =
@@ -173,7 +173,7 @@ mod tests {
             assert_eq!(summary.unchanged, 0);
             assert_eq!(
                 summary.skipped_non_utf8,
-                vec![std::fs::canonicalize(invalid).unwrap()]
+                vec![std::path::PathBuf::from(".khive/notes/invalid.md")]
             );
             let (valid_uri, valid_key) = mirror_slot(&tree, ".khive/notes/valid.md", &token);
             let (invalid_uri, invalid_key) = mirror_slot(&tree, ".khive/notes/invalid.md", &token);
@@ -204,9 +204,9 @@ mod tests {
         }
         mirror_bounded(async {
             let tree = MirrorTree::new();
-            let invalid = tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
+            tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
             tree.write(".khive/notes/valid.md", "stable valid prose");
-            let canonical_invalid = std::fs::canonicalize(invalid).unwrap();
+            let relative_invalid = std::path::PathBuf::from(".khive/notes/invalid.md");
             let (runtime, registry, token) = mirror_fixture();
             let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
             let first =
@@ -214,7 +214,7 @@ mod tests {
                     .await
                     .expect("first mixed pass");
             assert_eq!(first.committed, 1);
-            assert_eq!(first.skipped_non_utf8, vec![canonical_invalid.clone()]);
+            assert_eq!(first.skipped_non_utf8, vec![relative_invalid.clone()]);
             let documents = mirror_documents(&runtime, &token).await;
             let cursors = rows(&runtime).await;
             let edges = mirror_edges(&runtime, &token).await;
@@ -227,7 +227,7 @@ mod tests {
                     .expect("second mixed pass must still skip invalid bytes");
             assert_eq!(second.committed, 0);
             assert_eq!(second.unchanged, 1);
-            assert_eq!(second.skipped_non_utf8, vec![canonical_invalid]);
+            assert_eq!(second.skipped_non_utf8, vec![relative_invalid]);
             assert_eq!(mirror_documents(&runtime, &token).await, documents);
             assert_eq!(rows(&runtime).await, cursors);
             assert_eq!(mirror_edges(&runtime, &token).await, edges);
@@ -459,4 +459,6 @@ mod tests {
         mirror_bounded(mirror_competing_head_case(false)).await;
         mirror_done(NAME);
     }
+
+    include!("cursor/mirror_tests.rs");
 }

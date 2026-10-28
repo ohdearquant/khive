@@ -871,11 +871,9 @@ async fn mirror_versions_noop_and_complete_history_head() {
             "history fixture must have two genuine unlinked heads"
         );
         assert_eq!(read(&runtime, &key).await, None);
-        let error =
-            crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
-                .await
-                .expect_err("complete history must refuse ambiguous heads");
-        assert!(error.to_string().contains("no unique current document"));
+        let summary = mirror_ambiguous_once(&runtime, &registry, &token, &tree, &config).await;
+        assert_eq!(summary.skipped_no_current, vec![std::path::PathBuf::from(path)]);
+        assert_eq!(summary.committed, 0);
         assert_eq!(mirror_documents(&runtime, &token).await, documents);
         assert_eq!(read(&runtime, &key).await, None);
     })
