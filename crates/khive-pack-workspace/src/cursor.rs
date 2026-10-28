@@ -133,6 +133,7 @@ pub(crate) async fn get_on_writer(
 #[cfg(test)]
 mod tests {
     include!("cursor/tests.rs");
+    include!("cursor/mirror_tests.rs");
 
     #[tokio::test]
     async fn mirror_non_utf8_file_is_named_while_valid_file_commits() {
@@ -459,6 +460,4 @@ mod tests {
         mirror_bounded(mirror_competing_head_case(false)).await;
         mirror_done(NAME);
     }
-
-    include!("cursor/mirror_tests.rs");
 }
