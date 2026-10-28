@@ -694,8 +694,9 @@ async fn mirror_secrets_are_masked_without_rejecting_prose() {
         let tree = MirrorTree::new();
         const SECRET: &str = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
         let body = format!("Mirror prose before {SECRET} prose after.");
+        let surface = khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror;
         assert_ne!(
-            khive_runtime::secret_gate::mask_secrets(&body).as_ref(),
+            khive_runtime::secret_gate::mask_for_redaction_surface(surface, &body).as_ref(),
             body,
             "synthetic credential must actually activate the canonical masker"
         );
@@ -718,7 +719,7 @@ async fn mirror_secrets_are_masked_without_rejecting_prose() {
         assert!(description.ends_with(" prose after."));
         assert_eq!(
             description,
-            khive_runtime::secret_gate::mask_secrets(&body).as_ref()
+            khive_runtime::secret_gate::mask_for_redaction_surface(surface, &body).as_ref()
         );
     })
     .await;

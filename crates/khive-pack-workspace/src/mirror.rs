@@ -455,7 +455,10 @@ pub async fn mirror_directory_once(
             }
         };
         let checksum = Hash32::from_blake3(raw.as_bytes()).to_string();
-        let masked = khive_runtime::secret_gate::mask_secrets(&raw);
+        let masked = khive_runtime::secret_gate::mask_for_redaction_surface(
+            khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+            &raw,
+        );
         let expected = {
             let mut reader = runtime.sql().reader().await.map_err(|error| {
                 MirrorPassError::runtime(
