@@ -25,7 +25,7 @@ use super::common::{
     reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
     validate_graph_read_kind, KindSpec, SearchParams,
 };
-use crate::handler_defs::KG_HANDLERS;
+use crate::handler_defs::SEARCH_PARAMS;
 use crate::KgPack;
 
 /// Canonical search ranking fields shared by KG and coordinated search.
@@ -135,9 +135,7 @@ impl ValidatedSearchRequest {
     pub fn from_value(mut params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
         // Coordinated search parses the caller's arguments here without going through registry
         // dispatch, so it applies the same whole-number float rule for integer parameters.
-        if let Some(search) = KG_HANDLERS.iter().find(|def| def.name == "search") {
-            integer_params_from_whole_floats(&mut params, search.params);
-        }
+        integer_params_from_whole_floats(&mut params, SEARCH_PARAMS);
         if params.get("min_rank_score").is_some() && params.get("min_score").is_some() {
             return Err(RuntimeError::InvalidInput(
                 "supply only min_rank_score; min_score is its deprecated alias".to_string(),
