@@ -112,5 +112,23 @@ pub async fn upsert_on_writer(
     Ok(())
 }
 
+/// Read the exact slot on a transaction writer without a trait-object upcast.
+pub(crate) async fn get_on_writer(
+    writer: &mut dyn SqlWriter,
+    path: &str,
+) -> StorageResult<Option<CursorRow>> {
+    writer
+        .query_row(SqlStatement {
+            sql: "SELECT path, last_mtime, last_hash, last_synced_at \
+                  FROM workspace_mirror_cursor WHERE path = ?1"
+                .into(),
+            params: vec![SqlValue::Text(path.to_owned())],
+            label: Some("workspace_mirror_cursor_get".into()),
+        })
+        .await?
+        .map(decode)
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests;

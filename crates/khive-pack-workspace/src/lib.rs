@@ -3,6 +3,7 @@
 mod config;
 pub mod cursor;
 mod hook;
+pub mod mirror;
 mod pack;
 mod vocab;
 

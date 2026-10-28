@@ -5,6 +5,7 @@ use crate::secret_gate_finalizer::entity_admission::{
     prepare_entity_admission, EntityAdmission, EntityEntryPoint,
 };
 use crate::EntityCandidateMutation;
+use khive_storage::{BoxFuture, SqlWriter, StorageResult};
 
 fn claimed_entity_create_event(entity: &Entity) -> Event {
     let mut event = Event::new(
@@ -29,6 +30,192 @@ fn claimed_entity_create_event(entity: &Entity) -> Event {
 }
 
 impl KhiveRuntime {
+    /// `document`: (name, masked_content); `source`: (URI, type, checksum).
+    /// Cursor tail: same-writer first-poll-ready reads/DML. Outer Ok commits;
+    /// inner Err is post-commit failure; outer Err can retain an unknown commit state.
+    pub async fn create_workspace_document_with_cursor<F>(
+        &self,
+        registry: &crate::VerbRegistry,
+        token: &crate::NamespaceToken,
+        document: (&str, &str),
+        source: (&str, &str, &str),
+        previous: Option<khive_types::Id128>,
+        cursor: F,
+    ) -> crate::RuntimeResult<(khive_types::Id128, crate::RuntimeResult<()>)>
+    where
+        F: for<'w> FnOnce(&'w mut dyn SqlWriter) -> BoxFuture<'w, StorageResult<()>>
+            + Send
+            + 'static,
+    {
+        use crate::atomic_prepare::apply_post_commit_effects;
+        use crate::atomic_runner::PreparedAtomicError::{Refused, Storage};
+        use crate::atomic_runner::{
+            apply_plan_preserving_storage, run_prepared_atomic_unit, AtomicOpFailure, AtomicOpPlan,
+            PlanExecutionFailure, PreparedAtomicOp, PreparedAtomicOutcome,
+        };
+        use crate::canonical_apply::prepare_canonical_changeset;
+        use khive_changeset::{
+            ChangeSet, CreateOp, CreateTarget, EntityCreateFields, Envelope, LinkOp, Op,
+        };
+        use khive_storage::{SqlStatement, StorageError, WriterTaskRequestState};
+        use khive_types::{EdgeRelation, EntityKind, Id128, PropertyValue, Timestamp};
+        use std::mem::take;
+        use std::sync::{Arc, Mutex};
+        if self.backend_id().as_str() != crate::config::BackendId::MAIN {
+            return Err(RuntimeError::InvalidInput(format!(
+                "workspace mirror requires main backend; assigned backend: {}",
+                self.backend_id()
+            )));
+        }
+        let staged_at = u64::try_from(chrono::Utc::now().timestamp_micros())
+            .map(Timestamp::from_micros)
+            .map_err(|_| {
+                RuntimeError::Internal("workspace staging time precedes Unix epoch".into())
+            })?;
+        let id = Id128::from_bytes(*Uuid::new_v4().as_bytes());
+        let properties = [
+            ("source_uri".into(), PropertyValue::String(source.0.into())),
+            ("source_type".into(), PropertyValue::String(source.1.into())),
+            ("checksum".into(), PropertyValue::String(source.2.into())),
+        ]
+        .into_iter()
+        .collect();
+        let mut ops = vec![Op::Create(CreateOp {
+            id,
+            namespace: token.namespace().clone(),
+            target: CreateTarget::Entity(EntityCreateFields {
+                entity_kind: EntityKind::Document,
+                entity_type: None,
+                name: document.0.into(),
+                description: Some(document.1.into()),
+                properties,
+                tags: Vec::new(),
+            }),
+        })];
+        if let Some(previous) = previous {
+            ops.push(Op::Link(LinkOp {
+                id: Id128::from_bytes(*Uuid::new_v4().as_bytes()),
+                namespace: token.namespace().clone(),
+                source: id,
+                target: previous,
+                relation: EdgeRelation::Supersedes,
+                weight: 1.0,
+                properties: Default::default(),
+            }));
+        }
+        let changeset = ChangeSet::new(
+            Envelope::new("workspace.mirror", "deterministic", staged_at),
+            ops,
+        );
+        let plans = prepare_canonical_changeset(self, registry, token, &changeset).await?;
+        let handles = Arc::new(Mutex::new(Vec::<crate::EntityFinalizationPlan>::new()));
+        let attempted = Arc::clone(&handles);
+        let prepared: PreparedAtomicOp<(), (usize, AtomicOpFailure)> = Box::new(move |writer| {
+            Box::pin(async move {
+                let mut effects = Vec::new();
+                for (index, plan) in plans.into_iter().enumerate() {
+                    let savepoint = format!("adr099_atomic_op_{index}");
+                    writer
+                        .execute(SqlStatement::new(format!("SAVEPOINT {savepoint}"), vec![]))
+                        .await?;
+                    let materialized = match plan {
+                        AtomicOpPlan::Canonical(canonical) => {
+                            crate::canonical_apply::materialize(writer, &canonical).await
+                        }
+                        plan => Ok(plan),
+                    };
+                    let applied = match materialized {
+                        Ok(plan) => {
+                            if let AtomicOpPlan::FinalizeEntity(finalizer) = &plan {
+                                attempted
+                                    .lock()
+                                    .expect("workspace finalizer lock poisoned")
+                                    .push(finalizer.for_settlement());
+                            }
+                            apply_plan_preserving_storage(writer, &plan, false).await
+                        }
+                        Err(failure) => Err(PlanExecutionFailure::Operation(failure)),
+                    };
+                    match applied {
+                        Ok(applied) => {
+                            writer
+                                .execute(SqlStatement::new(format!("RELEASE {savepoint}"), vec![]))
+                                .await?;
+                            if let Some(effect) = applied.effect {
+                                effects.push(effect);
+                            }
+                        }
+                        Err(failure) => {
+                            let _ = writer
+                                .execute(SqlStatement::new(
+                                    format!("ROLLBACK TO {savepoint}"),
+                                    vec![],
+                                ))
+                                .await;
+                            let _ = writer
+                                .execute(SqlStatement::new(format!("RELEASE {savepoint}"), vec![]))
+                                .await;
+                            return Err(match failure {
+                                PlanExecutionFailure::Storage { source, .. } => Storage(source),
+                                PlanExecutionFailure::Operation(failure) => Refused {
+                                    failure: (index, failure),
+                                    message: format!("workspace atomic unit aborted at op {index}"),
+                                },
+                            });
+                        }
+                    }
+                }
+                cursor(writer).await.map_err(Storage)?;
+                Ok(((), effects))
+            })
+        });
+        let access = self.sql();
+        let outcome = run_prepared_atomic_unit(access.as_ref(), prepared).await;
+        let handles = take(&mut *handles.lock().expect("workspace finalizer lock poisoned"));
+        match outcome {
+            Ok(PreparedAtomicOutcome::Committed { post_commit, .. }) => {
+                for plan in handles {
+                    plan.finish_commit();
+                }
+                let effects = apply_post_commit_effects(self, token, post_commit).await;
+                Ok((id, effects))
+            }
+            Ok(PreparedAtomicOutcome::RolledBack((index, failure))) => {
+                let mut native_source = None;
+                for plan in handles {
+                    if let Some(source) = plan.finish_rollback(access.as_ref()).await {
+                        native_source = Some(source);
+                    }
+                }
+                if let Some(source) = native_source {
+                    return Err(RuntimeError::Storage(
+                        StorageError::WriterTaskRequestFailed {
+                            request_state: WriterTaskRequestState::TransactionRolledBack,
+                            source: Box::new(source),
+                        },
+                    ));
+                }
+                Err(RuntimeError::Internal(format!(
+                    "workspace atomic unit rolled back at op {index}: {failure:?}"
+                )))
+            }
+            Err(error) => {
+                if matches!(
+                    &error,
+                    StorageError::WriterTaskRequestFailed {
+                        request_state: WriterTaskRequestState::TransactionRolledBack,
+                        ..
+                    }
+                ) {
+                    for plan in handles {
+                        let _ = plan.finish_rollback(access.as_ref()).await;
+                    }
+                }
+                Err(RuntimeError::Storage(error))
+            }
+        }
+    }
+
     /// Claim a caller-derived entity id without replacing a competing row.
     /// Index writes are repeatable and never compensate by deleting the claim.
     pub async fn claim_entity_if_absent(
