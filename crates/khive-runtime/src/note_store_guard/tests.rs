@@ -821,17 +821,27 @@ async fn key_assignment_refuses_protected_notes_before_forwarding() {
     assert_eq!(reads.load(Ordering::SeqCst), 0);
     assert_eq!(assignments.load(Ordering::SeqCst), 0);
 
-    for properties in [
-        json!({"khive:secret_gate": "legacy"}),
-        json!({"khive:web_receipt": "v1"}),
+    // Each protected shape is refused by its own check: the reserved-property
+    // check also covers web receipts, so the web receipt asserts the guard's
+    // own refusal text.
+    for (properties, refusal) in [
+        (
+            json!({"khive:secret_gate": "legacy"}),
+            "property key `khive:secret_gate` is runtime-owned",
+        ),
+        (
+            json!({"khive:web_receipt": "v1"}),
+            "generic note writes cannot create or alter them",
+        ),
     ] {
         let note = Note::new("local", "observation", "protected").with_properties(properties);
         raw.upsert_note(note.clone()).await.unwrap();
         let before = raw.get_note(note.id).await.unwrap().unwrap();
-        assert!(store
+        let error = store
             .assign_note_key_if_unset(note.id, "locator", "local")
             .await
-            .is_err());
+            .expect_err("a protected note must be refused");
+        assert!(error.to_string().contains(refusal), "{error}");
         assert_eq!(assignments.load(Ordering::SeqCst), 0);
         assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), before);
     }
