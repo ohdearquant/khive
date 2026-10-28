@@ -527,9 +527,8 @@ half under it, and that no interim hard delete is authorized (lines 349-350). On
 interim run of the §4 historical classifier removed the eligible polling-dispatch audit rows from one deployment's
 events store, ahead of implementation. The operator approved that run on its reviewed plan, naming the plan's cutoff
 and digest; the approval is not a public record, and this amendment is the record's own account of the run. It records
-the tool, where the run departed from the base text, the evidence it left, and the bound on any further interim run.
-Once accepted, this amendment is the record's exception to §7 for the run it records and for runs that meet Decision 5;
-§7 is otherwise unchanged.
+the tool, where the run departed from the base text, and the evidence it left. Once accepted, this amendment is the
+record's exception to §7 for the run it records and for no other run; §7 is otherwise unchanged.
 
 Evidence line numbers refer to commit `b49d4d7dba4b4b47e9b6c32ebd5f412c38ab1411`.
 
@@ -573,6 +572,8 @@ For the 2026-10-28 run:
 
 - **Classifier.** `poll-dispatch-legacy-v1`.
 - **Capture instant and cutoff.** Plan at 2026-10-28T09:26:15.687092Z; cutoff exactly 604,800 s earlier, `cutoff_us` 1792574775687092.
+  This capture is the first interim capture of the store; rows written after it were outside the candidate set. The
+  tool refuses a cutoff later than its run start minus 604,800 s (`events_prune.rs:557-560`).
 - **Candidate-set digest.** `798db37643234a224c3371a36aa377df41f6bb6af7115c7dbfe6df3b4fb6a4de`.
 - **Rows.** 6,484,537 before (read from the backup); 4,229,195 removed in 2,115 committed batches, none skipped;
   2,255,814 after (read from the live store). The 472 rows beyond 6,484,537 minus 4,229,195 were written during the
@@ -594,18 +595,6 @@ The run returned no bytes to the file system. Later writes reuse the freed pages
 are spent. No conversion, VACUUM or drain runs on this store under this amendment; §6 governs reclaim, and a
 deployment that reaches its configured bound first decides on measured numbers, as §7 already states.
 
-### Decision 5 -- Further interim runs
+### Decision 5 -- No further interim run
 
-Until §8's acceptance passes, a further interim run of this tool is allowed only when all of these hold:
-
-1. The operator approves that run separately, by its cutoff and digest, after reviewing its plan. No approval carries
-   over from an earlier run.
-2. Its cutoff is no later than the first interim run's capture instant (2026-10-28T09:26:15.687092Z), so it reaches
-   only rows that existed when the first population was captured, the rows §4 says acquire age eligibility later. Rows
-   written after that instant wait for the implemented record and its write-time stamp. The seven-day floor holds on
-   its own: the tool refuses a cutoff later than its run start minus 604,800 s (`events_prune.rs:557-560`).
-3. It takes a fresh backup, runs the same controls, and either runs with the edge writers stopped or carries
-   Decision 2's read as a named step before it reports completion.
-4. It leaves the same evidence as Decision 3 and appends to the same expended-ID file.
-
-Every other deletion under this record waits for §7 as written.
+This amendment covers the 2026-10-28 run only; every other deletion under this record waits for §7 as written.
