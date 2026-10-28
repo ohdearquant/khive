@@ -29,6 +29,7 @@ fn registry(runtime: &KhiveRuntime) -> VerbRegistry {
 }
 
 fn initialize(runtime: &KhiveRuntime) {
+    runtime.backend().prepare_core_schema().expect("core schema before pack plans");
     registry(runtime)
         .apply_schema_plans_with_map(&HashMap::new(), runtime.backend())
         .expect("fallible writable pack schema initialization");
