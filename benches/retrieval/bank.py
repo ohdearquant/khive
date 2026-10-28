@@ -20,11 +20,17 @@ for k = 5 and 10. One JSONL file per arm, keyed by query_id = case_id, so `boots
 
 The store is never the caller's live one. The runner copies the named store files into a fresh scratch home (the
 events store beside the main one), refuses a source under the caller's ~/.khive, and refuses one with a non-empty
-WAL unless --copy-wal says no process writes it (the WAL is then staged beside its store). It writes
-its own config for an actor that has no binding row, and serves every arm from one `kkernel mcp` stdio process on the
-copy, run with KHIVE_NO_DAEMON=1 so no warm daemon starts or outlives the run. Writes made during the run (serve records, the profiles the feedback arms create) land in the copy and are
-removed with it. Every row carries the bank id and version, the population, the arm, the store snapshot id and the
-kkernel version.
+WAL unless --copy-wal says no process writes it (the WAL is then staged beside its store). A source whose inode, size
+or modification time changes during its copy stops the run, and the gap between the two sources' modification times
+is recorded. It writes its own config for an actor that has no binding row, and serves every arm from one
+`kkernel mcp` stdio process on the copy, run with KHIVE_NO_DAEMON=1 so no warm daemon starts or outlives the run.
+Writes made during the run (serve records, the profiles the feedback arms create) land in the copy. The scratch home
+is kept, and its path and the staged files' sha256 before and after the run are recorded; --remove-scratch removes it.
+
+Memory pressure is read before the copy and again before the server starts, and the run starts only when it is
+normal: on macOS kern.memorystatus_vm_pressure_level is 1; on Linux /proc/pressure/memory shows no full-stall time
+over the last 10 s (full avg10=0.00). An unreadable pressure counts as not normal. Both reads go in the run record.
+Every row carries the bank id and version, the population, the arm, the store snapshot id and the kkernel version.
 
 Arms. Every recall passes created_before = T, an exact store slice; a returned hit created at or after T stops the run.
     recall_rrf, recall_keyword_only, recall_vector_only
@@ -295,6 +301,59 @@ def under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def fingerprint(path: Path) -> tuple[int, int, int]:
+    st = path.stat()
+    return st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def copy_at_rest(src: Path, dest: Path) -> int:
+    """Copy src to dest; refuse when src's inode, size or modification time moved during the copy. Returns mtime_ns."""
+    before = fingerprint(src)
+    shutil.copyfile(src, dest)
+    after = fingerprint(src)
+    if before != after:
+        raise BankError(f"{src} changed during its copy (inode, size, mtime_ns {before} -> {after}); the copy at "
+                        f"{dest} is not used")
+    return before[2]
+
+
+def memory_pressure() -> dict:
+    """The kernel's memory pressure now, as {"source", "reading", "normal"}; normal is False when unreadable."""
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"], capture_output=True,
+                               text=True, timeout=10)
+            level = r.stdout.strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"source": "kern.memorystatus_vm_pressure_level", "reading": repr(e), "normal": False}
+        return {"source": "kern.memorystatus_vm_pressure_level", "reading": level, "normal": level == "1"}
+    try:
+        lines = Path("/proc/pressure/memory").read_text().splitlines()
+    except OSError as e:
+        return {"source": "/proc/pressure/memory", "reading": repr(e), "normal": False}
+    return {"source": "/proc/pressure/memory", "reading": " | ".join(lines), "normal": psi_full_avg10(lines) == 0.0}
+
+
+def psi_full_avg10(lines: list[str]) -> float | None:
+    """The avg10 field of a PSI file's "full" line, None when absent or unparsable."""
+    for line in lines:
+        kind, _, rest = line.partition(" ")
+        if kind == "full":
+            fields = dict(f.split("=", 1) for f in rest.split() if "=" in f)
+            try:
+                return float(fields["avg10"])
+            except (KeyError, ValueError):
+                return None
+    return None
+
+
+def require_normal_pressure(when: str) -> dict:
+    p = memory_pressure()
+    if not p["normal"]:
+        raise BankError(f"memory pressure is not normal {when} ({p['source']}: {p['reading']}); start when it is")
+    return p
+
+
 def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
     """Copy the store into scratch/home/.khive, write the bench config, return (main db path, env, manifest rows)."""
     live = Path(os.path.expanduser("~/.khive")).resolve()
@@ -312,12 +371,12 @@ def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
             if not args.copy_wal:
                 raise BankError(f"refusing {src}: its WAL is not empty; stage a checkpointed copy, or pass --copy-wal "
                                 "when no process writes the source")
-            shutil.copyfile(wal, Path(str(dest) + "-wal"))
+            mtime = copy_at_rest(wal, Path(str(dest) + "-wal"))
             manifest.append({"source": str(wal), "staged_as": name + "-wal", "bytes": wal.stat().st_size,
-                             "sha256": sha256_file(Path(str(dest) + "-wal"))})
-        shutil.copyfile(src, dest)
+                             "source_mtime_ns": mtime, "sha256": sha256_file(Path(str(dest) + "-wal"))})
+        mtime = copy_at_rest(src, dest)
         manifest.append({"source": str(src), "staged_as": name, "bytes": dest.stat().st_size,
-                         "sha256": sha256_file(dest)})
+                         "source_mtime_ns": mtime, "sha256": sha256_file(dest)})
     if args.models_dir:
         (home / ".lattice").mkdir()
         os.symlink(Path(args.models_dir).resolve(), home / ".lattice" / "models")
@@ -337,6 +396,28 @@ def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
            "KHIVE_RECOVERER_LOCK": h + "/.khive/recoverer.lock", "KHIVE_VOLUME_LOCK_DIR": h + "/.khive/vol-locks",
            "KHIVE_DB": str(kdir / "khive.db"), "KHIVE_NO_DAEMON": "1"}
     return kdir / "khive.db", env, manifest
+
+
+def staged_state(scratch: Path) -> list[dict]:
+    """sha256 of every non-empty store file in the scratch home, read after the server has closed."""
+    kdir = scratch / "home" / ".khive"
+    rows = []
+    for name in ("khive.db", "khive.db-wal", "khive.db.events.db", "khive.db.events.db-wal"):
+        f = kdir / name
+        if f.exists() and f.stat().st_size > 0:
+            rows.append({"staged_as": name, "bytes": f.stat().st_size, "sha256": sha256_file(f)})
+    return rows
+
+
+def finish_scratch(args, scratch: Path, record: dict) -> None:
+    """Record where the scratch home is and what it holds now; remove it only under --remove-scratch."""
+    kdir = scratch / "home" / ".khive"
+    holds_store = any((kdir / n).exists() for n in ("khive.db", "khive.db.events.db"))
+    record["scratch"] = {"path": str(scratch), "kept": holds_store and not args.remove_scratch}
+    if record["scratch"]["kept"]:
+        record["scratch"]["after_run"] = staged_state(scratch)
+    else:
+        shutil.rmtree(scratch)
 
 
 def recall(br: Bridge, query: str, before: str | None, what: str, **extra) -> list[dict]:
@@ -484,7 +565,11 @@ def cmd_check_bank(args) -> int:
 
 def start(args, run_id: str, scratch: Path):
     meta, cases = load_bank(Path(args.bank)) if args.bank else ({"bank_id": None, "version": None}, [])
+    pressure = {"before_copy": require_normal_pressure("before the copy")}
     db, env, manifest = stage(args, scratch)
+    pressure["before_server"] = require_normal_pressure("before the server starts")
+    stores = [m for m in manifest if m["staged_as"] in ("khive.db", "khive.db.events.db")]
+    skew_s = abs(stores[0]["source_mtime_ns"] - stores[1]["source_mtime_ns"]) / 1e9
     br = Bridge(args.kkernel, db, env, scratch / "kkernel-mcp.err")
     try:
         br.handshake()
@@ -496,7 +581,8 @@ def start(args, run_id: str, scratch: Path):
         raise
     base = {"bank_id": meta["bank_id"], "bank_version": meta["version"], "population": len(cases),
             "snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel), "run_id": run_id}
-    return meta, cases, br, base, {"ready_s": round(ready_s, 1), "control": ctl, "staged": manifest}
+    return meta, cases, br, base, {"ready_s": round(ready_s, 1), "control": ctl, "staged": manifest,
+                                   "source_mtime_skew_s": round(skew_s, 3), "memory_pressure": pressure}
 
 
 def scratch_dir(args, run_id: str) -> Path:
@@ -527,9 +613,10 @@ def cmd_run(args) -> int:
         finally:
             br.close()
     finally:
-        (out / "run.json").write_text(json.dumps(summary, indent=1) + "\n")
-        if not args.keep_scratch:
-            shutil.rmtree(scratch)
+        try:
+            finish_scratch(args, scratch, summary)
+        finally:
+            (out / "run.json").write_text(json.dumps(summary, indent=1) + "\n")
     return 0
 
 
@@ -601,48 +688,55 @@ def run_arms(args, arms, run_id, cases, br, base, out, summary) -> None:
 
 def cmd_calibrate_replay(args) -> int:
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
+    out = Path(args.out)
+    if out.exists():
+        raise BankError(f"refusing to overwrite {out}")
     scratch = scratch_dir(args, run_id)
+    report = {"status": "incomplete"}
     try:
         meta, cases, br, base, setup = start(args, run_id, scratch)
-    except BaseException:
-        if not args.keep_scratch:
-            shutil.rmtree(scratch)
-        raise
-    try:
-        twin = f"bench-replay-{run_id}"
-        br.one(op("brain.create_profile", name=twin, description="question-bank calibration: full feedback replay"))
-        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        actors = [a for a in args.feedback_actors.split(",") if a]
-        if args.queries_from_events:
-            cases, distinct = served_queries(br, actors, args.profile, args.feedback_since, now, args.n)
-            if not cases:
-                raise BankError(f"no recall_executed event served by {args.profile} for {actors}: nothing to compare")
-            base["query_source"] = {"kind": "recall_executed", "profile": args.profile, "actors": actors,
-                                    "distinct_queries": distinct, "sampled": len(cases)}
-            base["population"] = len(cases)
-        events = feedback_events(br, actors, args.profile, args.feedback_since, now)
-        counts = replay(br, events, twin)
-        rows = []
-        for c in cases[: args.n]:
-            a = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=args.profile)), "calibrate")
-            b = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=twin)), "calibrate")
-            ra = {hit_id(h, "calibrate"): h.get("rank_score") for h in a}
-            rb = {hit_id(h, "calibrate"): h.get("rank_score") for h in b}
-            shared = [i for i in ra if i in rb]
-            diffs = [abs(ra[i] - rb[i]) for i in shared if isinstance(ra[i], (int, float)) and isinstance(rb[i], (int, float))]
-            rows.append({"query_id": c["case_id"], "overlap@10": len(shared) / max(len(ra), 1),
-                         "same_order": list(ra) == list(rb), "max_abs_rank_score_diff": max(diffs, default=0.0)})
-        n = len(rows)
-        report = {**base, **setup, "events_found": len(events), **counts, "queries": n,
-                  "mean_overlap@10": round(sum(r["overlap@10"] for r in rows) / n, 4),
-                  "same_order_share": round(sum(r["same_order"] for r in rows) / n, 4),
-                  "max_abs_rank_score_diff": max(r["max_abs_rank_score_diff"] for r in rows), "rows": rows}
-        Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
-        print(json.dumps({k: v for k, v in report.items() if k != "rows"}), flush=True)
+        report.update(base)
+        report.update(setup)
+        try:
+            twin = f"bench-replay-{run_id}"
+            br.one(op("brain.create_profile", name=twin, description="question-bank calibration: full feedback replay"))
+            now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            actors = [a for a in args.feedback_actors.split(",") if a]
+            if args.queries_from_events:
+                cases, distinct = served_queries(br, actors, args.profile, args.feedback_since, now, args.n)
+                if not cases:
+                    raise BankError(f"no recall_executed event served by {args.profile} for {actors}: nothing to compare")
+                report["query_source"] = {"kind": "recall_executed", "profile": args.profile, "actors": actors,
+                                          "distinct_queries": distinct, "sampled": len(cases)}
+                report["population"] = len(cases)
+            events = feedback_events(br, actors, args.profile, args.feedback_since, now)
+            report["events_found"] = len(events)
+            report.update(replay(br, events, twin))
+            rows = []
+            for c in cases[: args.n]:
+                a = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=args.profile)),
+                             "calibrate")
+                b = hit_list(br.one(op("memory.recall", query=c["query"], top_k=10, profile_id=twin)), "calibrate")
+                ra = {hit_id(h, "calibrate"): h.get("rank_score") for h in a}
+                rb = {hit_id(h, "calibrate"): h.get("rank_score") for h in b}
+                shared = [i for i in ra if i in rb]
+                diffs = [abs(ra[i] - rb[i]) for i in shared
+                         if isinstance(ra[i], (int, float)) and isinstance(rb[i], (int, float))]
+                rows.append({"query_id": c["case_id"], "overlap@10": len(shared) / max(len(ra), 1),
+                             "same_order": list(ra) == list(rb), "max_abs_rank_score_diff": max(diffs, default=0.0)})
+            n = len(rows)
+            report.update({"queries": n, "mean_overlap@10": round(sum(r["overlap@10"] for r in rows) / n, 4),
+                           "same_order_share": round(sum(r["same_order"] for r in rows) / n, 4),
+                           "max_abs_rank_score_diff": max(r["max_abs_rank_score_diff"] for r in rows), "rows": rows})
+            report["status"] = "complete"
+        finally:
+            br.close()
     finally:
-        br.close()
-        if not args.keep_scratch:
-            shutil.rmtree(scratch)
+        try:
+            finish_scratch(args, scratch, report)
+        finally:
+            out.write_text(json.dumps(report, indent=1) + "\n")
+    print(json.dumps({k: v for k, v in report.items() if k not in ("rows", "staged")}), flush=True)
     return 0
 
 
@@ -683,6 +777,38 @@ def self_test() -> int:
           refused(check_served, [{"serve_attribution": "profile", "served_by_profile_id": "q"}], "x", "p", "t"))
     check("live store: a file under the live directory is refused, a sibling directory is not",
           under(Path("/h/.khive/khive.db"), Path("/h/.khive")) and not under(Path("/h/.khive-stage/khive.db"), Path("/h/.khive")))
+    psi = "some avg10=0.87 avg60=0.16 avg300=0.03 total=812622984"
+    check("pressure: PSI full avg10 parses, zero only for no stall",
+          psi_full_avg10([psi, "full avg10=0.00 avg60=0.00 avg300=0.00 total=1"]) == 0.0
+          and psi_full_avg10([psi, "full avg10=0.12 avg60=0.01 avg300=0.00 total=9"]) == 0.12
+          and psi_full_avg10([psi, "full avg10=10.00 avg60=0.01 avg300=0.00 total=9"]) == 10.0
+          and psi_full_avg10([psi]) is None)
+    global memory_pressure
+    real_pressure = memory_pressure
+    try:
+        memory_pressure = lambda: {"source": "test", "reading": "2", "normal": False}  # noqa: E731
+        check("pressure: a run does not start at a pressure that is not normal",
+              refused(require_normal_pressure, "in the test"))
+        memory_pressure = lambda: {"source": "test", "reading": "1", "normal": True}  # noqa: E731
+        check("pressure: a normal reading is returned and recorded", require_normal_pressure("in the test")["reading"] == "1")
+    finally:
+        memory_pressure = real_pressure
+    with tempfile.TemporaryDirectory() as d:
+        src, dest = Path(d) / "src.db", Path(d) / "dest.db"
+        src.write_bytes(b"x" * 4096)
+        check("copy: a source at rest copies", copy_at_rest(src, dest) == src.stat().st_mtime_ns)
+        real_copy = shutil.copyfile
+
+        def growing(a, b):
+            real_copy(a, b)
+            with open(a, "ab") as f:
+                f.write(b"y")
+
+        shutil.copyfile = growing
+        try:
+            check("copy: a source that grows during its copy is refused", refused(copy_at_rest, src, Path(d) / "d2.db"))
+        finally:
+            shutil.copyfile = real_copy
     check("spread: first and last kept, evenly spaced", spread(list(range(10)), 4) == [0, 3, 6, 9])
     check("spread: short lists come back whole", spread([1, 2], 5) == [1, 2] and spread([1, 2, 3], 0) == [])
     check("dig: finds a nested field", dig({"payload": {"data": {"signal": "useful"}}}, ("signal",)) == "useful")
@@ -731,7 +857,8 @@ def main() -> int:
         p.add_argument("--feedback-since", default="2025-01-01T00:00:00Z")
         p.add_argument("--ready-max-s", type=int, default=3600)
         p.add_argument("--scratch-parent", default=None)
-        p.add_argument("--keep-scratch", action="store_true")
+        p.add_argument("--remove-scratch", action="store_true",
+                       help="remove the scratch home and its store copy at the end (kept by default)")
         p.add_argument("--copy-wal", action="store_true", help="stage a non-empty WAL with its store (no writer active)")
         if name == "run":
             p.add_argument("--arms", default=",".join(ARMS))
