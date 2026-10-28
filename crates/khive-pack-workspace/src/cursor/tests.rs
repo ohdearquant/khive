@@ -465,6 +465,7 @@ async fn mirror_bounded(future: impl Future<Output = ()>) {
         .expect("mirror async fixture deadline");
 }
 fn mirror_fixture() -> (KhiveRuntime, VerbRegistry, khive_runtime::NamespaceToken) {
+    // This from_backend fixture binds typed stores and SQL to one SQLite backend.
     let runtime = KhiveRuntime::from_backend(
         std::sync::Arc::new(khive_runtime::StorageBackend::memory().unwrap()),
         khive_runtime::RuntimeConfig::no_embeddings(),
