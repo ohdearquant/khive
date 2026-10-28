@@ -663,3 +663,337 @@ async fn auto_compose_propagates_suggest_hydration_degradation() {
     );
     assert_eq!(response["data"]["count"], 0, "response: {response}");
 }
+
+use tracing::{field::Visit, instrument::WithSubscriber, span, Event, Metadata, Subscriber};
+
+#[derive(Clone, Default)]
+struct StaleAnnEvents(Arc<std::sync::Mutex<Vec<Value>>>);
+
+#[derive(Default)]
+struct StaleAnnFields(serde_json::Map<String, Value>);
+
+impl Visit for StaleAnnFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().into(), json!(format!("{value:?}")));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().into(), json!(value));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().into(), json!(value));
+    }
+}
+
+impl Subscriber for StaleAnnEvents {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+    fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+    fn enter(&self, _: &span::Id) {}
+    fn exit(&self, _: &span::Id) {}
+    fn event(&self, event: &Event<'_>) {
+        let mut fields = StaleAnnFields::default();
+        event.record(&mut fields);
+        if event.metadata().target() == "khive_pack_knowledge::knowledge::search"
+            && event.metadata().level() == &tracing::Level::INFO
+            && fields.0.contains_key("stale_ann_dropped")
+        {
+            self.0
+                .lock()
+                .expect("event capture")
+                .push(Value::Object(fields.0));
+        }
+    }
+}
+
+async fn bounded_stale_fixture<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(30), future)
+        .await
+        .expect("stale ANN fixture exceeded its async deadline")
+}
+
+async fn capture_stale_request(fixture: &Fixture, verb: &str, args: Value) -> (Value, Vec<Value>) {
+    let events = StaleAnnEvents::default();
+    let response = fixture
+        .dispatch(verb, args)
+        .with_subscriber(events.clone())
+        .await
+        .expect("public knowledge request succeeds");
+    // The request and its normal Drop event have completed inside WithSubscriber.
+    let captured = events.0.lock().expect("event capture").clone();
+    (response, captured)
+}
+
+fn assert_stale_event(events: &[Value], class: &str, expected: u64) {
+    assert_eq!(
+        events.len(),
+        1,
+        "one operator record per public request: {events:?}"
+    );
+    assert_eq!(
+        events[0]["request_class"], class,
+        "request class: {events:?}"
+    );
+    assert_eq!(
+        events[0]["stale_ann_dropped"], expected,
+        "unique stale count is local to one request: {events:?}"
+    );
+    let fields = events[0].as_object().expect("structured event");
+    assert_eq!(
+        fields.len(),
+        3,
+        "only class, count and fixed message: {events:?}"
+    );
+    assert_eq!(fields["message"], "stale ANN candidates dropped");
+}
+
+async fn stale_atom_fixture(hidden: bool) -> Fixture {
+    let fixture = Fixture::with_runtime(runtime_with_embedder());
+    fixture.execute(
+        "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, \
+         finalized, status, created_at, updated_at, deleted_at) VALUES \
+         ('71000000-0000-0000-0000-000000000001', 'local', 'absent-leader', \
+          'ANN Deleted Leader', 'opaque semantic vector source', '[]', NULL, 1, 'reviewed', 1, 1, NULL), \
+         ('71000000-0000-0000-0000-000000000002', 'local', 'hidden-prefix', \
+          'ANN Reviewed Prefix 1', 'hidden fixture payload', '[]', NULL, 1, 'reviewed', 2, 2, NULL), \
+         ('71000000-0000-0000-0000-000000000003', 'local', 'live-tail', \
+          'ANN Reviewed 2', 'opaque live vector source', '[]', NULL, 1, 'reviewed', 3, 3, NULL)"
+    ).await;
+    let index = fixture
+        .dispatch("knowledge.index", json!({"rebuild_ann": true}))
+        .await
+        .expect("build actual ANN index");
+    assert_eq!(index["indexed"], 3, "all three candidates must be indexed");
+    // Mutate canonical rows only, leaving the serving ANN candidate intact.
+    fixture
+        .execute("DELETE FROM knowledge_atoms WHERE id = '71000000-0000-0000-0000-000000000001'")
+        .await;
+    if hidden {
+        fixture.execute("UPDATE knowledge_atoms SET namespace = 'tenant-b' WHERE id = '71000000-0000-0000-0000-000000000002'").await;
+    }
+    fixture
+}
+
+const STALE_DOMAIN_QUERY: &str = "explain semantic retrieval ranking fusion candidate hydration degradation propagation across automatic knowledge composition";
+
+async fn stale_domain_fixture(stale: bool) -> Fixture {
+    let fixture = Fixture::with_runtime(runtime_with_embedder());
+    fixture
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {"slug": "operator-stale-domain", "name": "Operator Stale Domain",
+                 "description": format!("{STALE_DOMAIN_QUERY} Additional background supplies ordinary context for readers across common topics and examples."), "members": []},
+                {"slug": "operator-live-domain", "name": "Operator Live Domain",
+                 "description": format!("{STALE_DOMAIN_QUERY} Additional background supplies ordinary context for readers across common topics and examples."), "members": []}
+            ]}),
+        )
+        .await
+        .expect("seed real domain records and mirrors");
+    let index = fixture
+        .dispatch("knowledge.index", json!({"rebuild_ann": true}))
+        .await
+        .expect("build actual domain ANN index");
+    assert_eq!(index["indexed"], 2, "both domains must be indexed");
+    if stale {
+        fixture
+            .execute("DELETE FROM knowledge_atoms WHERE slug = 'operator-stale-domain'")
+            .await;
+        fixture
+            .execute("DELETE FROM knowledge_domains WHERE slug = 'operator-stale-domain'")
+            .await;
+    }
+    fixture
+}
+
+#[tokio::test]
+async fn absent_ann_id_is_dropped_without_hydration_failure() {
+    bounded_stale_fixture(async {
+        let fixture = stale_atom_fixture(false).await;
+        let (response, events) = capture_stale_request(
+            &fixture,
+            "knowledge.search",
+            json!({
+                "query": "unmatched vector diagnostic query", "limit": 5, "rerank": false
+            }),
+        )
+        .await;
+        let slugs = result_slugs(&response);
+        assert_eq!(
+            slugs.len(),
+            2,
+            "live ANN candidates remain usable: {response}"
+        );
+        assert!(
+            !slugs.contains(&"absent-leader"),
+            "absent shells never return"
+        );
+        assert!(
+            response.pointer("/degraded/hydration_failures").is_none(),
+            "absent canonical ID is an index miss, not hydration failure: {response}"
+        );
+        assert_stale_event(&events, "knowledge.search", 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mixed_hidden_and_absent_ann_ids_report_only_hidden_failure() {
+    bounded_stale_fixture(async {
+        let fixture = stale_atom_fixture(true).await;
+        let (response, events) = capture_stale_request(
+            &fixture,
+            "knowledge.search",
+            json!({
+                "query": "unmatched vector diagnostic query", "limit": 5, "rerank": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["degraded"]["hydration_failures"], 1,
+            "mixed hidden and absent IDs must count only the hidden row: {response}"
+        );
+        assert_eq!(
+            result_slugs(&response),
+            vec!["live-tail"],
+            "only visible live rows return"
+        );
+        assert!(
+            !response.to_string().contains("hidden fixture payload"),
+            "foreign content stays private"
+        );
+        assert_stale_event(&events, "knowledge.search", 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stale_ann_operator_events_are_scoped_to_public_request_class() {
+    bounded_stale_fixture(async {
+        for (stale, expected) in [(true, 1), (false, 0)] {
+            let fixture = stale_domain_fixture(stale).await;
+            for verb in ["knowledge.search", "knowledge.suggest", "knowledge.compose"] {
+                let args = match verb {
+                    "knowledge.search" => {
+                        json!({"query": STALE_DOMAIN_QUERY, "limit": 5, "rerank": false})
+                    }
+                    "knowledge.suggest" => json!({"query": STALE_DOMAIN_QUERY, "limit": 5}),
+                    _ => json!({"query": STALE_DOMAIN_QUERY}),
+                };
+                let (response, events) = capture_stale_request(&fixture, verb, args).await;
+                assert_stale_event(&events, verb, expected);
+                assert!(
+                    !response.to_string().contains("stale_ann_dropped"),
+                    "operator accounting is not a response field: {response}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ann_refill_skips_absent_prefix_without_hydration_degradation() {
+    bounded_stale_fixture(async {
+        let fixture = Fixture::with_runtime(runtime_with_embedder());
+
+        // The current fixed cohort starts at k=100, containing the stale leader and drafts only.
+        // Five reviewed records are later in the actual deterministic ANN order.
+        // Canonical deletion leaves the stale ID in each widened serving prefix.
+        fixture
+            .execute(
+                "INSERT INTO knowledge_atoms ( \
+                     id, namespace, slug, name, content, tags, properties, finalized, status, \
+                     source_uri, source_type, created_at, updated_at, deleted_at \
+                 ) VALUES ( \
+                     '50000000-0000-0000-0000-000000000000', 'local', \
+                     'ann-deleted-leader', 'ANN Deleted Leader', \
+                     'annstatus blocker lexical query fresh deletion candidate prefix', \
+                     '[]', NULL, 0, 'draft', NULL, NULL, 0, 0, NULL \
+                 )",
+            )
+            .await;
+        fixture
+            .execute(
+                "WITH RECURSIVE n(v) AS ( \
+                     VALUES(0) UNION ALL SELECT v + 1 FROM n WHERE v < 123 \
+                 ) \
+                 INSERT INTO knowledge_atoms ( \
+                     id, namespace, slug, name, content, tags, properties, finalized, status, \
+                     source_uri, source_type, created_at, updated_at, deleted_at \
+                 ) \
+                 SELECT \
+                     printf('50100000-0000-0000-0000-%012d', v), \
+                     'local', printf('ann-draft-%02d', v), printf('ANN Draft %02d', v), \
+                     'annstatus blocker lexical query ineligible prefix candidate', \
+                     '[]', NULL, 0, 'draft', NULL, NULL, 100 + v, 100 + v, NULL \
+                 FROM n",
+            )
+            .await;
+        fixture
+            .execute(
+                "WITH RECURSIVE n(v) AS ( \
+                     VALUES(0) UNION ALL SELECT v + 1 FROM n WHERE v < 4 \
+                 ) \
+                 INSERT INTO knowledge_atoms ( \
+                     id, namespace, slug, name, content, tags, properties, finalized, status, \
+                     source_uri, source_type, created_at, updated_at, deleted_at \
+                 ) \
+                 SELECT \
+                     printf('60000000-0000-0000-0000-%012d', v), \
+                     'local', printf('ann-reviewed-%02d', v), printf('ANN Reviewed %02d', v), \
+                     'opaque semantic vector document with no shared candidate vocabulary', \
+                     '[]', NULL, 1, 'reviewed', NULL, NULL, 200 + v, 200 + v, NULL \
+                 FROM n",
+            )
+            .await;
+
+        let index = fixture
+            .dispatch("knowledge.index", json!({"rebuild_ann": true}))
+            .await
+            .expect("ANN index builds");
+        assert_eq!(index["indexed"], 130, "index response: {index}");
+
+        fixture
+            .execute(
+                "DELETE FROM knowledge_atoms WHERE id = '50000000-0000-0000-0000-000000000000'",
+            )
+            .await;
+        let (response, events) = capture_stale_request(
+            &fixture,
+            "knowledge.search",
+            json!({
+                "query": "annstatus blocker lexical query", "status": "reviewed", "limit": 5,
+                "rerank": false
+            }),
+        )
+        .await;
+        let results = response["results"].as_array().expect("results");
+        assert_eq!(
+            results.len(),
+            5,
+            "eligible tail fills the requested result count: {response}"
+        );
+        assert!(
+            results.iter().all(|row| row["status"] == "reviewed"),
+            "eligibility remains intact"
+        );
+        assert!(
+            results.iter().all(|row| row["slug"]
+                .as_str()
+                .is_some_and(|slug| slug.starts_with("ann-reviewed-"))),
+            "the eligible ANN tail must refill"
+        );
+        assert!(
+            response.pointer("/degraded/hydration_failures").is_none(),
+            "refilled absent prefixes do not report hydration failure: {response}"
+        );
+        assert_stale_event(&events, "knowledge.search", 1);
+    })
+    .await;
+}

@@ -9,6 +9,32 @@ use super::{
     Value, HYDRATION_ID_CHUNK,
 };
 
+/// Operator-only accounting for one public request, including repeated ANN prefixes.
+pub(super) struct StaleAnnDiagnostics {
+    request_class: &'static str,
+    dropped_ids: HashSet<String>,
+}
+
+impl StaleAnnDiagnostics {
+    pub(super) fn new(request_class: &'static str) -> Self {
+        Self {
+            request_class,
+            dropped_ids: HashSet::new(),
+        }
+    }
+}
+
+impl Drop for StaleAnnDiagnostics {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "khive_pack_knowledge::knowledge::search",
+            request_class = self.request_class,
+            stale_ann_dropped = self.dropped_ids.len() as u64,
+            "stale ANN candidates dropped"
+        );
+    }
+}
+
 // ─── hit hydration ────────────────────────────────────────────────────────────
 
 /// Build the atom hydration statement for one id chunk.
@@ -66,6 +92,23 @@ pub(super) fn hydrate_domains_statement(ns: &str, ids: &[String]) -> SqlStatemen
     }
 }
 
+/// Presence only: no foreign content is read or admitted into caller-visible hits.
+fn candidate_presence_statement(ids: &[String]) -> SqlStatement {
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    SqlStatement {
+        sql: khive_runtime::sql!("knowledge_search_candidate_presence")
+            .replace("/* ids */ ?1", &placeholders),
+        // Both UNION arms reuse these numbered binds, preserving the chunk ceiling.
+        params: ids.iter().cloned().map(SqlValue::Text).collect(),
+        label: None,
+    }
+}
+
 /// Build the phase-B hydration statement for one chunk of phase-A rowids
 /// (issue #2396 fix 5).
 ///
@@ -113,14 +156,22 @@ pub(super) fn phase_b_hydration_statement(
 
 /// Hydrate ANN-only hit shells from the canonical corpus tables.
 ///
-/// Returns the number of candidate rows that could not be hydrated. Missing
-/// rows (for example a stale ANN id) and storage-read failures both degrade the
-/// candidate pool instead of failing an otherwise-useful lexical response, but
-/// unresolved shells are always removed and the count is surfaced to callers.
+/// Proven-absent IDs are index misses. Existing or unreadable rows that cannot
+/// hydrate remain failures. Every unresolved shell is removed.
+#[cfg(test)]
 pub(super) async fn hydrate_empty_hits(
     runtime: &KhiveRuntime,
     ns: &str,
     hits: &mut Vec<ScoredHit>,
+) -> usize {
+    hydrate_empty_hits_recording(runtime, ns, hits, &mut HashSet::new()).await
+}
+
+async fn hydrate_empty_hits_recording(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    hits: &mut Vec<ScoredHit>,
+    stale_ids: &mut HashSet<String>,
 ) -> usize {
     let ids: Vec<String> = hits
         .iter()
@@ -147,10 +198,16 @@ pub(super) async fn hydrate_empty_hits(
         }
     };
 
+    let mut uncertain_ids = HashSet::new();
     let mut atom_rows = Vec::new();
     for chunk in ids.chunks(HYDRATION_ID_CHUNK) {
         match reader.query_all(hydrate_atoms_statement(ns, chunk)).await {
-            Ok(rows) => atom_rows.extend(rows),
+            Ok(rows) => {
+                if rows.iter().any(|row| row_str(row, "id").is_none()) {
+                    uncertain_ids.extend(chunk.iter().cloned());
+                }
+                atom_rows.extend(rows);
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "khive_pack_knowledge::knowledge::search",
@@ -159,6 +216,7 @@ pub(super) async fn hydrate_empty_hits(
                     error = %error,
                     "knowledge atom candidate hydration chunk degraded"
                 );
+                uncertain_ids.extend(chunk.iter().cloned());
             }
         }
     }
@@ -199,7 +257,12 @@ pub(super) async fn hydrate_empty_hits(
     let mut domain_rows = Vec::new();
     for chunk in missing_ids.chunks(HYDRATION_ID_CHUNK) {
         match reader.query_all(hydrate_domains_statement(ns, chunk)).await {
-            Ok(rows) => domain_rows.extend(rows),
+            Ok(rows) => {
+                if rows.iter().any(|row| row_str(row, "id").is_none()) {
+                    uncertain_ids.extend(chunk.iter().cloned());
+                }
+                domain_rows.extend(rows);
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "khive_pack_knowledge::knowledge::search",
@@ -208,6 +271,7 @@ pub(super) async fn hydrate_empty_hits(
                     error = %error,
                     "knowledge domain candidate hydration chunk degraded"
                 );
+                uncertain_ids.extend(chunk.iter().cloned());
             }
         }
     }
@@ -232,6 +296,33 @@ pub(super) async fn hydrate_empty_hits(
         }
     }
 
+    let mut seen = HashSet::new();
+    let unresolved: Vec<String> = hits
+        .iter()
+        .filter(|hit| hit.slug.is_empty() && !uncertain_ids.contains(&hit.id))
+        .filter(|hit| seen.insert(hit.id.clone()))
+        .map(|hit| hit.id.clone())
+        .collect();
+    let mut absent = HashSet::new();
+    for chunk in unresolved.chunks(HYDRATION_ID_CHUNK) {
+        // Failed or malformed evidence is not absence. Preserve degradation and
+        // do not expose the global query or its IDs through an error payload.
+        if let Ok(rows) = reader.query_all(candidate_presence_statement(chunk)).await {
+            let present = rows
+                .iter()
+                .map(|row| row_str(row, "id"))
+                .collect::<Option<HashSet<_>>>();
+            let Some(present) = present else {
+                continue;
+            };
+            let requested: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+            if present.iter().all(|id| requested.contains(id.as_str())) {
+                absent.extend(chunk.iter().filter(|id| !present.contains(*id)).cloned());
+            }
+        }
+    }
+    stale_ids.extend(absent.iter().cloned());
+    hits.retain(|hit| !hit.slug.is_empty() || !absent.contains(&hit.id));
     let failed = hits.iter().filter(|hit| hit.slug.is_empty()).count();
     hits.retain(|hit| !hit.slug.is_empty());
     if failed > 0 {
@@ -395,9 +486,10 @@ async fn search_eligible_ann_with_refill(
     ann: &vamana::SharedAnn,
     key: &vamana::AnnKey,
     query_embedding: &[f32],
-    target_eligible: usize,
-    initial_k: usize,
+    limits: (usize, usize),
+    stale: &mut StaleAnnDiagnostics,
 ) -> Result<EligibleAnnSearchState, RuntimeError> {
+    let (target_eligible, initial_k) = limits;
     let runtime = ctx.runtime;
     let target_eligible = target_eligible.max(1);
     let mut request_k = initial_k.max(target_eligible).max(1);
@@ -429,7 +521,8 @@ async fn search_eligible_ann_with_refill(
             })
             .collect();
 
-        let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
+        let hydration_failures =
+            hydrate_empty_hits_recording(runtime, ctx.ns, &mut hits, &mut stale.dropped_ids).await;
         khive_storage::ensure_request_read_active("knowledge.search")?;
         filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
         filter_hits_by_type(&mut hits, ctx.type_filter);
@@ -481,6 +574,7 @@ pub(super) async fn run_candidate_stages<F>(
     raw_query: &str,
     options: CandidateStageOptions,
     lexical: F,
+    stale: &mut StaleAnnDiagnostics,
 ) -> Result<(SearchCoreOutcome, CandidateStageOutcome), RuntimeError>
 where
     F: std::future::Future<Output = Result<SearchCoreOutcome, RuntimeError>>,
@@ -516,8 +610,8 @@ where
                     ann,
                     &key,
                     vector,
-                    options.ann_target,
-                    options.ann_initial_k,
+                    (options.ann_target, options.ann_initial_k),
+                    stale,
                 ),
             )
             .await

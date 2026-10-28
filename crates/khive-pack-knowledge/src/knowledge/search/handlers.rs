@@ -25,6 +25,13 @@ use super::{
 #[cfg(test)]
 use super::{compose_read_tests, MEMBER_SIZING_READ_TIMEOUT};
 
+const MAX_AUTO_COMPOSE_DOMAINS: usize = 20;
+
+enum SuggestCandidateCohort {
+    RequestedLimit,
+    AutoCompose,
+}
+
 async fn apply_atom_weights(
     sql: &dyn khive_storage::SqlAccess,
     namespace: &str,
@@ -97,6 +104,7 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.search");
         khive_storage::ensure_request_read_active("knowledge.search")?;
         let p: SearchParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -274,6 +282,7 @@ impl KnowledgeHandlers {
                     search_core(&ctx, &raw_query, LexicalPass::Full).await
                 }
             },
+            &mut stale,
         )
         .await?;
 
@@ -429,12 +438,15 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.suggest");
         let (out, _) = Self::suggest_with_query_embedding(
             runtime,
             token,
             params,
             ann,
             QueryEmbeddingCache::default(),
+            SuggestCandidateCohort::RequestedLimit,
+            &mut stale,
         )
         .await?;
         Ok(out)
@@ -449,6 +461,8 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
         query_embedding: QueryEmbeddingCache,
+        cohort: SuggestCandidateCohort,
+        stale: &mut super::hydration::StaleAnnDiagnostics,
     ) -> Result<(Value, QueryEmbeddingCache), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
@@ -465,6 +479,11 @@ impl KnowledgeHandlers {
             )));
         }
         let limit = p.limit.unwrap_or(8).clamp(1, 100);
+        // Auto-compose reranks one cohort before applying the requested limit.
+        let candidate_limit = match cohort {
+            SuggestCandidateCohort::RequestedLimit => limit,
+            SuggestCandidateCohort::AutoCompose => MAX_AUTO_COMPOSE_DOMAINS,
+        };
         let ns = token.namespace().as_str().to_owned();
 
         // Exclude draft and deprecated domain atoms by default — same quality
@@ -480,17 +499,17 @@ impl KnowledgeHandlers {
             type_filter: Some("domain"),
             min_score: 0.0,
             w: &Weights::default(),
-            fetch_limit: limit * 3,
+            fetch_limit: candidate_limit * 3,
             statuses: &[],
             exclude_statuses: SUGGEST_EXCLUDE,
             term_budget: &term_budget,
         };
 
         // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
-        // limit*3 would return mostly atoms that all get dropped after type filtering.
+        // The candidate target would return mostly atoms dropped after type filtering.
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
-        let ann_k = (limit * 50).max(200);
+        let ann_k = (candidate_limit * 50).max(200);
         let (
             SearchCoreOutcome {
                 mut hits,
@@ -515,6 +534,7 @@ impl KnowledgeHandlers {
                 operation: "knowledge.suggest",
             },
             search_core(&ctx, &raw_query, LexicalPass::Full),
+            stale,
         )
         .await?;
 
@@ -823,6 +843,7 @@ impl KnowledgeHandlers {
         ann: &vamana::SharedAnn,
         type_weights: HashMap<String, f32>,
     ) -> Result<Value, RuntimeError> {
+        let mut stale = super::hydration::StaleAnnDiagnostics::new("knowledge.compose");
         let p: ComposeParams = deser(params)?;
 
         // Registry dispatch already mints an exact token for an explicit
@@ -910,13 +931,15 @@ impl KnowledgeHandlers {
         try_or_finish!(timing.begin(Phase::Suggest));
 
         if is_auto {
-            let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
+            let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, MAX_AUTO_COMPOSE_DOMAINS);
             let suggest_attempt = Self::suggest_with_query_embedding(
                 runtime,
                 token,
                 json!({ "query": &raw_query, "limit": auto_limit }),
                 ann,
                 std::mem::take(&mut query_embedding),
+                SuggestCandidateCohort::AutoCompose,
+                &mut stale,
             )
             .await;
             try_or_finish!(khive_storage::ensure_request_read_active(
