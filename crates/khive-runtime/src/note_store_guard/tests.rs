@@ -661,10 +661,23 @@ async fn channel_health_identity_public_store_preserves_first_insert_and_ordinar
 struct ReadCountingStore {
     inner: Arc<dyn NoteStore>,
     reads: Arc<AtomicUsize>,
+    key_assignments: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl NoteStore for ReadCountingStore {
+    async fn assign_note_key_if_unset(
+        &self,
+        id: Uuid,
+        key: &str,
+        namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        self.key_assignments.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .assign_note_key_if_unset(id, key, namespace)
+            .await
+    }
+
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
         self.inner.upsert_note(note).await
     }
@@ -784,8 +797,55 @@ fn guarded_store_counting_reads(runtime: &KhiveRuntime) -> (Arc<dyn NoteStore>, 
     let counting = ReadCountingStore {
         inner: runtime.raw_notes(&NamespaceToken::local()).unwrap(),
         reads: Arc::clone(&reads),
+        key_assignments: Arc::new(AtomicUsize::new(0)),
     };
     (PolicyEnforcingNoteStore::wrap(Arc::new(counting)), reads)
+}
+
+#[tokio::test]
+async fn key_assignment_refuses_protected_notes_before_forwarding() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let raw = runtime.raw_notes(&NamespaceToken::local()).unwrap();
+    let assignments = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let store = PolicyEnforcingNoteStore::wrap(Arc::new(ReadCountingStore {
+        inner: Arc::clone(&raw),
+        reads: Arc::clone(&reads),
+        key_assignments: Arc::clone(&assignments),
+    }));
+
+    assert!(store
+        .assign_note_key_if_unset(Uuid::new_v4(), "bad\0key", "local")
+        .await
+        .is_err());
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(assignments.load(Ordering::SeqCst), 0);
+
+    for properties in [
+        json!({"khive:secret_gate": "legacy"}),
+        json!({"khive:web_receipt": "v1"}),
+    ] {
+        let note = Note::new("local", "observation", "protected").with_properties(properties);
+        raw.upsert_note(note.clone()).await.unwrap();
+        let before = raw.get_note(note.id).await.unwrap().unwrap();
+        assert!(store
+            .assign_note_key_if_unset(note.id, "locator", "local")
+            .await
+            .is_err());
+        assert_eq!(assignments.load(Ordering::SeqCst), 0);
+        assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), before);
+    }
+
+    let ordinary = Note::new("local", "observation", "ordinary");
+    raw.upsert_note(ordinary.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .assign_note_key_if_unset(ordinary.id, "locator", "local")
+            .await
+            .unwrap(),
+        NoteKeyAssignOutcome::Assigned
+    );
+    assert_eq!(assignments.load(Ordering::SeqCst), 1);
 }
 
 async fn seed_patch_target(runtime: &KhiveRuntime, properties: Value) -> Note {

@@ -16,8 +16,9 @@ use uuid::Uuid;
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::StorageError;
 use khive_storage::note::{
-    FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NotePropertyPatch,
-    NoteSeekAfter, NoteStatusSelector, NoteTagMode, NoteTimeOrder, NoteVisibility, SortDir,
+    validate_note_key_for_store, FilterOp, Note, NoteFilter, NoteInstantSeekAfter,
+    NoteKeyAssignOutcome, NoteKeyCursor, NotePropertyPatch, NoteSeekAfter, NoteStatusSelector,
+    NoteTagMode, NoteTimeOrder, NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -370,6 +371,29 @@ pub fn note_set_property_statement(
         ],
         label: Some("note-set-property".to_string()),
     })
+}
+
+/// The conditional key assignment issued by [`NoteStore::assign_note_key_if_unset`].
+pub fn note_assign_key_statement(id: Uuid, key: &str, namespace: &str) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE notes SET key = ?1 WHERE id = ?2 AND namespace = ?3 \
+              AND key IS NULL AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(key.to_owned()),
+            SqlValue::Text(id.to_string()),
+            SqlValue::Text(namespace.to_owned()),
+        ],
+        label: Some("note-assign-key".to_string()),
+    }
+}
+
+fn note_key_unique_conflict(error: &rusqlite::Error) -> bool {
+    matches!(error,
+        rusqlite::Error::SqliteFailure(code, Some(message))
+        if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            && message == "UNIQUE constraint failed: notes.namespace, notes.kind, notes.key"
+    )
 }
 
 /// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
@@ -1770,6 +1794,46 @@ fn execute_filtered_note_property_patch(
 
 #[async_trait]
 impl NoteStore for SqlNoteStore {
+    async fn assign_note_key_if_unset(
+        &self,
+        id: Uuid,
+        key: &str,
+        namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        validate_note_key_for_store(key, "assign_note_key_if_unset")?;
+        let statement = note_assign_key_statement(id, key, namespace);
+        let namespace = namespace.to_owned();
+        self.with_writer_tx("assign_note_key_if_unset", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            let changed = match stmt.raw_execute() {
+                Ok(changed) => changed,
+                Err(error) if note_key_unique_conflict(&error) => {
+                    return Ok(NoteKeyAssignOutcome::KeyTaken);
+                }
+                Err(error) => return Err(error),
+            };
+            drop(stmt);
+            if changed != 0 {
+                return Ok(NoteKeyAssignOutcome::Assigned);
+            }
+            let existing = conn
+                .query_row(
+                    "SELECT key FROM notes WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![id.to_string(), namespace],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            match existing {
+                Some(Some(existing)) => Ok(NoteKeyAssignOutcome::AlreadyKeyed { existing }),
+                None => Ok(NoteKeyAssignOutcome::NotFound),
+                // An unkeyed live row could not fail the guarded UPDATE in this transaction.
+                Some(None) => Err(rusqlite::Error::InvalidQuery),
+            }
+        })
+        .await
+    }
+
     async fn get_live_notes_by_key(
         &self,
         namespace: &str,
@@ -2932,6 +2996,10 @@ pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqli
 #[cfg(test)]
 #[path = "note_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "note_key_assignment_tests.rs"]
+mod note_key_assignment_tests;
 
 #[cfg(test)]
 #[path = "comm_filter_plan_tests.rs"]

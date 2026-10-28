@@ -27,7 +27,8 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
-    /// Immutable caller-chosen identity, unique among live notes of the same namespace and kind.
+    /// Caller-chosen identity, unique among live notes of the same namespace and kind.
+    /// Once set, it cannot be replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// Persisted revision, assigned by storage and advanced on every matched update.
@@ -42,6 +43,49 @@ pub struct NoteVisibility {
     pub id: Uuid,
     pub namespace: String,
     pub deleted_at: Option<i64>,
+}
+
+/// Maximum size of a caller-chosen note key in UTF-8 bytes.
+pub const NOTE_KEY_MAX_BYTES: usize = 512;
+
+/// Whether a note key satisfies the shared size and character constraints.
+pub fn note_key_is_valid(key: &str) -> bool {
+    key.len() <= NOTE_KEY_MAX_BYTES && !key.contains('\0')
+}
+
+/// Validate a key for a note-store operation without accessing storage.
+pub fn validate_note_key_for_store(key: &str, operation: &'static str) -> StorageResult<()> {
+    if note_key_is_valid(key) {
+        Ok(())
+    } else {
+        Err(crate::StorageError::InvalidInput {
+            capability: crate::StorageCapability::Notes,
+            operation: operation.into(),
+            message: "key must be at most 512 UTF-8 bytes and must not contain U+0000".into(),
+        })
+    }
+}
+
+/// Result of setting the key on an existing note that has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoteKeyAssignOutcome {
+    Assigned,
+    AlreadyKeyed { existing: String },
+    KeyTaken,
+    NotFound,
+}
+
+#[cfg(test)]
+mod note_key_validation_tests {
+    use super::note_key_is_valid;
+
+    #[test]
+    fn key_limit_counts_utf8_bytes_and_rejects_nul() {
+        assert!(note_key_is_valid(""));
+        assert!(note_key_is_valid(&"é".repeat(256)));
+        assert!(!note_key_is_valid(&"a".repeat(513)));
+        assert!(!note_key_is_valid("before\0after"));
+    }
 }
 
 const fn initial_note_version() -> i64 {
@@ -512,6 +556,24 @@ pub struct NoteMailboxScope {
 /// the existing all-status population and do not bypass `include_deleted`.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
+    /// Set the key of a live, unkeyed note in the asserted namespace once.
+    /// The namespace is a row predicate, not an authorization check.
+    /// An existing key is never replaced, and the live key uniqueness scope is
+    /// namespace and note kind. Invalid keys are refused without a write.
+    async fn assign_note_key_if_unset(
+        &self,
+        _id: Uuid,
+        key: &str,
+        _namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        validate_note_key_for_store(key, "assign_note_key_if_unset")?;
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "assign_note_key_if_unset".into(),
+            message: "backend has no guarded note key assignment".into(),
+        })
+    }
+
     async fn get_live_notes_by_key(
         &self,
         _namespace: &str,
