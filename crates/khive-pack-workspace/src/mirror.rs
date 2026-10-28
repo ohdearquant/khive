@@ -24,13 +24,15 @@ use crate::{cursor, WorkspaceMirrorConfig};
 
 pub(crate) const HISTORY_PAGE_SIZE: u32 = 50;
 
-/// Progress for confirmed commits and unchanged files only.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Confirmed commits, unchanged files, and included paths skipped for invalid UTF-8.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MirrorPassSummary {
     /// Files whose document/lexical/cursor transaction was confirmed committed.
     pub committed: usize,
     /// Files whose checksum already matched committed progress.
     pub unchanged: usize,
+    /// Canonical-root paths whose bytes were not UTF-8; no document or cursor was written.
+    pub skipped_non_utf8: Vec<PathBuf>,
 }
 
 /// State of the current file, separate from earlier committed files.
@@ -64,22 +66,22 @@ pub struct MirrorPassError {
 
 impl MirrorPassError {
     fn runtime(
-        progress: MirrorPassSummary,
+        progress: &MirrorPassSummary,
         file: Option<&Path>,
         commit_state: FileCommitState,
         error: RuntimeError,
     ) -> Self {
         Self {
-            progress,
+            progress: progress.clone(),
             file: file.map(Path::to_owned),
             commit_state,
             cause: Box::new(Failure::Runtime(error)),
         }
     }
 
-    fn io(progress: MirrorPassSummary, file: &Path, error: std::io::Error) -> Self {
+    fn io(progress: &MirrorPassSummary, file: &Path, error: std::io::Error) -> Self {
         Self {
-            progress,
+            progress: progress.clone(),
             file: Some(file.to_owned()),
             commit_state: FileCommitState::NotAttempted,
             cause: Box::new(Failure::Io(error)),
@@ -177,6 +179,7 @@ fn next_offset(offset: u64, count: usize) -> Result<u64, RuntimeError> {
         .ok_or_else(|| invalid("workspace mirror history offset overflow"))
 }
 
+/// Lookup work is linear in this source URI's history, per file, per pass.
 async fn previous_document(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -299,8 +302,9 @@ fn advance_cursor<'w>(
 
 /// Mirror one tree sequentially, retaining at most one file's body at a time.
 ///
-/// All body bytes are read and hashed even when mtime is unchanged. Paths must
-/// be Unicode and symlink entries are skipped. This does not lock the tree or
+/// All body bytes are read; valid UTF-8 is hashed even when mtime is unchanged.
+/// Invalid UTF-8 files are skipped and named in the summary, without writes.
+/// Paths must be Unicode and symlink entries are skipped. This does not lock the tree or
 /// promise ABA-proof history serialization. Earlier files may already commit
 /// before a later error; inspect progress and commit_state before retrying.
 pub async fn mirror_directory_once(
@@ -313,7 +317,7 @@ pub async fn mirror_directory_once(
     let mut progress = MirrorPassSummary::default();
     if runtime.backend_id().as_str() != BackendId::MAIN {
         return Err(MirrorPassError::runtime(
-            progress,
+            &progress,
             None,
             FileCommitState::NotAttempted,
             invalid(&format!(
@@ -323,18 +327,19 @@ pub async fn mirror_directory_once(
         ));
     }
     let metadata = fs::symlink_metadata(project_root)
-        .map_err(|error| MirrorPassError::io(progress, project_root, error))?;
+        .map_err(|error| MirrorPassError::io(&progress, project_root, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(MirrorPassError::runtime(
-            progress,
+            &progress,
             Some(project_root),
             FileCommitState::NotAttempted,
             invalid("workspace mirror root must be a real directory"),
         ));
     }
     let root = fs::canonicalize(project_root)
-        .map_err(|error| MirrorPassError::io(progress, project_root, error))?;
-    let first = fs::read_dir(&root).map_err(|error| MirrorPassError::io(progress, &root, error))?;
+        .map_err(|error| MirrorPassError::io(&progress, project_root, error))?;
+    let first =
+        fs::read_dir(&root).map_err(|error| MirrorPassError::io(&progress, &root, error))?;
     let mut directories = vec![(root.clone(), first)];
     while let Some((directory, entries)) = directories.last_mut() {
         let (directory, next) = (directory.clone(), entries.next());
@@ -342,17 +347,17 @@ pub async fn mirror_directory_once(
             directories.pop();
             continue;
         };
-        let entry = entry.map_err(|error| MirrorPassError::io(progress, &directory, error))?;
+        let entry = entry.map_err(|error| MirrorPassError::io(&progress, &directory, error))?;
         let path = entry.path();
         let kind = entry
             .file_type()
-            .map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
         if kind.is_symlink() {
             continue;
         }
         if kind.is_dir() {
-            let entries =
-                fs::read_dir(&path).map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            let entries = fs::read_dir(&path)
+                .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
             directories.push((path, entries));
             continue;
         }
@@ -361,7 +366,7 @@ pub async fn mirror_directory_once(
         }
         let relative = path.strip_prefix(&root).map_err(|_| {
             MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::NotAttempted,
                 invalid("workspace mirror path escaped its root"),
@@ -372,7 +377,7 @@ pub async fn mirror_directory_once(
         }
         let name = relative.to_str().ok_or_else(|| {
             MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::NotAttempted,
                 invalid("workspace mirror paths must be Unicode"),
@@ -380,7 +385,7 @@ pub async fn mirror_directory_once(
         })?;
         let uri = file_uri(&path).ok_or_else(|| {
             MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::NotAttempted,
                 invalid("workspace mirror paths must be Unicode"),
@@ -388,41 +393,48 @@ pub async fn mirror_directory_once(
         })?;
         let key = cursor_key(token.namespace().as_str(), &uri);
         let mut file =
-            File::open(&path).map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            File::open(&path).map_err(|error| MirrorPassError::io(&progress, &path, error))?;
         let before = file
             .metadata()
-            .map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
         if !before.is_file() {
             continue;
         }
         let modified = before
             .modified()
-            .map_err(|error| MirrorPassError::io(progress, &path, error))?;
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)
-            .map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
         let after = file
             .metadata()
-            .map_err(|error| MirrorPassError::io(progress, &path, error))?;
+            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
         if before.len() != after.len()
             || modified
                 != after
                     .modified()
-                    .map_err(|error| MirrorPassError::io(progress, &path, error))?
+                    .map_err(|error| MirrorPassError::io(&progress, &path, error))?
         {
             return Err(MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::NotAttempted,
                 invalid("workspace mirror file changed while reading"),
             ));
         }
+        let raw = match String::from_utf8(raw) {
+            Ok(raw) => raw,
+            Err(_) => {
+                progress.skipped_non_utf8.push(path);
+                continue;
+            }
+        };
         let checksum = Hash32::from_blake3(raw.as_bytes()).to_string();
         let masked = khive_runtime::secret_gate::mask_secrets(&raw);
         let expected = {
             let mut reader = runtime.sql().reader().await.map_err(|error| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     error.into(),
@@ -430,7 +442,7 @@ pub async fn mirror_directory_once(
             })?;
             cursor::get(&mut *reader, &key).await.map_err(|error| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     error.into(),
@@ -441,7 +453,7 @@ pub async fn mirror_directory_once(
             .await
             .map_err(|error| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     error,
@@ -453,7 +465,7 @@ pub async fn mirror_directory_once(
         {
             if previous.is_none() {
                 return Err(MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     invalid("workspace mirror cursor has no current document"),
@@ -461,7 +473,7 @@ pub async fn mirror_directory_once(
             }
             progress.unchanged = progress.unchanged.checked_add(1).ok_or_else(|| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     invalid("workspace mirror counter overflow"),
@@ -484,7 +496,7 @@ pub async fn mirror_directory_once(
             hash: checksum.clone(),
             mtime: seconds(modified).map_err(|error| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     error,
@@ -492,7 +504,7 @@ pub async fn mirror_directory_once(
             })?,
             synced: seconds(SystemTime::now()).map_err(|error| {
                 MirrorPassError::runtime(
-                    progress,
+                    &progress,
                     Some(&path),
                     FileCommitState::NotAttempted,
                     error,
@@ -501,7 +513,7 @@ pub async fn mirror_directory_once(
         };
         let committed = progress.committed.checked_add(1).ok_or_else(|| {
             MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::NotAttempted,
                 invalid("workspace mirror counter overflow"),
@@ -518,12 +530,17 @@ pub async fn mirror_directory_once(
             )
             .await
             .map_err(|error| {
-                MirrorPassError::runtime(progress, Some(&path), FileCommitState::Unconfirmed, error)
+                MirrorPassError::runtime(
+                    &progress,
+                    Some(&path),
+                    FileCommitState::Unconfirmed,
+                    error,
+                )
             })?;
         progress.committed = committed;
         if let Err(error) = effects {
             return Err(MirrorPassError::runtime(
-                progress,
+                &progress,
                 Some(&path),
                 FileCommitState::Committed(id),
                 error,

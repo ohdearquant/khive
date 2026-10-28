@@ -30,9 +30,10 @@ fn claimed_entity_create_event(entity: &Entity) -> Event {
 }
 
 impl KhiveRuntime {
-    /// `document`: (name, masked_content); `source`: (URI, type, checksum).
-    /// Cursor tail: same-writer first-poll-ready reads/DML. Outer Ok commits;
-    /// inner Err is post-commit failure; outer Err can retain an unknown commit state.
+    /// Called only by the workspace mirror pass. `document`: (name, masked_content); `source`: (URI, type, checksum).
+    /// `previous` must be the URI's unique current document as found by the caller; this method does not re-check it.
+    /// Cursor tail: same-writer first-poll-ready reads/DML. Outer Ok commits; inner Err is a post-commit failure.
+    /// Outer Err can retain an unknown commit state.
     pub async fn create_workspace_document_with_cursor<F>(
         &self,
         registry: &crate::VerbRegistry,

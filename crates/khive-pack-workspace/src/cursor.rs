@@ -131,4 +131,111 @@ pub(crate) async fn get_on_writer(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("cursor/tests.rs");
+
+    #[tokio::test]
+    async fn mirror_non_utf8_file_is_named_while_valid_file_commits() {
+        const NAME: &str = "mirror_non_utf8_file_is_named_while_valid_file_commits";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+            {
+                let baseline = MirrorTree::new();
+                baseline.write(".khive/notes/baseline.md", "valid baseline prose");
+                let (runtime, registry, token) = mirror_fixture();
+                let result = crate::mirror::mirror_directory_once(
+                    &runtime,
+                    &registry,
+                    &token,
+                    &baseline.0,
+                    &config,
+                )
+                .await
+                .expect("valid-only caller baseline before mixed tree");
+                assert_eq!(result.committed, 1);
+                assert!(result.skipped_non_utf8.is_empty());
+            }
+            let tree = MirrorTree::new();
+            let invalid = tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
+            tree.write(".khive/notes/valid.md", "valid mixed-tree prose");
+            let (runtime, registry, token) = mirror_fixture();
+            let summary =
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                    .await
+                    .expect("mixed tree must skip invalid UTF-8 and continue");
+            assert_eq!(
+                summary.committed, 1,
+                "valid file must commit in the mixed pass"
+            );
+            assert_eq!(summary.unchanged, 0);
+            assert_eq!(
+                summary.skipped_non_utf8,
+                vec![std::fs::canonicalize(invalid).unwrap()]
+            );
+            let (valid_uri, valid_key) = mirror_slot(&tree, ".khive/notes/valid.md", &token);
+            let (invalid_uri, invalid_key) = mirror_slot(&tree, ".khive/notes/invalid.md", &token);
+            let documents = mirror_documents(&runtime, &token).await;
+            assert_eq!(
+                documents.len(),
+                1,
+                "invalid bytes must not create a document"
+            );
+            assert_eq!(documents[0]["properties"]["source_uri"], valid_uri);
+            assert_eq!(documents[0]["description"], "valid mixed-tree prose");
+            assert!(documents
+                .iter()
+                .all(|doc| doc["properties"]["source_uri"] != invalid_uri));
+            assert!(read(&runtime, &valid_key).await.is_some());
+            assert!(read(&runtime, &invalid_key).await.is_none());
+            assert_eq!(rows(&runtime).await.len(), 1);
+        })
+        .await;
+        mirror_done(NAME);
+    }
+
+    #[tokio::test]
+    async fn mirror_non_utf8_second_pass_names_skip_and_preserves_state() {
+        const NAME: &str = "mirror_non_utf8_second_pass_names_skip_and_preserves_state";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            let tree = MirrorTree::new();
+            let invalid = tree.write(".khive/notes/invalid.md", [0xff, 0xfe, 0x80]);
+            tree.write(".khive/notes/valid.md", "stable valid prose");
+            let canonical_invalid = std::fs::canonicalize(invalid).unwrap();
+            let (runtime, registry, token) = mirror_fixture();
+            let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+            let first =
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                    .await
+                    .expect("first mixed pass");
+            assert_eq!(first.committed, 1);
+            assert_eq!(first.skipped_non_utf8, vec![canonical_invalid.clone()]);
+            let documents = mirror_documents(&runtime, &token).await;
+            let cursors = rows(&runtime).await;
+            let edges = mirror_edges(&runtime, &token).await;
+            let lexical = mirror_lexical_rows(&runtime).await;
+            assert_eq!(documents.len(), 1);
+            assert_eq!(cursors.len(), 1);
+            let second =
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                    .await
+                    .expect("second mixed pass must still skip invalid bytes");
+            assert_eq!(second.committed, 0);
+            assert_eq!(second.unchanged, 1);
+            assert_eq!(second.skipped_non_utf8, vec![canonical_invalid]);
+            assert_eq!(mirror_documents(&runtime, &token).await, documents);
+            assert_eq!(rows(&runtime).await, cursors);
+            assert_eq!(mirror_edges(&runtime, &token).await, edges);
+            assert_eq!(mirror_lexical_rows(&runtime).await, lexical);
+            let (_, invalid_key) = mirror_slot(&tree, ".khive/notes/invalid.md", &token);
+            assert!(read(&runtime, &invalid_key).await.is_none());
+        })
+        .await;
+        mirror_done(NAME);
+    }
+}
