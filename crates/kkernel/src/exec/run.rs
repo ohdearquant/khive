@@ -1,4 +1,8 @@
+use std::io::{Seek as _, Write as _};
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
+
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor,
     build_single_backend_runtime, config_discovery_db_anchor, enforce_strict_actor_mode,
@@ -13,8 +17,6 @@ use khive_mcp::tools::request::RequestParams;
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
 use khive_runtime::{KhiveConfig, Namespace, RuntimeConfig};
 use khive_types::RefusalReason;
-use std::io::{Seek as _, Write as _};
-use std::path::{Path, PathBuf};
 
 use super::ops_file_apply::{apply_ops_file_reader_with_dispatch_mode, OpsFileDispatchMode};
 use super::ops_file_validate::{
@@ -29,10 +31,10 @@ use super::refusal::{
 use super::refusal::{forward_or_spawn_boxed, ForwardFnPtr};
 use super::{plan, ExecArgs};
 
-// The scheduled-event drain lives in `khive-mcp` for daemon reuse (ADR-106).
+// The scheduled-event drain now lives in `khive-mcp` (ADR-106: the
+// daemon-resident tick needs to call it from `khive-mcp::serve`, which
+// cannot depend back on `kkernel`).
 use khive_mcp::pending_events;
-#[path = "recall_drain.rs"]
-mod recall_drain;
 
 /// Execute the DSL expression, routing through the warm daemon when available.
 ///
@@ -612,7 +614,7 @@ const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// a read-only reader, so the last real closer can always take the
 /// EXCLUSIVE lock SQLite needs to checkpoint.
 async fn settle_exec_storage_before_return(server: KhiveMcpServer) {
-    recall_drain::wait_for_pending(EXEC_STORAGE_SETTLE_TIMEOUT).await;
+    super::recall_drain::wait_for_pending(EXEC_STORAGE_SETTLE_TIMEOUT).await;
     if let Err(reason) = server.shutdown_audit_batch().await {
         tracing::warn!(
             target: "kkernel::exec",

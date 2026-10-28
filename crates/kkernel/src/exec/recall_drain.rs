@@ -83,12 +83,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn pending_producer_warns_and_returns_after_bound() {
         // This test has no storage or producer seam.  Admission is synchronous,
-        // and the receiver keeps the real process-wide slot occupied.
+        // and the receiver keeps the real process-wide slot occupied. Other tests
+        // in this binary run real recalls on other threads, so the ledger count is
+        // shared: every assertion below holds whatever they add or settle.
         let before = khive_runtime::recall_ledger_snapshot();
-        assert_eq!(
-            before.pending, 0,
-            "fixture requires a fresh process with no pending producers"
-        );
         assert!(
             before.timeout_ms > 12_000,
             "fixture requires a producer timeout longer than the watchdog"
@@ -101,15 +99,16 @@ mod tests {
             let _ = held.await;
             let _ = finished.send(());
         });
-        let admitted = khive_runtime::recall_ledger_snapshot();
-        assert!(
-            admitted.pending > before.pending,
-            "fixture did not admit its producer"
-        );
+        // A producer the ledger did not admit is never spawned, so its start signal
+        // is the admission proof; the count only has to include it.
         tokio::time::timeout(Duration::from_secs(2), started_rx)
             .await
             .expect("held producer must start")
             .expect("held producer signalled start");
+        assert!(
+            khive_runtime::recall_ledger_snapshot().pending >= 1,
+            "the held producer must count as pending"
+        );
 
         let warnings = Warnings::default();
         let events = Arc::clone(&warnings.0);
