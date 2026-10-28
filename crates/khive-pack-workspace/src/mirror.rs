@@ -336,11 +336,8 @@ pub async fn mirror_directory_once(
         .map_err(|error| MirrorPassError::io(progress, project_root, error))?;
     let first = fs::read_dir(&root).map_err(|error| MirrorPassError::io(progress, &root, error))?;
     let mut directories = vec![(root.clone(), first)];
-    loop {
-        let (directory, next) = match directories.last_mut() {
-            Some((directory, entries)) => (directory.clone(), entries.next()),
-            None => break,
-        };
+    while let Some((directory, entries)) = directories.last_mut() {
+        let (directory, next) = (directory.clone(), entries.next());
         let Some(entry) = next else {
             directories.pop();
             continue;
