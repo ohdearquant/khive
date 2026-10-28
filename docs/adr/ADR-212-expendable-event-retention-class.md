@@ -525,8 +525,11 @@ base record.
 **Trigger.** §7 says that until this record is implemented and its acceptance passes, nothing is deleted from either
 half under it, and that no interim hard delete is authorized (lines 349-350). On 2026-10-28 an operator-authorized
 interim run of the §4 historical classifier removed the eligible polling-dispatch audit rows from one deployment's
-events store, ahead of implementation. This amendment records the tool, where the run departed from the base text,
-the evidence it left, and the bound on any further interim run.
+events store, ahead of implementation. The operator approved that run on its reviewed plan, naming the plan's cutoff
+and digest; the approval is not a public record, and this amendment is the record's own account of the run. It records
+the tool, where the run departed from the base text, the evidence it left, and the bound on any further interim run.
+Once accepted, this amendment is the record's exception to §7 for the run it records and for runs that meet Decision 5;
+§7 is otherwise unchanged.
 
 Evidence line numbers refer to commit `b49d4d7dba4b4b47e9b6c32ebd5f412c38ab1411`.
 
@@ -542,9 +545,9 @@ per-row recheck and stops on a control mismatch. It implements §4's predicate a
   an ID that never existed; §3's disclosed expiration is not in place, and §8 arm 4 does not pass.
 - In-store expended-ID records. The apply writes an append-only expended-ID file outside the store (one intent line
   and one commit line per batch, each carrying the digest), which stands in for them (`events_prune.rs:6-8`). The file
-  is kept with the backup and is permanent evidence under §4.
+  is kept read-only beside the backup, with its SHA-256 recorded next to it, and is permanent evidence under §4.
 - Per-ID historical assignments. The cohort is fixed by the plan's cutoff and digest instead; rows of the six keys
-  younger than seven days at the cutoff are classified but not assigned.
+  created after the cutoff, younger than seven days at the capture instant, are classified but not assigned.
 - §6's maintenance admission, capacity alarm and physical reclaim. The tool never VACUUMs and never changes
   `auto_vacuum` (`events_prune.rs:10-12`).
 
@@ -571,7 +574,10 @@ For the 2026-10-28 run:
 - **Classifier.** `poll-dispatch-legacy-v1`.
 - **Capture instant and cutoff.** Plan at 2026-10-28T09:26:15.687092Z; cutoff exactly 604,800 s earlier, `cutoff_us` 1792574775687092.
 - **Candidate-set digest.** `798db37643234a224c3371a36aa377df41f6bb6af7115c7dbfe6df3b4fb6a4de`.
-- **Rows.** 6,484,537 before; 4,229,195 removed in 2,115 committed batches, none skipped; 2,255,814 after.
+- **Rows.** 6,484,537 before (read from the backup); 4,229,195 removed in 2,115 committed batches, none skipped;
+  2,255,814 after (read from the live store). The 472 rows beyond 6,484,537 minus 4,229,195 were written during the
+  run, all after the cutoff: 98 younger rows of the six keys and 374 rows of other keys. Rows created before the cutoff
+  under the retained keys are 1,657,488 on both sides.
 - **Removed per key.** `comm.probe` 1,362,010; `comm.inbox` 1,246,609; `comm.cursor_get` 620,827; `comm.heartbeat` 620,385; `comm.cleanup_expired_quarantine` 218,450; `whoami` 160,914.
 - **Retained of the six keys.** 398,395 rows younger than the cutoff; none for any other reason.
 - **Backup.** Taken before the first batch; integrity check ok; its per-kind row counts sum to the row total of the plan read from the copy.
@@ -592,10 +598,12 @@ deployment that reaches its configured bound first decides on measured numbers, 
 
 Until §8's acceptance passes, a further interim run of this tool is allowed only when all of these hold:
 
-1. An operator authorizes that run by its cutoff and digest, after reviewing its plan.
+1. The operator approves that run separately, by its cutoff and digest, after reviewing its plan. No approval carries
+   over from an earlier run.
 2. Its cutoff is no later than the first interim run's capture instant (2026-10-28T09:26:15.687092Z), so it reaches
    only rows that existed when the first population was captured, the rows §4 says acquire age eligibility later. Rows
-   written after that instant wait for the implemented record and its write-time stamp.
+   written after that instant wait for the implemented record and its write-time stamp. The seven-day floor holds on
+   its own: the tool refuses a cutoff later than its run start minus 604,800 s (`events_prune.rs:557-560`).
 3. It takes a fresh backup, runs the same controls, and either runs with the edge writers stopped or carries
    Decision 2's read as a named step before it reports completion.
 4. It leaves the same evidence as Decision 3 and appends to the same expended-ID file.
