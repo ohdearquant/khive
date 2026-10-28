@@ -71,7 +71,7 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
     for mode in ["drain", "cleanup"] {
         for first in [libc::SIGTERM, libc::SIGINT] {
             for second in [libc::SIGTERM, libc::SIGINT] {
-                let dir = tempfile::Builder::new()
+                let dir = crate::test_process::private_tempdir_builder()
                     .prefix("kh-signal-")
                     .tempdir_in("/tmp")
                     .expect("isolated short socket directory");
