@@ -803,6 +803,15 @@ async fn mirror_directory_once_inner(
             .await;
         let (id, effects) = match result {
             Ok(result) => result,
+            Err(RuntimeError::CanonicalAdmission {
+                op_index: 0,
+                source,
+            }) if matches!(source.as_ref(), RuntimeError::SecretDetected(_)) => {
+                progress
+                    .refused
+                    .push((masked_diagnostic(relative), "SecretDetected"));
+                continue;
+            }
             Err(RuntimeError::SecretDetected(_)) => {
                 progress
                     .refused

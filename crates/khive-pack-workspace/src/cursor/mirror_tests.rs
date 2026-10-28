@@ -186,9 +186,23 @@ async fn mirror_credential_path_refusal_is_masked_and_other_file_commits() {
                 mirror_no_cursor,
             )
             .await;
+        let observed = match &direct {
+            Ok(_) => "Ok".to_owned(),
+            Err(khive_runtime::RuntimeError::CanonicalAdmission { op_index, source }) => {
+                format!(
+                    "CanonicalAdmission(op_index={op_index}, source={:?})",
+                    source.channel_ingest_failure_class()
+                )
+            }
+            Err(error) => format!("OtherOuter({:?})", error.channel_ingest_failure_class()),
+        };
         assert!(
-            matches!(direct, Err(khive_runtime::RuntimeError::SecretDetected(_))),
-            "fixture must prove the exact outer pre-unit admission refusal"
+            matches!(
+                &direct,
+                Err(khive_runtime::RuntimeError::CanonicalAdmission { op_index: 0, source })
+                    if matches!(source.as_ref(), khive_runtime::RuntimeError::SecretDetected(_))
+            ),
+            "fixture must prove the exact outer pre-unit admission refusal; observed {observed}"
         );
         assert!(
             read(&runtime, &key).await.is_none(),
@@ -213,12 +227,13 @@ async fn mirror_credential_path_refusal_is_masked_and_other_file_commits() {
             refused,
             "refused path must actually be masked"
         );
-        assert!(
-            summary.refused[0]
-                .0
-                .starts_with(std::path::Path::new(".khive").join("notes"))
-                && shown.ends_with(".md"),
-            "refused diagnostic must retain its safe relative prefix and suffix"
+        assert_eq!(
+            shown,
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+                &refused,
+            ),
+            "refused diagnostic must use the canonical whole-path mask"
         );
         assert!(
             read(&runtime, &key).await.is_none(),
