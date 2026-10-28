@@ -282,7 +282,7 @@ fn advance_cursor<'w>(
         if current != update.expected {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Sql,
-                operation: "workspace mirror cursor fence".to_owned(),
+                operation: "workspace mirror cursor fence".into(),
                 message: "workspace mirror cursor changed before commit".to_owned(),
             });
         }
