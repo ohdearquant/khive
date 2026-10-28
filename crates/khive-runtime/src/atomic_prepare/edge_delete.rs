@@ -15,7 +15,9 @@ use super::{
 /// Edge branch of `prepare_update`. Mirrors `KhiveRuntime::update_edge`'s
 /// patch semantics: `relation`/`weight`/`properties` are the only applicable
 /// fields, a changed `relation` is endpoint-validated first, `weight` is
-/// range-checked, and `properties` REPLACES `metadata` wholesale (no merge).
+/// range-checked, and `properties` shallow-merges into `metadata`: patch keys
+/// replace existing values, omitted keys are preserved, and null is stored
+/// as a literal value.
 /// See `docs/api/atomic_prepare.md#prepare_update_edge` for the DML-shape parity
 /// detail with `update_edge`.
 ///
@@ -77,7 +79,13 @@ pub(super) async fn prepare_update_edge(
         changed_fields.push("weight");
     }
     if let Some(p) = properties {
-        edge.metadata = Some(p);
+        let incoming = Some(p);
+        let (merged, _) = crate::curation::merge_properties(
+            &edge.metadata,
+            &incoming,
+            crate::curation::EntityDedupMergePolicy::PreferFrom,
+        );
+        edge.metadata = merged;
         changed_fields.push("properties");
     }
 
