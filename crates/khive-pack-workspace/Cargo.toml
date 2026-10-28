@@ -11,6 +11,7 @@ categories.workspace = true
 description = "Workspace pack  -  pack-owned `workspace` entity kind with typed `contains` membership edges to issue/pull_request/commit/task/session records (issue #873)"
 
 [dependencies]
+khive-fs = { version = "0.15.0", path = "../khive-fs" }
 khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
 khive-storage = { version = "0.15.0", path = "../khive-storage" }
@@ -26,3 +27,6 @@ khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.15.0", path = "../khive-pack-gtd" }
 khive-pack-git = { version = "0.15.0", path = "../khive-pack-git" }
 khive-pack-session = { version = "0.15.0", path = "../khive-pack-session" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
