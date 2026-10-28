@@ -105,6 +105,9 @@ jobs:
             if [ "$crate" = "khive-retrieval" ]; then
               pkg_args+=(--features "khive-retrieval/persist,khive-retrieval/ann")
             fi
+            if [ "$crate" = "khive-text" ]; then
+              pkg_args+=(--features "khive-text/unicode")
+            fi
           done
           echo "phase=compile start=$(date -u +%FT%TZ) timeout_seconds=$compile_seconds" | tee -a ../component-phases.log
           SECONDS=0
@@ -130,6 +133,9 @@ jobs:
             pkg_args+=(-p "$crate")
             if [ "$crate" = "khive-retrieval" ]; then
               pkg_args+=(--features "khive-retrieval/persist,khive-retrieval/ann")
+            fi
+            if [ "$crate" = "khive-text" ]; then
+              pkg_args+=(--features "khive-text/unicode")
             fi
           done
           echo "phase=criterion start=$(date -u +%FT%TZ) timeout_seconds=600" | tee -a ../component-phases.log
