@@ -67,7 +67,14 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         "khive-runtime/src/atomic_prepare/index_purge.rs",
         "purge_index_row_statement",
         "DELETE",
-        "{table}",
+        "main.{quoted}",
+        1,
+    ),
+    (
+        "khive-runtime/src/atomic_prepare/index_purge.rs",
+        "vector_purge_statements",
+        "DELETE",
+        "{quoted}",
         1,
     ),
     (
