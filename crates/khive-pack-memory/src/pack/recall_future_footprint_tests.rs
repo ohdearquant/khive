@@ -133,7 +133,10 @@ fn recall_dispatch_fits_two_mib_worker_in_child() {
                 }
             };
             let output = read_bounded_log(&log_path);
-            assert!(status.success(), "{arm} recall child failed: {status}\n{output}");
+            assert!(
+                status.success(),
+                "{arm} recall child failed: {status}\n{output}"
+            );
             for marker in [
                 "KHIVE_6182_SETUP_OK",
                 "KHIVE_6182_DISPATCH_STARTED",
