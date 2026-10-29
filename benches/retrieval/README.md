@@ -134,6 +134,49 @@ here touches `crates/` or requires a Rust rebuild.
    / significance read, or commit a new `gold/<name>.json` if it becomes a
    second baseline worth gating on.
 
+## Question banks on a staged store copy
+
+`bank.py` scores retrieval arms on a frozen, versioned question bank against a copy of a real store, where
+`evaluate.py` uses its own synthetic corpus. A bank is a directory with `bank.json` (`bank_id`, `version`,
+`cases_sha256`) and `cases.jsonl`; each case carries the query, the instant `T` the query belongs to, and
+`needed_info`, the facts the task required, each one an equivalence set of record ids (the same fact kept as a
+memory, a note and an entity counts once). The runner refuses a bank whose `cases.jsonl` no longer matches
+`cases_sha256`, so a correction mints the next version instead of editing a scored one.
+
+```bash
+uv run python bank.py self-test
+uv run python bank.py check-bank banks/001/v1
+uv run python bank.py run --bank banks/001/v1 --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models --namespaces local \
+  --profile <profile id> --control-id <memory uuid> --feedback-actors <actor> --out runs/<name>
+uv run python bootstrap.py runs/<name>/recall_rrf.jsonl runs/<name>/profile_on.jsonl --metrics hit@10,coverage@10,MRR@10
+```
+
+The copy is staged into a fresh scratch home and served by one `kkernel mcp` process with `KHIVE_NO_DAEMON=1`; a
+source under the caller's `~/.khive` is refused, and so is one with a non-empty WAL unless `--copy-wal` states that
+no process writes it. A source whose inode, size or modification time changes during its copy stops the run. The
+run starts only at normal memory pressure, read before the copy and again before the server starts. The scratch
+home is kept by default, and the record names its path and the staged files' sha256 before and after the run;
+`--remove-scratch` removes it. On another machine, `--staged-home <dir>` serves a copy already placed at
+`<dir>/home/.khive/` by a guarded transfer instead of copying it again: `<dir>/transfer.json` must carry verdict
+`ok`, the same snapshot id, and each file's size and sha256, which are checked before anything is written, and a copy
+with a `-wal` or `-shm` sidecar (one a server has already opened) is refused. That directory is never removed.
+Every recall passes `created_before = T`, and a hit created at or after `T` stops the run.
+Arms: three fusion strategies with configured
+defaults (no binding row), a named profile against configured defaults, a profile with no feedback events, a profile
+fed the named profile's explicit feedback events created before each case's `T`, and a fusion of recall with
+`search` over notes and entities (whose late hits are dropped after the fact and counted, since `search` has no
+time filter). The served profile is checked on every hit. Each run writes one JSONL file per arm and `run.json` with
+the bank version, population, store snapshot id, kkernel version, the staged files' sha256 and the control result.
+`calibrate-replay` measures how closely a profile rebuilt from replayed feedback events reproduces the original
+(top-10 overlap and rank-score differences), which bounds what the as-of-`T` arm can claim. Each query is recalled
+live, then by the rebuilt profile, then live again; the two live answers are compared the same way and reported as
+`aa`, a floor for the recall's own run-to-run variation (recency is read from the clock at each request, for one)
+that the live/rebuilt difference has to clear before it counts against the replay. Its queries come from a
+bank, or with `--queries-from-events` from n distinct queries the profile served, read from the copy's
+`recall_executed` events and spread over time; those events undercount recalls made through `kkernel exec`
+(#6259).
+
 ## Determinism
 
 `generate_corpus.py` and `evaluate.py` never read the wall clock or an
