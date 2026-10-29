@@ -5152,3 +5152,652 @@ async fn text_in_or_non_text_filters_before_pagination_with_count_parity() {
         }
     }
 }
+
+#[tokio::test]
+async fn quarantine_mailbox_store_filters_rows_counts_and_pages_before_limits() {
+    use khive_storage::note::NoteMailboxScope;
+
+    let store = setup_memory_store();
+    // The expected Q and ordinary partitions are fixture facts, independent of the SQL helpers.
+    let rows = [
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":true}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":"true"}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"outbound","from_actor":"landing","quarantined":true}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"to_actor":"landing","quarantined":"true"}"#,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"other","to_actor":17,"quarantined":true}"#,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":null,"quarantined":true}"#,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":1}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":1.0}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing"}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":null}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":false}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":"True"}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":[true]}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":{"value":true}}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            r#"{"direction":"inbound","to_actor":"maintainer","quarantined":true}"#,
+            true,
+            false,
+            true,
+            false,
+        ),
+        ("{}", false, false, false, true),
+        ("null", false, false, false, true),
+    ];
+    let mut ids = Vec::new();
+    for (index, (properties, _, _, _, _)) in rows.iter().enumerate() {
+        let mut note = make_note("local", "message", &format!("fixture-{index}"))
+            .with_properties(serde_json::from_str(properties).unwrap());
+        note.id = Uuid::from_u128(index as u128 + 1);
+        note.created_at = 1_000 - index as i64;
+        ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    let mut null_properties = make_note("local", "message", "SQL NULL properties");
+    null_properties.id = Uuid::from_u128(100);
+    null_properties.created_at = 900;
+    let null_id = null_properties.id;
+    store.upsert_note(null_properties).await.unwrap();
+    let mut ordinary = make_note("local", "observation", "not a message")
+        .with_properties(serde_json::json!({"quarantined": true}));
+    ordinary.id = Uuid::from_u128(101);
+    ordinary.created_at = 800;
+    let ordinary_id = ordinary.id;
+    store.upsert_note(ordinary).await.unwrap();
+    let mut foreign = make_note("foreign", "message", "foreign quarantine")
+        .with_properties(serde_json::from_str(rows[0].0).unwrap());
+    foreign.created_at = 2_000;
+    let foreign_id = foreign.id;
+    store.upsert_note(foreign).await.unwrap();
+    let mut deleted = make_note("local", "message", "deleted quarantine")
+        .with_properties(serde_json::from_str(rows[0].0).unwrap());
+    deleted.created_at = 2_001;
+    let deleted_id = deleted.id;
+    store.upsert_note(deleted).await.unwrap();
+    store
+        .delete_note(deleted_id, DeleteMode::Soft)
+        .await
+        .unwrap();
+    let all_ids = ids
+        .iter()
+        .copied()
+        .chain([null_id, ordinary_id, foreign_id, deleted_id])
+        .collect::<Vec<_>>();
+    let mut before = Vec::new();
+    for id in &all_ids {
+        before.push(
+            store
+                .get_note_including_deleted(*id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    for maintainer in [None, Some(""), Some("maintainer")] {
+        for (actor, legacy_local) in [
+            ("landing", false),
+            ("maintainer", false),
+            ("other", false),
+            ("local", false),
+            ("local", true),
+        ] {
+            let mut expected_messages = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    if maintainer.is_some_and(|value| !value.is_empty()) && row.1 {
+                        actor == maintainer.unwrap()
+                    } else {
+                        (actor == "landing" && row.2)
+                            || (actor == "maintainer" && row.3)
+                            || (actor == "local" && legacy_local && row.4)
+                    }
+                })
+                .map(|(index, _)| ids[index])
+                .collect::<Vec<_>>();
+            if actor == "local" && legacy_local {
+                expected_messages.push(null_id);
+            }
+            let mut expected = expected_messages.clone();
+            expected.push(ordinary_id);
+            let filter = NoteFilter {
+                mailbox: Some(NoteMailboxScope {
+                    actor_id: actor.into(),
+                    legacy_local,
+                    maintainer_actor: maintainer.map(str::to_owned),
+                }),
+                ..Default::default()
+            };
+            let page = store
+                .query_notes_filtered(
+                    "local",
+                    &filter,
+                    PageRequest {
+                        limit: 100,
+                        offset: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.total, Some(expected.len() as u64));
+            assert_eq!(
+                page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+                expected,
+                "actor={actor}, legacy={legacy_local}, maintainer={maintainer:?}"
+            );
+            let mut message_filter = filter.clone();
+            message_filter.kind = Some("message".into());
+            let messages = store
+                .query_notes_filtered(
+                    "local",
+                    &message_filter,
+                    PageRequest {
+                        limit: 100,
+                        offset: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(messages.total, Some(expected_messages.len() as u64));
+            assert_eq!(
+                messages
+                    .items
+                    .iter()
+                    .map(|note| note.id)
+                    .collect::<Vec<_>>(),
+                expected_messages
+            );
+            // The bounded API deliberately returns one lookahead row.
+            let bounded = store
+                .query_notes_filtered_bounded("local", &filter, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                bounded.iter().map(|note| note.id).collect::<Vec<_>>(),
+                expected.iter().take(3).copied().collect::<Vec<_>>()
+            );
+            for offset in 0..=expected.len() {
+                let request = PageRequest {
+                    limit: 2,
+                    offset: offset as u64,
+                };
+                let counted = store
+                    .query_notes_filtered("local", &filter, request.clone())
+                    .await
+                    .unwrap();
+                let count_free = store
+                    .query_notes_filtered_count_free("local", &filter, request)
+                    .await
+                    .unwrap();
+                let expected_page = expected
+                    .iter()
+                    .skip(offset)
+                    .take(2)
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_eq!(counted.total, Some(expected.len() as u64));
+                assert_eq!(count_free.total, None);
+                assert_eq!(
+                    counted.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+                    expected_page
+                );
+                assert_eq!(count_free.items, counted.items);
+            }
+        }
+    }
+    for (id, original) in all_ids.into_iter().zip(before) {
+        assert_eq!(
+            store.get_note_including_deleted(id).await.unwrap().unwrap(),
+            original,
+            "visibility queries must not rewrite stored routing or typed quarantine values"
+        );
+    }
+}
+
+fn quarantine_addressee_filter(actor: &str) -> NoteFilter {
+    use khive_storage::note::{NoteMailboxScope, PropertyFilter};
+
+    NoteFilter {
+        message_addressee: Some(NoteMailboxScope {
+            actor_id: actor.into(),
+            legacy_local: false,
+            maintainer_actor: Some("maintainer".into()),
+        }),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.direction".into(),
+            op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".into())]),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn message_addressee_rechecks_current_rows_and_rolls_back_atomic_targets() {
+    for queued in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("current-addressee.db")),
+                write_queue_enabled: Some(queued),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        assert_eq!(pool.write_queue_active(), queued);
+        {
+            let writer = pool.writer().unwrap();
+            writer.conn().execute_batch(NOTES_DDL).unwrap();
+        }
+        let store = SqlNoteStore::new(Arc::clone(&pool), queued);
+        let landing = quarantine_addressee_filter("landing");
+        let maintainer = quarantine_addressee_filter("maintainer");
+        // Read recipient matching deliberately accepts this directionless ordinary message.
+        let note =
+            make_note("local", "message", "current row").with_properties(serde_json::json!({
+                "to_actor": "landing", "read": false, "preserve": "current",
+            }));
+        let id = note.id;
+        let time = note.updated_at + 1;
+        store.upsert_note(note).await.unwrap();
+        assert!(store
+            .try_patch_note_property(
+                id,
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(true),
+                time
+            )
+            .await
+            .unwrap());
+        store
+            .set_note_property(id, "read", serde_json::json!(false), time + 1)
+            .await
+            .unwrap();
+        let validated = store.get_note(id).await.unwrap().unwrap();
+        assert_eq!(
+            validated.properties.as_ref().unwrap()["to_actor"],
+            "landing"
+        );
+        store
+            .set_note_property(id, "quarantined", serde_json::json!(true), time + 2)
+            .await
+            .unwrap();
+        let quarantined = store.get_note(id).await.unwrap().unwrap();
+        assert!(!store
+            .try_patch_note_property(
+                id,
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(true),
+                time + 3
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.get_note(id).await.unwrap().unwrap(), quarantined);
+        assert!(store
+            .try_patch_note_property(
+                id,
+                "local",
+                &maintainer,
+                "$.read",
+                serde_json::json!(true),
+                time + 4
+            )
+            .await
+            .unwrap());
+        let marked = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .unwrap();
+        assert_eq!(marked["read"], true);
+        assert_eq!(marked["preserve"], "current");
+        assert_eq!(marked["to_actor"], "landing");
+        assert_eq!(marked["quarantined"], true);
+
+        store
+            .set_note_property(id, "quarantined", serde_json::json!(false), time + 5)
+            .await
+            .unwrap();
+        store
+            .set_note_property(id, "read", serde_json::json!(false), time + 6)
+            .await
+            .unwrap();
+        let ordinary = store.get_note(id).await.unwrap().unwrap();
+        assert!(!store
+            .try_patch_note_property(
+                id,
+                "local",
+                &maintainer,
+                "$.read",
+                serde_json::json!(true),
+                time + 7
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.get_note(id).await.unwrap().unwrap(), ordinary);
+        assert!(store
+            .try_patch_note_property(
+                id,
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(true),
+                time + 8
+            )
+            .await
+            .unwrap());
+        store
+            .set_note_property(id, "to_actor", serde_json::json!("other"), time + 9)
+            .await
+            .unwrap();
+        let retargeted = store.get_note(id).await.unwrap().unwrap();
+        assert!(!store
+            .try_patch_note_property(
+                id,
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(false),
+                time + 10
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.get_note(id).await.unwrap().unwrap(), retargeted);
+        assert!(store
+            .try_patch_note_property(
+                id,
+                "local",
+                &quarantine_addressee_filter("other"),
+                "$.read",
+                serde_json::json!(false),
+                time + 11
+            )
+            .await
+            .unwrap());
+
+        for (kind, direction) in [("message", "outbound"), ("observation", "inbound")] {
+            let excluded =
+                make_note("local", kind, "outer read guard").with_properties(serde_json::json!({
+                    "direction": direction, "to_actor": "landing", "from_actor": "landing",
+                    "quarantined": "true", "read": false,
+                }));
+            let excluded_id = excluded.id;
+            store.upsert_note(excluded).await.unwrap();
+            let before = store.get_note(excluded_id).await.unwrap().unwrap();
+            assert!(!store
+                .try_patch_note_property(
+                    excluded_id,
+                    "local",
+                    &maintainer,
+                    "$.read",
+                    serde_json::json!(true),
+                    time + 12
+                )
+                .await
+                .unwrap());
+            assert_eq!(store.get_note(excluded_id).await.unwrap().unwrap(), before);
+        }
+
+        let first = make_note("local", "message", "eligible atomic target").with_properties(
+            serde_json::json!({"to_actor":"landing", "read":false, "preserve":"first"}),
+        );
+        let second = make_note("local", "message", "quarantine atomic target").with_properties(
+            serde_json::json!({"to_actor":"landing", "read":false, "preserve":"second"}),
+        );
+        let first_id = first.id;
+        let second_id = second.id;
+        store.upsert_note(first).await.unwrap();
+        store.upsert_note(second).await.unwrap();
+        // A previously eligible target changes after validation, before the conditional writer.
+        let originally_eligible = store.get_note(second_id).await.unwrap().unwrap();
+        assert!(originally_eligible
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("quarantined")
+            .is_none());
+        store
+            .set_note_property(
+                second_id,
+                "quarantined",
+                serde_json::json!("true"),
+                time + 13,
+            )
+            .await
+            .unwrap();
+        let before_first = store.get_note(first_id).await.unwrap().unwrap();
+        let before_second = store.get_note(second_id).await.unwrap().unwrap();
+        let error = store
+            .patch_note_property_atomic(
+                vec![first_id, second_id],
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(true),
+                time + 14,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack, source,
+        } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+            if message.contains(&second_id.to_string()))),
+            "{error:?}"
+        );
+        assert_eq!(
+            store.get_note(first_id).await.unwrap().unwrap(),
+            before_first
+        );
+        assert_eq!(
+            store.get_note(second_id).await.unwrap().unwrap(),
+            before_second
+        );
+        store
+            .set_note_property(
+                second_id,
+                "quarantined",
+                serde_json::json!(false),
+                time + 15,
+            )
+            .await
+            .unwrap();
+        store
+            .patch_note_property_atomic(
+                vec![first_id, second_id],
+                "local",
+                &landing,
+                "$.read",
+                serde_json::json!(true),
+                time + 16,
+            )
+            .await
+            .unwrap();
+        for (target, preserved) in [(first_id, "first"), (second_id, "second")] {
+            let marked = store
+                .get_note(target)
+                .await
+                .unwrap()
+                .unwrap()
+                .properties
+                .unwrap();
+            assert_eq!(marked["read"], true);
+            assert_eq!(marked["preserve"], preserved);
+        }
+    }
+}
+
+#[tokio::test]
+async fn message_addressee_without_maintainer_preserves_recipient_and_local_rules() {
+    let store = setup_memory_store();
+    let rows = [
+        (
+            serde_json::json!({"direction":"inbound", "to_actor":"landing", "quarantined":true}),
+            true,
+            false,
+        ),
+        (
+            serde_json::json!({"to_actor":"landing", "quarantined":"true"}),
+            true,
+            false,
+        ),
+        (serde_json::json!({"quarantined":true}), false, true),
+        (
+            serde_json::json!({"to_actor":null, "quarantined":"true"}),
+            false,
+            true,
+        ),
+        (
+            serde_json::json!({"to_actor":17, "quarantined":true}),
+            false,
+            false,
+        ),
+        (
+            serde_json::json!({"to_actor":["landing"], "quarantined":true}),
+            false,
+            false,
+        ),
+        (
+            serde_json::json!({"to_actor":"other", "quarantined":true}),
+            false,
+            false,
+        ),
+        (
+            serde_json::json!({"direction":"outbound", "to_actor":"landing", "quarantined":true}),
+            false,
+            false,
+        ),
+    ];
+    for maintainer in [None, Some("")] {
+        for (actor, legacy_local) in [("landing", false), ("local", false), ("local", true)] {
+            let mut filter = quarantine_addressee_filter(actor);
+            let scope = filter.message_addressee.as_mut().unwrap();
+            scope.legacy_local = legacy_local;
+            scope.maintainer_actor = maintainer.map(str::to_owned);
+            for (properties, landing, local) in &rows {
+                let note = make_note("local", "message", "unconfigured recipient")
+                    .with_properties(properties.clone());
+                let id = note.id;
+                let time = note.updated_at + 1;
+                store.upsert_note(note).await.unwrap();
+                let before = store.get_note(id).await.unwrap().unwrap();
+                let expected = (actor == "landing" && *landing)
+                    || (actor == "local" && legacy_local && *local);
+                assert_eq!(
+                    store
+                        .try_patch_note_property(
+                            id,
+                            "local",
+                            &filter,
+                            "$.read",
+                            serde_json::json!(true),
+                            time
+                        )
+                        .await
+                        .unwrap(),
+                    expected,
+                    "actor={actor}, legacy={legacy_local}, M={maintainer:?}, row={properties}"
+                );
+                let after = store.get_note(id).await.unwrap().unwrap();
+                if expected {
+                    let mut expected_properties = properties.clone();
+                    expected_properties["read"] = serde_json::json!(true);
+                    assert_eq!(after.properties, Some(expected_properties));
+                } else {
+                    assert_eq!(after, before);
+                }
+            }
+        }
+    }
+}

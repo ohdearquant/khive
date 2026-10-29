@@ -73,6 +73,7 @@ fn scope(actor: &str, legacy_local: bool) -> QueryMailboxScope {
     QueryMailboxScope {
         actor_id: actor.to_owned(),
         legacy_local,
+        maintainer_actor: None,
     }
 }
 
@@ -648,5 +649,337 @@ fn recursive_pages_remain_distinct_after_visibility_filtering() {
         .unwrap();
         let result = compile_with_mailbox(&query, &options(1), &scope("a", false)).unwrap();
         assert_eq!(run(&conn, &result), expected);
+    }
+}
+
+fn quarantine_scope(
+    actor: &str,
+    legacy_local: bool,
+    maintainer: Option<&str>,
+) -> QueryMailboxScope {
+    let mut mailbox = scope(actor, legacy_local);
+    mailbox.maintainer_actor = maintainer.map(str::to_owned);
+    mailbox
+}
+
+#[test]
+fn quarantine_partition_precedes_note_limits_and_query_endpoint_hydration() {
+    let conn = fixture();
+    let rows = [
+        (
+            "00-boolean",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":true}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "01-string",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":"true"}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "02-outbound",
+            r#"{"direction":"outbound","from_actor":"landing","to_actor":"landing","quarantined":true}"#,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "03-directionless",
+            r#"{"to_actor":"landing","quarantined":"true"}"#,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "04-malformed",
+            r#"{"direction":"other","to_actor":17,"quarantined":true}"#,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "05-null-routing",
+            r#"{"direction":null,"quarantined":true}"#,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            "06-number",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":1}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "07-real",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":1.0}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "08-missing",
+            r#"{"direction":"inbound","to_actor":"landing"}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "09-null",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":null}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "10-false",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":false}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "11-uppercase",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":"True"}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "12-array",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":[true]}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "13-object",
+            r#"{"direction":"inbound","to_actor":"landing","quarantined":{"value":true}}"#,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "14-maintainer",
+            r#"{"direction":"inbound","to_actor":"maintainer","quarantined":true}"#,
+            true,
+            false,
+            true,
+            false,
+        ),
+        ("15-legacy", "{}", false, false, false, true),
+    ];
+    entity(&conn, "root");
+    for (id, properties, _, _, _, _) in rows {
+        note(&conn, id, "message", Some(properties));
+        edge(&conn, &format!("edge-{id}"), "root", id);
+    }
+    note(
+        &conn,
+        "16-ordinary",
+        "observation",
+        Some(r#"{"quarantined":true}"#),
+    );
+    edge(&conn, "edge-16-ordinary", "root", "16-ordinary");
+    for id in ["foreign-quarantine", "deleted-quarantine"] {
+        note(&conn, id, "message", Some(rows[0].1));
+    }
+    conn.execute(
+        "UPDATE notes SET namespace = 'foreign' WHERE id = 'foreign-quarantine'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE notes SET deleted_at = 1 WHERE id = 'deleted-quarantine'",
+        [],
+    )
+    .unwrap();
+
+    for maintainer in [None, Some(""), Some("maintainer")] {
+        for (actor, legacy_local) in [
+            ("landing", false),
+            ("maintainer", false),
+            ("other", false),
+            ("local", false),
+            ("local", true),
+        ] {
+            let mailbox = quarantine_scope(actor, legacy_local, maintainer);
+            let mut expected = rows
+                .iter()
+                .filter(|row| {
+                    if maintainer.is_some_and(|value| !value.is_empty()) && row.2 {
+                        actor == maintainer.unwrap()
+                    } else {
+                        (actor == "landing" && row.3)
+                            || (actor == "maintainer" && row.4)
+                            || (actor == "local" && legacy_local && row.5)
+                    }
+                })
+                .map(|row| row.0.to_string())
+                .collect::<Vec<_>>();
+            let messages = expected.clone();
+            expected.push("16-ordinary".into());
+            assert_eq!(
+                run(&conn, &compiled("MATCH (n:message) RETURN n.id", &mailbox)),
+                messages,
+                "{mailbox:?}"
+            );
+            assert_eq!(
+                run(&conn, &compiled("MATCH (n:note) RETURN n.id", &mailbox)),
+                expected,
+                "{mailbox:?}"
+            );
+            let query = parse(
+                QueryLanguage::Sparql,
+                "SELECT ?b WHERE { ?a :name \"root\" . ?a :extends ?b . }",
+            )
+            .unwrap();
+            assert_eq!(
+                run(
+                    &conn,
+                    &compile_with_mailbox(&query, &options(100), &mailbox).unwrap()
+                ),
+                expected,
+                "{mailbox:?}"
+            );
+            let expected_edges = expected
+                .iter()
+                .map(|id| format!("edge-{id}"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                run(&conn, &compiled("MATCH (e:edge) RETURN e.id", &mailbox)),
+                expected_edges,
+                "{mailbox:?}"
+            );
+            for offset in 0..=messages.len() {
+                let total_limit = offset + 1;
+                let query = parse(
+                    QueryLanguage::Gql,
+                    &format!("MATCH (n:message) RETURN n.id SKIP {offset} LIMIT {total_limit}"),
+                )
+                .unwrap();
+                let actual = compile_with_mailbox(&query, &options(100), &mailbox).unwrap();
+                assert_eq!(
+                    run(&conn, &actual),
+                    messages
+                        .iter()
+                        .skip(offset)
+                        .take(1)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+            }
+            if maintainer == Some("") {
+                let empty = compiled("MATCH (n:message) RETURN n.id", &mailbox);
+                let original =
+                    compiled("MATCH (n:message) RETURN n.id", &scope(actor, legacy_local));
+                assert_eq!(empty.sql, original.sql);
+                let values = |query: &CompiledQuery| {
+                    query
+                        .params
+                        .iter()
+                        .map(|value| match value {
+                            QueryValue::Null => Value::Null,
+                            QueryValue::Integer(value) => Value::Integer(*value),
+                            QueryValue::Float(value) => Value::Real(*value),
+                            QueryValue::Text(value) => Value::Text(value.clone()),
+                            QueryValue::Blob(value) => Value::Blob(value.clone()),
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(values(&empty), values(&original));
+            }
+        }
+    }
+    let actor = "maintainer' OR 1=1 --";
+    let mailbox = quarantine_scope(actor, false, Some(actor));
+    let query = compiled("MATCH (n:message) RETURN n.id", &mailbox);
+    assert!(!query.sql.contains(actor));
+    assert_eq!(
+        query
+            .params
+            .iter()
+            .filter(|value| matches!(value, QueryValue::Text(text) if text == actor))
+            .count(),
+        2
+    );
+    assert_eq!(
+        run(&conn, &query),
+        rows.iter()
+            .filter(|row| row.2)
+            .map(|row| row.0.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn quarantine_edge_and_recursive_scopes_preserve_entity_precedence() {
+    let conn = fixture();
+    entity(&conn, "root");
+    entity(&conn, "end");
+    for (id, value) in [
+        ("q-boolean", "true"),
+        ("q-string", "\"true\""),
+        ("dead-q", "true"),
+        ("shared-q", "true"),
+        ("numeric", "1"),
+    ] {
+        let properties =
+            format!(r#"{{"direction":"inbound","to_actor":"landing","quarantined":{value}}}"#);
+        note(&conn, id, "message", Some(&properties));
+        edge(&conn, &format!("edge-{id}"), "root", id);
+    }
+    conn.execute("UPDATE notes SET deleted_at = 1 WHERE id = 'dead-q'", [])
+        .unwrap();
+    entity(&conn, "shared-q");
+    edge(&conn, "edge-q-source", "q-boolean", "end");
+    let landing = quarantine_scope("landing", false, Some("maintainer"));
+    let maintainer = quarantine_scope("maintainer", false, Some("maintainer"));
+    assert_eq!(
+        run(&conn, &compiled("MATCH (e:edge) RETURN e.id", &landing)),
+        ["edge-numeric", "edge-shared-q"]
+    );
+    assert_eq!(
+        run(&conn, &compiled("MATCH (e:edge) RETURN e.id", &maintainer)),
+        [
+            "edge-dead-q",
+            "edge-q-boolean",
+            "edge-q-source",
+            "edge-q-string",
+            "edge-shared-q"
+        ]
+    );
+    for mailbox in [&landing, &maintainer] {
+        let query = compiled(
+            "MATCH (a)-[:extends*1..2]->(b) WHERE a.id = 'root' RETURN b.id",
+            mailbox,
+        );
+        let mut actual = run(&conn, &query);
+        actual.sort();
+        let expected = if mailbox.actor_id == "maintainer" {
+            vec!["end", "q-boolean", "q-string", "shared-q"]
+        } else {
+            vec!["numeric", "shared-q"]
+        };
+        assert_eq!(actual, expected);
     }
 }

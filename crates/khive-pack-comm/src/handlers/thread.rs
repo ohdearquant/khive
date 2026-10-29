@@ -87,6 +87,14 @@ fn fold_thread_note(
         return;
     }
 
+    fold_visible_thread_note(canonical, canonical_order, note);
+}
+
+fn fold_visible_thread_note(
+    canonical: &mut HashMap<Uuid, ThreadRow>,
+    canonical_order: &mut Vec<Uuid>,
+    note: Note,
+) {
     let row = ThreadRow::from_note(note);
     let logical_id = row.logical_id();
     match canonical.get_mut(&logical_id) {
@@ -103,6 +111,27 @@ fn fold_thread_note(
                 existing.display_read = row.display_read;
             }
         }
+    }
+}
+
+fn fold_view_thread_note(
+    canonical: &mut HashMap<Uuid, ThreadRow>,
+    canonical_order: &mut Vec<Uuid>,
+    note: Note,
+    view: &MailboxView,
+    inherits_legacy_pool: bool,
+) {
+    match view.quarantine_override(&note) {
+        Some(true) => fold_visible_thread_note(canonical, canonical_order, note),
+        Some(false) => {}
+        None => fold_thread_note(
+            canonical,
+            canonical_order,
+            note,
+            &view.actor_id,
+            view.delegated,
+            inherits_legacy_pool,
+        ),
     }
 }
 
@@ -203,7 +232,7 @@ pub(crate) async fn handle_thread(
             .into_iter()
             .map(SqlValue::Text)
             .collect();
-    let thread_filter = NoteFilter {
+    let mut thread_filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters: vec![PropertyFilter {
             json_path: "$.thread_id".to_string(),
@@ -213,6 +242,13 @@ pub(crate) async fn handle_thread(
         order_by: None,
         ..Default::default()
     };
+    if view.maintainer_actor.is_some()
+        && view.maintainer_actor.as_deref() != Some(view.actor_id.as_str())
+    {
+        thread_filter
+            .property_filters
+            .extend(non_quarantine_property_filters());
+    }
     let mut physical_cursor = None;
     let mut seen_row_ids = HashSet::new();
     loop {
@@ -245,12 +281,11 @@ pub(crate) async fn handle_thread(
         .await;
         for note in page.items {
             if seen_row_ids.insert(note.id) {
-                fold_thread_note(
+                fold_view_thread_note(
                     &mut canonical,
                     &mut canonical_order,
                     note,
-                    &view.actor_id,
-                    view.delegated,
+                    &view,
                     inherits_legacy_pool,
                 );
             }
@@ -270,12 +305,11 @@ pub(crate) async fn handle_thread(
     // (issue #479b: a root lacking a `thread_id` property, e.g. legacy/imported data).
     let root_already_present = seen_row_ids.contains(&root_note.id);
     if !root_already_present {
-        fold_thread_note(
+        fold_view_thread_note(
             &mut canonical,
             &mut canonical_order,
             root_note,
-            &view.actor_id,
-            view.delegated,
+            &view,
             inherits_legacy_pool,
         );
     }

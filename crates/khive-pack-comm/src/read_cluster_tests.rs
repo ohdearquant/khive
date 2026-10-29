@@ -16,6 +16,8 @@ pub(super) enum Phase {
     ThreadPage(Vec<Uuid>),
     ThreadRetained { stage: &'static str, rows: usize },
     ThreadOwners(Vec<Uuid>),
+    PointValidated(Uuid),
+    InboxOrdinaryPage(Vec<Uuid>),
     BatchRead(Vec<Uuid>),
     ValidatedWindow(Vec<Uuid>),
     ValidatedAll,
@@ -1267,5 +1269,433 @@ async fn attachment_page_batch_keeps_readable_siblings_and_owner_diagnostics() {
             acquired <= 6,
             "{verb} diagnostics page acquisitions: {acquired}"
         );
+    }
+}
+
+fn am6_read_fixture(caller: &str) -> (KhiveRuntime, VerbRegistry) {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        actor_id: Some("lambda:maintainer".into()),
+        brain_profile: None,
+        packs: vec!["kg".into(), "comm".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("fixed maintainer runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(crate::CommPack::new(runtime.clone()));
+    builder.with_actor_id(Some(caller.into()));
+    (runtime, builder.build().expect("real read registry"))
+}
+
+#[tokio::test]
+async fn am6_single_read_rechecks_new_quarantine_after_real_point_validation() {
+    let (runtime, registry) = am6_read_fixture("lambda:reader");
+    seed(&runtime, vec![message(1)]).await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callback = hook({
+        let runtime = runtime.clone();
+        let hits = hits.clone();
+        move |phase| {
+            let runtime = runtime.clone();
+            let hits = hits.clone();
+            Box::pin(async move {
+                if matches!(phase, Phase::PointValidated(target) if target == id(1)) {
+                    assert_eq!(hits.fetch_add(1, Ordering::SeqCst), 0);
+                    change_properties(&runtime, id(1), |p| {
+                        p["quarantined"] = json!(true);
+                        p["concurrent"] = json!("retained");
+                    })
+                    .await;
+                }
+            })
+        }
+    });
+    let response = PHASE_HOOK
+        .scope(
+            callback,
+            registry.dispatch("comm.read", json!({"id":id(1).to_string(),"body":true})),
+        )
+        .await
+        .expect("best effort result");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "single validation seam must be reached once"
+    );
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["read"], false);
+    assert!(response.get("content").is_none());
+    let after = runtime
+        .backend()
+        .notes()
+        .unwrap()
+        .get_note(id(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = after.properties.unwrap();
+    assert_eq!(p["read"], false);
+    assert_eq!(p["quarantined"], true);
+    assert_eq!(p["concurrent"], "retained");
+}
+
+#[tokio::test]
+async fn am6_bulk_read_rechecks_quarantine_without_losing_other_properties() {
+    let (runtime, registry) = am6_read_fixture("lambda:reader");
+    seed(&runtime, vec![message(1), message(2)]).await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callback = hook({
+        let runtime = runtime.clone();
+        let hits = hits.clone();
+        move |phase| {
+            let runtime = runtime.clone();
+            let hits = hits.clone();
+            Box::pin(async move {
+                if matches!(phase, Phase::ValidatedAll) {
+                    assert_eq!(hits.fetch_add(1, Ordering::SeqCst), 0);
+                    change_properties(&runtime, id(1), |p| p["concurrent"] = json!("retained"))
+                        .await;
+                    change_properties(&runtime, id(2), |p| p["quarantined"] = json!("true")).await;
+                }
+            })
+        }
+    });
+    let response = PHASE_HOOK
+        .scope(
+            callback,
+            registry.dispatch(
+                "comm.read",
+                json!({"ids":[id(1).to_string(),id(2).to_string()],"body":true}),
+            ),
+        )
+        .await
+        .expect("real best-effort bulk result");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response["status"], "partial");
+    assert_eq!(response["results"][0]["read"], true);
+    assert_eq!(
+        response["results"][0]["properties"]["concurrent"],
+        "retained"
+    );
+    assert_eq!(response["results"][1]["status"], "failed");
+    assert_eq!(response["results"][1]["read"], false);
+    assert!(response["results"][1].get("content").is_none());
+    let after = runtime
+        .backend()
+        .notes()
+        .unwrap()
+        .get_note(id(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.properties.as_ref().unwrap()["read"], false);
+    assert_eq!(after.properties.as_ref().unwrap()["quarantined"], "true");
+}
+
+#[tokio::test]
+async fn am6_atomic_read_quarantine_recheck_rolls_back_the_earlier_patch() {
+    let (runtime, registry) = am6_read_fixture("lambda:reader");
+    seed(&runtime, vec![message(1), message(2)]).await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callback = hook({
+        let runtime = runtime.clone();
+        let hits = hits.clone();
+        move |phase| {
+            let runtime = runtime.clone();
+            let hits = hits.clone();
+            Box::pin(async move {
+                if matches!(phase, Phase::ValidatedAll) {
+                    assert_eq!(hits.fetch_add(1, Ordering::SeqCst), 0);
+                    change_properties(&runtime, id(1), |p| p["concurrent"] = json!("retained"))
+                        .await;
+                    change_properties(&runtime, id(2), |p| p["quarantined"] = json!(true)).await;
+                }
+            })
+        }
+    });
+    PHASE_HOOK
+        .scope(
+            callback,
+            registry.dispatch(
+                "comm.mark_read",
+                json!({"ids":[id(1).to_string(),id(2).to_string()],"atomic":true}),
+            ),
+        )
+        .await
+        .expect_err("current-row Q guard refuses the real atomic writer");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let store = runtime.backend().notes().unwrap();
+    let first = store.get_note(id(1)).await.unwrap().unwrap();
+    let second = store.get_note(id(2)).await.unwrap().unwrap();
+    assert_eq!(
+        first.properties.as_ref().unwrap()["read"],
+        false,
+        "earlier write rolled back"
+    );
+    assert_eq!(first.properties.as_ref().unwrap()["concurrent"], "retained");
+    assert_eq!(second.properties.as_ref().unwrap()["read"], false);
+    assert_eq!(second.properties.as_ref().unwrap()["quarantined"], true);
+}
+
+#[tokio::test]
+async fn am6_maintainer_read_loses_override_when_current_row_ceases_to_be_quarantine() {
+    let (runtime, registry) = am6_read_fixture("lambda:maintainer");
+    let mut stored = message(1);
+    stored.properties.as_mut().unwrap()["quarantined"] = json!(true);
+    seed(&runtime, vec![stored]).await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callback = hook({
+        let runtime = runtime.clone();
+        let hits = hits.clone();
+        move |phase| {
+            let runtime = runtime.clone();
+            let hits = hits.clone();
+            Box::pin(async move {
+                if matches!(phase, Phase::PointValidated(target) if target == id(1)) {
+                    assert_eq!(hits.fetch_add(1, Ordering::SeqCst), 0);
+                    change_properties(&runtime, id(1), |p| {
+                        p["quarantined"] = json!(false);
+                        p["concurrent"] = json!("retained");
+                    })
+                    .await;
+                }
+            })
+        }
+    });
+    let response = PHASE_HOOK
+        .scope(
+            callback,
+            registry.dispatch("comm.read", json!({"id":id(1).to_string(),"body":true})),
+        )
+        .await
+        .expect("best effort refuses former override");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response["read"], false);
+    assert!(response.get("content").is_none());
+    let after = runtime
+        .backend()
+        .notes()
+        .unwrap()
+        .get_note(id(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.properties.as_ref().unwrap()["read"], false);
+    assert_eq!(
+        after.properties.as_ref().unwrap()["to_actor"],
+        "lambda:reader"
+    );
+    assert_eq!(after.properties.as_ref().unwrap()["concurrent"], "retained");
+}
+
+#[tokio::test]
+async fn am6_hidden_outbound_quarantine_refuses_before_diagnostics_single_and_bulk() {
+    for q in [json!(true), json!("true")] {
+        let (runtime, registry) = am6_read_fixture("lambda:reader");
+        let mut stored = message(1);
+        stored.content = "private quarantine body".into();
+        let p = stored.properties.as_mut().unwrap();
+        p["quarantined"] = q;
+        p["direction"] = json!("outbound");
+        p["from_actor"] = json!("lambda:reader");
+        p["quarantine_content_ref"] = json!("private retained ref");
+        let before = serde_json::to_value(&stored).unwrap();
+        seed(&runtime, vec![stored]).await;
+        for actor in [Some("lambda:reader"), Some("lambda:other"), None] {
+            for bulk in [false, true] {
+                for body in [false, true] {
+                    let mut args = json!({"body":body});
+                    args[if bulk { "ids" } else { "id" }] = if bulk {
+                        json!([id(1).to_string()])
+                    } else {
+                        json!(id(1).to_string())
+                    };
+                    let error = registry
+                        .dispatch_with_identity(
+                            "comm.read",
+                            args,
+                            Some(khive_runtime::RequestIdentity {
+                                namespace: "local".into(),
+                                actor_id: actor.map(str::to_owned),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .expect_err("hidden Q is outside the real caller mailbox")
+                        .to_string();
+                    assert!(
+                        error.contains(&format!(
+                            "read: that message is not addressed to caller actor {:?}",
+                            actor.unwrap_or("local")
+                        )),
+                        "{error}"
+                    );
+                    for hidden in [
+                        "outbound",
+                        "quarantin",
+                        "private retained ref",
+                        "private quarantine body",
+                    ] {
+                        assert!(!error.contains(hidden), "{error}");
+                    }
+                }
+            }
+        }
+        for bulk in [false, true] {
+            for body in [false, true] {
+                let mut args = json!({"body":body});
+                args[if bulk { "ids" } else { "id" }] = if bulk {
+                    json!([id(1).to_string()])
+                } else {
+                    json!(id(1).to_string())
+                };
+                let error = registry
+                    .dispatch_as(
+                        "comm.read",
+                        args,
+                        khive_runtime::VerifiedActor::new("lambda:maintainer").unwrap(),
+                    )
+                    .await
+                    .expect_err("eligible maintainer still cannot mark outbound")
+                    .to_string();
+                assert!(
+                    error.contains("only received (inbound) messages can be marked as read"),
+                    "{error}"
+                );
+            }
+        }
+        let after = runtime
+            .backend()
+            .notes()
+            .unwrap()
+            .get_note(id(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+        change_properties(&runtime, id(1), |p| p["quarantined"] = json!(1)).await;
+        let error = registry
+            .dispatch("comm.read", json!({"id":id(1).to_string()}))
+            .await
+            .expect_err("numeric1 retains ordinary outbound diagnostic")
+            .to_string();
+        assert!(
+            error.contains("only received (inbound) messages can be marked as read"),
+            "{error}"
+        );
+        let mut positive = message(2);
+        positive.properties.as_mut().unwrap()["quarantined"] = json!(true);
+        seed(&runtime, vec![positive]).await;
+        let admitted = registry
+            .dispatch_as(
+                "comm.read",
+                json!({"id":id(2).to_string(),"body":true}),
+                khive_runtime::VerifiedActor::new("lambda:maintainer").unwrap(),
+            )
+            .await
+            .expect("real inbound maintainer positive");
+        assert_eq!(admitted["read"], true);
+        assert_eq!(admitted["content"], "message 2");
+    }
+}
+
+#[tokio::test]
+async fn am6_inbox_two_snapshots_consume_a_transitioned_row_once_before_offset_and_lookahead() {
+    for limit in [1_usize, 2, 4] {
+        for offset in 0_usize..=4 {
+            let (runtime, registry) = am6_read_fixture("lambda:maintainer");
+            let notes = (1..=4)
+                .map(|index| {
+                    let mut note = message(index);
+                    let properties = note.properties.as_mut().unwrap();
+                    properties["to_actor"] = json!("lambda:maintainer");
+                    properties["quarantined"] = json!(index == 3);
+                    properties["snapshot_image"] = json!("ordinary");
+                    note
+                })
+                .collect();
+            seed(&runtime, notes).await;
+            let hits = Arc::new(AtomicUsize::new(0));
+            let callback =
+                hook({
+                    let runtime = runtime.clone();
+                    let hits = hits.clone();
+                    move |phase| {
+                        let runtime = runtime.clone();
+                        let hits = hits.clone();
+                        Box::pin(async move {
+                            if let Phase::InboxOrdinaryPage(actual) = phase {
+                                assert_eq!(hits.fetch_add(1, Ordering::SeqCst), 0);
+                                assert_eq!(actual, vec![id(1), id(2), id(4)],
+                                "actual completed ordinary fetch contains the transitioning row");
+                                change_properties(&runtime, id(2), |p| {
+                                    p["quarantined"] = json!(true);
+                                    p["snapshot_image"] = json!("quarantine");
+                                })
+                                .await;
+                            }
+                        })
+                    }
+                });
+            let response = PHASE_HOOK
+                .scope(
+                    callback,
+                    registry.dispatch(
+                        "comm.inbox",
+                        json!({"status":"all", "limit":limit, "offset":offset}),
+                    ),
+                )
+                .await
+                .expect("real two-arm inbox with an inter-snapshot stored-row transition");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let rows = response["messages"].as_array().unwrap();
+            let actual: Vec<String> = rows
+                .iter()
+                .map(|row| row["full_id"].as_str().unwrap().to_owned())
+                .collect();
+            let all: Vec<String> = (1..=4).map(|index| id(index).to_string()).collect();
+            let end = offset.saturating_add(limit).min(all.len());
+            assert_eq!(
+                actual,
+                all[offset..end],
+                "global offset counts each physical ID once"
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                actual.len()
+            );
+            assert_eq!(response["count"], rows.len());
+            let has_more = end < all.len();
+            assert_eq!(
+                response["has_more"], has_more,
+                "lookahead counts each ID once"
+            );
+            assert_eq!(
+                response["next_offset"],
+                if has_more { json!(end) } else { Value::Null }
+            );
+            for row in rows {
+                if row["full_id"] == id(2).to_string() {
+                    assert_eq!(row["properties"]["quarantined"], true);
+                    assert_eq!(
+                        row["properties"]["snapshot_image"], "quarantine",
+                        "the quarantine image wins a matching-front tie deterministically"
+                    );
+                }
+            }
+            let stored = runtime
+                .backend()
+                .notes()
+                .unwrap()
+                .get_note(id(2))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.properties.as_ref().unwrap()["quarantined"], true);
+        }
     }
 }

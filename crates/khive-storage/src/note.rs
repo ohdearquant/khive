@@ -136,6 +136,16 @@ impl Note {
     }
 }
 
+/// Whether a message carries the quarantine flag in either supported JSON spelling.
+pub fn is_quarantined_message(note: &Note) -> bool {
+    note.kind == "message"
+        && note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("quarantined"))
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"))
+}
+
 #[cfg(test)]
 #[path = "note/tests.rs"]
 mod tests;
@@ -464,6 +474,9 @@ pub struct NoteFilter {
     /// only ever contains rows the reader is allowed to see.
     #[serde(default)]
     pub mailbox: Option<NoteMailboxScope>,
+    /// Internal current-row recipient guard for message read mutations.
+    #[serde(skip)]
+    pub message_addressee: Option<NoteMailboxScope>,
 }
 
 impl NoteFilter {
@@ -501,6 +514,9 @@ impl NoteFilter {
 pub struct NoteMailboxScope {
     pub actor_id: String,
     pub legacy_local: bool,
+    /// Trusted configured maintainer, supplied by the authorizing runtime.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub maintainer_actor: Option<String>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.

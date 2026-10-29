@@ -2,14 +2,25 @@ use super::{QueryMailboxScope, QueryValue};
 
 pub(super) struct MailboxLowering {
     actor_parameter: usize,
+    maintainer_parameter: Option<usize>,
     legacy_local: bool,
 }
 
 impl MailboxLowering {
     pub(super) fn bind(scope: &QueryMailboxScope, params: &mut Vec<QueryValue>) -> Self {
         params.push(QueryValue::Text(scope.actor_id.clone()));
+        let actor_parameter = params.len();
+        let maintainer_parameter = scope
+            .maintainer_actor
+            .as_ref()
+            .filter(|actor| !actor.is_empty())
+            .map(|actor| {
+                params.push(QueryValue::Text(actor.clone()));
+                params.len()
+            });
         Self {
-            actor_parameter: params.len(),
+            actor_parameter,
+            maintainer_parameter,
             legacy_local: scope.legacy_local,
         }
     }
@@ -73,9 +84,21 @@ impl MailboxLowering {
             Default::default()
         };
         // Preserve MailboxView/NoteMailboxScope's typed-JSON legacy partition.
-        format!(
+        let ordinary = format!(
             "({alias}.kind != 'message' OR ({direction} = 'inbound' AND ({to}{inbound_legacy})) \
              OR ({direction} = 'outbound' AND ({from}{outbound_legacy})){unrouted})"
+        );
+        let Some(maintainer) = self.maintainer_parameter else {
+            return ordinary;
+        };
+        let quarantine_type = json_type("quarantined");
+        let quarantine_value = extract("quarantined");
+        format!(
+            "({alias}.kind != 'message' OR CASE WHEN COALESCE(\
+             {quarantine_type} = 'true' OR \
+             ({quarantine_type} = 'text' AND {quarantine_value} = 'true'), 0) \
+             THEN ?{} = ?{maintainer} ELSE COALESCE({ordinary}, 0) END)",
+            self.actor_parameter
         )
     }
 }

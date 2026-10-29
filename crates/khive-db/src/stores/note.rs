@@ -1354,6 +1354,9 @@ fn build_note_filter_where(
     if let Some(scope) = &filter.mailbox {
         conditions.push(mailbox_condition(scope, &mut params));
     }
+    if let Some(scope) = &filter.message_addressee {
+        conditions.push(message_addressee_condition(scope, &mut params));
+    }
 
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
@@ -1398,9 +1401,59 @@ fn mailbox_condition(
     } else {
         Default::default()
     };
-    format!(
+    let ordinary = format!(
         "(kind != 'message' OR ({direction} = 'inbound' AND ({to}{inbound_legacy})) \
          OR ({direction} = 'outbound' AND ({from}{outbound_legacy})){unrouted})"
+    );
+    let Some(maintainer) = scope
+        .maintainer_actor
+        .as_ref()
+        .filter(|actor| !actor.is_empty())
+    else {
+        return ordinary;
+    };
+    params.push(Box::new(maintainer.clone()));
+    let maintainer = params.len();
+    let quarantine_type = json_type_expr("$.quarantined");
+    let quarantine_value = json_extract_expr("$.quarantined");
+    format!(
+        "(kind != 'message' OR CASE WHEN COALESCE(\
+         {quarantine_type} = 'true' OR \
+         ({quarantine_type} = 'text' AND {quarantine_value} = 'true'), 0) \
+         THEN {actor} = ?{maintainer} ELSE COALESCE({ordinary}, 0) END)"
+    )
+}
+
+fn message_addressee_condition(
+    scope: &khive_storage::note::NoteMailboxScope,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> String {
+    params.push(Box::new(scope.actor_id.clone()));
+    let actor = params.len();
+    let recipient_type = json_type_expr("$.to_actor");
+    let recipient = json_extract_expr("$.to_actor");
+    let legacy = if scope.legacy_local {
+        format!(" OR {recipient_type} IS NULL OR {recipient_type} = 'null'")
+    } else {
+        String::new()
+    };
+    let ordinary = format!("(({recipient_type} = 'text' AND {recipient} = ?{actor}){legacy})");
+    let Some(maintainer) = scope
+        .maintainer_actor
+        .as_ref()
+        .filter(|actor| !actor.is_empty())
+    else {
+        return format!("(kind = 'message' AND {ordinary})");
+    };
+    params.push(Box::new(maintainer.clone()));
+    let maintainer = params.len();
+    let quarantine_type = json_type_expr("$.quarantined");
+    let quarantine_value = json_extract_expr("$.quarantined");
+    format!(
+        "(kind = 'message' AND CASE WHEN COALESCE(\
+         {quarantine_type} = 'true' OR \
+         ({quarantine_type} = 'text' AND {quarantine_value} = 'true'), 0) \
+         THEN ?{actor} = ?{maintainer} ELSE COALESCE({ordinary}, 0) END)"
     )
 }
 
