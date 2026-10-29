@@ -293,22 +293,37 @@ class HarnessTests(unittest.TestCase):
 
     def test_stalled_initialize_is_bounded_and_reaped(self):
         exchange_budget = 0.25
+        initialize_budget = 2.0
         reap_budget = exchange_budget
         for kind in ("legacy", "pytest"):
             for mode in ("initialize_silent", "initialize_partial", "initialize_noise"):
                 with self.subTest(kind=kind, mode=mode), OwnedContractStore() as store:
                     start = time.monotonic()
+                    child_count = len(self.children)
                     with self.assertRaises(Exception) as error:
                         with self.adapter(kind, store, mode, timeout=exchange_budget,
-                                          reap_timeout=reap_budget):
+                                          reap_timeout=reap_budget,
+                                          startup_timeout=initialize_budget):
                             self.fail("stalled initialize unexpectedly completed")
                     elapsed = time.monotonic() - start
-                    self.assertIn("exceeded", str(error.exception))
-                    self.assert_completion_envelope(elapsed, phase="stalled initialize",
-                                                    exchange=exchange_budget, reap=reap_budget)
-                    self.assertTrue(store.root.exists())
-                    self.assert_protocol_stage(mode)
-                    self.assert_reaped()
+                    try:
+                        self.assertGreater(
+                            len(self.children), child_count,
+                            f"fixture setup failure: fake server was not spawned: {error.exception!r}",
+                        )
+                        self.assertTrue(self.log.is_file(),
+                                        "fixture setup failure: fake server log is missing")
+                        try:
+                            self.assert_protocol_stage(mode)
+                        except (AssertionError, OSError, ValueError) as exc:
+                            self.fail(f"fixture setup failure: fake did not reach {mode}: {exc}")
+                        self.assertIn("exceeded", str(error.exception))
+                        self.assert_completion_envelope(elapsed, phase="stalled initialize",
+                                                        exchange=initialize_budget, reap=reap_budget)
+                        self.assertTrue(store.root.exists())
+                    finally:
+                        if len(self.children) > child_count:
+                            self.assert_reaped()
 
     def test_stalled_request_is_bounded_and_reaped(self):
         # Initialize is setup; the stalled request remains a 0.25s contract.
