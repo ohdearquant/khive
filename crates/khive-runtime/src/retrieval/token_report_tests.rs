@@ -365,3 +365,123 @@ fn old_aggregate_payloads_default_new_counters_and_merge_saturates() {
         report
     );
 }
+
+#[tokio::test]
+async fn document_vector_refusal_describes_actual_truncation_cause() {
+    let (reported, _) = fixture(Behavior::Report);
+    let token_only = reported
+        .embed_document_with_model_outcome("report-test", "abcdefghijk")
+        .await.unwrap();
+    assert_eq!(token_only.source_bytes, token_only.embedded_bytes);
+    let token_error = document_vector_or_refusal(token_only).unwrap_err();
+    assert!(matches!(&token_error, RuntimeError::InvalidInput(_)));
+    assert!(token_error.to_string().contains("from 13 to 8 provider tokens"));
+    assert!(!token_error.to_string().contains(" bytes"));
+
+    let large = "x".repeat(MAX_TEXT_BYTES + 3);
+    let combined = reported
+        .embed_document_with_model_outcome("report-test", &large)
+        .await.unwrap();
+    let combined_error = document_vector_or_refusal(combined).unwrap_err();
+    assert!(matches!(&combined_error, RuntimeError::InvalidInput(_)));
+    let combined_message = combined_error.to_string();
+    assert!(combined_message.contains(&format!("from {} to {} bytes", large.len(), MAX_TEXT_BYTES)));
+    assert!(combined_message.contains(&format!("from {} to 8 provider tokens for the byte-bounded input", MAX_TEXT_BYTES + 2)));
+
+    let (unsupported, _) = fixture(Behavior::Unsupported);
+    let byte_only = unsupported
+        .embed_document_with_model_outcome("report-test", &large)
+        .await.unwrap();
+    assert!(byte_only.provider_token_count.is_none());
+    let byte_error = document_vector_or_refusal(byte_only).unwrap_err();
+    assert!(matches!(&byte_error, RuntimeError::InvalidInput(_)));
+    let RuntimeError::InvalidInput(byte_message) = byte_error else {
+        panic!("expected an input refusal");
+    };
+    assert_eq!(byte_message, format!(
+        "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
+        large.len(), MAX_TEXT_BYTES
+    ));
+
+    for runtime in [&reported, &unsupported] {
+        let complete = runtime.embed_document_with_model_outcome("report-test", "short")
+            .await.unwrap();
+        assert!(!complete.truncated);
+        assert_eq!(document_vector_or_refusal(complete).unwrap(), vec![5.0]);
+    }
+}
+
+struct DefaultReportingProvider {
+    name: String,
+    dimensions: usize,
+    service: Arc<ReportingService>,
+}
+
+#[async_trait::async_trait]
+impl EmbedderProvider for DefaultReportingProvider {
+    fn name(&self) -> &str { &self.name }
+    fn dimensions(&self) -> usize { self.dimensions }
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(self.service.clone())
+    }
+}
+
+fn default_fixture(behavior: Behavior) -> (KhiveRuntime, Arc<Mutex<Vec<Call>>>) {
+    let model = EmbeddingModel::AllMiniLmL6V2;
+    let runtime = KhiveRuntime::new(crate::RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(model),
+        packs: vec!["kg".into()],
+        ..crate::RuntimeConfig::no_embeddings()
+    }).expect("in-memory default-model runtime");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    runtime.register_embedder(DefaultReportingProvider {
+        name: model.to_string(),
+        dimensions: model.dimensions(),
+        service: Arc::new(ReportingService { behavior, calls: calls.clone() }),
+    });
+    (runtime, calls)
+}
+
+#[tokio::test]
+async fn embed_document_wrapper_reports_token_byte_and_combined_refusals() {
+    let model_name = EmbeddingModel::AllMiniLmL6V2.to_string();
+    let budget = document_embedding_budget(&model_name);
+    let large = "x".repeat(budget + 3);
+    let (reported, reported_calls) = default_fixture(Behavior::Report);
+    let complete = reported.embed_document("short").await;
+    assert_eq!(reported_calls.lock().unwrap().len(), 1, "default provider was called");
+    assert_eq!(complete.unwrap(), vec![5.0]);
+
+    let token_only = reported.embed_document("abcdefghijk").await;
+    assert_eq!(reported_calls.lock().unwrap().len(), 2, "token-only provider call");
+    let RuntimeError::InvalidInput(token_message) = token_only.unwrap_err() else {
+        panic!("token-only input must be refused as InvalidInput");
+    };
+    assert!(token_message.contains("from 13 to 8 provider tokens"));
+    assert!(!token_message.contains(" bytes"));
+
+    let combined = reported.embed_document(&large).await;
+    assert_eq!(reported_calls.lock().unwrap().len(), 3, "combined provider call");
+    let RuntimeError::InvalidInput(combined_message) = combined.unwrap_err() else {
+        panic!("combined truncation must be refused as InvalidInput");
+    };
+    assert!(combined_message.contains(&format!("from {} to {} bytes", large.len(), budget)));
+    assert!(combined_message.contains(&format!("from {} to 8 provider tokens for the byte-bounded input", budget + 2)));
+    assert_eq!(reported_calls.lock().unwrap()[2].texts[0].len(), budget);
+
+    let (unsupported, unsupported_calls) = default_fixture(Behavior::Unsupported);
+    let complete = unsupported.embed_document("short").await;
+    assert_eq!(unsupported_calls.lock().unwrap().len(), 2, "report then passage fallback");
+    assert_eq!(complete.unwrap(), vec![5.0]);
+    let bytes = unsupported.embed_document(&large).await;
+    assert_eq!(unsupported_calls.lock().unwrap().len(), 4, "byte-only report then fallback");
+    let RuntimeError::InvalidInput(byte_message) = bytes.unwrap_err() else {
+        panic!("byte-only truncation must be refused as InvalidInput");
+    };
+    assert_eq!(byte_message, format!(
+        "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
+        large.len(), budget
+    ));
+    assert_eq!(unsupported_calls.lock().unwrap()[3].texts[0].len(), budget);
+}
