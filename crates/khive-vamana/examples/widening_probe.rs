@@ -111,7 +111,10 @@ fn make_query_fixture(corpus: &[f32], query_id: usize) -> QueryFixture {
             Scenario { eligible, oracle }
         })
         .collect();
-    assert!(scenarios[3].eligible[query_id], "self must be near-eligible");
+    assert!(
+        scenarios[3].eligible[query_id],
+        "self must be near-eligible"
+    );
     assert!(
         scenarios[3].oracle.contains(&query_id),
         "self must be in near oracle"
@@ -259,11 +262,13 @@ fn main() {
             let quality: Vec<Value> = SCENARIOS
                 .iter()
                 .enumerate()
-                .map(|(i, name)| json!({
-                    "scenario": name,
-                    "mean_fill_at_10": samples.fill[i] / count as f64,
-                    "mean_exact_eligible_recall_at_10": samples.recall[i] / count as f64,
-                }))
+                .map(|(i, name)| {
+                    json!({
+                        "scenario": name,
+                        "mean_fill_at_10": samples.fill[i] / count as f64,
+                        "mean_exact_eligible_recall_at_10": samples.recall[i] / count as f64,
+                    })
+                })
                 .collect();
             json!({
                 "k": width,
