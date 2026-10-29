@@ -880,9 +880,12 @@ preserving screening labels and disclosing when the original could not be kept.
 Only failure to write that terminal quarantine continues to hold progress.
 
 When a quarantined inbound message carries `quarantine_content_ref`, ingest
-commits a `quarantine-original` note attachment with that same reference in the
-note's transaction. This attachment is the blob sweep's liveness root; metadata
-alone does not own stored bytes. An attachment-free duplicate is acknowledged
+establishes a `quarantine-original` Note-substrate attachment with that same
+reference on canonical main before publishing the reference in the message.
+On the main comm backend, the note and attachment commit in one transaction.
+On a configured secondary comm backend, the main attachment commits first and
+the secondary note is published afterward. This attachment is the blob sweep's
+liveness root; metadata alone does not own stored bytes. An attachment-free duplicate is acknowledged
 only after matching the namespaced, channel-scoped message identity, including
 the scoped legacy IMAP lookup. It attaches nothing and leaves the stored duplicate
 note unchanged; that receipt does not prove possession of the original or that
@@ -922,24 +925,34 @@ Quarantine notes receive `expires_at` at creation, computed from their own
 embedders may configure it with `CommPack::with_quarantine_retention`). Before
 each email or Telegram channel poll, an internal, bounded cleanup pass selects
 expired quarantine messages in that channel's ingest namespace and exact
-`channel_kind`/`channel_slug`, then hard-deletes each note and its attachment.
-Subsequent polls continue through the backlog, including when no new messages
-arrive. Hard deletion releases attachment ownership but leaves the original's
-blob bytes on disk; an unexpired quarantine note and its attachment remain
-available. This follows
+`channel_kind`/`channel_slug`, then hard-deletes each note. Main-backend note
+and attachment deletion remains atomic. For a secondary comm backend, cleanup
+first verifies that note deletion committed, then conditionally detaches the
+canonical-main `quarantine-original` owner only if its Note substrate and content
+reference still match the deleted note. A replacement with a different substrate
+or content reference is not deleted.
+This uses the same verified-delete and guarded-detach path as legacy slugless
+cleanup; the legacy selector and main-local deletion are unchanged. Subsequent
+polls continue through the backlog, including when no new messages arrive.
+Detaching ownership leaves the original's blob bytes on disk; an unexpired
+quarantine note and its attachment remain available. This follows
 [ADR-121](../../../../docs/adr/ADR-121-attachments-first-class.md)'s rule that
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
 
-Physical reclamation remains pending ([#3679](https://github.com/ohdearquant/khive/issues/3679)).
-The serving process has no caller for the committed-object collector
-([#3038](https://github.com/ohdearquant/khive/issues/3038)); the daemon's staged-upload
-expiry sweep does not collect committed originals. A future collector must preserve
-ADR-121's publish grace and satisfy its approved schema and producer review,
-complete ownership registration and manifest closure, store binding, and verified
-adoption of populated roots. [#3324](https://github.com/ohdearquant/khive/issues/3324)
-tracks the current schema gate, which also blocks collection on current databases.
+Blob reclamation is separate from message cleanup and follows the collector's
+grace and claim fence. Canonical-main attachment inserts and content-reference
+updates refuse a reference held by an active blob-sweep claim. An owner committed
+before the claim is visible to the sweep's ownership anti-join. Ingest never treats
+an uploaded but unowned blob as retained solely because `blob.put` succeeded.
+
+GC acceptance distinguishes two cases. On current-epoch databases, the collector
+must return typed `Unsupported` and preserve both owned and unowned objects. A
+separate isolated version-21 fixture exercises actual collection: an owned
+original must survive and an aged unowned original must be reclaimed. The fixture
+does not relax the current-epoch admission gate or establish a successful live
+sweep. These are separate acceptance requirements, not interchangeable evidence.
 
 The number of quarantine records that hold an original is bounded per channel
 configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
@@ -959,29 +972,39 @@ require a separate audited migration or cleanup before the same retention
 guarantee can cover them. A row with the matching slug but no `expires_at`
 can receive its deadline on a matching trusted replay.
 
-When the comm pack runs on a secondary backend, the message and the main-backend
-owner row cannot be written together, so `comm.ingest` records the quarantine
-without its original: it drops `quarantine_content_ref` and stores
-`quarantine_original_retained: "false"` with
-`quarantine_original_not_retained_reason: "secondary-backend"`, and logs a warning
-naming the reference. The record keeps the normal retention deadline and counts
-toward `quarantined_count`, so the cap above still limits how many such records
-exist at once. The object the poller already published has no owner row and is
-not reclaimed when the record expires, because no collector runs today (see
-above); the transport still holds the original message. Refusing the ingest
-instead would hold the channel's progress on that message for every later poll.
-A replay of the same message resolves to the stored record and writes no owner
-row either.
+When the comm pack runs on a secondary backend, `comm.ingest` allocates the
+message ID and conditionally inserts its canonical-main `quarantine-original`
+owner before writing the secondary message. An existing owner with the same Note
+substrate and reference is an idempotent replay. A different owner is neither
+overwritten nor deleted: the new record omits `quarantine_content_ref`, stores
+`quarantine_original_retained: "false"` and reason `owner-mismatch`. An active
+blob-sweep claim similarly records the message without the reference, with reason
+`blob-sweep-active`; ingest does not retry that registration within the same call.
+Other storage failures remain failures rather than being reported as sweep claims.
+
+If this attempt inserted the main owner and the secondary write is known not to
+have committed, cleanup releases only that exact owner with a substrate/ref-guarded
+delete. A replayed owner is not released by a losing attempt. A committed or unknown
+secondary outcome retains the owner. A crash between stores can therefore leave an
+owner without a secondary message; no zero-orphan guarantee is made. Bounded aged
+owner enumeration and one targeted comm-backend absence probe per candidate remain
+tracked by [#3178](https://github.com/ohdearquant/khive/issues/3178).
+
+This path applies to new ingests after deployment. It does not recreate owners for
+older secondary quarantine records that were stored without originals. Those
+unowned uploads remain subject to the collector's ordinary grace rules. Withheld
+delivery's main-local atomic custody requirement is unchanged.
 
 The `comm.ingest` receipt discloses the retention outcome for every NEW
 quarantine record (the `deduplicated=false` path): `quarantine_original_retained`
-is a JSON boolean read from the attachment actually persisted after the
-`secondary-backend` drop, so a drop inside `comm.ingest` reads like any other
-loss. When it is `false` the receipt also carries
+is a JSON boolean derived from the completed original-ownership outcome. A
+failed registration cannot be reported as retained. When it is `false` the receipt also carries
 `quarantine_original_not_retained_reason` with the record's own stored reason
 (for example `retention-limit`, `original-unavailable`, `original-store-failed`,
-`quarantine-write-failed` or `secondary-backend`). A retained original and a
-lost one are otherwise indistinguishable from the response alone. A
+`quarantine-write-failed`, `blob-sweep-active` or `owner-mismatch`). Historical
+`secondary-backend` reasons remain readable. These outcomes feed the existing
+`originals_not_retained` heartbeat total and `comm.health` reason; no second counter
+or interim upload gate is introduced. A
 non-quarantine message carries neither key, and a deduplicated acknowledgement
 (`deduplicated=true`) carries neither, because it wrote no new record.
 Integrity note: a quarantined record with neither an attachment nor a stored
