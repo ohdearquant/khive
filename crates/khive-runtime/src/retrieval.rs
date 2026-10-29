@@ -96,16 +96,22 @@ fn document_vector_or_refusal(outcome: DocumentEmbeddingOutcome) -> RuntimeResul
     if !outcome.truncated {
         return Ok(outcome.vector);
     }
-    let token_count = outcome.provider_token_count.filter(|count| count.truncated());
+    let token_count = outcome
+        .provider_token_count
+        .filter(|count| count.truncated());
     let byte_cut = outcome.source_bytes > outcome.embedded_bytes;
     let detail = match (byte_cut, token_count) {
         (true, Some(count)) => format!(
             "from {} to {} bytes and from {} to {} provider tokens for the byte-bounded input",
             outcome.source_bytes, outcome.embedded_bytes, count.before_truncation, count.embedded
         ),
-        (true, None) => format!("from {} to {} bytes", outcome.source_bytes, outcome.embedded_bytes),
+        (true, None) => format!(
+            "from {} to {} bytes",
+            outcome.source_bytes, outcome.embedded_bytes
+        ),
         (false, Some(count)) => format!(
-            "from {} to {} provider tokens", count.before_truncation, count.embedded
+            "from {} to {} provider tokens",
+            count.before_truncation, count.embedded
         ),
         (false, None) => "by an unspecified input limit".to_string(),
     };
