@@ -89,7 +89,7 @@ fn make_query_fixture(corpus: &[f32], query_id: usize) -> QueryFixture {
     assert!(exact[1].1 > 0.0, "query must have a unique exact match");
 
     let mut masks = vec![vec![false; N]; SCENARIOS.len()];
-    for id in 0..N {
+    for &(id, _) in &exact {
         let bucket = mix(id as u64 ^ SEED) % 100;
         for (scenario, threshold) in [1, 5, 20].iter().enumerate() {
             masks[scenario][id] = bucket < *threshold;
