@@ -1,6 +1,7 @@
 use super::*;
 
 use khive_runtime::{Namespace, VerbRegistryBuilder};
+use serial_test::serial;
 
 #[test]
 #[serial_test::serial(config_ledger)]
@@ -151,6 +152,7 @@ fn recall_dispatch_fits_two_mib_worker_in_child() {
 }
 
 #[test]
+#[serial(config_ledger)]
 fn recall_two_mib_worker_child() {
     use crate::test_support::HashVecProvider;
     use khive_pack_kg::KgPack;
