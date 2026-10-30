@@ -527,6 +527,57 @@ cover yet.
 
 ---
 
+## `[channel.node]` — node channel
+
+The optional `[channel.node]` table configures the node channel transport. It is
+off by default: without the table, or with `enabled = false`, nothing about the
+node channel runs and the daemon identity is unchanged.
+
+A setup command writes this table. Key material and peer pins are never typed
+by hand: the setup command creates the key in the login keychain, records the
+reference and fingerprint here, and appends peer pins as they are confirmed.
+The fields are described so the file can be read and reviewed, not so values
+can be pasted in.
+
+Unknown keys and wrong value types are rejected when the file loads, even when
+the table is disabled. The checks in the Range column run only when
+`enabled = true`; the first failing field, in the order below, is reported as
+`channel.node: <reason>`.
+
+| Field                     | Type            | Default   | Range / rule                                                                                                                   |
+| ------------------------- | --------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`                 | bool            | `false`   | Turns the node channel on.                                                                                                     |
+| `slug`                    | string          | none      | Required when enabled. 1 to 64 characters of `a-z`, `0-9`, `_`, `-`.                                                           |
+| `namespace`               | string          | `"local"` | A valid namespace.                                                                                                             |
+| `actor`                   | string          | none      | Required when enabled. Nonempty after trimming, at most 256 bytes, no control characters.                                      |
+| `realm`                   | string          | none      | Required when enabled. 1 to 64 characters of `a-z`, `0-9`, `.`, `_`, `-`.                                                      |
+| `service_url`             | string          | none      | Required when enabled, not blank. The channel client checks that it is an HTTPS origin without credentials, query or fragment. |
+| `agent_id`                | string          | none      | Required when enabled. Lowercase hyphenated UUID.                                                                              |
+| `device_id`               | string          | none      | Required when enabled. Lowercase hyphenated UUID.                                                                              |
+| `key_epoch`               | integer         | none      | Required when enabled. 1 to 4294967295.                                                                                        |
+| `key_reference`           | string          | none      | Required when enabled. 1 to 128 characters of letters, digits, `.`, `_`, `-`; names the keychain account.                      |
+| `key_fingerprint`         | string          | none      | Required when enabled. 64 lowercase hex characters.                                                                            |
+| `poll_wait_seconds`       | integer         | `25`      | 0 to 25.                                                                                                                       |
+| `outbox_interval_seconds` | integer         | `5`       | 1 to 60.                                                                                                                       |
+| `batch_size`              | integer         | `64`      | 1 to 256.                                                                                                                      |
+| `pins`                    | array of tables | empty     | At most 4096 entries; no two entries share `agent_id`, `device_id` and `key_epoch`.                                            |
+
+Each `[[channel.node.pins]]` entry has no defaults. All six fields are required:
+`agent_id` and `device_id` (lowercase hyphenated UUIDs), `key_epoch` (1 to
+4294967295), and `kem_public_key`, `signing_public_key` and `fingerprint` (64
+lowercase hex characters each).
+
+An enabled table is part of the daemon identity, including the bound `actor`
+and the pins. A running daemon started with a different `[channel.node]` table
+is not reused: the caller falls back to local dispatch until that daemon is
+restarted.
+
+Not covered:
+
+- Linux: the key facility is macOS only in this release.
+
+---
+
 ## References
 
 - [docs/khive-config-example.toml](khive-config-example.toml): full annotated

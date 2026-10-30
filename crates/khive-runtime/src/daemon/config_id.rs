@@ -14,6 +14,8 @@ pub(super) struct ConfigIdFields<'a> {
     telemetry: &'a str,
     pub(super) display_timezone: &'a str,
     visibility_receipts: &'a str,
+    /// Digest of an enabled `[channel.node]` table; absent from ids that carry none.
+    node_channel: Option<&'a str>,
     backends: Option<&'a str>,
     pub(super) pack_backends: Option<&'a str>,
     /// Trailing writable-SQLite disk policy; absent from ids that carry none.
@@ -36,6 +38,25 @@ pub(super) fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
 
     let base = base.strip_prefix("packs=[")?;
     let (packs, rest) = base.split_once("];db=")?;
+    // The digest is 64 lowercase hex characters. Trailing policy segments that
+    // this parser does not split out (`blob_file_transfers`, `disabled_verbs`)
+    // may follow it; they stay in the compared value so a difference there
+    // still refuses reuse.
+    let (rest, node_channel) = match rest.rsplit_once(";node_channel=") {
+        Some((rest, value)) => {
+            let digest = value.get(..64)?;
+            let tail = &value[64..];
+            if !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !(tail.is_empty() || tail.starts_with(';'))
+            {
+                return None;
+            }
+            (rest, Some(value))
+        }
+        None => (rest, None),
+    };
     let (rest, visibility_receipts) = rest
         .rsplit_once(";visibility_receipts=")
         .unwrap_or((rest, "<legacy-absent>"));
@@ -88,6 +109,7 @@ pub(super) fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         telemetry,
         display_timezone,
         visibility_receipts,
+        node_channel,
         backends,
         pack_backends,
         sqlite_disk_guard,
@@ -165,6 +187,7 @@ pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
         && client.telemetry == daemon.telemetry
         && client.display_timezone == daemon.display_timezone
         && client.visibility_receipts == daemon.visibility_receipts
+        && client.node_channel == daemon.node_channel
         && client.backends == daemon.backends
         && client.pack_backends == daemon.pack_backends
         && client.sqlite_disk_guard == daemon.sqlite_disk_guard
@@ -213,6 +236,8 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "display_tz"
     } else if client.visibility_receipts != daemon.visibility_receipts {
         "visibility_receipts"
+    } else if client.node_channel != daemon.node_channel {
+        "node_channel"
     } else if client.backends != daemon.backends {
         "backends"
     } else if client.pack_backends != daemon.pack_backends {

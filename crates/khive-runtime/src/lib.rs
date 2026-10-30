@@ -68,6 +68,9 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
+pub mod node_config;
+#[cfg(test)]
+mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;

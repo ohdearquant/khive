@@ -325,6 +325,8 @@ pub struct RuntimeConfig {
     pub credentials: Vec<crate::credentials::CredentialConfig>,
     /// Configured receipt key ring. Absence never generates a replacement key.
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
+    /// Enabled `[channel.node]` table. `None` when the table is absent or disabled.
+    pub node_channel: Option<crate::node_config::NodeChannelConfig>,
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -580,6 +582,7 @@ impl Default for RuntimeConfig {
             maintenance_concurrency: DEFAULT_MAINTENANCE_CONCURRENCY,
             credentials: Vec::new(),
             visibility_receipts: None,
+            node_channel: None,
             db_path,
             code_map_root: None,
             code_maps: Vec::new(),
@@ -1039,6 +1042,7 @@ pub fn runtime_config_from_khive_config(
     let mounts = khive_cfg.mounts.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
+    let node_channel = khive_cfg.channel.node.clone().filter(|node| node.enabled);
     let code_map_root = khive_cfg.code_map_root.clone();
     let code_maps = khive_cfg.code_maps.clone();
     let code_map_protected_database_paths = khive_cfg
@@ -1173,6 +1177,7 @@ pub fn runtime_config_from_khive_config(
         return RuntimeConfig {
             credentials,
             visibility_receipts,
+            node_channel,
             default_namespace,
             brain_profile,
             visible_namespaces,
@@ -1210,6 +1215,7 @@ pub fn runtime_config_from_khive_config(
     RuntimeConfig {
         credentials,
         visibility_receipts,
+        node_channel,
         engines: Some(engines),
         embedding_model,
         additional_embedding_models: additional,
