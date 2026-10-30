@@ -559,9 +559,8 @@ pub(super) async fn run_exec_inline(
     .await;
 }
 
-/// Bound on how long [`settle_exec_storage_before_return`] waits for one
-/// writer-task join. Matches the bound the settle-contract test at
-/// `khive-mcp/src/serve.rs` asserts on the identical join.
+/// Shared wait budget for recall producers and writer-task joins. Audit
+/// shutdown is awaited to completion; its elapsed time consumes this budget.
 const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Settle a short-lived exec invocation's storage before its
@@ -612,43 +611,89 @@ const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// closing last on this database (a pool's own writer connection and its
 /// writer task's standalone connection) are both writable; neither is ever
 /// a read-only reader, so the last real closer can always take the
-/// EXCLUSIVE lock SQLite needs to checkpoint.
+/// EXCLUSIVE lock SQLite needs to checkpoint when the writer joins settle.
+/// A deadline expiry is advisory and does not guarantee that a writer has
+/// completed. Audit shutdown is awaited without a deadline, so total elapsed
+/// time can exceed the shared recall/writer wait budget.
 async fn settle_exec_storage_before_return(server: KhiveMcpServer) {
-    super::recall_drain::wait_for_pending(EXEC_STORAGE_SETTLE_TIMEOUT).await;
-    if let Err(reason) = server.shutdown_audit_batch().await {
+    let deadline = tokio::time::Instant::now() + EXEC_STORAGE_SETTLE_TIMEOUT;
+    let recall = super::recall_drain::wait_for_pending(EXEC_STORAGE_SETTLE_TIMEOUT);
+    let audit_and_joins = async move {
+        if let Err(reason) = server.shutdown_audit_batch().await {
+            tracing::warn!(
+                target: "kkernel::exec",
+                reason = ?reason,
+                "exec: audit-batch drain did not complete cleanly before storage settle"
+            );
+        }
+
+        let mut writer_task_joins = Vec::new();
+        if let Some(pool) = server.pool() {
+            if let Some(join) = pool.take_writer_task_join() {
+                writer_task_joins.push(join);
+            }
+        }
+        for pool in server.secondary_pools() {
+            if let Some(join) = pool.take_writer_task_join() {
+                writer_task_joins.push(join);
+            }
+        }
+        drop(server);
+        writer_task_joins
+    };
+
+    settle_exec_stages(deadline, recall, audit_and_joins).await;
+}
+
+// Audit is deliberately not timed out: cancellation of accepted audit work is
+// not known to preserve its durability. Its elapsed time still reduces the
+// shared recall/writer budget, and it can make the total settle exceed it.
+async fn settle_exec_stages<R, A, W, E>(deadline: tokio::time::Instant, recall: R, audit: A)
+where
+    R: std::future::Future<Output = ()>,
+    A: std::future::Future<Output = Vec<W>>,
+    W: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    if tokio::time::Instant::now() >= deadline {
         tracing::warn!(
             target: "kkernel::exec",
-            reason = ?reason,
-            "exec: audit-batch drain did not complete cleanly before storage settle"
+            stage = "recall",
+            "exec: settle stage skipped because the shared deadline elapsed"
+        );
+    } else if tokio::time::timeout_at(deadline, recall).await.is_err() {
+        tracing::warn!(
+            target: "kkernel::exec",
+            stage = "recall",
+            "exec: settle stage did not finish before the shared deadline"
         );
     }
 
-    let mut writer_task_joins = Vec::new();
-    if let Some(pool) = server.pool() {
-        if let Some(join) = pool.take_writer_task_join() {
-            writer_task_joins.push(join);
+    let writer_task_joins = audit.await;
+    for (index, join) in writer_task_joins.into_iter().enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "kkernel::exec",
+                stage = "writer",
+                writer_index = index,
+                "exec: settle stage skipped because the shared deadline elapsed"
+            );
+            continue;
         }
-    }
-    for pool in server.secondary_pools() {
-        if let Some(join) = pool.take_writer_task_join() {
-            writer_task_joins.push(join);
-        }
-    }
-
-    drop(server);
-
-    for join in writer_task_joins {
-        match tokio::time::timeout(EXEC_STORAGE_SETTLE_TIMEOUT, join).await {
+        match tokio::time::timeout_at(deadline, join).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(
                 target: "kkernel::exec",
+                stage = "writer",
+                writer_index = index,
                 %error,
                 "exec: a writer task panicked while settling storage before return"
             ),
             Err(_) => tracing::warn!(
                 target: "kkernel::exec",
-                timeout = ?EXEC_STORAGE_SETTLE_TIMEOUT,
-                "exec: a writer task did not settle before returning"
+                stage = "writer",
+                writer_index = index,
+                "exec: settle stage did not finish before the shared deadline"
             ),
         }
     }
@@ -1180,4 +1225,215 @@ pub(super) async fn run_exec_ops_file(
     // invocation, the process) returns, regardless of dispatch outcome.
     settle_exec_storage_before_return(server).await;
     dispatch_result
+}
+
+#[cfg(test)]
+mod settle_exec_stages_tests {
+    use std::future::poll_fn;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::task::Poll;
+    use std::time::Duration;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    use super::settle_exec_stages;
+
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<Warning>>>);
+
+    #[derive(Debug, Default)]
+    struct Warning {
+        stage: String,
+        writer_index: Option<u64>,
+        message: String,
+    }
+
+    impl Visit for Warning {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "stage" {
+                self.stage = value.to_owned();
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "writer_index" {
+                self.writer_index = Some(value);
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    impl Subscriber for Warnings {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() == &tracing::Level::WARN && metadata.target() == "kkernel::exec"
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut warning = Warning::default();
+            event.record(&mut warning);
+            self.0.lock().unwrap().push(warning);
+        }
+    }
+
+    fn blocked_writer(
+        entered: Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), &'static str>> {
+        poll_fn(move |_| {
+            entered.store(true, Ordering::SeqCst);
+            Poll::<Result<(), &'static str>>::Pending
+        })
+    }
+
+    // Expected red control: resetting the timeout for the writer after recall
+    // would poll the blocked writer and extend the elapsed time past the margin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recall_exhausts_budget_and_writer_is_skipped() {
+        let recall_entered = Arc::new(AtomicBool::new(false));
+        let recall_flag = Arc::clone(&recall_entered);
+        let recall = poll_fn(move |_| {
+            recall_flag.store(true, Ordering::SeqCst);
+            Poll::<()>::Pending
+        });
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer_flag = Arc::clone(&writer_entered);
+        let writer = poll_fn(move |_| {
+            writer_flag.store(true, Ordering::SeqCst);
+            Poll::<Result<(), &'static str>>::Pending
+        });
+        let audit_completed = Arc::new(AtomicBool::new(false));
+        let audit_flag = Arc::clone(&audit_completed);
+        let audit = async move {
+            audit_flag.store(true, Ordering::SeqCst);
+            vec![writer]
+        };
+        let budget = Duration::from_secs(2);
+        let margin = Duration::from_secs(1);
+        let start = tokio::time::Instant::now();
+        settle_exec_stages(start + budget, recall, audit).await;
+        assert!(recall_entered.load(Ordering::SeqCst));
+        assert!(audit_completed.load(Ordering::SeqCst));
+        assert!(!writer_entered.load(Ordering::SeqCst));
+        assert!(start.elapsed() >= budget);
+        assert!(start.elapsed() < budget + margin);
+    }
+
+    // Expected red control: resetting the writer timeout after a slow recall
+    // takes about 6.5 seconds, beyond the shared 4-second budget plus 1.5-second
+    // margin. The wall-clock margin remains sensitive to an overloaded host.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recall_and_writer_both_consume_the_shared_budget() {
+        let recall_entered = Arc::new(AtomicBool::new(false));
+        let recall_flag = Arc::clone(&recall_entered);
+        let recall = async move {
+            recall_flag.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+        };
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer = blocked_writer(Arc::clone(&writer_entered));
+        let budget = Duration::from_secs(4);
+        let margin = Duration::from_millis(1500);
+        let start = tokio::time::Instant::now();
+        settle_exec_stages(start + budget, recall, async { vec![writer] }).await;
+        assert!(recall_entered.load(Ordering::SeqCst));
+        assert!(writer_entered.load(Ordering::SeqCst));
+        assert!(start.elapsed() >= budget);
+        assert!(start.elapsed() < budget + margin);
+    }
+
+    // Expected red control: removing a warning or awaiting a skipped future
+    // breaks the exact stage/index and polling assertions below.
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_stages_warn_once_and_are_not_polled() {
+        let warnings = Warnings::default();
+        let captured = Arc::clone(&warnings.0);
+        let _subscriber = tracing::subscriber::set_default(warnings);
+        let recall_entered = Arc::new(AtomicBool::new(false));
+        let recall_flag = Arc::clone(&recall_entered);
+        let recall = poll_fn(move |_| {
+            recall_flag.store(true, Ordering::SeqCst);
+            Poll::<()>::Pending
+        });
+        let first_entered = Arc::new(AtomicBool::new(false));
+        let second_entered = Arc::new(AtomicBool::new(false));
+        let first = blocked_writer(Arc::clone(&first_entered));
+        let second = blocked_writer(Arc::clone(&second_entered));
+        settle_exec_stages(
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            recall,
+            async { vec![first, second] },
+        )
+        .await;
+        assert!(!recall_entered.load(Ordering::SeqCst));
+        assert!(!first_entered.load(Ordering::SeqCst));
+        assert!(!second_entered.load(Ordering::SeqCst));
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0].stage, "recall");
+        assert_eq!(captured[0].writer_index, None);
+        assert!(captured[0].message.contains("skipped"));
+        for (warning, index) in captured[1..].iter().zip([0, 1]) {
+            assert_eq!(warning.stage, "writer");
+            assert_eq!(warning.writer_index, Some(index));
+            assert!(warning.message.contains("skipped"));
+        }
+    }
+
+    // Positive control: one blocked writer receives the entire remaining budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_stalled_writer_uses_its_remaining_budget() {
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer_flag = Arc::clone(&writer_entered);
+        let writer = poll_fn(move |_| {
+            writer_flag.store(true, Ordering::SeqCst);
+            Poll::<Result<(), &'static str>>::Pending
+        });
+        let budget = Duration::from_secs(2);
+        let margin = Duration::from_secs(1);
+        let start = tokio::time::Instant::now();
+        settle_exec_stages(start + budget, async {}, async { vec![writer] }).await;
+        assert!(writer_entered.load(Ordering::SeqCst));
+        assert!(start.elapsed() >= budget);
+        assert!(start.elapsed() < budget + margin);
+    }
+
+    // Expected red control: timing out or skipping audit would leave its flag
+    // unset; starting the writer after expiry would set the writer flag.
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_finishes_even_after_the_deadline() {
+        let audit_completed = Arc::new(AtomicBool::new(false));
+        let audit_flag = Arc::clone(&audit_completed);
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer_flag = Arc::clone(&writer_entered);
+        let writer = poll_fn(move |_| {
+            writer_flag.store(true, Ordering::SeqCst);
+            Poll::<Result<(), &'static str>>::Pending
+        });
+        let start = tokio::time::Instant::now();
+        let audit = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            audit_flag.store(true, Ordering::SeqCst);
+            vec![writer]
+        };
+        settle_exec_stages(start + Duration::from_millis(100), async {}, audit).await;
+        assert!(audit_completed.load(Ordering::SeqCst));
+        assert!(!writer_entered.load(Ordering::SeqCst));
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
 }
