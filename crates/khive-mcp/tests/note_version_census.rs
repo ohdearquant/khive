@@ -821,7 +821,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         MESSAGE,
-        "create_keyed_message_pair_with_attachments",
+        "create_keyed_message_pair_with_extra_statements",
         "note_insert_if_absent_statement",
         MarkerDisposition::FixedNonMemoryKind,
     ),
@@ -1046,7 +1046,7 @@ fn census() -> BTreeMap<(String, String), String> {
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
-        (MESSAGE, "create_keyed_message_pair_with_attachments"),
+        (MESSAGE, "create_keyed_message_pair_with_extra_statements"),
         // Guarded partial properties advance through the note version trigger.
         (GUARDED_PATCH, "note_patch_properties_statement"),
         // This feature can compile outside tests; keep its zero-row writer visible.
@@ -1204,7 +1204,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         // outbound note, so the fixture is a keyless message row.
         (
             MESSAGE,
-            "create_keyed_message_pair_with_attachments",
+            "create_keyed_message_pair_with_extra_statements",
             "message",
             "{}",
         ),
