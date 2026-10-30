@@ -78,6 +78,34 @@ impl Pack for KgPack {
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
         "resource",
     ];
+    // ADR-086 Amendment 1, Decision 1.
+    const ENTITY_TYPES: &'static [khive_types::EntityTypeDef] = &[
+        khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "note",
+            aliases: &[],
+        },
+        khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "summary",
+            aliases: &[],
+        },
+        khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "handoff",
+            aliases: &[],
+        },
+        khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "transcript",
+            aliases: &[],
+        },
+        khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "other",
+            aliases: &[],
+        },
+    ];
     const HANDLERS: &'static [HandlerDef] = &KG_HANDLERS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &KG_EDGE_RULES;
 }

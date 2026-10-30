@@ -2148,6 +2148,20 @@ fn inspect_pool_interruptibly(
     pool.inspect_diagnostic_connection_interruptibly(scope, collect_size_composition)
 }
 
+#[cfg(test)]
+struct DiagnosticConnectionDropWitness(
+    Option<Arc<crate::read_cancellation::DiagnosticGraphTestProbe>>,
+);
+
+#[cfg(test)]
+impl Drop for DiagnosticConnectionDropWitness {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.connection_dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub(crate) fn inspect_open_connection_interruptibly(
     pool: &ConnectionPool,
     opened: Result<rusqlite::Connection, crate::error::SqliteError>,
@@ -2155,6 +2169,9 @@ pub(crate) fn inspect_open_connection_interruptibly(
     collect_size_composition: bool,
 ) -> StorageResult<PoolInspection> {
     scope.ensure_active()?;
+    // Declared before `conn`, so this witness runs after the connection drops.
+    #[cfg(test)]
+    let _connection_witness = DiagnosticConnectionDropWitness(scope.diagnostic_graph_probe());
     let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
@@ -2211,8 +2228,20 @@ pub(crate) fn inspect_open_connection_interruptibly(
     // keep each query's ordinary SQLite result nested inside one guarded
     // execution while allowing the outer cancellation cause to remain typed.
     let (integrity, pages, fts_segments) = scope.run(&conn, || {
+        #[cfg(test)]
+        let graph_probe = scope.diagnostic_graph_probe();
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(true, Ordering::Release);
+        }
+        let integrity = graph_edge_integrity(&conn);
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(false, Ordering::Release);
+            probe.graph_returned.store(true, Ordering::Release);
+        }
         Ok((
-            graph_edge_integrity(&conn),
+            integrity,
             size_composition::collect(&conn, collect_size_composition),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))

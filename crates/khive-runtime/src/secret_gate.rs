@@ -541,6 +541,8 @@ pub enum RedactionSurface {
     GitIngest,
     /// Session mirroring stores only masked `text` and `raw` projections.
     SessionMirror,
+    /// Workspace mirroring stores masked document descriptions.
+    WorkspaceMirror,
     /// MCP diagnostics are bounded caller-visible transport data, not records.
     McpDiagnostic,
     /// The kg `scan` verb's masked preview: caller-visible, never stored.
@@ -580,11 +582,17 @@ pub const SESSION_MIRROR_STORED_TARGET: &str =
     "session_messages.text, session_messages.raw, sessions.cwd, sessions.git_branch, \
      and sessions.slug";
 
+/// Final stored target for [`RedactionSurface::WorkspaceMirror`] — see
+/// [`redaction_surface_contract`]. The mirror passes masked text into the
+/// document entity's `description`; source URI, type, and checksum are separate.
+pub const WORKSPACE_MIRROR_STORED_TARGET: &str = "workspace mirror document.description";
+
 /// Return the closed contract for a named redact-not-block surface.
 pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
     let final_stored_target = match surface {
         RedactionSurface::GitIngest => Some(GIT_INGEST_STORED_TARGET),
         RedactionSurface::SessionMirror => Some(SESSION_MIRROR_STORED_TARGET),
+        RedactionSurface::WorkspaceMirror => Some(WORKSPACE_MIRROR_STORED_TARGET),
         RedactionSurface::McpDiagnostic | RedactionSurface::GateProbe => None,
     };
 

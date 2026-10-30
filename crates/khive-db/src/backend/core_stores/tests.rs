@@ -802,7 +802,7 @@ fn every_live_core_trait_method_has_an_explicit_matching_backend_override() {
         total += expected.len();
     }
     assert_eq!(
-        total, 95,
+        total, 96,
         "review every new core method and update the bound inventory"
     );
 }

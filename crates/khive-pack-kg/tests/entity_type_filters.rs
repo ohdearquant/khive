@@ -439,3 +439,149 @@ async fn list_alias_groups_do_not_cross_kind_when_legacy_spellings_overlap() {
         assert_eq!(filtered_ids(&registry, "list", None, raw).await, expected);
     }
 }
+
+#[tokio::test]
+async fn kg_document_subtypes_create_and_search_through_registry() {
+    let registry = registry(false);
+    let expected_types = ["note", "summary", "handoff", "transcript", "other"];
+
+    for entity_type in expected_types {
+        let created = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "document",
+                    "name": format!("EntityFilterWitness KG document {entity_type}"),
+                    "entity_type": entity_type,
+                    "skip_dedup_check": true,
+                }),
+            )
+            .await;
+        assert!(
+            created.is_ok(),
+            "KG document subtype {entity_type:?} must be accepted through create: {created:?}"
+        );
+        let created = created.expect("accepted document subtype");
+        let id = created["id"].as_str().expect("created document id");
+        assert_eq!(
+            filtered_ids(&registry, "search", Some("document"), entity_type).await,
+            vec![id.to_string()],
+            "KG document subtype {entity_type:?} must remain searchable"
+        );
+    }
+
+    let declarations = <KgPack as Pack>::ENTITY_TYPES;
+    let mut declared_types = declarations
+        .iter()
+        .map(|definition| definition.type_name)
+        .collect::<Vec<_>>();
+    declared_types.sort_unstable();
+    let mut expected_types = expected_types.to_vec();
+    expected_types.sort_unstable();
+    assert_eq!(
+        declared_types, expected_types,
+        "KG must declare exactly the five accepted document subtype tokens"
+    );
+    assert!(declarations
+        .iter()
+        .all(|definition| definition.kind == EntityKind::Document));
+    assert!(declarations
+        .iter()
+        .all(|definition| definition.aliases.is_empty()));
+}
+
+#[tokio::test]
+async fn kg_document_subtypes_compose_with_builtin_and_loaded_types() {
+    let loaded = registry(true);
+    for entity_type in ["handoff", "paper", "spec", "report", "filter_report"] {
+        let id = create_typed_entity(&loaded, "document", entity_type).await;
+        for verb in ["list", "search"] {
+            assert_eq!(
+                filtered_ids(&loaded, verb, Some("document"), entity_type).await,
+                vec![id.clone()],
+                "{verb}: subtype {entity_type:?} must compose with KG document subtypes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn kg_document_subtypes_preserve_omitted_and_unknown_validation() {
+    let registry = registry(false);
+    let created = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "name": "KGDocumentSubtypeOmissionWitness",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("document creation must accept an omitted entity_type");
+    let id = created["id"].as_str().expect("created document id");
+    let row = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("read document created without entity_type");
+    let row_object = row
+        .as_object()
+        .expect("get returns a top-level entity object");
+    assert_eq!(
+        row_object.get("id").and_then(Value::as_str),
+        Some(id),
+        "get must return the created document id"
+    );
+    assert_eq!(
+        row_object.get("kind").and_then(Value::as_str),
+        Some("document"),
+        "get must identify the created document kind"
+    );
+    assert_eq!(
+        row_object.get("entity_type"),
+        Some(&Value::Null),
+        "an omitted document subtype must be present as JSON null"
+    );
+    let found = registry
+        .dispatch(
+            "search",
+            json!({
+                "kind": "document",
+                "query": "KGDocumentSubtypeOmissionWitness",
+                "source": "text",
+                "limit": 50,
+            }),
+        )
+        .await
+        .expect("search must accept an omitted document entity_type");
+    assert!(
+        found
+            .as_array()
+            .expect("raw entity search array")
+            .iter()
+            .any(|hit| hit["id"].as_str() == Some(id)),
+        "a document with omitted entity_type must remain searchable"
+    );
+
+    for (verb, params) in [
+        (
+            "create",
+            json!({
+                "kind": "document",
+                "name": "EntityFilterWitness refused memo",
+                "entity_type": "memo",
+                "skip_dedup_check": true,
+            }),
+        ),
+        ("search", filter_params("search", Some("document"), "memo")),
+    ] {
+        let error = registry
+            .dispatch(verb, params)
+            .await
+            .expect_err("an unknown document subtype must still be refused");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)));
+        let message = error.to_string();
+        assert!(message.contains("unknown entity_type"), "{verb}: {message}");
+        assert!(message.contains("memo"), "{verb}: {message}");
+    }
+}
