@@ -10,6 +10,7 @@ pub mod submit;
 
 pub mod encoding;
 pub mod envelope;
+pub mod keychain;
 pub mod keys;
 pub mod plaintext;
 pub mod receipt;
