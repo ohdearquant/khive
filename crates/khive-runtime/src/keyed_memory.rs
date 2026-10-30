@@ -273,6 +273,7 @@ pub async fn create_keyed_memory_with_receipt_and_report(
     crate::retrieval::EmbeddingTruncationReport,
 )> {
     validate_memory_key(spec.key)?;
+    crate::secret_gate::check_at(spec.key, "note", "key")?;
     if spec.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "content must not be empty".into(),
