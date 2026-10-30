@@ -25,6 +25,20 @@ pub enum TransportStatus {
     Unknown,
 }
 
+/// Build the sender transport INSERT for a first envelope as one statement, so the caller can
+/// commit it in the same atomic unit as the outbound note. Namespace and sender assurance are
+/// normalized exactly as [`KhiveRuntime::create_sender_transport`] does: the namespace comes from
+/// the token and assurance stays claimed. The envelope's `outbound_note_id` must already name the
+/// note the statement is committed beside.
+pub fn sender_transport_insert_statement(
+    token: &NamespaceToken,
+    mut envelope: SenderEnvelope,
+) -> RuntimeResult<khive_storage::SqlStatement> {
+    envelope.namespace = token.namespace().as_str().to_owned();
+    envelope.sender_assurance = SenderAssurance::Claimed;
+    Ok(khive_db::stores::note::transport::sender_envelope_insert_statement(&envelope)?)
+}
+
 impl KhiveRuntime {
     fn sender_transport_store(&self) -> SenderTransportStore {
         SenderTransportStore::new(self.backend().pool_arc())

@@ -1,7 +1,7 @@
 //! Durable sender-side records. No transport adapter performs SQL.
 use super::{map_err, SqlNoteStore};
 use crate::pool::ConnectionPool;
-use khive_storage::{StorageCapability, StorageError, StorageResult};
+use khive_storage::{SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -237,6 +237,46 @@ fn read_optional_unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Re
 fn sql_integer(value: u64) -> StorageResult<i64> {
     i64::try_from(value)
         .map_err(|_| invalid("unsigned transport value exceeds SQLite integer range"))
+}
+/// Label carried by the statement from [`sender_envelope_insert_statement`] so a failure in a
+/// shared atomic unit can be traced to the transport row.
+pub const SENDER_TRANSPORT_INSERT_LABEL: &str = "sender-transport-insert";
+
+/// Build the INSERT for the first envelope of a logical message as one parameterized statement,
+/// so a caller can commit it in the same transaction as the outbound note it belongs to.
+///
+/// The envelope is validated here. The row is always the first envelope (`envelope_seq` 1); a
+/// key-change re-encryption still goes through [`SenderTransportStore::create`]. Params follow
+/// the order of `comm-sender-envelope-insert.sql`.
+pub fn sender_envelope_insert_statement(envelope: &SenderEnvelope) -> StorageResult<SqlStatement> {
+    envelope.validate()?;
+    let now = chrono::Utc::now().timestamp_micros();
+    Ok(SqlStatement::new(
+        INSERT_SQL,
+        vec![
+            SqlValue::Text(envelope.namespace.clone()),
+            SqlValue::Text(envelope.logical_message_id.to_string()),
+            SqlValue::Text(envelope.outbound_note_id.to_string()),
+            SqlValue::Text(envelope.kind.clone()),
+            SqlValue::Text(envelope.slug.clone()),
+            SqlValue::Text(envelope.credential_ref.clone()),
+            SqlValue::Text(envelope.recipient_address.clone()),
+            SqlValue::Integer(i64::from(envelope.protocol_version)),
+            SqlValue::Text(envelope.sender_agent_id.clone()),
+            SqlValue::Text(envelope.recipient_agent_id.clone()),
+            SqlValue::Text(envelope.recipient_device_id.to_string()),
+            SqlValue::Integer(sql_integer(envelope.recipient_key_epoch)?),
+            SqlValue::Integer(sql_integer(envelope.contact_generation)?),
+            SqlValue::Integer(sql_integer(envelope.sender_key_epoch)?),
+            SqlValue::Text(envelope.recipient_key_fingerprint.clone()),
+            SqlValue::Blob(envelope.enc.clone()),
+            SqlValue::Blob(envelope.ciphertext.clone()),
+            SqlValue::Integer(now),
+            SqlValue::Integer(1),
+            SqlValue::Text(encode(&envelope.sender_assurance).to_string()),
+        ],
+    )
+    .labelled(SENDER_TRANSPORT_INSERT_LABEL))
 }
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderRecord> {
     Ok(SenderRecord {

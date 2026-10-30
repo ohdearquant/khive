@@ -37,6 +37,26 @@ pub async fn create_keyed_message_pair_with_attachments(
     physical_key: &str,
     attachments: &[khive_storage::NewAttachment],
 ) -> RuntimeResult<KeyedMessageWrite> {
+    create_keyed_message_pair_with_extra_statements(
+        runtime,
+        specs,
+        physical_key,
+        attachments,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Like [`create_keyed_message_pair_with_attachments`], and also commit `extra_statements` in the
+/// same unit, after the attachments and before the final key claim. A competing pair that loses
+/// the key claim rolls the extra rows back with the notes.
+pub async fn create_keyed_message_pair_with_extra_statements(
+    runtime: &KhiveRuntime,
+    specs: [AtomicNoteSpec<'_>; 2],
+    physical_key: &str,
+    attachments: &[khive_storage::NewAttachment],
+    extra_statements: Vec<SqlStatement>,
+) -> RuntimeResult<KeyedMessageWrite> {
     crate::atomic_message::validate_note_attachments(runtime, attachments)?;
     let namespace = specs[0].token.namespace().as_str().to_owned();
     if specs.iter().any(|spec| spec.kind != "message")
@@ -53,6 +73,8 @@ pub async fn create_keyed_message_pair_with_attachments(
     let mut prepared =
         prepare_atomic_notes(runtime, specs.into(), AtomicNoteOptions::default()).await?;
     crate::atomic_message::append_note_attachments(&mut prepared, attachments)?;
+    // The key claim pushed below stays the last statement of the unit.
+    crate::atomic_message::append_extra_statements(&mut prepared, extra_statements)?;
     for note in &prepared.notes {
         crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
     }
