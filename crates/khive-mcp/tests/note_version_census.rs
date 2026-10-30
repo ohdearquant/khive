@@ -1027,6 +1027,9 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_set_property_statement"),
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
+        // Key assignment sets only the key of a live keyless note; the version
+        // trigger advances it once.
+        (DB, "note_assign_key_statement"),
         (MIGRATIONS, "migrate_outbound_due_key"),
         (RECEIPTS, "claim_pending_event_inner"),
         (RECEIPTS, "mark_dispatch_invoking"),

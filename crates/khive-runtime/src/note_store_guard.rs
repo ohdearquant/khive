@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use khive_storage::note::NotePropertyPatch;
+use khive_storage::note::{validate_note_key_for_store, NoteKeyAssignOutcome, NotePropertyPatch};
 use khive_storage::{
     BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, NoteVisibility, Page,
     PageRequest, SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
@@ -319,6 +319,23 @@ impl PolicyEnforcingNoteStore {
 
 #[async_trait]
 impl NoteStore for PolicyEnforcingNoteStore {
+    async fn assign_note_key_if_unset(
+        &self,
+        id: Uuid,
+        key: &str,
+        namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        validate_note_key_for_store(key, "assign_note_key_if_unset")?;
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("assign_note_key_if_unset"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "assign_note_key_if_unset")?;
+        self.inner
+            .assign_note_key_if_unset(id, key, namespace)
+            .await
+    }
+
     async fn get_live_notes_by_key(
         &self,
         namespace: &str,

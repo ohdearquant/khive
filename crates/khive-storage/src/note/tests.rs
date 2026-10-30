@@ -127,6 +127,22 @@ impl DefaultOnlyNoteStore {
     }
 }
 
+#[tokio::test]
+async fn default_key_assignment_refuses_instead_of_emulating_a_write() {
+    let store = DefaultOnlyNoteStore::default();
+    let result = store
+        .assign_note_key_if_unset(Uuid::new_v4(), "key", "local")
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::StorageError::Unsupported { .. })
+    ));
+    assert_eq!(
+        store.record_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
 fn unsupported<T>(operation: &'static str) -> StorageResult<T> {
     Err(crate::StorageError::Unsupported {
         capability: crate::StorageCapability::Notes,
@@ -365,4 +381,12 @@ async fn bounded_snapshot_count_default_is_fail_closed_without_query_fallback() 
         0,
         "bounded snapshot count must not compose independent page queries"
     );
+}
+
+#[test]
+fn key_limit_counts_utf8_bytes_and_rejects_nul() {
+    assert!(note_key_is_valid(""));
+    assert!(note_key_is_valid(&"é".repeat(256)));
+    assert!(!note_key_is_valid(&"a".repeat(513)));
+    assert!(!note_key_is_valid("before\0after"));
 }
