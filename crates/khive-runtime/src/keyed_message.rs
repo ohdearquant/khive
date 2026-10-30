@@ -1,4 +1,7 @@
-//! A message pair publishes its outbound identity in the final atomic statement.
+//! A message pair claims its caller key before any extra statement of the unit runs.
+//!
+//! The claim decides a duplicate-key race, so a competing pair loses at the claim and replays the
+//! existing holder instead of failing at a later row.
 
 use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::{Details, KhiveError};
@@ -30,7 +33,7 @@ pub async fn create_keyed_message_pair(
     create_keyed_message_pair_with_attachments(runtime, specs, physical_key, &[]).await
 }
 
-/// Include every copy's attachments before the final key claim in the same unit.
+/// Include every copy's attachments in the same unit, ahead of the key claim.
 pub async fn create_keyed_message_pair_with_attachments(
     runtime: &KhiveRuntime,
     specs: [AtomicNoteSpec<'_>; 2],
@@ -48,8 +51,10 @@ pub async fn create_keyed_message_pair_with_attachments(
 }
 
 /// Like [`create_keyed_message_pair_with_attachments`], and also commit `extra_statements` in the
-/// same unit, after the attachments and before the final key claim. A competing pair that loses
-/// the key claim rolls the extra rows back with the notes.
+/// same unit, after the attachments and after the key claim. The claim is the only statement that
+/// decides a duplicate-key race: a competing pair loses there, before any extra row is written,
+/// and the existing holder is returned. A winning pair commits the claim, the notes, the
+/// attachments and the extra rows together.
 pub async fn create_keyed_message_pair_with_extra_statements(
     runtime: &KhiveRuntime,
     specs: [AtomicNoteSpec<'_>; 2],
@@ -73,8 +78,6 @@ pub async fn create_keyed_message_pair_with_extra_statements(
     let mut prepared =
         prepare_atomic_notes(runtime, specs.into(), AtomicNoteOptions::default()).await?;
     crate::atomic_message::append_note_attachments(&mut prepared, attachments)?;
-    // The key claim pushed below stays the last statement of the unit.
-    crate::atomic_message::append_extra_statements(&mut prepared, extra_statements)?;
     for note in &prepared.notes {
         crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
     }
@@ -108,6 +111,11 @@ pub async fn create_keyed_message_pair_with_extra_statements(
         },
         guard: Some(AffectedRowGuard::exactly(1)),
     });
+    // The claim is the only statement that decides a duplicate-key race, so it runs before the
+    // extra statements. A competing pair then rolls back here and replays the existing holder;
+    // were an extra row (for example a transport row keyed by the same logical id) placed first,
+    // the loser would fail on that row and surface as an internal error instead of a replay.
+    crate::atomic_message::append_extra_statements(&mut prepared, extra_statements)?;
 
     match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
         Ok(AtomicRunOutcome::Committed { .. }) => {
