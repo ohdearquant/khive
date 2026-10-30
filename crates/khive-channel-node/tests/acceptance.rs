@@ -1,5 +1,5 @@
 //! Acceptance tests for four wire-protocol requirements (ADR-105 Appendix A), written against the
-//! public API before the fix. Each one fails on the current models and must pass after it.
+//! public API only.
 
 use khive_channel::ReceiptDisposition;
 use khive_channel_node::encoding::{CanonicalUuid, Epoch, ProtocolVersion};
