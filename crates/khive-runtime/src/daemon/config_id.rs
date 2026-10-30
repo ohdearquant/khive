@@ -15,7 +15,7 @@ pub(super) struct ConfigIdFields<'a> {
     pub(super) display_timezone: &'a str,
     visibility_receipts: &'a str,
     /// Digest of an enabled `[channel.node]` table; absent from ids that carry none.
-    node_channel: Option<&'a str>,
+    pub(super) node_channel: Option<&'a str>,
     backends: Option<&'a str>,
     pub(super) pack_backends: Option<&'a str>,
     /// Trailing writable-SQLite disk policy; absent from ids that carry none.
