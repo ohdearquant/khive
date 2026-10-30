@@ -112,6 +112,23 @@ dotenvy = "0.15"
 lattice-embed = "=0.15.0"
 lattice-inference = { version = "=0.15.0", default-features = false }
 lattice-fann = "=0.15.0"
+# Pinned exactly so the moodboard descriptor's lattice version names the code that computes it.
+lattice-arch = { version = "=0.15.0", default-features = false }
+lattice-compute = { version = "=0.15.0", default-features = false }
+lattice-forecast = { version = "=0.15.0", default-features = false }
+lattice-grammar = { version = "=0.15.0", default-features = false }
+lattice-inference-core = { version = "=0.15.0", default-features = false }
+lattice-lora = { version = "=0.15.0", default-features = false }
+lattice-model-bert = { version = "=0.15.0", default-features = false }
+lattice-model-embeddinggemma2 = { version = "=0.15.0", default-features = false }
+lattice-model-io = { version = "=0.15.0", default-features = false }
+lattice-model-qwen3-embedding = { version = "=0.15.0", default-features = false }
+lattice-model-qwen35 = { version = "=0.15.0", default-features = false }
+lattice-quant = { version = "=0.15.0", default-features = false }
+lattice-router = { version = "=0.15.0", default-features = false }
+lattice-simd = { version = "=0.15.0", default-features = false }
+lattice-tokenizer = { version = "=0.15.0", default-features = false }
+lattice-weights = { version = "=0.15.0", default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.10.3"
 toml = "0.8"
