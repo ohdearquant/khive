@@ -3,8 +3,8 @@ use super::*;
 use crate::adapter::{receipt_cursor_source, NodeChannel, NODE_RECEIPT_CURSOR_GENERATION};
 use chrono::{DateTime, Utc};
 use khive_channel::{
-    Channel, ChannelCheckpoint, ChannelEnvelope, ReceiptReadFailure, ReceiptRejectionReason,
-    SenderReceiptClaim, SenderReceiptResult, StoredChannelCheckpoint,
+    Channel, ChannelCheckpoint, ChannelEnvelope, DeliveryPage, ReceiptReadFailure,
+    ReceiptRejectionReason, SenderReceiptClaim, SenderReceiptResult, StoredChannelCheckpoint,
     LOGICAL_MESSAGE_ID_METADATA_KEY,
 };
 
@@ -621,4 +621,214 @@ async fn adapter_refuses_legacy_methods_and_invalid_message_metadata_before_http
         Err(ChannelError::Transport(_))
     ));
     assert!(server.requests().await.is_empty());
+}
+
+fn delivery_sealing(plaintext: &[u8]) -> Delivery {
+    let mut d = delivery();
+    let header = EnvelopeHeader {
+        protocol_version: d.protocol_version,
+        realm: binding(false).realm,
+        sender_agent_id: d.sender_agent_id,
+        sender_device_id: d.sender_device_id,
+        sender_key_epoch: d.sender_key_epoch,
+        recipient_agent_id: d.recipient_agent_id,
+        recipient_device_id: d.recipient_device_id,
+        recipient_key_epoch: d.recipient_key_epoch,
+    };
+    let sealed = facility(true)
+        .seal(
+            &header,
+            d.logical_message_id,
+            &facility(false).public_keys().kem,
+            plaintext,
+        )
+        .unwrap();
+    d.enc = sealed.enc;
+    d.ciphertext = sealed.ciphertext;
+    d
+}
+
+async fn recipient_page(deliveries: &[&str], pins: Arc<dyn PinSource>) -> DeliveryPage {
+    let server = ScriptedServer::start(vec![Reply::json(
+        200,
+        &poll_body_slices(deliveries, &[], 7, "2026-09-24T00:00:00Z"),
+    )])
+    .await
+    .unwrap();
+    let client = client(
+        &server,
+        false,
+        Arc::new(FixedSource(Ok(None))),
+        pins,
+        SpyFacility::new(false),
+    );
+    NodeChannel::new(client, PollWait::new(0).unwrap())
+        .poll_deliveries(since(), None)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn recipient_page_yields_an_opened_delivery_with_its_ticket() {
+    let delivery_json = serde_json::to_string(&delivery()).unwrap();
+    let page = recipient_page(&[delivery_json.as_str()], pins(true)).await;
+    assert_eq!(
+        page.page().envelopes.len(),
+        1,
+        "an opened delivery must reach the caller"
+    );
+    assert_eq!(page.tickets().len(), 1);
+    assert_eq!(page.receipts_cursor(), Some(7));
+    let envelope = &page.page().envelopes[0];
+    let plain: Value =
+        serde_json::from_slice(&decode_hex(&value("envelope", "plaintext")).unwrap()).unwrap();
+    assert_eq!(envelope.content, plain["body"].as_str().unwrap());
+    assert_eq!(envelope.subject.as_deref(), plain["subject"].as_str());
+    assert_eq!(
+        envelope.sent_at,
+        Some(
+            plain["sent_at"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        )
+    );
+    assert_eq!(envelope.correlation_external_id, None);
+    let (sender, recipient) = (binding(true), binding(false));
+    assert_eq!(
+        envelope.from,
+        format!("khive1:{}/{}", sender.realm.as_str(), sender.agent)
+    );
+    assert_eq!(
+        envelope.to,
+        format!("khive1:{}/{}", recipient.realm.as_str(), recipient.agent)
+    );
+    assert_eq!(
+        envelope.metadata.get(LOGICAL_MESSAGE_ID_METADATA_KEY),
+        Some(&logical().to_string())
+    );
+    assert!(!envelope
+        .metadata
+        .contains_key(crate::adapter::INVALID_PLAINTEXT_METADATA_KEY));
+    assert!(!envelope
+        .metadata
+        .contains_key(crate::adapter::MESSAGE_KIND_METADATA_KEY));
+    let replay = envelope.quarantine_replay.as_ref().unwrap();
+    assert_eq!(replay.bytes, delivery_json.as_bytes());
+    let ticket = page.tickets()[0]
+        .as_ref()
+        .expect("an opened delivery carries its ticket");
+    assert_eq!(ticket.binding(), &receipt().binding.to_channel());
+    assert_eq!(ticket.sender_key_epoch(), sender.key_epoch.get());
+}
+
+#[tokio::test]
+async fn invalid_plaintext_reaches_the_caller_as_a_quarantine_envelope() {
+    let delivery_json = serde_json::to_string(&delivery_sealing(b"[]")).unwrap();
+    let page = recipient_page(&[delivery_json.as_str()], pins(true)).await;
+    assert_eq!(page.page().envelopes.len(), 1);
+    let envelope = &page.page().envelopes[0];
+    assert_eq!(
+        envelope
+            .metadata
+            .get(crate::adapter::INVALID_PLAINTEXT_METADATA_KEY)
+            .map(String::as_str),
+        Some("not_object")
+    );
+    assert!(envelope.content.is_empty());
+    assert_eq!(envelope.subject, None);
+    assert_eq!(
+        envelope.quarantine_replay.as_ref().unwrap().bytes,
+        delivery_json.as_bytes()
+    );
+    assert!(page.tickets()[0].is_some());
+}
+
+#[tokio::test]
+async fn deliveries_that_do_not_open_yield_no_envelope_and_no_ticket() {
+    let valid = serde_json::to_string(&delivery()).unwrap();
+    let mut forged = delivery_sealing(b"{}");
+    forged.ciphertext = delivery().ciphertext;
+    let forged = serde_json::to_string(&forged).unwrap();
+    let unconfirmed: Arc<dyn PinSource> = Arc::new(FixedPins {
+        state: PinState::UnconfirmedEpoch { candidate: None },
+        unavailable: false,
+    });
+    let held = recipient_page(&[valid.as_str()], unconfirmed).await;
+    assert!(held.page().envelopes.is_empty());
+    assert!(held.tickets().is_empty());
+    // Control: under a confirmed pin the valid delivery opens; the forged one beside it does not.
+    let page = recipient_page(&[forged.as_str(), valid.as_str()], pins(true)).await;
+    assert_eq!(
+        page.page().envelopes.len(),
+        1,
+        "only the delivery that opened"
+    );
+    assert_eq!(page.tickets().len(), 1);
+    assert_eq!(
+        page.page().envelopes[0]
+            .quarantine_replay
+            .as_ref()
+            .unwrap()
+            .bytes,
+        valid.as_bytes()
+    );
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn refused_deliveries_are_logged_by_index_and_code_and_settle_nothing() {
+    let valid = serde_json::to_string(&delivery()).unwrap();
+    let mut unsupported = serde_json::to_value(delivery()).unwrap();
+    unsupported["protocol_version"] = serde_json::json!(2);
+    let ciphertext = unsupported["ciphertext"].as_str().unwrap().to_owned();
+    let unsupported = serde_json::to_string(&unsupported).unwrap();
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let page = {
+        let _default = tracing::subscriber::set_default(subscriber);
+        recipient_page(&[unsupported.as_str(), valid.as_str()], pins(true)).await
+    };
+    assert_eq!(
+        page.page().envelopes.len(),
+        1,
+        "only the delivery that parsed"
+    );
+    assert_eq!(page.tickets().len(), 1);
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("node poll delivery refused").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("index=0"), "{text}");
+    assert!(text.contains("code=UnsupportedVersion"), "{text}");
+    assert!(
+        !text.contains(&ciphertext),
+        "a refused item's bytes must not reach the log"
+    );
 }

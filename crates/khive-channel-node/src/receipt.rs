@@ -24,20 +24,24 @@ pub struct WireReceipt {
     pub disposition: ReceiptDisposition,
     pub signature: Base64Bytes<64>,
 }
+impl WireReceiptBinding {
+    pub fn to_channel(&self) -> DeliveryReceiptBinding {
+        DeliveryReceiptBinding {
+            protocol_version: self.protocol_version.get() as u32,
+            logical_message_id: self.logical_message_id.into_uuid(),
+            sender_agent_id: self.sender_agent_id.to_string(),
+            recipient_agent_id: self.recipient_agent_id.to_string(),
+            recipient_device_id: self.recipient_device_id.into_uuid(),
+            recipient_key_epoch: self.recipient_key_epoch.get(),
+            contact_generation: self.contact_generation.get(),
+            delivery_attempt_id: self.delivery_attempt_id.into_uuid(),
+        }
+    }
+}
 impl WireReceipt {
     pub fn to_channel(&self) -> DeliveryReceipt {
-        let b = &self.binding;
         DeliveryReceipt {
-            binding: DeliveryReceiptBinding {
-                protocol_version: b.protocol_version.get() as u32,
-                logical_message_id: b.logical_message_id.into_uuid(),
-                sender_agent_id: b.sender_agent_id.to_string(),
-                recipient_agent_id: b.recipient_agent_id.to_string(),
-                recipient_device_id: b.recipient_device_id.into_uuid(),
-                recipient_key_epoch: b.recipient_key_epoch.get(),
-                contact_generation: b.contact_generation.get(),
-                delivery_attempt_id: b.delivery_attempt_id.into_uuid(),
-            },
+            binding: self.binding.to_channel(),
             disposition: self.disposition,
             signature: self.signature.as_bytes().to_vec(),
         }

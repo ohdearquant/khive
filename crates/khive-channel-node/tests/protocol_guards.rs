@@ -1,4 +1,4 @@
-//! JSON protocol guard fixtures use only the original public API.
+//! JSON protocol guard fixtures use only the public API.
 use khive_channel::ReceiptDisposition;
 use khive_channel_node::encoding::{CanonicalUuid, Epoch, ProtocolVersion};
 use khive_channel_node::keys::{InMemoryKeyFacility, KeyFacility};

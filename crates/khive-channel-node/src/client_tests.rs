@@ -1860,11 +1860,11 @@ async fn poll_version_and_ciphertext_refusals_keep_later_delivery_and_cursor() {
     assert_eq!(requests[2].target, "/node/v1/poll?wait=0&receipts_after=41");
 }
 
-#[path = "client_r2_rejection_tests.rs"]
-mod r2_rejection_tests;
+#[path = "client_rejection_tests.rs"]
+mod rejection_tests;
 
-#[path = "client_r3_regression_tests.rs"]
-mod r3_regression_tests;
+#[path = "client_regression_tests.rs"]
+mod regression_tests;
 
 #[path = "adapter_tests.rs"]
 mod adapter_tests;
