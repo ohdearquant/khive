@@ -34,6 +34,7 @@ pub mod config_ledger;
 pub mod context;
 pub mod cost_unit;
 pub mod credentials;
+pub mod node_pins;
 mod visibility_receipts;
 pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
