@@ -109,9 +109,9 @@ iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.12.0"
-lattice-inference = { version = "=0.12.0", default-features = false }
-lattice-fann = "=0.12.0"
+lattice-embed = "=0.15.0"
+lattice-inference = { version = "=0.15.0", default-features = false }
+lattice-fann = "=0.15.0"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.10.3"
 toml = "0.8"
