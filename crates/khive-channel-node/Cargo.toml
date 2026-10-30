@@ -13,6 +13,14 @@ description = "Node wire protocol v1 cryptography, encodings, and HTTPS client"
 # Built from this workspace and vendored by path; not on the crates.io publish ladder yet.
 publish = false
 
+[features]
+# Durable device keys in the macOS login keychain (macOS only).
+macos-keychain = ["dep:security-framework", "dep:libc"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.7.0", optional = true }
+libc = { workspace = true, optional = true }
+
 [dependencies]
 khive-channel = { version = "0.15.0", path = "../khive-channel" }
 serde = { workspace = true }
