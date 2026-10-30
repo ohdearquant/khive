@@ -1,6 +1,7 @@
 //! SQL-backed `NoteStore` implementation.
 
 mod guarded_patch;
+pub mod node_pins;
 pub mod recipient;
 pub mod transport;
 
