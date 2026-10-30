@@ -388,8 +388,12 @@ const MEMORY_VISIBILITY_EPOCHS: &str = "memory_visibility_epochs";
 /// Authority epochs and records are grant state issued for the namespace they
 /// name. As with `tool_grants`, a row carried into a target would grant there
 /// what no administrator of the target issued, so both stay and are reported.
+/// Confirmed node pins are keys an operator confirmed for the namespace that
+/// holds them; carried into a target they would be trusted there without that
+/// confirmation, so they stay and are reported.
 const LEAVE_BEHIND_TABLES: &[&str] = &[
     "comm_sender_transport",
+    "comm_node_confirmed_pin",
     "sessions",
     "session_messages",
     "note_stream_floors",
