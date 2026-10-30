@@ -51,10 +51,10 @@ mod client_test_server;
 #[cfg(test)]
 mod client_tests;
 #[cfg(test)]
-mod docs_r3_tests;
+mod docs_tests;
 #[cfg(test)]
-mod plaintext_r3_tests;
+mod plaintext_tests;
 #[cfg(test)]
-mod timestamp_r3_tests;
+mod timestamp_tests;
 #[cfg(test)]
-mod wire_r3_tests;
+mod wire_tests;

@@ -454,8 +454,8 @@
           "line": 432
         },
         {
-          "test": "plaintext_r3_tests::reserved_identity_null_kind_and_duplicate_members_are_invalid",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::reserved_identity_null_kind_and_duplicate_members_are_invalid",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 13
         }
       ],
@@ -476,8 +476,8 @@
           "line": 432
         },
         {
-          "test": "plaintext_r3_tests::plaintext_required_nullable_fields_and_kind_values_are_preserved",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::plaintext_required_nullable_fields_and_kind_values_are_preserved",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 61
         }
       ],
@@ -493,8 +493,8 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "plaintext_r3_tests::plaintext_required_nullable_fields_and_kind_values_are_preserved",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::plaintext_required_nullable_fields_and_kind_values_are_preserved",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 61
         }
       ],
@@ -713,8 +713,8 @@
           "line": 505
         },
         {
-          "test": "wire_r3_tests::typed_wire_decode_preserves_version_and_size_refusal_classes",
-          "source": "crates/khive-channel-node/src/wire_r3_tests.rs",
+          "test": "wire_tests::typed_wire_decode_preserves_version_and_size_refusal_classes",
+          "source": "crates/khive-channel-node/src/wire_tests.rs",
           "line": 146
         }
       ],
@@ -900,13 +900,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "wire_r3_tests::malformed_poll_receipts_keep_indices_valid_later_signature_and_cursor",
-          "source": "crates/khive-channel-node/src/wire_r3_tests.rs",
+          "test": "wire_tests::malformed_poll_receipts_keep_indices_valid_later_signature_and_cursor",
+          "source": "crates/khive-channel-node/src/wire_tests.rs",
           "line": 49
         },
         {
-          "test": "wire_r3_tests::malformed_delivery_does_not_hide_receipts_or_cursor",
-          "source": "crates/khive-channel-node/src/wire_r3_tests.rs",
+          "test": "wire_tests::malformed_delivery_does_not_hide_receipts_or_cursor",
+          "source": "crates/khive-channel-node/src/wire_tests.rs",
           "line": 78
         }
       ],
@@ -922,13 +922,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_sent_at_numeric_offset_is_invalid",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_sent_at_numeric_offset_is_invalid",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 115
         },
         {
-          "test": "plaintext_r3_tests::plaintext_sent_at_uses_the_strict_utc_profile",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::plaintext_sent_at_uses_the_strict_utc_profile",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 98
         }
       ],
@@ -944,13 +944,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_sent_at_space_separator_is_invalid",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_sent_at_space_separator_is_invalid",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 120
         },
         {
-          "test": "plaintext_r3_tests::plaintext_sent_at_uses_the_strict_utc_profile",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::plaintext_sent_at_uses_the_strict_utc_profile",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 98
         }
       ],
@@ -966,13 +966,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_sent_at_unknown_offset_is_invalid",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_sent_at_unknown_offset_is_invalid",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 125
         },
         {
-          "test": "plaintext_r3_tests::plaintext_sent_at_uses_the_strict_utc_profile",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::plaintext_sent_at_uses_the_strict_utc_profile",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 98
         }
       ],
@@ -988,8 +988,8 @@
       "client_coverage": "full",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_server_numeric_offset_normalizes_to_utc",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_server_numeric_offset_normalizes_to_utc",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 130
         }
       ],
@@ -1006,18 +1006,18 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_identity_signing_key_is_refused_at_enrolment",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_identity_signing_key_is_refused_at_enrolment",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 184
         },
         {
-          "test": "docs_r3_tests::a11_identity_signing_key_is_refused_at_pin",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_identity_signing_key_is_refused_at_pin",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 189
         },
         {
-          "test": "keys::r3_tests::signing_key_refuses_canonical_identity_point",
-          "source": "crates/khive-channel-node/src/keys_r3_tests.rs",
+          "test": "keys::tests::signing_key_refuses_canonical_identity_point",
+          "source": "crates/khive-channel-node/src/keys_tests.rs",
           "line": 49
         }
       ],
@@ -1034,23 +1034,23 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_noncanonical_signing_keys_are_refused_at_enrolment",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_noncanonical_signing_keys_are_refused_at_enrolment",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 194
         },
         {
-          "test": "docs_r3_tests::a11_noncanonical_signing_keys_are_refused_at_pin",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_noncanonical_signing_keys_are_refused_at_pin",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 199
         },
         {
-          "test": "keys::r3_tests::signing_key_refuses_identity_with_sign_bit",
-          "source": "crates/khive-channel-node/src/keys_r3_tests.rs",
+          "test": "keys::tests::signing_key_refuses_identity_with_sign_bit",
+          "source": "crates/khive-channel-node/src/keys_tests.rs",
           "line": 58
         },
         {
-          "test": "keys::r3_tests::signing_key_refuses_y_equal_to_p_plus_one",
-          "source": "crates/khive-channel-node/src/keys_r3_tests.rs",
+          "test": "keys::tests::signing_key_refuses_y_equal_to_p_plus_one",
+          "source": "crates/khive-channel-node/src/keys_tests.rs",
           "line": 65
         }
       ],
@@ -1066,13 +1066,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_nested_duplicate_member_is_invalid",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_nested_duplicate_member_is_invalid",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 204
         },
         {
-          "test": "plaintext_r3_tests::nested_duplicate_extensions_stay_invalid_and_unique_extensions_stay_ignored",
-          "source": "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+          "test": "plaintext_tests::nested_duplicate_extensions_stay_invalid_and_unique_extensions_stay_ignored",
+          "source": "crates/khive-channel-node/src/plaintext_tests.rs",
           "line": 37
         }
       ],
@@ -1089,13 +1089,13 @@
       "client_coverage": "partial",
       "client_tests": [
         {
-          "test": "docs_r3_tests::a11_malformed_delivery_keeps_valid_items_and_cursor",
-          "source": "crates/khive-channel-node/src/docs_r3_tests.rs",
+          "test": "docs_tests::a11_malformed_delivery_keeps_valid_items_and_cursor",
+          "source": "crates/khive-channel-node/src/docs_tests.rs",
           "line": 227
         },
         {
-          "test": "wire_r3_tests::malformed_delivery_does_not_hide_receipts_or_cursor",
-          "source": "crates/khive-channel-node/src/wire_r3_tests.rs",
+          "test": "wire_tests::malformed_delivery_does_not_hide_receipts_or_cursor",
+          "source": "crates/khive-channel-node/src/wire_tests.rs",
           "line": 78
         }
       ],

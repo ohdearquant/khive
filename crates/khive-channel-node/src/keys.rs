@@ -334,5 +334,5 @@ impl RngCore for TestEphemeral {
 }
 
 #[cfg(test)]
-#[path = "keys_r3_tests.rs"]
-mod r3_tests;
+#[path = "keys_tests.rs"]
+mod tests;

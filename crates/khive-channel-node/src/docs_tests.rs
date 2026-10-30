@@ -291,20 +291,20 @@ fn a11_conformance_metadata_distinguishes_scope_and_source_coverage() {
             include_str!("vectors.rs"),
         ),
         (
-            "crates/khive-channel-node/src/docs_r3_tests.rs",
-            include_str!("docs_r3_tests.rs"),
+            "crates/khive-channel-node/src/docs_tests.rs",
+            include_str!("docs_tests.rs"),
         ),
         (
-            "crates/khive-channel-node/src/keys_r3_tests.rs",
-            include_str!("keys_r3_tests.rs"),
+            "crates/khive-channel-node/src/keys_tests.rs",
+            include_str!("keys_tests.rs"),
         ),
         (
-            "crates/khive-channel-node/src/plaintext_r3_tests.rs",
-            include_str!("plaintext_r3_tests.rs"),
+            "crates/khive-channel-node/src/plaintext_tests.rs",
+            include_str!("plaintext_tests.rs"),
         ),
         (
-            "crates/khive-channel-node/src/wire_r3_tests.rs",
-            include_str!("wire_r3_tests.rs"),
+            "crates/khive-channel-node/src/wire_tests.rs",
+            include_str!("wire_tests.rs"),
         ),
     ];
     for row in fixture["conformance_cases"].as_array().unwrap() {
