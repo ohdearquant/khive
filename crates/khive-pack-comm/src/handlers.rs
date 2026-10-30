@@ -116,11 +116,25 @@ use validation::{
 /// Caller-keyed sends reconcile through the atomic outbound claim and its
 /// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
+#[cfg(test)]
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
+) -> Result<Value, RuntimeError> {
+    handle_send_with_route(runtime, inbox_signal, token, params, None).await
+}
+
+/// `send` with an optional node route. A recipient in the node address form is sealed through
+/// `route` before any row is written, then stored as a sender transport row beside the
+/// outbound note. Without a route the recipient is handled as an ordinary actor label.
+pub(crate) async fn handle_send_with_route(
+    runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
+    token: &NamespaceToken,
+    params: Value,
+    route: Option<&dyn crate::node_route::NodeSendRoute>,
 ) -> Result<Value, RuntimeError> {
     let p: SendParams = deser(params)?;
     validate_actor_label("send", &p.to, "to")?;
@@ -189,6 +203,35 @@ pub(crate) async fn handle_send(
             &p.attachments,
         )
     })?;
+    // A node-addressed recipient is sealed before any write, so a disabled channel, an
+    // unparseable address or an unknown pin refuses with nothing stored.
+    //
+    // The logical message id of a caller-keyed send is derived from the key's physical form, so
+    // a replay of the same keyed request seals under the identity of the first attempt even when
+    // the first attempt's transport row was lost. An un-keyed send mints a fresh id.
+    let logical_message_id = match identity.as_ref() {
+        Some(identity) => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            identity.physical_key(token).as_bytes(),
+        ),
+        None => Uuid::new_v4(),
+    };
+    let sealed = match route {
+        Some(route) if to_actor.starts_with(crate::node_route::NODE_ADDRESS_PREFIX) => Some(
+            route
+                .seal(crate::node_route::NodeSealRequest {
+                    address: &to_actor,
+                    logical_message_id,
+                    from_actor: &from_actor,
+                    content: &p.content,
+                    subject: p.subject.as_deref(),
+                    thread_id: thread_id.as_deref(),
+                })
+                .await
+                .map_err(|refusal| refusal.into_runtime_error())?,
+        ),
+        _ => None,
+    };
     let MessageWrite {
         outbound: outbound_note,
         embedding_truncation,
@@ -213,6 +256,19 @@ pub(crate) async fn handle_send(
         identity.as_ref(),
     )
     .await?;
+    if let Some(mut envelope) = sealed {
+        // A replay whose transport row already exists keeps that row; a replay that lost it
+        // (the note landed but the row did not) stores the freshly sealed envelope.
+        let already_recorded = replayed
+            && runtime
+                .sender_transport_status(token, outbound_note.id)
+                .await?
+                != khive_runtime::comm_transport::TransportStatus::Unknown;
+        if !already_recorded {
+            envelope.outbound_note_id = outbound_note.id;
+            runtime.create_sender_transport(token, envelope).await?;
+        }
+    }
     if !replayed {
         inbox_signal.publish();
     }

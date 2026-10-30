@@ -5,6 +5,7 @@ pub mod handlers;
 pub(crate) mod idempotency;
 pub(crate) mod inbox_signal;
 pub(crate) mod message;
+pub mod node_route;
 pub(crate) mod pack;
 pub(crate) mod params;
 pub(crate) mod vocab;
