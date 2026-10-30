@@ -98,7 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - khive builds on lattice 0.15.0 (`lattice-embed`, `lattice-inference` and `lattice-fann`).
   `kkernel` keeps the BERT vocab-size and tokenizer truncation warnings out of its log at the
   default level, as before; truncation is still reported per write through
-  `embedding_truncation_report`.
+  `embedding_truncation_report`. Moodboard descriptors now report inference version 0.15.0, so
+  their fingerprints and model keys change and existing moodboard vectors need reindexing;
+  preference bundles trained under 0.12.0 fail closed on load and need retraining. The
+  moodboard pack also pins every lattice crate those three resolve to at `=0.15.0`, so a fresh
+  resolution cannot pick a newer patch release of a transitive lattice crate under an unchanged
+  descriptor fingerprint.
 - **Breaking:** `exec.events` returns every event `id` as a string: a UUID for new
   lifecycle events and a decimal string for legacy rows. New lifecycle events use
   the shared event store with the caller's canonical actor attribution. Legacy
@@ -381,6 +386,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (target `lattice_embed`).
 - khive does not save lattice's persistent Qwen embedding cache, so the cache file-name change
   in lattice 0.15 needs no action.
+- Moodboard: assets indexed under lattice 0.12 are not found until they are indexed again, and
+  a preference bundle trained under 0.12 is refused at load with "moodboard preference model has
+  the wrong FANN identity" until it is trained again.
 
 ### Known issues
 
