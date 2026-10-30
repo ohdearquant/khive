@@ -1571,7 +1571,12 @@ commit, not who may mint.
    returns the handle. The serve host calls it when it registers a transport channel, with the
    enrollment, the actor and the namespace it read from configuration at boot. The handle is bound
    to the runtime instance, the `(kind, slug)`, the enrolled recipient, the bound actor, the write
-   namespace and a registration generation.
+   namespace and a registration generation. The authority to write that namespace is the same
+   configuration entry that enrolls the slug and binds its actor, never the actor's grants: the
+   delivery is the transport's act for its recipient (A.9), not a call the actor makes, and the
+   deployment that supplies that entry is the one that supplies the keys and pins (item 7). A
+   change to the entry is a new registration (item 6), so the handle carries the authority current
+   at its registration and no other.
 2. **Who may register.** The ingress authority is a value that
    `KhiveRuntime::claim_ingress_authority` returns once per runtime instance and refuses afterwards.
    The serve host claims it at boot, before it constructs any pack, and keeps it;
@@ -1603,24 +1608,31 @@ commit, not who may mint.
    restart of the runtime instance each end the handle: the ingest compares the handle's runtime
    instance and registration generation with the runtime's current ones for that `(kind, slug)`
    inside the write transaction, and a mismatch commits nothing. The generation is a counter the
-   runtime instance increases on every registration and never reuses. A change that lands while a
-   transaction holding the handle is open takes effect from the next transaction.
+   runtime instance increases on every registration and never reuses. The runtime instance's
+   identity is a value drawn when the runtime is constructed, from a process-wide counter that never
+   repeats within the process; a handle is not serializable and never crosses a process boundary,
+   so a restart ends every handle with the process that held it, and a second runtime constructed
+   in the same process draws a new value, against which the first one's handles refuse.
+   Unregistration is by `(kind, slug)` under the ingress authority and increases the generation, so
+   the host never needs the handle back: the loop task's handle refuses at its next ingest. A change
+   that lands while a transaction holding the handle is open takes effect from the next transaction.
 7. **The residual, stated.** An adapter that holds a valid handle can still assert a false sender
    for its own recipient; a compromised or defective adapter is inside the trust boundary, as the
    serve host that claims the ingress authority and the deployment that supplies its keys and pins
    are. Code that can construct its own runtime instance over the same store can claim that
-   instance's authority, but it already writes that store without any handle, so the claim adds
-   nothing; the boundary holds against code that holds only a runtime it was handed. A.5's note on
+   instance's authority; such code is inside the host's trust boundary, as the serve host is, and
+   this amendment makes no claim against it. The boundary it draws holds against code that holds
+   only a runtime it was handed: a pack, a verb handler, an MCP argument. A.5's note on
    recipient-key compromise stands.
 
 ### Consequences
 
 `ingest_verified_recipient` becomes `pub` with the handle as its authority, and `khive-runtime`
-gains `claim_ingress_authority`, `register_recipient_ingress` and an unregistration that consumes a
-handle. Today's namespace token argument and `LocalRecipientBinding` are replaced by the handle's
-bound values. The serve host's
-channel registration claims the authority and mints one handle per transport channel; the inbound
-node loop that uses it lands after this amendment is signed. Issue 3537's expected result is
+gains `claim_ingress_authority`, `register_recipient_ingress` and an unregistration by
+`(kind, slug)` (item 6). Today's namespace token argument and `LocalRecipientBinding` are replaced
+by the handle's bound values. The serve host claims the authority once at boot (item 2), and its
+registration of each transport channel mints that channel's handle; the inbound node loop that uses
+it lands after this amendment is signed. Issue 3537's expected result is
 restated to what items 1 to 7 deliver before the change that implements them closes it.
 
 ### Acceptance
@@ -1633,7 +1645,8 @@ Each arm names the change that must turn it red.
    `claim_ingress_authority` on the same runtime instance is refused. Making any of these reachable,
    or letting the claim succeed twice, turns its case red.
 2. **Wrong runtime, channel or recipient.** A handle minted on one runtime instance refuses on
-   another, including the same deployment after a restart; a handle for one `(kind, slug)` refuses a
+   another, including a second instance constructed over the same store in the same process (a
+   restart ends every handle with its process, item 6); a handle for one `(kind, slug)` refuses a
    delivery routed to another; a ticket naming a recipient, device or key epoch other than the
    handle's is refused. Each commits nothing. A handle registered with namespace A writes its note
    and journal entry in A and nowhere else, whatever namespace the ticket, the payload or the caller
@@ -1641,8 +1654,9 @@ Each arm names the change that must turn it red.
    red.
 3. **Stale registration.** After the channel is unregistered, after it is registered again, after
    its slug's bound actor changes, and after its enrolled recipient or key epoch changes, the old
-   handle's ingest commits nothing and, where a new registration exists, the new handle's commits.
-   Dropping the generation comparison turns these cases red.
+   handle's ingest commits nothing and, where a new registration exists, the new handle's commits;
+   with no live registration left for the `(kind, slug)`, every ingest for it is refused and commits
+   nothing. Dropping the generation comparison turns these cases red.
 4. **One mint site.** A test reads the source of `khive-channel-node` and asserts that
    `InboundReceiptTicket::new` appears exactly once outside tests, inside the branch that handles an
    opened delivery. Adding a second call, or moving the call outside that branch, turns it red.
