@@ -73,8 +73,11 @@ async fn a_conflicting_pin_is_refused_with_a_typed_storage_error_and_rolls_back(
     assert!(
         matches!(
             &error,
-            RuntimeError::Storage(StorageError::InvalidInput { message, .. })
-                if message == CONFLICT_TEXT
+            RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
+                request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) if matches!(source.as_ref(), StorageError::InvalidInput { message, .. }
+                if message == CONFLICT_TEXT)
         ),
         "{error:?}"
     );

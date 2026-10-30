@@ -39,7 +39,14 @@ fn fixture() -> (StorageBackend, NodePinStore) {
 }
 
 fn is_conflict(error: &StorageError) -> bool {
-    matches!(error, StorageError::InvalidInput { message, .. } if message == CONFLICT_TEXT)
+    matches!(
+        error,
+        StorageError::WriterTaskRequestFailed {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+            source,
+        } if matches!(source.as_ref(), StorageError::InvalidInput { message, .. }
+            if message == CONFLICT_TEXT)
+    )
 }
 
 #[tokio::test]
