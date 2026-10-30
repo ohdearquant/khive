@@ -1544,7 +1544,7 @@ leaves the text of that item unchanged.
 
 ## Amendment 2026-10-30 -- Who may commit an inbound delivery
 
-**Status.** Proposed (2026-10-30).
+**Status.** Accepted; signed by the maintainer, 2026-10-30.
 
 **Why.** Item 6 of the 2026-09-14 amendment says the verified-recipient ingest "can only be entered
 from the daemon's own node loop holding a valid ticket, never from wire parameters", and A.9 fixes
