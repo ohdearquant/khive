@@ -1537,3 +1537,95 @@ behavior changes. Item 5 of the 2026-09-14 amendment stands for `send_with_recei
 1 to 5 above refine them, and so does A.3: the private key stays in the key facility. The
 sender-receipts amendment stands as written: item 6 adds a case to the list in its item 3 and
 leaves the text of that item unchanged.
+
+## Amendment 2026-10-30 -- Who may commit an inbound delivery
+
+**Status.** Proposed (2026-10-30).
+
+**Why.** Item 6 of the 2026-09-14 amendment says the verified-recipient ingest "can only be entered
+from the daemon's own node loop holding a valid ticket, never from wire parameters", and A.9 fixes
+the recipient of an inbound message "by transport authority". The code does not yet say what makes
+a ticket valid. At khive-oss 9b216f6e the ticket's only constructor is public and "performs no
+verification" (`crates/khive-channel/src/lib.rs:459-467`), and the runtime's ingest takes a
+namespace token, a local binding the caller builds and a ticket, and checks only that the binding
+and the ticket agree (`crates/khive-runtime/src/comm_recipient.rs:131-138`, `:194-215`). The
+entry is `pub(crate)` with no caller outside its tests (`comm_recipient.rs:1-20`), so nothing
+reaches it today. Before the node loop calls it, a caller holding a namespace token must not be
+able to attribute a message to any sender in that namespace.
+
+No construction of the ticket can prove the sender. Opening an envelope needs the recipient's
+private key in the key facility (A.3, A.5); a constructor that called the facility's `open` would
+still trust whoever implements the facility, and the deployment that holds the keys stays the trust
+root under any choice. Rust has no visibility that admits one other crate, so a constructor in
+`khive-channel` cannot be reserved for `khive-channel-node`. This amendment therefore fixes who may
+commit, not who may mint.
+
+### What changes
+
+1. **A recipient-ingress handle is the authority to commit.** When the serve host registers a
+   transport channel under its exact `(kind, slug)`, it mints one recipient-ingress handle for that
+   registration. The handle is bound to the runtime instance, the `(kind, slug)`, the slug's
+   enrolled recipient (realm, agent identifier, device identifier, recipient key epoch), the slug's
+   bound actor, and a registration generation. The verified-recipient ingest takes the handle in
+   place of the namespace token and the caller-built local binding. It takes the recipient and the
+   actor from the handle, never from the caller or the payload, and refuses a ticket whose binding
+   names another recipient, device or key epoch.
+2. **What a handle is not.** The handle has no public constructor, is neither `Clone` nor
+   serializable, and is never derived from a namespace token or a principal's grants. No verb, wire
+   parameter, configuration read at request time or MCP argument can produce one or select the
+   verified-recipient mode. The serve host hands it only to the loop task it starts for that
+   registration.
+3. **The ticket stays adapter-asserted.** The ticket stays the assertion of the adapter that opened
+   the envelope with the pinned sender key, and holding a handle proves authority to ingest for this
+   recipient, not authentication of the ticket's sender claim. The opening itself is as A.5 and A.8
+   (Receiving, steps 1 to 3) require. This is not the sealed-receipt mechanism of the 2026-10-03
+   sender-receipts amendment applied to the envelope: that value cannot exist without a signature
+   check, and a ticket can.
+4. **One mint site in the node adapter.** In `khive-channel-node` (restored by pull request 6285),
+   `InboundReceiptTicket::new` is called at exactly one site, in the branch that handles a delivery
+   whose envelope opened (`DeliveryOpenResult::Opened` in `src/adapter.rs`, lines 180-221 at
+   36cf8c4d in pull request 6290). Rust cannot enforce this across crates, so it is a convention,
+   and acceptance arm 4 guards it.
+5. **A stale handle refuses.** Unregistering a channel, registering it again, changing its slug's
+   enrolled recipient, key epoch or bound actor, and a restart of the runtime instance each end the
+   handle: the ingest compares the handle's runtime instance and registration generation with the
+   registry's current ones for that `(kind, slug)` inside the write transaction, and a mismatch
+   commits nothing.
+6. **The residual, stated.** An adapter that holds a valid handle can still assert a false sender
+   for its own recipient; a compromised or defective adapter is inside the trust boundary, as the
+   deployment that supplies its keys and pins is. A.5's note on recipient-key compromise stands.
+
+### Consequences
+
+`ingest_verified_recipient` changes its parameters inside `khive-runtime`; it has no caller outside
+its tests, so no public signature changes. The serve host gains a registration entry that mints the
+handle; the inbound node loop that uses it lands after this amendment is signed. Issue 3537's
+expected result is restated to what items 1 to 6 deliver before the change that implements them
+closes it.
+
+### Acceptance
+
+Each arm names the change that must turn it red.
+
+1. **No external entry.** Compile-fail doctests in `khive-runtime`: code outside the crate cannot
+   call the ingest, construct a handle, or obtain one from a namespace token. Making any of the
+   three reachable turns its doctest red.
+2. **Wrong runtime, channel or recipient.** A handle minted on one runtime instance refuses on
+   another; a handle for one `(kind, slug)` refuses a delivery routed to another; a ticket naming a
+   recipient, device or key epoch other than the handle's is refused. Each commits nothing. Taking
+   any of these from the ticket or the caller instead of the handle turns its case red.
+3. **Stale registration.** After the channel is registered again, and separately after its slug's
+   bound actor changes, the old handle's ingest commits nothing and the new handle's commits.
+   Dropping the generation comparison turns the first case red.
+4. **One mint site.** A test reads the source of `khive-channel-node` and asserts that
+   `InboundReceiptTicket::new` appears exactly once outside tests, inside the arm that handles an
+   opened delivery. Adding a second call, or moving the call outside that arm, turns it red.
+5. **The authenticating path commits once.** A delivery that the node loop polls, opens and
+   ingests under its handle commits one note and one journal entry; the same delivery handed out
+   again commits nothing new (A.8, Replay identity).
+
+### What stands
+
+A.3, A.5, A.8 and A.9 stand, and so do both 2026-10-03 amendments. Item 6 of the 2026-09-14
+amendment stands: this amendment states what "the daemon's own node loop holding a valid ticket"
+means for the commit. No wire behavior changes and Appendix A is not edited.
