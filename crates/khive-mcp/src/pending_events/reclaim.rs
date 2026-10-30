@@ -115,6 +115,8 @@ pub(super) async fn reclaim_stale_firing_events(
     rt: &KhiveRuntime,
     now_micros: i64,
 ) -> Result<ReclaimSummary> {
+    let occurrence_store =
+        khive_pack_schedule::occurrence_store::OccurrenceStore::for_runtime(rt).await?;
     let legacy_stale_before = now_micros.saturating_sub(LEGACY_STALE_FIRING_TIMEOUT_MICROS);
     let rows = {
         let mut reader = rt
@@ -177,6 +179,15 @@ pub(super) async fn reclaim_stale_firing_events(
         };
         let mut properties: Value = serde_json::from_str(&selected_properties)
             .with_context(|| format!("pending-events: parse expired receipt for {id}"))?;
+        if properties.get("receipt_version").and_then(Value::as_i64) == Some(3) {
+            continue;
+        }
+        if let Some(store) = &occurrence_store {
+            if let Some(series) = store.series(id).await? {
+                store.definition(&series).await?;
+                continue;
+            }
+        }
         let firing_at = properties
             .get("firing_at")
             .and_then(Value::as_i64)

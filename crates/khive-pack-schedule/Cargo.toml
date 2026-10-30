@@ -26,8 +26,11 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+khive-db = { version = "0.14.0", path = "../khive-db" }
 serial_test = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }

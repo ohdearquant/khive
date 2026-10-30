@@ -34,6 +34,16 @@ const GRANTS: &str = "tool_grants";
 /// bare namespace or a composite that starts with one.
 const SNAPSHOTS: &str = "retrieval_snapshots";
 
+// Frozen attribution identifies both historical outcomes and unsettled work.
+pub(super) const SCHEDULED_OCCURRENCE_TABLES: &[&str] = &[
+    "scheduled_definitions_v3",
+    "scheduled_series_v3",
+    "scheduled_occurrences_v3",
+    "scheduled_attempts_v3",
+    "scheduled_receipts_v3",
+    "scheduled_notice_outbox_v3",
+];
+
 fn present(census: &NamespaceCensus, table: &str) -> bool {
     census
         .tables
@@ -108,6 +118,16 @@ pub(super) fn settle_pack_tables(
     }
 
     leave_authorization_behind(conn, census, request, counts)?;
+
+    for table in SCHEDULED_OCCURRENCE_TABLES {
+        if !present(census, table) {
+            continue;
+        }
+        let left = count_in_namespace(conn, table, source)?;
+        if left > 0 {
+            counts.left_behind.insert((*table).to_string(), left);
+        }
+    }
 
     if present(census, SNAPSHOTS) {
         drop_source_snapshots(conn, source)?;

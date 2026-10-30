@@ -4,13 +4,15 @@ fn schedule_pack_declares_scheduled_event_note_kind() {
 }
 
 #[test]
-fn schedule_pack_declares_four_handlers() {
-    assert_eq!(SchedulePack::HANDLERS.len(), 4);
+fn schedule_pack_declares_six_handlers() {
+    assert_eq!(SchedulePack::HANDLERS.len(), 6);
     let names: Vec<&str> = SchedulePack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"schedule.remind"));
     assert!(names.contains(&"schedule.schedule"));
     assert!(names.contains(&"schedule.agenda"));
     assert!(names.contains(&"schedule.cancel"));
+    assert!(names.contains(&"schedule.occurrences"));
+    assert!(names.contains(&"schedule.receipts"));
 }
 
 #[test]

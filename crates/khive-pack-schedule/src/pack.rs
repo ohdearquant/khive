@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack};
+use khive_types::{HandlerDef, Pack, PackSchemaPlan};
 
 use crate::handlers;
 use crate::vocab::SCHEDULE_HANDLERS;
@@ -24,6 +24,10 @@ impl Pack for SchedulePack {
     const NOTE_KINDS: &'static [&'static str] = &["scheduled_event"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &SCHEDULE_HANDLERS;
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "schedule",
+        statements: &[include_str!("../sql/occurrence-schema.sql")],
+    });
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
@@ -70,6 +74,10 @@ impl PackRuntime for SchedulePack {
             }
             "schedule.agenda" => handlers::handle_agenda(self.runtime(), token, params).await,
             "schedule.cancel" => handlers::handle_cancel(self.runtime(), token, params).await,
+            "schedule.occurrences" => {
+                handlers::handle_occurrences(self.runtime(), token, params).await
+            }
+            "schedule.receipts" => handlers::handle_receipts(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "schedule pack does not handle verb {verb:?}"
             ))),

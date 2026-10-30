@@ -22,6 +22,11 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
 ];
 const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
     (
+        "khive-pack-schedule/sql/occurrence-note-projection.sql",
+        SCHEDULE,
+        "project_note",
+    ),
+    (
         "khive-pack-gtd/sql/task-transition-update.sql",
         GTD,
         "gtd_transition_statement",
@@ -33,6 +38,8 @@ const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+const SCHEDULE: &str = "khive-pack-schedule/src/occurrence_store.rs";
+const SCHEDULE_STORE: &str = "00000000-0000-4000-8000-000000000003";
 const DB: &str = "khive-db/src/stores/note.rs";
 const PROPERTY_CAS: &str = "khive-db/src/statement_lists.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
@@ -1019,6 +1026,7 @@ fn census() -> BTreeMap<(String, String), String> {
     assert_markerless_callers(&markerless, MARKERLESS_CALLERS);
     assert_sql_ownership(&sql_sources, &loaded);
     let expected = [
+        (SCHEDULE, "project_note"),
         (DB, "NOTE_UPSERT_SQL"),
         (PROPERTY_CAS, "property_cas_statements"),
         (DB, "note_replace_if_unchanged_statement"),
@@ -1094,6 +1102,51 @@ fn fixture(kind: &str, properties: &str) -> Connection {
     conn
 }
 
+fn schedule_projection_fixture() -> Connection {
+    use khive_pack_schedule::occurrence::{
+        DefinitionActor, DefinitionV3, OccurrenceInstant, ScheduledPayload,
+    };
+    let conn = fixture(
+        "scheduled_event",
+        r#"{"status":"pending","trigger_at":"1970-01-01T00:01:40Z"}"#,
+    );
+    conn.execute_batch(include_str!(
+        "../../khive-pack-schedule/sql/occurrence-schema.sql"
+    ))
+    .unwrap();
+    let actor = DefinitionActor {
+        kind: "actor".into(),
+        id: "fixture".into(),
+    };
+    let definition = DefinitionV3 {
+        schema_version: 3,
+        schedule_id: ID.parse().unwrap(),
+        definition_revision: 1,
+        creator: actor.clone(),
+        namespace: "local".into(),
+        payload: ScheduledPayload::Action {
+            action: "stats()".into(),
+        },
+        first_trigger_text: "1970-01-01T00:01:40Z".into(),
+        first_trigger: OccurrenceInstant {
+            seconds: 100,
+            nanos: 0,
+        },
+        repeat: Some("every:1s".into()),
+        monthly_anchor: OccurrenceInstant {
+            seconds: 100,
+            nanos: 0,
+        },
+        misfire_policy: "skip".into(),
+        requested_max_lateness_s: None,
+        recipient: actor,
+    };
+    conn.execute("INSERT INTO scheduled_definitions_v3(store_id,schedule_id,definition_revision,namespace,definition_digest,canonical_definition,created_at_us) VALUES(?1,?2,1,'local',?3,?4,100)",
+        params![SCHEDULE_STORE,ID,definition.digest().unwrap().to_vec(),definition.canonical_bytes().unwrap()]).unwrap();
+    conn.execute("INSERT INTO scheduled_series_v3(store_id,schedule_id,definition_revision,namespace,revision,state,next_seconds,next_nanos) VALUES(?1,?2,1,'local',1,'active',200,123456789)",params![SCHEDULE_STORE,ID]).unwrap();
+    conn
+}
+
 fn deleted_fixture(kind: &str, properties: &str) -> Connection {
     let mut conn = Connection::open_in_memory().unwrap();
     khive_db::migrations::run_migrations(&mut conn).unwrap();
@@ -1127,7 +1180,7 @@ fn version(conn: &Connection) -> i64 {
 
 #[test]
 fn note_version_production_writers_never_assign_version() {
-    let conn = fixture("memory", "{}");
+    let conn = schedule_projection_fixture();
     for ((file, owner), sql) in census() {
         let concrete = if owner == "execute_filtered_note_property_patch" {
             sql.replace("{{}}", "{}")
@@ -1165,6 +1218,12 @@ fn note_version_production_writers_never_assign_version() {
 fn note_version_one_real_writer_per_file_advances_exactly_once() {
     let writers = census();
     let cases = [
+        (
+            SCHEDULE,
+            "project_note",
+            "scheduled_event",
+            r#"{"status":"pending","trigger_at":"1970-01-01T00:01:40Z"}"#,
+        ),
         (DB, "note_update_properties_statement", "memory", "{}"),
         (
             PROPERTY_CAS,
@@ -1224,7 +1283,9 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         cases.iter().map(|(file, ..)| *file).collect()
     );
     for (file, owner, kind, properties) in cases {
-        let conn = if file == OPERATIONS {
+        let conn = if file == SCHEDULE {
+            schedule_projection_fixture()
+        } else if file == OPERATIONS {
             deleted_fixture(kind, properties)
         } else {
             fixture(kind, properties)
@@ -1232,6 +1293,16 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         let sql = &writers[&(file.to_owned(), owner.to_owned())];
         assert_eq!(version(&conn), 1);
         let changed = match file {
+            SCHEDULE => conn.execute(
+                sql,
+                params![
+                    SCHEDULE_STORE,
+                    ID,
+                    "local",
+                    "1970-01-01T00:03:20.123456789Z",
+                    200_i64
+                ],
+            ),
             DB => conn.execute(
                 sql,
                 params![
@@ -1315,6 +1386,35 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         let expected = usize::from(file != FAULT);
         assert_eq!(changed, expected, "{file}::{owner}");
         assert_eq!(version(&conn), 1 + expected as i64, "{file}::{owner}");
+        if file == SCHEDULE {
+            assert_eq!(
+                conn.execute(
+                    sql,
+                    params![
+                        SCHEDULE_STORE,
+                        ID,
+                        "foreign",
+                        "1970-01-01T00:03:20.123456789Z",
+                        300_i64
+                    ]
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                version(&conn),
+                2,
+                "a nonmatched projection never advances version"
+            );
+            let trigger: String = conn
+                .query_row(
+                    "SELECT json_extract(properties,'$.trigger_at') FROM notes WHERE id=?1",
+                    [ID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(trigger, "1970-01-01T00:03:20.123456789Z");
+        }
     }
 }
 

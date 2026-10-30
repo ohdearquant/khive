@@ -2875,10 +2875,12 @@ name = "khive-pack-schedule"
 version = "0.15.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "criterion",
  "croner",
  "inventory",
+ "khive-db",
  "khive-pack-brain",
  "khive-pack-comm",
  "khive-pack-git",
@@ -2891,6 +2893,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "tempfile",
  "tokio",
  "uuid",
 ]

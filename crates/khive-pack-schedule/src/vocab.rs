@@ -26,7 +26,13 @@ const MAX_LATENESS_PARAM: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
+const RECEIPT_VERSION_PARAM: ParamDef = ParamDef {
+    name: "receipt_version", param_type: "integer", required: false,
+    description: "Opt into durable per-occurrence accounting by supplying 3 on a new declaration. Requires a file-backed schedule store. Omission preserves the existing receipt contract.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 6] = [
     HandlerDef {
         name: "schedule.remind",
         description: "Deliver a time-triggered reminder to the creating actor's inbox.",
@@ -50,6 +56,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
             REPEAT_PARAM,
             MISFIRE_POLICY_PARAM,
             MAX_LATENESS_PARAM,
+            RECEIPT_VERSION_PARAM,
         ],
     },
     HandlerDef {
@@ -98,6 +105,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
             REPEAT_PARAM,
             MISFIRE_POLICY_PARAM,
             MAX_LATENESS_PARAM,
+            RECEIPT_VERSION_PARAM,
         ],
     },
     HandlerDef {
@@ -157,4 +165,31 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
+    HandlerDef {
+        name: "schedule.occurrences",
+        description: "Read durable version-3 occurrence history in the original namespace, including after display-note cancellation, movement or deletion. No historical v1/v2 inventory is inferred.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef { name:"id",param_type:"string",required:true,description:"Complete schedule UUID.",resolution_mode:IdResolutionMode::NotApplicable },
+            ParamDef { name:"revision",param_type:"integer",required:false,description:"Positive immutable definition revision; omit for all retained revisions.",resolution_mode:IdResolutionMode::NotApplicable },
+            ParamDef { name:"after",param_type:"string",required:false,description:"Exclusive scheduled instant returned by next.after; supply with after_id.",resolution_mode:IdResolutionMode::NotApplicable },
+            ParamDef { name:"after_id",param_type:"string",required:false,description:"Exclusive occurrence UUID returned by next.after_id; supply with after.",resolution_mode:IdResolutionMode::NotApplicable },
+            ParamDef { name:"limit",param_type:"integer",required:false,description:"Page size 1 through 200; default 20.",resolution_mode:IdResolutionMode::NotApplicable },
+        ],
+    },
+
+    HandlerDef {
+        name: "schedule.receipts",
+        description:"Page immutable terminal and reconciliation evidence for one version-3 occurrence in its original namespace.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params:&[
+            ParamDef{name:"id",param_type:"string",required:true,description:"Complete occurrence UUID.",resolution_mode:IdResolutionMode::NotApplicable},
+            ParamDef{name:"after",param_type:"integer",required:false,description:"Exclusive recorded_at_us cursor returned in next.after; supply with after_id.",resolution_mode:IdResolutionMode::NotApplicable},
+            ParamDef{name:"after_id",param_type:"string",required:false,description:"Exclusive receipt UUID returned in next.after_id; supply with after.",resolution_mode:IdResolutionMode::NotApplicable},
+            ParamDef{name:"limit",param_type:"integer",required:false,description:"Page size 1 through 200; default 20.",resolution_mode:IdResolutionMode::NotApplicable},
+        ],
+    },
+
 ];

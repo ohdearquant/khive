@@ -511,7 +511,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
             subject_column: "note_id",
         },
 
-        // The next eight are created by a pack, not by a migration, so a store
+        // These tables are created by a pack, not by a migration, so a store
         // may not have them. Their rules live in `namespace_move_pack_tables.rs`.
         //
         // Readers of a task's audit rows key on `note_id` alone, so a transition
@@ -539,6 +539,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         "retrieval_snapshots" => Derived {
             trigger_maintained: false,
         },
+        _ if pack_tables::SCHEDULED_OCCURRENCE_TABLES.contains(&table.name.as_str()) => LeaveBehind,
         _ if LEAVE_BEHIND_TABLES.contains(&table.name.as_str()) => LeaveBehind,
 
         // Created at runtime, one per embedding model, and in no source file, so
