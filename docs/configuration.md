@@ -533,9 +533,9 @@ The optional `[channel.node]` table configures the node channel transport. It is
 off by default: without the table, or with `enabled = false`, nothing about the
 node channel runs and the daemon identity is unchanged.
 
-A setup command writes this table. Key material and peer pins are never typed
-by hand: the setup command creates the key in the login keychain, records the
-reference and fingerprint here, and appends peer pins as they are confirmed.
+Key material and peer pins are never typed by hand. The node setup commands,
+which are not available yet, will create the key in the login keychain, record
+the reference and fingerprint here, and append peer pins as they are confirmed.
 The fields are described so the file can be read and reviewed, not so values
 can be pasted in.
 
