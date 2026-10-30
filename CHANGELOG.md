@@ -7,18 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-
-- The npm distribution is no longer built or published. Use [khive cloud](https://khive.ai)
-  or build `kkernel` from source.
-
-## [0.15.0] - 2026-10-25
+## [0.15.0] - 2026-10-30
 
 ### Added
 
 - `embedding_truncation_report` replies may now include `discarded_tokens` and
   `token_reporting_unavailable` counters. Both new counters are omitted when zero.
-  Document embeddings report provider token cuts alongside the existing byte limit.
+  Document embeddings report provider token cuts alongside the existing byte limit,
+  and truncation refusals include provider-token counts when available.
 - `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared
   dependency-kind defaults to caller-resolved entity kinds without I/O.
 - Writer contention diagnostics now report per-pool FIFO admission depth, its
@@ -77,9 +73,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `KHIVE_AUDIT_SUCCESS_ROWS`. Reduced mode omits or samples successful rows for
   selected trusted handlers; `db_diagnostics` reports the decisions and
   `brain.event_counts` includes stored sampling metadata.
+- Add `kkernel db events-prune` to preview and remove eligible polling-dispatch audit
+  events. Applying a plan requires a verified backup and digest, uses bounded batches,
+  and can resume after interruption.
+- Add `kkernel kg export --ndjson` to write sorted `entities.ndjson` and `edges.ndjson`
+  files for a project.
+- `kkernel kg init` creates a versioned `.khive/kg/schema.yaml` when it is absent and
+  publishes its default files atomically; it can also offer to install a pre-commit hook.
+- Add `NoteStore::assign_note_key_if_unset` to assign a key once to an existing live
+  note that does not have one.
+- Add explicit workspace mirroring with `WorkspaceMirrorConfig` for polling intervals
+  and include/exclude path globs. Each mirror pass atomically commits its document,
+  index and edge changes, and cursor.
+- Background warm-up and maintenance work can be bounded with
+  `runtime.warm_concurrency` and `runtime.maintenance_concurrency`.
+- Register the document subtypes `note`, `summary`, `handoff`, `transcript` and `other`
+  as accepted values.
+- `db_diagnostics` reports note-search routes for each opened backend.
+- Add `grant_is_active_on` to `khive-pack-tool::policy` to check whether a held grant
+  is active at a supplied time.
 
 ### Changed
 
+- khive builds on lattice 0.15.0 (`lattice-embed`, `lattice-inference` and `lattice-fann`).
+  `kkernel` keeps the BERT vocab-size and tokenizer truncation warnings out of its log at the
+  default level, as before; truncation is still reported per write through
+  `embedding_truncation_report`.
 - **Breaking:** `exec.events` returns every event `id` as a string: a UUID for new
   lifecycle events and a decimal string for legacy rows. New lifecycle events use
   the shared event store with the caller's canonical actor attribution. Legacy
@@ -162,6 +181,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive-fs::read_link_at_bounded` returns complete symlink target bytes within a
   caller-supplied cap, or an explicit too-large result. `khive-pack-exec` uses this
   shared bounded read when capturing symlink targets.
+- Ordinary KG note lists and searches now default to active notes. Set `note_status` to
+  `archived` or `any` to include other live statuses.
+- Integer request parameters accept exact whole-number JSON floats; fractional or
+  inexact values remain refused.
+- `brain.feedback` and `memory.feedback` accept canonical `id` parameters and retain
+  `target_id` as a legacy alias.
+- Outbound mail tagged `traffic:list` can use a separate footer selected by
+  `KHIVE_EMAIL_LIST_FOOTER_FILE`; list mail is refused if the configured footer cannot
+  be read.
+- Edge property updates now shallow-merge patches, preserving omitted values and
+  treating `null` as a value.
+- `comm.health` reports current resident memory as `rss_bytes` separately from the
+  lifetime peak `max_rss_bytes`.
+- Entity updates persist unfinished indexing targets and report indexing status with
+  post-commit degradation details.
+- Audit events for `comm.inbox`, `comm.cleanup_expired_quarantine`, `whoami`,
+  `comm.probe`, `comm.cursor_get` and `comm.heartbeat` now include a `retention` object
+  with the class, policy and seven-day horizon.
+- `traverse` advertises `ids` as its canonical root parameter while retaining the
+  legacy input.
 
 ### Performance
 
@@ -210,6 +249,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer route. Use `atomic_unit` for statements that must run in one transaction.
 - Updates `ctutils` to 0.4.4 to address RUSTSEC-2026-0385.
 - Updates `tokio` to 1.53.3 to address RUSTSEC-2026-0386.
+- Startup validates pack declarations and reports all missing dependencies for selected
+  packs in one error.
+- `kkernel kg init` skips existing scaffold leaves without following links.
+- Resuming `kkernel db events-prune` keeps every previously batched ID in the authorized
+  digest, including rows skipped or still present after an interrupted batch.
+- `kg validate --fix` pairs results by source path and rule ID, and reports results after
+  fixes are applied.
+- Generic edge-rule violations now identify the edge record that failed validation.
+- MCP stdio remains open for requests received before initialization.
+- Workspace mirroring reads the current document head and superseding edges from one
+  statement.
+- `exec` shutdown settles admitted recall-ledger work before closing audit writers and
+  shares the bounded storage-settle deadline across recall and writer tasks.
+- Git document suffix matching now requires a path boundary, and exact document URI
+  matches rank ahead of basename fallbacks.
+- `khive-wire-protocol` enforces positive request deadlines and object event payloads;
+  clients follow the required handshake sequence and reject errors with invalid scopes.
+- `neighbors` advertises the canonical `id` parameter and retains `node_id` as an alias;
+  `verbs()` and `help` list the supported inputs.
+- Knowledge operations preserve indexed refusal details and known atomic settlement
+  outcomes in their responses.
+- Text search now prefers eligible matches for one- and two-character query tokens
+  without narrowing the query.
+- Credential trigger words in ordinary path references no longer cause unrelated values
+  to be refused.
 
 ### Removed
 
@@ -222,18 +286,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   create-only graph insertion instead.
 - `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
   `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
+- The npm distribution is no longer built or published. Use [khive cloud](https://khive.ai)
+  or build `kkernel` from source.
+
+### Security
+
+- Memory writes refuse keys that contain credential-shaped values.
+- Refusal diagnostics now mask credential-shaped values in `exec` string-type errors.
+- GitHub ingestion settles secret-refused records with safe replacements so processing
+  can continue without retaining the refused values.
+- Code-map opens are refused when a map path reaches its eight-handle quarantine limit.
 
 ### Breaking (Rust crates)
 
+- `khive_retrieval` re-exports `EmbedError`, `EmbeddingModel`, `EmbeddingService`,
+  `CachedEmbeddingService`, `NativeEmbeddingService` and `EmbedResult` from lattice-embed, so they
+  now carry lattice 0.15's definitions. `EmbedError` no longer has the `AttestationReportSize` and
+  `ResourceBudgetOverflow` variants.
 - `khive_runtime::DocumentEmbeddingOutcome` adds `provider_token_count`; direct
   struct literals must set it. `EmbeddingTruncationReport` adds `discarded_tokens`
   and `token_reporting_unavailable`; literals must set them or use `Default`.
 - `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission`,
   `writer_admission_unavailable_reason`, `audit_success_rows_omitted`,
   `audit_success_rows_sampled_out` and `audit_success_rows_forced`.
-  `khive_db::diagnostics::RuntimeAuditBatchMetrics` adds the same three
-  `audit_success_rows_*` fields. Direct struct literals must set them.
-- `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
+  `khive_db::diagnostics::RuntimeAuditBatchMetrics` adds `audit_success_rows_omitted`,
+  `audit_success_rows_sampled_out` and `audit_success_rows_forced`. Direct struct literals must set them.
+- `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs` and `note_search_routes`. Direct struct literals
+  must set them.
 - `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
   `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
   takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
@@ -247,13 +326,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exhaustive matches on either enum must handle the new variant.
 - `khive_runtime::KhiveConfig` adds `embed`, the `[embed]` table that carries the
   reindex batch size. Direct struct literals must set it or use `Default`.
-- `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation`. Exhaustive
-  matches must handle it.
+- `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation` and `BatchWrite`. Exhaustive
+  matches must handle them.
+- `khive_runtime::RuntimeConfig` and `khive_runtime::engine_config::RuntimeSectionConfig` add
+  `warm_concurrency` and `maintenance_concurrency`; direct struct literals must set them or use `Default`.
+- `khive_runtime::PackLoadError` adds `MissingDependencies`; exhaustive matches must
+  handle it.
 - `khive_runtime::ConfigError` adds `BlobS3FeatureDisabled`, returned when S3 blob
-  storage is configured in a build without `blob-s3`. Exhaustive matches must handle it.
+  storage is configured in a build without `blob-s3`, and `InvalidRuntimeConfig`. Exhaustive matches must
+  handle them.
 - `kkernel::kg::ImportArgs` adds `on_conflict`, `force`, `dry_run` and
-  `continue_on_error`. Direct struct literals must set them.
+  `continue_on_error`, and `kkernel::kg::ExportArgs` adds `ndjson`. Direct struct literals must set them.
 - `khive_types::EventKind` adds `GrantChange`; downstream exhaustive matches must handle it.
+- `khive_runtime::ProcessResourceUsage` replaces `rss_bytes` with `max_rss_bytes`, the lifetime peak.
+  Direct struct literals must use the new field; for the current resident size call
+  `khive_runtime::resource::current_rss_bytes()`.
+- `khive_runtime::secret_gate::RedactionSurface` adds `WorkspaceMirror`, which moves the implicit
+  discriminants of `McpDiagnostic` and `GateProbe`. Exhaustive matches must handle the new variant, and code
+  that relies on the cast values must be updated.
+- `khive_runtime::config_ledger::record_config_locked` is removed; use `KhiveRuntime::record_config_locked`,
+  which takes the value as a closure.
+- `KhiveRuntime::link_commit_annotation_if_absent` is removed, and `khive_storage::graph` removes
+  `CommitAnnotationCursorValue`, `CommitAnnotationGuard`, `CommitAnnotationInsertOutcome` and
+  `GraphStore::insert_commit_annotation_if_absent`. Historical commit-annotation repair goes through
+  `khive_pack_git::reconcile::run_reconciliation`.
+- `khive_storage::NoteFilter` adds `note_status`; direct struct literals must set it or use `Default`.
+- `khive_pack_git::ingest::IngestWriteRefusal` adds `redacted`. Direct struct literals must set it.
+- `khive_pack_charter::CharterPack` is now a struct that owns its runtime instead of a unit struct, and it no
+  longer implements `UnwindSafe` or `RefUnwindSafe`. Construct it with `CharterPack::new(runtime)`.
+- `khive_pack_charter::transition::RunState` adds `Terminated`, which moves the implicit discriminants of
+  `Cancelled`, `Superseded`, `Invalidated` and `Failed`. Exhaustive matches and code that relies on the cast
+  values must be updated.
 - `kkernel` and `khive-mcp` no longer enable `pack-agent`, `pack-telemetry` or `pack-web`
   by default, nor the optional pack dependencies behind them. Crates that depend on
   `kkernel` or `khive-mcp` and use those packs must enable the features.
@@ -265,9 +368,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo install kkernel` now builds without the agent, telemetry and web packs, S3 blob
   storage and the JSON, CSV and BibTeX KG import formats. To keep them, install with
   `--features pack-agent,pack-telemetry,pack-web,blob-s3,kg-adapters`.
-- This release adds database migrations V58 to V62: the proposal archive, the legacy
+- This release adds database migrations V58 to V63: the proposal archive, the legacy
   quarantine index, the stream truncation floor, the edge-governance tables and the
-  authority store.
+  authority store, and pending entity indexes.
+- Qwen3Embedding4B log lines that lattice 0.12 kept out of the `kkernel` log now appear at warn:
+  - `Metal forward failed (seq_len=...), falling back to CPU`, when the Metal forward pass fails
+    and the model runs on CPU instead (target `lattice_model_qwen3_embedding`).
+  - `failed to parse inference_config.json, using defaults`, when the model directory's
+    `inference_config.json` does not parse (target `lattice_model_qwen3_embedding`).
+  - `persistent Qwen cache not restored: model or tokenizer revision is unknown`, new in lattice
+    0.15, once at model load when the model directory records no model or tokenizer revision
+    (target `lattice_embed`).
+- khive does not save lattice's persistent Qwen embedding cache, so the cache file-name change
+  in lattice 0.15 needs no action.
 
 ### Known issues
 
