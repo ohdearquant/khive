@@ -2266,6 +2266,8 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "x25519-dalek",
  "zeroize",

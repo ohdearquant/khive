@@ -775,3 +775,60 @@ async fn deliveries_that_do_not_open_yield_no_envelope_and_no_ticket() {
         valid.as_bytes()
     );
 }
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn refused_deliveries_are_logged_by_index_and_code_and_settle_nothing() {
+    let valid = serde_json::to_string(&delivery()).unwrap();
+    let mut unsupported = serde_json::to_value(delivery()).unwrap();
+    unsupported["protocol_version"] = serde_json::json!(2);
+    let ciphertext = unsupported["ciphertext"].as_str().unwrap().to_owned();
+    let unsupported = serde_json::to_string(&unsupported).unwrap();
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let page = {
+        let _default = tracing::subscriber::set_default(subscriber);
+        recipient_page(&[unsupported.as_str(), valid.as_str()], pins(true)).await
+    };
+    assert_eq!(
+        page.page().envelopes.len(),
+        1,
+        "only the delivery that parsed"
+    );
+    assert_eq!(page.tickets().len(), 1);
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("node poll delivery refused").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("index=0"), "{text}");
+    assert!(text.contains("code=UnsupportedVersion"), "{text}");
+    assert!(
+        !text.contains(&ciphertext),
+        "a refused item's bytes must not reach the log"
+    );
+}
