@@ -148,6 +148,75 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
 }
 
 #[tokio::test]
+async fn keyed_memory_new_secret_key_is_refused_without_writes() {
+    // This is the synthetic detector fixture used by the secret-gate tests.
+    const SYNTHETIC_KEY: &str = "AKIAFAKEKEY1234567890";
+    validate_memory_key(SYNTHETIC_KEY).expect("fixture key must be syntactically valid");
+    assert!(
+        matches!(
+            crate::secret_gate::check(SYNTHETIC_KEY),
+            Err(RuntimeError::SecretDetected(_))
+        ),
+        "fixture key must independently trigger the secret detector"
+    );
+
+    // Establish that the same fixture can create and replay an ordinary key.
+    let (good_runtime, good_token, good_source) = fixture("key-gate-positive").await;
+    assert_rows(&good_runtime, &good_token, 0, 0).await;
+    let (first, edge, replayed, fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign create");
+    assert!(!replayed);
+    assert!(edge.is_some());
+    assert_eq!(fences.len(), 1);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+    let (second, replay_edge, replayed, replay_fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign exact replay");
+    assert!(replayed);
+    assert!(replay_edge.is_none());
+    assert_eq!(second.id, first.id);
+    assert_eq!(replay_fences, fences);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+
+    let (runtime, token, source) = fixture("key-gate-refusal").await;
+    assert_rows(&runtime, &token, 0, 0).await;
+    let error = match create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec(SYNTHETIC_KEY, "ordinary memory", Some(source)),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("secret-bearing new key was accepted"),
+    };
+    assert!(
+        !error.to_string().contains(SYNTHETIC_KEY),
+        "displayed refusal must not disclose the key"
+    );
+    assert!(
+        !format!("{error:?}").contains(SYNTHETIC_KEY),
+        "debug refusal must not disclose the key"
+    );
+    match error {
+        RuntimeError::SecretDetected(matched) => {
+            assert_eq!(matched.location.as_deref(), Some("note.key"));
+        }
+        _ => panic!("expected a located secret-gate refusal"),
+    }
+    assert_rows(&runtime, &token, 0, 0).await;
+}
+
+#[tokio::test]
 async fn keyed_memory_without_models_replays_an_explicit_empty_receipt() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     runtime.install_kind_registry(vec![], vec!["memory".into()]);
