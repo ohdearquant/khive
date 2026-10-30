@@ -7,6 +7,10 @@
   dual-write), [ADR-017](ADR-017-pack-standard.md) (pack vocabulary additivity)
 - 2026-10-05: the node client crate now lives with the hosted service, and later versions of the
   node protocol are specified there. Version 1 (Appendix A and the amendments below) stays as written.
+- 2026-10-30: the node client crate is back in this repository as `khive-channel-node`, and the
+  hosted service builds the same crate (maintainer decision of 2026-10-29: the open-source build
+  carries the node client, and the hosted build uses the same client). The 2026-10-05 line above no
+  longer holds. Version 1 stays as written.
 
 ## Context
 
