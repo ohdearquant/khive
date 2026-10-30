@@ -1562,64 +1562,81 @@ commit, not who may mint.
 
 ### What changes
 
-1. **A recipient-ingress handle is the authority to commit.** When the serve host registers a
-   transport channel under its exact `(kind, slug)`, it mints one recipient-ingress handle for that
-   registration. The handle is bound to the runtime instance, the `(kind, slug)`, the slug's
-   enrolled recipient (realm, agent identifier, device identifier, recipient key epoch), the slug's
-   bound actor, and a registration generation. The verified-recipient ingest takes the handle in
-   place of the namespace token and the caller-built local binding. It takes the recipient and the
-   actor from the handle, never from the caller or the payload, and refuses a ticket whose binding
-   names another recipient, device or key epoch.
-2. **What a handle is not.** The handle has no public constructor, is neither `Clone` nor
-   serializable, and is never derived from a namespace token or a principal's grants. No verb, wire
-   parameter, configuration read at request time or MCP argument can produce one or select the
-   verified-recipient mode. The serve host hands it only to the loop task it starts for that
-   registration.
-3. **The ticket stays adapter-asserted.** The ticket stays the assertion of the adapter that opened
+1. **A recipient-ingress handle is the authority to commit.** `khive-runtime` defines the handle
+   type and is the only crate that constructs one. Its one constructor is private; the one way to
+   obtain a handle is `KhiveRuntime::register_recipient_ingress`, a `pub` method that takes the
+   runtime's ingress authority (item 2), the channel's exact `(kind, slug)`, the slug's enrolled
+   recipient (realm, agent identifier, device identifier, recipient key epoch) and the slug's bound
+   actor, records the registration and returns the handle. The serve host calls it when it
+   registers a transport channel, with the enrollment and the actor it read from configuration at
+   boot. The handle is bound to the runtime instance, the `(kind, slug)`, the enrolled recipient,
+   the bound actor and a registration generation.
+2. **Who may register.** The ingress authority is a value that
+   `KhiveRuntime::claim_ingress_authority` returns once per runtime instance and refuses afterwards.
+   The serve host claims it at boot, before it constructs any pack, and keeps it. It has no public
+   constructor, is neither `Clone` nor serializable, and no pack receives it, so code that holds
+   only the runtime can neither register nor obtain a handle.
+3. **The ingest takes the handle.** `ingest_verified_recipient` becomes `pub` and takes the handle
+   in place of the namespace token and the caller-built local binding. It takes the recipient and
+   the actor from the handle, never from the caller or the payload, and refuses a ticket whose
+   binding names another recipient, device or key epoch. A handle has no public constructor, is
+   neither `Clone` nor serializable, and is never derived from a namespace token or a principal's
+   grants. No verb, wire parameter, configuration read at request time or MCP argument can produce
+   one or select the verified-recipient mode. The serve host hands each handle only to the loop task
+   it starts for that registration.
+4. **The ticket stays adapter-asserted.** The ticket stays the assertion of the adapter that opened
    the envelope with the pinned sender key, and holding a handle proves authority to ingest for this
    recipient, not authentication of the ticket's sender claim. The opening itself is as A.5 and A.8
    (Receiving, steps 1 to 3) require. This is not the sealed-receipt mechanism of the 2026-10-03
    sender-receipts amendment applied to the envelope: that value cannot exist without a signature
-   check, and a ticket can.
-4. **One mint site in the node adapter.** In `khive-channel-node` (restored by pull request 6285),
+   check, and a ticket can. `InboundReceiptTicket::new` stays public: a ticket minted anywhere else
+   commits nothing without a handle, so the handle, not the ticket, is the boundary.
+5. **One mint site in the node adapter.** In `khive-channel-node` (restored by pull request 6285),
    `InboundReceiptTicket::new` is called at exactly one site, in the branch that handles a delivery
-   whose envelope opened (`DeliveryOpenResult::Opened` in `src/adapter.rs`, lines 180-221 at
-   36cf8c4d in pull request 6290). Rust cannot enforce this across crates, so it is a convention,
-   and acceptance arm 4 guards it.
-5. **A stale handle refuses.** Unregistering a channel, registering it again, changing its slug's
-   enrolled recipient, key epoch or bound actor, and a restart of the runtime instance each end the
-   handle: the ingest compares the handle's runtime instance and registration generation with the
-   registry's current ones for that `(kind, slug)` inside the write transaction, and a mismatch
-   commits nothing.
-6. **The residual, stated.** An adapter that holds a valid handle can still assert a false sender
+   whose envelope opened (`DeliveryOpenResult::Opened` in `src/adapter.rs`; at pull request 6290's
+   head 36cf8c4d, lines 180-221). Rust cannot enforce this across crates; acceptance arm 4 is a
+   regression fence for the adapter's own structure, not a security boundary.
+6. **A stale handle refuses.** Unregistering the channel, registering it again, changing the slug's
+   enrolled recipient, key epoch or bound actor (each a new registration), and a restart of the
+   runtime instance each end the handle: the ingest compares the handle's runtime instance and
+   registration generation with the runtime's current ones for that `(kind, slug)` inside the write
+   transaction, and a mismatch commits nothing. A change that lands while a transaction holding the
+   handle is open takes effect from the next transaction.
+7. **The residual, stated.** An adapter that holds a valid handle can still assert a false sender
    for its own recipient; a compromised or defective adapter is inside the trust boundary, as the
-   deployment that supplies its keys and pins is. A.5's note on recipient-key compromise stands.
+   serve host that claims the ingress authority and the deployment that supplies its keys and pins
+   are. A.5's note on recipient-key compromise stands.
 
 ### Consequences
 
-`ingest_verified_recipient` changes its parameters inside `khive-runtime`; it has no caller outside
-its tests, so no public signature changes. The serve host gains a registration entry that mints the
-handle; the inbound node loop that uses it lands after this amendment is signed. Issue 3537's
-expected result is restated to what items 1 to 6 deliver before the change that implements them
-closes it.
+`ingest_verified_recipient` becomes `pub` with the handle as its authority, and `khive-runtime`
+gains `claim_ingress_authority`, `register_recipient_ingress` and an unregistration that consumes a
+handle. Today's `LocalRecipientBinding` is replaced by the handle's bound values. The serve host's
+channel registration claims the authority and mints one handle per transport channel; the inbound
+node loop that uses it lands after this amendment is signed. Issue 3537's expected result is
+restated to what items 1 to 7 deliver before the change that implements them closes it.
 
 ### Acceptance
 
 Each arm names the change that must turn it red.
 
 1. **No external entry.** Compile-fail doctests in `khive-runtime`: code outside the crate cannot
-   call the ingest, construct a handle, or obtain one from a namespace token. Making any of the
-   three reachable turns its doctest red.
+   construct a handle or an ingress authority, clone or deserialize either, call the ingest without
+   a handle, or obtain a handle from a namespace token. A unit test: a second
+   `claim_ingress_authority` on the same runtime instance is refused. Making any of these reachable,
+   or letting the claim succeed twice, turns its case red.
 2. **Wrong runtime, channel or recipient.** A handle minted on one runtime instance refuses on
-   another; a handle for one `(kind, slug)` refuses a delivery routed to another; a ticket naming a
-   recipient, device or key epoch other than the handle's is refused. Each commits nothing. Taking
-   any of these from the ticket or the caller instead of the handle turns its case red.
-3. **Stale registration.** After the channel is registered again, and separately after its slug's
-   bound actor changes, the old handle's ingest commits nothing and the new handle's commits.
-   Dropping the generation comparison turns the first case red.
+   another, including the same deployment after a restart; a handle for one `(kind, slug)` refuses a
+   delivery routed to another; a ticket naming a recipient, device or key epoch other than the
+   handle's is refused. Each commits nothing. Taking any of these from the ticket or the caller
+   instead of the handle turns its case red.
+3. **Stale registration.** After the channel is unregistered, after it is registered again, after
+   its slug's bound actor changes, and after its enrolled recipient or key epoch changes, the old
+   handle's ingest commits nothing and, where a new registration exists, the new handle's commits.
+   Dropping the generation comparison turns these cases red.
 4. **One mint site.** A test reads the source of `khive-channel-node` and asserts that
-   `InboundReceiptTicket::new` appears exactly once outside tests, inside the arm that handles an
-   opened delivery. Adding a second call, or moving the call outside that arm, turns it red.
+   `InboundReceiptTicket::new` appears exactly once outside tests, inside the branch that handles an
+   opened delivery. Adding a second call, or moving the call outside that branch, turns it red.
 5. **The authenticating path commits once.** A delivery that the node loop polls, opens and
    ingests under its handle commits one note and one journal entry; the same delivery handed out
    again commits nothing new (A.8, Replay identity).
