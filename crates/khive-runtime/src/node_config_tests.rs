@@ -1,6 +1,9 @@
 use crate::engine_config::KhiveConfig;
 use crate::node_config::{ChannelSectionConfig, NodeChannelConfig, NodePinConfig, MAX_NODE_PINS};
 
+/// One edit applied to a valid table by a table-driven test case.
+type ConfigMutation = Box<dyn Fn(&mut NodeChannelConfig)>;
+
 const AGENT: &str = "11111111-1111-4111-8111-111111111111";
 const DEVICE: &str = "22222222-2222-4222-8222-222222222222";
 const PEER_AGENT: &str = "33333333-3333-4333-8333-333333333333";
@@ -115,7 +118,7 @@ fn a_pin_rejects_unknown_keys_and_missing_fields() {
 
 #[test]
 fn an_enabled_table_missing_a_required_field_names_the_field() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut NodeChannelConfig)>)> = vec![
+    let cases: Vec<(&str, ConfigMutation)> = vec![
         ("slug", Box::new(|c| c.slug = None)),
         ("actor", Box::new(|c| c.actor = None)),
         ("realm", Box::new(|c| c.realm = None)),
@@ -138,7 +141,7 @@ fn an_enabled_table_missing_a_required_field_names_the_field() {
 
 #[test]
 fn each_field_refusal_carries_its_exact_text() {
-    let cases: Vec<(Box<dyn Fn(&mut NodeChannelConfig)>, &str)> = vec![
+    let cases: Vec<(ConfigMutation, &str)> = vec![
         (
             Box::new(|c| c.slug = Some(String::new())),
             "slug must contain 1..=64 lowercase letters, digits, '_' or '-'",
@@ -384,7 +387,7 @@ fn the_digest_ignores_pin_order() {
 #[test]
 fn the_digest_changes_with_every_field() {
     let base = valid().config_digest();
-    let variants: Vec<(&str, Box<dyn Fn(&mut NodeChannelConfig)>)> = vec![
+    let variants: Vec<(&str, ConfigMutation)> = vec![
         (
             "actor",
             Box::new(|c| c.actor = Some("other-actor".to_string())),
