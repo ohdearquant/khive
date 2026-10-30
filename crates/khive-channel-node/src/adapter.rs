@@ -116,6 +116,7 @@ impl Channel for NodeChannel {
     /// beside the page's sender receipt results and its receipt cursor. A delivery that did not
     /// open, or that names another recipient, gets no envelope and no receipt (ADR-105 A.8,
     /// Receiving, steps 1 to 3); it is not acknowledged, so the service hands it out again.
+    /// An item the client refused to parse is logged with its index and refusal code.
     /// The caller commits the cursor only when no result on the page is
     /// `SenderReceiptResult::Unhandled` (amendment of 2026-10-03, items 3 and 4).
     async fn poll_deliveries(
@@ -137,6 +138,15 @@ impl Channel for NodeChannel {
             return Err(ChannelError::Transport(format!(
                 "node receipt cursor {returned} is below requested receipts_after {requested}"
             )));
+        }
+        // A refused item is no authenticated envelope, so it settles nothing (A.8, step 3). It is
+        // logged by index and refusal code; its bytes never reach the log.
+        for rejection in &page.rejected_deliveries {
+            tracing::warn!(
+                index = rejection.index,
+                code = ?rejection.code,
+                "node poll delivery refused; not settled"
+            );
         }
         let realm = &self.client.binding().realm;
         let (envelopes, tickets): (Vec<_>, Vec<_>) = std::mem::take(&mut page.deliveries)
