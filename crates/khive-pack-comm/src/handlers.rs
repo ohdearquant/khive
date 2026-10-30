@@ -24,7 +24,7 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message_with_identity, note_to_message_json, project_message_json, short_id,
+    dual_write_message_with_transport, note_to_message_json, project_message_json, short_id,
     validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
     COMM_STABLE_PROPERTY_KEYS,
 };
@@ -126,9 +126,11 @@ pub(crate) async fn handle_send(
     handle_send_with_route(runtime, inbox_signal, token, params, None).await
 }
 
-/// `send` with an optional node route. A recipient in the node address form is sealed through
-/// `route` before any row is written, then stored as a sender transport row beside the
-/// outbound note. Without a route the recipient is handled as an ordinary actor label.
+/// `send` with an optional node route. A recipient in the node address form (scheme matched
+/// case-insensitively, no surrounding whitespace) is sealed through `route` before any row is
+/// written, and its sender transport row commits in the same transaction as the message pair.
+/// A node-form recipient with no route installed is refused as disabled; it is never handled as
+/// an ordinary actor label.
 pub(crate) async fn handle_send_with_route(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
@@ -137,6 +139,15 @@ pub(crate) async fn handle_send_with_route(
     route: Option<&dyn crate::node_route::NodeSendRoute>,
 ) -> Result<Value, RuntimeError> {
     let p: SendParams = deser(params)?;
+    // Classify the recipient exactly as written, before anything can read or write. A node
+    // address with no route installed is refused as disabled here and never falls through to the
+    // local actor-label path; a padded node address is refused rather than trimmed.
+    let recipient_form = crate::node_route::classify_recipient(&p.to);
+    if let Some(refusal) = crate::node_route::refusal_before_write(recipient_form, route.is_some())
+    {
+        return Err(refusal.into_runtime_error());
+    }
+    let node_recipient = recipient_form == crate::node_route::RecipientForm::Node;
     validate_actor_label("send", &p.to, "to")?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -216,8 +227,31 @@ pub(crate) async fn handle_send_with_route(
         ),
         None => Uuid::new_v4(),
     };
+    // The seal decision comes after the idempotency read, so a keyed replay of a send that already
+    // succeeded never reaches the route again.
+    let mut skip_seal = false;
+    let mut repair_holder: Option<Uuid> = None;
+    if node_recipient {
+        if let Some(identity) = identity.as_ref() {
+            if let Some(holder) = khive_runtime::keyed_message::find_keyed_message_holder(
+                runtime,
+                &caller_ns,
+                &identity.physical_key(token),
+            )
+            .await?
+            {
+                if runtime.sender_transport_status(token, holder).await?
+                    != khive_runtime::comm_transport::TransportStatus::Unknown
+                {
+                    skip_seal = true;
+                } else {
+                    repair_holder = Some(holder);
+                }
+            }
+        }
+    }
     let sealed = match route {
-        Some(route) if to_actor.starts_with(crate::node_route::NODE_ADDRESS_PREFIX) => Some(
+        Some(route) if node_recipient && !skip_seal => Some(
             route
                 .seal(crate::node_route::NodeSealRequest {
                     address: &to_actor,
@@ -232,11 +266,19 @@ pub(crate) async fn handle_send_with_route(
         ),
         _ => None,
     };
+    // A fresh node send commits its transport row in the same transaction as the message pair.
+    // Only a keyed replay whose pair landed without a row stores the row on its own, because the
+    // pair is already committed by then.
+    let (inline_transport, repair_transport) = if repair_holder.is_some() {
+        (None, sealed)
+    } else {
+        (sealed, None)
+    };
     let MessageWrite {
         outbound: outbound_note,
         embedding_truncation,
         replayed,
-    } = dual_write_message_with_identity(
+    } = dual_write_message_with_transport(
         runtime,
         token,
         "comm.send",
@@ -254,20 +296,12 @@ pub(crate) async fn handle_send_with_route(
         p.tags.as_deref(),
         &attachments,
         identity.as_ref(),
+        inline_transport,
     )
     .await?;
-    if let Some(mut envelope) = sealed {
-        // A replay whose transport row already exists keeps that row; a replay that lost it
-        // (the note landed but the row did not) stores the freshly sealed envelope.
-        let already_recorded = replayed
-            && runtime
-                .sender_transport_status(token, outbound_note.id)
-                .await?
-                != khive_runtime::comm_transport::TransportStatus::Unknown;
-        if !already_recorded {
-            envelope.outbound_note_id = outbound_note.id;
-            runtime.create_sender_transport(token, envelope).await?;
-        }
+    if let Some(mut envelope) = repair_transport {
+        envelope.outbound_note_id = outbound_note.id;
+        runtime.create_sender_transport(token, envelope).await?;
     }
     if !replayed {
         inbox_signal.publish();

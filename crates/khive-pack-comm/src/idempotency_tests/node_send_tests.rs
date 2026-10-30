@@ -171,7 +171,8 @@ async fn node_send_refusals_write_nothing_and_have_distinct_reasons() {
 async fn node_send_keyed_replay_keeps_the_first_logical_id_and_one_row() {
     let route = NodeTestRoute::accepting();
     let (sender, runtime) = routed_sender(&route);
-    let args = json!({"to": NODE_TO, "subject": "s", "content": "c", "idempotency_key": "node-op-1"});
+    let args =
+        json!({"to": NODE_TO, "subject": "s", "content": "c", "idempotency_key": "node-op-1"});
     let first = sender
         .dispatch("comm.send", args.clone())
         .await
@@ -213,4 +214,225 @@ async fn node_route_is_not_used_for_ordinary_actor_recipients() {
         .expect("local send");
     assert!(route.ids().is_empty(), "only node addresses are sealed");
     assert_eq!(message_count(&runtime, false).await, 2);
+}
+
+fn shared_backend() -> Arc<khive_db::StorageBackend> {
+    let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
+    backend.pool().run_migrations().expect("migrations");
+    Arc::new(backend)
+}
+
+fn as_route(route: &Arc<NodeTestRoute>) -> Arc<dyn crate::node_route::NodeSendRoute> {
+    route.clone()
+}
+
+async fn transport_row_count(runtime: &KhiveRuntime) -> i64 {
+    let result = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_scalar(SqlStatement {
+            sql: "SELECT count(*) FROM comm_sender_transport".into(),
+            params: vec![],
+            label: Some("node-send-transport-count".into()),
+        })
+        .await
+        .unwrap();
+    match result {
+        Some(SqlValue::Integer(n)) => n,
+        other => panic!("unexpected transport count: {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_recipient_without_a_route_is_refused_disabled_and_writes_nothing() {
+    let (sender, _, runtime) = parties();
+    for to in [NODE_TO, "KHIVE1:realm/agent", "Khive1:realm/agent"] {
+        let err = sender
+            .dispatch(
+                "comm.send",
+                json!({"to": to, "subject": "s", "content": "no route"}),
+            )
+            .await
+            .expect_err("a node address with no route must be refused");
+        let text = format!("{err:?}");
+        assert!(text.contains("disabled"), "{to}: {text}");
+        assert_eq!(message_count(&runtime, false).await, 0, "{to}");
+        assert_eq!(transport_row_count(&runtime).await, 0, "{to}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_scheme_is_case_insensitive_when_a_route_is_installed() {
+    let route = NodeTestRoute::accepting();
+    let (sender, runtime) = routed_sender(&route);
+    sender
+        .dispatch(
+            "comm.send",
+            json!({"to": "KHIVE1:realm/agent", "subject": "s", "content": "upper"}),
+        )
+        .await
+        .expect("upper-case scheme send");
+    assert_eq!(
+        route.ids().len(),
+        1,
+        "the upper-case scheme reaches the route"
+    );
+    assert_eq!(transport_row_count(&runtime).await, 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_recipient_with_leading_whitespace_is_refused_with_zero_writes() {
+    let route = NodeTestRoute::accepting();
+    let (sender, runtime) = routed_sender(&route);
+    for to in [
+        " khive1:realm/agent",
+        "\tkhive1:realm/agent",
+        "khive1:realm/agent ",
+    ] {
+        let result = sender
+            .dispatch(
+                "comm.send",
+                json!({"to": to, "subject": "s", "content": "padded"}),
+            )
+            .await;
+        if to.starts_with(char::is_whitespace) {
+            let text = format!(
+                "{:?}",
+                result.expect_err("padded node address must be refused")
+            );
+            assert!(text.contains("not a valid node address"), "{to:?}: {text}");
+            assert_eq!(message_count(&runtime, false).await, 0, "{to:?}");
+            assert_eq!(transport_row_count(&runtime).await, 0, "{to:?}");
+        }
+    }
+    assert!(
+        route.ids().is_empty(),
+        "a padded address never reaches the route"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_keyed_replay_of_a_succeeded_send_never_calls_the_route_again() {
+    let backend = shared_backend();
+    let first_route = NodeTestRoute::accepting();
+    let (first_sender, runtime) = actor_registry_with_route(
+        Arc::clone(&backend),
+        "actor:sender",
+        "local",
+        Some(as_route(&first_route)),
+    );
+    let args =
+        json!({"to": NODE_TO, "subject": "s", "content": "c", "idempotency_key": "node-op-2"});
+    let first = first_sender
+        .dispatch("comm.send", args.clone())
+        .await
+        .expect("first keyed node send");
+    assert_eq!(first_route.ids().len(), 1);
+    let again = first_sender
+        .dispatch("comm.send", args.clone())
+        .await
+        .expect("replay");
+    assert_eq!(again["replayed"], true);
+    assert_eq!(first_route.ids().len(), 1, "a replay must not seal again");
+    // The same actor now has a route that refuses everything; the replay still succeeds because
+    // the idempotency decision comes before the route is consulted.
+    let refusing_route = NodeTestRoute::refusing(crate::node_route::NodeSendRefusal::Disabled);
+    let (refusing_sender, _) = actor_registry_with_route(
+        backend,
+        "actor:sender",
+        "local",
+        Some(as_route(&refusing_route)),
+    );
+    let replay = refusing_sender
+        .dispatch("comm.send", args)
+        .await
+        .expect("replay with a refusing route");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["full_id"], first["full_id"]);
+    assert!(
+        refusing_route.ids().is_empty(),
+        "the refusing route was never called"
+    );
+    assert_eq!(transport_row_count(&runtime).await, 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_send_failure_at_the_transport_write_leaves_no_half_pair() {
+    for key in [None, Some("node-op-atomic")] {
+        let route = NodeTestRoute::accepting();
+        let (sender, runtime) = routed_sender(&route);
+        runtime
+            .sql()
+            .writer()
+            .await
+            .expect("comm writer")
+            .execute_script(
+                "CREATE TRIGGER fail_sender_transport_insert BEFORE INSERT ON comm_sender_transport \
+                 BEGIN SELECT RAISE(ABORT, 'injected transport write failure'); END;"
+                    .into(),
+            )
+            .await
+            .expect("install fault at the second write");
+        let mut args = json!({"to": NODE_TO, "subject": "s", "content": "atomic"});
+        if let Some(key) = key {
+            args["idempotency_key"] = json!(key);
+        }
+        let err = sender
+            .dispatch("comm.send", args)
+            .await
+            .expect_err("the injected transport failure must fail the send");
+        assert!(
+            format!("{err:?}").contains("injected transport write failure"),
+            "{err:?}"
+        );
+        assert_eq!(
+            message_count(&runtime, false).await,
+            0,
+            "no outbound or inbound note may survive a failed transport write ({key:?})"
+        );
+        assert_eq!(transport_row_count(&runtime).await, 0);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn node_send_two_senders_with_one_key_get_distinct_logical_ids() {
+    let backend = shared_backend();
+    let route_a = NodeTestRoute::accepting();
+    let route_b = NodeTestRoute::accepting();
+    let (sender_a, runtime) = actor_registry_with_route(
+        Arc::clone(&backend),
+        "actor:sender",
+        "local",
+        Some(as_route(&route_a)),
+    );
+    let (sender_b, _) =
+        actor_registry_with_route(backend, "actor:other", "local", Some(as_route(&route_b)));
+    let args =
+        json!({"to": NODE_TO, "subject": "s", "content": "c", "idempotency_key": "shared-key"});
+    let first = sender_a
+        .dispatch("comm.send", args.clone())
+        .await
+        .expect("sender a");
+    let second = sender_b
+        .dispatch("comm.send", args)
+        .await
+        .expect("sender b");
+    assert_eq!(
+        second["replayed"], false,
+        "another sender's key is not a replay"
+    );
+    assert_ne!(first["full_id"], second["full_id"]);
+    let (ids_a, ids_b) = (route_a.ids(), route_b.ids());
+    assert_eq!(ids_a.len(), 1);
+    assert_eq!(ids_b.len(), 1);
+    assert_ne!(ids_a[0], ids_b[0], "each sender owns its own logical id");
+    assert_eq!(transport_row_count(&runtime).await, 2);
 }

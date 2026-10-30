@@ -13,12 +13,54 @@ use khive_runtime::comm_transport::SenderEnvelope;
 use khive_runtime::RuntimeError;
 use uuid::Uuid;
 
-/// Prefix that marks a recipient as a node address.
+/// Prefix that marks a recipient as a node address. The scheme is matched case-insensitively.
 pub const NODE_ADDRESS_PREFIX: &str = "khive1:";
+
+/// How a raw `to` value relates to the node-address form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecipientForm {
+    /// Not a node address; the local actor-label and email paths apply.
+    Local,
+    /// A node address exactly as written, with no surrounding whitespace.
+    Node,
+    /// A node address with leading or trailing whitespace. It is refused, never trimmed.
+    PaddedNode,
+}
+
+/// Classify the raw recipient exactly as the caller wrote it. This is the only place the send
+/// path decides whether a recipient is a node address.
+pub fn classify_recipient(raw: &str) -> RecipientForm {
+    let trimmed = raw.trim();
+    let has_scheme = trimmed
+        .get(..NODE_ADDRESS_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(NODE_ADDRESS_PREFIX));
+    if !has_scheme {
+        RecipientForm::Local
+    } else if trimmed.len() != raw.len() {
+        RecipientForm::PaddedNode
+    } else {
+        RecipientForm::Node
+    }
+}
+
+/// The refusal owed to a recipient before anything is written, or `None` when the recipient is
+/// not a node address or the send may go on to sealing. A node-form recipient with no route
+/// installed is always refused as disabled; it never falls through to the local path.
+pub fn refusal_before_write(form: RecipientForm, route_installed: bool) -> Option<NodeSendRefusal> {
+    match form {
+        RecipientForm::Local => None,
+        _ if !route_installed => Some(NodeSendRefusal::Disabled),
+        RecipientForm::PaddedNode => Some(NodeSendRefusal::UnparseableAddress(
+            "surrounding whitespace is not allowed".to_string(),
+        )),
+        RecipientForm::Node => None,
+    }
+}
 
 /// Everything a route needs to seal one outgoing message.
 pub struct NodeSealRequest<'a> {
-    /// Recipient node address exactly as the caller wrote it (trimmed).
+    /// Recipient node address exactly as the caller wrote it; surrounding whitespace is refused
+    /// before sealing, so this never carries any.
     pub address: &'a str,
     /// Durable identity chosen for this message before any write.
     pub logical_message_id: Uuid,
@@ -71,4 +113,61 @@ pub type SealFuture<'a> =
 pub trait NodeSendRoute: Send + Sync {
     /// Seal `request` for the recipient's pinned key, or refuse without side effects.
     fn seal<'a>(&'a self, request: NodeSealRequest<'a>) -> SealFuture<'a>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_matches_the_scheme_in_any_case() {
+        for raw in ["khive1:abc", "KHIVE1:abc", "Khive1:abc"] {
+            assert_eq!(classify_recipient(raw), RecipientForm::Node, "{raw}");
+        }
+    }
+
+    #[test]
+    fn classify_flags_padding_instead_of_trimming() {
+        for raw in [" khive1:abc", "khive1:abc ", "\tKHIVE1:abc\n"] {
+            assert_eq!(
+                classify_recipient(raw),
+                RecipientForm::PaddedNode,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_leaves_other_recipients_local() {
+        for raw in [
+            "actor:recipient",
+            "telegram:recipient",
+            "khive",
+            "khive2:abc",
+            "",
+            "é",
+        ] {
+            assert_eq!(classify_recipient(raw), RecipientForm::Local, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn node_form_without_a_route_is_refused_as_disabled() {
+        for form in [RecipientForm::Node, RecipientForm::PaddedNode] {
+            assert_eq!(
+                refusal_before_write(form, false),
+                Some(NodeSendRefusal::Disabled)
+            );
+        }
+        assert_eq!(refusal_before_write(RecipientForm::Local, false), None);
+    }
+
+    #[test]
+    fn padded_node_form_with_a_route_is_unparseable() {
+        assert!(matches!(
+            refusal_before_write(RecipientForm::PaddedNode, true),
+            Some(NodeSendRefusal::UnparseableAddress(_))
+        ));
+        assert_eq!(refusal_before_write(RecipientForm::Node, true), None);
+    }
 }

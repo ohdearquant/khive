@@ -354,7 +354,7 @@ async fn absent_policy_preserves_backlog_and_non_email_recipients_ignore_email_p
     let denied_runtime = runtime
         .clone()
         .with_outbound_email_policy(OutboundEmailPolicy::configured(vec![]).unwrap());
-    for recipient in ["actor:recipient", "telegram:recipient", "khive1:recipient"] {
+    for recipient in ["actor:recipient", "telegram:recipient"] {
         send(
             &denied_runtime,
             &signal,
@@ -364,8 +364,24 @@ async fn absent_policy_preserves_backlog_and_non_email_recipients_ignore_email_p
         .await
         .unwrap();
     }
-    assert_eq!(snapshot(&runtime).await["notes"], 8);
-    assert_eq!(signal.snapshot(), 4);
+    // A node address with no node route installed is refused as disabled before anything is
+    // written; it never falls through to the plaintext local path.
+    let before_node = snapshot(&runtime).await;
+    let node_refusal = send(
+        &denied_runtime,
+        &signal,
+        &token,
+        json!({"to":"khive1:recipient","content":"non-email"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{node_refusal:?}").contains("the node channel is disabled"),
+        "{node_refusal:?}"
+    );
+    assert_eq!(snapshot(&runtime).await, before_node);
+    assert_eq!(snapshot(&runtime).await["notes"], 6);
+    assert_eq!(signal.snapshot(), 3);
     assert!(runtime.outbound_email_policy().allows("denied@example.com"));
     assert!(!denied_runtime
         .core()
