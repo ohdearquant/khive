@@ -5040,6 +5040,7 @@ fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() 
 }
 
 include!("server/config_id_read_only_tests.rs");
+include!("server/node_config_id_tests.rs");
 
 /// The collision fix is deliberately conditional: ordinary topology
 /// components that contain no reserved syntax keep the legacy spelling
