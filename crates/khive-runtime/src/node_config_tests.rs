@@ -420,7 +420,7 @@ fn the_runtime_config_keeps_only_an_enabled_table() {
         &enabled,
         crate::config::RuntimeConfig::default(),
     );
-    assert_eq!(mapped.node_channel, Some(valid()));
+    assert_eq!(mapped.node_channel.as_deref(), Some(&valid()));
 
     let mut disabled = KhiveConfig::default();
     disabled.channel.node = Some(NodeChannelConfig::default());
@@ -436,6 +436,17 @@ fn the_runtime_config_keeps_only_an_enabled_table() {
         crate::config::RuntimeConfig::default(),
     );
     assert!(mapped.node_channel.is_none());
+}
+
+#[test]
+fn the_runtime_config_holds_the_node_table_behind_one_pointer() {
+    // Runtime handles carry their config inline and the recall path holds
+    // several of them across awaits. With the table inline, a debug daemon's
+    // recall overflowed its 2 MiB worker stack.
+    assert_eq!(
+        std::mem::size_of_val(&crate::config::RuntimeConfig::default().node_channel),
+        std::mem::size_of::<usize>()
+    );
 }
 
 #[test]

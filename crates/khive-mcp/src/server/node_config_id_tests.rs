@@ -44,7 +44,7 @@ fn node_channel_table(actor: &str) -> khive_runtime::node_config::NodeChannelCon
 
 fn node_channel_id(node: Option<khive_runtime::node_config::NodeChannelConfig>) -> String {
     let runtime = RuntimeConfig {
-        node_channel: node,
+        node_channel: node.map(std::sync::Arc::new),
         ..RuntimeConfig::no_embeddings()
     };
     compute_config_id(&runtime, None)

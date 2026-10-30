@@ -326,7 +326,9 @@ pub struct RuntimeConfig {
     /// Configured receipt key ring. Absence never generates a replacement key.
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
     /// Enabled `[channel.node]` table. `None` when the table is absent or disabled.
-    pub node_channel: Option<crate::node_config::NodeChannelConfig>,
+    /// Held behind a pointer: every runtime handle carries this config inline, so
+    /// an inline table grows each future that holds a handle.
+    pub node_channel: Option<std::sync::Arc<crate::node_config::NodeChannelConfig>>,
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -1042,7 +1044,12 @@ pub fn runtime_config_from_khive_config(
     let mounts = khive_cfg.mounts.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
-    let node_channel = khive_cfg.channel.node.clone().filter(|node| node.enabled);
+    let node_channel = khive_cfg
+        .channel
+        .node
+        .clone()
+        .filter(|node| node.enabled)
+        .map(std::sync::Arc::new);
     let code_map_root = khive_cfg.code_map_root.clone();
     let code_maps = khive_cfg.code_maps.clone();
     let code_map_protected_database_paths = khive_cfg
