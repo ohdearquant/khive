@@ -23,8 +23,8 @@ use crate::repo;
 use crate::{
     blob, code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, pack_introspect, reindex, sync,
-    vector,
+    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, node, pack_introspect, reindex,
+    sync, vector,
 };
 use khive_runtime::{
     runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
@@ -144,6 +144,11 @@ enum Command {
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
+
+    // Node setup. Its summaries are set on the subcommands in `node`; it is
+    // routed through its own exit wrapper, which prints one line and exits with
+    // a typed code on failure.
+    Node(node::NodeArgs),
 }
 
 /// Arguments for the dedicated events daemon (ADR-170).
@@ -465,6 +470,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Db(d) => cmd_db(d).await,
         Command::Supervisor(command) => crate::supervisor::run(command, &args.log).await,
         Command::Engine(e) => engine::run_engine(e).await,
+        Command::Node(args) => node::run_cli(args).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Blob(b) => blob::run_blob(b).await,
         Command::Reindex(r) => reindex::run_reindex(r).await,

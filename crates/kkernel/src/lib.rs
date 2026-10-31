@@ -22,6 +22,7 @@ pub mod git_dedup;
 pub mod git_ingest;
 pub mod kg;
 pub mod mount;
+mod node;
 pub mod pack_introspect;
 pub mod reindex;
 #[cfg(feature = "repo-showcase")]

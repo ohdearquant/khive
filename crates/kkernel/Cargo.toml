@@ -67,6 +67,9 @@ toml = { workspace = true }
 rmcp = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
+khive-channel-node = { version = "0.15.0", path = "../khive-channel-node", optional = true }
+toml_edit = { version = "=0.22.27", optional = true }
+libc = { workspace = true, optional = true }
 
 lattice-embed = { workspace = true }
 
@@ -90,6 +93,7 @@ khive-mcp = { version = "0.15.0", path = "../khive-mcp", default-features = fals
 khive-gate-rego = { version = "0.15.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.15.0", path = "../khive-storage", features = ["test-support"] }
 khive-runtime = { version = "0.15.0", path = "../khive-runtime", features = ["test-internals"] }
+khive-channel-node = { version = "0.15.0", path = "../khive-channel-node", features = ["test-keychain", "test-server"] }
 blake3 = { workspace = true, features = ["std"] }
 
 [features]
@@ -117,6 +121,8 @@ kg-adapters = ["dep:khive-vcs-adapters"]
 repo-showcase = ["khive-repo-showcase/export"]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
+node-setup = ["dep:khive-channel-node", "dep:toml_edit", "dep:libc"]
+macos-keychain = ["node-setup", "khive-channel-node/macos-keychain"]
 # Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
 channel-email = ["khive-mcp/channel-email"]
 # Pass-through: enables the Telegram Bot API polling + outbox loop. Inert without KHIVE_TELEGRAM_* env vars.
