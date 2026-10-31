@@ -925,7 +925,7 @@ async fn supervisor_lock_opener_refuses_a_symlink() {
 
 #[tokio::test]
 #[serial]
-async fn explicit_supervisor_lock_parent_must_exist_and_be_safe() {
+async fn explicit_supervisor_lock_parent_is_created_when_missing_and_must_be_safe() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     if crate::test_isolation::rerun_with_private_home() {
@@ -934,19 +934,22 @@ async fn explicit_supervisor_lock_parent_must_exist_and_be_safe() {
     let _cleanup = RecoveryTestGuard::new();
     clear_daemon_env();
     let root = tempfile::tempdir().expect("private synthetic root");
-    let missing = root.path().join("missing");
+    let missing = root.path().join("missing").join("nested");
     std::env::set_var("KHIVE_PID", missing.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", missing.join("khived.sock"));
-    let absent_error = super::forward::acquire_supervisor_marker_lock()
-        .await
-        .unwrap_err();
-    assert!(absent_error
-        .to_string()
-        .contains(&missing.display().to_string()));
-    assert!(
-        !missing.exists(),
-        "an explicit absent parent must not be created"
+    // SAFETY: this test runs in an isolated private-home child process.
+    let old_umask = unsafe { libc::umask(0o077) };
+    let opened = super::forward::acquire_supervisor_marker_lock().await;
+    // SAFETY: restore the umask returned in this isolated process.
+    unsafe { libc::umask(old_umask) };
+    let guard = opened.expect("create trusted explicit supervisor parent and lock");
+    assert!(missing.is_dir(), "missing parent levels must be created");
+    assert_eq!(
+        std::fs::metadata(&missing).unwrap().permissions().mode() & 0o777,
+        0o700
     );
+    assert_eq!(guard.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    drop(guard);
 
     let unsafe_parent = root.path().join("unsafe");
     std::fs::create_dir(&unsafe_parent).unwrap();
@@ -977,6 +980,7 @@ async fn explicit_supervisor_lock_parent_must_exist_and_be_safe() {
     let target = root.path().join("target");
     let alias = root.path().join("alias");
     std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
     symlink(&target, &alias).unwrap();
     std::env::set_var("KHIVE_PID", alias.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", alias.join("khived.sock"));

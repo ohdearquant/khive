@@ -479,6 +479,7 @@ pub(super) fn ensure_rendezvous_dir_is_trusted(
     if mode & 0o022 != 0 {
         if role == RendezvousPathRole::PidFile
             && super::lifecycle::path_override(PID_PATH_ENV).is_none()
+            && parent == khive_dir()
         {
             anyhow::bail!(
                 "refusing to start: default PID-file directory {} is mode {:04o} — writable by group or other",
@@ -727,7 +728,8 @@ pub(super) fn ensure_rendezvous_path_is_swap_resistant(
 #[cfg(all(test, unix))]
 mod default_directory_repair_tests {
     use super::{
-        ensure_socket_dir_is_trusted, repair_default_dir_with_recovery_guidance,
+        ensure_pid_file_dir_is_trusted, ensure_socket_dir_is_trusted,
+        repair_default_dir_with_recovery_guidance,
         repair_owned_default_dir, repair_owned_default_dir_with_hooks, tighten_owned_recovery_lock,
         tighten_owned_recovery_lock_with_hook, RendezvousPathRole,
     };
@@ -762,6 +764,186 @@ mod default_directory_repair_tests {
         fn config_id(&self) -> &str {
             "test"
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pid_directory_diagnostic_depends_on_the_checked_path_and_override() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-pid-diagnostic-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        let default = home.join(".khive");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_SOCKET");
+
+        let other_message = ensure_pid_file_dir_is_trusted(&other.join("daemon.pid"))
+            .unwrap_err().to_string();
+        assert!(other_message.contains("PID-file directory") && other_message.contains("for KHIVE_PID"), "{other_message}");
+        let default_message = ensure_pid_file_dir_is_trusted(&default.join("khived.pid"))
+            .unwrap_err().to_string();
+        assert!(default_message.contains("default PID-file directory"), "{default_message}");
+
+        std::env::set_var("KHIVE_PID", default.join("khived.pid"));
+        let explicit_message = ensure_pid_file_dir_is_trusted(&default.join("khived.pid"))
+            .unwrap_err().to_string();
+        assert!(explicit_message.contains("for KHIVE_PID"), "{explicit_message}");
+        assert!(!explicit_message.contains("default PID-file directory"), "{explicit_message}");
+        assert_eq!(std::fs::metadata(&other).unwrap().permissions().mode() & 0o777, 0o775);
+        assert_eq!(std::fs::metadata(&default).unwrap().permissions().mode() & 0o777, 0o775);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_boot_lock_does_not_prepare_an_unrelated_default_home() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-explicit-boot-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("missing-home");
+        let lock = root.path().join("boot.lock");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("KHIVE_PID", root.path().join("daemon.pid"));
+        std::env::set_var("KHIVE_SOCKET", root.path().join("daemon.sock"));
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        let opened = super::super::locks::open_mutating_daemon_lock(&lock, false)
+            .expect("the explicit lock parent exists and is trusted");
+        assert!(lock.exists());
+        assert!(!home.exists(), "an unrelated default HOME must remain absent");
+        drop(opened);
+
+        let unsafe_parent = root.path().join("unsafe-parent");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let unsafe_lock = unsafe_parent.join("boot.lock");
+        assert!(super::super::locks::open_mutating_daemon_lock(&unsafe_lock, false).is_err());
+        assert!(!unsafe_lock.exists(), "an untrusted explicit parent must remain refused");
+        assert!(!home.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_boot_lock_creates_its_missing_pid_parent() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-explicit-missing-parent-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("missing-home");
+        let parent = root.path().join("new").join("rendezvous");
+        let lock = parent.join("boot.lock");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("KHIVE_PID", parent.join("daemon.pid"));
+        std::env::set_var("KHIVE_SOCKET", parent.join("daemon.sock"));
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        assert!(!parent.exists());
+        // SAFETY: this fixture runs alone in a dedicated child process.
+        let previous_umask = unsafe { libc::umask(0o077) };
+        let opened = super::super::locks::open_mutating_daemon_lock(&lock, false);
+        // SAFETY: restore the process umask immediately after the operation.
+        unsafe { libc::umask(previous_umask) };
+        let opened = opened.expect("the explicitly selected lock parent is created");
+        assert!(parent.is_dir());
+        assert!(lock.is_file());
+        assert!(!home.exists());
+        drop(opened);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_rendezvous_is_prepared_with_an_external_boot_lock() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-default-with-external-lock-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let lock = root.path().join("boot.lock");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        let opened = super::super::locks::open_mutating_daemon_lock(&lock, false)
+            .expect("the external boot lock parent is trusted");
+        let default = home.join(".khive");
+        assert!(default.is_dir());
+        assert_eq!(std::fs::metadata(default).unwrap().permissions().mode() & 0o777, 0o700);
+        drop(opened);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_daemon_boot_keeps_private_home_empty() {
+        use std::os::unix::fs::FileTypeExt;
+
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-explicit-daemon-")
+            .tempdir_in("/tmp")
+            .expect("private synthetic root");
+        let home = root.path().join("home");
+        let rendezvous = root.path().join("run");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&rendezvous).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&rendezvous, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = rendezvous.join("boot.lock");
+        let pid = rendezvous.join("daemon.pid");
+        let socket = rendezvous.join("daemon.sock");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::set_var("KHIVE_SOCKET", &socket);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+
+        let daemon = tokio::spawn(super::run_daemon(EmptyDispatcher));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(!daemon.is_finished(), "daemon exited before the boot witness");
+                if lock.exists() && pid.exists() && socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("daemon must create its explicit boot lock, PID and socket");
+        assert!(std::fs::metadata(&socket).unwrap().file_type().is_socket());
+        assert!(
+            std::fs::read_dir(&home).unwrap().next().is_none(),
+            "explicit daemon boot must leave its private HOME empty"
+        );
+        daemon.abort();
+        let error = daemon.await.expect_err("the daemon task must be cancelled");
+        assert!(error.is_cancelled(), "daemon task failed before cancellation: {error}");
     }
 
     #[tokio::test]
@@ -838,6 +1020,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn foreign_owner_is_refused_before_permissions_change() {
         let directory = tempfile::Builder::new()
             .prefix("khive-foreign-owner-")
@@ -865,6 +1048,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repair_does_not_chmod_a_replacement_path() {
         let root = tempfile::Builder::new()
             .prefix("khive-default-swap-")
@@ -902,6 +1086,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repair_does_not_follow_symlink_replacing_the_leaf_before_open() {
         use std::os::unix::fs::symlink;
 
@@ -936,6 +1121,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repair_refuses_directory_replaced_before_open_without_chmod() {
         let root = tempfile::Builder::new()
             .prefix("khive-default-before-open-")
@@ -976,6 +1162,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repair_does_not_restore_owner_bits_removed_after_validation() {
         let root = tempfile::Builder::new()
             .prefix("khive-default-chmod-")
@@ -1007,6 +1194,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn newly_created_inaccessible_default_dir_reports_manual_recovery() {
         let root = tempfile::Builder::new()
             .prefix("khive-dir-recovery-")
@@ -1041,6 +1229,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn concurrent_lock_creation_reopens_the_validated_existing_entry() {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-create-race-")
@@ -1070,6 +1259,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn concurrent_lock_symlink_is_refused_before_opening_its_target() {
         use std::os::unix::fs::symlink;
         let root = tempfile::Builder::new()
@@ -1101,6 +1291,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn created_lock_failures_leave_entry_and_report_manual_recovery() {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-failure-")
@@ -1141,6 +1332,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn created_lock_replacement_reports_inspection_without_removal_advice() {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-created-swap-")
@@ -1198,6 +1390,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn recovery_lock_opener_refuses_a_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -1225,6 +1418,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn foreign_owned_lock_is_refused_without_chmod() {
         let root = tempfile::Builder::new()
             .prefix("khive-foreign-lock-")
@@ -1251,6 +1445,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lock_tightening_does_not_chmod_a_replacement_path() {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-swap-")
@@ -1282,6 +1477,7 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lock_open_refuses_parent_replaced_after_directory_fd_check() {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-parent-swap-")

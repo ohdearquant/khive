@@ -22,7 +22,20 @@ pub fn open_mutating_daemon_lock(
     path: &std::path::Path,
     read_write: bool,
 ) -> std::io::Result<std::fs::File> {
-    super::prepare_default_rendezvous_for_recovery().map_err(lock_error)?;
+    let explicit_rendezvous = super::lifecycle::path_override(super::lifecycle::PID_PATH_ENV)
+        .is_some()
+        || super::lifecycle::path_override(super::lifecycle::SOCKET_PATH_ENV).is_some();
+    let is_default_lock_parent = path.parent() == Some(super::khive_dir().as_path());
+    if !explicit_rendezvous || is_default_lock_parent {
+        super::prepare_default_rendezvous_for_recovery().map_err(lock_error)?;
+    }
+    // Preserve recursive creation for caller-selected lock locations. The
+    // checked opener below still validates the resulting path before use.
+    if !is_default_lock_parent {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
     checked_open_lock(path, true, read_write, true)?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "created lock is absent"))
 }
