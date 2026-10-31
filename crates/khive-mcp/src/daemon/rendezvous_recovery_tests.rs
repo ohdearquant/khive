@@ -397,16 +397,24 @@ async fn recovery_repairs_default_directory_but_probes_do_not() {
     let refusal = pid_file_directory_is_trusted_if_present(&pid_file).unwrap_err();
     assert!(refusal.contains("0775"), "{refusal}");
     assert!(!refusal.contains("KHIVE_PID"), "{refusal}");
-    assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o775);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
 
     let spawn_calls = AtomicUsize::new(0);
     match recover(&spawn_calls).await {
-        Ok(RecoveryOutcome::Spawned(mut child)) => { let _ = child.wait(); }
+        Ok(RecoveryOutcome::Spawned(mut child)) => {
+            let _ = child.wait();
+        }
         other => panic!("expected default recovery to spawn, got {other:?}"),
     }
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
-    assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 #[tokio::test]
@@ -433,19 +441,26 @@ async fn recovery_from_fresh_home_under_umask_002() {
     unsafe { libc::umask(previous_umask) };
 
     match outcome {
-        Ok(RecoveryOutcome::Spawned(mut child)) => { let _ = child.wait(); }
+        Ok(RecoveryOutcome::Spawned(mut child)) => {
+            let _ = child.wait();
+        }
         other => panic!("expected fresh-home recovery to spawn, got {other:?}"),
     }
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
-    assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn fresh_home_paired_overrides_still_prepare_default_lock_parent() {
     use std::os::unix::fs::PermissionsExt;
-    if crate::test_isolation::rerun_with_private_home() { return; }
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let _cleanup = RecoveryTestGuard::new();
     clear_daemon_env();
     reset_counters();
@@ -457,17 +472,28 @@ async fn fresh_home_paired_overrides_still_prepare_default_lock_parent() {
     std::env::set_var("KHIVE_SOCKET", override_dir.path().join("daemon.sock"));
     let spawn_calls = AtomicUsize::new(0);
     match recover(&spawn_calls).await {
-        Ok(RecoveryOutcome::Spawned(mut child)) => { let _ = child.wait(); }
+        Ok(RecoveryOutcome::Spawned(mut child)) => {
+            let _ = child.wait();
+        }
         other => panic!("expected recovery using the default lock parent: {other:?}"),
     }
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::metadata(home.join(".khive")).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(home.join(".khive"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn failure_of_any_recovery_boot_fence_never_authorizes_later_actions() {
-    if crate::test_isolation::rerun_with_private_home() { return; }
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let _cleanup = RecoveryTestGuard::new();
     clear_daemon_env();
     reset_counters();
@@ -479,7 +505,10 @@ async fn failure_of_any_recovery_boot_fence_never_authorizes_later_actions() {
         super::recovery::FAIL_RECOVERY_BOOT_LOCK_STAGE.store(stage, Ordering::SeqCst);
         let result = recover(&spawn_calls).await;
         super::recovery::FAIL_RECOVERY_BOOT_LOCK_STAGE.store(usize::MAX, Ordering::SeqCst);
-        assert!(matches!(result, Ok(RecoveryOutcome::Uncertain)), "stage {stage}: {result:?}");
+        assert!(
+            matches!(result, Ok(RecoveryOutcome::Uncertain)),
+            "stage {stage}: {result:?}"
+        );
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
         assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
         assert_eq!(KILL_COUNT.load(Ordering::SeqCst), usize::from(stage == 2));
@@ -487,7 +516,9 @@ async fn failure_of_any_recovery_boot_fence_never_authorizes_later_actions() {
     }
     reset_counters();
     match recover(&spawn_calls).await {
-        Ok(RecoveryOutcome::Spawned(mut child)) => { let _ = child.wait(); }
+        Ok(RecoveryOutcome::Spawned(mut child)) => {
+            let _ = child.wait();
+        }
         other => panic!("baseline recovery must reach the launcher: {other:?}"),
     }
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
@@ -515,10 +546,16 @@ async fn recovery_refuses_insecure_explicit_override_without_chmod() {
 
     let outcome = recover(&spawn_calls).await;
 
-    assert!(matches!(outcome, Err(RecoveryError::PidFileDirectoryUntrusted(_))));
+    assert!(matches!(
+        outcome,
+        Err(RecoveryError::PidFileDirectoryUntrusted(_))
+    ));
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
-    assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o775);
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
 }
 
 #[test]
@@ -539,7 +576,10 @@ fn explicitly_selected_default_directory_is_not_repaired_by_recovery() {
     daemon::prepare_default_rendezvous_for_recovery().unwrap();
 
     assert!(pid_file_directory_is_trusted_if_present(&pid_path()).is_err());
-    assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o775);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
 }
 
 #[test]
@@ -559,7 +599,10 @@ fn empty_overrides_follow_the_default_repair_path() {
 
     daemon::prepare_default_rendezvous_for_recovery().unwrap();
 
-    assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 #[test]
@@ -576,7 +619,10 @@ fn read_only_pid_probe_does_not_create_an_absent_default_directory() {
 
     assert!(!pid_file_directory_is_trusted_if_present(&directory.join("khived.pid")).unwrap());
 
-    assert!(!directory.exists(), "a read-only probe must not create a directory");
+    assert!(
+        !directory.exists(),
+        "a read-only probe must not create a directory"
+    );
 }
 
 #[test]
@@ -595,7 +641,10 @@ fn default_recovery_allows_a_trusted_existing_override_parent() {
     std::env::set_var("KHIVE_LOCK", &outside_lock);
 
     daemon::prepare_default_rendezvous_for_recovery().unwrap();
-    assert!(!outside_lock.exists(), "default preparation does not create the override lock");
+    assert!(
+        !outside_lock.exists(),
+        "default preparation does not create the override lock"
+    );
     let lock = daemon::open_mutating_daemon_lock(&outside_lock, false)
         .expect("trusted existing override parent");
     assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
@@ -615,8 +664,13 @@ async fn recovery_refuses_preplaced_lock_symlinks_before_opening_them() {
     let directory = default_rendezvous_dir();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775)).unwrap();
     let target = directory.parent().unwrap().join("not-a-recovery-lock");
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
-    for lock in [daemon::lock_path(), daemon::recoverer_lock_path(), marker_lock.clone()] {
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    for lock in [
+        daemon::lock_path(),
+        daemon::recoverer_lock_path(),
+        marker_lock.clone(),
+    ] {
         symlink(&target, &lock).unwrap();
         let spawn_calls = AtomicUsize::new(0);
 
@@ -650,47 +704,70 @@ async fn recovery_waits_for_preopened_group_readable_locks() {
     reset_counters();
     let directory = default_rendezvous_dir();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775)).unwrap();
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     let boot_lock = daemon::lock_path();
 
-    for lock in [boot_lock.clone(), daemon::recoverer_lock_path(), marker_lock.clone()] {
+    for lock in [
+        boot_lock.clone(),
+        daemon::recoverer_lock_path(),
+        marker_lock.clone(),
+    ] {
         std::fs::write(&lock, b"").unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
         let held = std::fs::File::open(&lock).expect("read-only lock fixture");
         // SAFETY: `held` is an open file descriptor; LOCK_NB bounds the setup.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         if lock == marker_lock {
             daemon::prepare_default_rendezvous_for_recovery().unwrap();
             let (sender, receiver) = std::sync::mpsc::channel();
-            *super::forward::SUPERVISOR_LOCK_CONTENDED_HOOK.lock().unwrap() = Some(sender);
+            *super::forward::SUPERVISOR_LOCK_CONTENDED_HOOK
+                .lock()
+                .unwrap() = Some(sender);
             let mut task = tokio::spawn(super::forward::acquire_supervisor_marker_lock());
-            let event = tokio::task::spawn_blocking(move || receiver.recv_timeout(std::time::Duration::from_secs(3)));
+            let event = tokio::task::spawn_blocking(move || {
+                receiver.recv_timeout(std::time::Duration::from_secs(3))
+            });
             tokio::select! {
                 result = &mut task => panic!("marker contender completed while holder retained lock: {result:?}"),
                 received = event => received.unwrap().expect("fixture did not observe contention"),
             }
             drop(held);
             let guard = tokio::time::timeout(std::time::Duration::from_secs(3), task)
-                .await.expect("marker lock must acquire after release").unwrap().unwrap();
+                .await
+                .expect("marker lock must acquire after release")
+                .unwrap()
+                .unwrap();
             drop(guard);
         } else {
             let attempt = if lock == boot_lock {
                 daemon::try_acquire_daemon_boot_guard_until(std::time::Instant::now())
             } else {
                 daemon::try_acquire_recoverer_lock_until(std::time::Instant::now())
-            }.expect("qualified lock attempt");
-            assert!(attempt.is_none(), "the preopened holder must be observed before release");
+            }
+            .expect("qualified lock attempt");
+            assert!(
+                attempt.is_none(),
+                "the preopened holder must be observed before release"
+            );
             drop(held);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let guard = if lock == boot_lock {
                 daemon::try_acquire_daemon_boot_guard_until(deadline)
             } else {
                 daemon::try_acquire_recoverer_lock_until(deadline)
-            }.expect("qualified lock attempt");
+            }
+            .expect("qualified lock attempt");
             assert!(guard.is_some(), "the lock must be available after release");
             drop(guard);
         }
-        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
         std::fs::remove_file(lock).unwrap();
     }
@@ -708,9 +785,14 @@ async fn recovery_tightens_existing_owned_group_accessible_locks() {
     clear_daemon_env();
     reset_counters();
     default_rendezvous_dir();
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     for mode in [0o644, 0o664] {
-        for lock in [daemon::lock_path(), daemon::recoverer_lock_path(), marker_lock.clone()] {
+        for lock in [
+            daemon::lock_path(),
+            daemon::recoverer_lock_path(),
+            marker_lock.clone(),
+        ] {
             std::fs::write(&lock, b"").unwrap();
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
             let spawn_calls = AtomicUsize::new(0);
@@ -723,7 +805,10 @@ async fn recovery_tightens_existing_owned_group_accessible_locks() {
                 }
                 other => panic!("expected recovery with tightened lock, got {other:?}"),
             }
-            assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
             assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
             std::fs::remove_file(lock).unwrap();
@@ -743,15 +828,22 @@ async fn recovery_accepts_existing_owner_only_unheld_locks() {
     clear_daemon_env();
     reset_counters();
     default_rendezvous_dir();
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
-    for lock in [daemon::lock_path(), daemon::recoverer_lock_path(), marker_lock] {
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    for lock in [
+        daemon::lock_path(),
+        daemon::recoverer_lock_path(),
+        marker_lock,
+    ] {
         std::fs::write(&lock, b"").unwrap();
         std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let spawn_calls = AtomicUsize::new(0);
 
     match recover(&spawn_calls).await {
-        Ok(RecoveryOutcome::Spawned(mut child)) => { let _ = child.wait(); }
+        Ok(RecoveryOutcome::Spawned(mut child)) => {
+            let _ = child.wait();
+        }
         other => panic!("expected owner-only locks to permit recovery, got {other:?}"),
     }
     assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
@@ -774,7 +866,10 @@ fn existing_restrictive_lock_does_not_gain_owner_permissions() {
     for mode in [0o400, 0o200] {
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
         daemon::prepare_default_rendezvous_for_recovery().unwrap();
-        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, mode);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            mode
+        );
     }
 }
 
@@ -789,7 +884,8 @@ async fn new_supervisor_lock_is_owner_only_under_restrictive_umask() {
     let _cleanup = RecoveryTestGuard::new();
     clear_daemon_env();
     default_rendezvous_dir();
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     assert!(!marker_lock.exists());
     // SAFETY: this test runs in an isolated private-home child process.
     let old_umask = unsafe { libc::umask(0o777) };
@@ -816,10 +912,15 @@ async fn supervisor_lock_opener_refuses_a_symlink() {
     let lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     symlink(&target, &lock).unwrap();
 
-    let error = super::forward::acquire_supervisor_marker_lock().await.unwrap_err();
+    let error = super::forward::acquire_supervisor_marker_lock()
+        .await
+        .unwrap_err();
 
     assert!(error.to_string().contains(&lock.display().to_string()));
-    assert!(!target.exists(), "opening a lock must not create a symlink target");
+    assert!(
+        !target.exists(),
+        "opening a lock must not create a symlink target"
+    );
 }
 
 #[tokio::test]
@@ -836,20 +937,42 @@ async fn explicit_supervisor_lock_parent_must_exist_and_be_safe() {
     let missing = root.path().join("missing");
     std::env::set_var("KHIVE_PID", missing.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", missing.join("khived.sock"));
-    let absent_error = super::forward::acquire_supervisor_marker_lock().await.unwrap_err();
-    assert!(absent_error.to_string().contains(&missing.display().to_string()));
-    assert!(!missing.exists(), "an explicit absent parent must not be created");
+    let absent_error = super::forward::acquire_supervisor_marker_lock()
+        .await
+        .unwrap_err();
+    assert!(absent_error
+        .to_string()
+        .contains(&missing.display().to_string()));
+    assert!(
+        !missing.exists(),
+        "an explicit absent parent must not be created"
+    );
 
     let unsafe_parent = root.path().join("unsafe");
     std::fs::create_dir(&unsafe_parent).unwrap();
     std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o775)).unwrap();
     std::env::set_var("KHIVE_PID", unsafe_parent.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", unsafe_parent.join("khived.sock"));
-    let unsafe_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
-    let unsafe_error = super::forward::acquire_supervisor_marker_lock().await.unwrap_err();
-    assert!(unsafe_error.to_string().contains(&unsafe_parent.display().to_string()));
-    assert!(!unsafe_lock.exists(), "an unsafe override parent must not gain a lock");
-    assert_eq!(std::fs::metadata(&unsafe_parent).unwrap().permissions().mode() & 0o777, 0o775);
+    let unsafe_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let unsafe_error = super::forward::acquire_supervisor_marker_lock()
+        .await
+        .unwrap_err();
+    assert!(unsafe_error
+        .to_string()
+        .contains(&unsafe_parent.display().to_string()));
+    assert!(
+        !unsafe_lock.exists(),
+        "an unsafe override parent must not gain a lock"
+    );
+    assert_eq!(
+        std::fs::metadata(&unsafe_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
 
     let target = root.path().join("target");
     let alias = root.path().join("alias");
@@ -857,15 +980,24 @@ async fn explicit_supervisor_lock_parent_must_exist_and_be_safe() {
     symlink(&target, &alias).unwrap();
     std::env::set_var("KHIVE_PID", alias.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", alias.join("khived.sock"));
-    assert!(super::forward::acquire_supervisor_marker_lock().await.is_err());
+    assert!(super::forward::acquire_supervisor_marker_lock()
+        .await
+        .is_err());
     let target_lock = target.join("khived.sock.supervisor-marker.lock");
-    assert!(!target_lock.exists(), "a symlink override parent must not be followed");
+    assert!(
+        !target_lock.exists(),
+        "a symlink override parent must not be followed"
+    );
 
     std::env::set_var("KHIVE_PID", target.join("khived.pid"));
     std::env::set_var("KHIVE_SOCKET", target.join("khived.sock"));
-    let guard = super::forward::acquire_supervisor_marker_lock().await
+    let guard = super::forward::acquire_supervisor_marker_lock()
+        .await
         .expect("trusted explicit parent positive control");
-    assert_eq!(guard.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        guard.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[tokio::test]
@@ -882,15 +1014,22 @@ async fn forward_refuses_preplaced_marker_lock_before_open() {
     let directory = default_rendezvous_dir();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775)).unwrap();
     let target = directory.parent().unwrap().join("not-a-supervisor-lock");
-    let marker_lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let marker_lock =
+        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     symlink(&target, &marker_lock).unwrap();
     let (exe, launched) = recording_exe(directory.parent().unwrap());
 
     let outcome = forward_or_spawn_with_exe(&frame(), &exe).await;
 
     let data = refusal_data(outcome, "untrusted_pid_file_directory");
-    assert!(data["error"].as_str().unwrap().contains(&marker_lock.display().to_string()));
-    assert!(!target.exists(), "supervisor-lock open must not follow the symlink");
+    assert!(data["error"]
+        .as_str()
+        .unwrap()
+        .contains(&marker_lock.display().to_string()));
+    assert!(
+        !target.exists(),
+        "supervisor-lock open must not follow the symlink"
+    );
     assert!(!launched.exists());
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
 }
@@ -913,7 +1052,10 @@ fn recovery_rejects_default_directory_symlink_without_chmodding_target() {
     symlink(&target, &directory).unwrap();
 
     assert!(daemon::prepare_default_rendezvous_for_recovery().is_err());
-    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o775);
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
 }
 
 #[test]
@@ -972,7 +1114,11 @@ fn inaccessible_default_directory_never_gains_owner_permissions() {
 
     let _outcome = daemon::prepare_default_rendezvous_for_recovery();
 
-    let mode = std::fs::symlink_metadata(&directory).unwrap().permissions().mode() & 0o777;
+    let mode = std::fs::symlink_metadata(&directory)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(mode, 0o000);
 }

@@ -444,8 +444,9 @@ pub(super) fn supervisor_marker_lock_path(marker: &std::path::Path) -> std::path
 }
 
 #[cfg(test)]
-pub(super) static SUPERVISOR_LOCK_CONTENDED_HOOK: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
-    std::sync::Mutex::new(None);
+pub(super) static SUPERVISOR_LOCK_CONTENDED_HOOK: std::sync::Mutex<
+    Option<std::sync::mpsc::Sender<()>>,
+> = std::sync::Mutex::new(None);
 
 /// Serialize the client's last ownership decision with launcher publication.
 /// The launcher locks this same permanent `<marker>.lock` inode through publish

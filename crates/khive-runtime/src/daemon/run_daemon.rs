@@ -190,7 +190,11 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
     let parent = khive_dir();
     let mut marker_lock = supervisor_marker_path().into_os_string();
     marker_lock.push(".lock");
-    let locks = [lock_path(), recoverer_lock_path(), std::path::PathBuf::from(marker_lock)];
+    let locks = [
+        lock_path(),
+        recoverer_lock_path(),
+        std::path::PathBuf::from(marker_lock),
+    ];
     for lock in &locks {
         if lock.file_name().is_none() {
             anyhow::bail!(
@@ -199,7 +203,11 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
             );
         }
     }
-    if explicit_rendezvous && !locks.iter().any(|lock| lock.parent() == Some(parent.as_path())) {
+    if explicit_rendezvous
+        && !locks
+            .iter()
+            .any(|lock| lock.parent() == Some(parent.as_path()))
+    {
         return Ok(());
     }
     // An explicitly selected rendezvous is not ours to repair. If a default
@@ -227,12 +235,16 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
     builder.mode(0o700);
     let created = match builder.create(&parent) {
         Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && explicit_rendezvous => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && explicit_rendezvous => {
+            return Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(error) => return Err(anyhow::anyhow!(
-            "refusing to inspect default rendezvous directory {}: {error}",
-            parent.display()
-        )),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "refusing to inspect default rendezvous directory {}: {error}",
+                parent.display()
+            ))
+        }
     };
     repair_default_dir_with_recovery_guidance(&parent, daemon_euid, created)?;
 
@@ -324,7 +336,10 @@ fn repair_owned_default_dir_with_hooks(
     ensure_rendezvous_path_is_swap_resistant(ancestors, daemon_euid, role)?;
 
     let observed = std::fs::symlink_metadata(parent).map_err(|error| {
-        anyhow::anyhow!("refusing to stat default rendezvous directory {}: {error}", parent.display())
+        anyhow::anyhow!(
+            "refusing to stat default rendezvous directory {}: {error}",
+            parent.display()
+        )
     })?;
     let observed_mode = observed.permissions().mode() & 0o7777;
     if !observed.is_dir() {
@@ -345,7 +360,10 @@ fn repair_owned_default_dir_with_hooks(
             parent.display()
         ))?;
     let metadata = directory.metadata().map_err(|error| {
-        anyhow::anyhow!("refusing to stat default rendezvous directory {}: {error}", parent.display())
+        anyhow::anyhow!(
+            "refusing to stat default rendezvous directory {}: {error}",
+            parent.display()
+        )
     })?;
     if observed.dev() != metadata.dev() || observed.ino() != metadata.ino() {
         anyhow::bail!(
@@ -363,7 +381,10 @@ fn repair_owned_default_dir_with_hooks(
     }
     after_validation();
     let latest = directory.metadata().map_err(|error| {
-        anyhow::anyhow!("refusing to restat default rendezvous directory {}: {error}", parent.display())
+        anyhow::anyhow!(
+            "refusing to restat default rendezvous directory {}: {error}",
+            parent.display()
+        )
     })?;
     let latest_mode = latest.permissions().mode() & 0o7777;
     if !latest.is_dir() || latest.uid() != daemon_euid {
@@ -389,7 +410,10 @@ fn repair_owned_default_dir_with_hooks(
         )
     })?;
     if !current.is_dir() || metadata.dev() != current.dev() || metadata.ino() != current.ino() {
-        anyhow::bail!("default rendezvous directory {} changed during repair", parent.display());
+        anyhow::bail!(
+            "default rendezvous directory {} changed during repair",
+            parent.display()
+        );
     }
     ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
 }
@@ -714,7 +738,9 @@ mod default_directory_repair_tests {
 
     #[async_trait::async_trait]
     impl super::super::DaemonDispatch for EmptyDispatcher {
-        fn plan(&self, _ops: &str) -> String { String::new() }
+        fn plan(&self, _ops: &str) -> String {
+            String::new()
+        }
 
         async fn dispatch(
             &self,
@@ -730,8 +756,12 @@ mod default_directory_repair_tests {
         }
 
         async fn warm_all(&self) {}
-        fn namespace(&self) -> &str { "test" }
-        fn config_id(&self) -> &str { "test" }
+        fn namespace(&self) -> &str {
+            "test"
+        }
+        fn config_id(&self) -> &str {
+            "test"
+        }
     }
 
     #[tokio::test]
@@ -750,7 +780,13 @@ mod default_directory_repair_tests {
         std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o775)).unwrap();
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::env::set_var("HOME", &home);
-        for key in ["KHIVE_PID", "KHIVE_SOCKET", "KHIVE_LOCK", "KHIVE_RECOVERER_LOCK", "KHIVE_SUPERVISOR_MARKER"] {
+        for key in [
+            "KHIVE_PID",
+            "KHIVE_SOCKET",
+            "KHIVE_LOCK",
+            "KHIVE_RECOVERER_LOCK",
+            "KHIVE_SUPERVISOR_MARKER",
+        ] {
             std::env::remove_var(key);
         }
         let directory = home.join(".khive");
@@ -759,11 +795,25 @@ mod default_directory_repair_tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::run_daemon(EmptyDispatcher),
-        ).await;
+        )
+        .await;
 
-        assert!(matches!(outcome, Ok(Err(_))), "unsafe direct boot must refuse promptly");
-        assert!(!directory.exists(), "no lock directory may be created under an unsafe ancestor");
-        assert_eq!(std::fs::metadata(&unsafe_ancestor).unwrap().permissions().mode() & 0o777, 0o775);
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "unsafe direct boot must refuse promptly"
+        );
+        assert!(
+            !directory.exists(),
+            "no lock directory may be created under an unsafe ancestor"
+        );
+        assert_eq!(
+            std::fs::metadata(&unsafe_ancestor)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
 
         std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(&directory).unwrap();
@@ -772,8 +822,18 @@ mod default_directory_repair_tests {
         std::fs::write(&existing_lock, b"").unwrap();
         std::fs::set_permissions(&existing_lock, std::fs::Permissions::from_mode(0o644)).unwrap();
         let guard = super::super::acquire_daemon_boot_guard().expect("trusted boot-lock baseline");
-        assert_eq!(guard.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(&existing_lock).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            guard.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&existing_lock)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         drop(guard);
     }
 
@@ -783,23 +843,23 @@ mod default_directory_repair_tests {
             .prefix("khive-foreign-owner-")
             .tempdir_in("/tmp")
             .expect("private synthetic directory");
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775))
-            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
         let actual_owner = std::fs::metadata(directory.path()).unwrap().uid();
         let other_owner = actual_owner.wrapping_add(1);
 
-        let error = repair_owned_default_dir(
-            directory.path(),
-            RendezvousPathRole::PidFile,
-            other_owner,
-        )
-        .expect_err("directory owned by a different uid must not be repaired");
+        let error =
+            repair_owned_default_dir(directory.path(), RendezvousPathRole::PidFile, other_owner)
+                .expect_err("directory owned by a different uid must not be repaired");
 
         let message = error.to_string();
         assert!(message.contains("owner uid"), "{message}");
         assert!(message.contains("0775"), "{message}");
         assert_eq!(
-            std::fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o775
         );
     }
@@ -831,8 +891,14 @@ mod default_directory_repair_tests {
         );
 
         assert!(outcome.is_err(), "a path replacement must be reported");
-        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o755);
-        assert_eq!(std::fs::metadata(&original).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -863,7 +929,10 @@ mod default_directory_repair_tests {
         );
 
         assert!(outcome.is_err(), "a replacement symlink must be refused");
-        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o775);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
     }
 
     #[test]
@@ -892,9 +961,18 @@ mod default_directory_repair_tests {
             || {},
         );
 
-        assert!(outcome.is_err(), "a directory swapped before open must be refused");
-        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o775);
-        assert_eq!(std::fs::metadata(&original).unwrap().permissions().mode() & 0o777, 0o775);
+        assert!(
+            outcome.is_err(),
+            "a directory swapped before open must be refused"
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
     }
 
     #[test]
@@ -913,24 +991,34 @@ mod default_directory_repair_tests {
             RendezvousPathRole::PidFile,
             owner,
             || {},
-            || std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap(),
+            || {
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+                    .unwrap()
+            },
         );
 
         let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(outcome.is_ok(), "already restricted directory should remain usable");
+        assert!(
+            outcome.is_ok(),
+            "already restricted directory should remain usable"
+        );
         assert_eq!(mode, 0o500);
     }
 
     #[test]
     fn newly_created_inaccessible_default_dir_reports_manual_recovery() {
-        let root = tempfile::Builder::new().prefix("khive-dir-recovery-").tempdir_in("/tmp").unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("khive-dir-recovery-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let directory = root.path().join("rendezvous");
         std::fs::create_dir(&directory).unwrap();
         let uid = std::fs::metadata(&directory).unwrap().uid();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
         // This is a fixture qualification, not semantic evidence on a privileged host.
-        let denied = std::fs::File::open(&directory).expect_err("fixture requires an unprivileged owner unable to open mode 0000");
+        let denied = std::fs::File::open(&directory)
+            .expect_err("fixture requires an unprivileged owner unable to open mode 0000");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
         let error = repair_default_dir_with_recovery_guidance(&directory, uid, true).unwrap_err();
         let message = format!("{error:#}");
@@ -940,25 +1028,40 @@ mod default_directory_repair_tests {
         let retry_message = format!("{retry:#}");
         assert!(retry_message.contains(&directory.display().to_string()));
         assert!(retry_message.contains("0700") && retry_message.contains("by hand"));
-        let foreign = repair_default_dir_with_recovery_guidance(&directory, uid.wrapping_add(1), false).unwrap_err();
+        let foreign =
+            repair_default_dir_with_recovery_guidance(&directory, uid.wrapping_add(1), false)
+                .unwrap_err();
         assert!(!format!("{foreign:#}").contains("by hand"));
-        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0);
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0
+        );
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         repair_default_dir_with_recovery_guidance(&directory, uid, false).unwrap();
     }
 
     #[test]
     fn concurrent_lock_creation_reopens_the_validated_existing_entry() {
-        let root = tempfile::Builder::new().prefix("khive-lock-create-race-").tempdir_in("/tmp").unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("khive-lock-create-race-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let lock = root.path().join("recovery.lock");
 
         let opened = super::super::locks::checked_open_lock_with_observe_hook(
-            &lock, true, false, true, || {}, || {},
+            &lock,
+            true,
+            false,
+            true,
+            || {},
+            || {},
             (false, false, || {
                 std::fs::write(&lock, b"incumbent").unwrap();
                 std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
             }),
-        ).expect("concurrent valid lock must be reopened").unwrap();
+        )
+        .expect("concurrent valid lock must be reopened")
+        .unwrap();
 
         let on_disk = std::fs::metadata(&lock).unwrap();
         assert_eq!(opened.metadata().unwrap().ino(), on_disk.ino());
@@ -969,58 +1072,102 @@ mod default_directory_repair_tests {
     #[test]
     fn concurrent_lock_symlink_is_refused_before_opening_its_target() {
         use std::os::unix::fs::symlink;
-        let root = tempfile::Builder::new().prefix("khive-lock-create-symlink-").tempdir_in("/tmp").unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("khive-lock-create-symlink-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let lock = root.path().join("recovery.lock");
         let target = root.path().join("target");
         std::fs::write(&target, b"untouched").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let error = super::super::locks::checked_open_lock_with_observe_hook(
-            &lock, true, false, true, || {}, || {},
+            &lock,
+            true,
+            false,
+            true,
+            || {},
+            || {},
             (false, false, || symlink(&target, &lock).unwrap()),
-        ).unwrap_err();
+        )
+        .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
-        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]
     fn created_lock_failures_leave_entry_and_report_manual_recovery() {
-        let root = tempfile::Builder::new().prefix("khive-lock-failure-").tempdir_in("/tmp").unwrap();
-        for (label, fail_metadata, fail_chmod) in [("metadata", true, false), ("chmod", false, true)] {
+        let root = tempfile::Builder::new()
+            .prefix("khive-lock-failure-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        for (label, fail_metadata, fail_chmod) in
+            [("metadata", true, false), ("chmod", false, true)]
+        {
             let lock = root.path().join(label);
             let error = super::super::locks::checked_open_lock_with_faults(
-                &lock, true, false, true, || {},
-                || { if fail_chmod { std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap(); } },
+                &lock,
+                true,
+                false,
+                true,
+                || {},
+                || {
+                    if fail_chmod {
+                        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000))
+                            .unwrap();
+                    }
+                },
                 (fail_metadata, fail_chmod),
-            ).unwrap_err();
+            )
+            .unwrap_err();
             let message = error.to_string();
             assert!(message.contains(&lock.display().to_string()));
-            assert!(message.contains("confirming no daemon") && message.contains("verifying the entry is the leftover lock"));
+            assert!(
+                message.contains("confirming no daemon")
+                    && message.contains("verifying the entry is the leftover lock")
+            );
             assert!(lock.exists(), "failure must not unlink the created entry");
             std::fs::remove_file(&lock).unwrap();
-            let file = super::super::locks::checked_open_lock(&lock, true, false, true).unwrap().unwrap();
+            let file = super::super::locks::checked_open_lock(&lock, true, false, true)
+                .unwrap()
+                .unwrap();
             assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         }
     }
 
     #[test]
     fn created_lock_replacement_reports_inspection_without_removal_advice() {
-        let root = tempfile::Builder::new().prefix("khive-lock-created-swap-").tempdir_in("/tmp").unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("khive-lock-created-swap-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let lock = root.path().join("lock");
         let original = root.path().join("original");
         let replacement = root.path().join("replacement");
         std::fs::write(&replacement, b"replacement").unwrap();
         let error = super::super::locks::checked_open_lock_with_hooks(
-            &lock, true, false, true, || {}, || {
+            &lock,
+            true,
+            false,
+            true,
+            || {},
+            || {
                 std::fs::rename(&lock, &original).unwrap();
                 std::fs::rename(&replacement, &lock).unwrap();
             },
-        ).unwrap_err();
+        )
+        .unwrap_err();
         let message = error.to_string();
         assert!(message.contains(&lock.display().to_string()));
-        assert!(message.contains("inspect the path") && message.contains("do not remove the replacement"));
+        assert!(
+            message.contains("inspect the path")
+                && message.contains("do not remove the replacement")
+        );
         assert!(!message.contains("remove it and retry"));
         assert_eq!(std::fs::read(&lock).unwrap(), b"replacement");
         assert!(original.exists());
@@ -1071,7 +1218,10 @@ mod default_directory_repair_tests {
         let error = super::super::locks::open_lock_file(&lock).unwrap_err();
 
         assert!(error.to_string().contains(&lock.display().to_string()));
-        assert!(!target.exists(), "opening a lock must not create a symlink target");
+        assert!(
+            !target.exists(),
+            "opening a lock must not create a symlink target"
+        );
     }
 
     #[test]
@@ -1089,9 +1239,15 @@ mod default_directory_repair_tests {
 
         assert!(error.to_string().contains(&lock.display().to_string()));
         assert!(error.to_string().contains("0644"));
-        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         tighten_owned_recovery_lock(&lock, owner).unwrap();
-        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1115,8 +1271,14 @@ mod default_directory_repair_tests {
         });
 
         assert!(outcome.is_err());
-        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o644);
-        assert_eq!(std::fs::metadata(&original).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]
@@ -1135,7 +1297,10 @@ mod default_directory_repair_tests {
         let lock = directory.join("lock");
 
         let outcome = super::super::locks::checked_open_lock_with_hooks(
-            &lock, true, false, true,
+            &lock,
+            true,
+            false,
+            true,
             || {
                 std::fs::rename(&directory, &original).unwrap();
                 std::fs::rename(&replacement, &directory).unwrap();
@@ -1145,13 +1310,19 @@ mod default_directory_repair_tests {
 
         assert!(outcome.is_err());
         assert!(!lock.exists(), "replacement parent must not receive a lock");
-        assert!(!original.join("lock").exists(), "detected change must refuse before create");
+        assert!(
+            !original.join("lock").exists(),
+            "detected change must refuse before create"
+        );
         std::fs::rename(&directory, &replacement).unwrap();
         std::fs::rename(&original, &directory).unwrap();
         let positive = super::super::locks::checked_open_lock(&lock, true, false, true)
             .expect("trusted-parent positive control")
             .expect("mutating opener creates the lock");
-        assert_eq!(positive.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            positive.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1174,6 +1345,9 @@ mod default_directory_repair_tests {
         let outcome = ensure_socket_dir_is_trusted(&directory);
 
         assert!(outcome.is_err());
-        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o775);
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
     }
 }

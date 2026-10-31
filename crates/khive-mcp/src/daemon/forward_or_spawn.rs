@@ -477,7 +477,9 @@ where
         #[cfg(test)]
         supervisor_discovery_hook(SupervisorDiscoveryPoint::RecoveryAdmission);
         if let Err(error) = khive_runtime::daemon::prepare_default_rendezvous_for_recovery() {
-            return Some(Err(untrusted_pid_file_directory_error(format!("{error:#}"))));
+            return Some(Err(untrusted_pid_file_directory_error(format!(
+                "{error:#}"
+            ))));
         }
         let guard = match acquire_supervisor_marker_lock().await {
             Ok(guard) => guard,
