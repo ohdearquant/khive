@@ -260,6 +260,8 @@ pub(crate) async fn handle_send_with_route(
                     content: &p.content,
                     subject: p.subject.as_deref(),
                     thread_id: thread_id.as_deref(),
+                    namespace: &caller_ns,
+                    sent_at: &sent_at,
                 })
                 .await
                 .map_err(|refusal| refusal.into_runtime_error())?,

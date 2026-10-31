@@ -94,7 +94,11 @@ pub struct KhiveMcpServer {
     /// not hold comm's rows). In a multi-backend topology this may differ
     /// from `runtime` (the default backend); retaining the exact comm
     /// runtime keeps scan, owner claim, and delivered-at update on one store.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[cfg(any(
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
     pub(super) channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.

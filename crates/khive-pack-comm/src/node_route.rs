@@ -72,6 +72,11 @@ pub struct NodeSealRequest<'a> {
     pub subject: Option<&'a str>,
     /// Optional canonical thread id.
     pub thread_id: Option<&'a str>,
+    /// Namespace the send runs in; a route bound to one namespace refuses any other.
+    pub namespace: &'a str,
+    /// Send time as an RFC 3339 string, taken once by the handler so the sealed envelope and the
+    /// stored message agree.
+    pub sent_at: &'a str,
 }
 
 /// Why a node-addressed send was refused. Each variant maps to a distinct error text, and every
@@ -84,6 +89,20 @@ pub enum NodeSendRefusal {
     UnparseableAddress(String),
     /// No pinned key is known for the recipient address.
     UnknownRecipientPin(String),
+    /// The node configuration is invalid; carries a bounded detail naming the field.
+    InvalidConfiguration(String),
+    /// The persisted node state could not be read; retrying may succeed.
+    SourceUnavailable,
+    /// The key facility could not provide the sender key.
+    KeyUnavailable,
+    /// The recipient contact lookup failed; retrying may succeed.
+    ContactUnavailable,
+    /// The sender actor, namespace or realm does not match the configured node binding.
+    SenderBindingMismatch,
+    /// Sealing the envelope failed.
+    SealFailed,
+    /// Pair policy is set to `shadow` or `enforce`, and evaluation is not available.
+    PairPolicyUnavailable,
 }
 
 impl NodeSendRefusal {
@@ -99,6 +118,24 @@ impl NodeSendRefusal {
             Self::UnknownRecipientPin(address) => format!(
                 "send: no pinned key for recipient {address}; pin the recipient before sending"
             ),
+            Self::InvalidConfiguration(detail) => {
+                format!("send: node configuration is invalid: {detail}")
+            }
+            Self::SourceUnavailable => {
+                "send: node state is unavailable; retry later".to_string()
+            }
+            Self::KeyUnavailable => "send: node key facility is unavailable".to_string(),
+            Self::ContactUnavailable => {
+                "send: node contact lookup is unavailable; retry later".to_string()
+            }
+            Self::SenderBindingMismatch => {
+                "send: sender does not match the configured node binding".to_string()
+            }
+            Self::SealFailed => "send: node envelope could not be sealed".to_string(),
+            Self::PairPolicyUnavailable => {
+                "send: pair policy evaluation is unavailable; set pair_policy_mode to off to send node-addressed messages"
+                    .to_string()
+            }
         })
     }
 }

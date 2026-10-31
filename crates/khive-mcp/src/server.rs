@@ -237,7 +237,11 @@ impl KhiveMcpServer {
             bridge_executable: None,
             stdio_bridge: false,
             runtime: None,
-            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            #[cfg(any(
+                feature = "channel-email",
+                feature = "channel-telegram",
+                feature = "channel-node"
+            ))]
             channel_outbox_runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_loop_admission: ChannelLoopAdmission::default(),
@@ -249,7 +253,11 @@ impl KhiveMcpServer {
     /// the same `default_runtime` it already resolved while building the
     /// registry.
     pub fn with_runtime(mut self, runtime: KhiveRuntime) -> Self {
-        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        #[cfg(any(
+            feature = "channel-email",
+            feature = "channel-telegram",
+            feature = "channel-node"
+        ))]
         if self.channel_outbox_runtime.is_none() {
             self.channel_outbox_runtime = Some(runtime.clone());
         }
@@ -261,7 +269,11 @@ impl KhiveMcpServer {
     /// Multi-backend boot overrides the default-runtime fallback installed by
     /// [`Self::with_runtime`]; single-backend construction already points both
     /// handles at the same runtime.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[cfg(any(
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
     pub(crate) fn with_channel_outbox_runtime(mut self, runtime: Option<KhiveRuntime>) -> Self {
         self.channel_outbox_runtime = runtime;
         self
@@ -330,7 +342,12 @@ impl KhiveMcpServer {
     ///
     /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
     /// registry shares the same packs and dispatch state as the server.
-    #[cfg(any(test, feature = "channel-email", feature = "channel-telegram"))]
+    #[cfg(any(
+        test,
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
     pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
         self.registry.clone()
     }
@@ -338,7 +355,11 @@ impl KhiveMcpServer {
     /// Clone the KG-routed `KhiveRuntime` retained for background tasks that
     /// need a non-wire owner API (the email outbox loop's `external_id`
     /// claim). `KhiveRuntime` is internally `Arc`-wrapped so this is cheap.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[cfg(any(
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
     pub(crate) fn channel_outbox_runtime_clone(&self) -> Option<KhiveRuntime> {
         self.channel_outbox_runtime.clone()
     }
