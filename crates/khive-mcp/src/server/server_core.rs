@@ -76,6 +76,8 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     pub(super) config_id: String,
+    pub(super) spawn_config: Option<std::path::PathBuf>,
+    pub(super) spawn_db: Option<String>,
     /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
@@ -94,11 +96,7 @@ pub struct KhiveMcpServer {
     /// not hold comm's rows). In a multi-backend topology this may differ
     /// from `runtime` (the default backend); retaining the exact comm
     /// runtime keeps scan, owner claim, and delivered-at update on one store.
-    #[cfg(any(
-        feature = "channel-email",
-        feature = "channel-telegram",
-        feature = "channel-node"
-    ))]
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     pub(super) channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
