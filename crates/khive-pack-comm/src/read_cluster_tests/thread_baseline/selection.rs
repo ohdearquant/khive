@@ -19,13 +19,15 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
             row(102, 200, root),
             hidden_twin,
             foreign,
+            // A visible message from another thread is a valid physical anchor.
+            row(200, 400, id(901)),
         ],
     )
     .await;
     let (response, observation) = observed(
         &runtime,
         &registry,
-        json!({"id":id(101).to_string(),"order":"desc","after":id(100).to_string()}),
+        json!({"id":id(101).to_string(),"order":"desc","after":id(200).to_string()}),
     )
     .await;
     expect_ids(&response, &observation, &[id(101), id(102)]);
@@ -34,6 +36,22 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     assert_eq!(response["messages"][0]["content"], "message 101");
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][1]["read"], false);
+    let unknown = registry
+        .dispatch(
+            "comm.thread",
+            json!({"id":id(101).to_string(),"order":"desc","after":id(999).to_string()}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&unknown, RuntimeError::InvalidInput(_)));
+    let hidden = registry
+        .dispatch(
+            "comm.thread",
+            json!({"id":id(101).to_string(),"order":"desc","after":id(100).to_string()}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.to_string(), unknown.to_string());
     let (response, observation) = observed(
         &runtime,
         &registry,
