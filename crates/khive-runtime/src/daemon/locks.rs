@@ -174,7 +174,7 @@ pub(super) fn checked_open_lock_with_faults(
         }
         Ok(())
     };
-    check_identity().map_err(|error| { identity_changed.set(true); error })?;
+    check_identity().inspect_err(|_| { identity_changed.set(true); })?;
     if tighten {
         let latest = file.metadata()?;
         if !latest.is_file() || latest.uid() != uid || latest.nlink() != 1 {
@@ -190,7 +190,7 @@ pub(super) fn checked_open_lock_with_faults(
             file.set_permissions(std::fs::Permissions::from_mode(target))?;
         }
     }
-    check_identity().map_err(|error| { identity_changed.set(true); error })?;
+    check_identity().inspect_err(|_| { identity_changed.set(true); })?;
     Ok(())
     })();
     if let Err(error) = result {
