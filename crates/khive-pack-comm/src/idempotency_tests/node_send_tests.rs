@@ -436,3 +436,138 @@ async fn node_send_two_senders_with_one_key_get_distinct_logical_ids() {
     assert_ne!(ids_a[0], ids_b[0], "each sender owns its own logical id");
     assert_eq!(transport_row_count(&runtime).await, 2);
 }
+
+const RACE_SENT_AT: &str = "2026-01-01T00:00:00Z";
+
+/// A sealed envelope for a node send whose logical id the test chooses.
+fn race_envelope(logical_message_id: Uuid) -> SenderEnvelope {
+    SenderEnvelope {
+        namespace: "local".to_string(),
+        logical_message_id,
+        outbound_note_id: Uuid::nil(),
+        kind: "node".to_string(),
+        slug: "test".to_string(),
+        credential_ref: "test-credential".to_string(),
+        recipient_address: NODE_TO.to_string(),
+        protocol_version: 1,
+        sender_agent_id: Uuid::from_u128(1).to_string(),
+        sender_assurance: SenderAssurance::Claimed,
+        recipient_agent_id: Uuid::from_u128(2).to_string(),
+        recipient_device_id: Uuid::from_u128(NODE_DEVICE),
+        recipient_key_epoch: 1,
+        contact_generation: 1,
+        sender_key_epoch: 1,
+        recipient_key_fingerprint: "ab".repeat(32),
+        enc: vec![7u8; 32],
+        ciphertext: NODE_CIPHERTEXT.to_vec(),
+    }
+}
+
+/// The comm-level result of one keyed node send, shaped as `comm.send` renders it.
+fn race_response(
+    identity: &crate::idempotency::MessageIdentity,
+    write: &crate::message::MessageWrite,
+) -> Value {
+    let mut response = json!({
+        "full_id": write.outbound.id.as_hyphenated().to_string(),
+        "sent_at": RACE_SENT_AT,
+    });
+    identity.annotate_response(&mut response, &write.outbound, write.replayed);
+    response
+}
+
+/// Two keyed node sends with one key both pass the holder lookup before either commits, so both
+/// reach the pair writer with the same logical id. The key claim decides the race: the loser
+/// replays the winner instead of failing on the transport row, and nothing is written twice.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn keyed_node_send_that_loses_the_duplicate_race_replays_the_winner() {
+    let route = NodeTestRoute::accepting();
+    let (_registry, runtime) = routed_sender(&route);
+    let token = runtime
+        .authorize(Namespace::local())
+        .expect("authorize local");
+    let namespace = token.namespace().as_str().to_string();
+    let from_actor = token.actor().id.clone();
+    // The request is shaped exactly as `comm.send` builds it (handlers.rs): replay compares the
+    // stored subject, thread and tags against it, so a partial request never replays.
+    let identity = crate::idempotency::MessageIdentity::new(Some("race-key"), || {
+        crate::file_attachments::identify_request(
+            json!({
+                "version": 1, "op": "send", "to": NODE_TO, "content": "raced",
+                "subject": "s", "thread_id": null, "tags": [], "reply_parent_id": null,
+            }),
+            &[],
+        )
+    })
+    .expect("valid key")
+    .expect("key present");
+    let logical_message_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        identity.physical_key(&token).as_bytes(),
+    );
+
+    // Both sends found no holder, so each arrives here with the same identity and the same
+    // sealed envelope; the second write runs against the committed first.
+    let mut writes = Vec::new();
+    for _ in 0..2 {
+        let write = crate::message::dual_write_message_with_transport(
+            &runtime,
+            &token,
+            "comm.send",
+            &namespace,
+            &namespace,
+            Some("s"),
+            "raced",
+            None,
+            RACE_SENT_AT,
+            None,
+            Some(&from_actor),
+            Some(NODE_TO),
+            None,
+            None,
+            None,
+            &[],
+            Some(&identity),
+            Some(race_envelope(logical_message_id)),
+        )
+        .await
+        .expect("a keyed node send never fails on losing the race");
+        writes.push(write);
+    }
+    let (first, second) = (&writes[0], &writes[1]);
+
+    assert!(!first.replayed, "the winner creates the pair");
+    assert!(second.replayed, "the loser replays the existing holder");
+    assert_eq!(second.outbound.id, first.outbound.id);
+
+    assert_eq!(
+        message_count(&runtime, false).await,
+        2,
+        "exactly one outbound and one inbound note"
+    );
+    assert_eq!(message_count(&runtime, true).await, 1);
+    assert_eq!(
+        transport_row_count(&runtime).await,
+        1,
+        "exactly one transport row"
+    );
+    let record = runtime
+        .sender_transport(node_key(logical_message_id))
+        .await
+        .unwrap()
+        .expect("sender transport row");
+    assert_eq!(record.envelope.outbound_note_id, first.outbound.id);
+    assert_eq!(record.state, TransportState::Pending);
+
+    let mut first_response = race_response(&identity, first);
+    let mut second_response = race_response(&identity, second);
+    assert_eq!(first_response["replayed"], false);
+    assert_eq!(second_response["replayed"], true);
+    first_response["replayed"] = Value::Null;
+    second_response["replayed"] = Value::Null;
+    assert_eq!(
+        first_response, second_response,
+        "the comm-level result is the same for both calls"
+    );
+}
