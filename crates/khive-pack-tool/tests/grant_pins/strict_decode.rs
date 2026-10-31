@@ -105,6 +105,139 @@ async fn selected_grant_rejects_future_real_expiry_instead_of_truncating() {
 }
 
 #[tokio::test]
+async fn malformed_inactive_grant_timestamps_cannot_fall_through() {
+    for (column, value) in [
+        ("expires_at", -1.5),
+        ("expires_at", 9223372036854775808.0),
+        ("decided_at", 1.5),
+        ("invalidated_at", 1.5),
+    ] {
+        let tool = "strict-inactive-real";
+        let (f, id) = granted_with_deny(tool).await;
+        replace_column(&f, &id, column, SqlValue::Float(value), "real").await;
+        let error = f
+            .registry
+            .dispatch(
+                "tool.check",
+                json!({"tool": tool, "actor": "agent:requester"}),
+            )
+            .await
+            .expect_err("matching malformed grant must not fall through");
+        assert_decode_error(error, Some(&id), column);
+    }
+}
+
+#[tokio::test]
+async fn malformed_matching_history_precedes_active_grant_but_unrelated_actor_does_not() {
+    let tool = "strict-history-real";
+    let (f, id) = granted_with_deny(tool).await;
+    f.write(
+        "INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at, expires_at, registry_id, definition_digest, invalidated_by_registry_id, invalidated_at) SELECT 'malformed-history', namespace, actor, tool, 'revoked', requested_at, -1.5, registry_id, definition_digest, NULL, NULL FROM tool_grants WHERE id=?1",
+        vec![SqlValue::Text(id.clone())],
+    ).await;
+    let error = f
+        .registry
+        .dispatch(
+            "tool.check",
+            json!({"tool": tool, "actor": "agent:requester"}),
+        )
+        .await
+        .expect_err("malformed matching history must not be hidden by the active grant");
+    assert_decode_error(error, Some("malformed-history"), "expires_at");
+
+    f.write(
+        "UPDATE tool_grants SET actor=?1 WHERE id=?2",
+        vec![
+            SqlValue::Text("agent:other".into()),
+            SqlValue::Text("malformed-history".into()),
+        ],
+    )
+    .await;
+    let decision = f.check(tool).await;
+    assert_eq!(decision["decision"], "allow");
+    assert_eq!(decision["grant_id"], id);
+
+    f.write(
+        "UPDATE tool_grants SET actor=?1, namespace=?2 WHERE id=?3",
+        vec![
+            SqlValue::Text("agent:requester".into()),
+            SqlValue::Text("other".into()),
+            SqlValue::Text("malformed-history".into()),
+        ],
+    )
+    .await;
+    let decision = f.check(tool).await;
+    assert_eq!(decision["decision"], "allow");
+    assert_eq!(decision["grant_id"], id);
+}
+
+#[tokio::test]
+async fn valid_inactive_grants_do_not_allow() {
+    for (column, value, class) in [
+        ("status", SqlValue::Text("revoked".into()), "text"),
+        ("invalidated_at", SqlValue::Integer(1), "integer"),
+        (
+            "definition_digest",
+            SqlValue::Text("different".into()),
+            "text",
+        ),
+    ] {
+        let tool = "strict-valid-inactive";
+        let (f, id) = granted_with_deny(tool).await;
+        replace_column(&f, &id, column, value, class).await;
+        let decision = f.check(tool).await;
+        assert_eq!(decision["decision"], "deny", "{column}");
+        assert_eq!(decision["source"], "policy", "{column}");
+    }
+}
+
+#[tokio::test]
+async fn active_grant_precedes_malformed_matching_policy() {
+    let tool = "strict-grant-first";
+    let (f, id) = granted_with_deny(tool).await;
+    f.write(
+        "UPDATE tool_policy SET updated_at=?1 WHERE actor=?2 AND tool=?3",
+        vec![
+            SqlValue::Float(1.5),
+            SqlValue::Text("agent:requester".into()),
+            SqlValue::Text(tool.into()),
+        ],
+    )
+    .await;
+    let rows = f.rt.sql().reader().await.unwrap().query_all(SqlStatement {
+        sql: "SELECT id, typeof(updated_at) AS storage_class FROM tool_policy WHERE actor=?1 AND tool=?2".into(),
+        params: vec![SqlValue::Text("agent:requester".into()), SqlValue::Text(tool.into())],
+        label: None,
+    }).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text("storage_class").unwrap(), "real");
+    let policy_id = rows[0].text("id").unwrap().to_owned();
+    let decision = f.check(tool).await;
+    assert_eq!(decision["decision"], "allow");
+    assert_eq!(decision["source"], "grant");
+    assert_eq!(decision["grant_id"], id);
+
+    f.write(
+        "UPDATE tool_grants SET status=?1 WHERE id=?2",
+        vec![SqlValue::Text("revoked".into()), SqlValue::Text(id.clone())],
+    )
+    .await;
+    let error = f
+        .registry
+        .dispatch(
+            "tool.check",
+            json!({"tool": tool, "actor": "agent:requester"}),
+        )
+        .await
+        .expect_err("revoked grant must expose the malformed policy")
+        .to_string();
+    assert!(
+        error.contains(&policy_id) && error.contains("updated_at"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn valid_expiries_and_absent_grants_keep_existing_decisions() {
     let tool = "strict-expiry-controls";
     let (f, id) = granted_with_deny(tool).await;
