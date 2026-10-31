@@ -1328,8 +1328,13 @@ mod default_directory_repair_tests {
                 "{message}"
             );
         } else {
-            assert!(message.contains("owner uid"), "{message}");
-            assert!(message.contains("0775"), "{message}");
+            assert!(
+                message.contains(&format!(
+                    "refusing to repair default rendezvous directory {}: owner uid {actual_owner}, mode 0775; expected uid {other_owner}",
+                    directory.path().display()
+                )),
+                "{message}"
+            );
         }
         assert_eq!(
             std::fs::metadata(directory.path())
