@@ -123,6 +123,8 @@ async fn in_memory_request_skips_forward_and_dispatches_locally() {
     static FORWARD_CALLS: AtomicUsize = AtomicUsize::new(0);
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -158,12 +160,17 @@ async fn in_memory_request_skips_forward_and_dispatches_locally() {
 #[serial_test::serial(config_ledger)]
 async fn file_backed_request_reaches_forward_seam() {
     static FORWARD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CAPTURED: std::sync::Mutex<Option<(Option<std::path::PathBuf>, Option<String>)>> =
+        std::sync::Mutex::new(None);
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        config: Option<std::path::PathBuf>,
+        db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
         FORWARD_CALLS.fetch_add(1, Ordering::SeqCst);
+        *CAPTURED.lock().expect("capture lock") = Some((config, db));
         Box::pin(async { Some(Ok("forwarded-file-backed-request".to_string())) })
     }
 
@@ -171,7 +178,15 @@ async fn file_backed_request_reaches_forward_seam() {
     let dir = tempfile::tempdir().expect("forwarding fixture directory");
     let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
     assert!(runtime.backend().is_file_backed());
-    let server = KhiveMcpServer::new(runtime).expect("file-backed server");
+    let config = dir.path().join("explicit.toml");
+    let db = dir
+        .path()
+        .join("explicit.db")
+        .to_string_lossy()
+        .into_owned();
+    let server = KhiveMcpServer::new(runtime)
+        .expect("file-backed server")
+        .with_daemon_spawn_overrides(Some(config.clone()), Some(db.clone()));
     let response = server
         .request_with_forward(
             RequestParams {
@@ -185,4 +200,29 @@ async fn file_backed_request_reaches_forward_seam() {
 
     assert_eq!(FORWARD_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(response, "forwarded-file-backed-request");
+    assert_eq!(
+        CAPTURED.lock().expect("capture lock").take(),
+        Some((Some(config), Some(db))),
+        "explicit config and database overrides must reach the forwarding seam"
+    );
+
+    let runtime = forward_test_runtime(Some(dir.path().join("default.db")), &["kg"]);
+    let default_server = KhiveMcpServer::new(runtime).expect("default file-backed server");
+    let response = default_server
+        .request_with_forward(
+            RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            },
+            spy_forward,
+        )
+        .await
+        .expect("ordinary file-backed request reaches forwarding");
+    assert_eq!(FORWARD_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(response, "forwarded-file-backed-request");
+    assert_eq!(
+        CAPTURED.lock().expect("capture lock").take(),
+        Some((None, None)),
+        "omitted overrides must remain absent"
+    );
 }
