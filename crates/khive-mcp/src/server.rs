@@ -226,6 +226,8 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool: None,
             secondary_pools: Vec::new(),
