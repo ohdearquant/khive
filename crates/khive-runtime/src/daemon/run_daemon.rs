@@ -703,8 +703,8 @@ pub(super) fn ensure_rendezvous_path_is_swap_resistant(
 #[cfg(all(test, unix))]
 mod default_directory_repair_tests {
     use super::{
-        ensure_socket_dir_is_trusted, repair_owned_default_dir,
-        repair_owned_default_dir_with_hooks, tighten_owned_recovery_lock,
+        ensure_socket_dir_is_trusted, repair_default_dir_with_recovery_guidance,
+        repair_owned_default_dir, repair_owned_default_dir_with_hooks, tighten_owned_recovery_lock,
         tighten_owned_recovery_lock_with_hook, RendezvousPathRole,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
