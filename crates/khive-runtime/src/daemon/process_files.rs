@@ -202,9 +202,7 @@ fn read_pid_contents(file: &std::fs::File) -> std::io::Result<String> {
 }
 
 #[cfg(unix)]
-fn read_pid_file(
-    pid_file: &std::path::Path,
-) -> std::io::Result<(std::fs::Metadata, String)> {
+fn read_pid_file(pid_file: &std::path::Path) -> std::io::Result<(std::fs::Metadata, String)> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
