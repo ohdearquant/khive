@@ -34,6 +34,7 @@ fn node_channel_table(actor: &str) -> khive_runtime::node_config::NodeChannelCon
         poll_wait_seconds: 25,
         outbox_interval_seconds: 5,
         batch_size: 64,
+        pair_policy_mode: khive_db::stores::note::transport::PolicyMode::Off,
         pins: vec![node_channel_pin(
             NODE_CHANNEL_PEER_AGENT,
             NODE_CHANNEL_PEER_DEVICE,

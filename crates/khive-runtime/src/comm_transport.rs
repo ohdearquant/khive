@@ -100,6 +100,21 @@ impl KhiveRuntime {
     pub async fn sender_transport(&self, key: EnvelopeKey) -> RuntimeResult<Option<SenderRecord>> {
         Ok(self.sender_transport_store().get(key).await?)
     }
+    /// The current envelope for one logical message: the row with the highest envelope
+    /// sequence, whatever its state. Absence means unknown. The namespace comes from the
+    /// token, so a caller cannot read another namespace's transport rows.
+    pub async fn current_sender_transport(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        slug: &str,
+        logical_id: uuid::Uuid,
+    ) -> RuntimeResult<Option<SenderRecord>> {
+        Ok(self
+            .sender_transport_store()
+            .current_by_logical_id(token.namespace().as_str(), kind, slug, logical_id)
+            .await?)
+    }
     /// Due unheld submissions for the exact configured kind and slug. Times use
     /// Unix microseconds; choosing the backoff and jitter is the caller's job.
     pub async fn pending_sender_transports(
