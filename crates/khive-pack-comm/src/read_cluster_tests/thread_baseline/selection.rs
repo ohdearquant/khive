@@ -14,7 +14,6 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     seed(
         &runtime,
         vec![
-            hidden,
             inbound(101, 300, root, 100, json!(true)),
             row(102, 200, root),
             hidden_twin,
@@ -24,6 +23,19 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
         ],
     )
     .await;
+    let mut unknown_errors = Vec::new();
+    for order in ["asc", "desc"] {
+        let error = registry
+            .dispatch(
+                "comm.thread",
+                json!({"id":id(101).to_string(),"order":order,"after":id(100).to_string()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+        unknown_errors.push(error.to_string());
+    }
+    seed(&runtime, vec![hidden]).await;
     let (response, observation) = observed(
         &runtime,
         &registry,
@@ -36,22 +48,16 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     assert_eq!(response["messages"][0]["content"], "message 101");
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][1]["read"], false);
-    let unknown = registry
-        .dispatch(
-            "comm.thread",
-            json!({"id":id(101).to_string(),"order":"desc","after":id(999).to_string()}),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(&unknown, RuntimeError::InvalidInput(_)));
-    let hidden = registry
-        .dispatch(
-            "comm.thread",
-            json!({"id":id(101).to_string(),"order":"desc","after":id(100).to_string()}),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(hidden.to_string(), unknown.to_string());
+    for (order, unknown) in ["asc", "desc"].into_iter().zip(unknown_errors) {
+        let error = registry
+            .dispatch(
+                "comm.thread",
+                json!({"id":id(101).to_string(),"order":order,"after":id(100).to_string()}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), unknown);
+    }
     let (response, observation) = observed(
         &runtime,
         &registry,

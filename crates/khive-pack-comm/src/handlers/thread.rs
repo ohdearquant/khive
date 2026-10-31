@@ -99,6 +99,13 @@ async fn resolve_thread_id(
         .map(Some)
 }
 
+fn invalid_after_cursor(raw: &str) -> RuntimeError {
+    let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
+    RuntimeError::InvalidInput(format!(
+        "thread: `after` cursor {raw:?} does not resolve to a message"
+    ))
+}
+
 /// Fold captured rows in physical encounter order after mailbox visibility.
 /// An outbound owner inherits the first pre-promotion read value; later inbound
 /// rows replace only the display value, never the owner's captured properties.
@@ -330,25 +337,15 @@ pub(crate) async fn handle_thread(
             let looks_like_id = raw.parse::<Uuid>().is_ok()
                 || (raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()));
             if looks_like_id {
-                let cursor_uuid =
-                    resolve_thread_id(runtime, token, raw)
-                        .await?
-                        .ok_or_else(|| {
-                            RuntimeError::InvalidInput(
-                                "thread: `after` cursor does not resolve to a visible message"
-                                    .into(),
-                            )
-                        })?;
+                let cursor_uuid = resolve_thread_id(runtime, token, raw)
+                    .await?
+                    .ok_or_else(|| invalid_after_cursor(raw))?;
                 let cursor_store = runtime.notes(token)?;
                 let cursor_note = cursor_store
                     .get_note(cursor_uuid)
                     .await
                     .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput(
-                            "thread: `after` cursor does not resolve to a visible message".into(),
-                        )
-                    })?;
+                    .ok_or_else(|| invalid_after_cursor(raw))?;
                 if cursor_note.namespace != token.namespace().as_str()
                     || !thread_note_visible(
                         &cursor_note,
@@ -357,15 +354,10 @@ pub(crate) async fn handle_thread(
                         inherits_legacy_pool,
                     )
                 {
-                    return Err(RuntimeError::InvalidInput(
-                        "thread: `after` cursor does not resolve to a visible message".into(),
-                    ));
+                    return Err(invalid_after_cursor(raw));
                 }
                 if cursor_note.kind != "message" {
-                    let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "thread: `after` cursor {raw:?} does not resolve to a message"
-                    )));
+                    return Err(invalid_after_cursor(raw));
                 }
                 Some(AfterCursor::Id {
                     created_at: cursor_note.created_at,

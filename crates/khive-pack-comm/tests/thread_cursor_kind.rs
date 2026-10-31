@@ -221,13 +221,32 @@ async fn thread_hides_unaddressed_roots_and_cursors_without_hiding_visible_child
         &visible_child,
         &later,
         &outside,
-        &hidden,
         &child_of_hidden,
         &outbound,
         &inbound,
     ] {
         store.upsert_note(note.clone()).await.unwrap();
     }
+    let cursor_inputs = [hidden_root.to_string(), "77777777".to_string()];
+    let mut unknown_cursors = Vec::new();
+    for order in ["asc", "desc"] {
+        for cursor in &cursor_inputs {
+            let error = registry
+                .dispatch(
+                    "comm.thread",
+                    json!({"id": root, "after": cursor, "order": order}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+            assert_eq!(
+                error.to_string(),
+                format!("invalid input: thread: `after` cursor {cursor:?} does not resolve to a message")
+            );
+            unknown_cursors.push(error.to_string());
+        }
+    }
+    store.upsert_note(hidden.clone()).await.unwrap();
 
     let baseline = registry
         .dispatch("comm.thread", json!({"id": root}))
@@ -290,20 +309,8 @@ async fn thread_hides_unaddressed_roots_and_cursors_without_hiding_visible_child
         .to_string();
     assert_eq!(missing_prefix, missing_root);
 
-    for order in ["asc", "desc"] {
-        let missing_cursor = registry
-            .dispatch(
-                "comm.thread",
-                json!({"id": root, "after": missing, "order": order}),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        for hidden_id in [
-            hidden_root.to_string(),
-            "77777777".into(),
-            "aaaaaaaa".into(),
-        ] {
+    for (order, unknowns) in ["asc", "desc"].into_iter().zip(unknown_cursors.chunks(2)) {
+        for (hidden_id, unknown) in cursor_inputs.iter().zip(unknowns) {
             let error = registry
                 .dispatch(
                     "comm.thread",
@@ -312,7 +319,7 @@ async fn thread_hides_unaddressed_roots_and_cursors_without_hiding_visible_child
                 .await
                 .unwrap_err()
                 .to_string();
-            assert_eq!(error, missing_cursor);
+            assert_eq!(&error, unknown);
         }
     }
 }
@@ -408,15 +415,39 @@ async fn anonymous_local_alone_can_use_legacy_roots_and_cursors() {
         addressed_id,
     );
     let store = anonymous.notes(&token).unwrap();
-    for note in [
-        &legacy_root,
-        &legacy_cursor,
-        &legacy_later,
-        &object_recipient,
-        &addressed,
-    ] {
+    for note in [&legacy_root, &legacy_later, &addressed] {
         store.upsert_note(note.clone()).await.unwrap();
     }
+    let legacy_inputs = [legacy_cursor.id.to_string(), "22222222".to_string()];
+    let object_inputs = [object_id.to_string(), "44444444".to_string()];
+    let mut named_unknown_cursors = Vec::new();
+    let mut anonymous_unknown_cursors = Vec::new();
+    for order in ["asc", "desc"] {
+        for cursor in &legacy_inputs {
+            let error = named_registry
+                .dispatch(
+                    "comm.thread",
+                    json!({"id": addressed_id, "after": cursor, "order": order}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+            named_unknown_cursors.push(error.to_string());
+        }
+        for cursor in &object_inputs {
+            let error = anonymous_registry
+                .dispatch(
+                    "comm.thread",
+                    json!({"id": root, "after": cursor, "order": order}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+            anonymous_unknown_cursors.push(error.to_string());
+        }
+    }
+    store.upsert_note(legacy_cursor.clone()).await.unwrap();
+    store.upsert_note(object_recipient.clone()).await.unwrap();
 
     let baseline = anonymous_registry
         .dispatch("comm.thread", json!({"id": root}))
@@ -451,20 +482,21 @@ async fn anonymous_local_alone_can_use_legacy_roots_and_cursors() {
         .unwrap_err()
         .to_string();
     assert_eq!(hidden_root, missing_root);
-    let missing_after = named_registry
-        .dispatch("comm.thread", json!({"id": addressed_id, "after": missing}))
-        .await
-        .unwrap_err()
-        .to_string();
-    let hidden_after = named_registry
-        .dispatch(
-            "comm.thread",
-            json!({"id": addressed_id, "after": legacy_cursor.id}),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(hidden_after, missing_after);
+    for (order, unknowns) in ["asc", "desc"]
+        .into_iter()
+        .zip(named_unknown_cursors.chunks(2))
+    {
+        for (cursor, unknown) in legacy_inputs.iter().zip(unknowns) {
+            let error = named_registry
+                .dispatch(
+                    "comm.thread",
+                    json!({"id": addressed_id, "after": cursor, "order": order}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(&error.to_string(), unknown);
+        }
+    }
 
     let anonymous_missing = anonymous_registry
         .dispatch("comm.thread", json!({"id": missing}))
@@ -477,15 +509,19 @@ async fn anonymous_local_alone_can_use_legacy_roots_and_cursors() {
         .unwrap_err()
         .to_string();
     assert_eq!(object_root, anonymous_missing);
-    let missing_after = anonymous_registry
-        .dispatch("comm.thread", json!({"id": root, "after": missing}))
-        .await
-        .unwrap_err()
-        .to_string();
-    let object_after = anonymous_registry
-        .dispatch("comm.thread", json!({"id": root, "after": object_id}))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(object_after, missing_after);
+    for (order, unknowns) in ["asc", "desc"]
+        .into_iter()
+        .zip(anonymous_unknown_cursors.chunks(2))
+    {
+        for (cursor, unknown) in object_inputs.iter().zip(unknowns) {
+            let error = anonymous_registry
+                .dispatch(
+                    "comm.thread",
+                    json!({"id": root, "after": cursor, "order": order}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(&error.to_string(), unknown);
+        }
+    }
 }
