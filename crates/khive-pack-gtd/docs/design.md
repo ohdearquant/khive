@@ -39,6 +39,9 @@
 
 - Five task-management verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
 - `gtd.census` is an additional read-only timestamp-magnitude census; it does not repair task data.
+- `gtd.counts` is a read-only aggregate verb: per-status task counts for one assignee (every status
+  present, zeros included) and, with `tag`, the open rows of that tag as `id`, `title`, `status`,
+  `priority`, `updated_at` only. Counts are SQL aggregates, never a row scan.
 - `gtd.repair` applies only explicit observed-value-checked historical corrections;
   its default dry run changes nothing and it never infers timestamp units.
 - Lifecycle states: `inbox → next | waiting | someday | active | done | cancelled`.
@@ -60,6 +63,7 @@
 - `gtd.assign` → Directive (directs an actor to perform work)
 - `gtd.next` → Assertive (retrieves actionable task state)
 - `gtd.tasks` → Assertive (retrieves filtered task listing)
+- `gtd.counts` → Assertive (retrieves per-status task counts without task bodies)
 - `gtd.complete` → Declaration (changes task institutional status to terminal)
 - `gtd.transition` → Declaration (changes task lifecycle status by fiat)
 
