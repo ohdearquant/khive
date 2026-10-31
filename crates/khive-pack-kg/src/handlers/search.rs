@@ -86,9 +86,9 @@ impl SearchOrder {
 
 /// Reorder hits by a record timestamp, most recent first, then impose `limit`.
 ///
-/// A hit whose record was absent from the fetched batch has no timestamp and
-/// sorts last. The sort is stable, so hits sharing a timestamp keep the
-/// relevance order they arrived in, which makes the result deterministic.
+/// Entity search omits hits absent from its caller-visible metadata before
+/// sorting. Any missing timestamp sorts last. The sort is stable, so hits
+/// sharing a timestamp keep the relevance order they arrived in.
 fn apply_time_order<T>(hits: &mut Vec<T>, limit: usize, timestamp: impl Fn(&T) -> Option<i64>) {
     hits.sort_by_key(|hit| std::cmp::Reverse(timestamp(hit)));
     hits.truncate(limit);
@@ -103,6 +103,30 @@ struct EntityMeta {
     created_at: i64,
     updated_at: i64,
     version: i64,
+}
+
+// A scoped test-only rendezvous between candidate retrieval and metadata fetch.
+// Production builds have neither the hook nor a branch for it.
+#[cfg(test)]
+tokio::task_local! {
+    static ENTITY_HYDRATION_TEST_BARRIER: std::cell::RefCell<Option<(
+        tokio::sync::oneshot::Sender<Vec<Uuid>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>;
+}
+
+#[cfg(test)]
+async fn wait_for_entity_hydration_test_barrier(ids: &[Uuid]) {
+    let barrier = ENTITY_HYDRATION_TEST_BARRIER
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some((reached, proceed)) = barrier {
+        reached
+            .send(ids.to_vec())
+            .expect("entity test barrier observer");
+        proceed.await.expect("entity test barrier release");
+    }
 }
 
 /// Strict, canonical search request shared by the KG handler and the
@@ -443,6 +467,9 @@ impl KgPack {
     }
 
     /// Execute the same search core while retaining note-only operation metadata.
+    /// Entity hits absent from the caller-visible metadata fetch are omitted.
+    /// Concurrent updates may leave fields from different generations: this is
+    /// not a snapshot, and an omitted hit is not replaced with another candidate.
     pub(crate) async fn handle_search_with_metadata(
         &self,
         token: &NamespaceToken,
@@ -478,6 +505,8 @@ impl KgPack {
                 hits.retain(|hit| hit.score >= request.min_rank_score());
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+                #[cfg(test)]
+                wait_for_entity_hydration_test_barrier(&candidate_ids).await;
                 let entity_meta: HashMap<Uuid, EntityMeta> = if candidate_ids.is_empty() {
                     HashMap::new()
                 } else {
@@ -520,6 +549,10 @@ impl KgPack {
                         })
                         .collect()
                 };
+
+                // A candidate can disappear or become invisible between the
+                // retrieval pass and this caller-visible metadata fetch.
+                hits.retain(|hit| entity_meta.contains_key(&hit.entity_id));
 
                 let mut filtered_hits =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
@@ -845,3 +878,7 @@ async fn emit_search_executed_event(
 #[cfg(test)]
 #[path = "search_note_status_tests.rs"]
 mod note_status_tests;
+
+#[cfg(test)]
+#[path = "search_entity_race_tests.rs"]
+mod entity_race_tests;
