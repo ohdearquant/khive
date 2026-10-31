@@ -1188,7 +1188,7 @@ fn recovery_rejects_unsafe_ancestor_before_chmod() {
 
 #[test]
 #[serial]
-fn default_directory_repair_never_adds_owner_permissions() {
+fn default_directory_repair_restores_owner_access() {
     use std::os::unix::fs::PermissionsExt;
 
     if crate::test_isolation::rerun_with_private_home() {
@@ -1201,8 +1201,13 @@ fn default_directory_repair_never_adds_owner_permissions() {
 
     daemon::prepare_default_rendezvous_for_recovery().unwrap();
     let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+    let created = std::fs::File::create(directory.join("recovery-probe"));
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(mode, 0o500);
+    assert_eq!(mode, 0o700);
+    assert!(
+        created.is_ok(),
+        "the daemon can create its files after repair: {created:?}"
+    );
 }
 
 #[test]

@@ -434,7 +434,9 @@ fn repair_owned_default_dir_with_hooks(
             latest.uid()
         );
     }
-    let tightened = latest_mode & 0o700;
+    // The daemon creates its lock, pid and socket files here, so the owner keeps
+    // full access and every other bit is cleared.
+    let tightened = 0o700;
     if tightened != latest_mode {
         directory
             .set_permissions(std::fs::Permissions::from_mode(tightened))
@@ -1455,7 +1457,7 @@ mod default_directory_repair_tests {
 
     #[test]
     #[serial_test::serial]
-    fn repair_does_not_restore_owner_bits_removed_after_validation() {
+    fn repair_restores_owner_access_removed_after_validation() {
         let root = tempfile::Builder::new()
             .prefix("khive-default-chmod-")
             .tempdir_in("/tmp")
@@ -1477,12 +1479,45 @@ mod default_directory_repair_tests {
         );
 
         let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        let created = std::fs::File::create(directory.join("daemon.lock"));
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             outcome.is_ok(),
-            "already restricted directory should remain usable"
+            "an owned directory is repaired: {outcome:?}"
         );
-        assert_eq!(mode, 0o500);
+        assert_eq!(mode, 0o700);
+        assert!(
+            created.is_ok(),
+            "the daemon can create its files after repair: {created:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repair_makes_an_owner_read_only_directory_writable() {
+        let root = tempfile::Builder::new()
+            .prefix("khive-default-read-only-")
+            .tempdir_in("/tmp")
+            .expect("private synthetic directory");
+        let directory = root.path().join("rendezvous");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o550)).unwrap();
+        let owner = std::fs::metadata(&directory).unwrap().uid();
+
+        let outcome = repair_owned_default_dir(&directory, RendezvousPathRole::PidFile, owner);
+
+        let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        let created = std::fs::File::create(directory.join("daemon.pid"));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            outcome.is_ok(),
+            "an owned directory is repaired: {outcome:?}"
+        );
+        assert_eq!(mode, 0o700);
+        assert!(
+            created.is_ok(),
+            "the daemon can create its files after repair: {created:?}"
+        );
     }
 
     #[test]
