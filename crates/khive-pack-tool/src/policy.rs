@@ -105,6 +105,35 @@ fn malformed_policy_timestamp_sql() -> String {
     .join(" OR ")
 }
 
+// Keep this predicate identical to the malformed-grant partial index in 008.
+fn malformed_grant_timestamp_sql() -> String {
+    [
+        ("requested_at", true),
+        ("decided_at", false),
+        ("expires_at", false),
+        ("invalidated_at", false),
+    ]
+    .into_iter()
+    .map(|(column, required)| malformed_timestamp_sql(column, required))
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
+// Both probes are one statement: the read and write lookups must not miss a
+// malformed row inserted between checking history and selecting the live row.
+fn current_policy_sql() -> String {
+    let invalid = malformed_policy_timestamp_sql();
+    format!(
+        "SELECT {POLICY_COLUMNS} FROM tool_policy WHERE rowid = COALESCE(\
+         (SELECT rowid FROM tool_policy \
+          WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND ({invalid}) \
+          ORDER BY id ASC LIMIT 1), \
+         (SELECT rowid FROM tool_policy \
+          WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 \
+          AND deleted_at IS NULL LIMIT 1))"
+    )
+}
+
 fn opt_text(v: Option<&str>) -> SqlValue {
     SqlValue::from_opt_text(v)
 }
@@ -443,22 +472,27 @@ pub(crate) async fn select_deciding_policy(
     })
     .collect::<Vec<_>>()
     .join(" ");
+    let malformed = malformed_policy_timestamp_sql();
+    let specificity = format!("({} + {})", rank("actor"), rank("tool"));
+    let policy_order = format!(
+        "{specificity} DESC, CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, created_at ASC, id ASC"
+    );
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT id, actor, tool, decision, created_at, \
+                "WITH bad AS MATERIALIZED (\
+                 SELECT id, actor, tool, decision, created_at, \
                  CASE {invalid} ELSE NULL END AS invalid_timestamp, \
                  CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END AS policy_active \
-                 FROM tool_policy \
-                 WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
-                 ORDER BY (invalid_timestamp IS NOT NULL) DESC, policy_active DESC, \
-                 ({} + {}) DESC, \
-                 CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, \
-                 created_at ASC, id ASC \
-                 LIMIT 1",
-                rank("actor"),
-                rank("tool"),
+                 FROM tool_policy WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
+                 AND ({malformed}) ORDER BY policy_active DESC, {policy_order} LIMIT 1), \
+                 live AS MATERIALIZED (\
+                 SELECT id, actor, tool, decision, created_at, NULL AS invalid_timestamp, \
+                 1 AS policy_active FROM tool_policy \
+                 WHERE namespace = ?1 AND deleted_at IS NULL AND {actor_match} AND {tool_match} \
+                 AND NOT EXISTS (SELECT 1 FROM bad) ORDER BY {policy_order} LIMIT 1) \
+                 SELECT * FROM bad UNION ALL SELECT * FROM live"
             ),
             params: vec![
                 SqlValue::Text(ns.to_string()),
@@ -568,23 +602,19 @@ async fn select_grant_on(
          AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL \
          AND {pinned}"
     );
-    let invalid = [
-        ("requested_at", true),
-        ("decided_at", false),
-        ("expires_at", false),
-        ("invalidated_at", false),
-    ]
-    .into_iter()
-    .map(|(column, required)| malformed_timestamp_sql(column, required))
-    .collect::<Vec<_>>()
-    .join(" OR ");
+    let invalid = malformed_grant_timestamp_sql();
     let (sql, by_id, label) = match selector {
         GrantSelector::ByActor => (
             format!(
-                "SELECT {GRANT_COLUMNS}, \
-                 CASE WHEN ({activity}) THEN 1 ELSE 0 END AS grant_active \
+                "WITH bad AS MATERIALIZED (\
+                 SELECT {GRANT_COLUMNS}, CASE WHEN ({activity}) THEN 1 ELSE 0 END AS grant_active \
                  FROM tool_grants WHERE {scope} AND {actor_match} AND {tool_match} \
-                 ORDER BY ({invalid}) DESC, grant_active DESC, requested_at DESC, id ASC LIMIT 1"
+                 AND ({invalid}) ORDER BY grant_active DESC, requested_at DESC, id ASC LIMIT 1), \
+                 live AS MATERIALIZED (\
+                 SELECT {GRANT_COLUMNS}, 1 AS grant_active FROM tool_grants \
+                 WHERE {activity} AND NOT EXISTS (SELECT 1 FROM bad) \
+                 ORDER BY requested_at DESC, id ASC LIMIT 1) \
+                 SELECT * FROM bad UNION ALL SELECT * FROM live"
             ),
             false,
             "tool_grant_decide",
@@ -695,9 +725,8 @@ pub(crate) async fn upsert_policy(
     let author = write.author.to_string();
     let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
         let outcome: Result<PolicyRow, RuntimeError> = async {
-            let invalid = malformed_policy_timestamp_sql();
             let stored = writer.query_row(SqlStatement {
-                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND (deleted_at IS NULL OR ({invalid})) ORDER BY ({invalid}) DESC, id ASC LIMIT 1"),
+                sql: current_policy_sql(),
                 params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
                 label: Some("tool_policy_current".into()),
             }).await?;
@@ -768,9 +797,8 @@ pub(crate) async fn delete_policy(
     let author = author.to_string();
     let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
         let outcome: Result<PolicyRow, RuntimeError> = async {
-            let invalid = malformed_policy_timestamp_sql();
             let stored = writer.query_row(SqlStatement {
-                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND (deleted_at IS NULL OR ({invalid})) ORDER BY ({invalid}) DESC, id ASC LIMIT 1"),
+                sql: current_policy_sql(),
                 params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
                 label: Some("tool_policy_delete_current".into()),
             }).await?;
@@ -1185,7 +1213,29 @@ pub async fn decide(
 mod tests {
     use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
 
-    use super::{pattern_matches, GrantRow};
+    use super::{
+        malformed_grant_timestamp_sql, malformed_policy_timestamp_sql, pattern_matches, GrantRow,
+    };
+
+    #[test]
+    fn malformed_index_predicates_match_the_lookup_predicates() {
+        let migration = include_str!("../sql/008-malformed-history-index.sql");
+        let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (index, predicate) in [
+            (
+                "idx_tool_policy_malformed",
+                malformed_policy_timestamp_sql(),
+            ),
+            ("idx_tool_grants_malformed", malformed_grant_timestamp_sql()),
+        ] {
+            let statement = migration
+                .split(';')
+                .find(|statement| statement.contains(index))
+                .expect("malformed index must be registered in the migration");
+            let (_, actual) = statement.split_once("WHERE ").expect("index predicate");
+            assert_eq!(normalize(actual), normalize(&predicate), "{index}");
+        }
+    }
 
     fn active_row() -> SqlRow {
         SqlRow {
