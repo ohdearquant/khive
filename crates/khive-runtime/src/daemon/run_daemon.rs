@@ -1311,14 +1311,24 @@ mod default_directory_repair_tests {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
         let actual_owner = std::fs::metadata(directory.path()).unwrap().uid();
         let other_owner = actual_owner.wrapping_add(1);
+        let tmp_owner = std::fs::metadata("/tmp").unwrap().uid();
 
         let error =
             repair_owned_default_dir(directory.path(), RendezvousPathRole::PidFile, other_owner)
                 .expect_err("directory owned by a different uid must not be repaired");
 
         let message = error.to_string();
-        assert!(message.contains("owner uid"), "{message}");
-        assert!(message.contains("0775"), "{message}");
+        if tmp_owner != 0 && tmp_owner != other_owner {
+            assert!(
+                message.contains(&format!(
+                    "PID-file-path ancestor /tmp for KHIVE_PID is owned by uid {tmp_owner}, not this daemon's uid ({other_owner}) or root"
+                )),
+                "{message}"
+            );
+        } else {
+            assert!(message.contains("owner uid"), "{message}");
+            assert!(message.contains("0775"), "{message}");
+        }
         assert_eq!(
             std::fs::metadata(directory.path())
                 .unwrap()

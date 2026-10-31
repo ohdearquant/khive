@@ -664,13 +664,7 @@ async fn recovery_refuses_preplaced_lock_symlinks_before_opening_them() {
     let directory = default_rendezvous_dir();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775)).unwrap();
     let target = directory.parent().unwrap().join("not-a-recovery-lock");
-    let marker_lock =
-        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
-    for lock in [
-        daemon::lock_path(),
-        daemon::recoverer_lock_path(),
-        marker_lock.clone(),
-    ] {
+    for lock in [daemon::lock_path(), daemon::recoverer_lock_path()] {
         symlink(&target, &lock).unwrap();
         let spawn_calls = AtomicUsize::new(0);
 
@@ -678,13 +672,29 @@ async fn recovery_refuses_preplaced_lock_symlinks_before_opening_them() {
 
         match outcome {
             Err(RecoveryError::PidFileDirectoryUntrusted(message)) => {
-                assert!(message.contains(&lock.display().to_string()), "{message}");
+                assert!(
+                    message.contains(&lock.display().to_string()),
+                    "{}: {message}",
+                    lock.display()
+                );
             }
-            other => panic!("expected a lock refusal before startup, got {other:?}"),
+            other => panic!(
+                "{}: expected a lock refusal before startup, got {other:?}",
+                lock.display()
+            ),
         }
-        assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
-        assert!(!target.exists(), "a symlink target must not be created");
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 0, "{}", lock.display());
+        assert_eq!(
+            SIGTERM_COUNT.load(Ordering::SeqCst),
+            0,
+            "{}",
+            lock.display()
+        );
+        assert!(
+            !target.exists(),
+            "{}: a symlink target must not be created",
+            lock.display()
+        );
         std::fs::remove_file(lock).unwrap();
     }
 }
@@ -785,14 +795,8 @@ async fn recovery_tightens_existing_owned_group_accessible_locks() {
     clear_daemon_env();
     reset_counters();
     default_rendezvous_dir();
-    let marker_lock =
-        super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
     for mode in [0o644, 0o664] {
-        for lock in [
-            daemon::lock_path(),
-            daemon::recoverer_lock_path(),
-            marker_lock.clone(),
-        ] {
+        for lock in [daemon::lock_path(), daemon::recoverer_lock_path()] {
             std::fs::write(&lock, b"").unwrap();
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
             let spawn_calls = AtomicUsize::new(0);
@@ -803,14 +807,24 @@ async fn recovery_tightens_existing_owned_group_accessible_locks() {
                 Ok(RecoveryOutcome::Spawned(mut child)) => {
                     let _ = child.wait();
                 }
-                other => panic!("expected recovery with tightened lock, got {other:?}"),
+                other => panic!(
+                    "{}: expected recovery with tightened lock, got {other:?}",
+                    lock.display()
+                ),
             }
             assert_eq!(
                 std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
-                0o600
+                0o600,
+                "{}: original mode {mode:04o}",
+                lock.display()
             );
-            assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(spawn_calls.load(Ordering::SeqCst), 1, "{}", lock.display());
+            assert_eq!(
+                SIGTERM_COUNT.load(Ordering::SeqCst),
+                0,
+                "{}",
+                lock.display()
+            );
             std::fs::remove_file(lock).unwrap();
         }
     }
@@ -1005,6 +1019,91 @@ async fn explicit_supervisor_lock_parent_is_created_when_missing_and_must_be_saf
         guard.metadata().unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn forward_tightens_existing_owned_supervisor_marker_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let _cleanup = RecoveryTestGuard::new();
+    clear_daemon_env();
+    reset_counters();
+    let directory = default_rendezvous_dir();
+    let lock = super::forward::supervisor_marker_lock_path(&daemon::supervisor_marker_path());
+    let missing_executable = directory.join("no-such-daemon-executable");
+    assert!(!missing_executable.exists());
+
+    for mode in [0o644, 0o664] {
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        // SAFETY: the descriptor is live and LOCK_NB bounds fixture setup.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *super::forward::SUPERVISOR_LOCK_CONTENDED_HOOK
+            .lock()
+            .unwrap() = Some(sender);
+        let executable = missing_executable.clone();
+        let mut task =
+            tokio::spawn(async move { forward_or_spawn_with_exe(&frame(), &executable).await });
+        let contention = tokio::task::spawn_blocking(move || {
+            receiver.recv_timeout(std::time::Duration::from_secs(3))
+        })
+        .await;
+        drop(held);
+        *super::forward::SUPERVISOR_LOCK_CONTENDED_HOOK
+            .lock()
+            .unwrap() = None;
+        match contention {
+            Ok(Ok(())) => {}
+            other => {
+                task.abort();
+                let _ = task.await;
+                panic!("forward must reach the held supervisor marker lock: {other:?}");
+            }
+        }
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(15), &mut task).await;
+        let outcome = match completed {
+            Ok(result) => result.expect("join forward task"),
+            Err(error) => {
+                task.abort();
+                let _ = task.await;
+                panic!("forward must finish after releasing the marker lock: {error}");
+            }
+        };
+        if let Some(Err(error)) = &outcome {
+            assert!(
+                !error
+                    .message
+                    .contains("marker lock wait ended before dispatch")
+                    && !error
+                        .message
+                        .contains("supervisor marker ownership could not be established"),
+                "{}: marker lock was not acquired after release: {error:?}",
+                lock.display()
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{}: original mode {mode:04o}, forward outcome {outcome:?}",
+            lock.display()
+        );
+        assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+        std::fs::remove_file(&lock).unwrap();
+    }
 }
 
 #[tokio::test]
