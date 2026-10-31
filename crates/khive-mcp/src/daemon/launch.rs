@@ -4,6 +4,33 @@ use std::process::Stdio;
 
 use khive_runtime::process_retry::{spawn_retrying_executable_busy, EXECUTABLE_BUSY_BACKOFF_MS};
 
+/// Choose the configuration and database overrides for a newly spawned daemon.
+///
+/// A discovered configuration must be retained when a concrete database
+/// override is redundant with a declared backend, since omitting that override
+/// would otherwise lose the database-directory discovery anchor in the child.
+pub fn select_daemon_spawn_overrides(
+    explicit_config: Option<&std::path::Path>,
+    raw_db: Option<&str>,
+    discovered_config: Option<&std::path::Path>,
+    has_declared_backends: bool,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    let spawn_db = match raw_db {
+        Some(":memory:") => Some(":memory:".to_owned()),
+        Some(concrete) if !has_declared_backends => Some(concrete.to_owned()),
+        _ => None,
+    };
+    let spawn_config = explicit_config
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| match raw_db {
+            Some(raw) if raw != ":memory:" && has_declared_backends => {
+                discovered_config.map(std::path::Path::to_path_buf)
+            }
+            _ => None,
+        });
+    (spawn_config, spawn_db)
+}
+
 #[cfg(test)]
 use super::SPAWN_COUNT;
 
