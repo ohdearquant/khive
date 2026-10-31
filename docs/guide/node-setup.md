@@ -54,6 +54,15 @@ a key item. If an item already exists for this node the command refuses with
 exit code 4; after an interrupted run use `--recover`. `--recover` accepts only
 `--out` besides the global `--config`.
 
+`init` records the disabled table, including the new item's `key_reference`,
+before it creates the key item, so a key item never exists without a
+configuration that names it. If the Keychain step fails (exit code 4, for
+example a login Keychain that is locked in an ssh session), the table stays in
+the `prepared` state that `status` reports. Unlock the Keychain and run the same
+`init` again: it reuses the recorded `key_reference` and leaves the file
+unchanged until the key item exists. An `init` with different settings refuses
+with exit code 2.
+
 The public bundle goes to the file named by `--out`, or to standard output.
 A file is created only if it does not already exist; an existing path is refused
 before anything changes. The fingerprint is shown on standard error. When the

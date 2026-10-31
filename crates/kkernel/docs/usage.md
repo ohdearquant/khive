@@ -630,6 +630,8 @@ kkernel node status --config ~/.khive/khive.toml --bundle --out node-bundle.json
   `--actor` are required unless `--recover`; `--slug` defaults to `node`,
   `--namespace` to `local`, `--out` to `-` (standard output). `--recover`
   re-reads the public bundle of an incomplete init and accepts only `--out`.
+  A failed Keychain step leaves a `prepared` table; the same `init` run again
+  reuses its `key_reference`.
 - `assign`: "Import this Mac's enrolment result." `--input FILE` is required.
 - `pin`: "Confirm a contact's public keys." `--card FILE` is required. The
   confirmation is read from the terminal and only the exact answer `yes` pins.
