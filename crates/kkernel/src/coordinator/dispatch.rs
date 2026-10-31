@@ -1468,10 +1468,10 @@ impl SubstrateCoordinator {
                 let result = search.await;
                 (result, tokio::time::Instant::now(), deadline_snapshot)
             };
-            let handle = tokio::spawn(khive_runtime::search_audit::inherit(
-                khive_storage::inherit_request_read_context(
+            let handle = tokio::spawn(KhiveRuntime::search_profile_inherit(
+                khive_runtime::search_audit::inherit(khive_storage::inherit_request_read_context(
                     khive_storage::scope_request_read_deadline_at(request_deadline, search),
-                ),
+                )),
             ));
             handles.push((
                 joined_backend_id,
