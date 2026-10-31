@@ -443,25 +443,18 @@ pub(super) fn supervisor_marker_lock_path(marker: &std::path::Path) -> std::path
     std::path::PathBuf::from(lock_path)
 }
 
+#[cfg(test)]
+pub(super) static SUPERVISOR_LOCK_CONTENDED_HOOK: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
 /// Serialize the client's last ownership decision with launcher publication.
 /// The launcher locks this same permanent `<marker>.lock` inode through publish
 /// and exec. A bounded nonblocking retry keeps a stalled launcher from pinning
 /// a request worker; failure must never authorize a competing spawn.
 pub(super) async fn acquire_supervisor_marker_lock() -> std::io::Result<std::fs::File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let marker = daemon::supervisor_marker_path();
-    if let Some(parent) = marker.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(supervisor_marker_lock_path(&marker))?;
+    let path = supervisor_marker_lock_path(&marker);
+    let lock = daemon::open_mutating_daemon_lock(&path, true)?;
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS);
     let deadline = khive_storage::capture_request_read_context()
@@ -475,6 +468,10 @@ pub(super) async fn acquire_supervisor_marker_lock() -> std::io::Result<std::fs:
         match lock.try_lock() {
             Ok(()) => return Ok(lock),
             Err(std::fs::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                if let Some(sender) = SUPERVISOR_LOCK_CONTENDED_HOOK.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     return Err(std::io::ErrorKind::TimedOut.into());

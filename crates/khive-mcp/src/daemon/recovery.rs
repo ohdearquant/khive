@@ -230,6 +230,22 @@ where
     .await
 }
 
+// Failure to acquire the boot fence is uncertainty, never permission to
+// continue a probe, signal, unlink or spawn without the guard.
+#[cfg(test)]
+pub(super) static FAIL_RECOVERY_BOOT_LOCK_STAGE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn recovery_boot_lock(stage: usize) -> Option<std::fs::File> {
+    #[cfg(test)]
+    if FAIL_RECOVERY_BOOT_LOCK_STAGE.load(std::sync::atomic::Ordering::SeqCst) == stage {
+        return None;
+    }
+    #[cfg(not(test))]
+    let _ = stage;
+    acquire_recovery_lock()
+}
+
 pub(super) async fn kill_and_respawn_with_launcher_and_exit_timeout<L>(
     config_id: &str,
     namespace: &str,
@@ -239,8 +255,12 @@ pub(super) async fn kill_and_respawn_with_launcher_and_exit_timeout<L>(
 where
     L: DaemonLauncher,
 {
+    daemon::prepare_default_rendezvous_for_recovery()
+        .map_err(|error| RecoveryError::PidFileDirectoryUntrusted(format!("{error:#}")))?;
     let initial_probe = {
-        let _lock = acquire_recovery_lock();
+        let Some(_lock) = recovery_boot_lock(0) else {
+            return Ok(RecoveryOutcome::Uncertain);
+        };
         probe_daemon_identity(config_id, namespace, 500).await
     };
     match initial_probe {
@@ -311,7 +331,9 @@ where
             Ok(RecoveryOutcome::Uncertain)
         }
         ProbeOutcome::Dead => {
-            let boot_lock = acquire_recovery_lock();
+            let Some(boot_lock) = recovery_boot_lock(1) else {
+                return Ok(RecoveryOutcome::Uncertain);
+            };
             match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
                 ProbeOutcome::Alive | ProbeOutcome::Timeout => return Ok(RecoveryOutcome::Skipped),
                 ProbeOutcome::LockContended => return Ok(RecoveryOutcome::Uncertain),
@@ -320,11 +342,13 @@ where
             if khive_storage::request_read_is_cancelled() {
                 return Err(RecoveryError::RequestExpired);
             }
-            let expected_snapshot = kill_stale_daemon_inner(exit_timeout, boot_lock).await?;
+            let expected_snapshot = kill_stale_daemon_inner(exit_timeout, Some(boot_lock)).await?;
             // Keep the recoverer-only lock throughout, but let graceful exit
             // take the boot lock. An independently started successor can win
             // while we wait, so recheck under the boot lock before unlink/spawn.
-            let _boot_lock = acquire_recovery_lock();
+            let Some(_boot_lock) = recovery_boot_lock(2) else {
+                return Ok(RecoveryOutcome::Uncertain);
+            };
             match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
                 ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
                 ProbeOutcome::LockContended => Ok(RecoveryOutcome::Uncertain),
