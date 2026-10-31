@@ -5,8 +5,6 @@ pub mod handlers;
 pub(crate) mod idempotency;
 pub(crate) mod inbox_signal;
 pub(crate) mod message;
-#[cfg(feature = "node")]
-pub mod node;
 pub mod node_route;
 pub(crate) mod pack;
 pub(crate) mod params;

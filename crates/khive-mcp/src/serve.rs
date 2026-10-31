@@ -134,12 +134,6 @@ use crate::args::{resolve_cli_namespace, Args};
 use crate::server::KhiveMcpServer;
 use crate::transport::{ServeOptions, TransportRegistry};
 
-#[cfg(feature = "channel-node")]
-#[path = "serve/node.rs"]
-mod node;
-#[cfg(all(test, feature = "channel-node"))]
-#[path = "serve/node_composition_tests.rs"]
-mod node_composition_tests;
 #[path = "serve/startup.rs"]
 mod startup;
 

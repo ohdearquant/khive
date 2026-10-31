@@ -1424,9 +1424,8 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
-    /// `[channel.node]` table: the node-channel transport settings. Validated at
-    /// load by [`crate::node_config::ChannelSectionConfig::validate`]; absent or
-    /// disabled means the channel is off.
+    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
+    /// config file keeps loading; its contents are not interpreted.
     #[serde(default)]
     pub channel: crate::node_config::ChannelSectionConfig,
 
