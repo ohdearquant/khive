@@ -189,6 +189,13 @@ where
                 sock.display()
             );
         }
+        Incumbent::Unknown => {
+            anyhow::bail!(
+                "refusing to start: daemon rendezvous at {} could be live or could not be \
+                 inspected safely. Nothing was removed after the uncertainty was detected.",
+                sock.display()
+            );
+        }
         Incumbent::Stale => {}
     }
 
