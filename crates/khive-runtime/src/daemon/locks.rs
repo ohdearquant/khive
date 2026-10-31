@@ -68,8 +68,21 @@ pub(super) fn checked_open_lock_with_faults(
     after_open: impl FnOnce(),
     faults: (bool, bool),
 ) -> std::io::Result<Option<std::fs::File>> {
+    checked_open_lock_with_observe_hook(path, create, read_write, tighten, before_openat, after_open, (faults.0, faults.1, || {}))
+}
+
+#[cfg(unix)]
+pub(super) fn checked_open_lock_with_observe_hook(
+    path: &std::path::Path,
+    create: bool,
+    read_write: bool,
+    tighten: bool,
+    before_openat: impl FnOnce(),
+    after_open: impl FnOnce(),
+    faults_and_observer: (bool, bool, impl FnOnce()),
+) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::ffi::OsStrExt;
-    let (fail_metadata, fail_chmod) = faults;
+    let (fail_metadata, fail_chmod, after_observe) = faults_and_observer;
 
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -109,7 +122,7 @@ pub(super) fn checked_open_lock_with_faults(
     }
     // SAFETY: `geteuid` takes no arguments and always succeeds.
     let uid = unsafe { libc::geteuid() } as u32;
-    let observed = match std::fs::symlink_metadata(path) {
+    let mut observed = match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
@@ -123,14 +136,29 @@ pub(super) fn checked_open_lock_with_faults(
     if observed.is_none() && !create {
         return Ok(None);
     }
+    after_observe();
     let access = if read_write { libc::O_RDWR } else if tighten && !create { libc::O_RDONLY } else if create { libc::O_WRONLY } else { libc::O_RDONLY };
     let mut flags = access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    let created = observed.is_none();
+    let mut created = observed.is_none();
     if created {
         flags |= libc::O_CREAT | libc::O_EXCL;
     }
     // SAFETY: the parent fd is live, and leaf is a NUL-terminated basename.
     let mut fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+    if fd < 0 && created && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+        // Another opener created the lock after our absence observation. Retry
+        // once as an existing entry, retaining all no-follow and identity checks.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                format!("refusing lock {}: owner uid {}, mode {:04o}", path.display(), metadata.uid(), metadata.mode() & 0o7777)));
+        }
+        observed = Some(metadata);
+        created = false;
+        flags &= !(libc::O_CREAT | libc::O_EXCL);
+        // SAFETY: the validated directory descriptor and basename remain live.
+        fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+    }
     if fd < 0 && !create && tighten && !read_write
         && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
     {

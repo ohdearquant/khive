@@ -948,6 +948,44 @@ mod default_directory_repair_tests {
     }
 
     #[test]
+    fn concurrent_lock_creation_reopens_the_validated_existing_entry() {
+        let root = tempfile::Builder::new().prefix("khive-lock-create-race-").tempdir_in("/tmp").unwrap();
+        let lock = root.path().join("recovery.lock");
+
+        let opened = super::super::locks::checked_open_lock_with_observe_hook(
+            &lock, true, false, true, || {}, || {},
+            (false, false, || {
+                std::fs::write(&lock, b"incumbent").unwrap();
+                std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }),
+        ).expect("concurrent valid lock must be reopened").unwrap();
+
+        let on_disk = std::fs::metadata(&lock).unwrap();
+        assert_eq!(opened.metadata().unwrap().ino(), on_disk.ino());
+        assert_eq!(on_disk.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&lock).unwrap(), b"incumbent");
+    }
+
+    #[test]
+    fn concurrent_lock_symlink_is_refused_before_opening_its_target() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::Builder::new().prefix("khive-lock-create-symlink-").tempdir_in("/tmp").unwrap();
+        let lock = root.path().join("recovery.lock");
+        let target = root.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = super::super::locks::checked_open_lock_with_observe_hook(
+            &lock, true, false, true, || {}, || {},
+            (false, false, || symlink(&target, &lock).unwrap()),
+        ).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
     fn created_lock_failures_leave_entry_and_report_manual_recovery() {
         let root = tempfile::Builder::new().prefix("khive-lock-failure-").tempdir_in("/tmp").unwrap();
         for (label, fail_metadata, fail_chmod) in [("metadata", true, false), ("chmod", false, true)] {
