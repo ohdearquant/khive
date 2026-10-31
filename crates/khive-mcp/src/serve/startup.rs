@@ -264,10 +264,6 @@ pub(super) fn daemon_startup_report(
 pub(super) struct PreparedHostBackgroundTasks {
     #[cfg(feature = "channel-email")]
     pub(super) email: Option<PreparedEmailChannelLoops>,
-    /// Node channel host state, initialized only in a resident daemon with writable comm.
-    /// C2 starts no loop; the state is held for the channel loop that follows.
-    #[cfg(feature = "channel-node")]
-    pub(super) node: Option<Arc<khive_pack_comm::node::NodeHostState>>,
 }
 
 pub(super) async fn prepare_host_background_tasks(
@@ -281,8 +277,6 @@ pub(super) async fn prepare_host_background_tasks(
             _args.daemon
                 && _args.daemon_options().lifetime != khive_runtime::daemon::DaemonLifetime::Demand,
         )?,
-        #[cfg(feature = "channel-node")]
-        node: super::node::prepare_node_channel(_server, _args).await?,
     })
 }
 
@@ -292,11 +286,8 @@ pub(super) fn start_host_background_tasks(
     schedule_rt: Option<KhiveRuntime>,
     prepared: PreparedHostBackgroundTasks,
 ) -> khive_runtime::daemon::DaemonStartupReport {
-    #[cfg(not(any(feature = "channel-email", feature = "channel-node")))]
+    #[cfg(not(feature = "channel-email"))]
     let _ = prepared;
-    // C2 starts no node loop; keep the prepared state alive for the duration of startup.
-    #[cfg(feature = "channel-node")]
-    let _node_state = prepared.node;
     let report = daemon_startup_report(args, server, schedule_rt.is_some());
     if args.daemon
         && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
