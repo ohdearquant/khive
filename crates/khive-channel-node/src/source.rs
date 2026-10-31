@@ -67,18 +67,16 @@ pub trait OutboundSource: Send + Sync {
     ///
     /// A recipient receipt may name an earlier key epoch than the current envelope after a
     /// confirmed key change. Sources that keep envelope history override this to return that
-    /// exact historical row. The default is deliberately safe: it only answers when the current
-    /// envelope already carries the requested device and epoch, so a source without history
-    /// never verifies a receipt against a different envelope.
+    /// exact historical row, and `Ok(None)` when no row has that device and epoch. The default,
+    /// for a source without history, returns the current envelope: the receipt check compares
+    /// the receipt's device and epoch with the returned row and rejects any difference as a
+    /// binding mismatch, so a receipt is never verified against a different envelope.
     async fn for_receipt(
         &self,
         logical_id: Uuid,
-        recipient_device_id: Uuid,
-        recipient_key_epoch: u64,
+        _recipient_device_id: Uuid,
+        _recipient_key_epoch: u64,
     ) -> Result<Option<PersistedSubmission>, SourceError> {
-        Ok(self.current(logical_id).await?.filter(|p| {
-            p.recipient_device.into_uuid() == recipient_device_id
-                && p.recipient_key_epoch.get() == recipient_key_epoch
-        }))
+        self.current(logical_id).await
     }
 }

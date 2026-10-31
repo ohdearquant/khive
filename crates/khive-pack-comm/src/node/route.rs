@@ -20,7 +20,7 @@ use khive_runtime::comm_transport::{PolicyMode, SenderAssurance, SenderEnvelope}
 use khive_runtime::RuntimeError;
 use uuid::Uuid;
 
-use super::config::NodeHostState;
+use super::NodeHostState;
 use crate::node_route::{NodeSealRequest, NodeSendRefusal, NodeSendRoute, SealFuture};
 
 /// Transport kind recorded on every sealed node envelope.
@@ -94,9 +94,9 @@ impl RuntimeNodeSendRoute {
             .services()
             .await
             .map_err(|error| services_refusal(&error))?;
-        let lookup: &dyn NodeContactLookup = services.contact_lookup();
-        let facility: &dyn KeyFacility = services.facility();
-        let pins: &dyn PinSource = services.pin_source();
+        let lookup: &dyn NodeContactLookup = services.lookup().as_ref();
+        let facility: &dyn KeyFacility = services.key_facility().as_ref();
+        let pins: &dyn PinSource = services.pin_source().as_ref();
 
         // 4. Current contact record; it must agree with the owner's pin.
         let contact = lookup

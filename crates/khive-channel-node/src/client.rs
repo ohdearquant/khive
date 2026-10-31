@@ -405,17 +405,7 @@ impl NodeClient {
                     .await;
                 fetched = match by_receipt {
                     Ok(Some(p)) => p,
-                    // No envelope for that device and epoch: classify against the current one
-                    // so a mismatch is a binding mismatch and an absent message stays missing.
-                    Ok(None) => match self.state.source.current(logical).await {
-                        Ok(Some(p)) => p,
-                        Ok(None) => return rejected(ReceiptRejection::SourceMissing),
-                        Err(_) => {
-                            return ReceiptVerification::Unhandled(
-                                ReceiptReadFailure::SourceUnavailable,
-                            )
-                        }
-                    },
+                    Ok(None) => return rejected(ReceiptRejection::SourceMissing),
                     Err(_) => {
                         return ReceiptVerification::Unhandled(
                             ReceiptReadFailure::SourceUnavailable,

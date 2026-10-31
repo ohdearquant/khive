@@ -9,6 +9,8 @@ mod config;
 mod pins;
 mod route;
 mod source;
+#[cfg(test)]
+mod tests;
 
 use self::pins::RuntimePinSource;
 use self::route::NodeContactLookup;
