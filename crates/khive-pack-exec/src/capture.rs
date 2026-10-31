@@ -513,6 +513,26 @@ mod non_utf8_capture_tests {
         OsString::from_vec(bytes.to_vec())
     }
 
+    /// Whether this filesystem stores names that are not valid UTF-8. APFS refuses them with
+    /// EILSEQ, so on macOS these tests have nothing to walk and report a skip; on Linux a
+    /// refusal is a test failure, so the platform that can hold such names always runs them.
+    fn filesystem_holds_invalid_names(dir: &Path) -> bool {
+        let probe = dir.join(invalid_name(b"probe\x80"));
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                std::fs::remove_file(&probe).unwrap();
+                true
+            }
+            Err(error)
+                if error.raw_os_error() == Some(libc::EILSEQ) && !cfg!(target_os = "linux") =>
+            {
+                eprintln!("skipped: this filesystem refuses non-UTF-8 names ({error})");
+                false
+            }
+            Err(error) => panic!("could not create a non-UTF-8 name: {error}"),
+        }
+    }
+
     fn assert_content(found: &Found, expected: &[u8]) {
         match found.read_content_bounded(64).unwrap() {
             CaptureRead::Complete(content) => assert_eq!(content.bytes, expected),
@@ -523,6 +543,9 @@ mod non_utf8_capture_tests {
     #[test]
     fn distinct_invalid_names_are_reported_without_collision() {
         let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
+            return;
+        }
         std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"first").unwrap();
         std::fs::write(tmp.path().join(invalid_name(b"a\x81")), b"second").unwrap();
         std::fs::write(tmp.path().join("valid"), b"kept").unwrap();
@@ -538,6 +561,9 @@ mod non_utf8_capture_tests {
     #[test]
     fn invalid_name_does_not_hide_literal_replacement_character() {
         let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
+            return;
+        }
         std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"invalid").unwrap();
         std::fs::write(tmp.path().join("a\u{fffd}"), b"valid").unwrap();
         let root = CaptureRoot::open(tmp.path()).unwrap();
@@ -550,6 +576,9 @@ mod non_utf8_capture_tests {
     #[test]
     fn invalid_directory_is_reported_without_walking_its_subtree() {
         let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
+            return;
+        }
         let dir = tmp.path().join("parent");
         std::fs::create_dir(&dir).unwrap();
         let invalid = dir.join(invalid_name(b"bad\x80"));
