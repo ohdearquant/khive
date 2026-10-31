@@ -417,6 +417,35 @@ impl SenderTransportStore {
             })
             .await
     }
+    /// The current envelope for one logical message: the row with the highest envelope
+    /// sequence, whatever its state (held and failed rows included). Use [`Self::get`] with the
+    /// full key to read a specific historical envelope.
+    pub async fn current_by_logical_id(
+        &self,
+        namespace: &str,
+        kind: &str,
+        slug: &str,
+        logical_id: Uuid,
+    ) -> StorageResult<Option<SenderRecord>> {
+        let namespace = namespace.to_owned();
+        let kind = kind.to_owned();
+        let slug = slug.to_owned();
+        self.notes
+            .with_reader("sender_transport_current", move |conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM comm_sender_transport \
+                         WHERE namespace = ?1 AND kind = ?2 AND slug = ?3 \
+                         AND logical_message_id = ?4 \
+                         ORDER BY envelope_seq DESC LIMIT 1"
+                    ),
+                    params![namespace, kind, slug, logical_id.to_string()],
+                    read_row,
+                )
+                .optional()
+            })
+            .await
+    }
     /// Exact retries reuse the record. Only confirmed key-change operations
     /// may create another envelope.
     pub async fn create(
@@ -781,5 +810,7 @@ impl SenderTransportStore {
             .await
     }
 }
+#[cfg(test)]
+mod source_tests;
 #[cfg(test)]
 mod tests;

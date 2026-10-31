@@ -60,5 +60,25 @@ pub struct SourceError(pub String);
 /// retention; a later key rotation does not replace those recorded identifiers.
 #[async_trait]
 pub trait OutboundSource: Send + Sync {
+    /// The current persisted envelope for a logical message: the highest envelope sequence.
     async fn current(&self, logical_id: Uuid) -> Result<Option<PersistedSubmission>, SourceError>;
+
+    /// The persisted envelope for the exact recipient device and key epoch a receipt names.
+    ///
+    /// A recipient receipt may name an earlier key epoch than the current envelope after a
+    /// confirmed key change. Sources that keep envelope history override this to return that
+    /// exact historical row. The default is deliberately safe: it only answers when the current
+    /// envelope already carries the requested device and epoch, so a source without history
+    /// never verifies a receipt against a different envelope.
+    async fn for_receipt(
+        &self,
+        logical_id: Uuid,
+        recipient_device_id: Uuid,
+        recipient_key_epoch: u64,
+    ) -> Result<Option<PersistedSubmission>, SourceError> {
+        Ok(self.current(logical_id).await?.filter(|p| {
+            p.recipient_device.into_uuid() == recipient_device_id
+                && p.recipient_key_epoch.get() == recipient_key_epoch
+        }))
+    }
 }

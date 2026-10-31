@@ -27,6 +27,11 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+khive-channel-node = { version = "0.15.0", path = "../khive-channel-node", optional = true }
+
+[features]
+# Concrete node channel route, persisted sources and shared host state.
+node = ["dep:khive-channel-node", "khive-channel-node/macos-keychain"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

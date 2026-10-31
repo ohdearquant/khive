@@ -74,6 +74,11 @@ pub struct NodeChannelConfig {
     pub outbox_interval_seconds: u64,
     /// Messages handled per batch, 1 to 256.
     pub batch_size: u32,
+    /// Pair policy evaluation mode: `off`, `shadow` or `enforce`. Defaults to
+    /// `off`. Pair policy evaluation is not available yet, so with `shadow` or
+    /// `enforce` a new node-addressed send is refused before anything is
+    /// written.
+    pub pair_policy_mode: khive_db::stores::note::transport::PolicyMode,
     /// Pinned peer identities.
     pub pins: Vec<NodePinConfig>,
 }
@@ -95,6 +100,7 @@ impl Default for NodeChannelConfig {
             poll_wait_seconds: 25,
             outbox_interval_seconds: 5,
             batch_size: 64,
+            pair_policy_mode: khive_db::stores::note::transport::PolicyMode::Off,
             pins: Vec::new(),
         }
     }
