@@ -1,6 +1,11 @@
 #![cfg(unix)]
 use super::*;
 
+#[cfg(test)]
+pub(super) static DEFAULT_RENDEZVOUS_PREBIND_HOOK: std::sync::Mutex<
+    Option<Box<dyn FnOnce() + Send>>,
+> = std::sync::Mutex::new(None);
+
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
 ///
@@ -183,8 +188,6 @@ pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Res
 /// Read-only daemon probes must use `ensure_pid_file_dir_is_trusted` instead.
 #[cfg(unix)]
 pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
     let explicit_rendezvous = super::lifecycle::path_override(PID_PATH_ENV).is_some()
         || super::lifecycle::path_override(SOCKET_PATH_ENV).is_some();
     let parent = khive_dir();
@@ -210,6 +213,48 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
     {
         return Ok(());
     }
+    if !prepare_default_rendezvous_directory()? {
+        return Ok(());
+    }
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    for lock in locks {
+        if lock.parent() == Some(parent.as_path()) {
+            tighten_owned_recovery_lock(&lock, daemon_euid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Prepare the default parent only when this particular recovery lock needs it.
+#[cfg(unix)]
+pub fn prepare_default_rendezvous_for_lock(lock: &std::path::Path) -> anyhow::Result<()> {
+    let parent = khive_dir();
+    if lock.parent() != Some(parent.as_path()) {
+        return Ok(());
+    }
+    if lock.file_name().is_none() {
+        anyhow::bail!(
+            "refusing recovery lock {} without a filename",
+            lock.display()
+        );
+    }
+    if prepare_default_rendezvous_directory()? {
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let daemon_euid = unsafe { libc::geteuid() } as u32;
+        tighten_owned_recovery_lock(lock, daemon_euid)?;
+    }
+    Ok(())
+}
+
+/// Prepare the default directory without touching any lock in it.
+#[cfg(unix)]
+pub(super) fn prepare_default_rendezvous_directory() -> anyhow::Result<bool> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let explicit_rendezvous = super::lifecycle::path_override(PID_PATH_ENV).is_some()
+        || super::lifecycle::path_override(SOCKET_PATH_ENV).is_some();
+    let parent = khive_dir();
     // An explicitly selected rendezvous is not ours to repair. If a default
     // lock still needs this parent, create it only when absent; an existing
     // parent must already pass the normal trust checks at the checked opener.
@@ -221,7 +266,7 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
             if metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o7777 == 0 {
                 anyhow::bail!("cannot access default lock directory {} (mode 0000); verify ownership and set this directory to mode 0700 by hand, then retry", parent.display());
             }
-            return Ok(());
+            return Ok(false);
         }
     }
     // SAFETY: `geteuid` is always successful and takes no arguments.
@@ -236,7 +281,7 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
     let created = match builder.create(&parent) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && explicit_rendezvous => {
-            return Ok(())
+            return Ok(false)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => {
@@ -248,12 +293,7 @@ pub fn prepare_default_rendezvous_for_recovery() -> anyhow::Result<()> {
     };
     repair_default_dir_with_recovery_guidance(&parent, daemon_euid, created)?;
 
-    for lock in locks {
-        if lock.parent() == Some(parent.as_path()) {
-            tighten_owned_recovery_lock(&lock, daemon_euid)?;
-        }
-    }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -734,6 +774,15 @@ mod default_directory_repair_tests {
         tighten_owned_recovery_lock_with_hook, RendezvousPathRole,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    fn hold_lock(file: &std::fs::File) {
+        // SAFETY: the fixture owns this live file descriptor.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+    }
 
     #[derive(Clone)]
     struct EmptyDispatcher;
@@ -897,7 +946,75 @@ mod default_directory_repair_tests {
 
     #[test]
     #[serial_test::serial]
-    fn default_rendezvous_is_prepared_with_an_external_boot_lock() {
+    fn private_lock_with_default_rendezvous_does_not_prepare_home() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-private-lock-default-rendezvous-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let lock = root.path().join("boot.lock");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        let opened = super::super::locks::open_mutating_daemon_lock(&lock, false)
+            .expect("the private lock must open");
+        hold_lock(&opened);
+        assert!(lock.is_file());
+        assert!(
+            std::fs::read_dir(&home).unwrap().next().is_none(),
+            "opening a private lock must not prepare the default rendezvous"
+        );
+        drop(opened);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_lock_preparation_only_inspects_the_selected_lock() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-selected-default-lock-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        let default = home.join(".khive");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        let unrelated = default.join("khived.recoverer.lock");
+        std::os::unix::fs::symlink(root.path().join("missing"), &unrelated).unwrap();
+        let selected = default.join("khived.recovery.lock");
+        super::prepare_default_rendezvous_for_lock(&selected)
+            .expect("unrelated recovery lock must not be examined");
+        let opened = super::super::locks::open_mutating_daemon_lock(&selected, false)
+            .expect("selected default lock must open");
+        hold_lock(&opened);
+        assert_eq!(
+            opened.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(std::fs::symlink_metadata(unrelated)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn default_rendezvous_is_prepared_with_an_external_boot_lock() {
         if crate::test_process::run_in_child() {
             return;
         }
@@ -914,15 +1031,144 @@ mod default_directory_repair_tests {
         std::env::set_var("KHIVE_LOCK", &lock);
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
         std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
-        let opened = super::super::locks::open_mutating_daemon_lock(&lock, false)
-            .expect("the external boot lock parent is trusted");
+        // SAFETY: the test runs in a dedicated child process.
+        let previous_umask = unsafe { libc::umask(0o002) };
         let default = home.join(".khive");
-        assert!(default.is_dir());
+        let guard = super::super::acquire_daemon_boot_guard().expect("external boot guard");
+        assert_eq!(
+            std::fs::metadata(&default).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the default rendezvous must be private before boot"
+        );
+        let daemon = tokio::spawn(super::super::run_daemon_with_boot_guard_and_start(
+            EmptyDispatcher,
+            Some(guard),
+            |_| {},
+        ));
+        let pid = default.join("khived.pid");
+        let socket = default.join("khived.sock");
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(!daemon.is_finished(), "daemon exited before boot");
+                if lock.exists() && pid.exists() && socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // SAFETY: restore the process umask immediately after the boot witness.
+        unsafe { libc::umask(previous_umask) };
+        ready.expect("default daemon must bind with its external boot lock");
         assert_eq!(
             std::fs::metadata(default).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        drop(opened);
+        daemon.abort();
+        assert!(daemon
+            .await
+            .expect_err("daemon task must be cancelled")
+            .is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn supplied_external_guard_boots_with_private_default_rendezvous() {
+        use std::os::unix::fs::FileTypeExt;
+
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("khive-supplied-guard-default-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let lock = root.path().join("boot.lock");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::set_var("KHIVE_LOCK", &lock);
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+        let guard = super::super::locks::open_mutating_daemon_lock(&lock, false)
+            .expect("external guard file must open");
+        hold_lock(&guard);
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+
+        let default = home.join(".khive");
+        let pid = default.join("khived.pid");
+        let socket = default.join("khived.sock");
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_at_hook = std::sync::Arc::clone(&entered);
+        let observed_mode = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let mode_at_hook = std::sync::Arc::clone(&observed_mode);
+        let socket_absent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let socket_absent_at_hook = std::sync::Arc::clone(&socket_absent);
+        let directory_at_hook = default.clone();
+        let socket_at_hook = socket.clone();
+        *super::DEFAULT_RENDEZVOUS_PREBIND_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let mode = std::fs::metadata(&directory_at_hook)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(u32::MAX);
+            mode_at_hook.store(mode, std::sync::atomic::Ordering::SeqCst);
+            socket_absent_at_hook.store(
+                !socket_at_hook.exists(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            entered_at_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        // SAFETY: the test runs in a dedicated child process.
+        let previous_umask = unsafe { libc::umask(0o002) };
+        let daemon = tokio::spawn(super::super::run_daemon_with_boot_guard_and_start(
+            EmptyDispatcher,
+            Some(guard),
+            |_| {},
+        ));
+        let hook_reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) && !daemon.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(hook_reached.is_ok(), "daemon must reach pre-bind observer");
+        assert!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            "pre-bind observer must execute"
+        );
+        assert_eq!(
+            observed_mode.load(std::sync::atomic::Ordering::SeqCst),
+            0o700,
+            "default rendezvous must be private before binding; u32::MAX means absent or unreadable"
+        );
+        assert!(
+            socket_absent.load(std::sync::atomic::Ordering::SeqCst),
+            "witness must precede socket bind"
+        );
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(!daemon.is_finished(), "daemon exited before boot");
+                if pid.exists() && socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // SAFETY: restore the process umask immediately after the boot witness.
+        unsafe { libc::umask(previous_umask) };
+        ready.expect("daemon must bind with the caller-supplied guard");
+        assert!(std::fs::metadata(&socket).unwrap().file_type().is_socket());
+        assert_eq!(
+            std::fs::metadata(default).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        daemon.abort();
+        assert!(daemon
+            .await
+            .expect_err("daemon task must be cancelled")
+            .is_cancelled());
     }
 
     #[tokio::test]

@@ -255,7 +255,7 @@ pub(super) async fn kill_and_respawn_with_launcher_and_exit_timeout<L>(
 where
     L: DaemonLauncher,
 {
-    daemon::prepare_default_rendezvous_for_recovery()
+    daemon::prepare_default_rendezvous_for_lock(&daemon::lock_path())
         .map_err(|error| RecoveryError::PidFileDirectoryUntrusted(format!("{error:#}")))?;
     let initial_probe = {
         let Some(_lock) = recovery_boot_lock(0) else {
@@ -285,6 +285,8 @@ where
         }
     }
 
+    daemon::prepare_default_rendezvous_for_lock(&daemon::recoverer_lock_path())
+        .map_err(|error| RecoveryError::PidFileDirectoryUntrusted(format!("{error:#}")))?;
     let recoverer_deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS);
     let recoverer_guard = match tokio::time::timeout(

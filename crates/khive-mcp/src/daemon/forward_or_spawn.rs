@@ -476,7 +476,10 @@ where
         // admission. A launcher that publishes first holds the same lock.
         #[cfg(test)]
         supervisor_discovery_hook(SupervisorDiscoveryPoint::RecoveryAdmission);
-        if let Err(error) = khive_runtime::daemon::prepare_default_rendezvous_for_recovery() {
+        let marker = khive_runtime::daemon::supervisor_marker_path();
+        let marker_lock = super::forward::supervisor_marker_lock_path(&marker);
+        if let Err(error) = khive_runtime::daemon::prepare_default_rendezvous_for_lock(&marker_lock)
+        {
             return Some(Err(untrusted_pid_file_directory_error(format!(
                 "{error:#}"
             ))));

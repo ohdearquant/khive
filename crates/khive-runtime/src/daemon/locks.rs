@@ -22,12 +22,9 @@ pub fn open_mutating_daemon_lock(
     path: &std::path::Path,
     read_write: bool,
 ) -> std::io::Result<std::fs::File> {
-    let explicit_rendezvous = super::lifecycle::path_override(super::lifecycle::PID_PATH_ENV)
-        .is_some()
-        || super::lifecycle::path_override(super::lifecycle::SOCKET_PATH_ENV).is_some();
     let is_default_lock_parent = path.parent() == Some(super::khive_dir().as_path());
-    if !explicit_rendezvous || is_default_lock_parent {
-        super::prepare_default_rendezvous_for_recovery().map_err(lock_error)?;
+    if is_default_lock_parent {
+        super::run_daemon::prepare_default_rendezvous_directory().map_err(lock_error)?;
     }
     // Preserve recursive creation for caller-selected lock locations. The
     // checked opener below still validates the resulting path before use.
@@ -462,6 +459,15 @@ pub type DaemonBootGuard = std::fs::File;
 /// proceeding unguarded.
 #[cfg(unix)]
 pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
+    let explicit_rendezvous = super::lifecycle::path_override(super::lifecycle::PID_PATH_ENV)
+        .is_some()
+        || super::lifecycle::path_override(super::lifecycle::SOCKET_PATH_ENV).is_some();
+    if !explicit_rendezvous {
+        super::run_daemon::prepare_default_rendezvous_directory().map_err(|error| {
+            tracing::warn!(target: "khive_runtime::daemon", %error, "cannot prepare default daemon rendezvous");
+            anyhow::anyhow!("failed to acquire daemon boot/recovery lock")
+        })?;
+    }
     acquire_recovery_lock()
         .ok_or_else(|| anyhow::anyhow!("failed to acquire daemon boot/recovery lock"))
 }
