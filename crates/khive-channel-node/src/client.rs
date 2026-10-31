@@ -61,6 +61,37 @@ struct RawPollPage {
     server_time: ServerTimestamp,
 }
 
+/// Check that a node service URL is a plain HTTPS origin: no credentials, no query, no
+/// fragment and no path beyond `/`. Configuration activation and client construction both
+/// use this one check.
+pub fn validate_service_url(service_url: &str) -> Result<(), NodeError> {
+    check_service_origin(service_url, false).map(|_| ())
+}
+
+/// The shared origin check. The plain-HTTP loopback exception exists only in test builds and
+/// only for the in-process test server; production callers always pass `false`.
+fn check_service_origin(service_url: &str, loopback_test: bool) -> Result<Url, NodeError> {
+    let base = Url::parse(service_url).map_err(|_| NodeError::invalid("invalid service origin"))?;
+    let allowed_scheme = base.scheme() == "https"
+        || (cfg!(test)
+            && loopback_test
+            && base.scheme() == "http"
+            && base.host_str() == Some("127.0.0.1"));
+    if !allowed_scheme
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.fragment().is_some()
+        || base.query().is_some()
+        || base.path() != "/"
+    {
+        return Err(NodeError::invalid(
+            "service must be an HTTPS origin without credentials",
+        ));
+    }
+    Ok(base)
+}
+
 impl NodeClient {
     pub fn binding(&self) -> &NodeClientBinding {
         &self.state.binding
@@ -82,25 +113,7 @@ impl NodeClient {
         facility: Arc<dyn KeyFacility>,
         loopback_test: bool,
     ) -> Result<Self, NodeError> {
-        let base =
-            Url::parse(service_url).map_err(|_| NodeError::invalid("invalid service origin"))?;
-        let allowed_scheme = base.scheme() == "https"
-            || (cfg!(test)
-                && loopback_test
-                && base.scheme() == "http"
-                && base.host_str() == Some("127.0.0.1"));
-        if !allowed_scheme
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.fragment().is_some()
-            || base.query().is_some()
-            || base.path() != "/"
-        {
-            return Err(NodeError::invalid(
-                "service must be an HTTPS origin without credentials",
-            ));
-        }
+        let base = check_service_origin(service_url, loopback_test)?;
         if binding.namespace.is_empty()
             || binding.slug.is_empty()
             || binding.key_reference.is_empty()
@@ -368,14 +381,29 @@ impl NodeClient {
             .unwrap_or_else(|| receipt.binding.logical_message_id.into_uuid());
         let fetched;
         let p = match expected {
-            Some(p) => p,
-            None => {
-                fetched = match self
+            // The supplied row already carries the receipt's device and epoch, or the receipt
+            // names a different message (the binding check below rejects that): keep the row.
+            Some(p)
+                if p.logical_message_id != receipt.binding.logical_message_id
+                    || (p.recipient_device == receipt.binding.recipient_device_id
+                        && p.recipient_key_epoch == receipt.binding.recipient_key_epoch) =>
+            {
+                p
+            }
+            // Otherwise read the envelope for the exact recipient device and key epoch the
+            // receipt names; a confirmed key change leaves earlier epochs in history.
+            _ => {
+                let logical = receipt.binding.logical_message_id.into_uuid();
+                let by_receipt = self
                     .state
                     .source
-                    .current(receipt.binding.logical_message_id.into_uuid())
-                    .await
-                {
+                    .for_receipt(
+                        logical,
+                        receipt.binding.recipient_device_id.into_uuid(),
+                        receipt.binding.recipient_key_epoch.get(),
+                    )
+                    .await;
+                fetched = match by_receipt {
                     Ok(Some(p)) => p,
                     Ok(None) => return rejected(ReceiptRejection::SourceMissing),
                     Err(_) => {
