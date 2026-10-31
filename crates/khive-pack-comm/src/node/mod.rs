@@ -6,8 +6,14 @@
 //! factory nor metadata-only inspection blocks on OS I/O.
 
 mod config;
+#[cfg(test)]
+mod factory_tests;
+#[cfg(test)]
+mod pair_policy_tests;
 mod pins;
 mod route;
+#[cfg(test)]
+mod route_tests;
 mod source;
 #[cfg(test)]
 mod source_tests;
