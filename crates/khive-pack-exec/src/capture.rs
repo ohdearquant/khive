@@ -149,6 +149,7 @@ mod platform {
     use std::io;
     #[cfg(test)]
     use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::Arc;
@@ -384,10 +385,31 @@ mod platform {
                 )
             })?;
             for name in entries {
+                let Some(name_str) = name.to_str() else {
+                    let mut escaped = String::from("non-UTF-8 path: ");
+                    let mut append = |byte: u8| {
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        escaped.push_str("\\x");
+                        escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                        escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                    };
+                    if !rel.is_empty() {
+                        for byte in rel.bytes().chain(std::iter::once(b'/')) {
+                            append(byte);
+                        }
+                    }
+                    for &byte in name.as_bytes() {
+                        append(byte);
+                    }
+                    // Skipping a directory skips its subtree as well: its name
+                    // cannot be represented by the capture's string paths.
+                    skipped.push(escaped);
+                    continue;
+                };
                 let child_rel = if rel.is_empty() {
-                    name.to_string_lossy().into_owned()
+                    name_str.to_string()
                 } else {
-                    format!("{rel}/{}", name.to_string_lossy())
+                    format!("{rel}/{name_str}")
                 };
                 if child_rel.len() > MAX_CAPTURE_PATH_BYTES {
                     return Err(io::Error::new(
@@ -451,3 +473,112 @@ pub use platform::{walk, CaptureRoot};
 #[cfg(all(test, unix))]
 #[path = "capture/tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod non_utf8_capture_tests {
+    use super::platform::Found;
+    use super::{walk, CaptureRead, CaptureRoot};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "khive-capture-non-utf8-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create temporary capture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn invalid_name(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    fn assert_content(found: &Found, expected: &[u8]) {
+        match found.read_content_bounded(64).unwrap() {
+            CaptureRead::Complete(content) => assert_eq!(content.bytes, expected),
+            CaptureRead::TooLarge { .. } => panic!("small file was refused"),
+        }
+    }
+
+    #[test]
+    fn distinct_invalid_names_are_reported_without_collision() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"first").unwrap();
+        std::fs::write(tmp.path().join(invalid_name(b"a\x81")), b"second").unwrap();
+        std::fs::write(tmp.path().join("valid"), b"kept").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("valid").unwrap(), b"kept");
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.contains(&"non-UTF-8 path: \\x61\\x80".to_string()));
+        assert!(skipped.contains(&"non-UTF-8 path: \\x61\\x81".to_string()));
+    }
+
+    #[test]
+    fn invalid_name_does_not_hide_literal_replacement_character() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"invalid").unwrap();
+        std::fs::write(tmp.path().join("a\u{fffd}"), b"valid").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("a\u{fffd}").unwrap(), b"valid");
+        assert_eq!(skipped, vec!["non-UTF-8 path: \\x61\\x80".to_string()]);
+    }
+
+    #[test]
+    fn invalid_directory_is_reported_without_walking_its_subtree() {
+        let tmp = TempDir::new();
+        let dir = tmp.path().join("parent");
+        std::fs::create_dir(&dir).unwrap();
+        let invalid = dir.join(invalid_name(b"bad\x80"));
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::write(invalid.join("inside"), b"not visited").unwrap();
+        std::fs::write(dir.join("valid"), b"kept").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("parent/valid").unwrap(), b"kept");
+        assert_eq!(
+            skipped,
+            vec![
+                "non-UTF-8 path: \\x70\\x61\\x72\\x65\\x6e\\x74\\x2f\\x62\\x61\\x64\\x80"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn valid_replacement_character_path_is_preserved() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("a\u{fffd}"), b"valid").unwrap();
+        std::fs::write(tmp.path().join(r"literal\x61"), b"literal").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_content(files.get("a\u{fffd}").unwrap(), b"valid");
+        assert_content(files.get(r"literal\x61").unwrap(), b"literal");
+        assert!(skipped.is_empty());
+    }
+}
