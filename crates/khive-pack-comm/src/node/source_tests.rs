@@ -1,7 +1,4 @@
 //! Tests for the persisted outbound source of the node module.
-//!
-//! STATUS: written without compiling or running (cargo is not available for this change).
-//! Every API used here was read from the tree, but nothing has been type-checked.
 
 use super::source::RuntimeOutboundSource;
 use khive_channel_node::encoding::{

@@ -1,7 +1,4 @@
-//! Tests for the node module of the comm pack (wave 2b).
-//!
-//! STATUS: written without compiling or running (the leg brief forbids cargo). Every API used
-//! here was read from the tree, but nothing has been type-checked.
+//! Tests for the node module of the comm pack.
 
 use khive_channel_node::encoding::{CanonicalUuid, Epoch, HexBytes, Realm};
 use khive_channel_node::keys::{InMemoryKeyFacility, KeyFacility};
