@@ -10,10 +10,13 @@ mod pins;
 mod route;
 mod source;
 #[cfg(test)]
+mod source_tests;
+#[cfg(test)]
 mod tests;
 
 use self::pins::RuntimePinSource;
 use self::route::NodeContactLookup;
+pub(crate) use self::route::RuntimeNodeSendRoute;
 use self::source::RuntimeOutboundSource;
 use async_trait::async_trait;
 use khive_channel_node::adapter::NodeChannel;
