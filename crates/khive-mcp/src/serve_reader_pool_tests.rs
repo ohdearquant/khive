@@ -294,13 +294,20 @@ async fn mcp_boot_retains_discovered_config_for_declared_backends() {
     const CHILD_ROOT: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_ROOT";
     const CHILD_TOKEN: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_TOKEN";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
-        let allowed = ["HOME", "TMPDIR", CHILD_ROOT, CHILD_TOKEN];
+        // LLVM's coverage runtime sets this marker during profile initialization.
+        let allowed = [
+            "HOME",
+            "TMPDIR",
+            CHILD_ROOT,
+            CHILD_TOKEN,
+            "__LLVM_PROFILE_RT_INIT_ONCE",
+        ];
         for (key, _) in std::env::vars_os() {
             assert!(
                 allowed
                     .iter()
                     .any(|name| key.as_os_str() == std::ffi::OsStr::new(*name)),
-                "unexpected environment variable in discovery child"
+                "unexpected environment variable in discovery child: {key:?}"
             );
         }
         let _env = FixtureEnv::clear();
