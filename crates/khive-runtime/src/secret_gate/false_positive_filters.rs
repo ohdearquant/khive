@@ -826,131 +826,6 @@ fn is_line_location_suffix(suffix: &str) -> bool {
         && parts.next().is_none()
 }
 
-#[cfg(test)]
-mod issue_6263_tests {
-    use super::super::entropy::{check_entropy_heuristic, EntropyScanContext};
-    use super::{
-        has_clause_credential_label_with_inline, has_path_context_credential_label,
-        is_labeled_sha256_digest, ClauseValueKind,
-    };
-
-    const PATH: &str = "docs/Unforgeability/Theorems.md:349";
-
-    fn path_is_labeled(text: &str) -> bool {
-        let offset = text.find(PATH).expect("fixture contains the path");
-        has_path_context_credential_label(text, offset, false)
-    }
-
-    fn final_path_guard_is_labeled(text: &str) -> bool {
-        let offset = text.find(PATH).expect("fixture contains the path");
-        has_clause_credential_label_with_inline(text, offset, false, ClauseValueKind::FilePath)
-    }
-
-    fn entropy_refuses(text: &str) -> bool {
-        check_entropy_heuristic(text, 0, &EntropyScanContext::new(text)).is_some()
-    }
-
-    #[test]
-    fn quoted_line_reference_does_not_label_a_later_citation() {
-        let context = format!(
-            "{}\n`:1324`), x\n(`{PATH}`). x rests on the key",
-            "word ".repeat(21)
-        );
-        assert!(!path_is_labeled(&context));
-        assert!(!final_path_guard_is_labeled(&context));
-        assert!(!entropy_refuses(&context));
-        for prefix in ["", "word ", "word word word word word word word "] {
-            let input = format!("{prefix}`:1324`), x\n(`{PATH}`). x rests on the key");
-            assert!(!path_is_labeled(&input));
-            assert!(!final_path_guard_is_labeled(&input));
-            assert!(!entropy_refuses(&input));
-        }
-    }
-
-    #[test]
-    fn quoted_reference_cannot_hide_credential_assignments() {
-        for text in [
-            format!("api key:1324 `:1324` x {PATH}"),
-            format!("api key: `:1324` x {PATH}"),
-            format!("`:1324` x api key:1324 {PATH}"),
-            format!("api key {}: `:1324` x {PATH}", "word ".repeat(12)),
-        ] {
-            assert!(path_is_labeled(&text), "must retain label: {text}");
-            assert!(
-                final_path_guard_is_labeled(&text),
-                "must retain label: {text}"
-            );
-        }
-        // Assembled at run time so the high-entropy fixture is not a source literal.
-        let value = ["Aa9bB8cC", "7dD6eE5f", "F4gG3hH2", "iI1jJ0kK"].concat();
-        assert!(entropy_refuses(&format!("api key: `:1324` x {value}")));
-        assert!(entropy_refuses(&format!(
-            "api key: `:1324` x docs/{value}/file"
-        )));
-        assert!(entropy_refuses(&format!(
-            "api key: `:1324` x docs/0123456789abcdef0123/456789abcdef01234567/file"
-        )));
-    }
-
-    #[test]
-    fn path_shaped_high_entropy_values_remain_refused_under_credential_labels() {
-        // Each alphanumeric run is shorter than a standalone credential run,
-        // and none is a normalized credential-length hex span. These cases
-        // exercise the path exemption's label guard rather than relying on an
-        // independently detected secret inside the path.
-        let candidate = "assets/R9vQ4m7J/K2xW8p6S/L5dT3n1Y.dat:349";
-        let unlabeled = format!("source {candidate} is related to key handling");
-        assert!(!entropy_refuses(&unlabeled), "unlabeled path is a control");
-        for text in [
-            format!("api key: {candidate}"),
-            format!("api key: `:1324` x {candidate}"),
-            format!("api key:1324 `:1324` x {candidate}"),
-            format!("api key {}: `:1324` x {candidate}", "word ".repeat(12)),
-        ] {
-            assert!(entropy_refuses(&text), "must refuse labeled value: {text}");
-        }
-    }
-
-    #[test]
-    fn assignment_and_extended_citation_budgets_fail_closed() {
-        let assignment = format!("api key {}: {PATH}", "word ".repeat(8));
-        assert!(path_is_labeled(&assignment));
-        assert!(final_path_guard_is_labeled(&assignment));
-        let under_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(60));
-        let over_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(64));
-        assert!(!path_is_labeled(&under_extended_budget));
-        assert!(path_is_labeled(&over_extended_budget));
-        assert!(!final_path_guard_is_labeled(&under_extended_budget));
-        assert!(final_path_guard_is_labeled(&over_extended_budget));
-    }
-
-    #[test]
-    fn quoted_line_reference_preserves_vcs_and_digest_credential_guards() {
-        let vcs = format!("api key: `:1324` {PATH}");
-        let offset = vcs.find(PATH).expect("fixture contains the path");
-        assert!(has_clause_credential_label_with_inline(
-            &vcs,
-            offset,
-            false,
-            ClauseValueKind::VcsReference
-        ));
-
-        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let benign = format!("sha256: {digest}");
-        assert!(is_labeled_sha256_digest(
-            &benign,
-            benign.find(digest).expect("fixture contains the digest"),
-            digest
-        ));
-        let labeled = format!("api key: `:1324` x sha256: {digest}");
-        assert!(!is_labeled_sha256_digest(
-            &labeled,
-            labeled.find(digest).expect("fixture contains the digest"),
-            digest
-        ));
-    }
-}
-
 /// The raw span whose consecutive pure-hex runs — splitting on every
 /// non-alphanumeric character and dropping the separators for length
 /// accounting — reach one of [`HEX_CREDENTIAL_LENGTHS`].
@@ -1032,4 +907,129 @@ pub(super) fn has_normalized_hex_credential_span_overlapping(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod issue_6263_tests {
+    use super::super::entropy::{check_entropy_heuristic, EntropyScanContext};
+    use super::{
+        has_clause_credential_label_with_inline, has_path_context_credential_label,
+        is_labeled_sha256_digest, ClauseValueKind,
+    };
+
+    const PATH: &str = "docs/Unforgeability/Theorems.md:349";
+
+    fn path_is_labeled(text: &str) -> bool {
+        let offset = text.find(PATH).expect("fixture contains the path");
+        has_path_context_credential_label(text, offset, false)
+    }
+
+    fn final_path_guard_is_labeled(text: &str) -> bool {
+        let offset = text.find(PATH).expect("fixture contains the path");
+        has_clause_credential_label_with_inline(text, offset, false, ClauseValueKind::FilePath)
+    }
+
+    fn entropy_refuses(text: &str) -> bool {
+        check_entropy_heuristic(text, 0, &EntropyScanContext::new(text)).is_some()
+    }
+
+    #[test]
+    fn quoted_line_reference_does_not_label_a_later_citation() {
+        let context = format!(
+            "{}\n`:1324`), x\n(`{PATH}`). x rests on the key",
+            "word ".repeat(21)
+        );
+        assert!(!path_is_labeled(&context));
+        assert!(!final_path_guard_is_labeled(&context));
+        assert!(!entropy_refuses(&context));
+        for prefix in ["", "word ", "word word word word word word word "] {
+            let input = format!("{prefix}`:1324`), x\n(`{PATH}`). x rests on the key");
+            assert!(!path_is_labeled(&input));
+            assert!(!final_path_guard_is_labeled(&input));
+            assert!(!entropy_refuses(&input));
+        }
+    }
+
+    #[test]
+    fn quoted_reference_cannot_hide_credential_assignments() {
+        for text in [
+            format!("api key:1324 `:1324` x {PATH}"),
+            format!("api key: `:1324` x {PATH}"),
+            format!("`:1324` x api key:1324 {PATH}"),
+            format!("api key {}: `:1324` x {PATH}", "word ".repeat(12)),
+        ] {
+            assert!(path_is_labeled(&text), "must retain label: {text}");
+            assert!(
+                final_path_guard_is_labeled(&text),
+                "must retain label: {text}"
+            );
+        }
+        // Assembled at run time so the high-entropy fixture is not a source literal.
+        let value = ["Aa9bB8cC", "7dD6eE5f", "F4gG3hH2", "iI1jJ0kK"].concat();
+        assert!(entropy_refuses(&format!("api key: `:1324` x {value}")));
+        assert!(entropy_refuses(&format!(
+            "api key: `:1324` x assets/{value}/file"
+        )));
+        assert!(entropy_refuses(
+            "api key: `:1324` x docs/0123456789abcdef0123/456789abcdef01234567/file"
+        ));
+    }
+
+    #[test]
+    fn path_shaped_high_entropy_values_remain_refused_under_credential_labels() {
+        // Each alphanumeric run is shorter than a standalone credential run,
+        // and none is a normalized credential-length hex span. These cases
+        // exercise the path exemption's label guard rather than relying on an
+        // independently detected secret inside the path.
+        let candidate = "assets/R9vQ4m7J/K2xW8p6S/L5dT3n1Y.dat:349";
+        let unlabeled = format!("source {candidate} is related to key handling");
+        assert!(!entropy_refuses(&unlabeled), "unlabeled path is a control");
+        for text in [
+            format!("api key: {candidate}"),
+            format!("api key: `:1324` x {candidate}"),
+            format!("api key:1324 `:1324` x {candidate}"),
+            format!("api key {}: `:1324` x {candidate}", "word ".repeat(12)),
+        ] {
+            assert!(entropy_refuses(&text), "must refuse labeled value: {text}");
+        }
+    }
+
+    #[test]
+    fn assignment_and_extended_citation_budgets_fail_closed() {
+        let assignment = format!("api key {}: {PATH}", "word ".repeat(8));
+        assert!(path_is_labeled(&assignment));
+        assert!(final_path_guard_is_labeled(&assignment));
+        let under_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(60));
+        let over_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(64));
+        assert!(!path_is_labeled(&under_extended_budget));
+        assert!(path_is_labeled(&over_extended_budget));
+        assert!(!final_path_guard_is_labeled(&under_extended_budget));
+        assert!(final_path_guard_is_labeled(&over_extended_budget));
+    }
+
+    #[test]
+    fn quoted_line_reference_preserves_vcs_and_digest_credential_guards() {
+        let vcs = format!("api key: `:1324` {PATH}");
+        let offset = vcs.find(PATH).expect("fixture contains the path");
+        assert!(has_clause_credential_label_with_inline(
+            &vcs,
+            offset,
+            false,
+            ClauseValueKind::VcsReference
+        ));
+
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let benign = format!("sha256: {digest}");
+        assert!(is_labeled_sha256_digest(
+            &benign,
+            benign.find(digest).expect("fixture contains the digest"),
+            digest
+        ));
+        let labeled = format!("api key: `:1324` x sha256: {digest}");
+        assert!(!is_labeled_sha256_digest(
+            &labeled,
+            labeled.find(digest).expect("fixture contains the digest"),
+            digest
+        ));
+    }
 }
