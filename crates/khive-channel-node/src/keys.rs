@@ -182,6 +182,22 @@ impl InMemoryKeyFacility {
             signing_seed: seed,
         })
     }
+    /// Rebuilds a facility from durable key material: 32 bytes of HPKE input
+    /// keying material followed by a 32-byte Ed25519 seed. The caller keeps
+    /// ownership of its zeroizing copy; the facility copies only the seed into
+    /// its own zeroizing storage and derives the KEM key from the first half.
+    pub(crate) fn from_keychain_material(
+        material: &Zeroizing<[u8; 64]>,
+    ) -> Result<Self, ProtocolError> {
+        let mut signing_seed = Box::new(Zeroizing::new([0u8; 32]));
+        signing_seed.copy_from_slice(&material[32..]);
+        let (kem, _) = NodeKem::derive_keypair(&material[..32]);
+        Ok(Self {
+            kem,
+            signing_public_key: SigningPublicKey::new(signing_operation(&signing_seed, &[]).1)?,
+            signing_seed,
+        })
+    }
     #[cfg(test)]
     pub(crate) fn from_test_seeds(ikm: &[u8; 32], seed: &[u8; 32]) -> Self {
         let mut signing_seed = Box::new(Zeroizing::new([0u8; 32]));
