@@ -27,6 +27,25 @@ inventory = { workspace = true }
 lattice-embed = { workspace = true }
 lattice-inference = { workspace = true }
 lattice-fann = { workspace = true }
+# Not imported. These pin, to the exact version the descriptor records, every lattice
+# crate that lattice-embed, lattice-inference and lattice-fann resolve to, so the published
+# pack graph cannot float the descriptor math under an unchanged fingerprint.
+lattice-arch = { workspace = true }
+lattice-compute = { workspace = true }
+lattice-forecast = { workspace = true }
+lattice-grammar = { workspace = true }
+lattice-inference-core = { workspace = true }
+lattice-lora = { workspace = true }
+lattice-model-bert = { workspace = true }
+lattice-model-embeddinggemma2 = { workspace = true }
+lattice-model-io = { workspace = true }
+lattice-model-qwen3-embedding = { workspace = true }
+lattice-model-qwen35 = { workspace = true }
+lattice-quant = { workspace = true }
+lattice-router = { workspace = true }
+lattice-simd = { workspace = true }
+lattice-tokenizer = { workspace = true }
+lattice-weights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
