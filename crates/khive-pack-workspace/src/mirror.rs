@@ -26,9 +26,22 @@ use crate::{cursor, WorkspaceMirrorConfig};
 #[cfg(test)]
 pub(crate) const HISTORY_PAGE_SIZE: u32 = 50;
 
-/// Confirmed commits, unchanged files, and included paths skipped for invalid UTF-8.
+/// A selected file that exceeded the configured per-file byte limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OversizedWorkspaceFile {
+    /// Masked path relative to the workspace root.
+    pub path: PathBuf,
+    /// Bytes observed before stopping; the file can contain more bytes.
+    pub observed_bytes: u128,
+}
+
+/// Confirmed commits, unchanged files, and included paths skipped during a pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MirrorPassSummary {
+    /// Effective per-file byte limit, or `None` when reads are unlimited.
+    pub max_file_bytes: Option<u64>,
+    /// Selected files stopped after observing bytes beyond the configured limit.
+    pub oversized_files: Vec<OversizedWorkspaceFile>,
     /// Files whose document/lexical/cursor transaction was confirmed committed.
     pub committed: usize,
     /// Files whose checksum already matched committed progress.
@@ -41,6 +54,45 @@ pub struct MirrorPassSummary {
     pub refused: Vec<(PathBuf, &'static str)>,
     /// Masked relative paths of links or entries swapped before safe opening.
     pub skipped_entries: Vec<PathBuf>,
+}
+
+/// A complete input or a proven lower bound for an oversized input.
+#[derive(Debug, Eq, PartialEq)]
+enum SelectedFileBytes {
+    Complete(Vec<u8>),
+    Oversized { observed_at_least: u128 },
+}
+
+/// Read a selected file, optionally stopping after one byte beyond the limit.
+fn read_selected_file<R: Read>(
+    reader: &mut R,
+    max_bytes: Option<u64>,
+) -> std::io::Result<SelectedFileBytes> {
+    let mut raw = Vec::new();
+    let Some(limit) = max_bytes else {
+        reader.read_to_end(&mut raw)?;
+        return Ok(SelectedFileBytes::Complete(raw));
+    };
+
+    let mut bounded = (&mut *reader).take(limit);
+    bounded.read_to_end(&mut raw)?;
+    if bounded.limit() != 0 {
+        return Ok(SelectedFileBytes::Complete(raw));
+    }
+
+    let mut sentinel = [0_u8; 1];
+    loop {
+        match reader.read(&mut sentinel) {
+            Ok(0) => return Ok(SelectedFileBytes::Complete(raw)),
+            Ok(_) => {
+                return Ok(SelectedFileBytes::Oversized {
+                    observed_at_least: u128::from(limit) + 1,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn masked_diagnostic(path: &Path) -> PathBuf {
@@ -430,7 +482,9 @@ fn portable_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
 
 /// Mirror one tree sequentially, retaining at most one file's body at a time.
 ///
-/// All body bytes are read; valid UTF-8 is hashed even when mtime is unchanged.
+/// With no file limit, selected regular files are read in full; with a limit,
+/// oversized files are reported and skipped. Admitted UTF-8 files are fully
+/// read and hashed even when mtime is unchanged.
 /// Invalid UTF-8 files are skipped and named in the summary, without writes.
 /// Paths must be Unicode and symlink entries are skipped. This does not lock the tree or
 /// promise ABA-proof history serialization. Earlier files may already commit
@@ -444,8 +498,17 @@ pub async fn mirror_directory_once(
 ) -> Result<MirrorPassSummary, MirrorPassError> {
     #[cfg(test)]
     {
-        mirror_directory_once_inner(runtime, registry, token, project_root, config, None, None)
-            .await
+        mirror_directory_once_inner(
+            runtime,
+            registry,
+            token,
+            project_root,
+            config,
+            None,
+            None,
+            None,
+        )
+        .await
     }
     #[cfg(not(test))]
     {
@@ -470,6 +533,7 @@ pub(crate) async fn mirror_directory_once_with_hook(
         config,
         Some(hook),
         None,
+        None,
     )
     .await
 }
@@ -491,10 +555,55 @@ pub(crate) async fn mirror_directory_once_with_head_hook(
         config,
         None,
         Some(hook),
+        None,
     )
     .await
 }
 
+#[cfg(test)]
+pub(crate) async fn mirror_directory_once_with_read_hook(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    project_root: &Path,
+    config: &WorkspaceMirrorConfig,
+    hook: &mut (dyn FnMut(&Path) + Send),
+) -> Result<MirrorPassSummary, MirrorPassError> {
+    mirror_directory_once_inner(
+        runtime,
+        registry,
+        token,
+        project_root,
+        config,
+        None,
+        None,
+        Some(hook),
+    )
+    .await
+}
+
+#[cfg(test)]
+struct ReadWithProgressHook<'a> {
+    file: &'a mut File,
+    path: &'a Path,
+    hook: &'a mut (dyn FnMut(&Path) + Send),
+    fired: bool,
+}
+
+#[cfg(test)]
+impl Read for ReadWithProgressHook<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(buffer)?;
+        if read != 0 && !self.fired {
+            self.fired = true;
+            (self.hook)(self.path);
+        }
+        Ok(read)
+    }
+}
+
+// The three hooks exist only in test builds; a release build of this function takes five arguments.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn mirror_directory_once_inner(
     runtime: &KhiveRuntime,
     registry: &VerbRegistry,
@@ -503,8 +612,12 @@ async fn mirror_directory_once_inner(
     config: &WorkspaceMirrorConfig,
     #[cfg(test)] mut before_open: Option<&mut (dyn FnMut(&Path) + Send)>,
     #[cfg(test)] mut head_hook: Option<&mut HeadReadHook>,
+    #[cfg(test)] mut read_hook: Option<&mut (dyn FnMut(&Path) + Send)>,
 ) -> Result<MirrorPassSummary, MirrorPassError> {
-    let mut progress = MirrorPassSummary::default();
+    let mut progress = MirrorPassSummary {
+        max_file_bytes: config.max_file_bytes(),
+        ..MirrorPassSummary::default()
+    };
     if runtime.backend_id().as_str() != BackendId::MAIN {
         return Err(MirrorPassError::runtime(
             &progress,
@@ -683,9 +796,31 @@ async fn mirror_directory_once_inner(
         let modified = before
             .modified()
             .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
+        #[cfg(test)]
+        let selected = match read_hook.as_deref_mut() {
+            Some(hook) => {
+                let mut reader = ReadWithProgressHook {
+                    file: &mut file,
+                    path: &path,
+                    hook,
+                    fired: false,
+                };
+                read_selected_file(&mut reader, progress.max_file_bytes)
+            }
+            None => read_selected_file(&mut file, progress.max_file_bytes),
+        };
+        #[cfg(not(test))]
+        let selected = read_selected_file(&mut file, progress.max_file_bytes);
+        let raw = match selected.map_err(|error| MirrorPassError::io(&progress, &path, error))? {
+            SelectedFileBytes::Complete(raw) => raw,
+            SelectedFileBytes::Oversized { observed_at_least } => {
+                progress.oversized_files.push(OversizedWorkspaceFile {
+                    path: masked_diagnostic(relative),
+                    observed_bytes: observed_at_least,
+                });
+                continue;
+            }
+        };
         let after = file
             .metadata()
             .map_err(|error| MirrorPassError::io(&progress, &path, error))?;
@@ -856,4 +991,268 @@ async fn mirror_directory_once_inner(
         }
     }
     Ok(progress)
+}
+
+#[cfg(test)]
+mod selected_file_bytes_tests {
+    use super::{read_selected_file, SelectedFileBytes};
+    use std::io::{self, Read};
+
+    struct Counted<'a> {
+        remaining: &'a [u8],
+        delivered: usize,
+    }
+
+    impl Read for Counted<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let n = output.len().min(self.remaining.len());
+            output[..n].copy_from_slice(&self.remaining[..n]);
+            self.remaining = &self.remaining[n..];
+            self.delivered += n;
+            Ok(n)
+        }
+    }
+
+    fn counted(bytes: &[u8]) -> Counted<'_> {
+        Counted {
+            remaining: bytes,
+            delivered: 0,
+        }
+    }
+
+    #[test]
+    fn at_limit_is_complete_and_preserves_bytes() {
+        let mut input = counted(b"abc");
+        assert_eq!(
+            read_selected_file(&mut input, Some(3)).unwrap(),
+            SelectedFileBytes::Complete(b"abc".to_vec())
+        );
+        assert_eq!(input.delivered, 3);
+    }
+
+    #[test]
+    fn oversized_stops_after_one_extra_byte() {
+        let mut input = counted(b"abcdef");
+        assert_eq!(
+            read_selected_file(&mut input, Some(3)).unwrap(),
+            SelectedFileBytes::Oversized {
+                observed_at_least: 4
+            }
+        );
+        assert_eq!(input.delivered, 4);
+    }
+
+    #[test]
+    fn zero_limit_distinguishes_empty_from_nonempty() {
+        let mut empty = counted(b"");
+        assert_eq!(
+            read_selected_file(&mut empty, Some(0)).unwrap(),
+            SelectedFileBytes::Complete(Vec::new())
+        );
+        let mut nonempty = counted(b"ab");
+        assert_eq!(
+            read_selected_file(&mut nonempty, Some(0)).unwrap(),
+            SelectedFileBytes::Oversized {
+                observed_at_least: 1
+            }
+        );
+        assert_eq!(nonempty.delivered, 1);
+    }
+
+    #[test]
+    fn unset_and_maximum_limit_accept_small_input() {
+        let mut unlimited = counted(b"abc");
+        assert_eq!(
+            read_selected_file(&mut unlimited, None).unwrap(),
+            SelectedFileBytes::Complete(b"abc".to_vec())
+        );
+        let mut maximum = counted(b"abc");
+        assert_eq!(
+            read_selected_file(&mut maximum, Some(u64::MAX)).unwrap(),
+            SelectedFileBytes::Complete(b"abc".to_vec())
+        );
+    }
+
+    struct GrowsAtProbe {
+        initial: &'static [u8],
+        grew: bool,
+    }
+
+    impl Read for GrowsAtProbe {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.initial.is_empty() {
+                let n = output.len().min(self.initial.len());
+                output[..n].copy_from_slice(&self.initial[..n]);
+                self.initial = &self.initial[n..];
+                return Ok(n);
+            }
+            if !self.grew && !output.is_empty() {
+                self.grew = true;
+                output[0] = b'z';
+                return Ok(1);
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn growth_at_the_limit_is_observed_by_the_sentinel() {
+        let mut input = GrowsAtProbe {
+            initial: b"abc",
+            grew: false,
+        };
+        assert_eq!(
+            read_selected_file(&mut input, Some(3)).unwrap(),
+            SelectedFileBytes::Oversized {
+                observed_at_least: 4
+            }
+        );
+        assert!(input.grew);
+    }
+
+    #[test]
+    fn real_file_growth_is_observed_at_the_sentinel() {
+        use std::fs::{File, OpenOptions};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct RemoveOnDrop {
+            path: PathBuf,
+            armed: bool,
+        }
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+
+        struct GrowOnSentinel {
+            reader: File,
+            appender: File,
+            delivered: usize,
+            observed_lengths: Option<(u64, u64)>,
+        }
+        impl Read for GrowOnSentinel {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.delivered == 3 && self.observed_lengths.is_none() && !output.is_empty() {
+                    let before = self.reader.metadata()?.len();
+                    self.appender.write_all(b"z")?;
+                    let after = self.reader.metadata()?.len();
+                    self.observed_lengths = Some((before, after));
+                }
+                let count = self.reader.read(output)?;
+                self.delivered += count;
+                Ok(count)
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("khive-mirror-grow-{}-{nonce}", std::process::id()));
+        let mut cleanup = RemoveOnDrop {
+            path: path.clone(),
+            armed: false,
+        };
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        cleanup.armed = true;
+        reader.write_all(b"abc").unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(reader.metadata().unwrap().len(), 3);
+        let appender = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut input = GrowOnSentinel {
+            reader,
+            appender,
+            delivered: 0,
+            observed_lengths: None,
+        };
+        assert_eq!(
+            read_selected_file(&mut input, Some(3)).unwrap(),
+            SelectedFileBytes::Oversized {
+                observed_at_least: 4
+            }
+        );
+        assert_eq!(input.observed_lengths, Some((3, 4)));
+        assert_eq!(input.delivered, 4);
+    }
+
+    struct InterruptedOnProbe(u8);
+
+    impl Read for InterruptedOnProbe {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            match self.0 {
+                0 if !output.is_empty() => {
+                    self.0 = 1;
+                    output[0] = b'a';
+                    Ok(1)
+                }
+                1 => {
+                    self.0 = 2;
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                }
+                2 if !output.is_empty() => {
+                    self.0 = 3;
+                    output[0] = b'b';
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_sentinel_read_retries_without_losing_the_extra_byte() {
+        let mut input = InterruptedOnProbe(0);
+        assert_eq!(
+            read_selected_file(&mut input, Some(1)).unwrap(),
+            SelectedFileBytes::Oversized {
+                observed_at_least: 2
+            }
+        );
+    }
+
+    struct FailsAfterPrefix(bool);
+
+    impl Read for FailsAfterPrefix {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.0 && !output.is_empty() {
+                self.0 = true;
+                output[0] = b'a';
+                Ok(1)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "read failed",
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn read_errors_are_not_converted_to_eof() {
+        let mut before_limit = FailsAfterPrefix(false);
+        assert_eq!(
+            read_selected_file(&mut before_limit, Some(2))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut sentinel = FailsAfterPrefix(false);
+        assert_eq!(
+            read_selected_file(&mut sentinel, Some(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 }

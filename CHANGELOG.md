@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The workspace mirror accepts an optional per-file byte limit,
+  `KHIVE_MIRROR_WORKSPACE_MAX_FILE_BYTES`. Unset keeps today's behaviour (no
+  limit). A file over the limit is not committed: the pass reports it in
+  `MirrorPassSummary::oversized_files` with its masked path and the bytes
+  observed (a lower bound), and its cursor is unchanged. An invalid value is
+  refused as `WorkspaceMirrorConfigError::InvalidMaxFileBytes`.
+
 ## [0.15.0] - 2026-10-31
 
 ### Added

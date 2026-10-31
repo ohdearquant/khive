@@ -16,6 +16,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 const POLL: &str = "KHIVE_MIRROR_WORKSPACE_POLL_SECS";
 const INCLUDE: &str = "KHIVE_MIRROR_WORKSPACE_INCLUDE";
 const EXCLUDE: &str = "KHIVE_MIRROR_WORKSPACE_EXCLUDE";
+const MAX_FILE_BYTES: &str = "KHIVE_MIRROR_WORKSPACE_MAX_FILE_BYTES";
 const DEFAULT_INCLUDE: &[&str] = &[
     ".khive/notes/**/*.{md,markdown,txt}",
     ".khive/reports/**/*.{md,markdown,txt}",
@@ -35,6 +36,7 @@ const DEFAULT_EXCLUDE: &[&str] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceMirrorConfigError {
     InvalidPollInterval,
+    InvalidMaxFileBytes,
     NonUnicodeValue(&'static str),
     InvalidGlobList(&'static str),
     InvalidGlob(&'static str),
@@ -46,6 +48,9 @@ impl fmt::Display for WorkspaceMirrorConfigError {
         match self {
             Self::InvalidPollInterval => {
                 write!(f, "{POLL} must be a nonzero u64 number of seconds")
+            }
+            Self::InvalidMaxFileBytes => {
+                write!(f, "{MAX_FILE_BYTES} must be a nonzero u64 number of bytes")
             }
             Self::NonUnicodeValue(key) => write!(f, "{key} must contain Unicode text"),
             Self::InvalidGlobList(key) => write!(f, "{key} must be a JSON array of glob strings"),
@@ -62,6 +67,7 @@ impl std::error::Error for WorkspaceMirrorConfigError {}
 /// Default extension exclusions are path filters, not binary-content detection.
 pub struct WorkspaceMirrorConfig {
     poll_interval: Duration,
+    max_file_bytes: Option<u64>,
     include_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
     include: GlobSet,
@@ -69,8 +75,9 @@ pub struct WorkspaceMirrorConfig {
 }
 
 impl WorkspaceMirrorConfig {
-    /// Read the three workspace mirror variables. Missing interval means 2s;
-    /// zero, non-numeric and overflowing intervals are configuration errors.
+    /// Read the workspace mirror variables. Missing interval means 2s; an unset
+    /// file-size limit means unlimited. Zero, malformed and overflowing values
+    /// for either numeric setting are configuration errors.
     pub fn from_env() -> Result<Self, WorkspaceMirrorConfigError> {
         Self::from_lookup(|key| match std::env::var(key) {
             Ok(value) => Ok(Some(value)),
@@ -79,6 +86,11 @@ impl WorkspaceMirrorConfig {
                 Err(WorkspaceMirrorConfigError::NonUnicodeValue(key))
             }
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_defaults_for_test() -> Result<Self, WorkspaceMirrorConfigError> {
+        Self::from_lookup(|_| Ok(None))
     }
 
     fn from_lookup(
@@ -92,12 +104,22 @@ impl WorkspaceMirrorConfig {
                 .filter(|seconds| *seconds != 0)
                 .ok_or(WorkspaceMirrorConfigError::InvalidPollInterval)?,
         };
+        let max_file_bytes = match lookup(MAX_FILE_BYTES)? {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<u64>()
+                    .ok()
+                    .filter(|bytes| *bytes != 0)
+                    .ok_or(WorkspaceMirrorConfigError::InvalidMaxFileBytes)?,
+            ),
+        };
         let include_patterns = patterns(lookup(INCLUDE)?, DEFAULT_INCLUDE, INCLUDE)?;
         let exclude_patterns = patterns(lookup(EXCLUDE)?, DEFAULT_EXCLUDE, EXCLUDE)?;
         let include = compile(&include_patterns, INCLUDE)?;
         let exclude = compile(&exclude_patterns, EXCLUDE)?;
         Ok(Self {
             poll_interval: Duration::from_secs(poll_secs),
+            max_file_bytes,
             include_patterns,
             exclude_patterns,
             include,
@@ -107,6 +129,14 @@ impl WorkspaceMirrorConfig {
 
     pub fn poll_interval(&self) -> Duration {
         self.poll_interval
+    }
+    /// Maximum selected-file bytes, or `None` when no limit is configured.
+    pub fn max_file_bytes(&self) -> Option<u64> {
+        self.max_file_bytes
+    }
+    #[cfg(test)]
+    pub(crate) fn set_max_file_bytes_for_test(&mut self, value: Option<u64>) {
+        self.max_file_bytes = value;
     }
     pub fn include_patterns(&self) -> &[String] {
         &self.include_patterns
@@ -232,6 +262,29 @@ mod tests {
                 ),
                 "zero, malformed and overflowing intervals must be refused"
             );
+        }
+    }
+
+    #[test]
+    fn file_size_limit_defaults_to_unlimited_and_accepts_positive_u64() {
+        assert_eq!(config(&[]).expect("default config").max_file_bytes(), None);
+        for bytes in [1, 4096, u64::MAX] {
+            let raw = bytes.to_string();
+            let config = config(&[(MAX_FILE_BYTES, &raw)]).expect("positive byte limit");
+            assert_eq!(config.max_file_bytes(), Some(bytes));
+        }
+    }
+
+    #[test]
+    fn invalid_file_size_limits_are_refused_without_echoing_values() {
+        for raw in ["0", "", "-1", "private-value", "18446744073709551616"] {
+            let error = match config(&[(MAX_FILE_BYTES, raw)]) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid file-size limit must be refused"),
+            };
+            assert_eq!(error, WorkspaceMirrorConfigError::InvalidMaxFileBytes);
+            assert!(!error.to_string().contains("private-value"));
+            assert!(!format!("{error:?}").contains("private-value"));
         }
     }
 
