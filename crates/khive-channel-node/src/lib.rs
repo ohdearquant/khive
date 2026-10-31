@@ -54,7 +54,11 @@ mod client_tests;
 #[cfg(test)]
 mod docs_tests;
 #[cfg(test)]
+mod historical_receipt_tests;
+#[cfg(test)]
 mod plaintext_tests;
+#[cfg(test)]
+mod service_url_tests;
 #[cfg(test)]
 mod timestamp_tests;
 #[cfg(test)]

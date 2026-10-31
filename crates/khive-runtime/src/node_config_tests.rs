@@ -46,6 +46,7 @@ fn valid() -> NodeChannelConfig {
         poll_wait_seconds: 25,
         outbox_interval_seconds: 5,
         batch_size: 64,
+        pair_policy_mode: khive_db::stores::note::transport::PolicyMode::Off,
         pins: vec![pin(PEER_AGENT, PEER_DEVICE, 1)],
     }
 }
@@ -64,6 +65,37 @@ fn parse(text: &str) -> Result<ChannelSectionConfig, toml::de::Error> {
 #[test]
 fn a_complete_enabled_table_is_accepted() {
     valid().validate().expect("valid table");
+}
+
+#[test]
+fn pair_policy_defaults_to_off() {
+    assert_eq!(
+        NodeChannelConfig::default().pair_policy_mode,
+        khive_db::stores::note::transport::PolicyMode::Off
+    );
+    let section = parse("[channel.node]\nenabled = false\n").expect("parses");
+    assert_eq!(
+        section.node.expect("table").pair_policy_mode,
+        khive_db::stores::note::transport::PolicyMode::Off
+    );
+}
+
+#[test]
+fn pair_policy_shadow_and_enforce_parse() {
+    use khive_db::stores::note::transport::PolicyMode;
+    for (text, expected) in [
+        ("shadow", PolicyMode::Shadow),
+        ("enforce", PolicyMode::Enforce),
+    ] {
+        let doc = format!("[channel.node]\npair_policy_mode = \"{text}\"\n");
+        let node = parse(&doc).expect("parses").node.expect("table");
+        assert_eq!(node.pair_policy_mode, expected);
+    }
+}
+
+#[test]
+fn an_unknown_pair_policy_mode_fails_parsing() {
+    assert!(parse("[channel.node]\npair_policy_mode = \"sometimes\"\n").is_err());
 }
 
 #[test]
@@ -400,6 +432,12 @@ fn the_digest_changes_with_every_field() {
         ("namespace", Box::new(|c| c.namespace = "other".to_string())),
         ("epoch", Box::new(|c| c.key_epoch = Some(2))),
         ("batch", Box::new(|c| c.batch_size = 65)),
+        (
+            "pair_policy",
+            Box::new(|c| {
+                c.pair_policy_mode = khive_db::stores::note::transport::PolicyMode::Shadow
+            }),
+        ),
         ("poll", Box::new(|c| c.poll_wait_seconds = 24)),
         ("outbox", Box::new(|c| c.outbox_interval_seconds = 6)),
         ("pin", Box::new(|c| c.pins.push(pin(AGENT, DEVICE, 9)))),

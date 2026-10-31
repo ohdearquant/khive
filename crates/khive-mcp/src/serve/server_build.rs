@@ -882,7 +882,11 @@ pub fn build_server_from_multi_backend_registry(
     // they must hold the runtime that owns comm's rows — under a
     // `[packs.comm]` backend assignment that is the comm pack's runtime, not
     // the kg/main one (which would list an empty outbox forever).
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[cfg(any(
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
     let channel_outbox_runtime = multi
         .per_pack_runtimes
         .get("comm")
@@ -908,10 +912,14 @@ pub fn build_server_from_multi_backend_registry(
     .with_secondary_pools(secondary_pools)
     .with_runtime(default_runtime);
 
+    #[cfg(any(
+        feature = "channel-email",
+        feature = "channel-telegram",
+        feature = "channel-node"
+    ))]
+    let server = server.with_channel_outbox_runtime(channel_outbox_runtime);
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    let server = server
-        .with_channel_outbox_runtime(channel_outbox_runtime)
-        .with_channel_loop_admission(channel_loop_admission);
+    let server = server.with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),

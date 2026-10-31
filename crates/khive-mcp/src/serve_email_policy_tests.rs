@@ -79,6 +79,7 @@ fn startup_external_enabled_requires_actor_in_both_host_entrypoints() {
                 KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
             assert!(
                 prepare_host_background_tasks(&args, &server)
+                    .await
                     .unwrap()
                     .email
                     .is_none(),
@@ -102,6 +103,7 @@ fn startup_disabled_external_does_not_require_actor_or_parse_routes() {
                 KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
             let args = Args::parse_from(["mcp"]);
             assert!(prepare_host_background_tasks(&args, &server)
+                .await
                 .unwrap()
                 .email
                 .is_none());
@@ -179,6 +181,7 @@ fn startup_inbound_only_requires_actor_and_leaves_outbound_external_refused() {
             std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
             let server = server();
             assert!(prepare_host_background_tasks(&args(), &server)
+                .await
                 .unwrap()
                 .email
                 .is_none());
