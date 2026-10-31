@@ -533,11 +533,16 @@ The optional `[channel.node]` table configures the node channel transport. It is
 off by default: without the table, or with `enabled = false`, nothing about the
 node channel runs and the daemon identity is unchanged.
 
-Key material and peer pins are never typed by hand. The node setup commands,
-which are not available yet, will create the key in the login keychain, record
-the reference and fingerprint here, and append peer pins as they are confirmed.
-The fields are described so the file can be read and reviewed, not so values
-can be pasted in.
+Key material and peer pins are never typed by hand. The node setup commands
+create and record them: `kkernel node init` creates the device key in the login
+keychain and writes the prepared table with the key reference and fingerprint,
+`kkernel node assign` imports the enrolment result, binds the agent, device and
+key epoch, and enables the table, `kkernel node pin` appends a peer pin once the
+person at the terminal confirms its fingerprint, and `kkernel node status`
+reports the local setup and exports the public bundle without changing the
+file. Each command edits only the file named by `--config` and preserves
+unrelated content; changes take effect when the daemon restarts. The fields are
+described so the file can be read and reviewed, not so values can be pasted in.
 
 Unknown keys and wrong value types are rejected when the file loads, even when
 the table is disabled. The checks in the Range column run only when

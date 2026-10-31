@@ -612,6 +612,41 @@ newer build. Recreate it from the current schema; in-place downgrade is unsuppor
 
 ---
 
+## `kkernel node` — node setup
+
+Create device keys in the login Keychain, import an enrolment result, and confirm
+contact keys without editing key material by hand. Configuration changes preserve
+unrelated content and take effect after a daemon restart. See
+`docs/guide/node-setup.md` for the full walkthrough.
+
+```bash
+kkernel node init --config ~/.khive/khive.toml --service-url https://hub.example.com --realm <realm> --actor <label> --out node-bundle.json
+kkernel node assign --config ~/.khive/khive.toml --input enrolment.json
+kkernel node pin --config ~/.khive/khive.toml --card contact-card.json
+kkernel node status --config ~/.khive/khive.toml --bundle --out node-bundle.json
+```
+
+- `init`: "Initialize this Mac's node keys." `--service-url`, `--realm` and
+  `--actor` are required unless `--recover`; `--slug` defaults to `node`,
+  `--namespace` to `local`, `--out` to `-` (standard output). `--recover`
+  re-reads the public bundle of an incomplete init and accepts only `--out`.
+- `assign`: "Import this Mac's enrolment result." `--input FILE` is required.
+- `pin`: "Confirm a contact's public keys." `--card FILE` is required. The
+  confirmation is read from the terminal and only the exact answer `yes` pins.
+- `status`: "Show local node setup and export public information." `--bundle`
+  and `--card` are mutually exclusive; `--out FILE` requires one of them.
+
+Every subcommand needs the one configuration file selected with `--config` or
+`KHIVE_CONFIG`; it is never discovered. The commands need macOS and a build with
+the `macos-keychain` feature. Exit codes: `0` success, `2` usage or state
+refusal, `3` confirmation declined or no terminal, `4` platform, build or
+Keychain problem, `5` hub lookup refused or failed, `6` local file problem or
+configuration changed during the command. The commands write no key material to
+the configuration file, `init` makes no network request, and `status` checks
+nothing remote.
+
+---
+
 ## `kkernel kg import` — import with explicit collision policies
 
 ```bash

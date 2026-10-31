@@ -14,6 +14,7 @@ Documentation for using khive as a research knowledge graph runtime.
 | [GTD Task Management](tasks.md)                     | Task lifecycle, priorities, dependencies           |
 | [Tips and Tricks](tips-and-tricks.md)               | Query craft, DSL round-trips, param gotchas        |
 | [Proof-Graph Case Study](proof-graph-case-study.md) | Mathlib as a khive-at-scale case study             |
+| [Node Setup](node-setup.md)                         | Keychain node keys, enrolment, contact pins        |
 
 ## How to read these guides
 
