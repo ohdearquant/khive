@@ -47,8 +47,8 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod vectors;
 
-#[cfg(test)]
-mod client_test_server;
+#[cfg(any(test, feature = "test-server"))]
+pub mod client_test_server;
 #[cfg(test)]
 mod client_tests;
 #[cfg(test)]

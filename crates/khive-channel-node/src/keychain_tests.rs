@@ -171,6 +171,35 @@ fn accounts_are_independent() {
     assert!(matches!(err, Some(KeychainError::PublicKeyMismatch)));
 }
 
+#[test]
+fn node_recover_validates_material_without_creation() {
+    let backend = FakeBackend::default();
+    let err = recover_with(&backend, "node-a", realm()).err();
+    assert!(matches!(err, Some(KeychainError::ItemUnavailable)));
+    assert!(backend.items.borrow().is_empty());
+
+    let bundle = created(&backend, "node-a");
+    let stored = backend.stored("node-a").unwrap();
+    let recovered = recover_with(&backend, "node-a", realm()).unwrap();
+    assert_eq!(recovered, bundle);
+    assert_eq!(backend.stored("node-a").unwrap(), stored);
+    assert_eq!(backend.items.borrow().len(), 1);
+
+    let mut wrong_version = stored.clone();
+    wrong_version[0] = 2;
+    let mut short = stored.clone();
+    short.pop();
+    let mut long = stored.clone();
+    long.push(0);
+    for bad in [wrong_version, short, long] {
+        backend.put("node-a", bad.clone());
+        let err = recover_with(&backend, "node-a", realm()).err();
+        assert!(matches!(err, Some(KeychainError::InvalidMaterial)));
+        assert_eq!(backend.stored("node-a").unwrap(), bad);
+        assert_eq!(backend.items.borrow().len(), 1);
+    }
+}
+
 /// Compile-time proof that a type implements none of the named traits: the
 /// probe call is ambiguous (a compile error) if the trait is implemented.
 macro_rules! assert_not_impl {

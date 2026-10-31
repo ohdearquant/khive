@@ -101,13 +101,13 @@ impl KeyFacility for MacOsKeyFacility {
     }
 }
 
-/// Loads the item once, validates version, length and fingerprint, and keeps
-/// only zeroizing copies. A missing item never creates anything.
-fn open_with<B: KeychainBackend>(
+/// Reads the item for `reference` and returns its 64 bytes of private
+/// material after checking the version byte and the exact payload length. A
+/// missing item is `ItemUnavailable`; nothing is ever created here.
+fn read_material<B: KeychainBackend>(
     backend: &B,
     reference: &str,
-    expected_fingerprint: &[u8; 32],
-) -> Result<MacOsKeyFacility, KeychainError> {
+) -> Result<Zeroizing<[u8; MATERIAL_LEN]>, KeychainError> {
     let payload = backend
         .read(SERVICE, reference)?
         .ok_or(KeychainError::ItemUnavailable)?;
@@ -116,7 +116,17 @@ fn open_with<B: KeychainBackend>(
     }
     let mut material = Zeroizing::new([0u8; MATERIAL_LEN]);
     material.copy_from_slice(&payload[1..]);
-    drop(payload);
+    Ok(material)
+}
+
+/// Loads the item once, validates version, length and fingerprint, and keeps
+/// only zeroizing copies. A missing item never creates anything.
+fn open_with<B: KeychainBackend>(
+    backend: &B,
+    reference: &str,
+    expected_fingerprint: &[u8; 32],
+) -> Result<MacOsKeyFacility, KeychainError> {
+    let material = read_material(backend, reference)?;
     let inner = InMemoryKeyFacility::from_keychain_material(&material)
         .map_err(|_| KeychainError::InvalidMaterial)?;
     if inner.public_keys().fingerprint().as_bytes() != expected_fingerprint {
@@ -151,14 +161,31 @@ fn create_with<B: KeychainBackend, R: RngCore>(
     Ok(bundle)
 }
 
+/// Reads the existing item for `reference` and returns only the public
+/// enrolment bundle for `realm`. The version and length are checked exactly as
+/// on open. A missing item is `ItemUnavailable`; this never adds, replaces or
+/// deletes an item.
+fn recover_with<B: KeychainBackend>(
+    backend: &B,
+    reference: &str,
+    realm: Realm,
+) -> Result<EnrolmentBundle, KeychainError> {
+    let material = read_material(backend, reference)?;
+    let facility = InMemoryKeyFacility::from_keychain_material(&material)
+        .map_err(|_| KeychainError::InvalidMaterial)?;
+    facility
+        .enrolment_bundle(realm)
+        .map_err(|_| KeychainError::InvalidMaterial)
+}
+
 /// Real login-keychain backend: the user's login keychain is opened by explicit
 /// path under the effective user's home and no other keychain is searched.
 /// Key bytes never appear in a command line.
 #[cfg(all(target_os = "macos", feature = "macos-keychain"))]
 mod login_keychain {
     use super::{
-        create_with, open_with, EnrolmentBundle, KeychainBackend, KeychainError, MacOsKeyFacility,
-        Realm,
+        create_with, open_with, recover_with, EnrolmentBundle, KeychainBackend, KeychainError,
+        MacOsKeyFacility, Realm,
     };
     use rand_core::OsRng;
     use security_framework::os::macos::keychain::SecKeychain;
@@ -275,8 +302,24 @@ mod login_keychain {
         pub fn create(reference: &str, realm: Realm) -> Result<EnrolmentBundle, KeychainError> {
             create_with(&LoginKeychain::open()?, &mut OsRng, reference, realm)
         }
+
+        /// Returns the public enrolment bundle for the item already stored
+        /// under `reference`. Nothing is created, replaced or deleted.
+        pub fn recover_enrolment_bundle(
+            reference: &str,
+            realm: Realm,
+        ) -> Result<EnrolmentBundle, KeychainError> {
+            recover_with(&LoginKeychain::open()?, reference, realm)
+        }
     }
 }
+
+/// In-memory keychain for tests of crates that consume this facility. It runs
+/// the same create, open and recover logic as the login keychain and never
+/// touches the operating system.
+#[cfg(any(test, feature = "test-keychain"))]
+#[path = "keychain_testing.rs"]
+pub mod testing;
 
 #[cfg(test)]
 #[path = "keychain_tests.rs"]

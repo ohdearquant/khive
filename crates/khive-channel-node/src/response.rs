@@ -6,8 +6,9 @@ use crate::wire::{
     WireDecodeError,
 };
 use crate::ProtocolError;
+pub use khive_channel::ChannelError;
 pub use khive_channel::ReceiptRejectionReason as ReceiptRejection;
-use khive_channel::{ChannelError, ReceiptReadFailure, VerifiedRecipientReceipt};
+use khive_channel::{ReceiptReadFailure, VerifiedRecipientReceipt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -55,6 +56,8 @@ pub struct RemoteDiagnostic {
     pub date: Option<String>,
     pub clock: Option<ClockDiagnosis>,
     pub retry_after_seconds: Option<u64>,
+    /// The service's refusal code, when the response carried a valid refusal body.
+    pub refusal: Option<RefusalCode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

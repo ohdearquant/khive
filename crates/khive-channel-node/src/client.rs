@@ -61,20 +61,21 @@ struct RawPollPage {
     server_time: ServerTimestamp,
 }
 
-/// Check that a node service URL is a plain HTTPS origin: no credentials, no query, no
-/// fragment and no path beyond `/`. Configuration activation and client construction both
-/// use this one check.
+/// Check that `service_url` is an acceptable node service origin: an HTTPS
+/// origin with a host, no credentials, no query, no fragment and no path
+/// beyond `/`. Node client construction applies the same check.
 pub fn validate_service_url(service_url: &str) -> Result<(), NodeError> {
-    check_service_origin(service_url, false).map(|_| ())
+    parse_service_origin(service_url, false).map(|_| ())
 }
 
-/// The shared origin check. The plain-HTTP loopback exception exists only in test builds and
-/// only for the in-process test server; production callers always pass `false`.
-fn check_service_origin(service_url: &str, loopback_test: bool) -> Result<Url, NodeError> {
+/// The single copy of the service-origin rules. `allow_test_loopback` admits
+/// plain HTTP to 127.0.0.1 and only takes effect in this crate's own tests or
+/// when the `test-server` feature is enabled (a consumer's dev-dependency).
+fn parse_service_origin(service_url: &str, allow_test_loopback: bool) -> Result<Url, NodeError> {
     let base = Url::parse(service_url).map_err(|_| NodeError::invalid("invalid service origin"))?;
     let allowed_scheme = base.scheme() == "https"
-        || (cfg!(test)
-            && loopback_test
+        || (cfg!(any(test, feature = "test-server"))
+            && allow_test_loopback
             && base.scheme() == "http"
             && base.host_str() == Some("127.0.0.1"));
     if !allowed_scheme
@@ -113,7 +114,7 @@ impl NodeClient {
         facility: Arc<dyn KeyFacility>,
         loopback_test: bool,
     ) -> Result<Self, NodeError> {
-        let base = check_service_origin(service_url, loopback_test)?;
+        let base = parse_service_origin(service_url, loopback_test)?;
         if binding.namespace.is_empty()
             || binding.slug.is_empty()
             || binding.key_reference.is_empty()
@@ -149,8 +150,9 @@ impl NodeClient {
             }),
         })
     }
-    #[cfg(test)]
-    pub(crate) fn test_http(
+    /// A plain-HTTP loopback client for tests; the production constructor is HTTPS only.
+    #[cfg(any(test, feature = "test-server"))]
+    pub fn test_http(
         binding: NodeClientBinding,
         service_url: &str,
         source: Arc<dyn OutboundSource>,
@@ -256,6 +258,7 @@ impl NodeClient {
             date,
             clock,
             retry_after_seconds: None,
+            refusal: None,
         };
         // Authentication and server failures keep their A.9 class even if their bodies are unusable.
         if status == 401 || status >= 500 {
@@ -288,9 +291,9 @@ impl NodeClient {
         let observed: ContactResponse = decode(&r.body)?;
         observed
             .validated_keys(&self.state.binding.realm)
-            .map_err(|_| NodeError::transport("contact response is inconsistent"))?;
+            .map_err(|_| NodeError::invalid("contact response is inconsistent"))?;
         if observed.agent_id.into_uuid() != agent {
-            return Err(NodeError::transport("contact response names another agent"));
+            return Err(NodeError::invalid("contact response names another agent"));
         }
         let identity = PinIdentity {
             realm: self.state.binding.realm.clone(),
@@ -732,6 +735,7 @@ fn refusal_error(r: &HttpResponse) -> NodeError {
         .as_ref()
         .and_then(|x| x.retry_after_seconds.map(|n| n.get()));
     let code = refusal.as_ref().map(|x| x.error);
+    diagnostic.refusal = code;
     let error = if r.status == 401 {
         ChannelError::Auth("node authentication refused".into())
     } else if r.status >= 500

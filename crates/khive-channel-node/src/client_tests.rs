@@ -1195,7 +1195,7 @@ async fn contact_inconsistent_fingerprint_and_pin_read_failure_are_distinct() {
             .await
             .unwrap_err()
             .channel_error(),
-        Some(ChannelError::Transport(_))
+        Some(ChannelError::InvalidEnvelope(_))
     ));
 
     let observed = contact_response(facility(false).public_keys());

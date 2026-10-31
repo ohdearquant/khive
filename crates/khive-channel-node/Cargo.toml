@@ -16,6 +16,10 @@ publish = false
 [features]
 # Durable device keys in the macOS login keychain (macOS only).
 macos-keychain = ["dep:security-framework", "dep:libc"]
+# In-memory keychain for tests of consuming crates; never selects the real backend.
+test-keychain = []
+# Loopback HTTP client and scripted server for tests of consuming crates; never used by a production build.
+test-server = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "=3.7.0", optional = true }

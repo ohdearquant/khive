@@ -13,15 +13,15 @@ const MAX_REQUEST_BODY_BYTES: usize = 131_072;
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
-pub(crate) struct CapturedRequest {
-    pub(crate) method: String,
-    pub(crate) target: String,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
+pub struct CapturedRequest {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl CapturedRequest {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
@@ -29,16 +29,16 @@ impl CapturedRequest {
     }
 }
 
-pub(crate) struct Reply {
-    pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
+pub struct Reply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
     /// Release with `notify_one`, which also preserves a release before the wait.
-    pub(crate) gate: Option<Arc<Notify>>,
+    pub gate: Option<Arc<Notify>>,
 }
 
 impl Reply {
-    pub(crate) fn json(status: u16, body: &str) -> Self {
+    pub fn json(status: u16, body: &str) -> Self {
         Self {
             status,
             headers: vec![("Content-Type".into(), "application/json".into())],
@@ -54,14 +54,14 @@ struct Captures {
     outcome: Mutex<Option<Result<(), String>>>,
 }
 
-pub(crate) struct ScriptedServer {
+pub struct ScriptedServer {
     url: String,
     captures: Arc<Captures>,
     worker: JoinHandle<()>,
 }
 
 impl ScriptedServer {
-    pub(crate) async fn start(replies: Vec<Reply>) -> Result<Self, String> {
+    pub async fn start(replies: Vec<Reply>) -> Result<Self, String> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|error| error.to_string())?;
@@ -84,15 +84,15 @@ impl ScriptedServer {
         })
     }
 
-    pub(crate) fn url(&self) -> &str {
+    pub fn url(&self) -> &str {
         &self.url
     }
 
-    pub(crate) async fn requests(&self) -> Vec<CapturedRequest> {
+    pub async fn requests(&self) -> Vec<CapturedRequest> {
         self.captures.requests.lock().await.clone()
     }
 
-    pub(crate) async fn wait_for_requests(&self, count: usize) -> Result<(), String> {
+    pub async fn wait_for_requests(&self, count: usize) -> Result<(), String> {
         tokio::time::timeout(FIXTURE_TIMEOUT, async {
             loop {
                 if self.captures.requests.lock().await.len() >= count {
