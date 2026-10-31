@@ -590,6 +590,7 @@ pub(super) fn untrusted_pid_file_directory_error(message: String) -> McpError {
     );
     let mut data = serde_json::json!({
         "reason": "untrusted_pid_file_directory",
+        "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
         "error": message,
     });
     if is_daemon_strict_mode() {
