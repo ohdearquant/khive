@@ -1750,7 +1750,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.10",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2858,9 +2858,25 @@ dependencies = [
  "khive-score",
  "khive-storage",
  "khive-types",
+ "lattice-arch",
+ "lattice-compute",
  "lattice-embed",
  "lattice-fann",
+ "lattice-forecast",
+ "lattice-grammar",
  "lattice-inference",
+ "lattice-inference-core",
+ "lattice-lora",
+ "lattice-model-bert",
+ "lattice-model-embeddinggemma2",
+ "lattice-model-io",
+ "lattice-model-qwen3-embedding",
+ "lattice-model-qwen35",
+ "lattice-quant",
+ "lattice-router",
+ "lattice-simd",
+ "lattice-tokenizer",
+ "lattice-weights",
  "serde",
  "serde_json",
  "sha2",
@@ -3367,14 +3383,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-embed"
-version = "0.12.0"
+name = "lattice-arch"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f74253d8eb6650a3a800d25b4689369782e4cb48c3ee68154d1096403a968550"
+checksum = "2c5e1f4897b857c1fd9968f3882381873b1250c6369b9ee50d48d042ceacbfd3"
+dependencies = [
+ "lattice-grammar",
+ "lattice-inference-core",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lattice-compute"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f3de2760317c2e062e8fdd82016e3fa79152b0ae82def6aa8f1737c581770da"
+dependencies = [
+ "half",
+ "indexmap",
+ "lattice-arch",
+ "lattice-inference-core",
+ "lattice-lora",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
+name = "lattice-embed"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee341187675fda3f4a44f55b3cb799db277f9a245cc8dd0c16e7fe0e7f176b90"
 dependencies = [
  "async-trait",
  "chrono",
- "lattice-inference",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-model-bert",
+ "lattice-model-embeddinggemma2",
+ "lattice-model-qwen3-embedding",
+ "lattice-model-qwen35",
+ "lattice-simd",
+ "lattice-tokenizer",
+ "lattice-weights",
  "lru",
  "parking_lot",
  "serde",
@@ -3387,10 +3442,11 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.12.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261d1d047e5a87f4bfc9ccd5eea9628166ff78a7379dec951ad02d71b6fb4a93"
+checksum = "4a8c9b3b5e13b9495de7c65d77adaf84476a559cba30bd1651020595667a15c0"
 dependencies = [
+ "lattice-lora",
  "rand 0.8.7",
  "rand_distr",
  "thiserror 2.0.18",
@@ -3398,17 +3454,48 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-inference"
-version = "0.12.0"
+name = "lattice-forecast"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7164d6239a081970afc8c0e38ddff98e76bcbf5d96cb9677126f67d934f1b6a2"
+checksum = "da75d629e7969baa2b7be4ded99f4dd10b12d8929138a5511dcc052d1fd90ad4"
+dependencies = [
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lattice-grammar"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9f5f9cbab2a28a8c5af60bf9c42551c69c86344313c7573fc2b36a3b7f335b"
+dependencies = [
+ "lattice-inference-core",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-inference"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c66227ebd0f74902473d334d431d3ddf82008911d11310eb3d5101e84efcba8"
 dependencies = [
  "base64 0.22.1",
- "clap",
  "half",
- "image",
  "indexmap",
- "libc",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-forecast",
+ "lattice-grammar",
+ "lattice-inference-core",
+ "lattice-model-io",
+ "lattice-quant",
+ "lattice-router",
+ "lattice-tokenizer",
+ "lattice-weights",
  "memmap2",
  "rayon",
  "rustc-hash",
@@ -3417,7 +3504,169 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "lattice-inference-core"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a52165222f54b37d450239cb1b22cbed8828938adebb01e9a7d887febd3d302"
+
+[[package]]
+name = "lattice-lora"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2bb5982bdf0b4b3abdf2e65ebe2ca762ae7b09c8eabc3ddfd0ea6636c34f519"
+
+[[package]]
+name = "lattice-model-bert"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b133fa1997f8946d5f96d4d1420922f90aecb44ff85bf07a4588bf366a064d34"
+dependencies = [
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-model-embeddinggemma2"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9007a4d956becba8f98dcfc3cc744602b336c2a3d476b82c1681325d244266de"
+dependencies = [
+ "image",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lattice-model-io"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949f9c6f3a786d89308d02676e221ce3e3efd6d54e160ae1617ab7c0f8c2b7a"
+dependencies = [
+ "image",
+ "lattice-inference-core",
+ "sha2",
+ "tracing",
  "ureq",
+]
+
+[[package]]
+name = "lattice-model-qwen3-embedding"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb909e34b4f470a69268a6540ea3bc5e962243db1fba292260c870d41cc36bd3"
+dependencies = [
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-model-qwen35"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "611367540bd27a0076025330554b9aaf93a59d1bbde5d49a3e3bf083069d1a9c"
+dependencies = [
+ "half",
+ "image",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-grammar",
+ "lattice-inference-core",
+ "lattice-lora",
+ "lattice-model-io",
+ "lattice-quant",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "memmap2",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-quant"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ee04e89416d9acd53e48690fa33bd7b8dc8dcba43078b228c0c56cbad5c0eec"
+dependencies = [
+ "lattice-arch",
+ "lattice-inference-core",
+ "lattice-weights",
+ "memmap2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lattice-router"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5358366ab43845a2ff5014f27b2fe83d60e88e8cffe68c96e1be2424f303f00"
+dependencies = [
+ "lattice-lora",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lattice-simd"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1b810f4bb3c64600a90e13ea2b0eae9d8552c1c0b4775f2e189dee08af94c56"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lattice-tokenizer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1969de28475da329bf3b1d4a0f760caf16d3503d98b908206b693592d3e759c5"
+dependencies = [
+ "lattice-inference-core",
+ "rayon",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-weights"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84cd1abb0e3385777020d716f96e909033c94da39162460a7af76fbd59786eb"
+dependencies = [
+ "lattice-inference-core",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3450,7 +3699,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
- "webpki-roots 1.0.10",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4500,7 +4749,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.10",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5557,18 +5806,31 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
+version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
  "log",
- "once_cell",
+ "percent-encoding",
  "rustls",
  "rustls-pki-types",
- "url",
- "webpki-roots 0.26.11",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
+dependencies = [
+ "base64 0.22.1",
+ "http",
+ "httparse",
+ "log",
 ]
 
 [[package]]
@@ -5582,6 +5844,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -5781,15 +6049,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.10",
 ]
 
 [[package]]
