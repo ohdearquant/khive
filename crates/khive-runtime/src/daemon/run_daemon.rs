@@ -729,8 +729,8 @@ pub(super) fn ensure_rendezvous_path_is_swap_resistant(
 mod default_directory_repair_tests {
     use super::{
         ensure_pid_file_dir_is_trusted, ensure_socket_dir_is_trusted,
-        repair_default_dir_with_recovery_guidance,
-        repair_owned_default_dir, repair_owned_default_dir_with_hooks, tighten_owned_recovery_lock,
+        repair_default_dir_with_recovery_guidance, repair_owned_default_dir,
+        repair_owned_default_dir_with_hooks, tighten_owned_recovery_lock,
         tighten_owned_recovery_lock_with_hook, RendezvousPathRole,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -788,19 +788,40 @@ mod default_directory_repair_tests {
         std::env::remove_var("KHIVE_SOCKET");
 
         let other_message = ensure_pid_file_dir_is_trusted(&other.join("daemon.pid"))
-            .unwrap_err().to_string();
-        assert!(other_message.contains("PID-file directory") && other_message.contains("for KHIVE_PID"), "{other_message}");
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other_message.contains("PID-file directory") && other_message.contains("for KHIVE_PID"),
+            "{other_message}"
+        );
         let default_message = ensure_pid_file_dir_is_trusted(&default.join("khived.pid"))
-            .unwrap_err().to_string();
-        assert!(default_message.contains("default PID-file directory"), "{default_message}");
+            .unwrap_err()
+            .to_string();
+        assert!(
+            default_message.contains("default PID-file directory"),
+            "{default_message}"
+        );
 
         std::env::set_var("KHIVE_PID", default.join("khived.pid"));
         let explicit_message = ensure_pid_file_dir_is_trusted(&default.join("khived.pid"))
-            .unwrap_err().to_string();
-        assert!(explicit_message.contains("for KHIVE_PID"), "{explicit_message}");
-        assert!(!explicit_message.contains("default PID-file directory"), "{explicit_message}");
-        assert_eq!(std::fs::metadata(&other).unwrap().permissions().mode() & 0o777, 0o775);
-        assert_eq!(std::fs::metadata(&default).unwrap().permissions().mode() & 0o777, 0o775);
+            .unwrap_err()
+            .to_string();
+        assert!(
+            explicit_message.contains("for KHIVE_PID"),
+            "{explicit_message}"
+        );
+        assert!(
+            !explicit_message.contains("default PID-file directory"),
+            "{explicit_message}"
+        );
+        assert_eq!(
+            std::fs::metadata(&other).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        assert_eq!(
+            std::fs::metadata(&default).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
     }
 
     #[test]
@@ -824,7 +845,10 @@ mod default_directory_repair_tests {
         let opened = super::super::locks::open_mutating_daemon_lock(&lock, false)
             .expect("the explicit lock parent exists and is trusted");
         assert!(lock.exists());
-        assert!(!home.exists(), "an unrelated default HOME must remain absent");
+        assert!(
+            !home.exists(),
+            "an unrelated default HOME must remain absent"
+        );
         drop(opened);
 
         let unsafe_parent = root.path().join("unsafe-parent");
@@ -832,7 +856,10 @@ mod default_directory_repair_tests {
         std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o775)).unwrap();
         let unsafe_lock = unsafe_parent.join("boot.lock");
         assert!(super::super::locks::open_mutating_daemon_lock(&unsafe_lock, false).is_err());
-        assert!(!unsafe_lock.exists(), "an untrusted explicit parent must remain refused");
+        assert!(
+            !unsafe_lock.exists(),
+            "an untrusted explicit parent must remain refused"
+        );
         assert!(!home.exists());
     }
 
@@ -891,7 +918,10 @@ mod default_directory_repair_tests {
             .expect("the external boot lock parent is trusted");
         let default = home.join(".khive");
         assert!(default.is_dir());
-        assert_eq!(std::fs::metadata(default).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(default).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         drop(opened);
     }
 
@@ -927,7 +957,10 @@ mod default_directory_repair_tests {
         let daemon = tokio::spawn(super::run_daemon(EmptyDispatcher));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                assert!(!daemon.is_finished(), "daemon exited before the boot witness");
+                assert!(
+                    !daemon.is_finished(),
+                    "daemon exited before the boot witness"
+                );
                 if lock.exists() && pid.exists() && socket.exists() {
                     break;
                 }
@@ -943,7 +976,10 @@ mod default_directory_repair_tests {
         );
         daemon.abort();
         let error = daemon.await.expect_err("the daemon task must be cancelled");
-        assert!(error.is_cancelled(), "daemon task failed before cancellation: {error}");
+        assert!(
+            error.is_cancelled(),
+            "daemon task failed before cancellation: {error}"
+        );
     }
 
     #[tokio::test]

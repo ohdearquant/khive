@@ -948,7 +948,10 @@ async fn explicit_supervisor_lock_parent_is_created_when_missing_and_must_be_saf
         std::fs::metadata(&missing).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    assert_eq!(guard.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        guard.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     drop(guard);
 
     let unsafe_parent = root.path().join("unsafe");
