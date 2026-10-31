@@ -1,0 +1,1 @@
+SELECT id FROM knowledge_atoms WHERE id IN (/* ids */ ?2) AND +namespace = ?1 AND deleted_at IS NULL UNION SELECT id FROM knowledge_domains WHERE id IN (/* ids */ ?2) AND +namespace = ?1 AND deleted_at IS NULL
