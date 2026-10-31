@@ -293,6 +293,9 @@ enum DbCommand {
 
     /// Report per-backend schema state without applying changes.
     Check(DbCheckArgs),
+
+    /// Restore exported note rows (JSONL) into a database file with their original ids and timestamps.
+    ImportNotes(crate::import_notes::ImportNotesArgs),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -908,6 +911,7 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate(args) => cmd_db_migrate(args).await,
         DbCommand::Check(args) => cmd_db_check(args).await,
+        DbCommand::ImportNotes(args) => crate::import_notes::run(args).await,
     }
 }
 
