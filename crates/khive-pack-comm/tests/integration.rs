@@ -11172,7 +11172,7 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
         .expect("A sends to B");
     let root_id = sent["full_id"].as_str().expect("full_id").to_string();
 
-    let missing = Uuid::new_v4();
+    let missing = uuid::Uuid::new_v4();
     let unknown_from_c = registry_c
         .dispatch("comm.thread", serde_json::json!({ "id": missing }))
         .await
