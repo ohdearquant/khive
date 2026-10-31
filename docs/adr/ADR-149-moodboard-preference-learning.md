@@ -20,7 +20,7 @@ statistic.
 
 Khive already provides the necessary durable boundaries: actor-attributed namespace tokens,
 append-only events, artifact entities, and `BlobStore`. `lattice-fann` provides a compact governed
-network representation and CPU inference. Its 0.12.0 `BackpropTrainer`, however, computes MSE; it
+network representation and CPU inference. Its 0.15.0 `BackpropTrainer`, however, computes MSE; it
 does not expose Bradley--Terry binary cross-entropy. Calling that trainer a pairwise logistic
 learner would be mathematically false.
 
@@ -288,7 +288,7 @@ can build.
 | Alternative                                  | Why rejected                                                                                                                              |
 | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Treat cosine similarity as preference        | It has no interaction grounding and conflates retrieval geometry with human judgment.                                                     |
-| Train with `BackpropTrainer` and call it BCE | Version 0.12.0 hard-codes MSE, so the claimed objective would be false.                                                                   |
+| Train with `BackpropTrainer` and call it BCE | Version 0.15.0 hard-codes MSE, so the claimed objective would be false.                                                                   |
 | Store only JSON weights                      | It would not exercise or govern the requested FANN serialization and inference path.                                                      |
 | Use individual-event random split            | Side-reversed or repeated unordered pairs would leak across train/calibration/test.                                                       |
 | Fold ties into label `0.5`                   | It changes the decisive Bradley--Terry likelihood and hides the separate indifference decision.                                           |
