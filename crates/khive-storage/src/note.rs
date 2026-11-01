@@ -382,6 +382,8 @@ pub enum NoteTimeOrder {
     ExpiresAt,
     /// `COALESCE(expires_at, created_at) ASC, id ASC`.
     ExpiresAtOrCreatedAt,
+    /// `updated_at ASC, id ASC`: the oldest-touched rows first.
+    UpdatedAt,
 }
 
 /// Read selection on the note's top-level storage status, independent of

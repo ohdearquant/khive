@@ -152,6 +152,7 @@ async fn reindex_restores_the_fts_document_a_degraded_conditional_insert_lacks()
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     })
     .await

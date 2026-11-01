@@ -14,18 +14,32 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     seed(
         &runtime,
         vec![
-            hidden,
             inbound(101, 300, root, 100, json!(true)),
             row(102, 200, root),
             hidden_twin,
             foreign,
+            // A visible message from another thread is a valid physical anchor.
+            row(200, 400, id(901)),
         ],
     )
     .await;
+    let mut unknown_errors = Vec::new();
+    for order in ["asc", "desc"] {
+        let error = registry
+            .dispatch(
+                "comm.thread",
+                json!({"id":id(101).to_string(),"order":order,"after":id(100).to_string()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+        unknown_errors.push(error.to_string());
+    }
+    seed(&runtime, vec![hidden]).await;
     let (response, observation) = observed(
         &runtime,
         &registry,
-        json!({"id":id(101).to_string(),"order":"desc","after":id(100).to_string()}),
+        json!({"id":id(101).to_string(),"order":"desc","after":id(200).to_string()}),
     )
     .await;
     expect_ids(&response, &observation, &[id(101), id(102)]);
@@ -34,6 +48,16 @@ async fn thread_baseline_t3_visibility_precedes_fold_and_physical_cursor() {
     assert_eq!(response["messages"][0]["content"], "message 101");
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][1]["read"], false);
+    for (order, unknown) in ["asc", "desc"].into_iter().zip(unknown_errors) {
+        let error = registry
+            .dispatch(
+                "comm.thread",
+                json!({"id":id(101).to_string(),"order":order,"after":id(100).to_string()}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), unknown);
+    }
     let (response, observation) = observed(
         &runtime,
         &registry,

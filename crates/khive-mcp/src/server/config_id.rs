@@ -566,16 +566,6 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         visibility_receipts,
     );
 
-    // An enabled `[channel.node]` table is part of the runtime identity: a
-    // daemon serving a different node channel must not answer this caller. The
-    // segment sits after `visibility_receipts` and before the topology, and is
-    // omitted when the table is disabled or absent so existing ids are
-    // unchanged.
-    let base = match config.node_channel.as_ref().filter(|node| node.enabled) {
-        Some(node) => format!("{base};node_channel={}", node.config_digest()),
-        None => base,
-    };
-
     // Fold backend topology when non-empty so two configs differing only in
     // pack→backend routing produce different config_ids (ADR-049).
     // When backends is empty this branch is skipped; the implicit main ceiling

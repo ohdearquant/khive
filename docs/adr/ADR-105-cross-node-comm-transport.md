@@ -11,6 +11,11 @@
   hosted service builds the same crate (maintainer decision of 2026-10-29: the open-source build
   carries the node client, and the hosted build uses the same client). The 2026-10-05 line above no
   longer holds. Version 1 stays as written.
+- 2026-10-31: the node client crate has left this repository again. `khive-channel-node` and the
+  `channel-node` feature were removed by pull request 6333, and the hosted service builds the node
+  client (maintainer decision of 2026-10-31). The 2026-10-30 line above no longer holds. Version 1
+  stays as written; the `crates/khive-channel-node/...` citations below describe the tree before
+  that removal.
 
 ## Context
 

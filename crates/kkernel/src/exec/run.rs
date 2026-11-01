@@ -855,11 +855,6 @@ pub(super) async fn run_exec_inline_with_forward(
         //   construction, the redundant-main one proven and normalized above —
         //   withhold it: both sides use the config-declared main path and the
         //   override adds no storage selection information.
-        let spawn_db = match db_context.raw.as_deref() {
-            Some(":memory:") => Some(":memory:"),
-            Some(concrete) if khive_cfg.backends.is_empty() => Some(concrete),
-            _ => None,
-        };
         // Which config file a daemon this call may need to SPAWN must be
         // constructed with:
         // - An explicit `--config`/`KHIVE_CONFIG` selection always: it is the
@@ -878,19 +873,19 @@ pub(super) async fn run_exec_inline_with_forward(
         //   topology, so its fingerprint matches.
         // - Otherwise nothing: the empty-backends child gets its database
         //   directly via the forwarded concrete override above.
-        let spawn_config = match (&db_context.config, db_context.raw.as_deref()) {
-            (Some(explicit), _) => Some(explicit.clone()),
-            (None, Some(raw)) if raw != ":memory:" && !khive_cfg.backends.is_empty() => {
-                config_source.clone()
-            }
-            _ => None,
-        };
+        let (spawn_config, spawn_db) = khive_mcp::daemon::select_daemon_spawn_overrides(
+            db_context.config.as_deref(),
+            db_context.raw.as_deref(),
+            config_source.as_deref(),
+            !khive_cfg.backends.is_empty(),
+        );
         // Forward this client's already-resolved pack list unconditionally so
         // a daemon this call spawns matches `cfg`'s `config_id` fingerprint
         // (which folds `packs`) instead of re-deriving its own selection from
         // ambient env/config and risking a mismatch (khive-oss#1941).
         let spawn_packs = cfg.packs.clone();
-        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db, spawn_packs).await {
+        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db.as_deref(), spawn_packs).await
+        {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             disclose_daemon_execution();
             let output = prepare_exec_output(&output, strict);

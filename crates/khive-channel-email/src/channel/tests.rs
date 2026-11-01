@@ -28,6 +28,7 @@ fn make_config(maintainer: &str) -> EmailChannelConfig {
         maintainer_addresses: vec![MailAddress::parse(maintainer).unwrap()],
         trust_anchor: TrustAnchor::AuthservId(TEST_AUTHSERV_ID.to_string()),
         quarantine_store: true,
+        trust_exchange_internal: false,
         quarantine_max_retained: crate::config::DEFAULT_QUARANTINE_MAX_RETAINED,
     }
 }
@@ -241,6 +242,229 @@ fn spaced_auth_results_passes_attribution_gate() {
         vec!["mx.example.com; dmarc = pass header . from = example.com".to_string()];
     let channel = build_channel("user@example.com", vec![]);
     assert_eq!(channel.evaluate_auth(&email), Ok(()));
+}
+
+/// The gate's attribution as a comparable label (`EmailAttribution` has no `PartialEq`).
+fn gate_outcome(
+    channel: &EmailChannel,
+    email: &RawEmail,
+    inbound: Option<&InboundSuppression>,
+) -> Result<&'static str, QuarantineReason> {
+    channel
+        .gate(email, inbound)
+        .map(|attribution| match attribution {
+            EmailAttribution::Maintainer => "maintainer",
+            EmailAttribution::External => "external",
+        })
+}
+
+const EXCHANGE_INTERNAL: &[u8] = b"X-MS-Exchange-Organization-AuthAs: Internal\r\n\r\n";
+
+/// A message carrying no `Authentication-Results` or ARC header, with the given raw header block.
+fn exchange_email(from: &str, sender: Option<&str>, raw: &[u8]) -> RawEmail {
+    let mut email = make_email(from, "imap:test:1:9");
+    email.authentication_results.clear();
+    email.sender_addr = sender.map(str::to_string);
+    email.raw_bytes = raw.to_vec();
+    email
+}
+
+/// A channel whose mailbox is `user@example.com` and whose maintainer allowlist also holds an
+/// address on another domain and one on a subdomain, so the domain arms below refuse on the
+/// domain rule alone and never on the allowlist.
+fn exchange_config(enabled: bool) -> EmailChannelConfig {
+    let mut config = make_config_multi(&[
+        "owner@example.com",
+        "owner@outside.example",
+        "owner@sub.example.com",
+    ]);
+    config.trust_exchange_internal = enabled;
+    config
+}
+
+#[test]
+fn exchange_internal_anchor_admits_same_domain_maintainer() {
+    let channel = build_channel_from(exchange_config(true), vec![]);
+    let email = exchange_email(
+        "owner@example.com",
+        None,
+        b"From: owner@example.com\r\nX-MS-Exchange-Organization-AuthAs: Internal\r\n\r\nbody",
+    );
+    assert_eq!(gate_outcome(&channel, &email, None), Ok("maintainer"));
+
+    let folded = exchange_email(
+        "owner@example.com",
+        None,
+        b"X-MS-Exchange-Organization-AuthAs:\r\n Internal\r\n\r\n",
+    );
+    assert_eq!(
+        gate_outcome(&channel, &folded, None),
+        Ok("maintainer"),
+        "folded value"
+    );
+
+    let lower = exchange_email(
+        "owner@example.com",
+        None,
+        b"x-ms-exchange-organization-authas: internal\r\n\r\n",
+    );
+    assert_eq!(
+        gate_outcome(&channel, &lower, None),
+        Ok("maintainer"),
+        "case-insensitive"
+    );
+}
+
+/// One refusal arm: label, opt-in, From, Sender, raw header block.
+type RefusalArm<'a> = (&'a str, bool, &'a str, Option<&'a str>, &'a [u8]);
+
+#[test]
+fn exchange_internal_anchor_refuses_each_missing_condition() {
+    let internal_then_anonymous: &[u8] = b"X-MS-Exchange-Organization-AuthAs: Internal\r\nX-MS-Exchange-Organization-AuthAs: Anonymous\r\n\r\n";
+    let anonymous_then_internal: &[u8] = b"X-MS-Exchange-Organization-AuthAs: Anonymous\r\nX-MS-Exchange-Organization-AuthAs: Internal\r\n\r\n";
+    let cases: &[RefusalArm<'_>] = &[
+        (
+            "opt-in off",
+            false,
+            "owner@example.com",
+            None,
+            EXCHANGE_INTERNAL,
+        ),
+        (
+            "maintainer on another domain with a forged stamp",
+            true,
+            "owner@outside.example",
+            None,
+            EXCHANGE_INTERNAL,
+        ),
+        (
+            "maintainer on a subdomain of the mailbox domain",
+            true,
+            "owner@sub.example.com",
+            None,
+            EXCHANGE_INTERNAL,
+        ),
+        ("stamp absent", true, "owner@example.com", None, b"\r\n"),
+        (
+            "stamp Anonymous",
+            true,
+            "owner@example.com",
+            None,
+            b"X-MS-Exchange-Organization-AuthAs: Anonymous\r\n\r\n",
+        ),
+        (
+            "two stamps, Internal first",
+            true,
+            "owner@example.com",
+            None,
+            internal_then_anonymous,
+        ),
+        (
+            "two stamps, Anonymous first",
+            true,
+            "owner@example.com",
+            None,
+            anonymous_then_internal,
+        ),
+        (
+            "From not a maintainer",
+            true,
+            "other@example.com",
+            None,
+            EXCHANGE_INTERNAL,
+        ),
+        (
+            "maintainer From with a non-maintainer Sender",
+            true,
+            "owner@example.com",
+            Some("other@example.com"),
+            EXCHANGE_INTERNAL,
+        ),
+        (
+            "lookalike header name",
+            true,
+            "owner@example.com",
+            None,
+            b"X-MS-Exchange-Organization-AuthAsX: Internal\r\n\r\n",
+        ),
+        (
+            "stamp after the header block",
+            true,
+            "owner@example.com",
+            None,
+            b"Subject: hi\r\n\r\nX-MS-Exchange-Organization-AuthAs: Internal\r\n",
+        ),
+    ];
+    // Every arm runs, and a failure lists each arm that admitted, so a mutation shows its reach.
+    let mut admitted = Vec::new();
+    for &(label, enabled, from, sender, raw) in cases {
+        let channel = build_channel_from(exchange_config(enabled), vec![]);
+        let email = exchange_email(from, sender, raw);
+        let outcome = gate_outcome(&channel, &email, None);
+        if outcome != Err(QuarantineReason::AuthAbsent) {
+            admitted.push(format!("{label}: {outcome:?}"));
+        }
+    }
+
+    let mut two_from = exchange_email("owner@example.com", None, EXCHANGE_INTERNAL);
+    two_from.from_addrs.push("owner@example.com".to_string());
+    let channel = build_channel_from(exchange_config(true), vec![]);
+    let outcome = gate_outcome(&channel, &two_from, None);
+    if outcome != Err(QuarantineReason::AuthAbsent) {
+        admitted.push(format!("two From addresses: {outcome:?}"));
+    }
+    assert!(
+        admitted.is_empty(),
+        "arms not refused as auth-absent: {admitted:#?}"
+    );
+}
+
+#[test]
+fn exchange_internal_anchor_leaves_authentication_results_reasons_unchanged() {
+    let channel = build_channel_from(exchange_config(true), vec![]);
+    let mut email = exchange_email("owner@example.com", None, EXCHANGE_INTERNAL);
+    email.authentication_results =
+        vec!["mx.other.example; dmarc=pass header.from=example.com".to_string()];
+    assert_eq!(
+        gate_outcome(&channel, &email, None),
+        Err(QuarantineReason::AuthUntrusted)
+    );
+
+    email.authentication_results = vec![format!(
+        "{TEST_AUTHSERV_ID}; dmarc=fail header.from=example.com"
+    )];
+    assert_eq!(
+        gate_outcome(&channel, &email, None),
+        Err(QuarantineReason::DmarcFail)
+    );
+}
+
+#[test]
+fn exchange_internal_anchor_never_attributes_external() {
+    let inbound: InboundSuppression = Arc::new(|_| false);
+    let channel = build_channel_from(exchange_config(true), vec![])
+        .with_external_host(Arc::new(RoutingHost {
+            enabled: true,
+            ..Default::default()
+        }))
+        .with_external_inbound_config(ExternalInboundConfig {
+            routes: crate::InboundRoutes::parse("colleague@example.com=lambda:colleague").unwrap(),
+            actor: "lambda:recipient".into(),
+        });
+
+    // Control: the same non-maintainer sender with a trusted, aligned header reaches step 6
+    // and is attributed External on this channel.
+    let control = make_email("colleague@example.com", "imap:test:1:10");
+    assert_eq!(
+        gate_outcome(&channel, &control, Some(&inbound)),
+        Ok("external")
+    );
+
+    let email = exchange_email("colleague@example.com", None, EXCHANGE_INTERNAL);
+    assert_eq!(
+        gate_outcome(&channel, &email, Some(&inbound)),
+        Err(QuarantineReason::AuthAbsent)
+    );
 }
 
 #[tokio::test]

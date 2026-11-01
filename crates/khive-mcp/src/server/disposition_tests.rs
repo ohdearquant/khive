@@ -1969,6 +1969,8 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
     }
     fn native_forward(
         frame: DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         replay_read_only: bool,
     ) -> ForwardFuture {
