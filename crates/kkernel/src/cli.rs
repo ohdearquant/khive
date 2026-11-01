@@ -82,7 +82,7 @@ enum Command {
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
-    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune.
+    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune, import-notes.
     #[command(subcommand)]
     Db(DbCommand),
 
