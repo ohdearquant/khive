@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 31    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -1427,7 +1427,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 7 verbs
+## `gtd` pack — 8 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1542,6 +1542,26 @@ See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timesta
 
 ```
 request(ops="gtd.census()")
+```
+
+### `gtd.counts` — Assertive
+
+Read-only count of one assignee's live tasks by status, without task bodies. `by_status` has an
+entry for every task status, zeros included; `open` sums the non-terminal statuses and `total`
+sums all of them. A task whose stored status is absent or not text counts as `inbox`, as
+`gtd.tasks` reads it. With `tag`, the reply adds `{name, open, rows, truncated}`: the assignee's
+open tasks carrying exactly that tag, each row only id, title, status, priority and updated_at,
+ordered by priority and then oldest update, at most `limit`; `truncated` is true exactly when
+`open` exceeds the rows returned.
+
+| Param      | Type    | Required | Notes                                                    |
+| ---------- | ------- | -------- | -------------------------------------------------------- |
+| `assignee` | string  | yes      | Exact stored assignee, as in `gtd.tasks`.                |
+| `tag`      | string  | no       | Exact tag; adds the tag block. Empty string is rejected. |
+| `limit`    | integer | no       | Tag rows, default 50, 1..=200; out of range is rejected. |
+
+```
+request(ops='gtd.counts(assignee="agent:alice", tag="sprint:12")')
 ```
 
 ### `gtd.repair` — Declaration
