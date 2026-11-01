@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
+  database with their original ids, namespaces and timestamps. A row whose id is already present is left
+  unchanged and counted; `--verify` reads every row back and fails when any differs.
+- `kkernel reindex --fts-only` rebuilds entity and note FTS documents without any embedding model, so no
+  vector is dropped or written and the knowledge pass is skipped.
+
 ### Removed
 
 - The `khive-channel-node` crate and the `channel-node` feature, with their wiring in `khive-mcp`,
