@@ -703,9 +703,23 @@ def require_served_events(profile: str, expected: int, served: int) -> None:
                         f"{expected}; the bank would not run against the frozen profile state")
 
 
+WRITING_ARMS = ("feedback_fresh", "feedback_asof")
+
+
+def require_read_only_arms(arms: list[str]) -> None:
+    """The served-state check needs the staged copy's brain state to stay the frozen one. The arms that call
+    brain.create_profile and brain.feedback commit the server's brain state, credits included, to the staged copy, so
+    after them the served state is no longer the frozen one: they cannot run with --expect-profiles."""
+    written = [a for a in arms if a in WRITING_ARMS]
+    if written:
+        raise BankError(f"--expect-profiles cannot be combined with {', '.join(written)}: those arms write brain state "
+                        f"to the staged copy, so the served state is no longer the frozen one after them")
+
+
 def check_served_state(br: Bridge, profiles: list[str], expect: dict, record: list) -> None:
-    """Before any arm: each profile's served `total_events` must equal the frozen read-back. Each compared pair is
-    appended to `record` before the comparison, so a refused run still shows what was read."""
+    """Each profile's served `total_events` must equal the frozen read-back. It runs in a bank's server process after
+    the handshake and before that process's first recall (see open_bridge). Each compared pair is appended to
+    `record` before the comparison, so a refused run still shows what was read."""
     for profile in profiles:
         want = expect["events"][profile]
         try:
@@ -719,11 +733,13 @@ def check_served_state(br: Bridge, profiles: list[str], expect: dict, record: li
 
 
 def read_served_after(br: Bridge, profiles: list[str]) -> list[dict]:
-    """The same values read again after the bank's arms. Recorded only: it never stops a run."""
+    """The same profiles read again in the server's memory after the bank's arms. This is the in-process count: it
+    includes the credits for the recalls just served, and the read-only arms do not write it to the staged copy, so
+    it is not stored state. Recorded only: it never stops a run."""
     rows = []
     for profile in profiles:
         try:
-            rows.append({"profile": profile, "served_after": read_total_events(br, profile)})
+            rows.append({"profile": profile, "in_process_total_events": read_total_events(br, profile)})
         except BankError as e:
             rows.append({"profile": profile, "error": str(e.code)})
     return rows
@@ -856,21 +872,29 @@ def cmd_check_bank(args) -> int:
 
 
 def stage_once(args, scratch: Path) -> tuple[Path, dict, dict]:
-    """Stage the copy, once. Returns the staged store path, the server environment and the copy's record."""
+    """Stage the copy, once. Returns the staged store path, the server environment and the copy's record. Memory
+    pressure is read here before the copy; every server start reads it again (run_banks before each bank's server,
+    start() before its one server)."""
     pressure = {"before_copy": require_normal_pressure("before the copy")}
     db, env, manifest = stage(args, scratch)
-    pressure["before_server"] = require_normal_pressure("before the server starts")
     stores = [m for m in manifest if m["staged_as"] in ("khive.db", "khive.db.events.db")]
     skew_s = abs(stores[0]["source_mtime_ns"] - stores[1]["source_mtime_ns"]) / 1e9
     return db, env, {"staged": manifest, "source_mtime_skew_s": round(skew_s, 3), "memory_pressure": pressure}
 
 
-def open_bridge(args, db: Path, env: dict, scratch: Path, probe_query: str, profiles: list[str]):
+def open_bridge(args, db: Path, env: dict, scratch: Path, probe_query: str, profiles: list[str],
+                served_check=None, err_name: str = "kkernel-mcp.err"):
     """Start one `kkernel mcp` process on the staged copy, with the config now on disk, and wait until it answers
-    undegraded. `profiles` are read once as an existence check. Returns the bridge and its readiness record."""
-    br = Bridge(args.kkernel, db, env, scratch / "kkernel-mcp.err")
+    undegraded. `served_check`, when given, runs right after the handshake and before the first recall of the
+    process: a recall that names no profile is credited to the default profile in the server's memory, so a profile
+    read made after the readiness and control recalls no longer shows the stored count. `profiles` are read once as
+    an existence check, after those recalls. The server's stderr goes to `scratch / err_name`. Returns the bridge
+    and its readiness record."""
+    br = Bridge(args.kkernel, db, env, scratch / err_name)
     try:
         br.handshake()
+        if served_check is not None:
+            served_check(br)
         ready_s = wait_ready(br, probe_query, args.ready_max_s)
         ctl = control(br, args.control_id)
         for profile in profiles:
@@ -886,6 +910,7 @@ def start(args, run_id: str, scratch: Path):
     banks = [load_bank(Path(p)) for p in args.bank] if args.bank else []
     meta, cases = banks[0] if banks else ({"bank_id": None, "version": None}, [])
     db, env, staged = stage_once(args, scratch)
+    staged["memory_pressure"]["before_server"] = require_normal_pressure("before the server starts")
     write_config(scratch, args, args.visible_namespaces)
     br, ready = open_bridge(args, db, env, scratch, cases[0]["query"] if cases else "store ready probe", args.profile)
     base = {"snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel), "run_id": run_id}
@@ -908,12 +933,14 @@ def scratch_dir(args, run_id: str) -> Path:
 def run_banks(args, arms, run_id, banks, visible_by_bank, expect, scratch: Path, out: Path, summary: dict) -> None:
     """Stage the copy once, then serve each bank from its own server, in sequence. Between banks only the config and
     the process change. Each bank's visible set is written to the config before its process starts; with an
-    expected-profile file, the served profile state is checked before any arm and read again after the arms."""
+    expected-profile file, the served profile state is checked in each bank's server process, after the handshake and
+    before that process's first recall, and read again after the arms (recorded only). Memory pressure is read before
+    each bank's server starts, and each server writes its stderr to its own file."""
     db, env, staged = stage_once(args, scratch)
     base = {"snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel), "run_id": run_id}
     summary.update(base)
     summary.update(staged)
-    for meta, cases in banks:
+    for n, (meta, cases) in enumerate(banks, 1):
         bank_id = meta["bank_id"]
         visible = visible_by_bank[bank_id]
         record = {"bank_id": bank_id, "version": meta["version"], "cases_sha256": meta["cases_sha256"],
@@ -921,13 +948,18 @@ def run_banks(args, arms, run_id, banks, visible_by_bank, expect, scratch: Path,
         summary["banks"].append(record)
         summary["results"][bank_id] = {}
         write_config(scratch, args, visible)
+        record["memory_pressure"] = {"before_server": require_normal_pressure("before this bank's server starts")}
+        err_name = f"kkernel-mcp-bank{n}.err"
+        record["server_stderr"] = str(scratch / err_name)
+        check = None
+        if expect:
+            record["served_state"] = {"pairs": []}
+            check = lambda b, pairs=record["served_state"]["pairs"]: check_served_state(  # noqa: E731
+                b, args.profile, expect, pairs)
         br, ready = open_bridge(args, db, env, scratch, cases[0]["query"] if cases else "store ready probe",
-                                [] if expect else args.profile)
+                                [] if expect else args.profile, served_check=check, err_name=err_name)
         record.update(ready)
         try:
-            if expect:
-                record["served_state"] = {"pairs": []}
-                check_served_state(br, args.profile, expect, record["served_state"]["pairs"])
             args._fresh_profile = None
             if "feedback_fresh" in arms:
                 args._fresh_profile = f"bench-fresh-{run_id}-{bank_id}"
@@ -936,7 +968,7 @@ def run_banks(args, arms, run_id, banks, visible_by_bank, expect, scratch: Path,
             run_arms(args, arms, run_id, cases, br, out / bank_id, summary,
                      {**base, "bank_id": bank_id, "bank_version": meta["version"], "population": len(cases)}, bank_id)
             if expect:
-                record["served_state"]["after"] = read_served_after(br, args.profile)
+                record["served_state"]["after_in_process"] = read_served_after(br, args.profile)
         finally:
             br.close()
     summary["status"] = "complete"
@@ -964,6 +996,7 @@ def cmd_run(args) -> int:
     if "profile_on" in arms and not args.expect_profiles:
         raise BankError("--expect-profiles is required when the profile_on arm runs")
     if args.expect_profiles:
+        require_read_only_arms(arms)
         expect = load_expected_events(args.expect_profiles, args.expect_namespace, args.profile)
     read_engines(args)
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
@@ -1558,9 +1591,48 @@ def self_test() -> int:
     arm("bank-visible: a set that covers every case tag is accepted",
         lambda: require_bank_visible([({"bank_id": "bank-a"}, [tagged_case])], {"bank-a": ["team:a", "local"]}) is None)
 
-    def drive_banks(visible_by_bank, expect=None, served=0, moved_to=None):
-        """run_banks over a fake copy, fake server processes and a fake arm runner; the config writer is the real one."""
+    default_profile = "balanced-recall-v1"
+    real_open_bridge = open_bridge
+
+    def recalls_first_open_bridge(args, db, env, scr, probe, profile_ids, served_check=None, err_name="kkernel-mcp.err"):
+        """The order a bank must not use: the real open_bridge runs the readiness and control recalls, and the served-state
+        check runs after them."""
+        br, ready = real_open_bridge(args, db, env, scr, probe, profile_ids, err_name=err_name)
+        if served_check is not None:
+            try:
+                served_check(br)
+            except BaseException:
+                br.close()
+                raise
+        return br, ready
+
+    def fake_stage(events=None):
+        """A stand-in for stage(): it makes the staged home directory and returns a two-store manifest."""
+        def staged(args, scr):
+            if events is not None:
+                events.append("stage")
+            (scr / "home" / ".khive").mkdir(parents=True)
+            return (scr / "home" / ".khive" / "khive.db", {},
+                    [{"staged_as": "khive.db", "source_mtime_ns": 1},
+                     {"staged_as": "khive.db.events.db", "source_mtime_ns": 1}])
+        return staged
+
+    def normal_pressure():
+        return {"source": "test", "reading": "1", "normal": True}
+
+    def drive_banks(visible_by_bank, expect=None, served=0, moved_to=None, credit=None, profiles=("p1",),
+                    recalls_first=False, trace=None):
+        """run_banks over a fake copy and fake server processes. The config writer, stage_once and the pressure check are
+        the real ones, over a fake stage() and a fake pressure reader. Without `credit`, open_bridge and the arm runner
+        are fakes. With `credit` ({profile: stored total_events}), open_bridge, wait_ready, control and
+        check_served_state are the real ones over fake server processes that model the credit, and the fake arm runner
+        sends one recall that names no profile and one that names the last profile. `recalls_first` runs the check after
+        the readiness and control recalls, the order a bank must not use. `trace` receives the server processes
+        ("procs") and the pressure reads ("pressure_calls"); its "abnormal_at" is the number of the pressure read that
+        reports a pressure that is not normal."""
         events = []
+        trace = {} if trace is None else trace
+        trace["procs"], trace["pressure_calls"] = [], []
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             (td / "engines.toml").write_text('[[engines]]\nname = "e"\n')
@@ -1580,30 +1652,92 @@ def self_test() -> int:
                 def close(self):
                     events.append("close")
 
-            def fake_stage_once(args, scr):
-                events.append("stage")
-                (scr / "home" / ".khive").mkdir(parents=True)
-                return (scr / "home" / ".khive" / "khive.db", {},
-                        {"staged": [], "source_mtime_skew_s": 0.0, "memory_pressure": {}})
+            class CreditBridge:
+                """A fake `kkernel mcp` process that models the credit. A recall that names no profile adds one to the default
+                profile's count in this process's memory, a recall that names a profile adds one to that profile, and a
+                profile read serves the current count. Every process starts from the stored counts (`credit`), as a new
+                server process does after read-only arms. `log` holds the handshake and every op text, in order."""
 
-            def fake_open_bridge(args, db, env, scr, probe, profiles):
+                def __init__(self, kkernel, db, env, err_path):
+                    err_path.touch()
+                    self.err_path, self.counts, self.log = err_path, dict(credit), []
+                    trace["procs"].append(self)
+
+                def handshake(self):
+                    self.log.append("handshake")
+                    return {}
+
+                def ops(self, texts, timeout=900):
+                    results = []
+                    for text in texts:
+                        self.log.append(text)
+                        verb = text.split("(", 1)[0]
+                        named = re.search(r'profile_id="([^"]+)"', text)
+                        if verb == "get":
+                            results.append({"ok": True, "result": {"content": "c"}})
+                        elif verb == "brain.profile":
+                            if named is None or named.group(1) not in self.counts:
+                                results.append({"ok": False, "error": "no such profile"})
+                            else:
+                                results.append({"ok": True, "result": {"total_events": self.counts[named.group(1)]}})
+                        elif verb == "memory.recall":
+                            who = named.group(1) if named else default_profile
+                            self.counts[who] = self.counts.get(who, 0) + 1
+                            hit = {"id": u[0], "full_id": u[0], "created_at": "2026-01-01T00:00:00Z",
+                                   "serve_attribution": "profile" if named else "unspecified"}
+                            if named:
+                                hit["served_by_profile_id"] = who
+                            results.append({"ok": True, "result": [hit]})
+                        else:
+                            results.append({"ok": True, "result": {}})
+                    return results
+
+                def one(self, text, timeout=900):
+                    r = self.ops([text])[0]
+                    if not r.get("ok"):
+                        raise BankError(f"{text[:80]}: {r.get('error')!r}")
+                    return r.get("result")
+
+                def close(self):
+                    events.append("close")
+
+            def fake_open_bridge(args, db, env, scr, probe, profile_ids, served_check=None, err_name="kkernel-mcp.err"):
                 cfg = scr / "home" / ".khive" / "config.toml"
                 found = re.search(r"visible_namespaces\s*=\s*(\[[^\]]*\])", cfg.read_text()) if cfg.exists() else None
                 events.append(("start", json.loads(found.group(1)) if found else None))
-                return ServedBridge(served), {"ready_s": 0.0, "control": {}}
+                sb = ServedBridge(served)
+                if served_check is not None:
+                    try:
+                        served_check(sb)
+                    except BaseException:
+                        sb.close()
+                        raise
+                return sb, {"ready_s": 0.0, "control": {}}
 
             def fake_run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id):
                 events.append(("arms", bank_id))
                 if moved_to is not None:
                     br.total = moved_to
+                if credit is not None:
+                    br.one(recall_op(query="q", top_k=5))
+                    br.one(recall_op(query="q", top_k=5, profile_id=args.profile[-1]))
 
             banks = [({"bank_id": b, "version": 1, "cases_sha256": "x"},
                       [{"case_id": "c", "query": "q", "T": "t", "tags": []}]) for b in visible_by_bank]
             dargs = types.SimpleNamespace(kkernel="k", snapshot_id="s", engines_file=str(td / "engines.toml"),
-                                          profile=["p1"], feedback_actors="")
+                                          profile=list(profiles), feedback_actors="", ready_max_s=5, control_id=u[0])
             summary = {"banks": [], "results": {}}
-            patches = {"stage_once": fake_stage_once, "open_bridge": fake_open_bridge, "run_arms": fake_run_arms,
-                       "kkernel_version": lambda p: "test"}
+
+            def fake_pressure():
+                trace["pressure_calls"].append(1)
+                n = len(trace["pressure_calls"])
+                return {"source": "test", "reading": f"read-{n}", "normal": n != trace.get("abnormal_at")}
+
+            patches = {"stage": fake_stage(events), "memory_pressure": fake_pressure, "open_bridge": fake_open_bridge,
+                       "run_arms": fake_run_arms, "kkernel_version": lambda p: "test"}
+            if credit is not None:
+                patches["Bridge"] = CreditBridge
+                patches["open_bridge"] = recalls_first_open_bridge if recalls_first else real_open_bridge
             err = None
             try:
                 with_patches(patches, lambda: run_banks(dargs, ["profile_off"], "rid", banks, visible_by_bank, expect,
@@ -1626,8 +1760,9 @@ def self_test() -> int:
     arm("banks: two banks get two configs, each listing exactly its own set, written before each process starts, "
         "one copy", two_configs)
 
-    def cmd_refusal(bank_specs, visible, needle, arms="profile_off"):
-        """cmd_run over banks in a temp dir: the refusal names `needle`, no copy was attempted, no output exists."""
+    def cmd_refusal(bank_specs, visible, needle, arms="profile_off", expect=None, patches=None):
+        """cmd_run over banks in a temp dir: the refusal names `needle`, no copy was attempted, no output exists. `expect`
+        is the --expect-profiles value; `patches` are globals replaced for the call (a stand-in that raises `needle`)."""
         copied = []
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -1641,14 +1776,14 @@ def self_test() -> int:
                                                           "cases_sha256": sha256_file(bd / "cases.jsonl")}))
                 dirs.append(str(bd))
             cargs = types.SimpleNamespace(arms=arms, bank=dirs, profile=["p1"], bank_visible=visible,
-                                          expect_profiles=None, expect_namespace="local", out=str(td / "out"),
+                                          expect_profiles=expect, expect_namespace="local", out=str(td / "out"),
                                           engines_file=str(td / "missing-engines.toml"))
 
             def no_copy(*a, **k):
                 copied.append(1)
                 raise RuntimeError("copy attempted")
 
-            msg = with_patches({"stage": no_copy}, lambda: bank_error(cmd_run, cargs))
+            msg = with_patches({"stage": no_copy, **(patches or {})}, lambda: bank_error(cmd_run, cargs))
             return msg is not None and needle in msg and not copied and not (td / "out").exists()
 
     arm("banks: a bank without a --bank-visible set is refused before any copy",
@@ -1705,7 +1840,7 @@ def self_test() -> int:
         events, summary, err = drive_banks(one_bank, expect=expect_3596, served=3596, moved_to=3600)
         state = summary["banks"][0]["served_state"]
         return (err is None and state["pairs"][0]["served"] == 3596
-                and state["after"] == [{"profile": "p1", "served_after": 3600}])
+                and state["after_in_process"] == [{"profile": "p1", "in_process_total_events": 3600}])
 
     def missing_profile_stops():
         events, summary, err = drive_banks(one_bank, expect=expect_3596, served=None)
@@ -1719,6 +1854,138 @@ def self_test() -> int:
     arm("served state: mutation control, with the comparison replaced by a no-op the inequality arm reports failure",
         lambda: with_patches({"require_served_events": lambda profile, expected, served: None},
                              inequality_stops) is False)
+    # --- served-state order, arms that write brain state, per-bank hygiene and the calibrate setup path
+    cr_profiles = (default_profile, "p1")
+    cr_stored = {default_profile: 3596, "p1": 12}
+    cr_expect = {"events": dict(cr_stored)}
+    two_banks = {"bank-a": ["team:a"], "bank-b": ["team:b", "local"]}
+
+    def credit_run(visible=two_banks, recalls_first=False):
+        """run_banks over fake server processes that model the credit; every process starts from the stored counts."""
+        trace = {}
+        events, summary, err = drive_banks(visible, expect=cr_expect, credit=cr_stored, profiles=cr_profiles,
+                                           recalls_first=recalls_first, trace=trace)
+        return events, summary, err, trace
+
+    def served_pairs(summary, i=0):
+        return summary["banks"][i]["served_state"]["pairs"]
+
+    def check_before_recalls_passes():
+        events, summary, err, trace = credit_run()
+        after = {r["profile"]: r["in_process_total_events"]
+                 for r in summary["banks"][0]["served_state"]["after_in_process"]}
+        stored_pairs = [{"profile": default_profile, "expected": 3596, "served": 3596},
+                        {"profile": "p1", "expected": 12, "served": 12}]
+        return (err is None and ran_arms(events) and served_pairs(summary, 0) == stored_pairs
+                and served_pairs(summary, 1) == stored_pairs
+                and after["p1"] == 13 and after[default_profile] >= 3596 + 4)
+
+    def check_after_recalls_fails():
+        events, summary, err, trace = credit_run(recalls_first=True)
+        pairs = served_pairs(summary)
+        log = trace["procs"][0].log
+        first_recall = next(i for i, t in enumerate(log) if t.startswith("memory.recall"))
+        first_read = next(i for i, t in enumerate(log) if t.startswith("brain.profile"))
+        return (err is not None and not ran_arms(events) and len(pairs) == 1
+                and pairs[0]["profile"] == default_profile and pairs[0]["expected"] == 3596
+                and pairs[0]["served"] >= 3596 + 3 and first_recall < first_read)
+
+    def reads_precede_recalls():
+        events, summary, err, trace = credit_run()
+        if err is not None or len(trace["procs"]) != 2:
+            return False
+        for proc in trace["procs"]:
+            log = proc.log
+            reads = [i for i, t in enumerate(log) if t.startswith("brain.profile")]
+            recalls = [i for i, t in enumerate(log) if t.startswith("memory.recall")]
+            if not (log[0] == "handshake" and reads[:2] == [1, 2] and recalls and recalls[0] > 2
+                    and default_profile in log[1] and "p1" in log[2]):
+                return False
+        return True
+
+    arm("served state: with the credit modelled, the check run before the first recall of each bank's process passes "
+        "on the stored counts", check_before_recalls_passes)
+    arm("served state: with the credit modelled, the check run after the readiness and control recalls (the earlier "
+        "order, patched in here) reads the stored count plus the probe recalls and stops", check_after_recalls_fails)
+    arm("served state: in each bank's process every profile read of the check comes before the first memory.recall",
+        reads_precede_recalls)
+
+    for written_arm in ("feedback_fresh", "feedback_asof"):
+        arm(f"served state: --expect-profiles with {written_arm} is refused before any copy, naming the brain-state write",
+            lambda a=written_arm: cmd_refusal(
+                [("bank-a", "team:a")], ["bank-a=team:a"],
+                f"combined with {a}: those arms write brain state to the staged copy",
+                arms=f"profile_off,{a}", expect="expected.jsonl"))
+
+    def stop_at_expected_file(*a, **k):
+        raise BankError("reached the expected-file read")
+
+    arm("served state: profile_off,profile_on with --expect-profiles is accepted and reaches the expected-file read",
+        lambda: cmd_refusal([("bank-a", "team:a")], ["bank-a=team:a"], "reached the expected-file read",
+                            arms="profile_off,profile_on", expect="expected.jsonl",
+                            patches={"load_expected_events": stop_at_expected_file}))
+
+    def pressure_per_bank():
+        events, summary, err, trace = credit_run()
+        return (err is None and len(trace["pressure_calls"]) == 3
+                and summary["memory_pressure"]["before_copy"]["reading"] == "read-1"
+                and [b["memory_pressure"]["before_server"]["reading"] for b in summary["banks"]] == ["read-2", "read-3"])
+
+    def pressure_stops_second_bank():
+        trace = {"abnormal_at": 3}
+        events, summary, err = drive_banks(two_banks, trace=trace)
+        return (err is not None and len(trace["pressure_calls"]) == 3
+                and events == ["stage", ("start", ["team:a"]), ("arms", "bank-a"), "close"])
+
+    def stderr_per_bank():
+        events, summary, err, trace = credit_run()
+        paths = [b["server_stderr"] for b in summary["banks"]]
+        names = [Path(p).name for p in paths]
+        return (err is None and len(set(paths)) == 2 and names == ["kkernel-mcp-bank1.err", "kkernel-mcp-bank2.err"]
+                and paths == [str(p.err_path) for p in trace["procs"]]
+                and not any(bank_id in n for bank_id in two_banks for n in names))
+
+    arm("pressure: read once before the copy and once before each bank's server (three reads for two banks), each "
+        "recorded in that bank's record", pressure_per_bank)
+    arm("pressure: a pressure that is not normal before the second bank's server stops the run before that process",
+        pressure_stops_second_bank)
+    arm("stderr: two banks write to two distinct index-named files, each recorded in its bank's record", stderr_per_bank)
+
+    def calibrate_setup_reaches_write_config():
+        seen = []
+        real_write_config = write_config
+
+        def recording_write_config(scratch, args, visible):
+            seen.append(list(visible))
+            real_write_config(scratch, args, visible)
+
+        def stop_at_open_bridge(*a, **k):
+            raise BankError("stopped at open_bridge")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "engines.toml").write_text('[[engines]]\nname = "e"\n')
+            argv = ["bank.py", "calibrate-replay", "--kkernel", "k", "--store-main", "m.db", "--store-events", "e.db",
+                    "--snapshot-id", "s", "--engines-file", str(td / "engines.toml"), "--profile", "p1",
+                    "--control-id", u[0], "--feedback-actors", "a", "--queries-from-events",
+                    "--namespaces", "team:a", "--scratch-parent", str(td), "--out", str(td / "report.json")]
+            saved_argv = sys.argv
+            sys.argv = argv
+            try:
+                msg = with_patches({"stage": fake_stage(), "memory_pressure": normal_pressure,
+                                    "write_config": recording_write_config, "open_bridge": stop_at_open_bridge,
+                                    "finish_scratch": lambda a, s, r: None, "kkernel_version": lambda p: "test"},
+                                   lambda: bank_error(main))
+            except AttributeError:
+                return False
+            finally:
+                sys.argv = saved_argv
+            report = json.loads((td / "report.json").read_text())
+        return (msg is not None and "stopped at open_bridge" in msg and seen == [["team:a"]]
+                and report["visible_namespaces"] == ["team:a"])
+
+    arm("calibrate-replay: the setup path reaches write_config with a visible set and raises no AttributeError",
+        calibrate_setup_reaches_write_config)
     # --- bank-visible and served-state arms (end)
     print("SELF-TEST " + ("PASS" if not fails else f"FAIL ({len(fails)})"))
     return 1 if fails else 0

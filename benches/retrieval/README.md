@@ -164,7 +164,9 @@ uv run python bootstrap.py runs/<name>/team-a/recall_rrf.jsonl runs/<name>/team-
 The copy is staged into a fresh scratch home and served by `kkernel mcp` processes with `KHIVE_NO_DAEMON=1`, one per bank; a
 source under the caller's `~/.khive` is refused, and so is one with a non-empty WAL unless `--copy-wal` states that
 no process writes it. A source whose inode, size or modification time changes during its copy stops the run. The
-run starts only at normal memory pressure, read before the copy and again before the server starts. The scratch
+run starts only at normal memory pressure, read before the copy and again before each bank's server starts; each
+bank's record holds its reading. Each server writes its stderr to its own file in the scratch home
+(`kkernel-mcp-bank<N>.err`, numbered in the order the banks are given), named in that bank's record. The scratch
 home is kept by default, and the record names its path and the staged files' sha256 before and after the run;
 `--remove-scratch` removes it. On another machine, `--staged-home <dir>` serves a copy already placed at
 `<dir>/home/.khive/` by a guarded transfer instead of copying it again: `<dir>/transfer.json` must carry verdict
@@ -175,7 +177,7 @@ Arms: three fusion strategies with configured
 defaults (no binding row), a named profile against configured defaults, a profile with no feedback events, a profile
 fed the named profile's explicit feedback events created before each case's `T`, and a fusion of recall with
 `search` over notes and entities (whose late hits are dropped after the fact and counted, since `search` has no
-time filter). The served profile's name is checked on every hit; what shows that the profile holds its state is the served-state check below. `composed` refuses a namespaced case before anything is
+time filter). The served profile's name is checked on every hit; what shows that the served profile was loaded from the frozen snapshot is the served-state check below. `composed` refuses a namespaced case before anything is
 staged, because `search` has no read-namespace filter. Recall hits do not carry the namespace they were read from,
 so the namespace a case names is a label checked against the bank's visible set, not a per-hit property.
 
@@ -195,16 +197,24 @@ profile and the case namespace. `run.json` records each bank (id, version, cases
 the profiles, the store snapshot id, kkernel version, the staged files' sha256, the control
 result and the metrics grouped by bank and file.
 
-Before any arm of a bank runs, each `--profile` is read through that bank's server (`brain.profile`) and its
-`total_events` is compared with the count in the frozen read-back; a profile that is not found, or a different count,
-stops the run naming the profile, the expected value and the served value. A name comparison cannot do this: a profile
-seeded fresh under the same name passes it. `--expect-profiles <path>` names the read-back, a
+In each bank's server process, right after the handshake and before that process's first recall, each `--profile` is
+read (`brain.profile`) and its `total_events` is compared with the count in the frozen read-back; a profile that is not
+found, or a different count, stops the run naming the profile, the expected value and the served value. The order
+matters: a recall that names no profile is credited to the default profile `balanced-recall-v1` in the server's memory,
+so the readiness and control recalls would already have moved that count. Equal `total_events` shows that the served
+profile was loaded from the frozen snapshot rather than seeded fresh under another namespace; it does not show that the
+posteriors are identical. A name comparison cannot show even that: a profile seeded fresh under the same name passes
+it. `--expect-profiles <path>` names the read-back, a
 `brain_profile_snapshots.jsonl` export (one JSON array per line, `[profile_id, namespace, snapshot_json, updated_at]`);
 the row whose profile id is `__brain__` and whose namespace is `--expect-namespace` (default `local`) supplies
 `profiles.<id>.total_events`. It is required whenever `profile_on` is among the arms, and a file with no such row, or a
 row lacking a requested profile, is refused before anything is staged. `run.json` records the file's path and sha256,
-each compared pair, and the same counts read again after the bank's arms (recorded only, to show whether serving moved
-the profile state).
+each compared pair, and per bank `served_state.after_in_process`: the same profiles read again in that bank's server
+process after its arms. That is the in-process count, not stored state: it includes the credits for the recalls just
+served, and the read-only arms (`recall_*`, `profile_off`, `profile_on`) do not write it to the staged copy. It is
+recorded only and never stops the run. `--expect-profiles` is refused together with `feedback_fresh` or
+`feedback_asof`: those arms call `brain.create_profile` and `brain.feedback`, which write the server's brain state to
+the staged copy, so the served state is no longer the frozen one after them.
 
 `calibrate-replay` takes one bank (or `--queries-from-events`) and one profile, and measures how closely a profile rebuilt from replayed feedback events reproduces the original
 (top-10 overlap and rank-score differences), which bounds what the as-of-`T` arm can claim. Each query is recalled
