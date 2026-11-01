@@ -1176,6 +1176,20 @@ impl MemoryPack {
             }
         }
 
+        /// Stored properties and tags exactly as a recall hit reports them: the whole
+        /// stored object (`{}` when none) and its `tags` array (`[]` when absent).
+        fn hit_properties_and_tags(stored: Option<&Value>) -> (Value, Value) {
+            let properties = match stored {
+                Some(object) if object.is_object() => object.clone(),
+                _ => json!({}),
+            };
+            let tags = match properties.get("tags") {
+                Some(array) if array.is_array() => array.clone(),
+                _ => json!([]),
+            };
+            (properties, tags)
+        }
+
         let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
@@ -1186,6 +1200,8 @@ impl MemoryPack {
                     } else {
                         sn.note.content.clone()
                     };
+                let (hit_properties, hit_tags) =
+                    hit_properties_and_tags(sn.note.properties.as_ref());
                 let mut result = json!({
                     "id": sn.id.to_string(),
                     "full_id": sn.id.to_string(),
@@ -1197,6 +1213,9 @@ impl MemoryPack {
                     "decay_factor": sn.effective_decay_factor,
                     "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
+                    "namespace": sn.note.namespace,
+                    "tags": hit_tags,
+                    "properties": hit_properties,
                 });
                 if let Some(source) = source_ids.get(&sn.id) {
                     result["source_id"] = json!(source);

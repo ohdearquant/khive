@@ -420,6 +420,10 @@ pub(super) struct RememberParams {
     #[serde(alias = "source")]
     pub(super) source_id: Option<String>,
     pub(super) tags: Option<Vec<String>>,
+    /// Caller-supplied structured fields stored beside `memory_type` and `tags`.
+    /// Validated by `validate_properties` in the remember handler.
+    #[serde(default)]
+    pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
     /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
