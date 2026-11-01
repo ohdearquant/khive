@@ -15,8 +15,8 @@ description = "Brain primitives — Beta posteriors, section types, profile stat
 bench = false
 
 [dependencies]
-khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
-khive-types = { version = "0.15.0", path = "../khive-types" }
+khive-runtime = { version = "0.16.0", path = "../khive-runtime" }
+khive-types = { version = "0.16.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -12,8 +12,8 @@ categories.workspace = true
 description = "Pure configurable graph rule evaluation over in-memory NDJSON"
 
 [dependencies]
-khive-changeset = { version = "0.15.0", path = "../khive-changeset" }
-khive-types = { version = "0.15.0", path = "../khive-types" }
+khive-changeset = { version = "0.16.0", path = "../khive-changeset" }
+khive-types = { version = "0.16.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
