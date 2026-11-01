@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  160 public verbs (see the verb-catalog paragraph below       │
+│  161 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-010, forward-deployed,  │
@@ -111,7 +111,7 @@ not shipped.
 | `crates/khive-runtime-production-tests` | Private test consumer that exercises the runtime audit batcher without test-only features                                                                                                                                                                                                                                                                                         |
 | `crates/khive-request`                  | Request DSL parser (function-call + JSON forms, `\|` chains with `$prev`; LNDL planned)                                                                                                                                                                                                                                                                                           |
 | `crates/khive-pack-kg`                  | KG pack: vocabulary, 31 verb handlers, kind validation                                                                                                                                                                                                                                                                                                                            |
-| `crates/khive-pack-gtd`                 | GTD pack: 7 verbs over notes (assign / next / complete / tasks / transition / census / repair)                                                                                                                                                                                                                                                                                    |
+| `crates/khive-pack-gtd`                 | GTD pack: 8 verbs over notes (assign / next / complete / tasks / transition / census / counts / repair)                                                                                                                                                                                                                                                                           |
 | `crates/khive-pack-memory`              | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                                                                                                                                                             |
 | `crates/khive-pack-brain`               | Brain pack: profile management registry, Bayesian routing/feedback verbs                                                                                                                                                                                                                                                                                                          |
 | `crates/khive-pack-comm`                | Comm pack: threaded messaging, inbox/delivery/cursor/suppression verbs (fifteen public `comm.*` verbs)                                                                                                                                                                                                                                                                            |
@@ -280,7 +280,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `scan`            | `content`, `name?`, `properties?`                                                                                 | Would the secret gate refuse this note body: detector, field, exact refusal text, masked preview; no write                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `db_diagnostics`  | `backend?`, `size_composition?`                                                                                   | Writer-contention, graph-edge integrity, FTS5 segment/maintenance, and WAL/checkpoint diagnostics: aggregate plus pooled/standalone/writer-task acquisition counters, pooled checkout timeouts, audit failures, build identity, duplicate edge-ID and list-ledger counts, bounded one-row FTS structure readings, checkpoint/FTS maintenance counters, PASSIVE checkpoint probe, WAL file size, and explicitly qualified WAL-pin census. The probe may backfill WAL frames (normal checkpoint I/O); it never changes logical state, increments write-traffic acquisitions, escalates to TRUNCATE, or deletes sidecar evidence |
 
-### GTD pack verbs (7 — ADR-019)
+### GTD pack verbs (8 — ADR-019)
 
 In the default pack set; a non-empty `KHIVE_PACKS` or `--pack` list replaces that set, so it
 must name `gtd`. Adds the `task` note kind.
@@ -293,6 +293,7 @@ must name `gtd`. Adds the `task` note kind.
 | `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                                  |
 | `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation             |
 | `gtd.census`     | `include_candidates?`, `limit?`, `cursor?`                                   | Read-only task timestamp evidence and bounded candidates               |
+| `gtd.counts`     | `assignee`, `tag?`, `limit?`                                                 | Per-status counts for one assignee; open rows of one tag, no bodies    |
 | `gtd.repair`     | `items`, `apply?`                                                            | Preview or explicitly apply observed-value task repairs with audit     |
 
 ### Memory pack verbs (5 — ADR-021)
