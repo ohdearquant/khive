@@ -227,6 +227,14 @@ impl EmailChannel {
     /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
     /// any failing step quarantines it (never partially attributed).
     ///
+    /// Step 3 has one opt-in exception (ADR-056 Amendment 2026-11-01, Exchange Online intra-tenant
+    /// anchor). With `trust_exchange_internal` set, a message whose domain authentication is
+    /// `auth-absent` is attributed to the maintainer when `exchange_internal_maintainer` holds:
+    /// exactly one `From:` address on the configured mailbox's domain, exactly one
+    /// `X-MS-Exchange-Organization-AuthAs` field reading `Internal`, and the existing `From:` and
+    /// `Sender:` maintainer checks passing. Any failed condition stays `auth-absent`. This arm
+    /// never attributes external mail and never evaluates inbound suppression.
+    ///
     pub(super) fn gate(
         &self,
         email: &RawEmail,
