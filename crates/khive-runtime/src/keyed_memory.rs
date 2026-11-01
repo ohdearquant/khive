@@ -6,9 +6,12 @@ use khive_types::{Details, KhiveError};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::atomic_message::{AtomicNoteOptions, AtomicNoteSpec};
+use crate::atomic_message::{AtomicNoteOptions, AtomicNoteSpec, PreparedAtomicNotes};
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicRunOutcome};
-use crate::note_create::{prepare_note_create, KeyPublication, KEY_CLAIM};
+use crate::note_create::{
+    prepare_note_create_classified, KeyPublication, NoteCreatePrepareError,
+    KEYED_ANNOTATION_ENDPOINT, KEY_CLAIM,
+};
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
 pub struct KeyedMemorySpec<'a> {
@@ -258,6 +261,36 @@ pub async fn create_keyed_memory_with_receipt(
     Ok((note, edge_id, replayed, fences))
 }
 
+async fn prepare_keyed_memory(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: &KeyedMemorySpec<'_>,
+    source_id: Option<Uuid>,
+) -> Result<(PreparedAtomicNotes, Vec<Uuid>), NoteCreatePrepareError> {
+    prepare_note_create_classified(
+        runtime,
+        AtomicNoteSpec {
+            token,
+            id: None,
+            kind: "memory",
+            name: None,
+            content: spec.content,
+            properties: Some(spec.properties.clone()),
+        },
+        AtomicNoteOptions {
+            salience: Some(spec.salience),
+            decay_factor: Some(spec.decay_factor),
+            embedding_model: spec.embedding_model,
+            key: Some(spec.key),
+            memory_visibility_receipt: true,
+            ..Default::default()
+        },
+        &source_id.into_iter().collect::<Vec<_>>(),
+        KeyPublication::AfterDependents,
+    )
+    .await
+}
+
 /// Return both the original visibility receipt and the embedding-input report.
 /// Replays retain the stored fences and the report computed while preparing
 /// this call's embedding input; the report does not describe the original write.
@@ -273,33 +306,53 @@ pub async fn create_keyed_memory_with_receipt_and_report(
     crate::retrieval::EmbeddingTruncationReport,
 )> {
     validate_memory_key(spec.key)?;
+    crate::secret_gate::check_at(spec.key, "note", "key")?;
     if spec.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "content must not be empty".into(),
         ));
     }
-    let (mut prepared, annotation_ids) = prepare_note_create(
-        runtime,
-        AtomicNoteSpec {
-            token,
-            id: None,
-            kind: "memory",
-            name: None,
-            content: spec.content,
-            properties: Some(spec.properties),
-        },
-        AtomicNoteOptions {
-            salience: Some(spec.salience),
-            decay_factor: Some(spec.decay_factor),
-            embedding_model: spec.embedding_model,
-            key: Some(spec.key),
-            memory_visibility_receipt: true,
-            ..Default::default()
-        },
-        &spec.source_id.into_iter().collect::<Vec<_>>(),
-        KeyPublication::AfterDependents,
-    )
-    .await?;
+    // A replay's source describes no new write. Check the live holder before
+    // validating that creation-only endpoint, but still prepare the candidate
+    // so the existing content checks and embedding report remain in force.
+    let mut holder_seen = resolve_holder(runtime, token, spec.key).await?.is_some();
+    let source_to_prepare = if holder_seen { None } else { spec.source_id };
+    let mut candidate = match prepare_keyed_memory(runtime, token, &spec, source_to_prepare).await {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            // A winner can publish between the first lookup and source checking.
+            // Only this exact annotation-existence refusal is eligible for a
+            // recheck; unrelated NotFound errors must retain their meaning.
+            let missing_source = matches!(error, NoteCreatePrepareError::MissingAnnotation(_));
+            if !holder_seen && missing_source {
+                holder_seen = resolve_holder(runtime, token, spec.key).await?.is_some();
+                if holder_seen {
+                    prepare_keyed_memory(runtime, token, &spec, None)
+                        .await
+                        .map_err(NoteCreatePrepareError::into_runtime)?
+                } else {
+                    return Err(error.into_runtime());
+                }
+            } else {
+                return Err(error.into_runtime());
+            }
+        }
+    };
+    if holder_seen {
+        // The holder may have disappeared while preparation was in flight.
+        // In that case take the normal create path, including source checking.
+        if let Some(holder) = resolve_holder(runtime, token, spec.key).await? {
+            if holder.content != spec.content {
+                return Err(idempotency_conflict(spec.key, &holder));
+            }
+            let fences = classified_visibility_receipt(runtime, token, holder.id, true).await?;
+            return Ok((holder, None, true, fences, candidate.0.embedding_truncation));
+        }
+        candidate = prepare_keyed_memory(runtime, token, &spec, spec.source_id)
+            .await
+            .map_err(NoteCreatePrepareError::into_runtime)?;
+    }
+    let (mut prepared, annotation_ids) = candidate;
     let mut note = prepared.notes.remove(0);
     let edge_id = annotation_ids.first().copied();
 
@@ -338,6 +391,23 @@ pub async fn create_keyed_memory_with_receipt_and_report(
                 failed_op_index,
                 failure,
             }) => {
+                // The target can disappear after preparation while another
+                // writer publishes this key. Reconcile only this labeled
+                // endpoint guard; all other failures retain their old path.
+                if matches!(
+                    &failure,
+                    AtomicOpFailure::GuardFailed { statement_label, observed: 0, .. }
+                        if statement_label.as_deref() == Some(KEYED_ANNOTATION_ENDPOINT)
+                ) {
+                    if let Some(holder) = resolve_holder(runtime, token, spec.key).await? {
+                        if holder.content != spec.content {
+                            return Err(idempotency_conflict(spec.key, &holder));
+                        }
+                        let fences =
+                            classified_visibility_receipt(runtime, token, holder.id, true).await?;
+                        return Ok((holder, None, true, fences, prepared.embedding_truncation));
+                    }
+                }
                 // Admission is cached after the first successful cutover check,
                 // so a receipt store that broke since then surfaces here.
                 runtime.recheck_visibility_cutover()?;

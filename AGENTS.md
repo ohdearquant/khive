@@ -140,7 +140,7 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 7 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 8 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
 | Verb             | What it does                                                   | When to use                              |
 | ---------------- | -------------------------------------------------------------- | ---------------------------------------- |
@@ -150,6 +150,7 @@ request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_c
 | `gtd.tasks`      | Filtered task listing                                          | Browse tasks by status/assignee/priority |
 | `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)             | Moving a task through its lifecycle      |
 | `gtd.census`     | Count raw task timestamp evidence; optionally page candidates  | Inspect historical task rows             |
+| `gtd.counts`     | Count one assignee's tasks by status; optional open tag rows   | Queue size without task bodies           |
 | `gtd.repair`     | Preview or explicitly apply exact-observation task corrections | Repair historical task rows              |
 
 `gtd.repair` is dry-run by default. `apply=true` commits each accepted row with its

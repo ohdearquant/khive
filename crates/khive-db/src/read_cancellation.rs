@@ -69,6 +69,36 @@ struct DbReadTestContext {
     settlement_bounds: Option<(Duration, Duration)>,
     #[cfg(test)]
     bounded_wait_probe: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    diagnostic_graph_probe: Option<Arc<DiagnosticGraphTestProbe>>,
+}
+
+/// Request-local synchronization and lifecycle witnesses for diagnostic tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DiagnosticGraphTestProbe {
+    pub(crate) armed: AtomicBool,
+    pub(crate) entered: AtomicBool,
+    pub(crate) release: AtomicBool,
+    pub(crate) fail_safe: AtomicBool,
+    pub(crate) interrupt_latched: AtomicBool,
+    pub(crate) progress_returned_stop: AtomicBool,
+    pub(crate) graph_returned: AtomicBool,
+    pub(crate) connection_dropped: AtomicBool,
+    pub(crate) worker_exited: AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_test_diagnostic_graph_probe<F>(
+    probe: Arc<DiagnosticGraphTestProbe>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let mut context = current_test_context();
+    context.diagnostic_graph_probe = Some(probe);
+    DB_READ_TEST_CONTEXT.scope(context, future).await
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -176,6 +206,8 @@ struct ReadControl {
     fail_progress_clear: bool,
     #[cfg(test)]
     bounded_wait_probe: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    diagnostic_graph_probe: Option<Arc<DiagnosticGraphTestProbe>>,
 }
 
 impl ReadControl {
@@ -210,6 +242,8 @@ impl ReadControl {
             fail_progress_clear: test_context.fail_progress_clear,
             #[cfg(test)]
             bounded_wait_probe: test_context.bounded_wait_probe,
+            #[cfg(test)]
+            diagnostic_graph_probe: test_context.diagnostic_graph_probe,
         });
         if let Some(reason) = context.stop_reason() {
             control.cancel(stop_reason_code(reason));
@@ -239,6 +273,12 @@ impl ReadControl {
         self.stopped.store(true, Ordering::Release);
         if let RegistrationState::Running(interrupt) = &*state {
             interrupt.interrupt();
+            #[cfg(test)]
+            if let Some(probe) = &self.diagnostic_graph_probe {
+                if probe.armed.load(Ordering::Acquire) {
+                    probe.interrupt_latched.store(true, Ordering::Release);
+                }
+            }
         }
     }
 
@@ -342,13 +382,39 @@ impl ReadControl {
                 if let Some(probe) = &callback.progress_probe {
                     probe.fetch_add(1, Ordering::Relaxed);
                 }
+                #[cfg(test)]
+                if let Some(gate) = &callback.diagnostic_graph_probe {
+                    if gate.armed.load(Ordering::Acquire) {
+                        gate.entered.store(true, Ordering::Release);
+                        let started = WallInstant::now();
+                        while !gate.release.load(Ordering::Acquire)
+                            && !gate.interrupt_latched.load(Ordering::Acquire)
+                        {
+                            if started.elapsed() >= Duration::from_secs(5) {
+                                gate.fail_safe.store(true, Ordering::Release);
+                                gate.release.store(true, Ordering::Release);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
                 // Only the synchronous borrowed lease has no async waiter to
                 // latch its watch signal. Keep watch polling off the ordinary
                 // async progress path (its predicate remains lock-free).
                 if let Some(context) = &blocking_context {
                     callback.poll_blocking_request(context);
                 }
-                callback.progress_should_stop()
+                let stop = callback.progress_should_stop();
+                #[cfg(test)]
+                if stop {
+                    if let Some(gate) = &callback.diagnostic_graph_probe {
+                        if gate.armed.load(Ordering::Acquire) {
+                            gate.progress_returned_stop.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                stop
             }),
         ) {
             self.cleanup_failed.store(true, Ordering::Release);
@@ -493,6 +559,11 @@ impl Drop for QuarantinePooledWriterOnDrop<'_, '_> {
 }
 
 impl InterruptibleReadScope {
+    #[cfg(test)]
+    pub(crate) fn diagnostic_graph_probe(&self) -> Option<Arc<DiagnosticGraphTestProbe>> {
+        self.control.diagnostic_graph_probe.clone()
+    }
+
     /// Refuse to acquire another read resource after this request stopped.
     pub(crate) fn ensure_active(&self) -> StorageResult<()> {
         if self.control.progress_should_stop() {
@@ -767,6 +838,18 @@ impl Drop for CancelReadOnDrop {
     }
 }
 
+#[cfg(test)]
+struct TestDiagnosticWorkerWitness(Option<Arc<DiagnosticGraphTestProbe>>);
+
+#[cfg(test)]
+impl Drop for TestDiagnosticWorkerWitness {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.worker_exited.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Run blocking read work under the current request cancellation/deadline.
 async fn run_interruptible_read_inner<R, F>(
     capability: StorageCapability,
@@ -782,6 +865,9 @@ where
     let control = ReadControl::new(&context, operation);
     let worker_control = Arc::clone(&control);
     let mut worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _worker_witness =
+            TestDiagnosticWorkerWitness(worker_control.diagnostic_graph_probe.clone());
         let scope = InterruptibleReadScope {
             control: Arc::clone(&worker_control),
             capability,

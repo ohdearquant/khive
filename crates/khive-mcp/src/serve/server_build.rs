@@ -237,6 +237,7 @@ pub(super) struct PreparedServerBoot {
     pub(super) config: RuntimeConfig,
     pub(super) db_anchor: Option<PathBuf>,
     pub(super) khive_cfg: KhiveConfig,
+    pub(super) config_source: Option<PathBuf>,
 }
 
 /// Resolve storage topology without opening a database. The daemon takes its
@@ -314,6 +315,7 @@ pub(super) fn prepare_server_boot(
         config,
         db_anchor,
         khive_cfg,
+        config_source: config_source.map(|path| path.to_path_buf()),
     })
 }
 
@@ -327,7 +329,20 @@ pub(super) async fn build_server_from_prepared(
         config,
         db_anchor,
         khive_cfg,
+        config_source,
     } = prepared;
+
+    #[cfg(unix)]
+    let (spawn_config, spawn_db) = crate::daemon::select_daemon_spawn_overrides(
+        args.config.as_deref().map(std::path::Path::new),
+        args.db.as_deref(),
+        config_source.as_deref(),
+        !khive_cfg.backends.is_empty(),
+    );
+    #[cfg(not(unix))]
+    let _ = config_source;
+    #[cfg(not(unix))]
+    let (spawn_config, spawn_db): (Option<PathBuf>, Option<String>) = (None, None);
 
     let max_readers = if mcp_host {
         mcp_max_readers(args, &config, &khive_cfg.backends, None)
@@ -388,7 +403,10 @@ pub(super) async fn build_server_from_prepared(
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         let server = KhiveMcpServer::new_with_mounts_and_config(runtime, Some(&khive_cfg))
             .await
-            .map(|s| s.with_default_output_format(fmt))
+            .map(|s| {
+                s.with_default_output_format(fmt)
+                    .with_daemon_spawn_overrides(spawn_config, spawn_db)
+            })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok((server, schedule_rt));
     }
@@ -409,7 +427,8 @@ pub(super) async fn build_server_from_prepared(
             .get("schedule")
             .map(|rt| (**rt).clone()),
     );
-    let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+    let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None)
+        .with_daemon_spawn_overrides(spawn_config, spawn_db);
     Ok((server, schedule_rt))
 }
 
@@ -909,9 +928,9 @@ pub fn build_server_from_multi_backend_registry(
     .with_runtime(default_runtime);
 
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    let server = server
-        .with_channel_outbox_runtime(channel_outbox_runtime)
-        .with_channel_loop_admission(channel_loop_admission);
+    let server = server.with_channel_outbox_runtime(channel_outbox_runtime);
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let server = server.with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),

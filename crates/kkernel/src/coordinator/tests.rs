@@ -1185,6 +1185,32 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
         "merged note hits must be capped at limit=2, got {}",
         note_hits.len()
     );
+
+    // The coordinated boundary must normalize a whole-number JSON float just
+    // as registry dispatch does before applying the same result limit.
+    let registry = packs_registry(Arc::clone(&rt_main), &["kg"]);
+    let float_request = ValidatedSearchRequest::from_value(
+        serde_json::json!({
+            "kind": "note",
+            "query": "notelimitprobe",
+            "limit": 2.0,
+        }),
+        &registry,
+    )
+    .expect("whole-float limit normalizes at the coordinated search boundary");
+    assert_eq!(float_request.limit(), 2);
+    let (_entity_hits, float_hits, float_per_backend) =
+        coord.fan_out_search(&float_request, &ns).await;
+    assert_eq!(float_per_backend.len(), 2, "both backends in report");
+    assert!(
+        float_per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors for whole-float limit"
+    );
+    assert_eq!(
+        float_hits.len(),
+        2,
+        "whole-float limit returns two note hits"
+    );
 }
 
 // ---- Per-backend fan-out search timeout ----

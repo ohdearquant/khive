@@ -125,8 +125,10 @@ fn cmd_init_with_hook_prompt(
 
     for name in &["entities.ndjson", "edges.ndjson"] {
         let path = kg_dir.join(name);
-        if !path.exists() {
-            std::fs::write(&path, "").with_context(|| format!("create {}", path.display()))?;
+        if !khive_fs::atomic_create::create_only(&path, |_| Ok(()))
+            .with_context(|| format!("create {}", path.display()))?
+        {
+            println!("  Skipped {} (already exists)", path.display());
         }
     }
 
@@ -134,16 +136,20 @@ fn cmd_init_with_hook_prompt(
     update_gitignore(&gitignore)?;
 
     let hook_script = hooks_dir.join("pre-commit");
-    if !hook_script.exists() {
-        std::fs::write(&hook_script, PRE_COMMIT_HOOK)
-            .with_context(|| format!("write {}", hook_script.display()))?;
+    if !khive_fs::atomic_create::create_only(&hook_script, |file| {
+        file.write_all(PRE_COMMIT_HOOK.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_script)?.permissions();
+            let mut perms = file.metadata()?.permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_script, perms)?;
+            file.set_permissions(perms)?;
         }
+        Ok(())
+    })
+    .with_context(|| format!("create {}", hook_script.display()))?
+    {
+        println!("  Skipped {} (already exists)", hook_script.display());
     }
 
     println!(
@@ -155,10 +161,14 @@ fn cmd_init_with_hook_prompt(
         std::fs::create_dir_all(&workflow_dir)
             .with_context(|| format!("create {}", workflow_dir.display()))?;
         let workflow_path = workflow_dir.join("kg-validate.yml");
-        if !workflow_path.exists() {
-            std::fs::write(&workflow_path, CI_WORKFLOW)
-                .with_context(|| format!("write {}", workflow_path.display()))?;
+        if khive_fs::atomic_create::create_only(&workflow_path, |file| {
+            file.write_all(CI_WORKFLOW.as_bytes())
+        })
+        .with_context(|| format!("create {}", workflow_path.display()))?
+        {
             println!("  Generated {}", workflow_path.display());
+        } else {
+            println!("  Skipped {} (already exists)", workflow_path.display());
         }
     }
 
@@ -269,13 +279,66 @@ fn update_gitignore(path: &Path) -> Result<()> {
                 && std::fs::read(path).with_context(|| format!("read {}", path.display()))?
                     == OLD_GITIGNORE_CONTENT.as_bytes()
             {
-                std::fs::write(path, GITIGNORE_CONTENT)
-                    .with_context(|| format!("write {}", path.display()))?;
+                replace_gitignore(path, metadata.permissions())?;
             }
             Ok(())
         }
         Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
     }
+}
+
+// The parent/staging namespace is trusted, as for atomic_create. Only this
+// attempt's exclusively created sibling is cleaned up; rename commits replacement.
+fn replace_gitignore(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().context("gitignore must have a parent")?;
+    #[cfg(unix)]
+    let directory = std::fs::File::open(parent).context("open gitignore parent for sync")?;
+    for _ in 0..16 {
+        let stage = parent.join(format!(
+            ".gitignore-migrate-{}-{}.tmp",
+            std::process::id(),
+            NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&stage) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create gitignore migration stage"),
+        };
+        let prepared = (|| -> Result<()> {
+            file.write_all(GITIGNORE_CONTENT.as_bytes())
+                .context("write staged gitignore (WriteTmp)")?;
+            file.set_permissions(permissions.clone())
+                .context("preserve gitignore permissions on stage")?;
+            file.sync_all().context("sync staged gitignore (SyncTmp)")
+        })();
+        drop(file);
+        let promoted = prepared
+            .and_then(|()| std::fs::rename(&stage, path).context("rename staged gitignore"));
+        if let Err(primary) = promoted {
+            return match std::fs::remove_file(&stage) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(primary.context(format!(
+                    "cleanup owned gitignore stage {} also failed: {cleanup}",
+                    stage.display()
+                ))),
+            };
+        }
+        // The stage name is no longer ours after rename; never clean it here.
+        #[cfg(unix)]
+        directory
+            .sync_all()
+            .context("gitignore replacement installed; parent directory sync failed")?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "exclusive gitignore migration staging retry limit reached",
+    ))
+    .context("create gitignore migration stage")
 }
 
 pub(super) fn cmd_hook(cmd: HookCommand) -> Result<()> {
@@ -785,6 +848,106 @@ mod tests {
             DEFAULT_SCHEMA_YAML.as_bytes()
         );
         assert!(!create_default_schema(&path).expect("complete schema is preserved"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn gitignore_migration_write_failure_preserves_old_bytes_and_cleans_stage() {
+        const CHILD: &str = "KKERNEL_GITIGNORE_FSIZE_CHILD";
+        const IGNORE_PATH: &str = "KKERNEL_GITIGNORE_FSIZE_PATH";
+        const MARKER: &str = "KKERNEL_GITIGNORE_WRITE_TMP_EFBIG_REACHED";
+        let thread = std::thread::current();
+        let name = thread.name().expect("libtest test name");
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            assert_eq!(
+                std::env::args().skip(1).collect::<Vec<_>>(),
+                vec!["--exact", name, "--nocapture", "--test-threads=1"]
+            );
+            let path =
+                std::path::PathBuf::from(std::env::var_os(IGNORE_PATH).expect("ignore path"));
+            let error = update_gitignore(&path).expect_err("stage write must hit file-size limit");
+            assert!(
+                format!("{error:#}").contains("WriteTmp")
+                    && error.chain().any(|cause| cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == ErrorKind::FileTooLarge)),
+                "must reach actual staged write, not setup failure: {error:#}"
+            );
+            println!("{MARKER}");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, OLD_GITIGNORE_CONTENT).unwrap();
+        update_gitignore(&path).expect("unrestricted migration positive baseline");
+        assert_eq!(std::fs::read(&path).unwrap(), GITIGNORE_CONTENT.as_bytes());
+        std::fs::write(&path, OLD_GITIGNORE_CONTENT).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut command = Command::new("/bin/sh");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        let mut child = command
+            .args([
+                "-c",
+                r#"trap '' XFSZ || exit 81; ulimit -f 0 || exit 82; exec "$@""#,
+                "gitignore-write-limit",
+            ])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env(IGNORE_PATH, &path)
+            .env("HOME", &home)
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("LLVM_PROFILE_FILE", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn file-size-limited migration test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().expect("poll limited child").is_none() {
+            if std::time::Instant::now() >= deadline {
+                let killed = child.kill();
+                let reap_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let reaped = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Err(_) => break false,
+                        Ok(None) if std::time::Instant::now() >= reap_until => break false,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                };
+                panic!("limited migration child exceeded 30s; kill={killed:?}, reaped={reaped}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child
+            .wait_with_output()
+            .expect("collect limited child output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(MARKER),
+            "limited child must execute one passing WriteTmp case:\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            OLD_GITIGNORE_CONTENT.as_bytes()
+        );
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".gitignore-migrate-")));
+        update_gitignore(&path).expect("unrestricted retry must migrate");
+        assert_eq!(std::fs::read(&path).unwrap(), GITIGNORE_CONTENT.as_bytes());
     }
 }
 

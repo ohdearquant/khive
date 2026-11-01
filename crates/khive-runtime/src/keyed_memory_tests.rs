@@ -148,6 +148,75 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
 }
 
 #[tokio::test]
+async fn keyed_memory_new_secret_key_is_refused_without_writes() {
+    // This is the synthetic detector fixture used by the secret-gate tests.
+    const SYNTHETIC_KEY: &str = "AKIAFAKEKEY1234567890";
+    validate_memory_key(SYNTHETIC_KEY).expect("fixture key must be syntactically valid");
+    assert!(
+        matches!(
+            crate::secret_gate::check(SYNTHETIC_KEY),
+            Err(RuntimeError::SecretDetected(_))
+        ),
+        "fixture key must independently trigger the secret detector"
+    );
+
+    // Establish that the same fixture can create and replay an ordinary key.
+    let (good_runtime, good_token, good_source) = fixture("key-gate-positive").await;
+    assert_rows(&good_runtime, &good_token, 0, 0).await;
+    let (first, edge, replayed, fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign create");
+    assert!(!replayed);
+    assert!(edge.is_some());
+    assert_eq!(fences.len(), 1);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+    let (second, replay_edge, replayed, replay_fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign exact replay");
+    assert!(replayed);
+    assert!(replay_edge.is_none());
+    assert_eq!(second.id, first.id);
+    assert_eq!(replay_fences, fences);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+
+    let (runtime, token, source) = fixture("key-gate-refusal").await;
+    assert_rows(&runtime, &token, 0, 0).await;
+    let error = match create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec(SYNTHETIC_KEY, "ordinary memory", Some(source)),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("secret-bearing new key was accepted"),
+    };
+    assert!(
+        !error.to_string().contains(SYNTHETIC_KEY),
+        "displayed refusal must not disclose the key"
+    );
+    assert!(
+        !format!("{error:?}").contains(SYNTHETIC_KEY),
+        "debug refusal must not disclose the key"
+    );
+    match error {
+        RuntimeError::SecretDetected(matched) => {
+            assert_eq!(matched.location.as_deref(), Some("note.key"));
+        }
+        _ => panic!("expected a located secret-gate refusal"),
+    }
+    assert_rows(&runtime, &token, 0, 0).await;
+}
+
+#[tokio::test]
 async fn keyed_memory_without_models_replays_an_explicit_empty_receipt() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     runtime.install_kind_registry(vec![], vec!["memory".into()]);
@@ -743,7 +812,6 @@ async fn remove_holder(runtime: &KhiveRuntime, token: &NamespaceToken, holder: U
 async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate() {
     let (runtime, token, source) = fixture("keyed-memory-holder-retry").await;
     let key = "retry-operation";
-    let holder = seed_holder(&runtime, &token, key).await;
     let (_arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
     let worker_runtime = runtime.clone();
     let worker_token = token.clone();
@@ -756,10 +824,9 @@ async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate
         .await
     });
 
-    expect_checkpoint(&mut checkpoints, 0, false)
-        .await
-        .send(())
-        .expect("resume first attempt");
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    let holder = seed_holder(&runtime, &token, key).await;
+    resume.send(()).expect("resume first attempt");
     let resume = expect_checkpoint(&mut checkpoints, 0, true).await;
     remove_holder(&runtime, &token, holder).await;
     resume.send(()).expect("resume first holder lookup");
@@ -788,7 +855,6 @@ async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate
 async fn keyed_memory_disappearing_holders_exhaust_exactly_two_attempts_without_candidate_rows() {
     let (runtime, token, source) = fixture("keyed-memory-holder-exhaustion").await;
     let key = "exhaustion-operation";
-    let first_holder = seed_holder(&runtime, &token, key).await;
     let (_arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
     let worker_runtime = runtime.clone();
     let worker_token = token.clone();
@@ -801,10 +867,9 @@ async fn keyed_memory_disappearing_holders_exhaust_exactly_two_attempts_without_
         .await
     });
 
-    expect_checkpoint(&mut checkpoints, 0, false)
-        .await
-        .send(())
-        .expect("resume first attempt");
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    let first_holder = seed_holder(&runtime, &token, key).await;
+    resume.send(()).expect("resume first attempt");
     let resume = expect_checkpoint(&mut checkpoints, 0, true).await;
     remove_holder(&runtime, &token, first_holder).await;
     resume.send(()).expect("resume first holder lookup");
@@ -880,6 +945,47 @@ async fn keyed_memory_source_deleted_after_prepare_rolls_back_at_endpoint_guard(
         "endpoint failure must not retry or resolve a key"
     );
     assert_rows(&runtime, &token, 0, 0).await;
+}
+
+#[tokio::test]
+async fn keyed_memory_endpoint_guard_reconciles_winner_after_source_deletion() {
+    let (runtime, token, source) = fixture("keyed-memory-source-winner").await;
+    let key = "winner-after-prepare";
+    let content = "same concurrent keyed memory";
+    let (arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
+    let worker_runtime = runtime.clone();
+    let worker_token = token.clone();
+    let worker = tokio::spawn(async move {
+        create_keyed_memory_with_receipt(
+            &worker_runtime,
+            &worker_token,
+            spec(key, content, Some(source)),
+        )
+        .await
+    });
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    // Stop intercepting new callers while the already-paused loser stays paused.
+    drop(arm);
+    let (winner, _, replayed, winner_fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, None))
+            .await
+            .expect("concurrent winner commits");
+    assert!(!replayed);
+    assert!(runtime
+        .delete_entity(&token, source, true)
+        .await
+        .expect("delete source"));
+    resume.send(()).expect("resume prepared loser");
+    let (note, edge, replayed, fences) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
+        .await
+        .expect("worker must finish")
+        .expect("worker must not panic")
+        .expect("failed endpoint guard reconciles the winning key");
+    assert_eq!(note.id, winner.id);
+    assert!(edge.is_none());
+    assert!(replayed);
+    assert_eq!(fences, winner_fences);
+    assert_rows(&runtime, &token, 1, 0).await;
 }
 
 #[tokio::test]
@@ -1415,4 +1521,116 @@ async fn orphan_fences_are_unknown_even_with_a_legacy_or_modern_marker() {
         }
         assert_unknown_replay(&runtime, &token, &note).await;
     }
+}
+
+#[tokio::test]
+async fn keyed_memory_replay_ignores_source_and_preserves_the_original_write() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    runtime.install_kind_registry(vec!["concept".into()], vec!["memory".into()]);
+    let token = token(&runtime, "keyed-memory-source-replay");
+    let source = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "original source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("original source")
+        .id;
+    let alternate = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "alternate source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("alternate source")
+        .id;
+    runtime.register_embedder(TestEmbeddingProvider);
+    runtime
+        .vectors_for_model(&token, MODEL)
+        .expect("test vector table");
+    let key = "source-is-creation-only";
+    let content = "a keyed memory with an original source";
+    let (first, first_edge, replayed, fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, Some(source)))
+            .await
+            .expect("first create");
+    assert!(!replayed);
+    let first_edge = first_edge.expect("original annotation edge");
+    assert_rows(&runtime, &token, 1, 1).await;
+
+    for replay_source in [Some(source), Some(alternate), Some(Uuid::new_v4()), None] {
+        let (note, new_edge, replayed, replay_fences) =
+            create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, replay_source))
+                .await
+                .expect("source is ignored for an existing keyed replay");
+        assert_eq!(note.id, first.id);
+        assert!(replayed);
+        assert!(new_edge.is_none());
+        assert_eq!(replay_fences, fences);
+        assert_rows(&runtime, &token, 1, 1).await;
+        assert_eq!(
+            count(
+                &runtime,
+                "SELECT COUNT(*) FROM graph_edges WHERE id = ?1 AND source_id = ?2 \
+                 AND target_id = ?3 AND relation = 'annotates' AND deleted_at IS NULL",
+                vec![
+                    SqlValue::Text(first_edge.to_string()),
+                    SqlValue::Text(first.id.to_string()),
+                    SqlValue::Text(source.to_string()),
+                ],
+            )
+            .await,
+            1
+        );
+    }
+
+    let conflict = create_keyed_memory(
+        &runtime,
+        &token,
+        spec(key, "different content", Some(Uuid::new_v4())),
+    )
+    .await
+    .expect_err("a missing replay source cannot mask a content conflict");
+    assert_idempotency_conflict(conflict, key, first.id);
+    assert_rows(&runtime, &token, 1, 1).await;
+
+    assert!(runtime
+        .delete_entity(&token, source, true)
+        .await
+        .expect("delete source"));
+    let edge_count = count(
+        &runtime,
+        "SELECT COUNT(*) FROM graph_edges WHERE namespace = ?1",
+        vec![SqlValue::Text(token.namespace().as_str().into())],
+    )
+    .await;
+    let (note, new_edge, replayed, replay_fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, Some(source)))
+            .await
+            .expect("replay after source deletion");
+    assert_eq!(note.id, first.id);
+    assert!(replayed);
+    assert!(new_edge.is_none());
+    assert_eq!(replay_fences, fences);
+    assert_rows(&runtime, &token, 1, edge_count).await;
+
+    let error = create_keyed_memory(
+        &runtime,
+        &token,
+        spec("new-key", "new content", Some(Uuid::new_v4())),
+    )
+    .await
+    .expect_err("a new key still requires an existing source");
+    assert!(matches!(error, RuntimeError::NotFound(_)));
+    assert_rows(&runtime, &token, 1, edge_count).await;
 }

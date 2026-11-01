@@ -312,15 +312,19 @@ and message namespaces must read each scope explicitly. No fallback to `local`
 is performed.
 
 `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report of
-this process's own cumulative CPU time and RSS (via `getrusage`,
-`khive_runtime::process_resource_usage`) plus the names of any background
+this process's own cumulative CPU time, current RSS, and lifetime peak RSS plus the names of any background
 phases (e.g. `ann_warm`) currently in flight in this process
 (`khive_runtime::active_phase_names`). "This process" is, in the common case,
 the daemon itself: a client-role stdio session without an in-memory poll loop
 of its own still forwards `dispatch` calls to the daemon over its socket, so
 this handler body executes inside the daemon process, not the thin client.
-`cpu_us`/`rss_bytes` are `null` only if the underlying `getrusage` read is
-unavailable on this platform; `active_phases` is always present and empty
+`cpu_us` is cumulative microseconds from `getrusage`; `rss_bytes` is current
+resident bytes (macOS task info or Linux `/proc/self/statm`), and
+`max_rss_bytes` is the lifetime `getrusage` peak normalized to bytes. Each
+field is `null` when its reading is unavailable; a failed current RSS sample
+does not discard a successful CPU or peak reading. If `getrusage` fails, CPU
+and peak are `null`, while the independently sampled current RSS may remain
+available. These readings cover only the executing process, not its descendants; `active_phases` is always present and empty
 when nothing is in flight. Raw observations only, per the same "no computed
 healthy bool" rule as the rest of this verb — attributing severity to a given
 CPU/RSS number is the caller's judgment, not this verb's.

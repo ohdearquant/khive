@@ -516,3 +516,87 @@ existing coverage or passing results. ADR-211 §2 owns the backfill exclusion; t
 | E8  | Capacity pressure preserves ordinary writes and audit obligations while refusing maintenance that lacks a proven peak bound.         | Required `poll_retention_capacity`; §8 arm 8.                                                                          |
 | E9  | Audit failures and crash recovery preserve evidence; every insertion/edge/emitter path participates in the census.                   | Required `poll_retention_recovery_census`; §8 arm 9.                                                                   |
 | E10 | The backfill and expenditure classifiers cannot claim the same polling ID.                                                           | Required `backfill_poll_retention_disjoint`; ADR-211 §2 and this record §5.                                            |
+
+## Amendment 1 (2026-10-28) -- An interim historical prune before implementation
+
+**Status**: Proposed 2026-10-28. It needs specification approval before it binds. It does not change the status of the
+base record.
+
+**Trigger.** §7 says that until this record is implemented and its acceptance passes, nothing is deleted from either
+half under it, and that no interim hard delete is authorized (lines 349-350). On 2026-10-28 an operator-authorized
+interim run of the §4 historical classifier removed the eligible polling-dispatch audit rows from one deployment's
+events store, ahead of implementation. The operator approved that run on its reviewed plan, naming the plan's cutoff
+and digest; the approval is not a public record, and this amendment is the record's own account of the run. It records
+the tool, where the run departed from the base text, and the evidence it left. Once accepted, this amendment is the
+record's exception to §7 for the run it records and for no other run; §7 is otherwise unchanged.
+
+Evidence line numbers refer to commit `b49d4d7dba4b4b47e9b6c32ebd5f412c38ab1411`.
+
+### Decision 1 -- The interim tool and what it does not implement
+
+`kkernel db events-prune` (`crates/khive-db/src/events_prune.rs`, #6192, with the resume fix in #6252) runs
+`poll-dispatch-legacy-v1` in three phases: a read-only plan that reports counts by verb, age bucket and retention
+reason with the §4 candidate-set digest; a backup through SQLite's online backup API with an integrity check and
+per-kind row counts; and an apply pinned to the plan's cutoff and digest, which deletes in bounded transactions with a
+per-row recheck and stops on a control mismatch. It implements §4's predicate and digest. It does not implement:
+
+- §3's two-half reservations and the Expended disposition. A by-ID read of a removed event returns the same answer as
+  an ID that never existed; §3's disclosed expiration is not in place, and §8 arm 4 does not pass.
+- In-store expended-ID records. The apply writes an append-only expended-ID file outside the store (one intent line
+  and one commit line per batch, each carrying the digest), which stands in for them (`events_prune.rs:6-8`). The file
+  is kept read-only beside the backup, with its SHA-256 recorded next to it, and is permanent evidence under §4.
+- Per-ID historical assignments. The cohort is fixed by the plan's cutoff and digest instead; rows of the six keys
+  created after the cutoff, younger than seven days at the capture instant, are classified but not assigned.
+- §6's maintenance admission, capacity alarm and physical reclaim. The tool never VACUUMs and never changes
+  `auto_vacuum` (`events_prune.rs:10-12`).
+
+### Decision 2 -- The edge-writer precondition and its compensating read
+
+The tool's edge-reference check reads the edge stores on their own connections, so it cannot share a transaction with
+the delete; §3 closes that window with main-writer reservations, which the tool does not implement, so the tool
+requires that no process write edges to the named stores during the apply, a precondition stated in its header and
+not checked by the tool (`events_prune.rs:17-24`). The 2026-10-28
+run did not meet this precondition: the deployment's daemon served requests throughout. §4's writer-quiesced capture
+boundary (line 199) was not met either; rows written during the run were all younger than the cutoff and outside the
+candidate set.
+
+The compensating read: after the apply, the plan runs read-only on the backup copy, which holds the pre-apply rows,
+against the live edge stores at the same cutoff. The apply is complete only when the candidate count equals the
+backup plan's, taken before the apply, the digest equals the authorized digest, and no candidate is retained as
+edge-referenced; an edge written during the window moves its candidate to edge-referenced and lowers the count. This shows
+that no edge existing at the time of the read names a removed row. It does not cover an edge written and deleted again
+inside the window. For the 2026-10-28 run the read found 4,229,195 candidates, the authorized digest, and no
+edge-referenced retention.
+
+### Decision 3 -- Run evidence
+
+For the 2026-10-28 run:
+
+- **Classifier.** `poll-dispatch-legacy-v1`.
+- **Capture instant and cutoff.** Plan at 2026-10-28T09:26:15.687092Z; cutoff exactly 604,800 s earlier, `cutoff_us` 1792574775687092.
+  This capture is the first interim capture of the store; rows written after it were outside the candidate set. The
+  tool refuses a cutoff later than its run start minus 604,800 s (`events_prune.rs:557-560`).
+- **Candidate-set digest.** `798db37643234a224c3371a36aa377df41f6bb6af7115c7dbfe6df3b4fb6a4de`.
+- **Rows.** 6,484,537 before (read from the backup); 4,229,195 removed in 2,115 committed batches, none skipped;
+  2,255,814 after (read from the live store). The 472 rows beyond 6,484,537 minus 4,229,195 were written during the
+  run, all after the cutoff: 98 younger rows of the six keys and 374 rows of other keys. Rows created before the cutoff
+  under the retained keys are 1,657,488 on both sides.
+- **Removed per key.** `comm.probe` 1,362,010; `comm.inbox` 1,246,609; `comm.cursor_get` 620,827; `comm.heartbeat` 620,385; `comm.cleanup_expired_quarantine` 218,450; `whoami` 160,914.
+- **Retained of the six keys.** 398,395 rows younger than the cutoff; none for any other reason.
+- **Backup.** Taken before the first batch; integrity check ok; its per-kind row counts sum to the row total of the plan read from the copy.
+- **Controls.** The tool's same-run control in each of nine invocations, no mismatch; rows before the cutoff for all 206 retained (kind, verb) pairs equal before and after; `recall_executed` and `config_locked` event counts up to the cutoff equal before and after, read for one namespace (an all-kinds count timed out).
+- **Edge read.** Decision 2, clean.
+- **Write-ahead log.** One PASSIVE checkpoint after each committed batch, no other checkpoint, no VACUUM.
+- **File.** 5,181,235,200 bytes before, 5,181,272,064 after; 764,105 free pages of 1,264,959; `auto_vacuum` NONE.
+
+The main half was not pruned.
+
+### Decision 4 -- Physical reclaim stays under §6
+
+The run returned no bytes to the file system. Later writes reuse the freed pages, so the file does not grow until they
+are spent. No conversion, VACUUM or drain runs on this store under this amendment; §6 governs reclaim, and a
+deployment that reaches its configured bound first decides on measured numbers, as §7 already states.
+
+### Decision 5 -- No further interim run
+
+This amendment covers the 2026-10-28 run only; every other deletion under this record waits for §7 as written.

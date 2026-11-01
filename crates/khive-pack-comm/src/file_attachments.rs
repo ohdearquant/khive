@@ -46,11 +46,17 @@ pub(crate) async fn prepare(
             "{verb}: at most 8 attachments are permitted"
         )));
     }
-    if ["email:", "telegram:", "khive1:"]
-        .iter()
-        .any(|prefix| recipient.starts_with(prefix))
-    {
-        return Err(RuntimeError::InvalidInput(format!("{verb}: attachments require a local recipient; {recipient:?} is an outbound channel address")));
+    // Outbound-channel schemes are matched case-insensitively, the same way the send handler
+    // classifies a node address, so an upper-case scheme cannot slip past this refusal.
+    if ["email:", "telegram:", "khive1:"].iter().any(|prefix| {
+        recipient
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: attachments require a local recipient; {recipient:?} is an outbound channel address"
+        )));
     }
     // Pins note and attachment SQL to main before preparing any write.
     runtime.attachments().map_err(|error| {

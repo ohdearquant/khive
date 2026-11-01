@@ -39,6 +39,9 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
+    #[error("channel.node: {reason}")]
+    InvalidNodeConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -1421,6 +1424,11 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
+    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
+    /// config file keeps loading; its contents are not interpreted.
+    #[serde(default)]
+    pub channel: crate::node_config::ChannelSectionConfig,
+
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -1905,6 +1913,7 @@ impl KhiveConfig {
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;
         }
+        self.channel.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
