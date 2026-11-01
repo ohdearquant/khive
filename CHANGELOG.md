@@ -7,11 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task
+  bodies. `by_status` has an entry for every task status, zeros included; `open` sums the
+  non-terminal statuses and `total` sums all of them. With `tag`, the reply adds the
+  assignee's open tasks carrying exactly that tag: at most `limit` rows (default 50, 1 to
+  200) of `id`, `title`, `status`, `priority` and `updated_at`, ordered by priority and then
+  oldest update, with `truncated` true when more are open. The gtd pack now has eight
+  verbs, 161 in total.
+- `khive_storage::note::NoteTimeOrder::UpdatedAt` (`updated_at ASC, id ASC`).
+- `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` (default `false`): for a mailbox hosted by Exchange
+  Online, a message from a maintainer on the mailbox's own domain that arrives with a single
+  Exchange same-tenant `AuthAs: Internal` stamp and no authentication-results header is
+  attributed to that maintainer instead of reading as `auth-absent`. Every other message keeps its
+  existing result. Use it only for Exchange Online mailboxes.
+- A routing seam for node addresses in `comm.send`. An embedder installs a
+  `khive_pack_comm::node_route::NodeSendRoute` with `CommPack::with_node_route`; a recipient
+  written as a node address (`khive1:`, scheme matched case-insensitively) is then sealed by
+  that route and stored as a sender transport row, and two racing sends with the same
+  idempotency key replay the first result. `khive_runtime` keeps the history of confirmed
+  node public keys (`retain_confirmed_node_pins`, `NodePinKey`, `NodePinRecord`) in a new
+  `comm_node_confirmed_pin` table (migration 064); a retained key is never overwritten or
+  deleted. This release installs no route.
+- The configuration file accepts a `[channel]` section whose only key is a `[channel.node]`
+  table. The table is held as given and is not read; any other key under `[channel]` is
+  rejected.
+
+### Changed
+
+- `comm.send` to a node address (`khive1:`) is refused before anything is written when no
+  node route is installed, which is the default. Such a recipient never falls through to a
+  local mailbox, and a node address with surrounding whitespace is refused, never trimmed.
+
+### Performance
+
+- Consolidating a memory-mapped vector index no longer copies the whole mapped corpus into
+  owned memory first. Inserting into a mapped index still does.
+
+### Fixed
+
+- A keyed `memory.remember` that matches a stored memory returns the stored note even when
+  the replay names a source record that was never created or has since been deleted. A new
+  key still refuses a missing source and writes nothing.
+- Entity `search` drops a candidate that is deleted or hidden between candidate retrieval
+  and the metadata fetch, instead of returning it with null metadata. A page can therefore
+  hold fewer hits than `limit`.
+- When an MCP session starts a daemon, the bridge now passes the session's `--config` and
+  `--db` overrides to it, so the started daemon opens the store the session named.
+- Stale daemon cleanup keeps a reachable or ambiguous socket when the PID file is missing,
+  invalid or unreadable, and removes a socket or PID file only after confirming it is the
+  same file it inspected.
+- The exec pack's run-directory capture skips an entry whose name is not valid UTF-8 and
+  reports it by its escaped bytes and parent path, instead of replacing the name lossily.
+
 ### Removed
 
-- The `khive-channel-node` crate and the `channel-node` feature, with their wiring in `khive-mcp`,
-  `khive-pack-comm`, `khive-runtime` and `kkernel` and the node section of the configuration
-  reference. The hosted service builds the node client.
+- The unpublished `khive-channel-node` crate. The hosted service builds the node client;
+  this repository keeps the routing seam described under Added.
+
+### Security
+
+- Daemon lock files that are written to are opened relative to a validated parent
+  directory. Unsafe paths, such as a symlinked lock, an unsafe ancestor directory or a
+  directory another user owns, are refused, and owned lock files have their permissions
+  tightened through the opened file. An owned default lock directory is repaired to mode 0700.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` adds `channel`, the `[channel]` section. Direct struct literals
+  must set it or use `Default`.
+- `khive_channel_email::EmailChannelConfig` adds `trust_exchange_internal`. Direct struct
+  literals must set it.
+- New enum variants: `khive_runtime::ConfigError::InvalidNodeConfig` and
+  `khive_storage::note::NoteTimeOrder::UpdatedAt`. Neither enum is `#[non_exhaustive]`, so
+  downstream exhaustive matches must handle them.
 
 ## [0.15.0] - 2026-10-31
 
