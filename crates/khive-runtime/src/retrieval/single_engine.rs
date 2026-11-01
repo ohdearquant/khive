@@ -20,34 +20,42 @@ impl KhiveRuntime {
     ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
         khive_storage::await_request_read_phase("hybrid_search.vector", async {
             let mut vector_error: Option<String> = None;
-            let mut vector_hits =
-                if query_vector.is_some() || !self.default_embedder_name().is_empty() {
-                    crate::search_audit::record(crate::search_audit::SearchArm::Vector);
-                    match self
-                        .vector_search(
-                            token,
-                            query_vector,
-                            Some(query_text),
-                            candidates,
-                            Some(SubstrateKind::Entity),
-                        )
-                        .await
-                    {
-                        Ok(hits) => hits,
-                        Err(e) if tolerate_vector_error => {
-                            vector_error = Some(e.to_string());
-                            Vec::new()
-                        }
-                        Err(e) => return Err(e),
+            let run_vector = query_vector.is_some() || !self.default_embedder_name().is_empty();
+            let mut profile = if run_vector {
+                super::search_profile::span(super::search_profile::Stage::Vector)
+            } else {
+                None
+            };
+            let mut vector_hits = if run_vector {
+                crate::search_audit::record(crate::search_audit::SearchArm::Vector);
+                match self
+                    .vector_search(
+                        token,
+                        query_vector,
+                        Some(query_text),
+                        candidates,
+                        Some(SubstrateKind::Entity),
+                    )
+                    .await
+                {
+                    Ok(hits) => hits,
+                    Err(e) if tolerate_vector_error => {
+                        vector_error = Some(e.to_string());
+                        Vec::new()
                     }
-                } else {
-                    Vec::new()
-                };
+                    Err(e) => return Err(e),
+                }
+            } else {
+                Vec::new()
+            };
             if let Some(cosine_floor) = vector_similarity_floor {
                 // Vector store scores use canonical cosine similarity (`1 - distance`),
                 // so the caller's raw-cosine floor is already on the comparison scale.
                 let score_floor = DeterministicScore::from_f64(cosine_floor);
                 vector_hits.retain(|hit| hit.score >= score_floor);
+            }
+            if vector_error.is_none() {
+                super::search_profile::complete(&mut profile);
             }
             Ok((vector_hits, vector_error))
         })
@@ -68,7 +76,13 @@ impl KhiveRuntime {
         kind: Option<SubstrateKind>,
     ) -> RuntimeResult<Vec<VectorSearchHit>> {
         validate_query_input(query_embedding.as_deref(), query_text)?;
-        let engine = self.require_default_embedder()?;
+        let engine = {
+            let mut profile =
+                super::search_profile::span(super::search_profile::Stage::ModelResolution);
+            let engine = self.require_default_embedder()?;
+            super::search_profile::complete(&mut profile);
+            engine
+        };
         self.vector_search_in(token, engine, query_embedding, query_text, top_k, kind)
             .await
     }
@@ -92,28 +106,47 @@ impl KhiveRuntime {
         kind: Option<SubstrateKind>,
     ) -> RuntimeResult<Vec<VectorSearchHit>> {
         validate_query_input(query_embedding.as_deref(), query_text)?;
-        let (engine, dimensions) = self.vector_model_metadata(engine)?;
+        let (engine, dimensions) = {
+            let mut profile =
+                super::search_profile::span(super::search_profile::Stage::ModelMetadata);
+            let metadata = self.vector_model_metadata(engine)?;
+            super::search_profile::complete(&mut profile);
+            metadata
+        };
         let embedding = match query_embedding {
             Some(vector) => vector,
             None => {
+                let mut profile =
+                    super::search_profile::span(super::search_profile::Stage::Embedding);
                 let text = query_text.ok_or_else(missing_query)?;
-                self.embed_query_with_model_for_token(token, &engine, text)
-                    .await?
+                let embedding = self
+                    .embed_query_with_model_for_token(token, &engine, text)
+                    .await?;
+                super::search_profile::complete(&mut profile);
+                embedding
             }
         };
         validate_vector(&engine, dimensions, &embedding, "vec_search")?;
-        let hits = self
-            .vectors_for_model(token, &engine)?
-            .search(VectorSearchRequest {
-                query_vectors: vec![embedding],
-                top_k,
-                namespace: Some(token.namespace().as_str().to_owned()),
-                kind,
-                embedding_model: None,
-                filter: None,
-                backend_hints: entity_vector_backend_hints(kind),
-            })
-            .await;
+        let hits = {
+            let mut profile =
+                super::search_profile::span(super::search_profile::Stage::VectorStore);
+            let hits = self
+                .vectors_for_model(token, &engine)?
+                .search(VectorSearchRequest {
+                    query_vectors: vec![embedding],
+                    top_k,
+                    namespace: Some(token.namespace().as_str().to_owned()),
+                    kind,
+                    embedding_model: None,
+                    filter: None,
+                    backend_hints: entity_vector_backend_hints(kind),
+                })
+                .await;
+            if hits.is_ok() {
+                super::search_profile::complete(&mut profile);
+            }
+            hits
+        };
         crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
         hits.map_err(RuntimeError::from)
     }

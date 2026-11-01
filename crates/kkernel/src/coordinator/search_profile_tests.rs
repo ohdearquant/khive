@@ -523,6 +523,128 @@ fn stages(lines: &[serde_json::Value]) -> Vec<&str> {
         .collect()
 }
 
+// The child isolates the process-wide profiling switch and captures real stderr
+// emitted by runtime spans. Both coordinator backends use `memory_runtime()`.
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_and_coordinator_emit_correlated_search_lines() {
+    const CHILD: &str = "KHIVE_6213_CORRELATION_CHILD";
+    const COORDINATOR_PREFIX: &str = "KHIVE_6213_COORDINATOR:";
+
+    if std::env::var_os(CHILD).is_some() {
+        let mut registry = BackendRegistry::new();
+        registry.register(backend_id("main"), memory_runtime());
+        registry.register(backend_id("lore"), seeded_runtime().await);
+        let service = SubstrateCoordinatorService::new(SubstrateCoordinator::new(registry));
+        let query = request(serde_json::json!({
+            "kind": "entity", "query": "ProfileProbe", "limit": 10
+        }));
+        let (result, lines) =
+            search_profile::capture(service.fan_out_search(&query, &Namespace::local(), &[])).await;
+        assert!(
+            !result.partial,
+            "in-memory coordinated search must succeed on every backend"
+        );
+        for line in lines {
+            eprintln!("{COORDINATOR_PREFIX}{line}");
+        }
+        return;
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("runtime_and_coordinator_emit_correlated_search_lines")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env("KHIVE_SEARCH_PROFILE", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("isolated profiling child");
+    // Drain both pipes while the child runs so a full stderr pipe cannot block
+    // completion. Both reader threads are joined after the child is reaped.
+    let mut stdout_pipe = child.stdout.take().expect("child stdout");
+    let mut stderr_pipe = child.stderr.take().expect("child stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout_pipe, &mut bytes).expect("read child stdout");
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stderr_pipe, &mut bytes).expect("read child stderr");
+        bytes
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll profiling child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().expect("reap timed-out child");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let stdout_bytes = stdout_reader.join().expect("stdout reader joined");
+    let stderr_bytes = stderr_reader.join().expect("stderr reader joined");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    assert!(
+        !timed_out,
+        "profiling child timed out: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        status.success(),
+        "child failed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "running 1 test"),
+        "expected exactly one child test: {stdout}"
+    );
+
+    let coordinator: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(COORDINATOR_PREFIX))
+        .map(|line| serde_json::from_str(line).expect("coordinator JSON"))
+        .collect();
+    let call = coordinator
+        .iter()
+        .find(|line| line["s"] == "search")
+        .and_then(|line| line["c"].as_u64())
+        .filter(|id| *id > 0)
+        .expect("coordinator search line with call id");
+    assert!(
+        coordinator.iter().any(|line| {
+            line["s"] == "backend"
+                && line["b"] == "lore"
+                && line["o"] == "ok"
+                && line["n"].as_u64().is_some_and(|n| n > 0)
+        }),
+        "seeded backend must return a hit: {coordinator:?}"
+    );
+
+    let runtime: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["layer"] == "runtime")
+        .collect();
+    assert!(
+        !runtime.is_empty(),
+        "runtime must emit real stage lines: {stderr}"
+    );
+    assert!(
+        runtime
+            .iter()
+            .any(|line| line["s"] == "text" && line["outcome"] == "ok"),
+        "successful runtime text-stage witness missing: {runtime:?}"
+    );
+    assert!(
+        runtime.iter().all(|line| line["c"].as_u64() == Some(call)),
+        "runtime and coordinator call IDs differ: {runtime:?} vs {call}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn a_two_backend_search_writes_a_line_per_backend_and_per_stage_under_one_call() {

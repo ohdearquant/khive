@@ -32,7 +32,30 @@ pub use khive_retrieval::{
     HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource,
 };
 
+mod search_profile;
 mod single_engine;
+
+impl KhiveRuntime {
+    /// Current shared search-profile call, if the task is in a profile scope.
+    #[doc(hidden)]
+    pub fn search_profile_call_id() -> Option<u64> {
+        search_profile::call_id()
+    }
+
+    /// Enter one shared profiling scope, retaining a surrounding call ID.
+    #[doc(hidden)]
+    pub async fn search_profile_scope<F: std::future::Future>(on: bool, future: F) -> F::Output {
+        search_profile::scope_if(on, future).await
+    }
+
+    /// Capture the current profile call before spawning the provided future.
+    #[doc(hidden)]
+    pub fn search_profile_inherit<F: std::future::Future + Send>(
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + Send {
+        search_profile::inherit(future)
+    }
+}
 
 #[cfg(test)]
 mod request_stop_tests;
@@ -862,9 +885,10 @@ impl KhiveRuntime {
             .hybrid_vector_stage(token, query_text, query_vector, candidates, None, false)
             .await?;
         let mut per_kind = Vec::with_capacity(entity_kinds.len());
-        for &kind in entity_kinds {
-            let (hits, _vector_error) = self
-                .hybrid_search_inner(
+        for (index, &kind) in entity_kinds.iter().enumerate() {
+            let (hits, _vector_error) = search_profile::iteration(
+                index,
+                self.hybrid_search_inner(
                     token,
                     query_text,
                     None,
@@ -877,8 +901,9 @@ impl KhiveRuntime {
                     None,
                     false,
                     Some(vector_hits.clone()),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             per_kind.push(hits);
         }
         Ok(per_kind)
@@ -1017,10 +1042,11 @@ impl KhiveRuntime {
             // doesn't strip, this fails loud instead of degrading to vector-only fusion.
             let text_store = self.text(token)?;
             let text_fut = async {
+                let mut profile = search_profile::span(search_profile::Stage::Text);
                 let _phase = khive_storage::request_context::enter_search_phase(
                     khive_storage::request_context::SearchPhase::TextSearch,
                 );
-                text_store
+                let result = text_store
                     .search(TextSearchRequest {
                         query: query_text.to_string(),
                         mode: text_mode,
@@ -1040,7 +1066,11 @@ impl KhiveRuntime {
                         top_k: candidates,
                         snippet_chars: 200,
                     })
-                    .await
+                    .await;
+                if result.is_ok() {
+                    search_profile::complete(&mut profile);
+                }
+                result
             };
             let text_fut = crate::stage_seam::text_stage(text_fut);
             // The stages read nothing from each other, so they run together; a text error wins.
@@ -1081,15 +1111,19 @@ impl KhiveRuntime {
             // cap here lets stale or filtered hits hide live candidates from the other.
             let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
             let mut fused = {
+                let mut profile = search_profile::span(search_profile::Stage::Fusion);
                 let _phase = khive_storage::request_context::enter_search_phase(
                     khive_storage::request_context::SearchPhase::Fusion,
                 );
-                rrf_fuse(text_hits, vector_hits, fusion_limit, query_text)
+                let fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
+                search_profile::complete(&mut profile);
+                fused
             };
 
             // tags_any has a SQL column and is pushed into query_entities; properties
             // filtering has no SQL column and is applied in Rust below on the fetched records.
             if !fused.is_empty() {
+                let mut profile = search_profile::span(search_profile::Stage::Hydration);
                 let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
                 let _phase = khive_storage::request_context::enter_search_phase(
                     khive_storage::request_context::SearchPhase::EntityHydration,
@@ -1142,6 +1176,7 @@ impl KhiveRuntime {
                         }
                     }
                 }
+                search_profile::complete(&mut profile);
             }
 
             fused.truncate(limit as usize);
