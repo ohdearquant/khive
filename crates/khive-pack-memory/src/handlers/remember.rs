@@ -174,7 +174,11 @@ impl MemoryPack {
             None => None,
         };
 
-        // Explicit namespace wins; otherwise episodic uses actor scope and semantic uses local.
+        // Explicit namespace wins. Otherwise both memory types are written to the caller's
+        // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
+        // namespace of its own: its write stays in the token's namespace and is flagged
+        // `attribution: "unresolved"` instead of being refused.
+        let unresolved_attribution = p.namespace.is_none() && token.actor().is_anonymous();
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
         let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
         {
@@ -182,7 +186,9 @@ impl MemoryPack {
                 RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
             })?;
             Some(token.with_namespace(ns))
-        } else if memory_type == "episodic" {
+        } else if unresolved_attribution {
+            None
+        } else {
             let actor_id = token.actor().id.as_str();
             let ns = Namespace::parse(actor_id).map_err(|e| {
                 RuntimeError::InvalidInput(format!(
@@ -190,8 +196,6 @@ impl MemoryPack {
                 ))
             })?;
             Some(token.with_namespace(ns))
-        } else {
-            None
         };
         let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
 
@@ -233,6 +237,9 @@ impl MemoryPack {
             for (key, value) in extra {
                 props[key.as_str()] = value;
             }
+        }
+        if unresolved_attribution {
+            props["attribution"] = json!("unresolved");
         }
 
         let mut annotates: Vec<Uuid> = vec![];
@@ -392,6 +399,9 @@ impl MemoryPack {
         }
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if unresolved_attribution {
+            response["attribution"] = json!("unresolved");
         }
         if embedding_truncation.any_truncated() {
             response["warnings"] =

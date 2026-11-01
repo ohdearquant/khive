@@ -1594,8 +1594,12 @@ Create a memory note with salience and decay.
 | `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
 | `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
 | `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
+| `namespace`       | string | no       | Write namespace override. Default: caller's actor namespace (anonymous: `local`).                                                     |
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+Without `namespace`, both memory types are written to the caller's actor namespace. A caller with
+no actor (anonymous) writes to `local`; that memory is flagged with `attribution: "unresolved"` in
+its properties and in the response, and attributed writes carry no `attribution` key.
 
 With `idempotency_key`, a replay whose content matches the stored memory returns the original
 memory with `replayed=true`. Different content under the same key is refused with the conflict

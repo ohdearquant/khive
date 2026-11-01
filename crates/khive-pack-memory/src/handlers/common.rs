@@ -426,7 +426,9 @@ pub(super) struct RememberParams {
     pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
+    /// Exact namespace override. Without it, both memory types use the caller's actor
+    /// namespace; an anonymous caller keeps the token's namespace and the memory is
+    /// flagged `attribution: "unresolved"`.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
