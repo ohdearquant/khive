@@ -241,6 +241,7 @@ async fn interleaved_reindex(entities: bool, mutation: Mutation) {
             no_sections: false,
             sections_only: false,
             rebuild_fts: false,
+            fts_only: false,
             human: false,
         },
         no_models,
