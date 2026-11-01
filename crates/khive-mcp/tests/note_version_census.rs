@@ -793,6 +793,12 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         MarkerDisposition::UnkeyedNote,
     ),
     (
+        "khive-runtime/src/operations/quarantine_note_retention.rs",
+        "try_insert_secondary_quarantine_note",
+        "try_insert_note",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
         COMM_HEARTBEAT,
         "persist_heartbeat",
         "insert_note_if_absent",
