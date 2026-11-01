@@ -53,7 +53,7 @@ pub(crate) async fn run(_command: SupervisorCommand, _log: &str) -> Result<()> {
 
 #[cfg(unix)]
 mod unix {
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -522,7 +522,7 @@ mod unix {
             let root = tempfile::tempdir().unwrap();
             let marker = root.path().join("khived.supervisor");
             let guard = MarkerGuard::acquire(&marker).unwrap();
-            let competing_lock = OpenOptions::new()
+            let competing_lock = std::fs::OpenOptions::new()
                 .write(true)
                 .open(root.path().join("khived.supervisor.lock"))
                 .unwrap();
