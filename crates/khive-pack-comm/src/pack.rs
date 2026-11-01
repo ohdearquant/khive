@@ -10,13 +10,8 @@ use khive_runtime::{
 };
 use khive_types::{HandlerDef, NotePropertyPolicySpec, Pack, PropertyPolicy};
 
-#[cfg(feature = "node")]
-use std::sync::Arc;
-
 use crate::handlers;
 use crate::inbox_signal::InboxSignal;
-#[cfg(feature = "node")]
-use crate::node::{NodeHostState, RuntimeNodeSendRoute};
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
 /// Communication pack providing fifteen public `comm.*` verbs.
@@ -38,14 +33,9 @@ pub struct CommPack {
     /// given to it.
     channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
     email_message_id_domains: Result<Option<EmailMessageIdDomains>, String>,
-    /// Route used by `comm.send` for node-addressed recipients. Without one, a recipient in the
-    /// node address form is handled as an ordinary actor label.
+    /// Route used by `comm.send` for node-addressed recipients. Without one, a send to a recipient
+    /// in the node address form is refused before anything is written.
     node_route: Option<std::sync::Arc<dyn crate::node_route::NodeSendRoute>>,
-    /// Shared node channel state, built from the runtime configuration without I/O. `Ok(None)`
-    /// when the node channel is absent or disabled; `Err` holds the bounded validation message of
-    /// an enabled but invalid configuration, which `validate_config` refuses.
-    #[cfg(feature = "node")]
-    node_state: Result<Option<Arc<NodeHostState>>, String>,
 }
 
 impl Pack for CommPack {
@@ -124,11 +114,6 @@ impl CommPack {
     /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
         runtime.install_note_embedding_policies(<Self as Pack>::NOTE_EMBEDDING_POLICIES);
-        #[cfg(feature = "node")]
-        let node_state = Self::node_state_from_runtime(&runtime);
-        #[cfg(feature = "node")]
-        let node_route = Self::node_route_for(&node_state);
-        #[cfg(not(feature = "node"))]
         let node_route = None;
         Self {
             runtime,
@@ -137,8 +122,6 @@ impl CommPack {
             channel_ingest: std::sync::OnceLock::new(),
             email_message_id_domains: EmailMessageIdDomains::from_env(),
             node_route,
-            #[cfg(feature = "node")]
-            node_state,
         }
     }
 
@@ -194,73 +177,13 @@ impl CommPack {
         self.channel_ingest.get()
     }
 
-    /// Validate the node channel configuration without I/O. A validation failure is kept as its
-    /// bounded message (without the error-kind prefix, which `validate_config` adds back).
-    #[cfg(feature = "node")]
-    fn node_state_from_runtime(
-        runtime: &KhiveRuntime,
-    ) -> Result<Option<Arc<NodeHostState>>, String> {
-        NodeHostState::from_runtime(runtime.clone()).map_err(|error| match error {
-            RuntimeError::InvalidInput(message) => message,
-            other => other.to_string(),
-        })
-    }
-
-    /// The send route owed to this state: one only for an enabled, valid configuration. A
-    /// disabled, absent or invalid configuration installs nothing.
-    #[cfg(feature = "node")]
-    fn node_route_for(
-        state: &Result<Option<Arc<NodeHostState>>, String>,
-    ) -> Option<Arc<dyn crate::node_route::NodeSendRoute>> {
-        match state {
-            Ok(Some(host)) => Some(Arc::new(RuntimeNodeSendRoute::new(host.clone()))
-                as Arc<dyn crate::node_route::NodeSendRoute>),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// The shared node state for an enabled valid configuration; `None` for disabled, absent or
-    /// invalid. Every call returns the same `Arc`.
-    #[cfg(feature = "node")]
-    fn node_host_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        match &self.node_state {
-            Ok(Some(state)) => Some(state.clone()),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// Without the `node` feature there is no node state.
-    #[cfg(not(feature = "node"))]
+    /// This pack holds no shared host state.
     fn node_host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         None
     }
 
-    /// Refuse a stored node configuration error. An invalid enabled configuration is never
-    /// treated as "no route".
-    #[cfg(feature = "node")]
+    /// This pack has no configuration of its own to refuse, so every configuration is accepted.
     fn validate_node_config(&self) -> Result<(), RuntimeError> {
-        match &self.node_state {
-            Err(message) => Err(RuntimeError::InvalidInput(message.clone())),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    /// A build without the `node` feature cannot run an enabled `[channel.node]` table, so the
-    /// raw runtime configuration is refused rather than silently ignored.
-    #[cfg(not(feature = "node"))]
-    fn validate_node_config(&self) -> Result<(), RuntimeError> {
-        let enabled = self
-            .runtime
-            .config()
-            .node_channel
-            .as_ref()
-            .is_some_and(|config| config.enabled);
-        if enabled {
-            return Err(RuntimeError::InvalidInput(
-                "channel.node: enabled channel requires a build with node channel support"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }

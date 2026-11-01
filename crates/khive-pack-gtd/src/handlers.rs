@@ -459,12 +459,12 @@ pub(crate) async fn resolve_context_entity_id(
 /// Property filters that select this value must use `FilterOp::TextEqOrNonText`
 /// (not plain `Eq`) so their SQL predicate mirrors [`task_status`]'s exact
 /// `CASE` semantics for absent, JSON-null, and non-text legacy values.
-const DEFAULT_STATUS: &str = "inbox";
+pub(crate) const DEFAULT_STATUS: &str = "inbox";
 
 /// Priority projected when the `priority` property is missing or non-text.
 /// An explicit default-priority filter uses `FilterOp::TextEqOrNonText` to
 /// match that fallback; empty and unknown strings retain their stored values.
-const DEFAULT_PRIORITY: &str = "p2";
+pub(crate) const DEFAULT_PRIORITY: &str = "p2";
 
 /// Status used internally on a task. Defaults to "inbox" when missing or non-string.
 fn task_status(props: Option<&Value>) -> String {
