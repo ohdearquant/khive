@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Online, a message from a maintainer on the mailbox's own domain that arrives with a single
   Exchange same-tenant `AuthAs: Internal` stamp and no authentication-results header is
   attributed to that maintainer instead of reading as `auth-absent`. Every other message keeps its
-  existing result. Use it only for Exchange Online mailboxes.
+  existing result. Use it only for Exchange Online mailboxes: the rule relies on Exchange removing
+  organization authentication headers from mail arriving from outside the tenant and stamping its
+  own. Before enabling it, confirm on the mailbox that outside mail carrying a forged
+  `AuthAs: Internal` arrives with a different stamp or with a second copy of the field. Other mail
+  hosts may keep sender-supplied headers and must leave it off (ADR-056, Amendment 2026-11-01).
 - A routing seam for node addresses in `comm.send`. An embedder installs a
   `khive_pack_comm::node_route::NodeSendRoute` with `CommPack::with_node_route`; a recipient
   written as a node address (`khive1:`, scheme matched case-insensitively) is then sealed by
