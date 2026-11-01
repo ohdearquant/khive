@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.16.0] - 2026-11-01
 ### Added
 
 - `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task

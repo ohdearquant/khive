@@ -15,8 +15,8 @@ description = "Email (SMTP/IMAP) channel adapter for khive (ADR-056)"
 bench = false
 
 [dependencies]
-khive-types = { version = "0.15.0", path = "../khive-types" }
-khive-channel = { version = "0.15.0", path = "../khive-channel" }
+khive-types = { version = "0.16.0", path = "../khive-types" }
+khive-channel = { version = "0.16.0", path = "../khive-channel" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -37,12 +37,12 @@ rand = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-pack-blob = { version = "0.15.0", path = "../khive-pack-blob" }
+khive-pack-blob = { version = "0.16.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full", "test-util"] }
-khive-pack-comm = { version = "0.15.0", path = "../khive-pack-comm" }
-khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
-khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
-khive-storage = { version = "0.15.0", path = "../khive-storage" }
+khive-pack-comm = { version = "0.16.0", path = "../khive-pack-comm" }
+khive-pack-kg = { version = "0.16.0", path = "../khive-pack-kg" }
+khive-runtime = { version = "0.16.0", path = "../khive-runtime" }
+khive-storage = { version = "0.16.0", path = "../khive-storage" }
 
 [[bench]]
 name = "email_routes"

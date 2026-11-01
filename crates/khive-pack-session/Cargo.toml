@@ -12,11 +12,11 @@ categories.workspace = true
 description = "Session verb pack - store/list/resume/export over the notes substrate"
 
 [dependencies]
-khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde", "sha2"] }
-khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
+khive-types = { version = "0.16.0", path = "../khive-types", features = ["serde", "sha2"] }
+khive-runtime = { version = "0.16.0", path = "../khive-runtime" }
 inventory = { workspace = true }
-khive-storage = { version = "0.15.0", path = "../khive-storage" }
-khive-score = { version = "0.15.0", path = "../khive-score" }
+khive-storage = { version = "0.16.0", path = "../khive-storage" }
+khive-score = { version = "0.16.0", path = "../khive-score" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,7 +27,7 @@ zstd = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-khive-fs = { version = "0.15.0", path = "../khive-fs" }
+khive-fs = { version = "0.16.0", path = "../khive-fs" }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -41,11 +41,11 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-khive-storage = { version = "0.15.0", path = "../khive-storage", features = ["test-support"] }
+khive-storage = { version = "0.16.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["full"] }
 lattice-embed = { workspace = true }
 rusqlite = { workspace = true }
-khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.16.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
 # Test-only: builds a bare `PoolConfig { write_queue_enabled: true, .. }` +
 # `SqlBridge` directly (no `KhiveRuntime`, no `KHIVE_WRITE_QUEUE` env var) for
@@ -53,4 +53,4 @@ tempfile = { workspace = true }
 # established pattern in khive-pack-brain's `fold_gate.rs` and `persist.rs`
 # (documented there: env-var mutation races other tests' `KhiveRuntime::new`
 # calls in the same binary; a literal `PoolConfig` sidesteps that).
-khive-db = { version = "0.15.0", path = "../khive-db", features = ["test-support"] }
+khive-db = { version = "0.16.0", path = "../khive-db", features = ["test-support"] }
