@@ -196,6 +196,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `git.update_ref`                  | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L24)                     |
 | `gtd.assign`                      | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)                                 |
 | `gtd.census`                      | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)                                 |
+| `gtd.counts`                      | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L140)                                |
 | `gtd.complete`                    | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)                                |
 | `gtd.next`                        | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L191)                                |
 | `gtd.repair`                      | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs)                                     |

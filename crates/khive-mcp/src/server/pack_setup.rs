@@ -138,11 +138,7 @@ impl KhiveMcpServer {
             #[cfg(unix)]
             bridge_executable: None,
             stdio_bridge: false,
-            #[cfg(any(
-                feature = "channel-email",
-                feature = "channel-telegram",
-                feature = "channel-node"
-            ))]
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
