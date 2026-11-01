@@ -4,6 +4,7 @@
 //! timestamp census plus explicit repairs over the notes substrate.
 
 mod census;
+mod counts;
 pub(crate) mod dependency;
 pub mod handlers;
 pub mod hook;
