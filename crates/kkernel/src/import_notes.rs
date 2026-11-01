@@ -15,6 +15,10 @@
 //! data is not written; run `kkernel reindex` against the destination afterwards. The destination must already
 //! carry the current schema (`kkernel db migrate --db <path>` on a fresh file), so the daemon that later opens it
 //! finds its migrations applied.
+//!
+//! No write-epoch marker is written either, because a restore is not evidence of the original write. A restored keyed
+//! memory therefore has missing provenance: an exact replay of its key returns the unavailable receipt error with
+//! reason `receipt_epoch_unknown`, and recall is unchanged.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
