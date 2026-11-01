@@ -96,6 +96,16 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 KS = (5, 10)
 RRF_K = 60
 POOL = 50
+# Hits a budget-capped recall response must still carry for the top-k measures to be exact: the cap keeps a
+# rank-order prefix of the ranked list, so the first max(KS) ranks are unchanged when at least that many survive.
+SCORED_DEPTH = max(KS)
+# Budget config sent with every memory.recall op this runner builds (see recall_op). memory.recall ranks, cuts the
+# list to top_k, then keeps the rank-order prefix whose content, counted in bytes, fits default_token_budget x
+# chars_per_token (defaults 4000 x 4) and stamps every kept hit truncated. The pack clamps a requested budget to its cap of 16000 tokens (apply_dos_caps in
+# crates/khive-pack-memory/src/scoring.rs, enforced in handlers/recall.rs), so this asks for the largest budget the
+# pack allows. A request config replaces the served recall config wholesale and serde defaults fill every field it
+# omits; those defaults equal what this runner serves because the config it writes has no memory section.
+RECALL_CONFIG = {"scoring": {"default_token_budget": 16000}}
 BENCH_ACTOR = "bench:unbound"
 RECALL_ARMS = {
     "recall_rrf": {"fusion_strategy": "rrf"},
@@ -268,23 +278,38 @@ def op(verb: str, **args) -> str:
     return f"{verb}(" + ", ".join(f"{k}={json.dumps(v)}" for k, v in args.items() if v is not None) + ")"
 
 
-def hit_list(result, what: str) -> list[dict]:
-    """The hit list of a recall or search result: a bare array, or an envelope with a results array. A degraded or
-    budget-truncated response is refused, never scored."""
+def recall_op(**args) -> str:
+    """A memory.recall op carrying the runner's budget config. Every recall the runner sends is built here."""
+    return op("memory.recall", config=RECALL_CONFIG, **args)
+
+
+def hit_list(result, what: str, depth: int | None = None) -> list[dict]:
+    """The hit list of a recall or search result: a bare array, or an envelope with a results array. A degraded
+    response is always refused, and so is an envelope carrying any flag (that includes the capped-empty envelope,
+    which has no hit to score). A hit stamped truncated comes from a budget-capped response, which keeps a
+    rank-order prefix of the ranked list: it is accepted only when the caller passes a scored depth and at least that
+    many hits came back, so ranks 1..depth are exact. Without a depth any capped hit is refused."""
+    def refuse(flag: str, value, returned: int):
+        needed = "none given, a capped hit is not accepted" if depth is None else str(depth)
+        raise BankError(f"{what}: {flag}={value!r}; {returned} hit(s) returned, scored depth required: {needed}; "
+                        "not scored")
+
     if isinstance(result, list):
         hits = result
     elif isinstance(result, dict) and isinstance(result.get("results"), list):
         for flag in ("degraded", "truncated", "budget_capped", "truncated_for_budget"):
             if result.get(flag):
-                raise BankError(f"{what}: response carries {flag}={result.get(flag)!r}; not scored")
+                refuse(flag, result.get(flag), len(result["results"]))
         hits = result["results"]
     else:
         raise BankError(f"{what}: unexpected response shape {type(result).__name__}")
     for h in hits:
         if not isinstance(h, dict):
             raise BankError(f"{what}: a hit is not an object")
-        if h.get("degraded") or h.get("truncated"):
-            raise BankError(f"{what}: a hit carries degraded/truncated ({h.get('degraded')!r}); not scored")
+        if h.get("degraded"):
+            refuse("degraded", h.get("degraded"), len(hits))
+        if h.get("truncated") and (depth is None or len(hits) < depth):
+            refuse("truncated", h.get("truncated"), len(hits))
     return hits
 
 
@@ -481,16 +506,20 @@ def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
     else:
         (kdir / "vol-locks").mkdir(parents=True)
         manifest, sources = [], ((args.store_main, "khive.db"), (args.store_events, "khive.db.events.db"))
+    # Every source is checked before any is copied, so a refusal on a later source leaves no copy of an earlier one.
+    plan = []
     for src, name in sources:
         src = Path(src).resolve()
         if under(src, live):
             raise BankError(f"refusing {src}: it is under the caller's live store directory {live}")
         wal = Path(str(src) + "-wal")
-        dest = kdir / name
-        if wal.exists() and wal.stat().st_size > 0:
-            if not args.copy_wal:
-                raise BankError(f"refusing {src}: its WAL is not empty; stage a checkpointed copy, or pass --copy-wal "
-                                "when no process writes the source")
+        has_wal = wal.exists() and wal.stat().st_size > 0
+        if has_wal and not args.copy_wal:
+            raise BankError(f"refusing {src}: its WAL is not empty; stage a checkpointed copy, or pass --copy-wal "
+                            "when no process writes the source")
+        plan.append((src, wal, has_wal, name, kdir / name))
+    for src, wal, has_wal, name, dest in plan:
+        if has_wal:
             mtime = copy_at_rest(wal, Path(str(dest) + "-wal"))
             manifest.append({"source": str(wal), "staged_as": name + "-wal", "bytes": wal.stat().st_size,
                              "source_mtime_ns": mtime, "sha256": sha256_file(Path(str(dest) + "-wal"))})
@@ -539,9 +568,11 @@ def finish_scratch(args, scratch: Path, record: dict) -> None:
         shutil.rmtree(scratch)
 
 
-def recall(br: Bridge, query: str, before: str | None, what: str, namespace: str | None = None, **extra) -> list[dict]:
-    hits = hit_list(br.one(op("memory.recall", query=query, top_k=POOL, created_before=before,
-                              namespace=namespace, **extra)), what)
+def recall(br: Bridge, query: str, before: str | None, what: str, namespace: str | None = None,
+           depth: int | None = None, **extra) -> list[dict]:
+    """One recall of the pool. A capped response is accepted only with a depth and at least that many hits."""
+    hits = hit_list(br.one(recall_op(query=query, top_k=POOL, created_before=before,
+                                     namespace=namespace, **extra)), what, depth)
     if before:
         t = parse_instant(before)
         late = [h for h in hits if parse_instant(h.get("created_at")) >= t]
@@ -562,7 +593,7 @@ def check_served(hits: list[dict], arm: str, want_profile: str | None, what: str
 def wait_ready(br: Bridge, query: str, max_s: int) -> float:
     t0 = time.monotonic()
     while True:
-        r = br.ops([op("memory.recall", query=query, top_k=5, fusion_strategy="vector_only")])[0]
+        r = br.ops([recall_op(query=query, top_k=5, fusion_strategy="vector_only")])[0]
         if r.get("ok"):
             try:
                 hit_list(r.get("result"), "readiness")
@@ -581,7 +612,7 @@ def control(br: Bridge, control_id: str) -> dict:
         raise BankError(f"control {control_id}: no content to query with")
     out = {"control_id": control_id}
     for strategy in ("vector_only", "keyword_only"):
-        ids = [hit_id(h, "control") for h in hit_list(br.one(op("memory.recall", query=content[:400], top_k=5,
+        ids = [hit_id(h, "control") for h in hit_list(br.one(recall_op(query=content[:400], top_k=5,
                                                                    fusion_strategy=strategy)), "control")]
         if control_id not in ids:
             raise BankError(f"control {control_id} is not in the top 5 of its own content under {strategy} "
@@ -742,7 +773,7 @@ def cmd_run(args) -> int:
     out = Path(args.out)
     scratch = scratch_dir(args, run_id)
     out.mkdir(parents=True, exist_ok=False)
-    summary = {"status": "incomplete", "banks": [], "profiles": args.profile,
+    summary = {"status": "incomplete", "recall_config": RECALL_CONFIG, "banks": [], "profiles": args.profile,
                "visible_namespaces": args.visible_namespaces, "results": {}}
     try:
         loaded, br, base, setup = start(args, run_id, scratch)
@@ -790,15 +821,18 @@ def run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id) -> None
             for c in ordered:
                 what = f"{arm} {c['case_id']}"
                 if arm in RECALL_ARMS:
-                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), **RECALL_ARMS[arm])
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), depth=SCORED_DEPTH,
+                                  **RECALL_ARMS[arm])
                     check_served(hits, arm, None, what)
                     ranked = [hit_id(h, what) for h in hits]
                 elif arm == "profile_on":
-                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=serving_profile)
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=serving_profile,
+                                  depth=SCORED_DEPTH)
                     check_served(hits, arm, serving_profile, what)
                     ranked = [hit_id(h, what) for h in hits]
                 elif arm == "feedback_fresh":
-                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=fresh)
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=fresh,
+                                  depth=SCORED_DEPTH)
                     check_served(hits, arm, fresh, what)
                     ranked = [hit_id(h, what) for h in hits]
                 elif arm == "feedback_asof":
@@ -809,7 +843,8 @@ def run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id) -> None
                         for s, n in got["refused_by_signal"].items():
                             replay_counts["refused_by_signal"][s] = replay_counts["refused_by_signal"].get(s, 0) + n
                         fed_until = c["T"]
-                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=asof)
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=asof,
+                                  depth=SCORED_DEPTH)
                     check_served(hits, arm, asof, what)
                     ranked = [hit_id(h, what) for h in hits]
                     extra = {"feedback_replayed_so_far": replay_counts["replayed"]}
@@ -834,7 +869,8 @@ def run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id) -> None
                                fresh if arm == "feedback_fresh" else asof if arm == "feedback_asof" else None)
                 rows.append({"query_id": c["case_id"], "arm": arm, "profile": row_profile,
                              "namespace": case_namespace(c), **base, **measures(ranked, c["needed_info"]),
-                             "returned": len(ranked), "top10": ranked[:10], **extra})
+                             "returned": len(ranked), "capped": any(h.get("truncated") for h in hits),
+                             "top10": ranked[:10], **extra})
             stem = f"profile_on.{serving_profile}" if arm == "profile_on" else arm
             with open(out / f"{stem}.jsonl", "w") as f:
                 for r in rows:
@@ -869,7 +905,7 @@ def calibrate_case(br, case: dict, live: str, replayed: str) -> dict:
     """One query recalled live, then by the replayed profile, then live again (A B A). The first live answer is the
     reference for both comparisons, so the A/A row and the replay row share it."""
     def recall_top10(profile):
-        return hit_list(br.one(op("memory.recall", query=case["query"], top_k=10, profile_id=profile,
+        return hit_list(br.one(recall_op(query=case["query"], top_k=10, profile_id=profile,
                                   namespace=case_namespace(case))), "calibrate")
     a = recall_top10(live)
     b = recall_top10(replayed)
@@ -884,7 +920,7 @@ def cmd_calibrate_replay(args) -> int:
     if out.exists():
         raise BankError(f"refusing to overwrite {out}")
     scratch = scratch_dir(args, run_id)
-    report = {"status": "incomplete", "visible_namespaces": args.visible_namespaces}
+    report = {"status": "incomplete", "recall_config": RECALL_CONFIG, "visible_namespaces": args.visible_namespaces}
     try:
         loaded, br, base, setup = start(args, run_id, scratch)
         meta, cases = loaded[0] if loaded else ({"bank_id": None, "version": None}, [])
@@ -952,6 +988,26 @@ def self_test() -> int:
     check("instant: a naive time is refused", refused(parse_instant, "2026-10-28T12:00:00"))
     check("hits: a degraded envelope is refused", refused(hit_list, {"results": [], "degraded": True}, "t"))
     check("hits: a degraded hit is refused", refused(hit_list, [{"id": u[0], "degraded": "ann_unavailable"}], "t"))
+    capped = [{"id": u[i], "truncated": True} for i in range(6)]
+    try:
+        got = hit_list(capped, "t", 5)
+    except BankError:
+        got = []
+    check("hits: a capped prefix with at least the depth is accepted and reported capped",
+          len(got) == 6 and any(h.get("truncated") for h in got))
+    check("hits: a capped prefix shorter than the depth is refused", refused(hit_list, capped[:4], "t", 5))
+    check("hits: a capped hit is refused when no depth is given", refused(hit_list, capped, "t"))
+    check("hits: a capped-empty envelope is refused even with a depth",
+          refused(hit_list, {"results": [], "truncated": True}, "t", 5))
+    check("hits: a degraded hit is refused even with a depth",
+          refused(hit_list, capped[:5] + [{"id": u[5], "degraded": "ann_unavailable"}], "t", 5))
+    try:
+        hit_list(capped[:4], "t", 5)
+        refusal = ""
+    except BankError as e:
+        refusal = str(e)
+    check("hits: the refusal names the flag, the hits returned and the depth required",
+          "truncated" in refusal and "4 hit(s) returned" in refusal and "depth required: 5" in refusal)
     check("hits: a hit without a full id is refused", refused(hit_id, {"id": "0000abcd"}, "t"))
     check("served: an unbound arm refuses a profile-served hit",
           refused(check_served, [{"serve_attribution": "profile", "served_by_profile_id": "p"}], "x", None, "t"))
@@ -1157,6 +1213,101 @@ def self_test() -> int:
                        'arm: feedback replayed as of T")']
               and summary["results"]["b"]["feedback_asof"].get("profile") == "bench-asof-test-b"
               and summary["results"]["a"]["feedback_asof"].get("replay", {}).get("replayed") == 0)
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        src_dir = d / "src"
+        src_dir.mkdir()
+        for sname, body in (("khive.db", b"main"), ("khive.db.events.db", b"events"),
+                            ("khive.db.events.db-wal", b"pending")):
+            (src_dir / sname).write_bytes(body)
+        (d / "engines.toml").write_text('[[engines]]\nname = "e"\n')
+        sargs = types.SimpleNamespace(staged_home=None, store_main=str(src_dir / "khive.db"),
+                                      store_events=str(src_dir / "khive.db.events.db"), copy_wal=False,
+                                      models_dir=None, engines_file=str(d / "engines.toml"),
+                                      visible_namespaces=["local"])
+        try:
+            stage(sargs, d / "refused")
+            wal_msg = ""
+        except BankError as e:
+            wal_msg = str(e)
+        check("staging: a WAL refusal on the second source leaves no copy of the first",
+              "WAL is not empty" in wal_msg and "khive.db.events.db" in wal_msg
+              and not list((d / "refused" / "home" / ".khive").glob("khive.db*")))
+        (src_dir / "khive.db.events.db-wal").unlink()
+        try:
+            _, _, staged_manifest = stage(sargs, d / "ok")
+        except BankError:
+            staged_manifest = []
+        check("staging: with no pending WAL both sources are copied in order",
+              [m["staged_as"] for m in staged_manifest] == ["khive.db", "khive.db.events.db"]
+              and (d / "ok" / "home" / ".khive" / "khive.db.events.db").is_file())
+
+    class OpBridge:
+        def __init__(self):
+            self.calls = []
+
+        def one(self, text):
+            self.calls.append(text)
+            if text.startswith("get("):
+                return {"content": "c"}
+            if text.startswith("brain.create_profile"):
+                return {}
+            served = re.search(r'profile_id="([^"]+)"', text)
+            return [{"id": u[0], "full_id": u[0], "created_at": "2026-01-01T00:00:00Z", "rank_score": 1.0,
+                     "serve_attribution": "profile" if served else "unspecified",
+                     **({"served_by_profile_id": served.group(1)} if served else {})}]
+
+        def ops(self, texts):
+            self.calls.extend(texts)
+            return [{"ok": True, "result": [{"id": u[0]}]} for _ in texts]
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        ob = OpBridge()
+        oargs = types.SimpleNamespace(profile=["p1"], feedback_actors="", feedback_since="2025-01-01T00:00:00Z")
+        ocases = [{"case_id": "q1", "query": "q", "T": "2026-10-28T12:00:00Z", "needed_info": ni}]
+        run_arms(oargs, list(ARMS), "test", ocases, ob, d / "a", {"results": {"a": {}}},
+                 {"bank_id": "a", "bank_version": 1, "population": 1}, "a")
+        wait_ready(ob, "q", 1)
+        control(ob, u[0])
+        calibrate_case(ob, {"case_id": "q1", "query": "q"}, "live-p", "twin-p")
+        recall_ops = [c for c in ob.calls if c.startswith("memory.recall(")]
+        check("recall ops: every memory.recall op the runner builds carries the budget config",
+              len(recall_ops) == 14 and all("config=" + json.dumps(RECALL_CONFIG) in c for c in recall_ops))
+
+    class CappedBridge:
+        def __init__(self, n, truncated):
+            self.n, self.truncated = n, truncated
+
+        def one(self, text):
+            ids = [f"{i + 1:08x}-0000-4000-8000-000000000000" for i in range(self.n)]
+            return [{"id": i, "full_id": i, "created_at": "2026-01-01T00:00:00Z", "serve_attribution": "unspecified",
+                     **({"truncated": True} if self.truncated else {})} for i in ids]
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+
+        def scored_row(arm, n, truncated):
+            out = d / f"{arm}-{n}-{truncated}"
+            cargs = types.SimpleNamespace(profile=["p1"], feedback_actors="", feedback_since="2025-01-01T00:00:00Z")
+            ccases = [{"case_id": "q1", "query": "q", "T": "2026-10-28T12:00:00Z", "needed_info": ni}]
+            try:
+                run_arms(cargs, [arm], "test", ccases, CappedBridge(n, truncated), out, {"results": {"a": {}}},
+                         {"bank_id": "a", "bank_version": 1, "population": 1}, "a")
+            except BankError:
+                return None
+            return json.loads((out / f"{arm}.jsonl").read_text().splitlines()[0])
+
+        capped_row = scored_row("profile_off", SCORED_DEPTH, True)
+        plain_row = scored_row("profile_off", SCORED_DEPTH, False)
+        check("capped: a scored row from a capped response carries capped true, a plain one false",
+              capped_row is not None and capped_row["capped"] is True
+              and plain_row is not None and plain_row["capped"] is False)
+        check("capped: a prefix shorter than the scored depth is refused by the runner",
+              scored_row("profile_off", SCORED_DEPTH - 1, True) is None)
+        check("composed: a capped response is refused by the runner, an uncapped one is scored",
+              scored_row("composed", SCORED_DEPTH, True) is None
+              and scored_row("composed", SCORED_DEPTH, False) is not None)
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "cases.jsonl").write_text(json.dumps({"case_id": "c1", "query": "q", "T": "2026-10-28T12:00:00Z",
