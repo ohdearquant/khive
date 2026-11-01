@@ -55,7 +55,7 @@ pub(crate) async fn run(_command: SupervisorCommand, _log: &str) -> Result<()> {
 mod unix {
     use std::fs::{self, File, OpenOptions};
     use std::io::Write;
-    use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -110,14 +110,9 @@ mod unix {
             }
             let mut lock_path = path.as_os_str().to_os_string();
             lock_path.push(".lock");
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(PathBuf::from(lock_path))
-                .context("open supervisor marker ownership lock")?;
+            let lock =
+                khive_runtime::daemon::open_mutating_daemon_lock(&PathBuf::from(lock_path), true)
+                    .context("open supervisor marker ownership lock")?;
             lock.lock().context("lock supervisor marker ownership")?;
             Ok(Self {
                 path: path.to_path_buf(),
@@ -399,6 +394,69 @@ mod unix {
         use super::*;
 
         const CLAIM: &str = "00000000-0000-4000-8000-000000000001";
+
+        fn marker_test_dir() -> tempfile::TempDir {
+            let root = tempfile::Builder::new()
+                .prefix("khive-supervisor-marker-")
+                .tempdir_in("/tmp")
+                .expect("create marker test directory");
+            khive_runtime::daemon::open_mutating_daemon_lock(
+                &root.path().join("baseline.lock"),
+                true,
+            )
+            .expect("marker test directory must have trusted ancestry");
+            root
+        }
+
+        #[test]
+        fn ownership_lock_refuses_symlink_without_changing_target() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let target = root.path().join("target");
+            fs::write(&target, b"unchanged").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            symlink(&target, root.path().join("khived.supervisor.lock")).unwrap();
+
+            assert!(MarkerGuard::acquire(&marker).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o644
+            );
+        }
+
+        #[test]
+        fn ownership_lock_tightens_permissions_without_replacing_inode() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let lock = root.path().join("khived.supervisor.lock");
+            fs::write(&lock, b"lock").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+            let inode = fs::metadata(&lock).unwrap().ino();
+
+            let _guard = MarkerGuard::acquire(&marker).unwrap();
+            let metadata = fs::metadata(&lock).unwrap();
+            assert_eq!(metadata.ino(), inode);
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        }
+
+        #[test]
+        fn ownership_lock_creation_uses_private_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let _guard = MarkerGuard::acquire(&marker).unwrap();
+            let lock = marker.parent().unwrap().join("khived.supervisor.lock");
+            assert_eq!(
+                fs::metadata(lock).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+        }
 
         #[test]
         fn marker_has_four_lines_and_same_label_can_restart() {
