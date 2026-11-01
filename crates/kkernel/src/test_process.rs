@@ -32,7 +32,13 @@ fn run_in_child_with_stack(stack_bytes: Option<usize>) -> bool {
             .env_remove("LATTICE_MODEL_CACHE")
             .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
-            .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"));
+            .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"))
+            .env(
+                "KHIVE_RECOVERER_LOCK",
+                root.path().join("khived.recoverer.lock"),
+            )
+            .env("KHIVE_PID", root.path().join("khived.pid"))
+            .env("KHIVE_SOCKET", root.path().join("khived.sock"));
         if let Some(stack_bytes) = stack_bytes {
             command.env("RUST_MIN_STACK", stack_bytes.to_string());
         }
@@ -112,6 +118,39 @@ mod tests {
         );
         let _guard = khive_runtime::daemon::acquire_recovery_lock().expect("private recovery lock");
         assert!(lock.is_file(), "recovery lock must use the fixture path");
+        assert!(
+            std::fs::read_dir(&home).unwrap().next().is_none(),
+            "acquiring the private lock must not create default HOME paths"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rendezvous_paths_share_the_private_fixture() {
+        if super::run_in_child() {
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = home.parent().unwrap();
+        for key in [
+            "KHIVE_LOCK",
+            "KHIVE_RECOVERER_LOCK",
+            "KHIVE_PID",
+            "KHIVE_SOCKET",
+        ] {
+            let path = std::path::PathBuf::from(std::env::var_os(key).expect("private path"));
+            assert_eq!(
+                path.parent(),
+                Some(root),
+                "{key} must use the private fixture"
+            );
+            assert!(!path.starts_with(&home), "{key} must stay outside HOME");
+        }
+        let marker = khive_runtime::daemon::supervisor_marker_path();
+        assert_eq!(marker.parent(), Some(root));
+        assert!(!marker.starts_with(&home));
+        let _guard = khive_runtime::daemon::acquire_recovery_lock().expect("private recovery lock");
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
     }
 
     #[test]

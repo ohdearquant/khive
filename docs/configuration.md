@@ -527,6 +527,15 @@ cover yet.
 
 ---
 
+## `[channel.node]` — accepted and not interpreted
+
+The node channel is not part of this release. A `[channel.node]` table left in
+an existing configuration file still loads and is accepted as it stands: its
+contents are not read or checked, and it changes nothing about how the daemon
+runs. Any other key under `[channel]` is still rejected when the file loads.
+
+---
+
 ## References
 
 - [docs/khive-config-example.toml](khive-config-example.toml): full annotated

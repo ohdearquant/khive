@@ -574,6 +574,7 @@ impl VerbRegistry {
         ("comm", "comm.probe"),
         // gtd
         ("gtd", "gtd.census"),
+        ("gtd", "gtd.counts"),
         ("gtd", "gtd.next"),
         ("gtd", "gtd.tasks"),
         // kg

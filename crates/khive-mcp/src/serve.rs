@@ -209,7 +209,7 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(args, &server)?;
+    let prepared_background = prepare_host_background_tasks(args, &server).await?;
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(

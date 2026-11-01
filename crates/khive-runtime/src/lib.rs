@@ -34,6 +34,7 @@ pub mod config_ledger;
 pub mod context;
 pub mod cost_unit;
 pub mod credentials;
+pub mod node_pins;
 mod visibility_receipts;
 pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
@@ -68,6 +69,9 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
+pub mod node_config;
+#[cfg(test)]
+mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;

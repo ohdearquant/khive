@@ -601,7 +601,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.keyed_message",
-        site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair_with_attachments",
+        site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair_with_extra_statements",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -614,7 +614,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.note_create",
-        site: "khive-runtime/src/note_create.rs::prepare_note_create",
+        site: "khive-runtime/src/note_create.rs::prepare_note_create_classified",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,

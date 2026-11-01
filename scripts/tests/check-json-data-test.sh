@@ -214,4 +214,140 @@ R=$(fresh_repo c25)
 big_json "$R" apps/web/package-lock.json 300; git -C "$R" add apps/web/package-lock.json
 [ "$(run_guard "$R")" = 0 ] && pass || fail "apps/web/package-lock.json was refused"
 
+# --- merge commits --------------------------------------------------------------
+# A merge commit stages every path the merged-in branch changed. The guard admits a
+# staged path only when its blob is the blob a merge head carries AND that head is
+# already part of the remote default branch. Each case builds a scratch repository
+# with a bare "origin" whose default branch (main) is set. Case 26 and case 30 share
+# their construction, so 26 is the control that makes 30 attributable to origin/HEAD
+# being unset.
+
+# mg <repo> <git args...>: git with a fixed identity and no hooks of its own.
+mg() {
+  local r="$1"; shift
+  git -C "$r" -c user.name=fixture -c user.email=fixture@example.invalid \
+    -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"
+}
+
+# merge_fixture <name>: a repository with a bare origin whose default branch is set,
+# one base commit on main, and a feature branch checked out at that commit.
+merge_fixture() {
+  local r o
+  r=$(fresh_repo "$1")
+  o="$WORK/$1-origin.git"
+  rm -rf "$o"
+  git init -q --bare "$o"
+  git -C "$o" symbolic-ref HEAD refs/heads/main
+  mg "$r" checkout -q -b main
+  mg "$r" remote add origin "$o"
+  printf 'base\n' >"$r/base.txt"; mg "$r" add base.txt; mg "$r" commit -q -m base
+  mg "$r" push -q origin main
+  mg "$r" remote set-head origin main
+  mg "$r" checkout -q -b feature
+  printf '%s\n' "$r"
+}
+
+on_default() { mg "$1" checkout -q main; }
+# publish_default <repo> <message>: commit what is in the tree onto main, publish it, go back to feature.
+publish_default() {
+  mg "$1" add -A; mg "$1" commit -q -m "$2"; mg "$1" push -q origin main
+  mg "$1" checkout -q feature
+}
+diverge_feature() { printf 'feature\n' >"$1/feature.txt"; mg "$1" add feature.txt; mg "$1" commit -q -m feature; }
+# merge_in <repo> <heads...>: start a merge and stop before committing it.
+merge_in() { local r="$1"; shift; mg "$r" merge -q --no-commit --no-ff "$@" >/dev/null 2>&1 || true; }
+# assert_merging <repo> <paths...>: the fixture is mid-merge and each path is staged.
+assert_merging() {
+  local r="$1" p; shift
+  [ -f "$r/.git/MERGE_HEAD" ] || { echo "FIXTURE: $r is not mid-merge" >&2; exit 2; }
+  for p in "$@"; do
+    if mg "$r" --literal-pathspecs diff --cached --quiet -- "$p"; then
+      echo "FIXTURE: $p is not staged in $r" >&2; exit 2
+    fi
+  done
+}
+
+echo "--- case 26: merging the default branch admits the JSONL and the oversize JSON it carries ---"
+R=$(merge_fixture m26)
+on_default "$R"; mkdir -p "$R/data"; printf '{"a":1}\n' >"$R/data/ledger.jsonl"; big_json "$R" data/big.json 300
+publish_default "$R" "default data"; diverge_feature "$R"
+merge_in "$R" origin/main
+assert_merging "$R" data/ledger.jsonl data/big.json
+[ "$(run_guard "$R")" = 0 ] && pass || fail "data already on the default branch was refused during a merge of it"
+
+echo "--- case 27: merging a side branch that is not on the default branch is refused ---"
+R=$(merge_fixture m27)
+mg "$R" checkout -q -b side; printf '{"a":1}\n' >"$R/side.jsonl"; mg "$R" add side.jsonl; mg "$R" commit -q -m side
+mg "$R" checkout -q feature; diverge_feature "$R"
+merge_in "$R" side
+assert_merging "$R" side.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'side.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "a side branch's JSONL was admitted during a merge"
+
+echo "--- case 28: a default-branch file edited during the merge is refused ---"
+R=$(merge_fixture m28)
+on_default "$R"; mkdir -p "$R/data"; printf '{"a":1}\n' >"$R/data/ledger.jsonl"
+publish_default "$R" "default data"; diverge_feature "$R"
+merge_in "$R" origin/main
+assert_merging "$R" data/ledger.jsonl
+printf '{"a":2}\n' >"$R/data/ledger.jsonl"; mg "$R" add data/ledger.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'data/ledger.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "a file edited during the merge was admitted"
+
+echo "--- case 29: an octopus merge admits the trusted head's file and refuses the other head's ---"
+R=$(merge_fixture m29)
+mg "$R" checkout -q -b side; printf '{"a":1}\n' >"$R/side.jsonl"; mg "$R" add side.jsonl; mg "$R" commit -q -m side
+mg "$R" checkout -q feature
+on_default "$R"; mkdir -p "$R/data"; printf '{"a":1}\n' >"$R/data/ledger.jsonl"
+publish_default "$R" "default data"; diverge_feature "$R"
+merge_in "$R" origin/main side
+assert_merging "$R" data/ledger.jsonl side.jsonl
+[ "$(grep -c . "$R/.git/MERGE_HEAD")" = 2 ] || { echo "FIXTURE: not an octopus merge" >&2; exit 2; }
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'side.jsonl — JSONL/NDJSON staged' "$ERR" && ! grep -qF 'data/ledger.jsonl' "$ERR" && pass || fail "the octopus merge did not split trusted from untrusted heads"
+
+echo "--- case 30: with origin/HEAD unset the same merge as case 26 is refused (fail closed) ---"
+R=$(merge_fixture m30)
+on_default "$R"; mkdir -p "$R/data"; printf '{"a":1}\n' >"$R/data/ledger.jsonl"
+publish_default "$R" "default data"; diverge_feature "$R"
+mg "$R" remote set-head origin -d >/dev/null
+! mg "$R" symbolic-ref -q refs/remotes/origin/HEAD >/dev/null || { echo "FIXTURE: origin/HEAD is still set" >&2; exit 2; }
+merge_in "$R" origin/main
+assert_merging "$R" data/ledger.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'data/ledger.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "a merge was admitted although the default branch could not be resolved"
+
+echo "--- case 31: trusted names with a space, a leading '-' and a newline are admitted ---"
+R=$(merge_fixture m31)
+nl=$'nl\nname.jsonl'
+on_default "$R"; printf '{"a":1}\n' >"$R/-sp ace.jsonl"; printf '{"a":1}\n' >"$R/$nl"
+publish_default "$R" "default odd names"; diverge_feature "$R"
+merge_in "$R" origin/main
+assert_merging "$R" '-sp ace.jsonl' "$nl"
+[ "$(run_guard "$R")" = 0 ] && pass || fail "a trusted odd file name was refused during a merge"
+
+echo "--- case 31b: editing one of those names during the merge refuses it, by name ---"
+printf '{"a":2}\n' >"$R/-sp ace.jsonl"; mg "$R" add -- '-sp ace.jsonl'
+[ "$(run_guard "$R")" = 1 ] && grep -qF -- '-sp ace.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "an edited odd file name was admitted"
+
+echo "--- case 32: outside a merge the same blob is still refused (control: no MERGE_HEAD, no trust) ---"
+R=$(merge_fixture m32)
+on_default "$R"; printf '{"a":1}\n' >"$R/ledger.jsonl"; publish_default "$R" "default data"
+mg "$R" checkout -q origin/main -- ledger.jsonl
+[ ! -f "$R/.git/MERGE_HEAD" ] || { echo "FIXTURE: unexpectedly mid-merge" >&2; exit 2; }
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'ledger.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "a default-branch blob was admitted outside a merge"
+
+echo "--- case 33: --all is unchanged in the middle of a merge ---"
+R=$(merge_fixture m33)
+on_default "$R"; printf '{"a":1}\n' >"$R/ledger.jsonl"; publish_default "$R" "default data"; diverge_feature "$R"
+merge_in "$R" origin/main
+assert_merging "$R" ledger.jsonl
+[ "$(run_guard "$R" --all)" = 1 ] && grep -qF 'ledger.jsonl' "$ERR" && pass || fail "--all admitted a JSONL file because a merge was in progress"
+
+echo "--- case 34: a merge head that is an ancestor of the default branch (not its tip) is trusted ---"
+R=$(merge_fixture m34)
+on_default "$R"; printf '{"a":1}\n' >"$R/ledger.jsonl"; publish_default "$R" "default data"
+older=$(mg "$R" rev-parse origin/main)
+on_default "$R"; printf 'later\n' >"$R/later.txt"; publish_default "$R" "default later"
+diverge_feature "$R"
+merge_in "$R" "$older"
+assert_merging "$R" ledger.jsonl
+[ "$(run_guard "$R")" = 0 ] && pass || fail "a merge of an older default-branch commit was refused"
+
 echo "all cases passed"
