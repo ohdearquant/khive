@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Question-bank runner: score retrieval arms on a frozen bank against a staged copy of a khive store.
+"""Question-bank runner: score retrieval arms across frozen banks and profiles against one staged store copy.
 
 A bank is a directory holding bank.json and cases.jsonl. bank.json names the bank (bank_id, version) and carries the
 sha256 of cases.jsonl (cases_sha256); the runner refuses a bank whose cases file no longer matches, so a version is
@@ -9,14 +9,16 @@ frozen once written and a fix mints the next version. One case per line:
      "needed_info": [{"statement": "...", "ids": ["<full uuid>", "<full uuid>"]}],
      "pass_predicate": "...", "tags": ["..."], "provenance": "..."}
 
-`query` is the context the task had at instant T. `needed_info` lists the facts the task required; each member's ids
+`query` is the context the task had at instant T. An optional `namespace:<ns>` tag selects the recall namespace for
+that case; only the first colon is a separator. `needed_info` lists the facts the task required; each member's ids
 are one equivalence set (the same fact kept as a memory, a note and an entity counts once, whichever comes back).
 
 Measures, per case and arm, over the ranked ids the arm returns:
     hit@k       1 when some member has an id in the top k, else 0
     coverage@k  the share of members with an id in the top k
     MRR@10      the reciprocal rank of the first id belonging to any member, 0 when none is in the top 10
-for k = 5 and 10. One JSONL file per arm, keyed by query_id = case_id, so `bootstrap.py --metrics` pairs two arms.
+for k = 5 and 10. Each bank writes one JSONL file per arm, keyed by query_id = case_id, so
+`bootstrap.py --metrics` pairs two arms from the same bank.
 
 The store is never the caller's live one. The runner copies the named store files into a fresh scratch home (the
 events store beside the main one), refuses a source under the caller's ~/.khive, and refuses one with a non-empty
@@ -47,6 +49,14 @@ Arms. Every recall passes created_before = T, an exact store slice; a returned h
 The served profile is checked on every hit: the default arms must read serve_attribution "unspecified", the profile
 arms the profile they name. A mismatch stops the run, because the arm would not be the arm its name says.
 
+`run` accepts repeated `--bank` and `--profile` flags. Bank ids and profiles must be distinct. The visible namespace
+set is the sorted union of `--namespaces` and each case's optional `namespace:<ns>` tag; the union cannot be empty.
+The tag value includes every character after its first colon. One invocation stages one copy and serves every bank
+and profile. Output files are `<out>/<bank_id>/<arm>.jsonl`, except profile-on files, which are
+`<out>/<bank_id>/profile_on.<profile>.jsonl`. `run.json` records bank metadata and namespace counts, profiles, the
+visible namespace set, and metrics grouped by bank and file stem. `calibrate-replay` accepts one bank or
+`--queries-from-events` and exactly one profile.
+
 Before any case runs, a control memory (--control-id) must come back in the top 5 of its own content under both the
 vector-only and the keyword-only strategy: that proves the copy is visible to the bench actor and that the configured
 embedding model matches the store's vectors. The run waits (bounded by --ready-max-s) until the vector index answers
@@ -54,7 +64,7 @@ without a degraded flag.
 
 Subcommands:
     check-bank        validate a bank directory and print its population
-    run               score the chosen arms and write <out>/<arm>.jsonl plus <out>/run.json
+    run               score repeated banks and profiles, writing <out>/<bank_id>/<arm>.jsonl plus run.json
     calibrate-replay  replay the --profile profile's whole explicit feedback history into a fresh profile and compare
                       the two on the bank's queries (top-10 overlap, rank-score differences on shared ids). Each query
                       is recalled live, then by the replayed profile, then live again, and the two live answers are
@@ -127,6 +137,64 @@ def parse_instant(value) -> datetime.datetime:
         raise BankError(f"not an RFC 3339 instant with an offset: {value!r}") from None
 
 
+def case_namespace(case: dict) -> str | None:
+    values = [tag.split(":", 1)[1] for tag in case.get("tags", [])
+              if isinstance(tag, str) and tag.startswith("namespace:")]
+    if len(values) > 1:
+        raise BankError(f"case {case.get('case_id')}: at most one namespace:<ns> tag is allowed")
+    if values and not values[0]:
+        raise BankError(f"case {case.get('case_id')}: namespace tag value must not be empty")
+    return values[0] if values else None
+
+
+def namespace_counts(cases: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for case in cases:
+        ns = case_namespace(case)
+        if ns is not None:
+            counts[ns] = counts.get(ns, 0) + 1
+    return counts
+
+
+def visible_namespace_union(configured: str, banks: list[list[dict]]) -> list[str]:
+    values = {n for n in configured.split(",") if n}
+    for cases in banks:
+        values.update(namespace_counts(cases))
+    if not values:
+        raise BankError("the visible namespace union is empty")
+    return sorted(values)
+
+
+def safe_name(value: str, what: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise BankError(f"{what} {value!r} is not safe for a file name")
+
+
+def require_distinct(values: list[str], what: str) -> None:
+    if len(set(values)) != len(values):
+        raise BankError(f"{what} must be distinct")
+
+
+def require_profile_count(profiles: list[str], arm: str) -> None:
+    if arm == "feedback_asof" and len(profiles) != 1:
+        raise BankError("feedback_asof requires exactly one --profile")
+
+
+def require_calibration_shape(banks: list[str], from_events: bool) -> None:
+    if (bool(banks) == from_events) or (banks and len(banks) != 1):
+        raise BankError("calibrate-replay takes exactly one bank or --queries-from-events")
+
+
+def require_calibration_profiles(profiles: list[str]) -> None:
+    if len(profiles) != 1:
+        raise BankError("calibrate-replay takes exactly one --profile")
+
+
+def require_composed_namespace(namespace: str | None) -> None:
+    if namespace:
+        raise BankError("composed refuses namespaced cases because search has no read-namespace filter")
+
+
 def load_bank(bank_dir: Path) -> tuple[dict, list[dict]]:
     try:
         meta = json.loads((bank_dir / "bank.json").read_text())
@@ -134,6 +202,7 @@ def load_bank(bank_dir: Path) -> tuple[dict, list[dict]]:
         raise BankError(f"cannot read {bank_dir / 'bank.json'}: {e!r}") from None
     if not isinstance(meta, dict) or not isinstance(meta.get("bank_id"), str) or not meta["bank_id"]:
         raise BankError("bank.json lacks bank_id")
+    safe_name(meta["bank_id"], "bank_id")
     version = meta.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         raise BankError(f"bank.json version must be an integer from 1, got {version!r}")
@@ -158,6 +227,7 @@ def load_bank(bank_dir: Path) -> tuple[dict, list[dict]]:
         seen.add(cid)
         if not isinstance(c.get("query"), str) or not c["query"].strip():
             raise BankError(f"case {cid}: empty query")
+        case_namespace(c)
         parse_instant(c.get("T"))
         members = c.get("needed_info")
         if not isinstance(members, list) or not members:
@@ -434,7 +504,7 @@ def stage(args, scratch: Path) -> tuple[Path, dict, list[dict]]:
         s = line.strip()
         if s.startswith("[") and s != "[[engines]]":
             raise BankError(f"--engines-file holds only [[engines]] tables; found {s}")
-    visible = [n for n in args.namespaces.split(",") if n]
+    visible = args.visible_namespaces
     (kdir / "config.toml").write_text(
         f'[actor]\nid = "{BENCH_ACTOR}"\ndisplay_name = "{BENCH_ACTOR}"\nvisible_namespaces = {json.dumps(visible)}\n\n'
         f'{engines.strip()}\n\n[[backends]]\nname = "main"\nkind = "sqlite"\npath = "{kdir / "khive.db"}"\n')
@@ -469,8 +539,9 @@ def finish_scratch(args, scratch: Path, record: dict) -> None:
         shutil.rmtree(scratch)
 
 
-def recall(br: Bridge, query: str, before: str | None, what: str, **extra) -> list[dict]:
-    hits = hit_list(br.one(op("memory.recall", query=query, top_k=POOL, created_before=before, **extra)), what)
+def recall(br: Bridge, query: str, before: str | None, what: str, namespace: str | None = None, **extra) -> list[dict]:
+    hits = hit_list(br.one(op("memory.recall", query=query, top_k=POOL, created_before=before,
+                              namespace=namespace, **extra)), what)
     if before:
         t = parse_instant(before)
         late = [h for h in hits if parse_instant(h.get("created_at")) >= t]
@@ -608,12 +679,15 @@ def kkernel_version(kkernel: str) -> str:
 def cmd_check_bank(args) -> int:
     meta, cases = load_bank(Path(args.bank))
     print(json.dumps({"bank_id": meta["bank_id"], "version": meta["version"], "population": len(cases),
-                      "needed_info_members": sum(len(c["needed_info"]) for c in cases)}))
+                      "needed_info_members": sum(len(c["needed_info"]) for c in cases),
+                      "namespaces": namespace_counts(cases),
+                      "without_namespace": sum(case_namespace(c) is None for c in cases)}))
     return 0
 
 
 def start(args, run_id: str, scratch: Path):
-    meta, cases = load_bank(Path(args.bank)) if args.bank else ({"bank_id": None, "version": None}, [])
+    banks = [load_bank(Path(p)) for p in args.bank] if args.bank else []
+    meta, cases = banks[0] if banks else ({"bank_id": None, "version": None}, [])
     pressure = {"before_copy": require_normal_pressure("before the copy")}
     db, env, manifest = stage(args, scratch)
     pressure["before_server"] = require_normal_pressure("before the server starts")
@@ -624,13 +698,13 @@ def start(args, run_id: str, scratch: Path):
         br.handshake()
         ready_s = wait_ready(br, cases[0]["query"] if cases else "store ready probe", args.ready_max_s)
         ctl = control(br, args.control_id)
-        br.one(op("brain.profile", profile_id=args.profile))
+        for profile in args.profile:
+            br.one(op("brain.profile", profile_id=profile))
     except BaseException:
         br.close()
         raise
-    base = {"bank_id": meta["bank_id"], "bank_version": meta["version"], "population": len(cases),
-            "snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel), "run_id": run_id}
-    return meta, cases, br, base, {"ready_s": round(ready_s, 1), "control": ctl, "staged": manifest,
+    base = {"snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel), "run_id": run_id}
+    return banks, br, base, {"ready_s": round(ready_s, 1), "control": ctl, "staged": manifest,
                                    "source_mtime_skew_s": round(skew_s, 3), "memory_pressure": pressure}
 
 
@@ -638,7 +712,8 @@ def scratch_dir(args, run_id: str) -> Path:
     if os.environ.get("KHIVE_DB"):
         raise BankError("refusing to run with KHIVE_DB set in the caller's environment; unset it")
     if args.bank:
-        load_bank(Path(args.bank))
+        for bank in args.bank:
+            load_bank(Path(bank))
     if args.staged_home:
         if args.remove_scratch:
             raise BankError("--remove-scratch does not apply to --staged-home: the runner did not make that copy")
@@ -651,17 +726,42 @@ def cmd_run(args) -> int:
     unknown = sorted(set(arms) - set(ARMS))
     if unknown or not arms:
         raise BankError(f"unknown arms {unknown}; choose from {', '.join(ARMS)}")
+    banks = [load_bank(Path(p)) for p in args.bank]
+    ids = [m["bank_id"] for m, _ in banks]
+    require_distinct(ids, "bank ids")
+    require_distinct(args.profile, "profile values")
+    for p in args.profile:
+        safe_name(p, "profile")
+    require_profile_count(args.profile, "feedback_asof" if "feedback_asof" in arms else "")
+    if "composed" in arms:
+        for _, cases in banks:
+            for c in cases:
+                require_composed_namespace(case_namespace(c))
+    args.visible_namespaces = visible_namespace_union(args.namespaces, [c for _, c in banks])
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
     out = Path(args.out)
     scratch = scratch_dir(args, run_id)
     out.mkdir(parents=True, exist_ok=False)
-    summary = {"status": "incomplete", "arms": {}}
+    summary = {"status": "incomplete", "banks": [], "profiles": args.profile,
+               "visible_namespaces": args.visible_namespaces, "results": {}}
     try:
-        meta, cases, br, base, setup = start(args, run_id, scratch)
+        loaded, br, base, setup = start(args, run_id, scratch)
         summary.update(base)
         summary.update(setup)
         try:
-            run_arms(args, arms, run_id, cases, br, base, out, summary)
+            if "feedback_fresh" in arms:
+                args._fresh_profile = f"bench-fresh-{run_id}"
+                br.one(op("brain.create_profile", name=args._fresh_profile,
+                          description="question-bank arm: no feedback events"))
+            for meta, cases in loaded:
+                ns_counts = namespace_counts(cases)
+                summary["banks"].append({"bank_id": meta["bank_id"], "version": meta["version"],
+                    "cases_sha256": meta["cases_sha256"], "population": len(cases), "namespaces": ns_counts})
+                summary["results"][meta["bank_id"]] = {}
+                bank_base = {**base, "bank_id": meta["bank_id"], "bank_version": meta["version"],
+                             "population": len(cases)}
+                run_arms(args, arms, run_id, cases, br, out / meta["bank_id"], summary,
+                         bank_base, meta["bank_id"])
             summary["status"] = "complete"
         finally:
             br.close()
@@ -673,70 +773,78 @@ def cmd_run(args) -> int:
     return 0
 
 
-def run_arms(args, arms, run_id, cases, br, base, out, summary) -> None:
-    fresh = asof = None
-    if "feedback_fresh" in arms:
-        fresh = f"bench-fresh-{run_id}"
-        br.one(op("brain.create_profile", name=fresh, description="question-bank arm: no feedback events"))
+def run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    fresh = getattr(args, "_fresh_profile", None)
+    asof = None
     if "feedback_asof" in arms:
-        asof = f"bench-asof-{run_id}"
+        asof = f"bench-asof-{run_id}-{bank_id}"
         br.one(op("brain.create_profile", name=asof, description="question-bank arm: feedback replayed as of T"))
     actors = [a for a in args.feedback_actors.split(",") if a]
     for arm in arms:
-        rows, extra = [], {}
-        ordered = sorted(cases, key=lambda c: parse_instant(c["T"])) if arm == "feedback_asof" else cases
-        fed_until, replay_counts = args.feedback_since, {"replayed": 0, "refused": 0, "refused_by_signal": {}}
-        for c in ordered:
-            what = f"{arm} {c['case_id']}"
-            if arm in RECALL_ARMS:
-                hits = recall(br, c["query"], c["T"], what, **RECALL_ARMS[arm])
-                check_served(hits, arm, None, what)
-                ranked = [hit_id(h, what) for h in hits]
-            elif arm == "profile_on":
-                hits = recall(br, c["query"], c["T"], what, profile_id=args.profile)
-                check_served(hits, arm, args.profile, what)
-                ranked = [hit_id(h, what) for h in hits]
-            elif arm == "feedback_fresh":
-                hits = recall(br, c["query"], c["T"], what, profile_id=fresh)
-                check_served(hits, arm, fresh, what)
-                ranked = [hit_id(h, what) for h in hits]
-            elif arm == "feedback_asof":
-                if parse_instant(c["T"]) > parse_instant(fed_until):
-                    got = replay(br, feedback_events(br, actors, args.profile, fed_until, c["T"]), asof)
-                    for k in ("replayed", "refused"):
-                        replay_counts[k] += got[k]
-                    for s, n in got["refused_by_signal"].items():
-                        replay_counts["refused_by_signal"][s] = replay_counts["refused_by_signal"].get(s, 0) + n
-                    fed_until = c["T"]
-                hits = recall(br, c["query"], c["T"], what, profile_id=asof)
-                check_served(hits, arm, asof, what)
-                ranked = [hit_id(h, what) for h in hits]
-                extra = {"feedback_replayed_so_far": replay_counts["replayed"]}
-            else:  # composed
-                hits = recall(br, c["query"], c["T"], what, fusion_strategy="rrf")
-                check_served(hits, arm, None, what)
-                mem = [hit_id(h, what) for h in hits]
-                t, dropped, lists = parse_instant(c["T"]), 0, [mem]
-                for kind in ("note", "entity"):
-                    kept = []
-                    for h in hit_list(br.one(op("search", kind=kind, query=c["query"], limit=POOL)), what):
-                        if parse_instant(h.get("created_at")) >= t:
-                            dropped += 1
-                        else:
-                            kept.append(hit_id(h, what))
-                    lists.append(kept)
-                ranked = rrf(lists)
-                extra = {"dropped_created_at_or_after_T": dropped}
-            rows.append({"query_id": c["case_id"], "arm": arm, **base, **measures(ranked, c["needed_info"]),
-                         "returned": len(ranked), "top10": ranked[:10], **extra})
-        with open(out / f"{arm}.jsonl", "w") as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
-        n = len(rows)
-        agg = {m: round(sum(r[m] for r in rows) / n, 4) for m in ("hit@5", "hit@10", "coverage@5", "coverage@10",
-                                                                "MRR@10")}
-        summary["arms"][arm] = {"n": n, **agg, **({"replay": replay_counts} if arm == "feedback_asof" else {})}
-        print(json.dumps({"arm": arm, "n": n, **agg}), flush=True)
+        profiles = args.profile if arm == "profile_on" else [None]
+        for serving_profile in profiles:
+            rows, extra = [], {}
+            ordered = sorted(cases, key=lambda c: parse_instant(c["T"])) if arm == "feedback_asof" else cases
+            fed_until, replay_counts = args.feedback_since, {"replayed": 0, "refused": 0, "refused_by_signal": {}}
+            for c in ordered:
+                what = f"{arm} {c['case_id']}"
+                if arm in RECALL_ARMS:
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), **RECALL_ARMS[arm])
+                    check_served(hits, arm, None, what)
+                    ranked = [hit_id(h, what) for h in hits]
+                elif arm == "profile_on":
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=serving_profile)
+                    check_served(hits, arm, serving_profile, what)
+                    ranked = [hit_id(h, what) for h in hits]
+                elif arm == "feedback_fresh":
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=fresh)
+                    check_served(hits, arm, fresh, what)
+                    ranked = [hit_id(h, what) for h in hits]
+                elif arm == "feedback_asof":
+                    if parse_instant(c["T"]) > parse_instant(fed_until):
+                        got = replay(br, feedback_events(br, actors, args.profile[0], fed_until, c["T"]), asof)
+                        for k in ("replayed", "refused"):
+                            replay_counts[k] += got[k]
+                        for s, n in got["refused_by_signal"].items():
+                            replay_counts["refused_by_signal"][s] = replay_counts["refused_by_signal"].get(s, 0) + n
+                        fed_until = c["T"]
+                    hits = recall(br, c["query"], c["T"], what, namespace=case_namespace(c), profile_id=asof)
+                    check_served(hits, arm, asof, what)
+                    ranked = [hit_id(h, what) for h in hits]
+                    extra = {"feedback_replayed_so_far": replay_counts["replayed"]}
+                else:  # composed
+                    ns = case_namespace(c)
+                    require_composed_namespace(ns)
+                    hits = recall(br, c["query"], c["T"], what, namespace=ns, fusion_strategy="rrf")
+                    check_served(hits, arm, None, what)
+                    mem = [hit_id(h, what) for h in hits]
+                    t, dropped, lists = parse_instant(c["T"]), 0, [mem]
+                    for kind in ("note", "entity"):
+                        kept = []
+                        for h in hit_list(br.one(op("search", kind=kind, query=c["query"], limit=POOL)), what):
+                            if parse_instant(h.get("created_at")) >= t:
+                                dropped += 1
+                            else:
+                                kept.append(hit_id(h, what))
+                        lists.append(kept)
+                    ranked = rrf(lists)
+                    extra = {"dropped_created_at_or_after_T": dropped}
+                row_profile = (serving_profile if arm == "profile_on" else
+                               fresh if arm == "feedback_fresh" else asof if arm == "feedback_asof" else None)
+                rows.append({"query_id": c["case_id"], "arm": arm, "profile": row_profile,
+                             "namespace": case_namespace(c), **base, **measures(ranked, c["needed_info"]),
+                             "returned": len(ranked), "top10": ranked[:10], **extra})
+            stem = f"profile_on.{serving_profile}" if arm == "profile_on" else arm
+            with open(out / f"{stem}.jsonl", "w") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+            n = len(rows)
+            agg = {m: round(sum(r[m] for r in rows) / n, 4) for m in ("hit@5", "hit@10", "coverage@5", "coverage@10",
+                                                                    "MRR@10")}
+            summary["results"][bank_id][stem] = {"n": n, **agg, **({"profile": asof, "replay": replay_counts}
+                                                                if arm == "feedback_asof" else {})}
+            print(json.dumps({"bank_id": bank_id, "arm": arm, "profile": serving_profile, "n": n, **agg}), flush=True)
 
 
 def compare(x: list[dict], y: list[dict]) -> dict:
@@ -761,7 +869,8 @@ def calibrate_case(br, case: dict, live: str, replayed: str) -> dict:
     """One query recalled live, then by the replayed profile, then live again (A B A). The first live answer is the
     reference for both comparisons, so the A/A row and the replay row share it."""
     def recall_top10(profile):
-        return hit_list(br.one(op("memory.recall", query=case["query"], top_k=10, profile_id=profile)), "calibrate")
+        return hit_list(br.one(op("memory.recall", query=case["query"], top_k=10, profile_id=profile,
+                                  namespace=case_namespace(case))), "calibrate")
     a = recall_top10(live)
     b = recall_top10(replayed)
     a2 = recall_top10(live)
@@ -775,9 +884,10 @@ def cmd_calibrate_replay(args) -> int:
     if out.exists():
         raise BankError(f"refusing to overwrite {out}")
     scratch = scratch_dir(args, run_id)
-    report = {"status": "incomplete"}
+    report = {"status": "incomplete", "visible_namespaces": args.visible_namespaces}
     try:
-        meta, cases, br, base, setup = start(args, run_id, scratch)
+        loaded, br, base, setup = start(args, run_id, scratch)
+        meta, cases = loaded[0] if loaded else ({"bank_id": None, "version": None}, [])
         report.update(base)
         report.update(setup)
         try:
@@ -786,16 +896,16 @@ def cmd_calibrate_replay(args) -> int:
             now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             actors = [a for a in args.feedback_actors.split(",") if a]
             if args.queries_from_events:
-                cases, distinct = served_queries(br, actors, args.profile, args.feedback_since, now, args.n)
+                cases, distinct = served_queries(br, actors, args.profile[0], args.feedback_since, now, args.n)
                 if not cases:
-                    raise BankError(f"no recall_executed event served by {args.profile} for {actors}: nothing to compare")
-                report["query_source"] = {"kind": "recall_executed", "profile": args.profile, "actors": actors,
+                    raise BankError(f"no recall_executed event served by {args.profile[0]} for {actors}: nothing to compare")
+                report["query_source"] = {"kind": "recall_executed", "profile": args.profile[0], "actors": actors,
                                           "distinct_queries": distinct, "sampled": len(cases)}
                 report["population"] = len(cases)
-            events = feedback_events(br, actors, args.profile, args.feedback_since, now)
+            events = feedback_events(br, actors, args.profile[0], args.feedback_since, now)
             report["events_found"] = len(events)
             report.update(replay(br, events, twin))
-            rows = [calibrate_case(br, c, args.profile, twin) for c in cases[: args.n]]
+            rows = [calibrate_case(br, c, args.profile[0], twin) for c in cases[: args.n]]
             report.update({"queries": len(rows), "recall_order": "live, replayed, live", **aggregate(rows),
                            "aa": aggregate([r["aa"] for r in rows]),
                            "replayed_vs_second_live": aggregate([r["replayed_vs_second_live"] for r in rows]),
@@ -847,6 +957,24 @@ def self_test() -> int:
           refused(check_served, [{"serve_attribution": "profile", "served_by_profile_id": "p"}], "x", None, "t"))
     check("served: a profile arm refuses another profile",
           refused(check_served, [{"serve_attribution": "profile", "served_by_profile_id": "q"}], "x", "p", "t"))
+    check("namespace: absent and first-colon values", case_namespace({"case_id": "x"}) is None and
+          case_namespace({"case_id": "x", "tags": ["namespace:team:a"]}) == "team:a")
+    check("namespace: two tags refused", refused(case_namespace, {"case_id": "x", "tags": ["namespace:a", "namespace:b"]}))
+    check("namespace: empty value refused", refused(case_namespace, {"case_id": "x", "tags": ["namespace:"]}))
+    namespaced_call = op("memory.recall", query="q", namespace="team:a")
+    plain_call = op("memory.recall", query="q", namespace=None)
+    check("namespace: recall op includes only a supplied namespace", 'namespace="team:a"' in namespaced_call and "namespace=" not in plain_call)
+    check("namespace: visible union sorted, distinct, and rejects empty",
+          visible_namespace_union("z,a,z", [[{"tags": ["namespace:m"]}, {"tags": ["namespace:a"]}]]) == ["a", "m", "z"]
+          and refused(visible_namespace_union, "", [[]]))
+    check("names: repeated bank ids refused", refused(require_distinct, ["b", "b"], "bank ids"))
+    check("names: repeated profiles refused", refused(require_distinct, ["p", "p"], "profile values"))
+    check("names: path-unsafe names refused", refused(safe_name, "../bad", "profile"))
+    check("feedback_asof: multiple profiles refused", refused(require_profile_count, ["p", "q"], "feedback_asof"))
+    check("calibrate-replay: multiple banks refused", refused(require_calibration_shape, ["a", "b"], False))
+    check("calibrate-replay: multiple profiles refused", refused(require_calibration_profiles, ["p", "q"]))
+    check("composed: namespaced cases refused because search cannot filter reads",
+          refused(require_composed_namespace, "team:a") and not refused(require_composed_namespace, None))
     check("live store: a file under the live directory is refused, a sibling directory is not",
           under(Path("/h/.khive/khive.db"), Path("/h/.khive")) and not under(Path("/h/.khive-stage/khive.db"), Path("/h/.khive")))
     psi = "some avg10=0.87 avg60=0.16 avg300=0.03 total=812622984"
@@ -973,6 +1101,77 @@ def self_test() -> int:
     check("calibrate: live, replayed, live; the replay row reads the first live answer, the A/A row both live answers",
           ['profile_id="live-p"' in c for c in sb.calls] == [True, False, True] and 'profile_id="twin-p"' in sb.calls[1]
           and row["same_order"] and not row["aa"]["same_order"] and not row["replayed_vs_second_live"]["same_order"])
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        class RunBridge:
+            def __init__(self): self.calls = []
+            def one(self, text):
+                self.calls.append(text)
+                profile = next((p for p in ("p1", "p2") if f'profile_id="{p}"' in text), None)
+                return [{"id": u[0], "full_id": u[0], "created_at": "2026-01-01T00:00:00Z",
+                         "serve_attribution": "profile" if profile else "unspecified",
+                         **({"served_by_profile_id": profile} if profile else {})}]
+        rb = RunBridge()
+        args = types.SimpleNamespace(profile=["p1", "p2"], feedback_actors="", feedback_since="2025-01-01T00:00:00Z")
+        cases = [{"case_id": "q1", "query": "q", "T": "2026-10-28T12:00:00Z", "tags": ["namespace:team:a"], "needed_info": ni}]
+        summary = {"results": {"a": {}, "b": {}}}
+        for bid in ("a", "b"):
+            run_arms(args, ["profile_off", "profile_on"], "test", cases, rb, d / bid, summary,
+                     {"bank_id": bid, "bank_version": 1, "population": 1}, bid)
+        files = sorted(str(p.relative_to(d)) for p in d.rglob("*.jsonl"))
+        expected = ["a/profile_off.jsonl", "a/profile_on.p1.jsonl", "a/profile_on.p2.jsonl",
+                    "b/profile_off.jsonl", "b/profile_on.p1.jsonl", "b/profile_on.p2.jsonl"]
+        rows = [json.loads(path.read_text().splitlines()[0]) if path.exists() else {}
+                for bid in ("a", "b") for profile in ("p1", "p2")
+                for path in [d / bid / f"profile_on.{profile}.jsonl"]]
+        check("multi-bank: exact output files and profile/namespace row fields",
+              files == expected and all(r["namespace"] == "team:a" and r["profile"] == profile
+                  and r["bank_id"] == bid for r, (bid, profile) in zip(rows, [(b,p) for b in ("a","b") for p in ("p1","p2")]))
+              and all(sum(f'profile_id="{profile}"' in call for call in rb.calls) == 2 for profile in ("p1", "p2"))
+              and sum('namespace="team:a"' in call for call in rb.calls) == 6)
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+
+        class AsofBridge:
+            def __init__(self):
+                self.calls = []
+
+            def one(self, text):
+                self.calls.append(text)
+                if text.startswith("brain.create_profile"):
+                    return {}
+                served = re.search(r'profile_id="([^"]+)"', text)
+                return [{"id": u[0], "created_at": "2026-01-01T00:00:00Z", "serve_attribution": "profile",
+                         "served_by_profile_id": served.group(1) if served else None}]
+        ab = AsofBridge()
+        args = types.SimpleNamespace(profile=["p1"], feedback_actors="", feedback_since="2025-01-01T00:00:00Z")
+        cases = [{"case_id": "q1", "query": "q", "T": "2026-10-28T12:00:00Z", "needed_info": ni}]
+        summary = {"results": {"a": {}, "b": {}}}
+        for bid in ("a", "b"):
+            run_arms(args, ["feedback_asof"], "test", cases, ab, d / bid, summary,
+                     {"bank_id": bid, "bank_version": 1, "population": 1}, bid)
+        made = [c for c in ab.calls if c.startswith("brain.create_profile")]
+        check("feedback_asof: one as-of profile per bank, and its replay counts kept in the summary",
+              made == ['brain.create_profile(name="bench-asof-test-a", description="question-bank arm: feedback '
+                       'replayed as of T")', 'brain.create_profile(name="bench-asof-test-b", description="question-bank '
+                       'arm: feedback replayed as of T")']
+              and summary["results"]["b"]["feedback_asof"].get("profile") == "bench-asof-test-b"
+              and summary["results"]["a"]["feedback_asof"].get("replay", {}).get("replayed") == 0)
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "cases.jsonl").write_text(json.dumps({"case_id": "c1", "query": "q", "T": "2026-10-28T12:00:00Z",
+                                                   "tags": ["namespace:team-a"], "needed_info": ni}) + "\n")
+        (d / "bank.json").write_text(json.dumps({"bank_id": "b", "version": 1,
+                                                 "cases_sha256": sha256_file(d / "cases.jsonl")}))
+        a = types.SimpleNamespace(arms="composed", bank=[str(d)], profile=["p"], namespaces="", out=str(d / "out"))
+        try:
+            cmd_run(a)
+            early = False
+        except BankError:
+            early = True
+        except Exception:  # a refusal that comes later than the bank check reaches the incomplete args here
+            early = False
+        check("composed: a namespaced case is refused before anything is staged", early and not (d / "out").exists())
     print("SELF-TEST " + ("PASS" if not fails else f"FAIL ({len(fails)})"))
     return 1 if fails else 0
 
@@ -985,7 +1184,8 @@ def main() -> int:
     for name in ("run", "calibrate-replay"):
         p = sub.add_parser(name)
         p.add_argument("--kkernel", default="kkernel")
-        p.add_argument("--bank", required=(name == "run"))
+        p.add_argument("--bank", action="append", required=(name == "run"),
+                       help="bank directory; repeat for several banks")
         p.add_argument("--store-main", default=None, help="the staged copy's main store file")
         p.add_argument("--store-events", default=None, help="the staged copy's events store file")
         p.add_argument("--staged-home", default=None,
@@ -994,8 +1194,8 @@ def main() -> int:
         p.add_argument("--snapshot-id", required=True, help="written into every row")
         p.add_argument("--engines-file", required=True, help="the [[engines]] tables the store was embedded with")
         p.add_argument("--models-dir", default=None, help="linked as the scratch home's ~/.lattice/models")
-        p.add_argument("--namespaces", required=True, help="comma-separated namespaces the bench actor reads")
-        p.add_argument("--profile", required=True, help="the store's live profile id")
+        p.add_argument("--namespaces", default="", help="comma-separated namespaces the bench actor reads")
+        p.add_argument("--profile", action="append", required=True, help="live profile id; repeat for comparisons")
         p.add_argument("--control-id", required=True, help="a memory that must come back for its own content")
         p.add_argument("--feedback-actors", default="", help="comma-separated actors whose feedback events replay")
         p.add_argument("--feedback-since", default="2025-01-01T00:00:00Z")
@@ -1006,7 +1206,7 @@ def main() -> int:
         p.add_argument("--copy-wal", action="store_true", help="stage a non-empty WAL with its store (no writer active)")
         if name == "run":
             p.add_argument("--arms", default=",".join(ARMS))
-            p.add_argument("--out", required=True, help="a new directory: <arm>.jsonl per arm and run.json")
+            p.add_argument("--out", required=True, help="a new directory: <bank_id>/<arm>.jsonl and run.json")
         else:
             p.add_argument("--n", type=int, default=50)
             p.add_argument("--queries-from-events", action="store_true",
@@ -1021,8 +1221,17 @@ def main() -> int:
     if bool(args.staged_home) == bool(args.store_main or args.store_events) or (
             not args.staged_home and not (args.store_main and args.store_events)):
         raise BankError("take either --staged-home, or both --store-main and --store-events")
-    if args.cmd == "calibrate-replay" and bool(args.bank) == args.queries_from_events:
-        raise BankError("calibrate-replay takes exactly one of --bank and --queries-from-events")
+    if args.cmd == "calibrate-replay":
+        require_calibration_shape(args.bank, args.queries_from_events)
+        require_calibration_profiles(args.profile)
+    require_distinct(args.profile, "profile values")
+    for p in args.profile:
+        safe_name(p, "profile")
+    if args.cmd == "calibrate-replay":
+        banks = [load_bank(Path(args.bank[0]))] if args.bank else []
+        args.visible_namespaces = visible_namespace_union(args.namespaces, [c for _, c in banks])
+    elif "feedback_asof" in args.arms.split(","):
+        require_profile_count(args.profile, "feedback_asof")
     if (args.cmd == "calibrate-replay" or "feedback_asof" in args.arms.split(",")) and not args.feedback_actors:
         raise BankError("--feedback-actors is required to replay feedback events; an empty list would replay none")
     return cmd_run(args) if args.cmd == "run" else cmd_calibrate_replay(args)
