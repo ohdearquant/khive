@@ -34,8 +34,9 @@ paths = [
 
 # The node wire protocol appendix publishes an HPKE test vector, and its shared secret is an
 # intermediate derived from test seeds the appendix also publishes. It is a specification value,
-# not a credential, and the node crate's vector fixture carries the same value. Exempted by value
-# and by path, as above.
+# not a credential, and the node crate's vector fixture carried the same value until the crate left
+# this repository. The entry stays because the full-history scan still reads that fixture. Exempted
+# by value and by path, as above.
 [[rules.allowlists]]
 description = "The HPKE shared secret in the node wire protocol appendix's published test vector"
 condition = "AND"
@@ -47,9 +48,10 @@ paths = [
 ]
 
 # RFC 9180 Appendix A.2.3 publishes an auth-mode HPKE test vector for DHKEM(X25519, HKDF-SHA256)
-# with ChaCha20-Poly1305, and the node crate keeps it as a test fixture. Its shared secret is a
-# specification value derived from the seeds the RFC also publishes, not a credential. Exempted by
-# value and by path, as above.
+# with ChaCha20-Poly1305, and the node crate kept it as a test fixture until the crate left this
+# repository; the entry stays because the full-history scan still reads that fixture. Its shared
+# secret is a specification value derived from the seeds the RFC also publishes, not a credential.
+# Exempted by value and by path, as above.
 [[rules.allowlists]]
 description = "The HPKE shared secret in RFC 9180's published auth-mode X25519 test vector, a node crate test fixture"
 condition = "AND"
