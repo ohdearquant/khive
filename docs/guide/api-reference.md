@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 31    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -828,7 +828,7 @@ batch callers verify that every result is associated with the submitted root.
 
 | Param            | Type            | Required | Notes                                                                                                                                                                                        |
 | ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `node_id`        | uuid            | yes      | Node whose neighbors to return.                                                                                                                                                              |
+| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                          |
 | `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
 | `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
 | `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
@@ -838,7 +838,7 @@ batch callers verify that every result is associated with the submitted root.
 | `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
 
 ```
-request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
+request(ops="neighbors(id=\"<uuid>\", direction=\"both\")")
 ```
 
 Response shape:
@@ -884,16 +884,16 @@ Bounded multi-hop BFS traversal. Nodes are selected at their shallowest depth;
 same-depth tie order is intentionally unspecified. Limits count non-root
 first-visit nodes independently per distinct root.
 
-| Param                | Type            | Required | Notes                                                                      |
-| -------------------- | --------------- | -------- | -------------------------------------------------------------------------- |
-| `roots`              | array\<uuid\>   | yes      | Starting UUIDs; maximum 100 raw entries, then de-duplicated after resolve. |
-| `max_depth`          | integer         | no       | Default 3; maximum 10; values above 10 are rejected.                       |
-| `direction`          | string          | no       | `out`/`outgoing`, `in`/`incoming`, or `both` (default `both`).             |
-| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                                     |
-| `min_weight`         | number          | no       | Minimum edge weight, finite and within 0.0–1.0.                            |
-| `limit`              | integer         | no       | Non-root results per root; default 100, maximum 1,000.                     |
-| `include_roots`      | boolean         | no       | Include depth-0 roots (default `true`; they do not consume `limit`).       |
-| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).                 |
+| Param                | Type            | Required | Notes                                                                                                                       |
+| -------------------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `ids`                | array\<uuid\>   | yes      | Starting UUIDs; maximum 100 raw entries, then de-duplicated after resolve. `roots` and `start_ids` remain accepted aliases. |
+| `max_depth`          | integer         | no       | Default 3; maximum 10; values above 10 are rejected.                                                                        |
+| `direction`          | string          | no       | `out`/`outgoing`, `in`/`incoming`, or `both` (default `both`).                                                              |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                                                                                      |
+| `min_weight`         | number          | no       | Minimum edge weight, finite and within 0.0–1.0.                                                                             |
+| `limit`              | integer         | no       | Non-root results per root; default 100, maximum 1,000.                                                                      |
+| `include_roots`      | boolean         | no       | Include depth-0 roots (default `true`; they do not consume `limit`).                                                        |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).                                                                  |
 
 One public request shares a 100,000-adjacency-row work budget and five-second
 storage-expansion deadline across all roots and visible namespaces. Self-loops, parallel paths,
@@ -904,7 +904,7 @@ visible between frontier expansions; a single old WAL snapshot is never held for
 the full operation.
 
 ```
-request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
+request(ops="traverse(ids=[\"<uuid>\"], max_depth=2)")
 ```
 
 The response contains exactly one traversal object per distinct requested root. Each path node
@@ -1427,7 +1427,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 7 verbs
+## `gtd` pack — 8 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1544,6 +1544,26 @@ See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timesta
 request(ops="gtd.census()")
 ```
 
+### `gtd.counts` — Assertive
+
+Read-only count of one assignee's live tasks by status, without task bodies. `by_status` has an
+entry for every task status, zeros included; `open` sums the non-terminal statuses and `total`
+sums all of them. A task whose stored status is absent or not text counts as `inbox`, as
+`gtd.tasks` reads it. With `tag`, the reply adds `{name, open, rows, truncated}`: the assignee's
+open tasks carrying exactly that tag, each row only id, title, status, priority and updated_at,
+ordered by priority and then oldest update, at most `limit`; `truncated` is true exactly when
+`open` exceeds the rows returned.
+
+| Param      | Type    | Required | Notes                                                    |
+| ---------- | ------- | -------- | -------------------------------------------------------- |
+| `assignee` | string  | yes      | Exact stored assignee, as in `gtd.tasks`.                |
+| `tag`      | string  | no       | Exact tag; adds the tag block. Empty string is rejected. |
+| `limit`    | integer | no       | Tag rows, default 50, 1..=200; out of range is rejected. |
+
+```
+request(ops='gtd.counts(assignee="agent:alice", tag="sprint:12")')
+```
+
 ### `gtd.repair` — Declaration
 
 Preview explicit corrections to task `created_at`, `updated_at`, or a noncanonical text
@@ -1616,7 +1636,7 @@ Each result carries `serve_attribution` (`profile`, `unattributed`, or
 means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
 Each result also carries canonical `full_id`; pass it directly to
-`memory.feedback(target_id=...)` in a later request without an extra `get`.
+`memory.feedback(id=...)` in a later request without an extra `get`.
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
@@ -1641,13 +1661,17 @@ request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3
 
 Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
 
-| Param       | Type   | Required | Notes                                                                                                                                                                           |
-| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | uuid   | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
+| Param    | Type   | Required | Notes                                                                                                                                                                           |
+| -------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`     | uuid   | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
+| `signal` | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
+
+`target_id` remains an accepted input alias for `id`. Supplying both spellings in
+one request is rejected before feedback is applied. The acknowledgement keeps its
+canonical `target_id` response field.
 
 ```
-request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="memory.feedback(id=\"<uuid>\", signal=\"useful\")")
 ```
 
 ### `memory.prune` — Commissive
@@ -1891,9 +1915,13 @@ request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
 
 Emit a `FeedbackExplicit` event into the shared log.
 
+Use `id` for the target record. The legacy `target_id` spelling remains
+accepted; supplying both is rejected. Successful responses retain the
+`target_id` field.
+
 | Param                  | Type   | Required | Notes                                                                                                                                              |
 | ---------------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
+| `id`                   | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
 | `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                                                              |
 | `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                                                              |
 | `serve_attribution`    | string | no       | `profile`\|`unattributed`\|`unspecified`; unattributed implicit feedback is forced to zero weight, while explicit/correction feedback is rejected. |
@@ -1902,8 +1930,14 @@ Emit a `FeedbackExplicit` event into the shared log.
 | `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                                                               |
 
 ```
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<uuid>\", signal=\"useful\")")
 ```
+
+`brain.emit` is a deprecated internal subhandler for trusted Rust registry callers.
+Use canonical `id`; legacy `target_id` remains accepted, and supplying both is
+rejected. Successful responses retain `verb: "brain.feedback"` and `target_id`;
+persisted events retain the `brain.feedback` verb and
+`originating_verb: "brain.emit"`.
 
 ### `brain.auto_feedback` — Commissive
 

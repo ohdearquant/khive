@@ -32,6 +32,20 @@ mod search_ranking_tests {
                 .await)
         }
 
+        async fn fan_out_note_search_scoped_with_count(
+            &self,
+            request: &ValidatedSearchRequest,
+            token: &khive_runtime::NamespaceToken,
+            args: &Value,
+            extra_visible: &[Namespace],
+        ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+            // Only active observation rows; this ranking fixture does not test disclosure.
+            let result = self
+                .fan_out_search_scoped(request, token, args, extra_visible)
+                .await?;
+            Ok((result, 0))
+        }
+
         async fn locate(&self, _id: Uuid) -> Option<BackendId> {
             None
         }

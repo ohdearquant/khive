@@ -939,7 +939,7 @@ outside these four runtime paths do not gain automatic lifecycle events.
 
 ## Amendment 7: Recover unfinished indexes after a committed entity update (#4755)
 
-**Status**: Proposed (2026-10-18). **Source pin**: `8493167aaa4e43349372ed6519c00b6f364dde3c`.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments. **Source pin**: `8493167aaa4e43349372ed6519c00b6f364dde3c`.
 
 This amendment qualifies Context item 3, the Index consistency section, and the index-consistency consequences for the deferred entity-update route: updates whose required search indexes publish after the entity commits. Other routes retain their existing boundaries and durable-retry deferral.
 
@@ -981,3 +981,24 @@ Property-only and tag-only patches skip reindexing but advance the entity versio
 - Pre-existing stale indexes, damage after completion, orphan-index cleanup, and backfill for later models.
 - Model or input-construction revisions, entity-vector provenance attestations and reconciliation scans.
 - Redefining or retiring blocked model obligations, a lease protocol or a general job framework.
+
+## Amendment 8: Edge property updates merge at the top level (#6243)
+
+**Status**: Proposed 2026-10-28. It does not change the status of the base ADR or of earlier amendments.
+
+This amendment replaces one sentence of the stale-snapshot amendment (#1753), "Edge properties retain their documented wholesale replacement semantics", for curation updates: `update` on an edge, on the direct path and on the prepared atomic path. Archive import keeps its own rule (ADR-020: present edge `properties` replace the stored ones); its write path is separate and is not changed.
+
+### Context
+
+The kg `update` verb documents `properties` as "Properties to merge in (shallow merge)", and the section "Property unset and edge property updates" added edge properties for symmetry with entities. The edge write path instead replaced the stored metadata with the patch, so every key the patch omitted was dropped (#6243). Entity and note updates already merge.
+
+### Decision
+
+1. An edge update that carries `properties` merges the patch into the stored metadata with the rule entity and note updates use: each top-level patch key replaces the stored value at that key, a nested object at a patched key replaces the stored value rather than merging into it, keys the patch omits are kept, and an edge with no stored metadata takes the patch as given.
+2. A `null` value in the patch is stored as a literal `null` at its key. The `update` verb exposes no key removal for any record kind, and this amendment adds none for edges. The base section's sentence that a caller removes a key by passing the desired post-state object does not hold under a top-level merge; key removal through `update` stays undecided (below).
+3. The reserved secret-gate property check runs on the patch before the merge on both paths. Stored metadata passed the same check when it was written, so the merged map cannot gain the reserved key.
+4. The direct and prepared atomic paths apply the same merge helper, so their results are identical for the same stored edge and patch.
+
+### Not decided
+
+- A first-class unset of a property key, for any record kind.

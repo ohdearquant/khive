@@ -34,6 +34,7 @@ pub mod config_ledger;
 pub mod context;
 pub mod cost_unit;
 pub mod credentials;
+pub mod node_pins;
 mod visibility_receipts;
 pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
@@ -68,6 +69,9 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
+pub mod node_config;
+#[cfg(test)]
+mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -98,6 +102,7 @@ pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
 pub mod resource;
+pub mod resource_admission;
 pub mod retrieval;
 pub mod runtime;
 pub mod search_audit;
@@ -178,7 +183,10 @@ pub use error::{
     WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
-pub use error_projection::runtime_error_value;
+pub use error_projection::{
+    failure_entry_parts, failure_error_disposition, runtime_error_value, FailureEntryParts,
+    FailureEntrySource,
+};
 pub use event_actor_scope::{resolve_event_actor_read_scope, EventActorReadScope};
 pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
@@ -230,7 +238,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
-pub use params::deser_params;
+pub use params::{deser_params, integer_params_from_whole_floats};
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};

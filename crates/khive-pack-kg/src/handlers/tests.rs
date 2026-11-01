@@ -2091,7 +2091,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
 
     impl Pack for TagHookPack {
         const NAME: &'static str = "tag-update-test";
-        const NOTE_KINDS: &'static [&'static str] = &["tag-hook-note"];
+        const NOTE_KINDS: &'static [&'static str] = &["tag_hook_note"];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[];
     }
@@ -2111,7 +2111,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
             Self::HANDLERS
         }
         fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-            (kind == "tag-hook-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+            (kind == "tag_hook_note").then(|| self.0.clone() as Arc<dyn KindHook>)
         }
         async fn dispatch(
             &self,
@@ -2134,7 +2134,7 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
         let note = pack
             .handle_create(
                 &token,
-                json!({"kind": "tag-hook-note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                json!({"kind": "tag_hook_note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
                 &registry,
             )
             .await
@@ -2841,8 +2841,8 @@ async fn link_reports_replace_and_explicit_resurrection_with_edge_observations()
             && !event.payload["previous"]["deleted_at"].is_null()));
 }
 
-// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
-// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// ADR-087 Amendment 1 §A9: decision chains use `decision precedes decision`
+// note-to-note edges from each earlier decision to the next. KG_EDGE_RULES
 // additively extends the base entity-only `precedes` contract to
 // `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
 // `depends_on` rule.

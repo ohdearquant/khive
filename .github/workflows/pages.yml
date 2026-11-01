@@ -1,7 +1,7 @@
 name: pages
 
 # Builds a static docs site from docs/guide/*.md and README.md using Jekyll's
-# GitHub Pages Actions build (no bundled framework, no npm/node toolchain).
+# GitHub Pages Actions build (no bundled framework).
 #
 # Layout: remote_theme just-the-docs (GitHub-Pages-compatible via the
 # jekyll-remote-theme gem bundled in the github-pages gem group that
@@ -261,7 +261,7 @@ jobs:
             echo
             echo "> A research knowledge graph runtime for AI agents: typed entities, a closed"
             echo "> 20-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
-            echo "> all dispatched through one MCP tool (\`request\`). 160 verbs across 14 packs."
+            echo "> all dispatched through one MCP tool (\`request\`). 161 verbs across 14 packs."
             echo
             echo "## Docs"
             echo

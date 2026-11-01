@@ -875,7 +875,7 @@ impl KhiveRuntime {
         }
         if let Some(props) = patch.properties {
             crate::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
-            edge.metadata = Some(props);
+            edge.metadata = Self::merge_edge_properties(&edge.metadata, props);
         }
 
         // For symmetric relations, canonicalise endpoint order and check

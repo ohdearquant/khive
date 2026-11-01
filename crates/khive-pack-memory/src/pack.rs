@@ -177,10 +177,10 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
-                name: "target_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID of the recalled entity or memory being rated. A short-prefix resolution can miss or be ambiguous and is rejected because feedback must identify one exact recalled record.",
+                description: "Full UUID of the recalled entity or memory being rated. A short-prefix resolution can miss or be ambiguous and is rejected because feedback must identify one exact recalled record. `target_id` remains accepted as an alias for `id`.",
                 resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
@@ -609,7 +609,7 @@ impl MemoryPack {
     ) -> Result<Value, RuntimeError> {
         let budget_ms = match parse_recall_deadline_override(&params)? {
             Some(ms) => ms,
-            None => recall_deadline_ms(),
+            None => recall_deadline_ms(&self.runtime),
         };
         let start = std::time::Instant::now();
         // `handle_recall` is a large state machine: its text/vector fan-out
@@ -701,17 +701,14 @@ pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
 }
 
 /// Return the cached end-to-end recall deadline, defaulting to 30 seconds.
-pub(crate) fn recall_deadline_ms() -> u64 {
+pub(crate) fn recall_deadline_ms(runtime: &khive_runtime::KhiveRuntime) -> u64 {
     static DEADLINE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *DEADLINE_MS.get_or_init(|| {
+    let ms = *DEADLINE_MS.get_or_init(|| {
         let raw = std::env::var("KHIVE_MEMORY_RECALL_DEADLINE_MS").ok();
-        let ms = parse_recall_deadline_env(raw.as_deref());
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_MEMORY_RECALL_DEADLINE_MS",
-            ms.to_string(),
-        );
-        ms
-    })
+        parse_recall_deadline_env(raw.as_deref())
+    });
+    runtime.record_config_locked("KHIVE_MEMORY_RECALL_DEADLINE_MS", || ms.to_string());
+    ms
 }
 
 /// Warn when a nontrivial base table has less than half its rows represented in FTS.
@@ -785,7 +782,7 @@ mod receipt_custody_tests;
 #[path = "pack/read_only_warm_tests.rs"]
 mod read_only_warm_tests;
 
-// ── MAJ-1 regression test: second recall routes through warm ANN ──────────────
+// ── A second recall routes through warm ANN ─────────────────────────────────
 
 #[cfg(test)]
 #[path = "pack/ann_route_tests.rs"]

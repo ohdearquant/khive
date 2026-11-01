@@ -34,12 +34,13 @@ use crate::schema::{
 use crate::GtdPack;
 
 fn idempotency_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
+    let key = mask_for_redaction_surface(RedactionSurface::GateProbe, key);
     KhiveError::conflict(format!(
         "idempotency_key_conflict: key {key:?} already exists; stored content differs (existing task {existing_id})"
     ))
     .with_details(Details::new_owned([
         ("reason", "idempotency_key_conflict".into()),
-        ("key", key.to_owned()),
+        ("key", key.into_owned()),
         ("existing_id", existing_id.to_string()),
     ]))
     .into()
@@ -386,7 +387,8 @@ pub async fn resolve_uuid(
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -406,7 +408,8 @@ async fn resolve_lifecycle_uuid(s: &str, runtime: &KhiveRuntime) -> Result<Uuid,
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -426,7 +429,8 @@ pub(crate) async fn resolve_context_entity_id(
         RuntimeError::InvalidInput(format!(
             "context_entity_id must be a full UUID because a short prefix would require a \
              primary-namespace resolution and this field stores an explicit stable entity \
-             reference; got {raw:?}"
+             reference; got {:?}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
         ))
     })?;
 
@@ -455,12 +459,12 @@ pub(crate) async fn resolve_context_entity_id(
 /// Property filters that select this value must use `FilterOp::TextEqOrNonText`
 /// (not plain `Eq`) so their SQL predicate mirrors [`task_status`]'s exact
 /// `CASE` semantics for absent, JSON-null, and non-text legacy values.
-const DEFAULT_STATUS: &str = "inbox";
+pub(crate) const DEFAULT_STATUS: &str = "inbox";
 
 /// Priority projected when the `priority` property is missing or non-text.
 /// An explicit default-priority filter uses `FilterOp::TextEqOrNonText` to
 /// match that fallback; empty and unknown strings retain their stored values.
-const DEFAULT_PRIORITY: &str = "p2";
+pub(crate) const DEFAULT_PRIORITY: &str = "p2";
 
 /// Status used internally on a task. Defaults to "inbox" when missing or non-string.
 fn task_status(props: Option<&Value>) -> String {
@@ -672,7 +676,8 @@ async fn fetch_all_matching_tasks(
         property_filters,
         namespaces,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
     let store = runtime.notes(token)?;
 
     let notes = store
@@ -1608,7 +1613,8 @@ impl GtdPack {
             tags: p.tags.unwrap_or_default(),
             tag_mode: p.tag_mode.unwrap_or_default(),
             ..Default::default()
-        };
+        }
+        .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
         let page = self
             .runtime()
             .notes(token)?
@@ -1816,3 +1822,67 @@ impl GtdPack {
 #[cfg(test)]
 #[path = "handlers_lifecycle_snapshot_tests.rs"]
 mod lifecycle_snapshot_tests;
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tasks_and_next_preserve_workflow_filters_but_exclude_archived_notes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(GtdPack::new(runtime.clone()));
+            let registry = builder.build().expect("actual GTD schema and hooks");
+            runtime.install_edge_rules(registry.all_edge_rules());
+            let mut expected = None;
+            for (status, priority, timestamp) in [("archived", "p0", 20), ("active", "p2", 10)] {
+                let mut note =
+                    khive_storage::note::Note::new("local", "task", format!("{status} task"));
+                note.status = status.into();
+                note.created_at = timestamp;
+                note.updated_at = timestamp;
+                note.properties =
+                    Some(json!({"status": "next", "priority": priority, "depends_on": []}));
+                if status == "active" {
+                    expected = Some(note.id);
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let expected = expected.unwrap().to_string();
+            let pack = GtdPack::new(runtime);
+            let next = pack.handle_next(&token, json!({"limit": 1})).await.unwrap();
+            let next = next.as_array().unwrap();
+            assert_eq!(next.len(), 1);
+            assert_eq!(
+                next[0]["full_id"], expected,
+                "next must not prioritize an archived actionable task"
+            );
+            let tasks = pack
+                .handle_tasks(&token, json!({"status": "next", "limit": 1}))
+                .await
+                .unwrap();
+            let tasks = tasks.as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0]["full_id"], expected,
+                "tasks must apply active note status before pagination"
+            );
+            assert_eq!(
+                tasks[0]["status"], "next",
+                "workflow status remains distinct"
+            );
+        })
+        .await
+        .expect("bounded actual GTD ordinary-query regression");
+    }
+}

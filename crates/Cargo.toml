@@ -97,10 +97,10 @@ mail-parser = "0.9"
 rusqlite = { version = "0.40" }
 anyhow = "1.0.103"
 thiserror = "2.0"
-zstd = "0.13.3"
+zstd = "0.14.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 chrono-tz = "0.10"
 croner = { version = "4.0", default-features = false, features = ["chrono"] }
@@ -108,9 +108,26 @@ iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.12.0"
-lattice-inference = { version = "=0.12.0", default-features = false }
-lattice-fann = "=0.12.0"
+lattice-embed = "=0.15.0"
+lattice-inference = { version = "=0.15.0", default-features = false }
+lattice-fann = "=0.15.0"
+# Pinned exactly so the moodboard descriptor's lattice version names the code that computes it.
+lattice-arch = { version = "=0.15.0", default-features = false }
+lattice-compute = { version = "=0.15.0", default-features = false }
+lattice-forecast = { version = "=0.15.0", default-features = false }
+lattice-grammar = { version = "=0.15.0", default-features = false }
+lattice-inference-core = { version = "=0.15.0", default-features = false }
+lattice-lora = { version = "=0.15.0", default-features = false }
+lattice-model-bert = { version = "=0.15.0", default-features = false }
+lattice-model-embeddinggemma2 = { version = "=0.15.0", default-features = false }
+lattice-model-io = { version = "=0.15.0", default-features = false }
+lattice-model-qwen3-embedding = { version = "=0.15.0", default-features = false }
+lattice-model-qwen35 = { version = "=0.15.0", default-features = false }
+lattice-quant = { version = "=0.15.0", default-features = false }
+lattice-router = { version = "=0.15.0", default-features = false }
+lattice-simd = { version = "=0.15.0", default-features = false }
+lattice-tokenizer = { version = "=0.15.0", default-features = false }
+lattice-weights = { version = "=0.15.0", default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.10.3"
 toml = "0.8"

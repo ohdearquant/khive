@@ -15,6 +15,7 @@ pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
 pub mod entity_type_backfill;
+pub mod events_prune;
 pub mod exec;
 pub mod git_annotation_repair;
 pub mod git_dedup;

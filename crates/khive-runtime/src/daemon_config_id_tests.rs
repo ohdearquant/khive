@@ -258,3 +258,84 @@ fn peer_fingerprint_is_separate_from_fresh_tail_and_trailing_policies() {
     let malformed = modern.replace(";fresh_tail=", ";unexpected=value;fresh_tail=");
     assert!(super::parse_config_id(&malformed).is_none());
 }
+
+fn with_node_channel(id: &str, hash: char) -> String {
+    format!(
+        "{id};visibility_receipts=disabled;node_channel={}",
+        hash.to_string().repeat(64)
+    )
+}
+
+#[test]
+fn node_channel_digest_is_parsed_with_and_without_routing() {
+    let hash = "a".repeat(64);
+    let plain = with_node_channel(&config_id("p", ""), 'a');
+    let routed = format!("{plain}{ROUTING}");
+    for id in [&plain, &routed] {
+        let fields = super::parse_config_id(id).expect("node channel id parses");
+        assert_eq!(fields.node_channel, Some(hash.as_str()));
+    }
+    let legacy = config_id("p", "");
+    let fields = super::parse_config_id(&legacy).expect("legacy id parses");
+    assert_eq!(fields.node_channel, None);
+}
+
+#[test]
+fn a_malformed_node_channel_digest_is_not_a_config_id() {
+    let short = format!("{};node_channel={}", config_id("p", ""), "a".repeat(63));
+    let upper = format!("{};node_channel={}", config_id("p", ""), "A".repeat(64));
+    let non_hex = format!("{};node_channel={}", config_id("p", ""), "g".repeat(64));
+    for id in [short, upper, non_hex] {
+        assert!(super::parse_config_id(&id).is_none(), "{id}");
+    }
+}
+
+#[test]
+fn a_node_channel_digest_followed_by_a_trailing_policy_still_parses() {
+    for tail in [
+        ";blob_file_transfers=true",
+        ";disabled_verbs={\"comm\":[\"comm.send\"]}",
+    ] {
+        let client = format!("{}{tail}", with_node_channel(&config_id("p", ""), 'a'));
+        let daemon = format!("{}{tail}", with_node_channel(&config_id("p", "m"), 'a'));
+        assert!(super::parse_config_id(&client).is_some(), "{client}");
+        assert!(super::config_ids_compatible(&client, &daemon), "{tail}");
+
+        let other_tail = with_node_channel(&config_id("p", "m"), 'a');
+        assert!(
+            !super::config_ids_compatible(&client, &other_tail),
+            "{tail}"
+        );
+    }
+}
+
+#[test]
+fn the_same_node_channel_digest_is_compatible() {
+    let client = with_node_channel(&config_id("p", ""), 'a');
+    let daemon = with_node_channel(&config_id("p", ""), 'a');
+    assert!(super::config_ids_compatible(&client, &daemon));
+}
+
+#[test]
+fn a_different_node_channel_digest_refuses_daemon_reuse() {
+    let client = with_node_channel(&config_id("p", ""), 'a');
+    let daemon = with_node_channel(&config_id("p", ""), 'b');
+    assert!(!super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "node_channel"
+    );
+}
+
+#[test]
+fn a_node_channel_on_only_one_side_refuses_daemon_reuse() {
+    let plain = format!("{};visibility_receipts=disabled", config_id("p", ""));
+    let with_channel = with_node_channel(&config_id("p", ""), 'a');
+    for (client, daemon) in [(&plain, &with_channel), (&with_channel, &plain)] {
+        assert!(!super::config_ids_compatible(client, daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(client, Some(daemon)),
+            "node_channel"
+        );
+    }
+}

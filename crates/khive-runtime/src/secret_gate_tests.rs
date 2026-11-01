@@ -2960,6 +2960,55 @@ fn mask_secrets_borrows_clean_text() {
     assert_eq!(masked, clean);
 }
 
+fn assert_named_redaction_surface_coverage(
+    list_name: &str,
+    surfaces: impl IntoIterator<Item = RedactionSurface>,
+) {
+    let source = include_str!("secret_gate.rs");
+    let marker = "pub enum RedactionSurface {";
+    assert_eq!(
+        source.matches(marker).count(),
+        1,
+        "one surface declaration required"
+    );
+    let body = source
+        .split_once(marker)
+        .expect("surface declaration required")
+        .1
+        .split_once("\n}")
+        .expect("unit surface enum closing brace required")
+        .0;
+    let mut declared: Vec<_> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("///"))
+        .map(|line| {
+            let name = line
+                .strip_suffix(',')
+                .expect("unit surface variant required");
+            let mut bytes = name.bytes();
+            assert!(
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "surface coverage guard requires ASCII unit variants"
+            );
+            name.to_owned()
+        })
+        .collect();
+    let mut covered: Vec<_> = surfaces
+        .into_iter()
+        .map(|surface| format!("{surface:?}"))
+        .collect();
+    declared.sort();
+    covered.sort();
+    assert_eq!(
+        covered, declared,
+        "{list_name} must cover every declared RedactionSurface exactly once"
+    );
+}
+
 #[test]
 fn named_redaction_surfaces_are_permanently_mask_only() {
     let contracts = [
@@ -2968,9 +3017,17 @@ fn named_redaction_surfaces_are_permanently_mask_only() {
             RedactionSurface::SessionMirror,
             Some(SESSION_MIRROR_STORED_TARGET),
         ),
+        (
+            RedactionSurface::WorkspaceMirror,
+            Some(WORKSPACE_MIRROR_STORED_TARGET),
+        ),
         (RedactionSurface::McpDiagnostic, None),
         (RedactionSurface::GateProbe, None),
     ];
+    assert_named_redaction_surface_coverage(
+        "named_redaction_surfaces_are_permanently_mask_only",
+        contracts.iter().map(|(surface, _)| *surface),
+    );
 
     for (surface, expected_target) in contracts {
         let contract = redaction_surface_contract(surface);
@@ -2985,12 +3042,18 @@ fn named_redaction_surfaces_are_permanently_mask_only() {
 fn named_redaction_surfaces_mask_without_exemption_admission() {
     let content = format!("credential: {}", openai_project_key_fixture());
 
-    for surface in [
+    let surfaces = [
         RedactionSurface::GitIngest,
         RedactionSurface::SessionMirror,
+        RedactionSurface::WorkspaceMirror,
         RedactionSurface::McpDiagnostic,
         RedactionSurface::GateProbe,
-    ] {
+    ];
+    assert_named_redaction_surface_coverage(
+        "named_redaction_surfaces_mask_without_exemption_admission",
+        surfaces.iter().copied(),
+    );
+    for surface in surfaces {
         let masked = mask_for_redaction_surface(surface, &content);
         assert!(masked.contains(REDACTION_MARKER));
         assert!(check(masked.as_ref()).is_ok());
@@ -3565,7 +3628,7 @@ fn mask_secrets_redacts_entropy_token_whose_trigger_is_left_of_earlier_secret() 
 
 #[test]
 fn allows_high_entropy_file_path_near_secret_word() {
-    let content = "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
+    let content = "workspace path field-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
     assert!(
         check(content).is_ok(),
         "structured file path in technical prose must pass; got {:?}",
@@ -3659,7 +3722,7 @@ fn hyphenated_random_secret_is_not_a_structured_identifier() {
 #[test]
 fn structured_identifier_true_for_repro_paths() {
     let paths = [
-        "fable-ops/ADR-DRAFT-adr079-slices234.md",
+        "field-ops/ADR-DRAFT-adr079-slices234.md",
         "internal/workspaces/20260701/adr079-slices234/PACKET.md",
         "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
         "release_notes_v2.md",
@@ -4104,7 +4167,7 @@ fn allows_fp_paths_whose_full_token_entropy_is_already_below_threshold() {
 
 #[test]
 fn allows_adr_draft_path_near_trigger() {
-    let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
+    let content = "api_key handling in field-ops/ADR-DRAFT-adr079-slices234.md";
     assert!(
         check(content).is_ok(),
         "ADR-DRAFT path in technical prose must pass; got {:?}",

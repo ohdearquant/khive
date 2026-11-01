@@ -48,3 +48,44 @@ fn stop_word_case_sensitive() {
     // StopWordFilter expects lowercased input
     assert_eq!(StopWordFilter.apply("The".into()), Some("The".into()));
 }
+
+#[test]
+fn lowercase_ascii_reuses_owned_buffer() {
+    for (input, expected) in [
+        ("HELLO_123", "hello_123"),
+        ("already_lower", "already_lower"),
+    ] {
+        let mut token = String::with_capacity(128);
+        token.push_str(input);
+        let pointer = token.as_ptr();
+        let capacity = token.capacity();
+
+        let output = LowercaseFilter
+            .apply(token)
+            .expect("lowercase retains ASCII tokens");
+
+        assert_eq!(output, expected);
+        assert_eq!(
+            output.as_ptr(),
+            pointer,
+            "ASCII lowercase replaced the owned buffer"
+        );
+        assert_eq!(
+            output.capacity(),
+            capacity,
+            "ASCII lowercase changed the owned capacity"
+        );
+    }
+}
+
+#[test]
+fn lowercase_unicode_preserves_expansion_and_context() {
+    for (input, expected) in [("İ", "i\u{307}"), ("ΟΣ", "ος"), ("ΟΣΑ", "οσα")] {
+        assert_eq!(LowercaseFilter.apply(input.into()), Some(expected.into()));
+    }
+}
+
+#[test]
+fn lowercase_empty_token_is_retained() {
+    assert_eq!(LowercaseFilter.apply(String::new()), Some(String::new()));
+}

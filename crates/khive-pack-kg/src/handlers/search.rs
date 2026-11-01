@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
-    micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind, RuntimeError, SearchSignals,
-    SearchSource, VerbRegistry,
+    integer_params_from_whole_floats, micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind,
+    RuntimeError, SearchSignals, SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, TextQueryMode};
@@ -25,6 +25,7 @@ use super::common::{
     reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
     validate_graph_read_kind, KindSpec, SearchParams,
 };
+use crate::handler_defs::SEARCH_PARAMS;
 use crate::KgPack;
 
 /// Canonical search ranking fields shared by KG and coordinated search.
@@ -85,9 +86,9 @@ impl SearchOrder {
 
 /// Reorder hits by a record timestamp, most recent first, then impose `limit`.
 ///
-/// A hit whose record was absent from the fetched batch has no timestamp and
-/// sorts last. The sort is stable, so hits sharing a timestamp keep the
-/// relevance order they arrived in, which makes the result deterministic.
+/// Entity search omits hits absent from its caller-visible metadata before
+/// sorting. Any missing timestamp sorts last. The sort is stable, so hits
+/// sharing a timestamp keep the relevance order they arrived in.
 fn apply_time_order<T>(hits: &mut Vec<T>, limit: usize, timestamp: impl Fn(&T) -> Option<i64>) {
     hits.sort_by_key(|hit| std::cmp::Reverse(timestamp(hit)));
     hits.truncate(limit);
@@ -102,6 +103,30 @@ struct EntityMeta {
     created_at: i64,
     updated_at: i64,
     version: i64,
+}
+
+// A scoped test-only rendezvous between candidate retrieval and metadata fetch.
+// Production builds have neither the hook nor a branch for it.
+#[cfg(test)]
+tokio::task_local! {
+    static ENTITY_HYDRATION_TEST_BARRIER: std::cell::RefCell<Option<(
+        tokio::sync::oneshot::Sender<Vec<Uuid>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>;
+}
+
+#[cfg(test)]
+async fn wait_for_entity_hydration_test_barrier(ids: &[Uuid]) {
+    let barrier = ENTITY_HYDRATION_TEST_BARRIER
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some((reached, proceed)) = barrier {
+        reached
+            .send(ids.to_vec())
+            .expect("entity test barrier observer");
+        proceed.await.expect("entity test barrier release");
+    }
 }
 
 /// Strict, canonical search request shared by the KG handler and the
@@ -120,6 +145,7 @@ pub struct ValidatedSearchRequest {
     kind_filter: Option<String>,
     entity_type: Option<String>,
     include_superseded: bool,
+    note_status: Option<khive_storage::note::NoteStatusSelector>,
     properties: Option<Value>,
     tags: Vec<String>,
     source: Option<SearchSource>,
@@ -130,7 +156,10 @@ pub struct ValidatedSearchRequest {
 
 impl ValidatedSearchRequest {
     /// Parse and validate the canonical KG search wire contract.
-    pub fn from_value(params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+    pub fn from_value(mut params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+        // Coordinated search parses the caller's arguments here without going through registry
+        // dispatch, so it applies the same whole-number float rule for integer parameters.
+        integer_params_from_whole_floats(&mut params, SEARCH_PARAMS);
         if params.get("min_rank_score").is_some() && params.get("min_score").is_some() {
             return Err(RuntimeError::InvalidInput(
                 "supply only min_rank_score; min_score is its deprecated alias".to_string(),
@@ -141,6 +170,7 @@ impl ValidatedSearchRequest {
         } else {
             "min_score"
         };
+        let note_status_present = params.get("note_status").is_some();
         let p: SearchParams = deser(params)?;
         let text_mode = match p.text_mode.as_deref() {
             None | Some("all_terms") => TextQueryMode::Plain,
@@ -223,6 +253,11 @@ impl ValidatedSearchRequest {
                     "include_superseded",
                     SearchSubstrate::Entity,
                 )?;
+                if note_status_present {
+                    return Err(RuntimeError::InvalidInput(
+                        "note_status is only valid when kind resolves to note".into(),
+                    ));
+                }
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
@@ -246,6 +281,7 @@ impl ValidatedSearchRequest {
                     kind_filter,
                     entity_type,
                     include_superseded: false,
+                    note_status: None,
                     properties,
                     tags,
                     source,
@@ -279,6 +315,7 @@ impl ValidatedSearchRequest {
                     kind_filter,
                     entity_type: None,
                     include_superseded: p.include_superseded.unwrap_or(false),
+                    note_status: Some(p.note_status.unwrap_or(khive_storage::note::NoteStatusSelector::Active)),
                     properties,
                     tags,
                     source,
@@ -339,6 +376,11 @@ impl ValidatedSearchRequest {
     /// Canonical entity subtype filter; always `None` for note searches.
     pub fn entity_type(&self) -> Option<&str> {
         self.entity_type.as_deref()
+    }
+
+    /// Effective lifecycle selector for note searches; absent for entity searches.
+    pub fn note_status(&self) -> Option<khive_storage::note::NoteStatusSelector> {
+        self.note_status
     }
 
     /// Whether notes targeted by a `supersedes` edge remain eligible.
@@ -419,6 +461,26 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        self.handle_search_with_metadata(token, params, registry)
+            .await
+            .map(|outcome| outcome.result)
+    }
+
+    /// Execute the same search core while retaining note-only operation metadata.
+    /// Entity hits absent from the caller-visible metadata fetch are omitted.
+    /// Concurrent updates may leave fields from different generations: this is
+    /// not a snapshot, and an omitted hit is not replaced with another candidate.
+    pub(crate) async fn handle_search_with_metadata(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<
+        khive_runtime::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        RuntimeError,
+    > {
         let search_start = Instant::now();
         let request = ValidatedSearchRequest::from_value(params.clone(), registry)?;
         match request.substrate() {
@@ -443,6 +505,8 @@ impl KgPack {
                 hits.retain(|hit| hit.score >= request.min_rank_score());
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+                #[cfg(test)]
+                wait_for_entity_hydration_test_barrier(&candidate_ids).await;
                 let entity_meta: HashMap<Uuid, EntityMeta> = if candidate_ids.is_empty() {
                     HashMap::new()
                 } else {
@@ -485,6 +549,10 @@ impl KgPack {
                         })
                         .collect()
                 };
+
+                // A candidate can disappear or become invisible between the
+                // retrieval pass and this caller-visible metadata fetch.
+                hits.retain(|hit| entity_meta.contains_key(&hit.entity_id));
 
                 let mut filtered_hits =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
@@ -562,6 +630,7 @@ impl KgPack {
                     search_start.elapsed().as_micros() as i64,
                 );
                 to_json(&result)
+                    .map(|result| khive_runtime::pack::InterceptedDispatchResult::new(result, None))
             }
             SearchSubstrate::Note => {
                 let mailbox = self
@@ -570,9 +639,12 @@ impl KgPack {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let source_filter = request.source();
-                let mut hits = self
+                let note_status = request.note_status().ok_or_else(|| {
+                    RuntimeError::Internal("validated note search has no lifecycle selector".into())
+                })?;
+                let (mut hits, note_status_dropped) = self
                     .runtime
-                    .search_notes_with_text_mode(
+                    .search_notes_with_text_mode_and_status(
                         token,
                         request.query(),
                         None,
@@ -582,6 +654,8 @@ impl KgPack {
                         tag_filter.unwrap_or(&[]),
                         props_filter,
                         request.text_mode(),
+                        note_status,
+                        Some(&mailbox),
                     )
                     .await?;
                 hits.retain(|hit| hit.score >= request.min_rank_score());
@@ -702,7 +776,12 @@ impl KgPack {
                     &result,
                     search_start.elapsed().as_micros() as i64,
                 );
-                to_json(&result)
+                to_json(&result).map(|result| {
+                    khive_runtime::pack::InterceptedDispatchResult::new(
+                        result,
+                        Some((note_status, note_status_dropped)),
+                    )
+                })
             }
         }
     }
@@ -795,3 +874,11 @@ async fn emit_search_executed_event(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "search_note_status_tests.rs"]
+mod note_status_tests;
+
+#[cfg(test)]
+#[path = "search_entity_race_tests.rs"]
+mod entity_race_tests;

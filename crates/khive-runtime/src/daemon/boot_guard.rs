@@ -67,6 +67,16 @@ where
     D: DaemonDispatch,
     F: FnOnce(&D) -> DaemonStartupReport + Send,
 {
+    // This refusal precedes the inner teardown guard. Close the shared domain
+    // even when a retained dispatcher/runtime clone still owns its root. Keep
+    // the existing process-token policy: only the inner guard cancels it.
+    if options.idle_interval.is_zero() {
+        if let Some(resources) = dispatcher.background_resources() {
+            if let Err(error) = resources.close_with_policy() {
+                tracing::warn!(error = %error, "background resource setup refusal deadline failed");
+            }
+        }
+    }
     anyhow::ensure!(
         !options.idle_interval.is_zero(),
         "daemon idle interval must be positive"
@@ -90,13 +100,23 @@ where
     // post-ownership startup callback. The guard precedes all fallible work
     // so even a process that never becomes the daemon relinquishes its
     // process-lifetime shutdown token; restarting requires exec.
-    struct ComponentTeardown;
+    struct ComponentTeardown {
+        resources: Option<crate::resource_admission::BackgroundDomainControl>,
+    }
     impl Drop for ComponentTeardown {
         fn drop(&mut self) {
+            if let Some(resources) = &self.resources {
+                if let Err(error) = resources.close_with_policy() {
+                    tracing::warn!(error = %error, "background resource teardown deadline failed");
+                }
+            }
             daemon_shutdown_token().cancel();
         }
     }
-    let _component_teardown = ComponentTeardown;
+    let background_resources = dispatcher.background_resources();
+    let _component_teardown = ComponentTeardown {
+        resources: background_resources.clone(),
+    };
 
     // Placed after the teardown guard so this refusal keeps the ADR-119
     // contract every other pre-bind error path has, and before the paths are
@@ -166,6 +186,13 @@ where
                 "refusing to start: pid {incumbent_pid} owns the daemon PID file and is alive, \
                  but nothing answered the khived protocol on {}. It may be draining. Nothing \
                  was removed; stop that process first if you intend to replace it.",
+                sock.display()
+            );
+        }
+        Incumbent::Unknown => {
+            anyhow::bail!(
+                "refusing to start: daemon rendezvous at {} could be live or could not be \
+                 inspected safely. Nothing was removed after the uncertainty was detected.",
                 sock.display()
             );
         }
@@ -464,21 +491,76 @@ where
     // Same ordering contract for ADR-119 daemon components: cancel before
     // drain, so each component's supervisor (itself a tracked task) can run
     // its bounded shutdown inside the drain wait.
+    let drain_budget = drain_timeout();
+    let cleanup = crate::resource_admission::CleanupPolicy::new(drain_budget);
+    let initial_deadline = cleanup.deadline_from(std::time::Instant::now());
+    let mut resource_deadline = match initial_deadline {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            tracing::warn!(error = %error, "background resource shutdown deadline overflowed");
+            std::time::Instant::now()
+        }
+    };
+    if let Some(resources) = &background_resources {
+        resources.close(resource_deadline);
+    }
     daemon_shutdown_token().cancel();
 
+    let mut signal_shutdown = reason == DaemonShutdownReason::Signal;
     let drained = if reason == DaemonShutdownReason::Idle {
         tokio::select! {
-            _ = drain_for_idle(&active, drain_timeout()) => true,
+            _ = drain_for_idle(&active, drain_budget) => true,
             result = &mut shutdown => {
                 exit_record.exiting(exit_record::ExitReason::Signal(result?));
                 lifecycle.draining(DaemonShutdownReason::Signal);
+                signal_shutdown = true;
                 let _ = request_shutdown_tx.send(true);
-                drain(&active).await
+                resource_deadline = cleanup.deadline_from(std::time::Instant::now())
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "background resource signal deadline overflowed");
+                        std::time::Instant::now()
+                    });
+                if let Some(resources) = &background_resources {
+                    resources.close(resource_deadline);
+                }
+                drain_with_timeout(
+                    &active,
+                    resource_deadline.saturating_duration_since(std::time::Instant::now()),
+                ).await
             }
         }
     } else {
-        drain(&active).await
+        drain_with_timeout(
+            &active,
+            resource_deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+        .await
     };
+
+    if let Some(resources) = &background_resources {
+        // Idle drain above has waited for real tracked work without a cutoff.
+        // Observe infrastructure exit without extending its expired cleanup
+        // deadline. Signal shutdown retains its one original shared budget.
+        let exit = if signal_shutdown {
+            resources.shutdown(resource_deadline).await
+        } else {
+            let observation_deadline = cleanup
+                .deadline_from(std::time::Instant::now())
+                .unwrap_or(resource_deadline);
+            resources.observe_exit_until(observation_deadline).await
+        };
+        match exit {
+            Ok(report) if report.workers_exited && report.coordinator_joined => {}
+            Ok(report) => tracing::warn!(
+                outstanding_jobs = report.outstanding_jobs,
+                incomplete_finalizations = report.incomplete_finalizations,
+                workers_exited = report.workers_exited,
+                coordinator_joined = report.coordinator_joined,
+                "background resource shutdown remains incomplete",
+            ),
+            Err(error) => tracing::warn!(error = %error, "background resource shutdown failed"),
+        }
+    }
     let tasks = {
         let mut retained = connection_tasks
             .lock()
@@ -542,5 +624,122 @@ pub(super) fn shutdown_cleanup_if_owned(
             "skipping shutdown cleanup — a replacement daemon already owns this socket/PID"
         );
         false
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod background_setup_refusal_tests {
+    use super::*;
+    use crate::resource_admission::{
+        BackgroundRoot, CleanupPolicy, ResourceError, TrackedJob, WorkClass, WorkClassLimits,
+    };
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    struct RetainedResourceDispatcher {
+        root: BackgroundRoot,
+    }
+
+    #[async_trait::async_trait]
+    impl DaemonDispatch for RetainedResourceDispatcher {
+        fn background_resources(
+            &self,
+        ) -> Option<crate::resource_admission::BackgroundDomainControl> {
+            Some(self.root.control())
+        }
+        fn plan(&self, _ops: &str) -> String {
+            panic!("setup refusal must not plan")
+        }
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<crate::RequestIdentity>,
+        ) -> Result<String, String> {
+            panic!("setup refusal must not dispatch")
+        }
+        async fn warm_all(&self) {
+            panic!("setup refusal must not warm")
+        }
+        fn namespace(&self) -> &str {
+            "resource-setup-refusal-test"
+        }
+        fn config_id(&self) -> &str {
+            "resource-setup-refusal-test"
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn zero_idle_refusal_closes_shared_domain_despite_retained_dispatcher_clone() {
+        // Bound the synchronous constructor receipt as well as async waits.
+        // The detached fixture initializer returns/drops its root if this test
+        // receiver times out; this is not a production startup-timeout claim.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let initializer = std::thread::spawn(move || {
+            let result = BackgroundRoot::start(
+                WorkClassLimits::validate(2, 3).unwrap(),
+                CleanupPolicy::new(Duration::from_secs(1)),
+            );
+            let _ = ready_tx.send(result);
+        });
+        drop(initializer);
+        let root = ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("domain fixture startup timed out")
+            .expect("domain fixture startup failed");
+        let dispatcher = RetainedResourceDispatcher { root };
+        let retained = dispatcher.clone();
+        let control = retained.root.control();
+        assert!(!control.is_closed());
+        let process_was_cancelled = daemon_shutdown_token().is_cancelled();
+        let options = DaemonOptions {
+            idle_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_daemon_with_options_and_boot_guard_and_start(dispatcher, None, options, |_| {
+                panic!("invalid setup must not invoke startup callback")
+            }),
+        )
+        .await
+        .expect("setup refusal timed out")
+        .expect_err("zero interval must refuse");
+        assert_eq!(error.to_string(), "daemon idle interval must be positive");
+        assert!(
+            control.is_closed(),
+            "retained external root must not leave admission open"
+        );
+        assert_eq!(
+            daemon_shutdown_token().is_cancelled(),
+            process_was_cancelled,
+            "outer options refusal must preserve existing process-token policy"
+        );
+        let tracking = TrackedJob::register("resource_test_retained_setup_clone");
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                retained.root.handle().admit(WorkClass::Warm, &tracking)
+            )
+            .await
+            .expect("closed admission did not settle"),
+            Err(ResourceError::Closed)
+        ));
+        drop(tracking);
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            control.observe_exit_until(Instant::now().checked_add(Duration::from_secs(4)).unwrap()),
+        )
+        .await
+        .expect("exit observation timed out")
+        .expect("exit observation failed");
+        assert!(report.workers_exited && report.coordinator_joined);
+        assert_eq!(report.outstanding_jobs, 0);
+        drop(retained);
     }
 }

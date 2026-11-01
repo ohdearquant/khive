@@ -316,6 +316,11 @@ pub fn process_ref_from_env() -> Option<String> {
 /// retain the legacy programmatic model shorthand until startup preparation.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    /// Maximum simultaneous background warm jobs in the host's shared domain.
+    /// Must be positive and fit Tokio's semaphore capacity.
+    pub warm_concurrency: usize,
+    /// Maximum simultaneous background maintenance jobs; interactive is unbounded.
+    pub maintenance_concurrency: usize,
     /// Named custody references; secret material stays inside credential providers.
     pub credentials: Vec<crate::credentials::CredentialConfig>,
     /// Configured receipt key ring. Absence never generates a replacement key.
@@ -571,6 +576,8 @@ impl Default for RuntimeConfig {
             .ok()
             .filter(|s| !s.trim().is_empty());
         Self {
+            warm_concurrency: DEFAULT_WARM_CONCURRENCY,
+            maintenance_concurrency: DEFAULT_MAINTENANCE_CONCURRENCY,
             credentials: Vec::new(),
             visibility_receipts: None,
             db_path,
@@ -1138,6 +1145,14 @@ pub fn runtime_config_from_khive_config(
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
+    let warm_concurrency = khive_cfg
+        .runtime
+        .warm_concurrency
+        .unwrap_or(base.warm_concurrency);
+    let maintenance_concurrency = khive_cfg
+        .runtime
+        .maintenance_concurrency
+        .unwrap_or(base.maintenance_concurrency);
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -1173,6 +1188,8 @@ pub fn runtime_config_from_khive_config(
             code_map_root,
             code_maps,
             code_map_protected_database_paths,
+            warm_concurrency,
+            maintenance_concurrency,
             blob_hydration_bytes,
             display_timezone,
             web,
@@ -1211,6 +1228,8 @@ pub fn runtime_config_from_khive_config(
         code_map_root,
         code_maps,
         code_map_protected_database_paths,
+        warm_concurrency,
+        maintenance_concurrency,
         blob_hydration_bytes,
         display_timezone,
         web,
@@ -1629,3 +1648,13 @@ mod configured_embedding_models_order_tests {
         );
     }
 }
+
+/// Policy from the 2026-10-20 00:00Z through 2026-10-27 04:40Z event window:
+/// completed warm spans peaked at one with no observed overlap. Configured
+/// knowledge warm was unobserved. This is a conservative policy, not capacity.
+pub(crate) const DEFAULT_WARM_CONCURRENCY: usize = 1;
+
+/// Maintenance policy uses the same 2026-10-20 00:00Z through 2026-10-27 04:40Z
+/// observation: warm peak one, no overlaps, configured knowledge warm absent.
+/// Checkpoint work has warm attribution; other WAL/Vamana work was uninstrumented.
+pub(crate) const DEFAULT_MAINTENANCE_CONCURRENCY: usize = 1;

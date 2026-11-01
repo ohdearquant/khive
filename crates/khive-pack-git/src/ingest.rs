@@ -261,6 +261,9 @@ pub struct IngestWriteRefusal {
     pub record_key: String,
     pub detector: String,
     pub masked: String,
+    /// Present only for a GitHub replacement attempt; true after a real UUID returns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted: Option<bool>,
 }
 
 /// Machine-readable state of one ingest source (`commits`, `issues`,
@@ -441,7 +444,7 @@ fn record_write_failure(
     record_key: String,
     error: RuntimeError,
 ) {
-    if let RuntimeError::SecretDetected(secret) = &error {
+    if let RuntimeError::SecretDetected(secret) = error.refusal_source() {
         report.writes_refused += 1;
         report.write_refusals.push(IngestWriteRefusal {
             verb: verb.to_string(),
@@ -449,11 +452,136 @@ fn record_write_failure(
             record_key: record_key.clone(),
             detector: secret.detector.to_string(),
             masked: secret.masked.clone(),
+            redacted: None,
         });
     }
     report
         .warnings
         .push(format!("{verb} {record_kind} {record_key}: {error}"));
+}
+
+struct GithubCreateResult {
+    response: Value,
+    content: String,
+}
+
+/// Rebuild the replacement from trusted identity and a closed set of typed fields.
+/// Remote prose, labels, actors and branch names never carry through this path.
+fn redacted_github_payload(kind: &str, number: u64, project_id: Uuid, original: &Value) -> Value {
+    let properties = original.get("properties");
+    let timestamp = |key: &str| {
+        properties
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|dt| khive_runtime::presentation::format_utc_rfc3339_seconds(&dt))
+    };
+    let mut replacement = json!({
+        "number": number,
+        "project_id": project_id.to_string(),
+        "title": "GitHub content redacted",
+        "author": null,
+        "created_at": timestamp("created_at"),
+        "closed_at": timestamp("closed_at"),
+    });
+    if kind == "pull_request" {
+        replacement["merged_at"] = json!(timestamp("merged_at"));
+        replacement["base_ref"] = Value::Null;
+        replacement["head_ref"] = Value::Null;
+    } else {
+        replacement["labels"] = json!([]);
+        if let StateReasonField::Valid(reason) = canonical_issue_state_reason(
+            properties
+                .and_then(|p| p.get("state_reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ) {
+            replacement["state_reason"] = json!(reason);
+        }
+    }
+    json!({
+        "kind": kind,
+        "name": format!("#{number} [redacted]"),
+        "content": "GitHub content was redacted after a secret-gate refusal.",
+        "properties": replacement,
+        "annotates": [project_id.to_string()],
+    })
+}
+
+/// Both GitHub walkers use this single production dispatch instantiation.
+async fn create_github_record(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    report: &mut IngestReport,
+    kind: &str,
+    number: u64,
+    project_id: Uuid,
+    payload: Value,
+) -> Option<GithubCreateResult> {
+    let fallback = redacted_github_payload(kind, number, project_id, &payload);
+    create_github_record_with(report, kind, number, payload, fallback, |params| {
+        crate::dispatch_from_token(registry, token, "create", params)
+    })
+    .await
+}
+
+/// A typed refusal alone permits one replacement; every other failure still stalls.
+/// The closure is the real token-bound dispatch in production, with no fault flag.
+async fn create_github_record_with<F, Fut>(
+    report: &mut IngestReport,
+    kind: &str,
+    number: u64,
+    payload: Value,
+    fallback: Value,
+    mut dispatch: F,
+) -> Option<GithubCreateResult>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Value, RuntimeError>>,
+{
+    let content = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match dispatch(payload).await {
+        Ok(response) => Some(GithubCreateResult { response, content }),
+        Err(error) => {
+            let retry = matches!(error.refusal_source(), RuntimeError::SecretDetected(_));
+            let first_refusal = report.write_refusals.len();
+            record_write_failure(report, "create", kind, format!("#{number}"), error);
+            if !retry {
+                return None;
+            }
+            report.write_refusals.get_mut(first_refusal)?.redacted = Some(false);
+            let content = fallback
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            match dispatch(fallback).await {
+                Ok(response) => {
+                    if response
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .is_some()
+                    {
+                        report.write_refusals[first_refusal].redacted = Some(true);
+                    }
+                    Some(GithubCreateResult { response, content })
+                }
+                Err(error) => {
+                    let next_refusal = report.write_refusals.len();
+                    record_write_failure(report, "create", kind, format!("#{number}"), error);
+                    if let Some(refusal) = report.write_refusals.get_mut(next_refusal) {
+                        refusal.redacted = Some(false);
+                    }
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Overwrite a walker's source slot with `StoppedEarly(reason)` at an
@@ -1350,3 +1478,7 @@ mod module_index_loader_tests;
 #[cfg(test)]
 #[path = "ingest/property_index_tests.rs"]
 mod property_index_tests;
+
+#[cfg(all(test, unix))]
+#[path = "ingest/github_refusal_tests.rs"]
+mod github_refusal_tests;

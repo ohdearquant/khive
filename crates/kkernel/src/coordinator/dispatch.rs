@@ -221,7 +221,7 @@ pub struct SubstrateCoordinator {
     #[cfg(test)]
     pub(super) panic_backend_id: Option<String>,
     /// Test-only: named backend's fan-out search task never resolves,
-    /// simulating a hung backend (MAJ-2 timeout regression coverage).
+    /// simulating a hung backend whose search must time out.
     #[cfg(test)]
     pub(super) hang_backend_ids: Vec<String>,
     /// Test-only: delay a backend result past the shared absolute deadline.
@@ -236,7 +236,7 @@ pub struct SubstrateCoordinator {
         Option<(String, khive_storage::request_context::SearchPhase)>,
     /// Test-only: when set, a backend's entity fan-out task returns this
     /// list verbatim instead of calling `hybrid_search`, so RRF-merge
-    /// regression tests can pin exact ranks/UUIDs (MAJ-4).
+    /// tests can pin exact ranks/UUIDs for RRF merge ordering.
     #[cfg(test)]
     pub(super) entity_hits_override: Option<HashMap<String, Vec<SearchHit>>>,
     /// Test-only: same as `entity_hits_override`, for the note substrate.
@@ -739,7 +739,7 @@ impl SubstrateCoordinator {
     }
 
     /// Same as [`Self::fan_out_search`], but authorizes each backend token
-    /// with an explicit extra read-visibility set (MAJ-3 fix).
+    /// with an explicit extra read-visibility set.
     ///
     /// `extra_visible` mirrors the normal registry dispatch path's
     /// `['local'] ∪ visible_namespaces` widening
@@ -807,7 +807,63 @@ impl SubstrateCoordinator {
         extra_visible: &[Namespace],
         caller: Option<(&NamespaceToken, &serde_json::Value)>,
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        let (entities, notes, backends, _) = self
+            .fan_out_search_candidates_with_count(request, namespace, extra_visible, caller)
+            .await;
+        (entities, notes, backends)
+    }
+
+    /// Keep status counts only from successful backend legs accepted before the
+    /// shared deadline. The result and backend DTOs retain their existing shape.
+    pub async fn fan_out_search_with_token_and_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> (
+        Vec<SearchHit>,
+        Vec<NoteSearchHit>,
+        Vec<BackendSearchResult>,
+        u64,
+    ) {
+        if request.substrate() == SearchSubstrate::Entity {
+            let (entities, notes, backends) = self
+                .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
+                .await;
+            return (entities, notes, backends, 0);
+        }
+        let started = search_profile::start();
+        let (mut entity_hits, mut note_hits, per_backend, dropped) = self
+            .fan_out_search_candidates_with_count(
+                request,
+                token.namespace(),
+                extra_visible,
+                Some((token, args)),
+            )
+            .await;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
+        self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
+            .await;
+        search_profile::stage("finalize", started, &[]);
+        (entity_hits, note_hits, per_backend, dropped)
+    }
+
+    async fn fan_out_search_candidates_with_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        namespace: &Namespace,
+        extra_visible: &[Namespace],
+        caller: Option<(&NamespaceToken, &serde_json::Value)>,
+    ) -> (
+        Vec<SearchHit>,
+        Vec<NoteSearchHit>,
+        Vec<BackendSearchResult>,
+        u64,
+    ) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
+        let note_status = request.note_status();
         let requested_substrate = if search_notes {
             SubstrateKind::Note
         } else {
@@ -835,7 +891,7 @@ impl SubstrateCoordinator {
             .collect();
 
         if entries.is_empty() {
-            return (vec![], vec![], vec![]);
+            return (vec![], vec![], vec![], 0);
         }
 
         let timeout_ms = backend_search_timeout_ms();
@@ -866,10 +922,10 @@ impl SubstrateCoordinator {
                         error: Some(BackendSearchFailure::from_runtime_error(e)),
                         vector_error: None,
                     };
-                    return (vec![], vec![], vec![backend_result]);
+                    return (vec![], vec![], vec![backend_result], 0);
                 }
             };
-            // MAJ-2 (r2 follow-up): the single-backend early return has no
+            // The single-backend early return has no
             // spawned task to bound with the fan-out timeout loop below, so
             // both awaits are wrapped directly in the same
             // `backend_search_timeout_ms()` budget — an unbounded await here
@@ -910,8 +966,8 @@ impl SubstrateCoordinator {
                         .backend()
                         .pool_arc()
                         .record_search_dispatch(backend_id.as_str(), &requested_kind);
-                    let mut outcome = runtime
-                        .search_notes_outcome_with_text_mode(
+                    let (mut outcome, dropped) = runtime
+                        .search_notes_outcome_with_text_mode_and_status(
                             &token,
                             request.query(),
                             search_limit,
@@ -920,12 +976,14 @@ impl SubstrateCoordinator {
                             &tags_owned,
                             props_filter_owned.as_ref(),
                             request.text_mode(),
+                            note_status.expect("validated note search has a status selector"),
+                            mailbox.as_ref(),
                         )
                         .await?;
                     if let Some(view) = &mailbox {
                         scope_note_search_hits(runtime, &token, view, &mut outcome.hits).await?;
                     }
-                    Ok::<_, RuntimeError>(outcome)
+                    Ok::<_, RuntimeError>((outcome, dropped))
                 };
                 let search_fut = khive_storage::request_context::scope_search_phase_trace(
                     phase_trace.clone(),
@@ -942,7 +1000,7 @@ impl SubstrateCoordinator {
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok((Ok(outcome), None)) => {
+                    Ok((Ok((outcome, dropped)), None)) => {
                         let filtered_note_hits: Vec<NoteSearchHit> = outcome
                             .hits
                             .iter()
@@ -960,7 +1018,7 @@ impl SubstrateCoordinator {
                             error: None,
                             vector_error: outcome.vector_error,
                         };
-                        return (vec![], filtered_note_hits, vec![backend_result]);
+                        return (vec![], filtered_note_hits, vec![backend_result], dropped);
                     }
                     Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
@@ -970,7 +1028,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Ok((_late, Some(phase_snapshot))) => {
                         search_profile::backend_deadline(
@@ -995,7 +1053,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Err(_elapsed) => {
                         let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
@@ -1029,7 +1087,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                 }
             } else {
@@ -1097,7 +1155,7 @@ impl SubstrateCoordinator {
                             error: None,
                             vector_error: outcome.vector_error,
                         };
-                        return (filtered_hits, vec![], vec![backend_result]);
+                        return (filtered_hits, vec![], vec![backend_result], 0);
                     }
                     Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
@@ -1107,7 +1165,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Ok((_late, Some(phase_snapshot))) => {
                         search_profile::backend_deadline(
@@ -1132,7 +1190,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Err(_elapsed) => {
                         let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
@@ -1166,7 +1224,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                 }
             }
@@ -1254,7 +1312,7 @@ impl SubstrateCoordinator {
                     panic!("injected backend search panic");
                 }
                 if should_hang {
-                    // Never resolves — exercises the fan-out timeout (MAJ-2).
+                    // Never resolves — exercises the fan-out timeout.
                     std::future::pending::<()>().await;
                     unreachable!("a pending future never resolves");
                 }
@@ -1269,16 +1327,17 @@ impl SubstrateCoordinator {
                         )),
                         None::<Vec<NoteSearchHit>>,
                         None,
+                        0,
                     );
                 }
                 if search_notes && caller.is_none() {
                     if let Some(hits) = note_override.as_ref() {
-                        return (backend_id, Ok(vec![]), Some(hits.clone()), None);
+                        return (backend_id, Ok(vec![]), Some(hits.clone()), None, 0);
                     }
                 }
                 if !search_notes {
                     if let Some(hits) = entity_override {
-                        return (backend_id, Ok(hits), None, None);
+                        return (backend_id, Ok(hits), None, None, 0);
                     }
                 }
                 let (token, mailbox) = match search_token(
@@ -1294,7 +1353,7 @@ impl SubstrateCoordinator {
                             error = %bounded_backend_cause_for_log(&e.to_string()),
                             "fan_out_search: authorization denied for namespace"
                         );
-                        return (backend_id, Err(e), None, None);
+                        return (backend_id, Err(e), None, None, 0);
                     }
                 };
                 if let Some(phase) = phase_hold {
@@ -1308,10 +1367,10 @@ impl SubstrateCoordinator {
                             if let Err(error) =
                                 scope_note_search_hits(&runtime, &token, view, &mut hits).await
                             {
-                                return (backend_id, Err(error), None, None);
+                                return (backend_id, Err(error), None, None, 0);
                             }
                         }
-                        return (backend_id, Ok(vec![]), Some(hits), None);
+                        return (backend_id, Ok(vec![]), Some(hits), None, 0);
                     }
                 }
                 runtime
@@ -1320,7 +1379,7 @@ impl SubstrateCoordinator {
                     .record_search_dispatch(backend_id.as_str(), &requested_kind);
                 if search_notes {
                     let result = runtime
-                        .search_notes_outcome_with_text_mode(
+                        .search_notes_outcome_with_text_mode_and_status(
                             &token,
                             &q,
                             sl,
@@ -1329,16 +1388,18 @@ impl SubstrateCoordinator {
                             &tg,
                             pf.as_ref(),
                             text_mode,
+                            note_status.expect("validated note search has a status selector"),
+                            mailbox.as_ref(),
                         )
                         .await;
                     match result {
                         // Full search_limit-bounded window is retained here —
-                        // truncating to the caller's limit per backend (MAJ-4)
+                        // truncating to the caller's limit per backend
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
                         // Finalization applies the floor and requested order
                         // before imposing the caller's limit.
-                        Ok(mut outcome) => {
+                        Ok((mut outcome, dropped)) => {
                             if let Some(view) = &mailbox {
                                 if let Err(error) = scope_note_search_hits(
                                     &runtime,
@@ -1348,7 +1409,7 @@ impl SubstrateCoordinator {
                                 )
                                 .await
                                 {
-                                    return (backend_id, Err(error), None, None);
+                                    return (backend_id, Err(error), None, None, 0);
                                 }
                             }
                             (
@@ -1356,9 +1417,10 @@ impl SubstrateCoordinator {
                                 Ok(vec![]),
                                 Some(outcome.hits),
                                 outcome.vector_error,
+                                dropped,
                             )
                         }
-                        Err(e) => (backend_id, Err(e), None, None),
+                        Err(e) => (backend_id, Err(e), None, None, 0),
                     }
                 } else {
                     let result = runtime
@@ -1375,9 +1437,11 @@ impl SubstrateCoordinator {
                         .await;
                     match result {
                         // See the note-substrate arm above: no per-backend
-                        // truncation before RRF merge (MAJ-4).
-                        Ok(outcome) => (backend_id, Ok(outcome.hits), None, outcome.vector_error),
-                        Err(e) => (backend_id, Err(e), None, None),
+                        // truncation before RRF merge.
+                        Ok(outcome) => {
+                            (backend_id, Ok(outcome.hits), None, outcome.vector_error, 0)
+                        }
+                        Err(e) => (backend_id, Err(e), None, None, 0),
                     }
                 }
             };
@@ -1418,6 +1482,7 @@ impl SubstrateCoordinator {
         }
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
+        let mut dropped_total = 0_u64;
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
         let interrupt_settlement_deadline =
@@ -1453,9 +1518,26 @@ impl SubstrateCoordinator {
                 _ => tokio::time::Instant::now(),
             });
             match joined {
-                Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at, _)))
-                    if completed_at <= request_deadline.async_at() =>
-                {
+                Ok(Ok((
+                    (backend_id, Ok(hits), note_hits_opt, vector_error, dropped),
+                    completed_at,
+                    _,
+                ))) if completed_at <= request_deadline.async_at() => {
+                    let Some(total) = dropped_total.checked_add(dropped) else {
+                        per_backend.push(BackendSearchResult {
+                            backend_id,
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::from_runtime_error(
+                                RuntimeError::Internal(
+                                    "note search status count exceeds u64".into(),
+                                ),
+                            )),
+                            vector_error: None,
+                        });
+                        continue;
+                    };
+                    dropped_total = total;
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
                         entity_ranked_lists.push(hits.clone());
@@ -1471,7 +1553,7 @@ impl SubstrateCoordinator {
                         vector_error,
                     });
                 }
-                Ok(Ok(((backend_id, Err(e), _, _), completed_at, _)))
+                Ok(Ok(((backend_id, Err(e), _, _, _), completed_at, _)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     per_backend.push(BackendSearchResult {
@@ -1574,7 +1656,7 @@ impl SubstrateCoordinator {
         let merged_notes =
             rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
         search_profile::stage("merge", started, &[]);
-        (merged_entities, merged_notes, per_backend)
+        (merged_entities, merged_notes, per_backend, dropped_total)
     }
 }
 
@@ -1619,7 +1701,7 @@ async fn search_with_deadline_snapshot<F: std::future::Future>(
     (search.await, Some(snapshot))
 }
 
-/// Per-backend fan-out search timeout (MAJ-2 fix): bounds how long a single
+/// Per-backend fan-out search timeout: bounds how long a single
 /// backend's search task may run before the coordinator gives up on it and
 /// reports a timeout-specific error for that backend, so one hung backend
 /// cannot block the whole fan-out from returning healthy siblings' results.
@@ -1635,9 +1717,10 @@ fn backend_search_timeout_ms() -> u64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_BACKEND_SEARCH_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
-            ms.to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
+            value = ms,
         );
         ms
     })
@@ -2180,7 +2263,7 @@ mod search_phase_trace_tests {
     }
 }
 
-/// Per-backend fan-out over-fetch bound for RRF merge fairness (MAJ-4 fix).
+/// Per-backend fan-out over-fetch bound for RRF merge fairness.
 ///
 /// Each backend must contribute more than just the caller's `limit` worth of
 /// ranked candidates, or a candidate that ranks #2+ on multiple backends can

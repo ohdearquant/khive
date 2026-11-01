@@ -237,6 +237,28 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
 
+### Retention class
+
+Generic dispatch receipts whose kind is `Audit` and whose persisted canonical verb
+is exactly one of `comm.inbox`, `comm.cleanup_expired_quarantine`, `whoami`,
+`comm.probe`, `comm.cursor_get`, or `comm.heartbeat` carry this top-level payload
+field:
+
+```json
+{
+  "retention": {
+    "class": "expendable",
+    "policy": "poll-dispatch-v1",
+    "horizon_seconds": 604800
+  }
+}
+```
+
+The runtime assigns it at event construction, before batch admission, for success,
+denied, and error outcomes, including sampled and forced success rows. Caller
+arguments never set or change it. Readers and deletion paths do not use this
+marker yet.
+
 ### Successful search query shape
 
 Successful `search` dispatch audit payloads additionally contain `match_mode`

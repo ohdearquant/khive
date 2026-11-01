@@ -252,3 +252,38 @@ races one daemon-served writer with one explicit local writer rather than starti
 the same store. Its acceptance checks both equal-content replay and different-content refusal,
 and a control dropping `idx_notes_namespace_kind_key` must turn the proof red. The writer-process
 and unique-index claims survive; the old two-daemon fixture shape does not.
+
+## Amendment 3 (2026-10-28): a key assigned once to a live note that has none
+
+**Status**: Proposed.
+
+D3 says the key is set at create and never updated. That leaves no way to give a key to a live note that was written
+without one, so a project copied between stores through an archive with no key field loses every key it held. The only
+route back would delete each note and re-insert it under the same id: two transactions, the note's attachments
+dropped and its version reset.
+
+This amendment admits one more writer of `key`: `NoteStore::assign_note_key_if_unset`, which sets it on a live note
+whose key is NULL, in one conditional statement, and does nothing else.
+
+- **What it writes.** It writes `key` and no other column; `updated_at` is unchanged. The `bump_note_version` trigger
+  raises `version` by one, as for any update.
+- **The outcomes.**
+  - `Assigned`.
+  - `AlreadyKeyed { existing }`: the stored key is returned whether or not it equals the one asked for, and nothing is
+    written.
+  - `KeyTaken`: the live partial unique index `idx_notes_namespace_kind_key` refuses the key for that namespace and kind,
+    and nothing is written. Any other constraint failure is an error, never `KeyTaken`.
+  - `NotFound`: no live note with that id in the asserted namespace.
+- **Validation.** The key is validated by the same rule as `memory.remember` (D1), one function in `khive-storage` that
+  the runtime validator calls.
+- **Who may call it.** It has no verb. Its caller authorizes the call before it reaches the store, as for
+  `set_note_property`; the namespace argument is the row's asserted namespace, not authorization. The policy-enforcing
+  store applies the checks it applies to `set_note_property` on the existing row and nothing more.
+
+What D3 still holds:
+
+- A key is never replaced and never cleared.
+- A soft delete still releases it.
+- `memory.remember` remains the only writer of a key at create.
+
+A note that once had a key and was later soft-deleted cannot regain one through this method, because it is not live.

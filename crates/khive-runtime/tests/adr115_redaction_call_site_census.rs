@@ -27,6 +27,7 @@ const EXEMPT_FILES: &[&str] = &[
     "khive-runtime/src/secret_gate/masking.rs",
     "khive-runtime/src/secret_gate_tests.rs",
     "khive-runtime/src/secret_gate/issue_2655_tests.rs",
+    "khive-runtime/src/secret_gate/entropy/issue_6100_tests.rs",
     "khive-runtime/tests/adr115_redaction_call_site_census.rs",
 ];
 

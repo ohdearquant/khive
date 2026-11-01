@@ -39,6 +39,9 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
+    #[error("channel.node: {reason}")]
+    InvalidNodeConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -219,6 +222,9 @@ pub enum ConfigError {
     #[error("[web] {key}: {reason}")]
     InvalidWebConfig { key: String, reason: String },
 
+    #[error("[runtime] {key}: {reason}")]
+    InvalidRuntimeConfig { key: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -284,7 +290,7 @@ impl ConfigError {
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:leo"                          # attribution identity (required)
+/// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// ```
@@ -1418,6 +1424,11 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
+    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
+    /// config file keeps loading; its contents are not interpreted.
+    #[serde(default)]
+    pub channel: crate::node_config::ChannelSectionConfig,
+
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -1532,6 +1543,16 @@ pub struct KhiveConfig {
 /// absent.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
+    /// Maximum simultaneous background warm jobs in one serving host.
+    /// Absent preserves the resolved base; zero and unsupported capacities fail.
+    #[serde(default)]
+    pub warm_concurrency: Option<usize>,
+
+    /// Maximum simultaneous background maintenance jobs in one serving host.
+    /// Interactive dispatch does not use this admission limit.
+    #[serde(default)]
+    pub maintenance_concurrency: Option<usize>,
+
     /// Packs to load when neither `--pack` nor `KHIVE_PACKS` selects them.
     /// An absent or empty list preserves the built-in production default.
     #[serde(default)]
@@ -1856,6 +1877,34 @@ impl KhiveConfig {
             return Err(ConfigError::BlobS3FeatureDisabled);
         }
 
+        let warm = self
+            .runtime
+            .warm_concurrency
+            .unwrap_or(crate::config::DEFAULT_WARM_CONCURRENCY);
+        let maintenance = self
+            .runtime
+            .maintenance_concurrency
+            .unwrap_or(crate::config::DEFAULT_MAINTENANCE_CONCURRENCY);
+        crate::resource_admission::WorkClassLimits::validate(warm, maintenance).map_err(
+            |error| {
+                let key = match &error {
+                    crate::resource_admission::ResourceError::InvalidLimit {
+                        class: crate::resource_admission::WorkClass::Warm,
+                        ..
+                    } => "warm_concurrency",
+                    crate::resource_admission::ResourceError::InvalidLimit {
+                        class: crate::resource_admission::WorkClass::Maintenance,
+                        ..
+                    } => "maintenance_concurrency",
+                    _ => "background_concurrency",
+                };
+                ConfigError::InvalidRuntimeConfig {
+                    key: key.to_owned(),
+                    reason: error.to_string(),
+                }
+            },
+        )?;
+
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
@@ -1864,6 +1913,7 @@ impl KhiveConfig {
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;
         }
+        self.channel.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
@@ -2249,3 +2299,78 @@ mod schema_tests;
 #[cfg(test)]
 #[path = "engine_config_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_limit_tests {
+    use super::*;
+
+    #[test]
+    fn optional_background_limits_parse_and_validate() {
+        let config: KhiveConfig =
+            toml::from_str("[runtime]\nwarm_concurrency = 3\nmaintenance_concurrency = 2\n")
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.runtime.warm_concurrency, Some(3));
+        assert_eq!(config.runtime.maintenance_concurrency, Some(2));
+    }
+
+    #[test]
+    fn zero_and_overflow_limits_report_the_actual_runtime_key() {
+        for key in ["warm_concurrency", "maintenance_concurrency"] {
+            for value in [0, tokio::sync::Semaphore::MAX_PERMITS + 1] {
+                let mut config: KhiveConfig = toml::from_str("").unwrap();
+                if key == "warm_concurrency" {
+                    config.runtime.warm_concurrency = Some(value);
+                } else {
+                    config.runtime.maintenance_concurrency = Some(value);
+                }
+                assert!(matches!(config.validate(),
+                    Err(ConfigError::InvalidRuntimeConfig { key: found, .. }) if found == key
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn negative_toml_background_limits_are_not_deserialized() {
+        for key in ["warm_concurrency", "maintenance_concurrency"] {
+            let text = format!("[runtime]\n{key} = -1\n");
+            assert!(toml::from_str::<KhiveConfig>(&text).is_err());
+        }
+    }
+
+    #[test]
+    fn limits_keep_base_and_override_values_on_both_mapping_branches() {
+        for engines_declared in [false, true] {
+            let mut config: KhiveConfig =
+                toml::from_str("[runtime]\nwarm_concurrency = 5\n").unwrap();
+            config.engines_declared = engines_declared;
+            let base = crate::RuntimeConfig {
+                warm_concurrency: 3,
+                maintenance_concurrency: 2,
+                ..crate::RuntimeConfig::no_embeddings()
+            };
+            let mapped = crate::config::runtime_config_from_khive_config(&config, base);
+            assert_eq!(mapped.warm_concurrency, 5);
+            assert_eq!(mapped.maintenance_concurrency, 2);
+        }
+    }
+
+    #[test]
+    fn defaults_use_the_named_validated_background_constants() {
+        let config = crate::RuntimeConfig::default();
+        assert_eq!(
+            config.warm_concurrency,
+            crate::config::DEFAULT_WARM_CONCURRENCY
+        );
+        assert_eq!(
+            config.maintenance_concurrency,
+            crate::config::DEFAULT_MAINTENANCE_CONCURRENCY
+        );
+        crate::resource_admission::WorkClassLimits::validate(
+            config.warm_concurrency,
+            config.maintenance_concurrency,
+        )
+        .unwrap();
+    }
+}

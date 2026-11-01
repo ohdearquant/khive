@@ -279,10 +279,11 @@ request(ops="brain.activate(profile_id=\"<profile_id>\")")
 ### Give feedback on recall quality
 
 ```
-request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<full_uuid>\", signal=\"useful\")")
 ```
 
-`target_id` must be a full UUID. Signals: `useful`, `not_useful`, `wrong`,
+`id` accepts a full UUID or a globally unique hex prefix of at least eight characters.
+Signals: `useful`, `not_useful`, `wrong`,
 `explicit_positive`, `explicit_negative`, `correction`.
 
 ### Auto-feedback after recall

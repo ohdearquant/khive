@@ -345,9 +345,21 @@ pub struct KhiveRuntime {
     /// main-bound runtime handle without constructing a new connection.
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
+    /// Observations belonging to this runtime construction and its clones.
+    config_lock_ledger: Arc<crate::config_ledger::ConfigLockLedger>,
+    /// A core ledger belongs to this runtime's exact backend-Arc binding.
+    /// Clones and old core handles retain the binding they already hold.
+    core_config_lock_ledger: Option<(
+        Arc<StorageBackend>,
+        Arc<crate::config_ledger::ConfigLockLedger>,
+    )>,
+    /// Admission identity shared by every view of this host's runtime.
+    background_domain: crate::resource_admission::BackgroundDomainHandle,
+    /// External lifetime ownership; absent only on background job views.
+    background_root: Option<crate::resource_admission::BackgroundRoot>,
     config: RuntimeConfig,
     pub(crate) code_map_registry: Arc<crate::CodeMapRegistry>,
-    outbound_email_policy: crate::OutboundEmailPolicy,
+    outbound_email_policy: std::sync::Arc<crate::OutboundEmailPolicy>,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
@@ -462,6 +474,33 @@ pub struct KhiveRuntime {
 }
 
 impl KhiveRuntime {
+    /// Observe a resolved config value once for this runtime construction.
+    ///
+    /// The lazy value runs outside the ledger mutex. A name already recorded
+    /// does not evaluate its lazy value. Concurrent first observers of one name
+    /// may each evaluate their closure, so value closures must have no side effects.
+    /// Only the first to insert the name after evaluation queues an observation.
+    pub fn record_config_locked<F>(&self, key: &'static str, value: F)
+    where
+        F: FnOnce() -> String,
+    {
+        self.config_lock_ledger.record_config_locked(key, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_config_lock_test_hook(
+        &self,
+        point: crate::config_ledger::TestRecordPoint,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.config_lock_ledger.install_test_hook(point, hook);
+    }
+
+    /// Take this runtime's pending observations for its bound audit registry.
+    pub(crate) fn drain_config_locked(&self) -> Vec<(&'static str, String)> {
+        self.config_lock_ledger.drain_config_locked()
+    }
+
     /// Return the code maps accepted from the configuration used to construct this runtime.
     pub fn code_map_registry(&self) -> &crate::CodeMapRegistry {
         self.code_map_registry.as_ref()
@@ -517,6 +556,7 @@ impl KhiveRuntime {
         create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        let background_limits = Self::validated_background_limits(&config)?;
         config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
@@ -555,10 +595,12 @@ impl KhiveRuntime {
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
+        let background = Self::start_background_root(background_limits)?;
         Ok(Self::assemble_from_backend(
             Arc::new(backend),
             config,
             false,
+            background,
         ))
     }
 
@@ -619,6 +661,7 @@ impl KhiveRuntime {
         mut config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        let background_limits = Self::validated_background_limits(&config)?;
         config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
@@ -637,10 +680,12 @@ impl KhiveRuntime {
             }
         };
         backend.prepare_core_schema()?;
+        let background = Self::start_background_root(background_limits)?;
         Ok(Self::assemble_from_backend(
             Arc::new(backend),
             config,
             false,
+            background,
         ))
     }
 
@@ -674,15 +719,59 @@ impl KhiveRuntime {
     /// registration failures must also abort startup.
     pub fn try_from_backend(
         backend: Arc<StorageBackend>,
-        mut config: RuntimeConfig,
+        config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
+        Self::try_from_backend_with_background(backend, config, None)
+    }
+
+    /// Assemble a backend in the main runtime's existing admission domain.
+    ///
+    /// Panics on invalid configuration, matching [`Self::from_backend`].
+    pub fn from_backend_in_domain(
+        backend: Arc<StorageBackend>,
+        config: RuntimeConfig,
+        background: crate::resource_admission::BackgroundRoot,
+    ) -> Self {
+        Self::try_from_backend_in_domain(backend, config, background)
+            .expect("from_backend_in_domain requires matching valid background limits")
+    }
+
+    /// Validate limits and reuse a host domain without creating another worker.
+    pub fn try_from_backend_in_domain(
+        backend: Arc<StorageBackend>,
+        config: RuntimeConfig,
+        background: crate::resource_admission::BackgroundRoot,
+    ) -> RuntimeResult<Self> {
+        Self::try_from_backend_with_background(backend, config, Some(background))
+    }
+
+    fn try_from_backend_with_background(
+        backend: Arc<StorageBackend>,
+        mut config: RuntimeConfig,
+        background: Option<crate::resource_admission::BackgroundRoot>,
+    ) -> RuntimeResult<Self> {
+        let limits = Self::validated_background_limits(&config)?;
+        if background
+            .as_ref()
+            .is_some_and(|root| root.limits() != limits)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "runtime background limits must match the host admission domain".into(),
+            ));
+        }
         config.prepare_engines()?;
         if !backend.is_read_only() {
             if let Err(err) = register_configured_embedding_models(&backend, &config) {
                 tracing::warn!(error = %err, "failed to register configured embedding models");
             }
         }
-        Ok(Self::assemble_from_backend(backend, config, false))
+        let background = match background {
+            Some(root) => root,
+            None => Self::start_background_root(limits)?,
+        };
+        Ok(Self::assemble_from_backend(
+            backend, config, false, background,
+        ))
     }
 
     /// Construct a single-backend runtime after a host boot coordinator has
@@ -695,6 +784,7 @@ impl KhiveRuntime {
         backend: Arc<StorageBackend>,
         mut config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
+        let background_limits = Self::validated_background_limits(&config)?;
         config.prepare_engines()?;
         if backend.attachment_cutover_status()?
             != khive_db::migrations::AttachmentCutoverStatus::Complete
@@ -708,13 +798,41 @@ impl KhiveRuntime {
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
-        Ok(Self::assemble_from_backend(backend, config, true))
+        let background = Self::start_background_root(background_limits)?;
+        Ok(Self::assemble_from_backend(
+            backend, config, true, background,
+        ))
+    }
+
+    /// Validate raw host admission limits before preparing engines or opening storage.
+    /// This pure check starts no worker and performs no filesystem or boot work.
+    pub fn validated_background_limits(
+        config: &RuntimeConfig,
+    ) -> RuntimeResult<crate::resource_admission::WorkClassLimits> {
+        crate::resource_admission::WorkClassLimits::validate(
+            config.warm_concurrency,
+            config.maintenance_concurrency,
+        )
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+    }
+
+    fn start_background_root(
+        limits: crate::resource_admission::WorkClassLimits,
+    ) -> RuntimeResult<crate::resource_admission::BackgroundRoot> {
+        crate::resource_admission::BackgroundRoot::start(
+            limits,
+            crate::resource_admission::CleanupPolicy::new(crate::daemon::drain_timeout()),
+        )
+        .map_err(|error| {
+            RuntimeError::Internal(format!("background runtime startup failed: {error}"))
+        })
     }
 
     fn assemble_from_backend(
         backend: Arc<StorageBackend>,
         config: RuntimeConfig,
         cutover_validated: bool,
+        background: crate::resource_admission::BackgroundRoot,
     ) -> Self {
         if config.backend_id.as_str() == BackendId::MAIN {
             backend.pool().main_pool_generation();
@@ -741,6 +859,10 @@ impl KhiveRuntime {
             named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
             core_named_vector_stores: None,
             core_backend: None,
+            config_lock_ledger: Arc::new(crate::config_ledger::ConfigLockLedger::default()),
+            core_config_lock_ledger: None,
+            background_domain: background.handle(),
+            background_root: Some(background),
             config,
             code_map_registry,
             outbound_email_policy: Default::default(),
@@ -783,6 +905,16 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if !self
+            .core_config_lock_ledger
+            .as_ref()
+            .is_some_and(|(bound, _)| Arc::ptr_eq(bound, &core))
+        {
+            self.core_config_lock_ledger = Some((
+                core.clone(),
+                Arc::new(crate::config_ledger::ConfigLockLedger::default()),
+            ));
+        }
         if self.visibility_cutover.is_bound_to(&core) {
             self.core_visibility_cutover = self.visibility_cutover.clone();
         } else if !self.core_visibility_cutover.is_bound_to(&core) {
@@ -914,6 +1046,15 @@ impl KhiveRuntime {
                         .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
                     core_named_vector_stores: None,
                     core_backend: None,
+                    config_lock_ledger: self
+                        .core_config_lock_ledger
+                        .as_ref()
+                        .filter(|(bound, _)| Arc::ptr_eq(bound, main_arc))
+                        .map(|(_, ledger)| ledger.clone())
+                        .expect("core backend binding must retain its config-lock ledger"),
+                    core_config_lock_ledger: None,
+                    background_domain: self.background_domain.clone(),
+                    background_root: self.background_root.clone(),
                     config: core_config,
                     code_map_registry: self.code_map_registry.clone(),
                     outbound_email_policy: self.outbound_email_policy.clone(),
@@ -2274,6 +2415,32 @@ impl KhiveRuntime {
         detached
     }
 
+    /// Borrow the shared host domain without extending its external lifetime.
+    pub fn background_domain(&self) -> crate::resource_admission::BackgroundDomainHandle {
+        self.background_domain.clone()
+    }
+
+    /// Retain external ownership when composing another host backend.
+    pub fn background_root(&self) -> RuntimeResult<crate::resource_admission::BackgroundRoot> {
+        self.background_root.clone().ok_or_else(|| {
+            RuntimeError::Internal("a background view cannot own a new host runtime".into())
+        })
+    }
+
+    /// Close or observe this host's domain, without retaining its external owner.
+    pub fn background_resources_control(
+        &self,
+    ) -> crate::resource_admission::BackgroundDomainControl {
+        self.background_domain.control()
+    }
+
+    /// Detach callbacks and external ownership before capturing a runtime in a job.
+    pub fn background_view(&self) -> Self {
+        let mut view = self.detached_for_note_search_ann_provider();
+        view.background_root = None;
+        view
+    }
+
     /// Install the memory pack's note-search provider only on its own opened
     /// backend. A same-named but separate store keeps the exact search route.
     pub fn install_note_search_ann_provider(&self, provider: Arc<dyn NoteSearchAnnProvider>) {
@@ -2575,3 +2742,90 @@ fn vector_dimensions_from_ddl(ddl: &str) -> Option<usize> {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_resource_tests {
+    use super::*;
+
+    fn config() -> RuntimeConfig {
+        RuntimeConfig {
+            db_path: None,
+            warm_concurrency: 3,
+            maintenance_concurrency: 2,
+            ..RuntimeConfig::no_embeddings()
+        }
+    }
+
+    #[test]
+    fn clones_core_and_detached_views_share_the_original_domain() {
+        let runtime = KhiveRuntime::new(config()).expect("root runtime");
+        let root = runtime.background_root().expect("external root");
+        for view in [
+            runtime.clone(),
+            runtime.core(),
+            runtime.detached_for_note_search_ann_provider(),
+        ] {
+            assert!(root.same_domain(&view.background_root().expect("retained external root")));
+        }
+        let other = KhiveRuntime::new(config()).expect("independent root");
+        assert!(!root.same_domain(&other.background_root().unwrap()));
+    }
+
+    #[test]
+    fn assigned_backend_and_rebound_core_keep_the_main_domain() {
+        let main = KhiveRuntime::new(config()).expect("main runtime");
+        let root = main.background_root().unwrap();
+        let secondary_config = RuntimeConfig {
+            backend_id: BackendId::parse("secondary").expect("secondary backend id"),
+            ..config()
+        };
+        let secondary = KhiveRuntime::try_from_backend_in_domain(
+            Arc::new(StorageBackend::memory().unwrap()),
+            secondary_config,
+            root.clone(),
+        )
+        .unwrap()
+        .with_core_backend(Arc::clone(&main.backend));
+        assert!(root.same_domain(&secondary.background_root().unwrap()));
+        assert!(root.same_domain(&secondary.core().background_root().unwrap()));
+    }
+
+    #[test]
+    fn background_view_cannot_keep_the_external_root_alive() {
+        let runtime = KhiveRuntime::new(config()).expect("root runtime");
+        let view = runtime.background_view();
+        let control = view.background_resources_control();
+        assert!(view.background_root().is_err());
+        assert_eq!(view.background_domain().limits().warm(), 3);
+        assert!(!control.is_closed());
+        drop(runtime);
+        assert!(
+            control.is_closed(),
+            "last external root closes despite the job view"
+        );
+    }
+
+    #[test]
+    fn invalid_limits_and_injected_limit_mismatch_are_refused() {
+        for (warm, maintenance) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+            let mut bad = config();
+            bad.warm_concurrency = warm;
+            bad.maintenance_concurrency = maintenance;
+            assert!(matches!(
+                KhiveRuntime::new(bad),
+                Err(RuntimeError::InvalidInput(_))
+            ));
+        }
+        let main = KhiveRuntime::new(config()).unwrap();
+        let mut different = config();
+        different.warm_concurrency += 1;
+        assert!(matches!(
+            KhiveRuntime::try_from_backend_in_domain(
+                Arc::new(StorageBackend::memory().unwrap()),
+                different,
+                main.background_root().unwrap(),
+            ),
+            Err(RuntimeError::InvalidInput(_))
+        ));
+    }
+}

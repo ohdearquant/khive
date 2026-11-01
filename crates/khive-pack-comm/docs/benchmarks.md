@@ -6,15 +6,28 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-pack-comm`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
-| Benchmark                          | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ---------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `comm/inbox/10`                    | 309.641 µs       | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/inbox/100`                   | 440.808 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/read`                        | 141.573 µs       | 1.018     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/reply`                       | 722.030 µs       | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/send`                        | 411.994 µs       | 1.042     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/thread/5`                    | 196.582 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
-| `comm/thread_in_busy_mailbox/2000` | 201.326 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                                                                                             | Reference median | A/A ratio  | Baseline commit                            | Commit date |
+| ----------------------------------------------------------------------------------------------------- | ---------------- | ---------- | ------------------------------------------ | ----------- |
+| `khive-pack-comm:comm_bench/comm/inbox/10/median_ns`                                                  | 308.392 µs       | 1.011      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/inbox/100/median_ns`                                                 | 444.211 µs       | 1.015      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/read/median_ns`                                                      | 143.365 µs       | 1.002      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/reply/median_ns`                                                     | 730.416 µs       | 1.013      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/send/median_ns`                                                      | 418.357 µs       | 1.039      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/thread/5/median_ns`                                                  | 179.051 µs       | 1.004      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_bench/comm/thread_in_busy_mailbox/2000/median_ns`                               | 183.672 µs       | 1.008      | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cleanup_expired_quarantine/100/median_ns`              | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_commit/median_ns`                               | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_get/median_ns`                                  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/cursor_get_commit/median_ns`                           | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/ingest/median_ns`                                      | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/mark_read/200/median_ns`                               | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_lifecycle/suppression_list/100/median_ns`                        | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/hidden490_twins490_owners20/limit_1/median_ns`  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/hidden490_twins490_owners20/limit_20/median_ns` | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/unique_1000/limit_1/median_ns`                  | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-pack-comm:comm_lifecycle/comm_thread_rendering/unique_1000/limit_20/median_ns`                 | unmeasured       | unmeasured | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 
@@ -90,8 +103,8 @@ public Rust registry dispatch, not public MCP verbs.
 | ------------------------ | -------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `comm_lifecycle`         | `ingest`                         | One generated inbound message; one `comm.ingest` dispatch                                     | Fresh, non-deduplicated UUID; no committed-write degradation; actual inbound note and recipient  |
 | `comm_lifecycle`         | `cleanup_expired_quarantine/100` | 100 notes ingested with quarantine metadata; one cleanup dispatch                             | All 100 hard-deleted; no routed-owner detachment; each UUID absent                               |
-| `comm_lifecycle`         | `cursor_get`                     | One seeded cursor at generation 1 / high-water 100; one get dispatch                          | Returned checkpoint remains at 100 and equals an additional persisted read                        |
-| `comm_lifecycle`         | `cursor_commit`                  | One seeded cursor at generation 1 / high-water 100; one commit to high-water 101               | Receipt is at 101 and equals an additional persisted read                                         |
+| `comm_lifecycle`         | `cursor_get`                     | One seeded cursor at generation 1 / high-water 100; one get dispatch                          | Returned checkpoint remains at 100 and equals an additional persisted read                       |
+| `comm_lifecycle`         | `cursor_commit`                  | One seeded cursor at generation 1 / high-water 100; one commit to high-water 101              | Receipt is at 101 and equals an additional persisted read                                        |
 | `comm_lifecycle`         | `cursor_get_commit`              | One seeded cursor at generation 1 / high-water 100; get then commit high-water 101            | Old read, new receipt and an additional persisted read agree                                     |
 | `comm_lifecycle`         | `mark_read/200`                  | 200 distinct unread inbound notes; one `comm.mark_read(atomic=false)` dispatch                | Requested, unique and marked counts all 200; no failures or unknowns; all stored read flags true |
 | `comm_lifecycle`         | `suppression_list/100`           | 100 unique outbound address suppressions seeded via `comm.suppression_add`; one list dispatch | Exact 100-entry identity/value set, with limit 100 and offset 0                                  |
@@ -170,13 +183,42 @@ The v0.2.8 ledger above remains historical; none of its numbers are measurements
 these new workloads. Pipeline selection is maintained by the benchmark workflow's
 owning component.
 
-| Group / scenario                                | Reported unit                                              | Baseline | Commit  | Toolchain / machine |
-| ----------------------------------------------- | ---------------------------------------------------------- | -------- | ------- | ------------------- |
-| `comm_lifecycle/ingest`                         | Median ns per single dispatch                              | pending  | pending | pending             |
-| `comm_lifecycle/cleanup_expired_quarantine/100` | Median ms per 100-note cleanup dispatch                    | pending  | pending | pending             |
-| `comm_lifecycle/cursor_get`                     | Median ns per single get dispatch                         | pending  | pending | pending             |
-| `comm_lifecycle/cursor_commit`                  | Median ns per single commit dispatch                      | pending  | pending | pending             |
-| `comm_lifecycle/cursor_get_commit`              | Median ns per get + commit round-trip                      | pending  | pending | pending             |
-| `comm_lifecycle/mark_read/200`                  | Median ns per 200-message dispatch                         | pending  | pending | pending             |
-| `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending  | pending | pending             |
-| `comm/thread_in_busy_mailbox/2000`              | Existing Criterion estimate, compared with `comm/thread/5` | pending  | pending | pending             |
+| Group / scenario                                | Reported unit                                              | Baseline        | Commit          | Toolchain / machine |
+| ----------------------------------------------- | ---------------------------------------------------------- | --------------- | --------------- | ------------------- |
+| `comm_lifecycle/ingest`                         | Median ns per single dispatch                              | pending         | pending         | pending             |
+| `comm_lifecycle/cleanup_expired_quarantine/100` | Median ms per 100-note cleanup dispatch                    | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_get`                     | Median ns per single get dispatch                          | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_commit`                  | Median ns per single commit dispatch                       | pending         | pending         | pending             |
+| `comm_lifecycle/cursor_get_commit`              | Median ns per get + commit round-trip                      | pending         | pending         | pending             |
+| `comm_lifecycle/mark_read/200`                  | Median ns per 200-message dispatch                         | pending         | pending         | pending             |
+| `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending         | pending         | pending             |
+| `comm/thread_in_busy_mailbox/2000`              | Existing Criterion estimate, compared with `comm/thread/5` | reference block | reference block | reference block     |
+
+## CI observation, 2026-10-27 (UTC)
+
+The seven lifecycle rows marked pending above predate this run; their first measured values are recorded below. The generated fixed-reference/A/A block and historical release ledger remain unchanged. These quick-profile timings are advisory, without cross-machine improvement or scaling claims.
+
+Provenance: [run 40430486230](https://github.com/ohdearquant/khive/actions/runs/40430486230), attempt 1, [storage-brain job 121947482396](https://github.com/ohdearquant/khive/actions/runs/40430486230/job/121947482396), [artifact 12701769351](https://github.com/ohdearquant/khive/actions/runs/40430486230/artifacts/12701769351). The measured checkout was synthetic merge [a72ad862cbfc57b6063fa26a1d7dfcebd0749c91](https://github.com/ohdearquant/khive/commit/a72ad862cbfc57b6063fa26a1d7dfcebd0749c91), ref `6184/merge`. Its tree equals integration head `a8aaafaf104d76f3dd67a3232246b94900744efe`; the comm benchmark sources and manifest match dev `f7524e536512c6a57b039933be034bbc5b75c4d3`. Artifact ZIP SHA-256: `639426af9689e0a0ed33e9387c93ab43a54abdf02240f2d71392ca65e73a0fed`.
+
+Host: Linux x86_64, `ubuntu-24.04` runner image, 4 logical CPUs, runner `GitHub Actions 1000462433`. Actual toolchain: `rustc 1.95.0 (59807616e 2026-04-14)`, `x86_64-unknown-linux-gnu`; optimized `bench` profile, `CARGO_INCREMENTAL=0`. CPU model and exhaustive compiler flags were not captured. The checked-in `crates/Cargo.lock` Git blob is `c5544b62827ecac6464b5eaa4a66e799554f4de0`, identical at measured/integration/dev commits; no separate runtime lockfile SHA-256 was captured.
+
+The component compiled and ran successfully. From `crates`, its benchmark command was:
+
+```text
+cargo bench -p khive-db -p khive-fold -p khive-brain-core -p khive-pack-brain -p khive-pack-comm --benches -- --quick --noplot
+```
+
+The first seven rows are the benchmark's standalone reported median of 11 independent whole operations (sorted rank 6), logged at 01:20 UTC. Each uses a fresh in-memory fixture; setup, seeding, validation and audit drain/destruction are untimed. The log retains seven summaries, not the 77 individual durations. Cleanup and mark-read values cover the complete 100-note/200-message dispatch; the cursor pair includes both calls. The final row is separately the Criterion `new/estimates.json` median point estimate, rounded to 0.001 µs; it is not an eleven-operation report.
+
+| Scenario                                        | Observed median | Method                          |
+| ----------------------------------------------- | --------------- | ------------------------------- |
+| `comm_lifecycle/ingest`                         | 1,407,106 ns    | Standalone 11-operation report  |
+| `comm_lifecycle/cleanup_expired_quarantine/100` | 112.872495 ms   | Standalone 11-operation report  |
+| `comm_lifecycle/cursor_get`                     | 116,887 ns      | Standalone 11-operation report  |
+| `comm_lifecycle/cursor_commit`                  | 209,911 ns      | Standalone 11-operation report  |
+| `comm_lifecycle/cursor_get_commit`              | 336,614 ns      | Standalone 11-operation report  |
+| `comm_lifecycle/mark_read/200`                  | 43,773,877 ns   | Standalone 11-operation report  |
+| `comm_lifecycle/suppression_list/100`           | 693,496 ns      | Standalone 11-operation report  |
+| `comm/thread_in_busy_mailbox/2000`              | 308.388 µs      | Criterion median point estimate |
+
+The archive's `bench-data/components.jsonl` schema-v2 record is `status=ok`, `gate_status=pass`; its lifecycle metrics are separate Criterion trend estimates, not the standalone medians above. Its `timestamp` is the measured commit's date (`2026-10-26T21:05:33-04:00`), not the execution date. The source for the seven standalone values is the job log; the busy-thread source is the archived `new/estimates.json`. This observation establishes neither an A/A calibration nor a latency bound.

@@ -19,6 +19,8 @@ mod callbacks;
 mod ledger;
 use ledger::GuardedLedger;
 #[cfg(test)]
+mod quarantine_budget_tests;
+#[cfg(test)]
 mod tests;
 mod transition;
 mod vfs;
@@ -28,6 +30,7 @@ mod windows;
 use windows as os;
 
 const QUARANTINE_CAP: usize = 32;
+const MAP_QUARANTINE_CAP: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -85,6 +88,10 @@ pub(crate) enum GuardError {
         "code-map VFS opened-handle quarantine is full; restart the process before another code-map open"
     )]
     QuarantineFull,
+    #[error(
+        "code-map VFS map opened-handle quarantine budget is full (limit 8); restart the process before another open of this map"
+    )]
+    MapQuarantineFull,
     #[error("code-map VFS registration capacity is full; restart the process before another code-map open")]
     RegistrationFull,
 }
@@ -158,11 +165,104 @@ struct ActiveMain {
     transition: usize,
 }
 
+/// A quarantine fault domain is a pinned directory's native identity and exact
+/// native leaf spelling. It is independent of mode, expected main identity and
+/// protected-path contract. There is no canonicalization, case folding or alias
+/// union: hardlinks, case-equivalent leaves and replaced parents may split budgets,
+/// but different path slots are never merged. The global cap bounds those splits.
+/// Every occupied budget pins its parent so a recycled identity cannot merge slots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QuarantineDomain {
+    parent: os::Identity,
+    leaf: OsString,
+}
+
+struct QuarantineBudget {
+    _parent: Arc<os::PinnedParent>,
+    retained: usize,
+    reserved: usize,
+}
+
 #[derive(Default)]
 struct ProcessLedger {
     guarded: GuardedLedger,
     quarantined: Vec<File>,
+    quarantine_by_domain: HashMap<QuarantineDomain, QuarantineBudget>,
+    quarantine_reserved: usize,
     active_main: HashMap<os::Identity, ActiveMain>,
+}
+
+/// Hold capacity before a native open can produce an unsafe-to-close handle.
+/// The borrowed ledger remains locked; rollback never acquires that mutex again.
+struct QuarantineReservation<'a> {
+    ledger: &'a mut ProcessLedger,
+    domain: QuarantineDomain,
+    active: bool,
+}
+
+impl<'a> QuarantineReservation<'a> {
+    fn new(
+        ledger: &'a mut ProcessLedger,
+        domain: &QuarantineDomain,
+        parent: &Arc<os::PinnedParent>,
+    ) -> Result<Self, GuardError> {
+        check_map_quarantine(ledger, domain)?;
+        // Allocate all retention bookkeeping before there can be a suspect File.
+        ledger.quarantined.reserve(1);
+        let domain = domain.clone();
+        let budget = ledger
+            .quarantine_by_domain
+            .entry(domain.clone())
+            .or_insert_with(|| QuarantineBudget {
+                _parent: Arc::clone(parent),
+                retained: 0,
+                reserved: 0,
+            });
+        budget.reserved += 1;
+        ledger.quarantine_reserved += 1;
+        Ok(Self {
+            ledger,
+            domain,
+            active: true,
+        })
+    }
+
+    fn retain(&mut self, file: File) {
+        // Never reject or deduplicate after opening: every suspect stays live.
+        self.ledger.quarantined.push(file);
+        self.ledger
+            .quarantine_by_domain
+            .get_mut(&self.domain)
+            .expect("reserved quarantine domain remains present")
+            .retained += 1;
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.ledger.quarantine_reserved -= 1;
+        let empty = {
+            let budget = self
+                .ledger
+                .quarantine_by_domain
+                .get_mut(&self.domain)
+                .expect("reserved quarantine domain remains present");
+            budget.reserved -= 1;
+            budget.retained == 0 && budget.reserved == 0
+        };
+        if empty {
+            self.ledger.quarantine_by_domain.remove(&self.domain);
+        }
+    }
+}
+
+impl Drop for QuarantineReservation<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 fn ledger() -> &'static Mutex<ProcessLedger> {
@@ -179,11 +279,33 @@ fn lock_ledger() -> std::sync::MutexGuard<'static, ProcessLedger> {
 }
 
 fn check_quarantine(ledger: &ProcessLedger) -> Result<(), GuardError> {
-    if ledger.quarantined.len() >= QUARANTINE_CAP {
+    if ledger.quarantined.len() + ledger.quarantine_reserved >= QUARANTINE_CAP {
         Err(GuardError::QuarantineFull)
     } else {
         Ok(())
     }
+}
+
+fn check_map_quarantine(
+    ledger: &ProcessLedger,
+    domain: &QuarantineDomain,
+) -> Result<(), GuardError> {
+    if ledger
+        .quarantine_by_domain
+        .get(domain)
+        .is_some_and(|budget| budget.retained + budget.reserved >= MAP_QUARANTINE_CAP)
+    {
+        return Err(GuardError::MapQuarantineFull);
+    }
+    check_quarantine(ledger)
+}
+
+#[cfg(test)]
+fn quarantine_reserved_count() -> usize {
+    ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .quarantine_reserved
 }
 
 pub(crate) fn quarantine_occupancy() -> usize {
@@ -262,7 +384,8 @@ fn io_at(path: &Path, source: std::io::Error) -> GuardError {
 pub(crate) struct CodeMapHandleGuard {
     target: PathBuf,
     main_leaf: OsString,
-    parent: os::PinnedParent,
+    parent: Arc<os::PinnedParent>,
+    quarantine_domain: QuarantineDomain,
     mode: Mode,
     expected_main_identity: Option<DatabaseFileIdentity>,
     protected: Vec<ProductionBase>,
@@ -352,6 +475,17 @@ fn with_refusal(error: crate::error::SqliteError, vfs_name: &str) -> crate::erro
 }
 
 impl CodeMapHandleGuard {
+    #[cfg(test)]
+    fn quarantine_domain_counts(&self) -> (usize, usize) {
+        let ledger = ledger()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger
+            .quarantine_by_domain
+            .get(&self.quarantine_domain)
+            .map_or((0, 0), |budget| (budget.retained, budget.reserved))
+    }
+
     fn record_refusal(&self, reason: String) {
         *self
             .last_refusal
@@ -407,10 +541,16 @@ impl CodeMapHandleGuard {
                 io_at(parent_path, error)
             }
         })?;
+        let parent = Arc::new(parent);
+        let quarantine_domain = QuarantineDomain {
+            parent: parent.identity(),
+            leaf: main_leaf.clone(),
+        };
         let guard = Self {
             target,
             main_leaf,
             parent,
+            quarantine_domain,
             mode,
             expected_main_identity,
             protected,
@@ -419,13 +559,14 @@ impl CodeMapHandleGuard {
             exclusive_main_handles: AtomicUsize::new(0),
             last_refusal: Mutex::new(None),
         };
+        check_map_quarantine(&ledger, &guard.quarantine_domain)?;
         guard.preflight_locked(&ledger)?;
         Ok(guard)
     }
 
     pub(crate) fn preflight(&self) -> Result<AdmissionSnapshot, GuardError> {
         let ledger = lock_ledger();
-        check_quarantine(&ledger)?;
+        check_map_quarantine(&ledger, &self.quarantine_domain)?;
         self.preflight_locked(&ledger)
     }
 
@@ -530,13 +671,13 @@ impl CodeMapHandleGuard {
 
     pub(crate) fn open(&self, role: Role, access: OpenAccess) -> Result<GuardedFile, GuardError> {
         let mut ledger = lock_ledger();
-        check_quarantine(&ledger)?;
+        check_map_quarantine(&ledger, &self.quarantine_domain)?;
         self.open_locked(&mut ledger, role, access)
     }
 
     pub(crate) fn access(&self, role: Role) -> Result<bool, GuardError> {
         let ledger = lock_ledger();
-        check_quarantine(&ledger)?;
+        check_map_quarantine(&ledger, &self.quarantine_domain)?;
         let snapshot = self.preflight_locked(&ledger)?;
         Ok(self.snapshot_role(&snapshot, role).is_some())
     }
@@ -562,13 +703,13 @@ impl CodeMapHandleGuard {
         #[cfg(windows)]
         {
             let mut ledger = lock_ledger();
-            check_quarantine(&ledger)?;
+            check_map_quarantine(&ledger, &self.quarantine_domain)?;
             self.delete_windows_locked(&mut ledger, role, sync_parent)
         }
         #[cfg(unix)]
         {
             let ledger = lock_ledger();
-            check_quarantine(&ledger)?;
+            check_map_quarantine(&ledger, &self.quarantine_domain)?;
             self.preflight_locked(&ledger)?;
             let name = self.leaf(role);
             let path = self.path(role);
@@ -591,6 +732,8 @@ impl CodeMapHandleGuard {
             return Ok(());
         };
         let protected_before = self.sample_protected()?;
+        let mut reservation =
+            QuarantineReservation::new(ledger, &self.quarantine_domain, &self.parent)?;
         before_os_open();
         let Some(file) = self
             .parent
@@ -602,7 +745,7 @@ impl CodeMapHandleGuard {
         let observed = match os::observe_file(&file) {
             Ok(observed) => observed,
             Err(error) => {
-                ledger.quarantined.push(file);
+                reservation.retain(file);
                 return Err(io_at(&path, error));
             }
         };
@@ -612,18 +755,18 @@ impl CodeMapHandleGuard {
             .as_ref()
             .is_ok_and(|samples| Self::matches_protected(observed.identity, samples));
         if matches_before || matches_after {
-            ledger.quarantined.push(file);
+            reservation.retain(file);
             return Err(GuardError::ProtectedAlias { path });
         }
         let protected_after = match protected_after {
             Ok(samples) => samples,
             Err(error) => {
-                ledger.quarantined.push(file);
+                reservation.retain(file);
                 return Err(error);
             }
         };
         if protected_before != protected_after {
-            ledger.quarantined.push(file);
+            reservation.retain(file);
             return Err(GuardError::ProtectedChanged);
         }
         if observed.identity != expected {
@@ -702,6 +845,8 @@ impl CodeMapHandleGuard {
         let protected_before = self.sample_protected()?;
         let name = self.leaf(role);
         let path = self.path(role);
+        let mut reservation =
+            QuarantineReservation::new(ledger, &self.quarantine_domain, &self.parent)?;
         before_os_open();
         let file = self
             .parent
@@ -710,7 +855,7 @@ impl CodeMapHandleGuard {
         let observed = match os::observe_file(&file) {
             Ok(observed) => observed,
             Err(error) => {
-                ledger.quarantined.push(file);
+                reservation.retain(file);
                 return Err(io_at(&path, error));
             }
         };
@@ -720,22 +865,23 @@ impl CodeMapHandleGuard {
             .as_ref()
             .is_ok_and(|samples| Self::matches_protected(observed.identity, samples));
         if matches_before || matches_after {
-            ledger.quarantined.push(file);
+            reservation.retain(file);
             return Err(GuardError::ProtectedAlias { path });
         }
         let protected_after = match protected_after {
             Ok(samples) => samples,
             Err(error) => {
-                ledger.quarantined.push(file);
+                reservation.retain(file);
                 return Err(error);
             }
         };
         if protected_before != protected_after {
             // A post-open sample drift is an uncertain stat-to-open interval.
             // Keep the live handle so a same-process production lock survives.
-            ledger.quarantined.push(file);
+            reservation.retain(file);
             return Err(GuardError::ProtectedChanged);
         }
+        let ledger = &mut *reservation.ledger;
         if role == Role::Main {
             if let Some(expected) = self.expected_main_identity {
                 let actual = match crate::file_identity::database_file_identity_from_file(&file) {

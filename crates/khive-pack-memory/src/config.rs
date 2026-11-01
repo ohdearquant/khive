@@ -347,19 +347,7 @@ impl RecallFtsGatherConfig {
     }
 }
 
-// The historical 2026-05-25 tuning artifact swept 116 configs, but the synthetic corpus
-// produced an identical recall@10 = 0.9333 for every config — i.e. a flat landscape that
-// cannot empirically distinguish these parameters. Defaults below stay at the prior values
-// until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
-// See tests/khive-contract/tune/README.md for the retained limitation.
-//
-// Default strategy: RRF k=10 (restored 2026-07-21). CC-6 flipped this to
-// Weighted [0.7, 0.3] to let salience act as a tiebreaker, but the live golden-suite
-// sweep showed the flip regressed adversarial-paraphrase recall (hit@5 0.471 -> 0.353,
-// MRR 0.321 -> 0.153) while RRF k=10 held the holdout suite at its best tier: min-max
-// weighted fusion lets a keyword-only text hit outrank paraphrase hits visible only to
-// the vector leg. Salience still contributes through the composite score weights.
-// The RRF strategy remains available via `fusion_strategy="rrf"`.
+// Default selection rationale: crates/khive-pack-memory/docs/api/configuration.md#default-selection-rationale.
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {
@@ -371,12 +359,6 @@ impl Default for RecallConfig {
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
             candidate_limit: Some(150),
-            // RRF k=10 is the calibrated default (2026-06 pen-default, reconfirmed by
-            // the 2026-07-21 live sweep). The CC-6 Weighted [0.7, 0.3] flip regressed
-            // the adversarial-paraphrase suite (hit@5 0.471 -> 0.353, MRR halved):
-            // min-max weighted fusion lets a strong text-leg score on a keyword-only
-            // match outrank paraphrase hits that only the vector leg sees. RRF's
-            // rank-based fusion is robust to that magnitude mismatch.
             fuse_strategy: FusionStrategy::Rrf { k: 10 },
             min_score: 0.0,
             min_salience: 0.0,
@@ -519,16 +501,12 @@ pub struct ScoreBreakdown {
     /// when no profile served the request (component 1 never ran) or the
     /// default-weight score is ~0 (div-by-zero guard).
     pub profile_component: f64,
-    /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for
-    /// this hit's UUID. `None` when no profile served the request, or the
-    /// profile holds no posterior for this UUID beyond the uninformative
-    /// prior. As of Stage B (§2), this value is not just reported: it is
-    /// the input to the bounded per-entity term
-    /// `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` that
-    /// multiplies the response's `rank_score` — so a value here other than
-    /// the neutral case (`None`, or a mean of exactly 0.5) means this hit's
-    /// `rank_score` was moved by up to +/-15% relative to the same
-    /// candidate under a profile with no posterior for it.
+    /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for this UUID.
+    /// `None` without a serving profile or a posterior beyond the uninformative prior.
+    /// Multiplies `rank_score` by
+    /// `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`;
+    /// `None` or a mean of 0.5 is neutral. See
+    /// `crates/khive-pack-memory/docs/api/configuration.md#score-breakdowns`.
     pub entity_posterior_mean: Option<f64>,
 }
 

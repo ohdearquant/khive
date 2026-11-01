@@ -6,6 +6,8 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-score`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
 | Benchmark                                | Reference median | A/A ratio | Baseline commit                            | Commit date |
 | ---------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
 | `DeterministicScore/arithmetic/add`      | 1.130 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
@@ -222,3 +224,63 @@ The earlier release ledger remains a historical observation only.
 - Notes: none
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## CI observation, 2026-10-27 (UTC)
+
+The “Current baseline status” section above predates this observation: the rows below supply measured quick-mode trends for the requested families. Qualified-host/A/A calibration for the new workloads remains pending. The existing generated fixed-reference/A/A block and release ledger remain unchanged; these observations imply no cross-machine improvement, scaling result or fixed latency guarantee.
+
+Provenance: [run 40430486230](https://github.com/ohdearquant/khive/actions/runs/40430486230), attempt 1, [scoring-retrieval job 121947482310](https://github.com/ohdearquant/khive/actions/runs/40430486230/job/121947482310), [artifact 12702217093](https://github.com/ohdearquant/khive/actions/runs/40430486230/artifacts/12702217093). Measured checkout: synthetic merge [a72ad862cbfc57b6063fa26a1d7dfcebd0749c91](https://github.com/ohdearquant/khive/commit/a72ad862cbfc57b6063fa26a1d7dfcebd0749c91), ref `6184/merge`, tree `ae5b6ef2b3fde51324783e963302fff4b4d1c8fe` (equal to integration head `a8aaafaf104d76f3dd67a3232246b94900744efe`). The score sources and manifest match dev `f7524e536512c6a57b039933be034bbc5b75c4d3`. Artifact ZIP SHA-256: `2879796e358155b3e1d6e90ae30356da5a93f89d724d820a80f73a5a989a5544`.
+
+Host: Linux x86_64, `ubuntu-24.04` runner image, 4 logical CPUs, runner `GitHub Actions 1000462429`. Actual toolchain: `rustc 1.95.0 (59807616e 2026-04-14)`, `x86_64-unknown-linux-gnu`; optimized `bench` profile, `CARGO_INCREMENTAL=0`. CPU model, exhaustive compiler flags and resolved feature graph were not captured. The checked-in `crates/Cargo.lock` Git blob is `c5544b62827ecac6464b5eaa4a66e799554f4de0`; no separate runtime lockfile SHA-256 was captured.
+
+From `crates`, the component successfully compiled its bench targets, then ran:
+
+```text
+cargo bench -p khive-score -p khive-fusion -p khive-retrieval -p khive-text -p khive-bm25 --benches -- --quick --noplot
+```
+
+Each value is the archived Criterion `new/estimates.json` median point estimate in nanoseconds per benchmark iteration. All 37 selected `sample.json` files have `sampling_mode: "Linear"` and exactly two `iters`/`times` entries: these are actual two-sample quick observations, not the configured 20-sample arithmetic baseline or eleven individually timed operations. Batch IDs measure the entire batch; the workload boundaries above apply. Digits reproduce the archived point estimates, not a claim of measurement precision.
+
+| Exact Criterion source ID                | Observed median (ns) |
+| ---------------------------------------- | -------------------- |
+| `ops/weighted_sum/32`                    | 210.68160438537598   |
+| `score_from_distance/cosine_scalar`      | 6.183337330818176    |
+| `strict_cosine/valid`                    | 7.041262447834015    |
+| `strict_cosine/below_range`              | 2.530705213546753    |
+| `strict_cosine/above_range`              | 2.7077079713344574   |
+| `strict_cosine/nan`                      | 1.992587685585022    |
+| `strict_cosine/infinity`                 | 1.9863653630018234   |
+| `rrf_one_based/rank_50_k60`              | 5.449764281511307    |
+| `rrf_one_based/ranks_1_100_k60`          | 571.7925415039062    |
+| `decay_apply/exponential_rate/100`       | 1315.2475509643555   |
+| `decay_apply/exponential_rate/1000`      | 10964.87255859375    |
+| `decay_apply/hyperbolic_rate/100`        | 851.7629547119141    |
+| `decay_apply/hyperbolic_rate/1000`       | 5913.924285888672    |
+| `decay_apply/exponential_half_life/100`  | 1210.2587509155273   |
+| `decay_apply/exponential_half_life/1000` | 9730.628601074219    |
+| `decay_apply/hyperbolic_half_life/100`   | 827.5621643066406    |
+| `decay_apply/hyperbolic_half_life/1000`  | 5642.722839355469    |
+| `decay_apply/power_law/100`              | 833.8719177246094    |
+| `decay_apply/power_law/1000`             | 5916.452850341797    |
+| `decay_apply/none/100`                   | 685.5620880126953    |
+| `decay_apply/none/1000`                  | 4929.419006347656    |
+| `min_max_band/f64/100`                   | 582.7093276977539    |
+| `min_max_band/f64/1000`                  | 3961.0382690429688   |
+| `min_max_band/f32/100`                   | 555.3947067260742    |
+| `min_max_band/f32/1000`                  | 3388.302032470703    |
+| `weight_validation/ordered_valid/2`      | 10.482904314994812   |
+| `weight_validation/ordered_valid/8`      | 17.973282784223557   |
+| `weight_validation/ordered_valid/32`     | 50.37022441625595    |
+| `weight_validation/ordered_invalid/2`    | 23.82474994659424    |
+| `weight_validation/ordered_invalid/8`    | 30.410592555999756   |
+| `weight_validation/ordered_invalid/32`   | 61.69587969779968    |
+| `weight_validation/named_valid/2`        | 19.77314519882202    |
+| `weight_validation/named_valid/8`        | 54.95233511924744    |
+| `weight_validation/named_valid/32`       | 522.7974219322205    |
+| `weight_validation/named_invalid/2`      | 26.112743854522705   |
+| `weight_validation/named_invalid/8`      | 118.2883026599884    |
+| `weight_validation/named_invalid/32`     | 246.348130941391     |
+
+The 35 `arithmetic_paths` scenes appear once each, alongside the existing weighted-sum and lossy-cosine anchors. Directory/metric alias `ops_weighted_sum/32` maps to source ID `ops/weighted_sum/32`; the rows use source IDs, not escaped directory names. All 37 map to distinct metric keys and one benchmark start each in the job log; no score-selection collision was observed.
+
+The archive's `bench-data/components.jsonl` schema-v2 record is `status=ok`, `gate_status=pass`, with the same point estimates. Its `timestamp` (`2026-10-26T21:05:33-04:00`) is the measured commit date, not the execution date; the job ran on 2026-10-27 UTC. This single quick CI observation does not replace a qualified baseline or establish A/A repeatability.

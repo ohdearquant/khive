@@ -1,4 +1,6 @@
-use super::*;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::Duration;
 
 /// Bump whenever the request or response frame shape changes incompatibly.
 /// The server rejects frames whose version it does not speak, so a skewed

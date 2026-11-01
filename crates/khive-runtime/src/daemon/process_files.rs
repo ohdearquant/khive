@@ -172,8 +172,46 @@ pub(super) enum Incumbent {
     Serving(u32),
     /// A live PID still has an active or ambiguous rendezvous. Nothing removed.
     Live(u32),
+    /// A rendezvous could be live or could not be safely inspected.
+    Unknown,
     /// Nothing live owns the store; the socket and PID file were removed.
     Stale,
+}
+
+#[cfg(unix)]
+fn read_pid_contents(file: &std::fs::File) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon PID file is not a regular file",
+        ));
+    }
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut contents = String::new();
+    (&mut file).take(4097).read_to_string(&mut contents)?;
+    if contents.len() > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon PID file exceeds the inspection limit",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn read_pid_file(pid_file: &std::path::Path) -> std::io::Result<(std::fs::Metadata, String)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(pid_file)?;
+    let metadata = file.metadata()?;
+    let contents = read_pid_contents(&file)?;
+    Ok((metadata, contents))
 }
 
 /// Check whether `pid_file`/`sock` already name a live daemon and, if not,
@@ -189,8 +227,16 @@ pub(super) async fn cleanup_stale_daemon(
     allow_same_process_incumbent: bool,
     expected_config_id: &str,
 ) -> Incumbent {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
     let mut stale_pid_file_guard = None;
-    if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
+    let pid_snapshot = match read_pid_file(pid_file) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Incumbent::Unknown,
+    };
+    let pid_contents = pid_snapshot.as_ref().map(|(_, contents)| contents);
+    if let Some(pid_str) = pid_contents {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
                 && is_process_running(pid)
@@ -216,14 +262,69 @@ pub(super) async fn cleanup_stale_daemon(
             }
         }
     }
-    if sock.exists() {
-        if let Err(e) = std::fs::remove_file(sock) {
-            tracing::warn!(error = %e, path = ?sock, "failed to remove stale socket");
+    if pid_contents.is_some() && stale_pid_file_guard.is_none() {
+        match try_acquire_pid_file_lock(pid_file) {
+            Ok(Some(guard)) => stale_pid_file_guard = Some(guard),
+            Ok(None) | Err(_) => return Incumbent::Unknown,
         }
     }
-    if pid_file.exists() {
-        if let Err(e) = std::fs::remove_file(pid_file) {
-            tracing::warn!(error = %e, path = ?pid_file, "failed to remove stale PID file");
+    if let (Some((observed, expected)), Some(guard)) = (&pid_snapshot, &stale_pid_file_guard) {
+        let (Ok(owned), Ok(current), Ok(contents)) = (
+            guard.metadata(),
+            std::fs::symlink_metadata(pid_file),
+            read_pid_contents(guard),
+        ) else {
+            return Incumbent::Unknown;
+        };
+        if !owned.is_file()
+            || !current.is_file()
+            || owned.dev() != observed.dev()
+            || owned.ino() != observed.ino()
+            || owned.dev() != current.dev()
+            || owned.ino() != current.ino()
+            || &contents != expected
+        {
+            return Incumbent::Unknown;
+        }
+    }
+
+    let socket_metadata = match std::fs::symlink_metadata(sock) {
+        Ok(metadata) if metadata.file_type().is_socket() => Some(metadata),
+        Ok(_) => return Incumbent::Unknown,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Incumbent::Unknown,
+    };
+    if let Some(observed) = socket_metadata {
+        if !socket_is_unreachable(sock).await {
+            return Incumbent::Unknown;
+        }
+        let current = match std::fs::symlink_metadata(sock) {
+            Ok(metadata) if metadata.file_type().is_socket() => metadata,
+            _ => return Incumbent::Unknown,
+        };
+        if observed.dev() != current.dev() || observed.ino() != current.ino() {
+            return Incumbent::Unknown;
+        }
+        if let Err(error) = std::fs::remove_file(sock) {
+            tracing::warn!(%error, path = ?sock, "failed to remove stale socket");
+            return Incumbent::Unknown;
+        }
+    }
+    if let Some(guard) = &stale_pid_file_guard {
+        let owned = match guard.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => return Incumbent::Unknown,
+        };
+        let current = match std::fs::symlink_metadata(pid_file) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => return Incumbent::Unknown,
+        };
+        if owned.dev() != current.dev() || owned.ino() != current.ino() {
+            return Incumbent::Unknown;
+        }
+        if let Err(error) = std::fs::remove_file(pid_file) {
+            tracing::warn!(%error, path = ?pid_file, "failed to remove stale PID file");
+            return Incumbent::Unknown;
         }
     }
     drop(stale_pid_file_guard);
@@ -260,10 +361,25 @@ pub(super) fn write_pid_file_exclusive(
 pub(super) fn try_acquire_pid_file_lock(
     pid_file: &std::path::Path,
 ) -> std::io::Result<Option<std::fs::File>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pid_file)?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = |write| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(pid_file)
+    };
+    let file = match open(true) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => open(false)?,
+        result => result?,
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon PID file is not a regular file",
+        ));
+    }
     // SAFETY: flock is a POSIX advisory lock with no memory side effects.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
@@ -320,7 +436,7 @@ pub(super) async fn pid_file_names_a_reachable_daemon(
         && socket_speaks_khived_protocol(sock, expected_config_id).await
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) async fn drain(active: &std::sync::atomic::AtomicUsize) -> bool {
     drain_with_timeout(active, drain_timeout()).await
 }

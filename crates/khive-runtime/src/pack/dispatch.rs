@@ -734,46 +734,33 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // Drain any process-lifetime `OnceLock` config locks queued
-                // since the last dispatch and persist them as `ConfigLocked`
-                // events, riding this same audit-persistence gate. The
-                // namespace/actor stamped on these rows are whichever
-                // dispatch happens to observe the queue non-empty first:
-                // an accepted provenance quirk, preferred over threading an
-                // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site. The verb column is NOT
-                // inherited from that bystander dispatch: a config-lock row
-                // wearing an operation verb pollutes verb-filtered queries
-                // (e.g. per-verb receipt counts), so these rows carry their
-                // own `config.lock` pseudo-verb and remain discoverable by
-                // `EventKind::ConfigLocked`.
-                if let Some(store) = &self.event_store {
-                    if crate::config_ledger::PENDING
-                        .swap(false, std::sync::atomic::Ordering::AcqRel)
-                    {
-                        for (key, value) in crate::config_ledger::drain_config_locked() {
-                            let payload = serde_json::json!({ "key": key, "value": value });
-                            let storage_event = Event::new(
-                                gate_req.namespace.as_str(),
-                                "config.lock",
-                                EventKind::ConfigLocked,
-                                SubstrateKind::Event,
-                                format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
-                            )
-                            .with_payload(payload);
-                            // ConfigLocked is pure observability: the helper
-                            // never returns `Err` for it, so there is
-                            // nothing to fold.
-                            let _ = append_audit_event_best_effort(
-                                self.audit_batch.as_ref(),
-                                store,
-                                storage_event,
-                                "config.lock",
-                                crate::audit_batch::AuditProducer::ConfigLocked,
-                                false,
-                            )
-                            .await;
-                        }
+                // Drain only the runtime retained with this audit sink. The
+                // owned batch has released its ledger guard before any append.
+                // Namespace/actor and the best-effort audit path stay unchanged.
+                if let (Some(store), Some(runtime)) = (&self.event_store, &self.config_lock_runtime)
+                {
+                    for (key, value) in runtime.drain_config_locked() {
+                        let payload = serde_json::json!({ "key": key, "value": value });
+                        let storage_event = Event::new(
+                            gate_req.namespace.as_str(),
+                            "config.lock",
+                            EventKind::ConfigLocked,
+                            SubstrateKind::Event,
+                            format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+                        )
+                        .with_payload(payload);
+                        // ConfigLocked is pure observability: the helper
+                        // never returns `Err` for it, so there is
+                        // nothing to fold.
+                        let _ = append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            storage_event,
+                            "config.lock",
+                            crate::audit_batch::AuditProducer::ConfigLocked,
+                            false,
+                        )
+                        .await;
                     }
                 }
 
@@ -968,7 +955,7 @@ impl VerbRegistry {
                                 .get("properties")
                                 .is_some_and(|properties| properties.get("namespace").is_some())
                         });
-                let params = if !handler_accepts_namespace {
+                let mut params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
                         Value::Object(map)
@@ -978,6 +965,9 @@ impl VerbRegistry {
                 } else {
                     params
                 };
+                if let Some(handler) = handler_def {
+                    crate::params::integer_params_from_whole_floats(&mut params, handler.params);
+                }
                 let dispatch_start = Instant::now();
                 let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
                     serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})

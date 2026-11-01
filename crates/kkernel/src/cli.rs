@@ -82,7 +82,7 @@ enum Command {
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
-    /// Schema migration lifecycle: migrate and check.
+    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune.
     #[command(subcommand)]
     Db(DbCommand),
 
@@ -293,6 +293,9 @@ enum DbCommand {
 
     /// Report per-backend schema state without applying changes.
     Check(DbCheckArgs),
+
+    /// Prune expendable polling-dispatch audit rows from an events store (ADR-212 §4). Dry run unless --apply.
+    EventsPrune(crate::events_prune::EventsPruneArgs),
 
     /// Restore exported note rows (JSONL) into a database file with their original ids and timestamps.
     ImportNotes(crate::import_notes::ImportNotesArgs),
@@ -911,6 +914,7 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate(args) => cmd_db_migrate(args).await,
         DbCommand::Check(args) => cmd_db_check(args).await,
+        DbCommand::EventsPrune(args) => crate::events_prune::run(args).await,
         DbCommand::ImportNotes(args) => crate::import_notes::run(args).await,
     }
 }
@@ -1264,16 +1268,20 @@ impl<W: std::io::Write> std::io::Write for BestEffortWriter<W> {
 fn init_tracing(level: &str) {
     // Tracing goes to stderr — stdout is reserved for JSON / MCP results.
     //
-    // Silence the benign `lattice_inference` tokenizer warning ("tokenizer and
-    // model vocab sizes differ" — the multilingual paraphrase model carries a
-    // handful of extra reserved tokens) while honoring the caller's level for
-    // everything else.
+    // Silence the benign BERT tokenizer warning ("tokenizer and model vocab
+    // sizes differ" — the multilingual paraphrase model carries a handful of
+    // extra reserved tokens), logged by `lattice_model_bert` (by
+    // `lattice_inference` before lattice 0.15), and the `lattice_tokenizer`
+    // truncation warnings (WordPiece, SentencePiece and BPE: an input longer
+    // than the model's max_seq_len is cut to fit; khive reports that itself per
+    // write through `EmbeddingTruncationReport`) while honoring the caller's
+    // level for everything else.
     //
     // Force-enable `khive.boot` at INFO: the resolved-database disclosure
     // (issue #1586) is emitted on that target at startup, and the global
     // default level is `warn` — without this pin the disclosure would be
     // silently filtered for every operator who never sets KHIVE_LOG.
-    let filter = format!("{level},khive.boot=info,khive.import.schema=warn,khive.config.schema=warn,lattice_inference=error");
+    let filter = format!("{level},khive.boot=info,khive.import.schema=warn,khive.config.schema=warn,lattice_inference=error,lattice_model_bert=error,lattice_tokenizer=error");
     tracing_subscriber::fmt()
         .with_writer(|| BestEffortWriter(std::io::stderr()))
         .with_env_filter(filter)

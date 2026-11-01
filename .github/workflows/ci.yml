@@ -987,7 +987,12 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
     needs: resolve-revision
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The nightly run scans every ref and a replay scans its commit's whole history. Measured on the
+    # scheduled runs: the full-history checkout took 2.5 to 4.2 minutes; the scan finished 12,304
+    # commits in 5m50s on the one night it completed and was still running at 6m00s to 6m50s on the
+    # nights the 10-minute limit cancelled it (9 of 10). Pull request and push runs scan their own
+    # range whenever one resolves, and keep 10.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 10 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1734,6 +1739,14 @@ jobs:
       # step runs the S3 store, configuration and server library tests.
       - name: Run the S3 blob store library tests
         run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
+      # The install gate probes the operator build with an isolated config, and a pack
+      # that refuses to register under that config fails every install. This step
+      # builds kkernel with the build-local feature set and runs the same probe on it,
+      # so that refusal fails the pull request instead.
+      - name: Probe a kkernel built with the operator feature set
+        run: |
+          cargo build -p kkernel --bin kkernel --locked --features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
+          make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}
@@ -1772,7 +1785,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
-      # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
+      # compile on x86_64-pc-windows-msvc.
       # Not (yet) a required check in branch protection — plain `cargo check`
       # (no --all-targets) keeps this fast while the Windows lane is new;
       # widen once it has proven stable.

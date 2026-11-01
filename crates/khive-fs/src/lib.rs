@@ -11,9 +11,15 @@
 //! on every platform; its separate final-component no-follow regular-file open is Unix only.
 //! `tree_discovery` adds breadth-first discovery with progress and failure reports on every
 //! platform, retaining parent-directory capabilities for selected files on Unix.
+//! `canonical_path` resolves pathnames with missing suffixes on every platform by observing
+//! the current topology; it does not grant a file or directory capability.
 
+/// Complete create-only publication, preserving competing final entries.
+pub mod atomic_create;
 #[cfg(unix)]
 pub mod atomic_publish;
+/// Portable current-topology pathname resolution with missing suffixes.
+pub mod canonical_path;
 #[cfg(unix)]
 pub mod directory_walk;
 #[cfg(unix)]

@@ -308,6 +308,122 @@ async fn remember_replay_answers_from_the_stored_memory() {
         .and_then(|v| v.as_str())
         .map(str::to_owned);
     assert_eq!(stored_type.as_deref(), Some("semantic"));
+
+    let alternate = rt
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "alternate source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .map(|(row, _report)| row)
+        .expect("alternate entity");
+    let missing = uuid::Uuid::new_v4();
+    for replay_source in [alternate.id, missing] {
+        let replay = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "replayed memory answers from the store",
+                    "memory_type": "semantic",
+                    "namespace": "local",
+                    "source_id": replay_source.to_string(),
+                    "idempotency_key": "remember-replay-stored",
+                }),
+            )
+            .await
+            .expect("replay ignores a changed or missing full UUID source");
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(replay["replayed"], serde_json::json!(true));
+        assert_eq!(replay["edge_id"], serde_json::json!(first_edge));
+    }
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let edge_count = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edge-count".into()),
+        })
+        .await
+        .expect("count original memory edges");
+    assert!(matches!(edge_count, Some(SqlValue::Integer(1))));
+    drop(reader);
+
+    assert!(rt
+        .delete_entity(&token, source.id, true)
+        .await
+        .expect("delete source"));
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let before = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edges-before".into()),
+        })
+        .await
+        .expect("count edges after source deletion");
+    drop(reader);
+    let replay = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "replayed memory answers from the store",
+                "memory_type": "semantic",
+                "namespace": "local",
+                "source_id": source.id.to_string(),
+                "idempotency_key": "remember-replay-stored",
+            }),
+        )
+        .await
+        .expect("replay after deletion of original source");
+    assert_eq!(replay["id"], first["id"]);
+    assert_eq!(replay["replayed"], serde_json::json!(true));
+    let surviving_edges = rt
+        .neighbors_with_query(
+            &token,
+            first["id"].as_str().unwrap().parse().unwrap(),
+            khive_storage::types::NeighborQuery {
+                direction: khive_storage::types::Direction::Out,
+                relations: Some(vec![khive_storage::EdgeRelation::Annotates]),
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .expect("read surviving original annotation");
+    let surviving_edge = surviving_edges.first().map(|hit| hit.edge_id.to_string());
+    if let Some(edge) = &surviving_edge {
+        assert_eq!(edge, &first_edge);
+    }
+    assert_eq!(
+        replay.get("edge_id").and_then(|edge| edge.as_str()),
+        surviving_edge.as_deref()
+    );
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let after = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edges-after".into()),
+        })
+        .await
+        .expect("count edges after replay");
+    assert!(matches!((before, after),
+        (Some(SqlValue::Integer(a)), Some(SqlValue::Integer(b))) if a == b));
+    drop(reader);
+    assert_eq!(
+        rt.notes(&token)
+            .unwrap()
+            .get_live_notes_by_key("local", "remember-replay-stored", Some("memory"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 struct CountingService(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 

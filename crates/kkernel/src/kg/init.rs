@@ -1,6 +1,6 @@
 //! `kkernel kg init` and `kkernel kg hook` — initialization and hook management.
 
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
 
 use super::types::{HookCommand, HookStatus, InitArgs};
@@ -15,6 +15,15 @@ model = "all-minilm-l6-v2"
 default = true
 dims = 384
 "#;
+
+// Vocabulary caches are owned by pack management (ADR-020 §3), not init.
+const DEFAULT_SCHEMA_YAML: &str = concat!(
+    "format_version: \"2.0.0\"\n",
+    "ontology_version: \"1.0.0\"\n",
+    "khive_version: \"",
+    env!("CARGO_PKG_VERSION"),
+    "\"\nremotes: []\n",
+);
 
 const OLD_GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!khive.toml\n";
 const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!config.toml\n";
@@ -53,6 +62,13 @@ jobs:
 "#;
 
 pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
+    cmd_init_with_hook_prompt(args, prompt_hook_install)
+}
+
+fn cmd_init_with_hook_prompt(
+    args: InitArgs,
+    prompt: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     if args.add_hooks {
         return hook_install(&args.repo);
     }
@@ -100,10 +116,19 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("create {}", hooks_dir.display()))?;
 
+    let schema_path = kg_dir.join("schema.yaml");
+    if create_default_schema(&schema_path)? {
+        println!("  Initialized {}", schema_path.display());
+    } else {
+        println!("  Skipped {} (already exists)", schema_path.display());
+    }
+
     for name in &["entities.ndjson", "edges.ndjson"] {
         let path = kg_dir.join(name);
-        if !path.exists() {
-            std::fs::write(&path, "").with_context(|| format!("create {}", path.display()))?;
+        if !khive_fs::atomic_create::create_only(&path, |_| Ok(()))
+            .with_context(|| format!("create {}", path.display()))?
+        {
+            println!("  Skipped {} (already exists)", path.display());
         }
     }
 
@@ -111,32 +136,76 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     update_gitignore(&gitignore)?;
 
     let hook_script = hooks_dir.join("pre-commit");
-    if !hook_script.exists() {
-        std::fs::write(&hook_script, PRE_COMMIT_HOOK)
-            .with_context(|| format!("write {}", hook_script.display()))?;
+    if !khive_fs::atomic_create::create_only(&hook_script, |file| {
+        file.write_all(PRE_COMMIT_HOOK.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_script)?.permissions();
+            let mut perms = file.metadata()?.permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_script, perms)?;
+            file.set_permissions(perms)?;
         }
+        Ok(())
+    })
+    .with_context(|| format!("create {}", hook_script.display()))?
+    {
+        println!("  Skipped {} (already exists)", hook_script.display());
     }
 
-    println!("  Initialized .khive/kg/ (entities.ndjson, edges.ndjson, hooks/pre-commit)");
+    println!(
+        "  Initialized .khive/kg/ (schema.yaml, entities.ndjson, edges.ndjson, hooks/pre-commit)"
+    );
 
     if args.ci {
         let workflow_dir = args.repo.join(".github/workflows");
         std::fs::create_dir_all(&workflow_dir)
             .with_context(|| format!("create {}", workflow_dir.display()))?;
         let workflow_path = workflow_dir.join("kg-validate.yml");
-        if !workflow_path.exists() {
-            std::fs::write(&workflow_path, CI_WORKFLOW)
-                .with_context(|| format!("write {}", workflow_path.display()))?;
+        if khive_fs::atomic_create::create_only(&workflow_path, |file| {
+            file.write_all(CI_WORKFLOW.as_bytes())
+        })
+        .with_context(|| format!("create {}", workflow_path.display()))?
+        {
             println!("  Generated {}", workflow_path.display());
+        } else {
+            println!("  Skipped {} (already exists)", workflow_path.display());
         }
     }
 
+    prompt(&args.repo)?;
+    Ok(())
+}
+
+fn prompt_hook_install(repo: &Path) -> Result<()> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Ok(());
+    }
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout();
+    prompt_hook_install_with_io(repo, true, &mut input, &mut output)
+}
+
+fn prompt_hook_install_with_io<R: BufRead, W: Write>(
+    repo: &Path,
+    stdin_is_terminal: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<()> {
+    if !stdin_is_terminal {
+        return Ok(());
+    }
+    write!(output, "  Install pre-commit hook? [y/N]: ")
+        .context("write hook installation prompt")?;
+    output.flush().context("flush hook installation prompt")?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .context("read hook installation answer")?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        hook_install(repo)?;
+    }
     Ok(())
 }
 
@@ -163,17 +232,11 @@ fn existing_config_file(path: &Path) -> Result<bool> {
 }
 
 fn create_default_config(path: &Path) -> Result<bool> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_KHIVE_TOML.as_bytes())
-                .with_context(|| format!("write {}", path.display()))?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(DEFAULT_KHIVE_TOML.as_bytes())
+    }) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
             if !existing_config_file(path)? {
                 bail!(
                     "Configuration path {} changed during initialization; rerun kg init",
@@ -186,16 +249,29 @@ fn create_default_config(path: &Path) -> Result<bool> {
     }
 }
 
+fn create_default_schema(path: &Path) -> Result<bool> {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(DEFAULT_SCHEMA_YAML.as_bytes())
+    }) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            if !metadata.is_file() {
+                bail!("KG schema path {} is not a regular file", path.display());
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
 fn update_gitignore(path: &Path) -> Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => file
-            .write_all(GITIGNORE_CONTENT.as_bytes())
-            .with_context(|| format!("write {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+    match khive_fs::atomic_create::create_only(path, |file| {
+        file.write_all(GITIGNORE_CONTENT.as_bytes())
+    }) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
             // A link belongs to the operator. Do not follow it for migration.
             let metadata = std::fs::symlink_metadata(path)
                 .with_context(|| format!("inspect {}", path.display()))?;
@@ -203,13 +279,66 @@ fn update_gitignore(path: &Path) -> Result<()> {
                 && std::fs::read(path).with_context(|| format!("read {}", path.display()))?
                     == OLD_GITIGNORE_CONTENT.as_bytes()
             {
-                std::fs::write(path, GITIGNORE_CONTENT)
-                    .with_context(|| format!("write {}", path.display()))?;
+                replace_gitignore(path, metadata.permissions())?;
             }
             Ok(())
         }
         Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
     }
+}
+
+// The parent/staging namespace is trusted, as for atomic_create. Only this
+// attempt's exclusively created sibling is cleaned up; rename commits replacement.
+fn replace_gitignore(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().context("gitignore must have a parent")?;
+    #[cfg(unix)]
+    let directory = std::fs::File::open(parent).context("open gitignore parent for sync")?;
+    for _ in 0..16 {
+        let stage = parent.join(format!(
+            ".gitignore-migrate-{}-{}.tmp",
+            std::process::id(),
+            NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&stage) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create gitignore migration stage"),
+        };
+        let prepared = (|| -> Result<()> {
+            file.write_all(GITIGNORE_CONTENT.as_bytes())
+                .context("write staged gitignore (WriteTmp)")?;
+            file.set_permissions(permissions.clone())
+                .context("preserve gitignore permissions on stage")?;
+            file.sync_all().context("sync staged gitignore (SyncTmp)")
+        })();
+        drop(file);
+        let promoted = prepared
+            .and_then(|()| std::fs::rename(&stage, path).context("rename staged gitignore"));
+        if let Err(primary) = promoted {
+            return match std::fs::remove_file(&stage) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(primary.context(format!(
+                    "cleanup owned gitignore stage {} also failed: {cleanup}",
+                    stage.display()
+                ))),
+            };
+        }
+        // The stage name is no longer ours after rename; never clean it here.
+        #[cfg(unix)]
+        directory
+            .sync_all()
+            .context("gitignore replacement installed; parent directory sync failed")?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "exclusive gitignore migration staging retry limit reached",
+    ))
+    .context("create gitignore migration stage")
 }
 
 pub(super) fn cmd_hook(cmd: HookCommand) -> Result<()> {
@@ -309,6 +438,14 @@ mod tests {
 
     use super::*;
 
+    fn init_noninteractive(args: InitArgs) -> Result<()> {
+        let mut input = std::io::empty();
+        let mut output = std::io::sink();
+        cmd_init_with_hook_prompt(args, |repo| {
+            prompt_hook_install_with_io(repo, false, &mut input, &mut output)
+        })
+    }
+
     #[test]
     fn init_creates_expected_files() {
         let tmp = TempDir::new().unwrap();
@@ -317,7 +454,7 @@ mod tests {
             ci: false,
             add_hooks: false,
         };
-        cmd_init(args).unwrap();
+        init_noninteractive(args).unwrap();
 
         assert!(tmp.path().join(".khive/kg/entities.ndjson").exists());
         assert!(tmp.path().join(".khive/kg/edges.ndjson").exists());
@@ -337,7 +474,7 @@ mod tests {
             ci: false,
             add_hooks: false,
         };
-        cmd_init(args).unwrap();
+        init_noninteractive(args).unwrap();
 
         let content = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(content, "# custom\n", "should not overwrite existing toml");
@@ -365,7 +502,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&init.stderr)
         );
-        cmd_init(InitArgs {
+        init_noninteractive(InitArgs {
             repo: tmp.path().to_path_buf(),
             ci: false,
             add_hooks: false,
@@ -425,4 +562,395 @@ mod tests {
             assert_eq!(output.status.code(), Some(expected), "{path}");
         }
     }
+
+    fn manifest_init_args(tmp: &TempDir) -> InitArgs {
+        InitArgs {
+            repo: tmp.path().to_path_buf(),
+            ci: false,
+            add_hooks: false,
+        }
+    }
+
+    #[test]
+    fn init_creates_versioned_schema_with_empty_remotes() {
+        let tmp = TempDir::new().unwrap();
+
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
+
+        let path = tmp.path().join(".khive/kg/schema.yaml");
+        assert!(path.is_file(), "kg init must create its default schema");
+        let schema = std::fs::read_to_string(&path).unwrap();
+        assert!(schema.starts_with("format_version: \"2.0.0\"\n"));
+        assert!(schema.contains("\nontology_version: \"1.0.0\"\n"));
+        assert!(schema.contains(&format!(
+            "\nkhive_version: \"{}\"\n",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(schema.ends_with("remotes: []\n"));
+        for pack_owned in [
+            "entity_kinds:",
+            "entity_types:",
+            "edge_relations:",
+            "properties:",
+            "packs:",
+        ] {
+            assert!(
+                !schema.contains(pack_owned),
+                "init must not invent a pack vocabulary cache"
+            );
+        }
+        let before = std::fs::read(&path).unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn init_preserves_custom_schema_and_pins_across_reruns() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = tmp.path().join(".khive/kg");
+        std::fs::create_dir_all(&kg_dir).unwrap();
+        let path = kg_dir.join("schema.yaml");
+        let custom = concat!(
+            "# operator-owned schema and pins\n",
+            "format_version: '2.4.0'\nontology_version: '9.8.7'\nkhive_version: 'custom-writer'\n",
+            "entity_kinds: [concept]\ncustom: {answer: 42}\n",
+            "remotes:\n  - name: upstream\n    repo: example/project\n",
+            "    commit: '1111111111111111111111111111111111111111'\n",
+            "    pin: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "    ref: stable\n",
+        );
+        std::fs::write(&path, custom).unwrap();
+
+        for _ in 0..2 {
+            init_noninteractive(manifest_init_args(&tmp)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), custom.as_bytes());
+        }
+    }
+
+    #[test]
+    fn schema_create_preserves_an_existing_competing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        std::fs::write(&path, "# competing schema\nremotes: []\n").unwrap();
+
+        assert!(!create_default_schema(&path).unwrap());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"# competing schema\nremotes: []\n"
+        );
+    }
+
+    #[test]
+    fn schema_create_refuses_a_directory_without_replacing_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(create_default_schema(&path).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_create_refuses_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        for contents in [Some("# custom schema\n"), None] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("schema.yaml");
+            let target = tmp.path().join("operator-schema.yaml");
+            if let Some(contents) = contents {
+                std::fs::write(&target, contents).unwrap();
+            }
+            symlink(&target, &path).unwrap();
+
+            assert!(create_default_schema(&path).is_err());
+            assert_eq!(std::fs::read_link(path).unwrap(), target);
+            if let Some(contents) = contents {
+                assert_eq!(std::fs::read(&target).unwrap(), contents.as_bytes());
+            } else {
+                assert!(!target.exists());
+            }
+        }
+    }
+
+    // Owner-native fixture only: each child Git command is confined to this TempDir.
+    // Never mutate process-global environment or substitute a fake Git executable.
+    fn manifest_fixture_git(repo: &Path, args: &[&str]) -> String {
+        let empty_config = repo.join("empty-fixture.gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("GIT_")) {
+                command.env_remove(name);
+            }
+        }
+        let mut hooks = std::ffi::OsString::from("core.hooksPath=");
+        hooks.push(repo.join("no-hooks"));
+        let output = command
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", empty_config)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-c")
+            .arg(hooks)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "user.name=KG init fixture",
+                "-c",
+                "user.email=kg-init-fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn init_schema_supports_public_remote_pin_update_and_preserves_result_on_rerun() {
+        const OLD_COMMIT: &str = "1111111111111111111111111111111111111111";
+        const ARCHIVE_PIN: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tmp = TempDir::new().unwrap();
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
+        let schema_path = tmp.path().join(".khive/kg/schema.yaml");
+        assert!(
+            schema_path.is_file(),
+            "the real init route must produce the input schema"
+        );
+        let initial = std::fs::read_to_string(&schema_path).unwrap();
+        let metadata = initial
+            .strip_suffix("remotes: []\n")
+            .expect("init provides an empty remote sequence");
+        let configured = format!(
+            "{metadata}remotes:\n  - name: origin\n    url: ./remote.git\n    commit: '{OLD_COMMIT}'\n    ref: stable\n    pin: {ARCHIVE_PIN}\n",
+        );
+        std::fs::write(&schema_path, configured).unwrap();
+        let remote_path = tmp.path().join("remote.git");
+        std::fs::create_dir(&remote_path).unwrap();
+        manifest_fixture_git(
+            &remote_path,
+            &[
+                "init",
+                "--quiet",
+                "--object-format=sha1",
+                "--template=",
+                ".",
+            ],
+        );
+        manifest_fixture_git(&remote_path, &["symbolic-ref", "HEAD", "refs/heads/stable"]);
+        manifest_fixture_git(
+            &remote_path,
+            &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+        );
+        let expected = manifest_fixture_git(&remote_path, &["rev-parse", "--verify", "HEAD"]);
+        let remote = khive_vcs::sync::RemoteName::parse("origin").unwrap();
+
+        let result = khive_vcs::remote_pin::update_remote_pin(tmp.path(), &remote, None);
+
+        assert!(
+            result.is_ok(),
+            "init metadata plus only one remote entry must be accepted: {result:?}"
+        );
+        let receipt = result.unwrap();
+        assert!(receipt.updated);
+        assert_eq!(receipt.remote, "origin");
+        assert_eq!(receipt.requested_ref, "stable");
+        assert_eq!(receipt.previous_commit, OLD_COMMIT);
+        assert_eq!(receipt.commit, expected);
+        let pinned = std::fs::read(&schema_path).unwrap();
+        assert!(String::from_utf8_lossy(&pinned).contains(ARCHIVE_PIN));
+        let second = khive_vcs::remote_pin::update_remote_pin(tmp.path(), &remote, None).unwrap();
+        assert!(!second.updated);
+        assert_eq!(second.previous_commit, expected);
+        assert_eq!(second.commit, expected);
+        assert_eq!(std::fs::read(&schema_path).unwrap(), pinned);
+        init_noninteractive(manifest_init_args(&tmp)).unwrap();
+        assert_eq!(std::fs::read(schema_path).unwrap(), pinned);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_create_write_failure_leaves_no_final_and_allows_retry() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        const LIMITED_CHILD: &str = "KKERNEL_SCHEMA_FSIZE_CHILD";
+        const SCHEMA_PATH: &str = "KKERNEL_SCHEMA_FSIZE_PATH";
+        const WRITE_ERROR_MARKER: &str = "KKERNEL_SCHEMA_LIMIT_WRITE_ERROR_REACHED";
+        let thread = std::thread::current();
+        let name = thread.name().expect("libtest names its test threads");
+        if std::env::var(LIMITED_CHILD).ok().as_deref() == Some(name) {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(SCHEMA_PATH).expect("limited child schema path"),
+            );
+            let error = create_default_schema(&path)
+                .expect_err("zero file-size limit must refuse the nonempty schema write");
+            assert!(
+                error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
+                }),
+                "limited child must reach a file-size write failure: {error:#}"
+            );
+            println!("{WRITE_ERROR_MARKER}");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schema.yaml");
+        let probe = tmp.path().join("normal-limit-control");
+        std::fs::write(&probe, DEFAULT_SCHEMA_YAML.as_bytes())
+            .expect("normal-limit parent can write the complete schema");
+        std::fs::remove_file(probe).unwrap();
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"trap '' XFSZ || exit 81; ulimit -f 0 || exit 82; exec "$@""#,
+                "schema-write-limit",
+            ])
+            .arg(std::env::current_exe().expect("current library test executable"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(LIMITED_CHILD, name)
+            .env(SCHEMA_PATH, &path)
+            // Profiling must not create a regular profraw file under the zero limit.
+            .env("LLVM_PROFILE_FILE", "/dev/null")
+            .output()
+            .expect("spawn the isolated file-size-limited test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(WRITE_ERROR_MARKER),
+            "limited child must execute exactly one passing write-failure case:\n{stdout}\n{stderr}"
+        );
+        println!("KKERNEL_SCHEMA_LIMIT_CHILD_VERIFIED");
+
+        let final_entry = std::fs::symlink_metadata(&path);
+        assert!(
+            matches!(&final_entry, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "failed schema write must leave no final directory entry: {final_entry:?}"
+        );
+        assert!(create_default_schema(&path).expect("normal-limit retry creates schema"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            DEFAULT_SCHEMA_YAML.as_bytes()
+        );
+        assert!(!create_default_schema(&path).expect("complete schema is preserved"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn gitignore_migration_write_failure_preserves_old_bytes_and_cleans_stage() {
+        const CHILD: &str = "KKERNEL_GITIGNORE_FSIZE_CHILD";
+        const IGNORE_PATH: &str = "KKERNEL_GITIGNORE_FSIZE_PATH";
+        const MARKER: &str = "KKERNEL_GITIGNORE_WRITE_TMP_EFBIG_REACHED";
+        let thread = std::thread::current();
+        let name = thread.name().expect("libtest test name");
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            assert_eq!(
+                std::env::args().skip(1).collect::<Vec<_>>(),
+                vec!["--exact", name, "--nocapture", "--test-threads=1"]
+            );
+            let path =
+                std::path::PathBuf::from(std::env::var_os(IGNORE_PATH).expect("ignore path"));
+            let error = update_gitignore(&path).expect_err("stage write must hit file-size limit");
+            assert!(
+                format!("{error:#}").contains("WriteTmp")
+                    && error.chain().any(|cause| cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == ErrorKind::FileTooLarge)),
+                "must reach actual staged write, not setup failure: {error:#}"
+            );
+            println!("{MARKER}");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, OLD_GITIGNORE_CONTENT).unwrap();
+        update_gitignore(&path).expect("unrestricted migration positive baseline");
+        assert_eq!(std::fs::read(&path).unwrap(), GITIGNORE_CONTENT.as_bytes());
+        std::fs::write(&path, OLD_GITIGNORE_CONTENT).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut command = Command::new("/bin/sh");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        let mut child = command
+            .args([
+                "-c",
+                r#"trap '' XFSZ || exit 81; ulimit -f 0 || exit 82; exec "$@""#,
+                "gitignore-write-limit",
+            ])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env(IGNORE_PATH, &path)
+            .env("HOME", &home)
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("LLVM_PROFILE_FILE", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn file-size-limited migration test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().expect("poll limited child").is_none() {
+            if std::time::Instant::now() >= deadline {
+                let killed = child.kill();
+                let reap_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let reaped = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Err(_) => break false,
+                        Ok(None) if std::time::Instant::now() >= reap_until => break false,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                };
+                panic!("limited migration child exceeded 30s; kill={killed:?}, reaped={reaped}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child
+            .wait_with_output()
+            .expect("collect limited child output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(MARKER),
+            "limited child must execute one passing WriteTmp case:\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            OLD_GITIGNORE_CONTENT.as_bytes()
+        );
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".gitignore-migrate-")));
+        update_gitignore(&path).expect("unrestricted retry must migrate");
+        assert_eq!(std::fs::read(&path).unwrap(), GITIGNORE_CONTENT.as_bytes());
+    }
 }
+
+#[cfg(test)]
+#[path = "init_prompt_tests.rs"]
+mod prompt_tests;

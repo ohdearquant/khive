@@ -47,6 +47,9 @@ impl KhiveMcpServer {
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
+                error @ PackLoadError::MissingDependencies { .. } => {
+                    PackRegFailure::Registry(RuntimeError::InvalidInput(error.to_string()))
+                }
                 PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
@@ -123,6 +126,8 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.as_str().to_string(),
             config_id,
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool,
             secondary_pools: Vec::new(),

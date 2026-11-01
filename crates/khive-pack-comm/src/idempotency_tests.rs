@@ -19,3 +19,5 @@ include!("idempotency_tests/concurrency_and_reply_tests.rs");
 include!("idempotency_tests/key_scope_tests.rs");
 
 include!("idempotency_tests/lifecycle_tests.rs");
+
+include!("idempotency_tests/node_send_tests.rs");

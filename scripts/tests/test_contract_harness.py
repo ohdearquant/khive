@@ -211,7 +211,8 @@ class HarnessTests(unittest.TestCase):
                    "KHIVE_CONFIG": "/unowned/config", "KHIVE_NO_DAEMON": "0", "FAKE_LOG": str(self.log)}
         with mock.patch.dict(os.environ, ambient):
             before = dict(os.environ)
-            with KhiveMcpSession(binary=self.fake, timeout=0.3) as session:
+            with KhiveMcpSession(binary=self.fake, timeout=2.0, reap_timeout=0.3) as session:
+                session._transport.timeout = 0.3
                 session.tools_list()
             self.assertEqual(dict(os.environ), before)
         call = self.calls()[0]
@@ -225,7 +226,7 @@ class HarnessTests(unittest.TestCase):
         self.assertNotEqual(call['env']['HOME'], before.get('HOME'))
         with OwnedContractStore() as store, mock.patch.dict(os.environ, ambient):
             parent = dict(os.environ)
-            with self.adapter("legacy", store) as request:
+            with self.adapter("legacy", store, startup_timeout=2.0, reap_timeout=0.3) as request:
                 self.assertEqual(request(), [])
             self.assertEqual(dict(os.environ), parent)
             call = self.calls()[-1]
@@ -275,13 +276,15 @@ class HarnessTests(unittest.TestCase):
         note = fixtures.sample_note.__wrapped__("local")()
         explicit = {"kind": "concept", "name": "ExplicitNamespace", "namespace": "ns-alpha"}
         with OwnedContractStore() as store:
-            with KhiveMcpSession(binary=self.fake, store=store, env={"FAKE_LOG": str(self.log)}, timeout=0.3) as session:
+            with KhiveMcpSession(binary=self.fake, store=store, env={"FAKE_LOG": str(self.log)}, timeout=2.0, reap_timeout=0.3) as session:
+                session._transport.timeout = 0.3
                 for args in (entity, note, explicit):
                     self.assertEqual(session.verb("create", args), args)
                 ops = [{"tool": "create", "args": explicit}]
                 self.assertEqual(session.request_batch(ops)["results"][0]["result"], explicit)
             with mock.patch.object(legacy, "BINARY", str(self.fake)):
-                proc = legacy._start_server(store, env=dict(os.environ, FAKE_LOG=str(self.log)), timeout=0.3)
+                proc = legacy._start_server(store, env=dict(os.environ, FAKE_LOG=str(self.log)), timeout=2.0, reap_timeout=0.3)
+                proc.contract_transport.timeout = 0.3
                 try:
                     self.assertEqual(legacy._tool(proc, "create", explicit), explicit)
                 finally:
@@ -290,22 +293,37 @@ class HarnessTests(unittest.TestCase):
 
     def test_stalled_initialize_is_bounded_and_reaped(self):
         exchange_budget = 0.25
+        initialize_budget = 2.0
         reap_budget = exchange_budget
         for kind in ("legacy", "pytest"):
             for mode in ("initialize_silent", "initialize_partial", "initialize_noise"):
                 with self.subTest(kind=kind, mode=mode), OwnedContractStore() as store:
                     start = time.monotonic()
+                    child_count = len(self.children)
                     with self.assertRaises(Exception) as error:
                         with self.adapter(kind, store, mode, timeout=exchange_budget,
-                                          reap_timeout=reap_budget):
+                                          reap_timeout=reap_budget,
+                                          startup_timeout=initialize_budget):
                             self.fail("stalled initialize unexpectedly completed")
                     elapsed = time.monotonic() - start
-                    self.assertIn("exceeded", str(error.exception))
-                    self.assert_completion_envelope(elapsed, phase="stalled initialize",
-                                                    exchange=exchange_budget, reap=reap_budget)
-                    self.assertTrue(store.root.exists())
-                    self.assert_protocol_stage(mode)
-                    self.assert_reaped()
+                    try:
+                        self.assertGreater(
+                            len(self.children), child_count,
+                            f"fixture setup failure: fake server was not spawned: {error.exception!r}",
+                        )
+                        self.assertTrue(self.log.is_file(),
+                                        "fixture setup failure: fake server log is missing")
+                        try:
+                            self.assert_protocol_stage(mode)
+                        except (AssertionError, OSError, ValueError) as exc:
+                            self.fail(f"fixture setup failure: fake did not reach {mode}: {exc}")
+                        self.assertIn("exceeded", str(error.exception))
+                        self.assert_completion_envelope(elapsed, phase="stalled initialize",
+                                                        exchange=initialize_budget, reap=reap_budget)
+                        self.assertTrue(store.root.exists())
+                    finally:
+                        if len(self.children) > child_count:
+                            self.assert_reaped()
 
     def test_stalled_request_is_bounded_and_reaped(self):
         # Initialize is setup; the stalled request remains a 0.25s contract.
@@ -349,18 +367,18 @@ class HarnessTests(unittest.TestCase):
         for kind in ("legacy", "pytest"):
             with self.subTest(kind=kind), OwnedContractStore() as store:
                 with self.assertRaises(Exception):
-                    with self.adapter(kind, store, "initialize_error"):
+                    with self.adapter(kind, store, "initialize_error", startup_timeout=2.0, reap_timeout=0.3):
                         self.fail("initialization error was ignored")
                 self.assert_reaped()
 
     def test_success_and_test_exception_reap_children(self):
         for kind in ("legacy", "pytest"):
             with self.subTest(kind=kind), OwnedContractStore() as store:
-                with self.adapter(kind, store) as request:
+                with self.adapter(kind, store, startup_timeout=2.0, reap_timeout=0.3) as request:
                     self.assertEqual(request(), [])
                 self.assert_reaped()
                 with self.assertRaisesRegex(RuntimeError, "test body"):
-                    with self.adapter(kind, store) as request:
+                    with self.adapter(kind, store, startup_timeout=2.0, reap_timeout=0.3) as request:
                         self.assertEqual(request(), [])
                         raise RuntimeError("test body")
                 self.assert_reaped()
@@ -372,7 +390,7 @@ class HarnessTests(unittest.TestCase):
                 # The short budget belongs to the reap: this server ignores EOF,
                 # so exclude spawn, handshake and the successful request from the
                 # timer that checks close's two reap waits.
-                with self.adapter(kind, store, "ignore_eof", reap_timeout=reap_budget) as request:
+                with self.adapter(kind, store, "ignore_eof", reap_timeout=reap_budget, startup_timeout=2.0) as request:
                     self.assertEqual(request(), [])
                     if kind == "pytest":
                         session = request.__self__
@@ -451,7 +469,7 @@ class HarnessTests(unittest.TestCase):
     def test_stderr_output_cannot_stall_response(self):
         for kind in ("legacy", "pytest"):
             with OwnedContractStore() as store:
-                with self.adapter(kind, store, "stderr_flood") as request:
+                with self.adapter(kind, store, "stderr_flood", startup_timeout=2.0, reap_timeout=0.3) as request:
                     self.assertEqual(request(), [])
                 self.assert_reaped()
 
@@ -484,16 +502,19 @@ class HarnessTests(unittest.TestCase):
         with OwnedContractStore() as store:
             env = dict(os.environ, FAKE_LOG=str(self.log))
             with KhiveMcpSession(binary=relative, store=store, db=os.path.relpath(store.db),
-                                 config=os.path.relpath(store.config), env=env, timeout=0.3) as session:
+                                 config=os.path.relpath(store.config), env=env, timeout=2.0, reap_timeout=0.3) as session:
+                session._transport.timeout = 0.3
                 self.assertEqual(session.tools_list(), [])
                 call = self.calls()[-1]
                 self.assertEqual(Path(call["argv"][call["argv"].index("--db") + 1]), store.db.resolve())
                 self.assertEqual(Path(call["argv"][call["argv"].index("--config") + 1]), store.config.resolve())
             with mock.patch.dict(os.environ, dict(env, KKERNEL_BINARY=relative)):
-                with KhiveMcpSession(store=store, timeout=0.3) as session:
+                with KhiveMcpSession(store=store, timeout=2.0, reap_timeout=0.3) as session:
+                    session._transport.timeout = 0.3
                     self.assertEqual(session.tools_list(), [])
             with mock.patch.object(legacy, "BINARY", relative):
-                proc = legacy._start_server(store, env=env, timeout=0.3)
+                proc = legacy._start_server(store, env=env, timeout=2.0, reap_timeout=0.3)
+                proc.contract_transport.timeout = 0.3
                 legacy._stop_server(proc)
         self.assert_reaped()
 

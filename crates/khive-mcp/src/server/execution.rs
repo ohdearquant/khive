@@ -283,6 +283,24 @@ impl KhiveMcpServer {
             return coord_result.and_then(|result| chain_ok_envelope_or_depth_error(tool, result));
         }
 
+        if tool == "search" && !is_help {
+            let vector_selected = self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.vector_arm_selected());
+            if let Some(result) = super::dispatch_helpers::dispatch_registry_search_inner(
+                &self.registry,
+                &tool,
+                &args_value,
+                identity,
+                vector_selected,
+            )
+            .await
+            {
+                return result.and_then(|success| chain_ok_envelope_or_depth_error(tool, success));
+            }
+        }
+
         let search_args = (tool == "search" && !is_help).then(|| args_value.clone());
         match self
             .registry
@@ -558,6 +576,25 @@ impl KhiveMcpServer {
                                         Err(failure) => failure.into_entry(),
                                     };
                                 }
+                            }
+                        }
+
+                        if tool == "search" && !is_help {
+                            if let Some(result) = super::dispatch_helpers::dispatch_registry_search_inner(
+                                &registry, &tool, &args_value, op_identity.as_ref(), op_vector_selected,
+                            ).await {
+                                return match result {
+                                    Ok(success) => {
+                                        let content_scope = note_content_scope(
+                                            parse_content, &tool, &success.result, &registry,
+                                        );
+                                        present_ok_envelope_or_depth_error(
+                                            tool, success, effective_mode, now_unix,
+                                            presentation_policy, content_scope,
+                                        )
+                                    }
+                                    Err(failure) => failure.into_entry(),
+                                };
                             }
                         }
 

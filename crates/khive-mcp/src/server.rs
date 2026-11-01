@@ -122,12 +122,13 @@ use bridge::{strict_fallback_envelope_response, ForwardFuture};
 use dispatch_helpers::{
     apply_presentation_to_result, chain_aggregation_depth_reject, chain_ok_envelope_or_depth_error,
     decorate_schedule_agenda_with_ticker_health, dispatch_via_coordinator_inner,
-    drop_value_iteratively, note_content_scope, parse_content_requested,
-    present_ok_envelope_or_depth_error, result_within_depth_limit, runtime_error_value,
-    stamp_usage, substitution_error_payload,
+    note_content_scope, parse_content_requested, present_ok_envelope_or_depth_error, stamp_usage,
+    substitution_error_payload,
 };
 #[cfg(test)]
-use dispatch_helpers::{coordinator_search_visibility, ok_envelope, result_exceeds_depth_limit};
+use dispatch_helpers::{
+    coordinator_search_visibility, ok_envelope, result_exceeds_depth_limit, runtime_error_value,
+};
 #[cfg(unix)]
 use rendering::cancelled_forward_error;
 use rendering::{
@@ -225,6 +226,8 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool: None,
             secondary_pools: Vec::new(),
@@ -617,6 +620,16 @@ result (e.g. create then link with the new entity's id)."#)]
             self.request_with_cancellation(p),
         )
         .await
+    }
+}
+
+#[cfg(any(test, feature = "test-forward-seam"))]
+impl KhiveMcpServer {
+    /// Fixture-only access to the unchanged MCP request path.
+    #[doc(hidden)]
+    pub async fn request_for_config_lock_test(&self, p: RequestParams) -> Result<String, McpError> {
+        self.request(Parameters(p), tokio_util::sync::CancellationToken::new())
+            .await
     }
 }
 

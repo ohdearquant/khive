@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for SnapshotId {
                 s
             )));
         }
-        if !hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        if !khive_types::is_lowercase_hex(hex) {
             return Err(de::Error::custom(format!(
                 "invalid SnapshotId: hex must be lower-case with no whitespace in {:?}",
                 s

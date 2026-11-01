@@ -12,14 +12,14 @@ correctly to a running `kkernel mcp` server.
 `khive` is a single umbrella plugin — one pattern skill per pack plus the kg stewardship agents,
 all over the one `kkernel mcp` server.
 
-## Step 1 — Install kkernel
+## Step 1 — Install kkernel from source
 
 ```bash
-cargo install kkernel
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cargo install --path crates/kkernel --locked
 ```
 
-`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface (the npm
-package additionally installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`). Add the
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. Add the
 MCP server config (Step 2), and you are ready to go.
 
 Verify:
@@ -217,12 +217,12 @@ All examples should report `invalid=0`.
 
 ## Troubleshooting
 
-| Symptom                          | Fix                                                           |
-| -------------------------------- | ------------------------------------------------------------- |
-| `kkernel: command not found`     | Run `cargo install kkernel` or add `~/.cargo/bin` to `PATH`   |
-| MCP tool not appearing in Claude | Check `.mcp.json` is in the project root; restart Claude Code |
-| `Unknown verb` error             | Confirm `--pack` flag includes the right pack for the verb    |
-| `Pack not loaded` error          | Verify `kkernel --version` matches the plugin version         |
+| Symptom                          | Fix                                                                                                         |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `kkernel: command not found`     | Run `cargo install --path crates/kkernel --locked` from the repository root or add `~/.cargo/bin` to `PATH` |
+| MCP tool not appearing in Claude | Check `.mcp.json` is in the project root; restart Claude Code                                               |
+| `Unknown verb` error             | Confirm `--pack` flag includes the right pack for the verb                                                  |
+| `Pack not loaded` error          | Verify `kkernel --version` matches the plugin version                                                       |
 
 ## Links
 

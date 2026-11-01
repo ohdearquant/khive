@@ -102,7 +102,7 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
     );
 }
 
-/// The cursor-floor guard while stalled (round-2 finding 1): while a pass
+/// The cursor-floor guard must hold while stalled: while a pass
 /// is stalled on a refused record, an ALREADY-EXISTING record walked after
 /// the stall point — with a strictly newer `updated_at` — must not advance
 /// the persisted floor past the refused record. The natural-key lookup
@@ -225,10 +225,9 @@ async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
     );
 }
 
-/// Issue-side mirror of `pr_cursor_does_not_advance_past_refused_record_on_later_existing`
-/// (round-2 finding 1): the refusal mechanism here is the deterministic
-/// ungoverned-`stateReason` rejection, and the pre-landed record is an
-/// issue with the newest timestamp.
+/// The issue walker also keeps its cursor at a refused record when a
+/// newer, already-landed issue follows it. Refusal uses the deterministic
+/// ungoverned-`stateReason` rejection.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {

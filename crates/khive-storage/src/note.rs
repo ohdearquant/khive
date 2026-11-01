@@ -27,7 +27,8 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
-    /// Immutable caller-chosen identity, unique among live notes of the same namespace and kind.
+    /// Caller-chosen identity, unique among live notes of the same namespace and kind.
+    /// Once set, it cannot be replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// Persisted revision, assigned by storage and advanced on every matched update.
@@ -42,6 +43,36 @@ pub struct NoteVisibility {
     pub id: Uuid,
     pub namespace: String,
     pub deleted_at: Option<i64>,
+}
+
+/// Maximum size of a caller-chosen note key in UTF-8 bytes.
+pub const NOTE_KEY_MAX_BYTES: usize = 512;
+
+/// Whether a note key satisfies the shared size and character constraints.
+pub fn note_key_is_valid(key: &str) -> bool {
+    key.len() <= NOTE_KEY_MAX_BYTES && !key.contains('\0')
+}
+
+/// Validate a key for a note-store operation without accessing storage.
+pub fn validate_note_key_for_store(key: &str, operation: &'static str) -> StorageResult<()> {
+    if note_key_is_valid(key) {
+        Ok(())
+    } else {
+        Err(crate::StorageError::InvalidInput {
+            capability: crate::StorageCapability::Notes,
+            operation: operation.into(),
+            message: "key must be at most 512 UTF-8 bytes and must not contain U+0000".into(),
+        })
+    }
+}
+
+/// Result of setting the key on an existing note that has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoteKeyAssignOutcome {
+    Assigned,
+    AlreadyKeyed { existing: String },
+    KeyTaken,
+    NotFound,
 }
 
 const fn initial_note_version() -> i64 {
@@ -351,6 +382,37 @@ pub enum NoteTimeOrder {
     ExpiresAt,
     /// `COALESCE(expires_at, created_at) ASC, id ASC`.
     ExpiresAtOrCreatedAt,
+    /// `updated_at ASC, id ASC`: the oldest-touched rows first.
+    UpdatedAt,
+}
+
+/// Read selection on the note's top-level storage status, independent of
+/// workflow fields such as `properties.status`. Tombstone visibility remains
+/// controlled separately by [`NoteFilter::include_deleted`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteStatusSelector {
+    Active,
+    Archived,
+    Any,
+}
+
+impl NoteStatusSelector {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+            Self::Any => "any",
+        }
+    }
+
+    pub fn matches(self, status: &str) -> bool {
+        match self {
+            Self::Active => status == "active",
+            Self::Archived => status == "archived",
+            Self::Any => true,
+        }
+    }
 }
 
 /// Filter + sort options for [`NoteStore::query_notes_filtered`].
@@ -360,6 +422,12 @@ pub enum NoteTimeOrder {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NoteFilter {
     pub kind: Option<String>,
+    /// Top-level storage status for filtered reads. `None` and `Any` are raw
+    /// all-status selection; ordinary callers may default missing input to Active.
+    /// Neither bypasses tombstone visibility. Active/Archived are read-only and
+    /// must be rejected by filtered mutations before writer admission.
+    #[serde(default)]
+    pub note_status: Option<NoteStatusSelector>,
     #[serde(default)]
     pub property_filters: Vec<PropertyFilter>,
     /// `(json_path, direction)` — `None` defaults to `created_at DESC`.
@@ -432,6 +500,12 @@ pub struct NoteFilter {
 }
 
 impl NoteFilter {
+    /// Supply an ordinary-read default without replacing an explicit selector.
+    pub fn with_default_note_status(mut self, status: NoteStatusSelector) -> Self {
+        self.note_status.get_or_insert(status);
+        self
+    }
+
     /// Select expiry timestamps at or before `micros` (inclusive, Unix microseconds).
     /// A note without an expiry does not match this bound.
     pub fn expires_before(mut self, micros: i64) -> Self {
@@ -463,8 +537,32 @@ pub struct NoteMailboxScope {
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.
+///
+/// Every read accepting a [`NoteFilter`] must apply its `note_status` selection
+/// before counting, paging, lookahead and cursor derivation, or fail closed with
+/// [`crate::StorageError::Unsupported`] if it cannot honor that selector. It must
+/// never silently ignore Active/Archived. Raw `None` and explicit `Any` retain
+/// the existing all-status population and do not bypass `include_deleted`.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
+    /// Set the key of a live, unkeyed note in the asserted namespace once.
+    /// The namespace is a row predicate, not an authorization check.
+    /// An existing key is never replaced, and the live key uniqueness scope is
+    /// namespace and note kind. Invalid keys are refused without a write.
+    async fn assign_note_key_if_unset(
+        &self,
+        _id: Uuid,
+        key: &str,
+        _namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        validate_note_key_for_store(key, "assign_note_key_if_unset")?;
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "assign_note_key_if_unset".into(),
+            message: "backend has no guarded note key assignment".into(),
+        })
+    }
+
     async fn get_live_notes_by_key(
         &self,
         _namespace: &str,
@@ -610,6 +708,11 @@ pub trait NoteStore: Send + Sync + 'static {
     /// validated it, or the stored document is not a JSON object); the
     /// caller degrades that the same way as `update_note_properties`'s
     /// `Ok(false)`.
+    ///
+    /// Active/Archived `note_status` values are read-only selectors and must be
+    /// rejected before writer admission, not ignored. Selector-aware backends
+    /// return InvalidInput; unsupported backends may fail closed as Unsupported.
+    /// None/Any preserve the existing neutral mutation population.
     async fn try_patch_note_property(
         &self,
         id: Uuid,
@@ -655,6 +758,8 @@ pub trait NoteStore: Send + Sync + 'static {
     /// keys are preserved by the same storage-side `json_set` operation as
     /// [`Self::try_patch_note_property`]. Backends without a transactional
     /// multi-note implementation retain the default `Unsupported` result.
+    /// Active/Archived `note_status` values must be rejected before writer
+    /// admission, as for [`Self::try_patch_note_property`]; None/Any are neutral.
     async fn patch_note_property_atomic(
         &self,
         _ids: Vec<Uuid>,
@@ -759,7 +864,9 @@ pub trait NoteStore: Send + Sync + 'static {
     /// the rows *scanned* before `cap` matches are found, not the rows that
     /// match. Callers building filters against this bound must ensure the
     /// full predicate set is indexed, not just the predicate that narrows the
-    /// population most. Backends that cannot preserve the shared snapshot or
+    /// population most. This includes `note_status`: selecting a status does not
+    /// imply a status index or a cap-proportional scan. Backends that cannot
+    /// preserve the shared snapshot or
     /// work bound must fail closed.
     async fn count_notes_filtered_bounded_in_snapshot(
         &self,
@@ -894,5 +1001,73 @@ pub trait NoteStore: Send + Sync + 'static {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod note_status_selector_contract_tests {
+    use super::*;
+
+    #[test]
+    fn selector_wire_values_and_exact_status_matching_are_closed() {
+        for (selector, wire) in [
+            (NoteStatusSelector::Active, "active"),
+            (NoteStatusSelector::Archived, "archived"),
+            (NoteStatusSelector::Any, "any"),
+        ] {
+            assert_eq!(selector.as_str(), wire);
+            assert_eq!(
+                serde_json::to_value(selector).unwrap(),
+                Value::String(wire.into())
+            );
+            assert_eq!(
+                serde_json::from_value::<NoteStatusSelector>(Value::String(wire.into())).unwrap(),
+                selector
+            );
+        }
+        for invalid in ["Active", "deleted", "unknown", ""] {
+            assert!(
+                serde_json::from_value::<NoteStatusSelector>(Value::String(invalid.into()))
+                    .is_err()
+            );
+        }
+        assert!(NoteStatusSelector::Active.matches("active"));
+        assert!(!NoteStatusSelector::Active.matches("archived"));
+        assert!(!NoteStatusSelector::Active.matches("ACTIVE"));
+        assert!(NoteStatusSelector::Archived.matches("archived"));
+        assert!(!NoteStatusSelector::Archived.matches("active"));
+        assert!(NoteStatusSelector::Any.matches("deleted"));
+        assert!(NoteStatusSelector::Any.matches("unrecognized-stored-status"));
+    }
+
+    #[test]
+    fn raw_filter_is_neutral_and_defaulting_preserves_explicit_status() {
+        let legacy: NoteFilter = serde_json::from_value(serde_json::json!({
+            "kind": null, "order_by": null, "min_created_at": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.note_status, None);
+        assert_eq!(NoteFilter::default().note_status, None);
+        assert_eq!(
+            legacy
+                .with_default_note_status(NoteStatusSelector::Active)
+                .note_status,
+            Some(NoteStatusSelector::Active)
+        );
+        for explicit in [
+            NoteStatusSelector::Active,
+            NoteStatusSelector::Archived,
+            NoteStatusSelector::Any,
+        ] {
+            let filter = NoteFilter {
+                note_status: Some(explicit),
+                ..Default::default()
+            }
+            .with_default_note_status(NoteStatusSelector::Active);
+            assert_eq!(filter.note_status, Some(explicit));
+            let decoded: NoteFilter =
+                serde_json::from_value(serde_json::to_value(filter).unwrap()).unwrap();
+            assert_eq!(decoded.note_status, Some(explicit));
+        }
     }
 }

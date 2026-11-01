@@ -863,7 +863,7 @@ publication policy, plus the reserved-value test above.
 
 ## Amendment 13 (2026-10-21): an outbound network declaration on exec registrations
 
-**Status: Proposed.** Partial amendment. It amends, for registrations that declare network only:
+**Status: Accepted 2026-10-21.** Partial amendment. It amends, for registrations that declare network only:
 Decision step 3 ("no network"), Acceptance 4 as restated by Amendment 11, the posture sentence in
 Amendment 12's Ratification scope ("a run has no network"), Amendment 1 item 5 (one new refusal
 class), Amendment 1 item 7 with Amendment 7 (two additive `sandbox` fields), Amendment 2 item 3
@@ -1248,7 +1248,7 @@ Implementation follows acceptance of this amendment and goes through the usual r
 
 ## Amendment 14 (2026-10-21): the executable's bytes, the macOS build and the resolver socket for networked runs
 
-**Status: Proposed.** Partial amendment of Amendment 13, which stays Proposed and stands except where this amendment
+**Status: Accepted 2026-10-22.** Partial amendment of Amendment 13, which stands except where this amendment
 changes it: Decision items 1, 2, 3, 4, 5 and 7; items 1 and 5 of what a grant on a networked registration approves, with
 three items added; acceptance arms 44, 45, 49 to 53, 56, 58, 59 and 60, with seven arms added. It amends ADR-180
 Amendment 1 item 1 for one more property, on rows that carry `network` only. A host turns networked runs on only under

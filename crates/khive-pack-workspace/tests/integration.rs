@@ -443,7 +443,7 @@ async fn update_workspace_accepts_integer_schema_version() {
     assert_eq!(resp["properties"]["schema_version"], 2);
 }
 
-/// Class-closing guard (Leo ruling 2026-09-18 04:52Z, issue #2943): every
+/// Class-closing guard (issue #2943): every
 /// pack in this registry that declares an entity kind AND registers a
 /// `KindHook` must be on the allowlist below, with a matching update-path
 /// acceptance test (the `update_workspace_*` pair above, for `workspace`).

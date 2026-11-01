@@ -1,6 +1,4 @@
 use super::*;
-use khive_pack_kg::KgPack;
-use khive_runtime::VerbRegistryBuilder;
 use khive_types::Namespace;
 use std::sync::Arc;
 
@@ -289,23 +287,12 @@ async fn cancelled_text_put_keeps_admission_until_background_io_finishes() {
     assert!(store.inner.exists(&content_ref).await.unwrap());
 }
 
-/// See `fetch::tests::install_web_edge_rules` for why this is needed:
-/// the in-crate test runtime carries no `VerbRegistry`, so the web
-/// pack's own `EDGE_RULES` are never installed on it by default.
-fn install_web_edge_rules(runtime: &KhiveRuntime) {
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(runtime.clone()));
-    builder.register(crate::WebPack::new(runtime.clone()));
-    let registry = builder.build().expect("kg+web registry builds");
-    runtime.install_edge_rules(registry.all_edge_rules());
-}
-
 async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
         .expect("fs blob store");
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-    install_web_edge_rules(&runtime);
+    crate::test_support::install_web_edge_rules(&runtime);
     runtime
         .install_blob_store(Arc::new(store))
         .expect("install blob store");

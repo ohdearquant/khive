@@ -214,6 +214,8 @@ async fn restricted_registry_pack_list_reaches_forward_seam() {
 
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -279,6 +281,8 @@ mod read_replay_tests {
 
     fn capture_forward_policy(
         frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         replay_read_only: bool,
     ) -> ForwardFuture {
@@ -594,6 +598,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
     // fixed delay is long enough.
     fn delayed_partial_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -672,6 +678,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
 async fn cancelled_request_with_save_to_refuses_before_local_dispatch() {
     fn unreachable_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -741,6 +749,8 @@ async fn cancellation_visible_after_forward_returns_none_refuses_local_dispatch(
 
     fn cancel_then_none_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -827,6 +837,8 @@ async fn dropping_handler_does_not_drop_an_admitted_forward() {
     // long enough for the detached task to finish.
     fn slow_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -911,6 +923,8 @@ async fn admitted_forward_that_never_resolves_reports_unknown_outcome_after_the_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -988,6 +1002,8 @@ async fn admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -1079,6 +1095,8 @@ async fn admitted_forward_without_installed_deadline_falls_back_to_request_read_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -3778,6 +3796,7 @@ fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
     let envelope = ok_envelope(
         "search".to_string(),
         OpSuccess {
+            note_status_disclosure: None,
             result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
             degradation: forward,
         },
@@ -5902,12 +5921,13 @@ fn chain_seam_rejects_over_limit_result_before_envelope_build() {
     let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
     let err =
         chain_ok_envelope_or_depth_error("traverse".to_string(), OpSuccess::complete(pathological))
-            .expect_err("over-limit result must be rejected, not enveloped");
-    assert_eq!(err.tool, "traverse");
-    assert_eq!(err.error["kind"], json!("result_too_deep"));
+            .expect_err("over-limit result must be rejected, not enveloped")
+            .into_entry();
+    assert_eq!(err["tool"], "traverse");
+    assert_eq!(err["error"]["kind"], json!("result_too_deep"));
     // The error payload must never embed the oversized value itself.
-    assert!(err.error.get("result").is_none());
-    assert!(err.error.get("nested").is_none());
+    assert!(err["error"].get("result").is_none());
+    assert!(err["error"].get("nested").is_none());
 }
 
 #[test]
@@ -5959,6 +5979,7 @@ fn parallel_seam_accepts_shallow_result_and_applies_presentation() {
 #[test]
 fn success_envelope_requires_typed_degradation_and_preserves_it_through_presentation() {
     let success = OpSuccess {
+        note_status_disclosure: None,
         result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
         degradation: SearchDegradation {
             status: Some(SearchStatus::Partial),
@@ -6901,7 +6922,7 @@ async fn single_backend_search_reports_status_complete() {
     );
 }
 
-// ── MAJ-3: explicit-namespace narrowing arm of `coordinator_search_visibility` ──
+// ── Explicit-namespace narrowing arm of `coordinator_search_visibility` ──
 
 fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();

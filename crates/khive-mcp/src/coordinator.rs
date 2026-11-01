@@ -208,7 +208,7 @@ pub trait CoordinatorService: Send + Sync {
     /// boundary cannot silently narrow the public wire shape.
     ///
     /// `extra_visible` is the caller's resolved extra read-visibility
-    /// namespaces beyond `namespace` itself (MAJ-3 fix) — the same
+    /// namespaces beyond `namespace` itself — the same
     /// `['local'] ∪ visible_namespaces` set the normal registry dispatch path
     /// authorizes with, or empty when the caller named an explicit
     /// `namespace=` (which intentionally narrows visibility). Implementations
@@ -241,6 +241,20 @@ pub trait CoordinatorService: Send + Sync {
         Ok(self
             .fan_out_search(request, token.gate_namespace(), extra_visible)
             .await)
+    }
+
+    /// Scoped note search with the number of otherwise eligible notes excluded
+    /// by the effective status selector. Unavailable implementations fail closed.
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        _request: &ValidatedSearchRequest,
+        _token: &NamespaceToken,
+        _args: &serde_json::Value,
+        _extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        Err(RuntimeError::Internal(
+            "this coordinator does not support note search status disclosure".into(),
+        ))
     }
 
     /// True when only one backend is registered (zero-change invariant check).

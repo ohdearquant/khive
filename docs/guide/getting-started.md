@@ -9,39 +9,19 @@ graph, and link concepts together.
 khive is a research knowledge graph runtime. When you read papers, form
 concepts, link ideas, record decisions, or track tasks, khive gives that work a
 typed, queryable graph that persists across sessions. Everything is accessible
-through 160 verbs across 14 packs, dispatched through a single MCP tool.
+through 161 verbs across 14 packs, dispatched through a single MCP tool.
 
 ## Install
 
-### From crates.io (Rust)
-
-```bash
-cargo install kkernel
-```
-
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
 surface.
-
-### From npm
-
-```bash
-npm install -g khive
-# or
-npm install -g @khive-ai/cli
-```
-
-The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`. The npm
-release can lag the crates.io release, so run `khive --version` after install and compare against
-[crates.io/crates/khive-mcp](https://crates.io/crates/khive-mcp) if you need the latest verbs
-documented here.
 
 ### From source
 
 ```bash
 git clone https://github.com/ohdearquant/khive
-cd khive/crates
-cargo build --release -p kkernel
-# Binary at target/release/kkernel (relative to crates/)
+cd khive
+cargo install --path crates/kkernel --locked
 ```
 
 For the guarded developer install, run from the repository root:

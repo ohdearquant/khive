@@ -1,200 +1,647 @@
 {
+ "attempts": [
+  {
+   "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+   "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+   "fingerprint": {
+    "CARGO_PROFILE_BENCH_DEBUG": "",
+    "CARGO_TARGET_DIR": "/home/ci/oss-targets/khive",
+    "RUSTFLAGS": "",
+    "RUSTUP_TOOLCHAIN": "1.95.0"
+   },
+   "idle_min": 95.0,
+   "in_class": true,
+   "job": "bb-refb-46b7d9c5",
+   "load": {
+    "end": "1.15 1.18 1.55 1/423 301454",
+    "start": "5.73 4.67 2.92 1/428 6213"
+   },
+   "machine_identity": "Ubuntu-noble-latest-amd64-base.zst",
+   "mode": "reference",
+   "posture": {
+    "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549568\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3542524\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+    "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549835\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=400000\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+   },
+   "require_pin": true,
+   "targets": {
+    "khive-pack-brain:brain_pack_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.01639344262295082,
+        "clock_band": 0.005873835127670106,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548618.5,
+        "other_busy_max": 32.7
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.006086890595772349,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548117,
+        "other_busy_max": 19.0
+       }
+      }
+     }
+    ],
+    "khive-pack-brain:brain_resolve": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0025980305688447104,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548842,
+        "other_busy_max": 5.9
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0014619821254442085,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549291,
+        "other_busy_max": 8.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_allocations": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completeness_failure",
+      "reasons": [
+       "no D2 manifest registers an allocation target's identities; its run output cannot register them",
+       "arm a names unregistered identities pack_code_allocations/clippy_jsonl/100, pack_code_allocations/clippy_jsonl/10000, pack_code_allocations/fresh_l1_l15/10, pack_code_allocations/fresh_l1_l15/1000, pack_code_allocations/fresh_l1_l15/10000, pack_code_allocations/json/100, pack_code_allocations/json/10000",
+       "arm b names unregistered identities pack_code_allocations/clippy_jsonl/100, pack_code_allocations/clippy_jsonl/10000, pack_code_allocations/fresh_l1_l15/10, pack_code_allocations/fresh_l1_l15/1000, pack_code_allocations/fresh_l1_l15/10000, pack_code_allocations/json/100, pack_code_allocations/json/10000"
+      ],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0014847648894519287,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549383.5,
+        "other_busy_max": 2.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0017674699314566538,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549141.0,
+        "other_busy_max": 4.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_findings": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.002095710305966939,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547246.0,
+        "other_busy_max": 11.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.001548123759696915,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547520.0,
+        "other_busy_max": 10.0
+       }
+      }
+     }
+    ],
+    "khive-pack-code:code_ingest": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.038461538461538464,
+        "clock_band": 0.0031434454822410547,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548972.0,
+        "other_busy_max": 31.7
+       },
+       "b": {
+        "busy_frac": 0.03349282296650718,
+        "clock_band": 0.008649620230341003,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549520,
+        "other_busy_max": 25.0
+       }
+      }
+     }
+    ],
+    "khive-pack-comm:comm_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.002101982938186742,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549505.5,
+        "other_busy_max": 12.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.0022009983099477264,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549298.5,
+        "other_busy_max": 12.0
+       }
+      }
+     }
+    ],
+    "khive-pack-comm:comm_lifecycle": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.017857142857142856,
+        "clock_band": 0.006891582368022787,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547951.5,
+        "other_busy_max": 21.2
+       },
+       "b": {
+        "busy_frac": 0.017543859649122806,
+        "clock_band": 0.005691439892852421,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547257,
+        "other_busy_max": 22.2
+       }
+      }
+     }
+    ],
+    "khive-pack-gtd:gtd_bench": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.020833333333333332,
+        "clock_band": 0.0015960178720193696,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3549459.0,
+        "other_busy_max": 22.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.00230778378920682,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3548426,
+        "other_busy_max": 5.0
+       }
+      }
+     }
+    ],
+    "khive-pack-gtd:gtd_maintenance": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.00678986327516525,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546905.0,
+        "other_busy_max": 5.1
+       },
+       "b": {
+        "busy_frac": 0.03225806451612903,
+        "clock_band": 0.006886319209241825,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3547178,
+        "other_busy_max": 22.0
+       }
+      }
+     }
+    ],
+    "kkernel:coord_locate": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.0,
+        "clock_band": 0.003646446645871047,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546740.5,
+        "other_busy_max": 5.0
+       },
+       "b": {
+        "busy_frac": 0.0,
+        "clock_band": 0.003721941296462591,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3546805.0,
+        "other_busy_max": 5.0
+       }
+      }
+     }
+    ],
+    "kkernel:locator": [
+     {
+      "archive_digest": "sha256:881eb938ac037c4891248437073f367135a0eb6169cbad9f6b79af8bd79918d8",
+      "attempt": "bb-refb-46b7d9c5",
+      "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+      "decision": {
+       "file_environment_issue": false,
+       "reason": "no completed in-class attempt at this commit",
+       "run": true,
+       "supplies_entry": true
+      },
+      "in_class": true,
+      "outcome": "completed",
+      "reasons": [],
+      "runs": {
+       "a": {
+        "busy_frac": 0.023255813953488372,
+        "clock_band": 0.005144597424737647,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3542940,
+        "other_busy_max": 21.0
+       },
+       "b": {
+        "busy_frac": 0.024390243902439025,
+        "clock_band": 0.0045541103258483154,
+        "clock_basis": "loaded-core",
+        "clock_khz_median": 3543612,
+        "other_busy_max": 22.0
+       }
+      }
+     }
+    ]
+   },
+   "thresholds": {
+    "busy_frac_max": 0.05,
+    "busy_max": 20.0,
+    "clock_bound_frac": 0.975,
+    "clock_floor_khz": 400000,
+    "freq_band": 0.1,
+    "noise_ceiling": 1.15,
+    "pin_max_khz": 3600000
+   }
+  }
+ ],
  "benches": {
   "brain_pack/feedback_plain/useful": {
    "a": {
-    "ci_hi_ns": 724755.3333333334,
-    "ci_lo_ns": 695540.5,
-    "median_ns": 716720.0
+    "ci_hi_ns": 746335.5,
+    "ci_lo_ns": 712988.0,
+    "median_ns": 728950.25
    },
-   "aa_spread": 1.0071,
+   "aa_spread": 1.028,
    "b": {
-    "ci_hi_ns": 724741.6666666666,
-    "ci_lo_ns": 703921.6666666666,
-    "median_ns": 711633.3333333334
+    "ci_hi_ns": 718435.25,
+    "ci_lo_ns": 695875.0,
+    "median_ns": 709105.5
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
-   "median_ns": 714176.667,
+   "kind": "criterion",
+   "median_ns": 719027.875,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
     }
    }
   },
   "brain_pack/feedback_sections/capped_200_opposing": {
    "a": {
-    "ci_hi_ns": 45005503.0,
-    "ci_lo_ns": 44676226.0,
-    "median_ns": 44805194.5
+    "ci_hi_ns": 45348375.5,
+    "ci_lo_ns": 45048348.0,
+    "median_ns": 45226961.5
    },
-   "aa_spread": 1.0244,
+   "aa_spread": 1.012,
    "b": {
-    "ci_hi_ns": 46000887.0,
-    "ci_lo_ns": 45445960.5,
-    "median_ns": 45896712.5
+    "ci_hi_ns": 45910332.0,
+    "ci_lo_ns": 45508389.5,
+    "median_ns": 45769903.0
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
-   "median_ns": 45350953.5,
+   "kind": "criterion",
+   "median_ns": 45498432.25,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
     }
    }
   },
   "brain_pack/profile_read/balanced_recall_v1": {
    "a": {
-    "ci_hi_ns": 42787.916163901464,
-    "ci_lo_ns": 42754.64955357143,
-    "median_ns": 42768.800790004476
+    "ci_hi_ns": 43679.44848123883,
+    "ci_lo_ns": 43617.11250560287,
+    "median_ns": 43639.80354133564
    },
-   "aa_spread": 1.0171,
+   "aa_spread": 1.0007,
    "b": {
-    "ci_hi_ns": 43519.938617190724,
-    "ci_lo_ns": 43482.689675377944,
-    "median_ns": 43499.09079835082
+    "ci_hi_ns": 43651.04186795491,
+    "ci_lo_ns": 43559.46086956522,
+    "median_ns": 43607.920850720155
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
-   "median_ns": 43133.946,
+   "kind": "criterion",
+   "median_ns": 43623.862,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
     }
    }
   },
   "brain_pack/reset/balanced_recall_v1": {
    "a": {
-    "ci_hi_ns": 579995.8333333333,
-    "ci_lo_ns": 568799.3333333334,
-    "median_ns": 573832.6666666667
+    "ci_hi_ns": 634803.5,
+    "ci_lo_ns": 588683.75,
+    "median_ns": 608403.5
    },
-   "aa_spread": 1.0901,
+   "aa_spread": 1.0105,
    "b": {
-    "ci_hi_ns": 627335.6666666666,
-    "ci_lo_ns": 617964.1666666666,
-    "median_ns": 625544.3333333333
+    "ci_hi_ns": 622985.5,
+    "ci_lo_ns": 591401.5,
+    "median_ns": 602103.75
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
-   "median_ns": 599688.5,
+   "kind": "criterion",
+   "median_ns": 605253.625,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
+    }
+   }
+  },
+  "brain_pack/resolve/100_bindings": {
+   "a": {
+    "ci_hi_ns": 42092.410477249854,
+    "ci_lo_ns": 42062.74389051808,
+    "median_ns": 42079.42641673932
+   },
+   "aa_spread": 1.0,
+   "b": {
+    "ci_hi_ns": 42096.957680491556,
+    "ci_lo_ns": 42050.44086021505,
+    "median_ns": 42077.5713793375
+   },
+   "clock_khz_median": {
+    "a": 3548842,
+    "b": 3549291
+   },
+   "kind": "criterion",
+   "median_ns": 42078.499,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_resolve",
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0025980305688447104,
+     "other_busy_max": 5.9
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0014619821254442085,
+     "other_busy_max": 8.0
     }
    }
   },
   "brain_pack/section_posterior_gate/mean_shift_ge_0_3": {
    "a": {
-    "ci_hi_ns": 0.035321559357258,
-    "ci_lo_ns": 0.03531356876343019,
-    "median_ns": 0.03531690286815327
+    "ci_hi_ns": 0.035319772302853145,
+    "ci_lo_ns": 0.03531501951414083,
+    "median_ns": 0.03531745930200254
    },
    "aa_spread": 1.0001,
    "b": {
-    "ci_hi_ns": 0.035314148826685134,
-    "ci_lo_ns": 0.03531118980274908,
-    "median_ns": 0.03531251488336617
+    "ci_hi_ns": 0.03531397501960733,
+    "ci_lo_ns": 0.03531087212704258,
+    "median_ns": 0.03531289749623617
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
+   "kind": "criterion",
    "median_ns": 0.035,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
     }
    }
   },
   "brain_pack/snapshot_roundtrip/state_read_twice": {
    "a": {
-    "ci_hi_ns": 88714.70886243386,
-    "ci_lo_ns": 88636.33433302809,
-    "median_ns": 88666.4592796796
+    "ci_hi_ns": 90693.53988868275,
+    "ci_lo_ns": 90626.30381118882,
+    "median_ns": 90651.81268047396
    },
-   "aa_spread": 1.0295,
+   "aa_spread": 1.0065,
    "b": {
-    "ci_hi_ns": 91353.39679691652,
-    "ci_lo_ns": 91195.06576402321,
-    "median_ns": 91286.3738733985
+    "ci_hi_ns": 91307.63123029735,
+    "ci_lo_ns": 91194.26106812808,
+    "median_ns": 91243.29718746166
    },
    "clock_khz_median": {
-    "a": 3548009,
-    "b": 3547802
+    "a": 3548618.5,
+    "b": 3548117
    },
-   "median_ns": 89976.417,
+   "kind": "criterion",
+   "median_ns": 90947.555,
+   "metric": "median_ns",
+   "target": "khive-pack-brain:brain_pack_bench",
    "verdict": "MEASURED",
    "window": {
     "a": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.005482511459243762,
-     "other_busy_max": 21.4
+     "band_basis": "loaded-core",
+     "busy_frac": 0.01639344262295082,
+     "clock_band": 0.005873835127670106,
+     "other_busy_max": 32.7
     },
     "b": {
-     "band_basis": "both-core-bound",
-     "busy_frac": 0.014705882352941176,
-     "clock_band": 0.004651612463153243,
-     "other_busy_max": 23.0
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.006086890595772349,
+     "other_busy_max": 19.0
     }
    }
   }
@@ -214,59 +661,266 @@
     "3600000"
    ]
   },
-  "host": "Ubuntu-noble-latest-amd64-base.zst",
   "kernel": "6.8.0-142-generic",
-  "mode": "reference",
   "profile": "bench",
-  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
-  "window": "03:55-05:00Z"
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
  },
- "commands": {
-  "khive-pack-brain:brain_pack_bench": {
-   "a": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-brain --locked --bench brain_pack_bench -- --save-baseline aa-a --noplot",
-   "b": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-brain --locked --bench brain_pack_bench -- --save-baseline aa-b --noplot"
-  }
+ "coverage": {
+  "bench_targets": 2,
+  "entered_benchmarks": 7,
+  "measured_benchmarks": 7,
+  "targets_with_entry": 2
  },
  "crate": "khive-pack-brain",
- "criterion": "the benchmark's own configuration (no time or sample-size override)",
- "evidence": {
-  "archive": {
-   "location": "outside the repository",
-   "manifest": "MANIFEST.sha256 (sha256 of every stored file)",
-   "manifest_sha256": "69943a791885867d7bd34b92e40fcd513662b9281e1d07bb1d68f011aaeac6ca"
-  },
-  "band_bound": {
-   "basis": "both-core-bound",
-   "freq_band": 0.1,
-   "max_over_min_all_runs": 0.0189,
-   "why": "the run's sampler recorded one mean busy share for the pinned cores, so the loaded core per sample is not recoverable; the band was read on both pinned cores' readings with the idle floor dropped, a superset of any loaded-core selection"
-  },
-  "job": "bb-ref-212bf72e",
-  "reduced_from_stored_run": "verdicts applied to the run's stored files after the run's own reduction code reproduced its recorded verdicts for all 20 crates (ADR-206 Amendment 2, First references)"
+ "kinds": {
+  "khive-pack-brain:brain_pack_bench": "criterion",
+  "khive-pack-brain:brain_resolve": "criterion"
  },
- "excluded_targets": {},
  "load1": {
-  "end": "1.59",
-  "start": "5.65"
+  "end": "1.15",
+  "start": "5.73"
  },
  "pin_status": {
-  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3543900\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549747\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3549083\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
-  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3539321\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3548464\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3550098\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549568\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3542524\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549835\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=400000\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
  },
  "reduction": {
   "aa_spread": "max(a,b)/min(a,b)",
-  "busy": "fraction of samples with a CPU outside the pinned cores above busy_max, judged against busy_frac_max; other_busy_max is logged",
   "busy_frac_max": 0.05,
   "busy_max": 20.0,
-  "clock_band": "(max-min)/median of the loaded pinned core's clock per sample, readings equal to clock_floor_khz dropped",
+  "clock_bound_frac": 0.975,
   "clock_floor_khz": 400000,
+  "criterion": "the benchmark's own configuration",
   "freq_band": 0.1,
   "noise_ceiling": 1.15,
-  "statistic": "Criterion median estimate per arm (estimates.json)"
+  "pin_max_khz": 3600000,
+  "shift": "median of the second run's timing value over the first's"
  },
- "schema": "bench-reference/v1",
- "sha": "212bf72e498de9fbbda42cc0e2902906c730e3ea",
- "targets": [
-  "khive-pack-brain:brain_pack_bench"
- ]
+ "run": {
+  "host": "Ubuntu-noble-latest-amd64-base.zst",
+  "mode": "reference",
+  "window": ""
+ },
+ "schema": "bench-reference/v2",
+ "targets": {
+  "khive-pack-brain:brain_pack_bench": {
+   "entries": [
+    {
+     "attempt": "bb-refb-46b7d9c5",
+     "benchmarks": {
+      "brain_pack/feedback_plain/useful": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 746335.5,
+         "ci_lo_ns": 712988.0,
+         "median_ns": 728950.25
+        },
+        "aa_spread": 1.028,
+        "b": {
+         "ci_hi_ns": 718435.25,
+         "ci_lo_ns": 695875.0,
+         "median_ns": 709105.5
+        },
+        "kind": "criterion",
+        "median_ns": 719027.875,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "brain_pack/feedback_sections/capped_200_opposing": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 45348375.5,
+         "ci_lo_ns": 45048348.0,
+         "median_ns": 45226961.5
+        },
+        "aa_spread": 1.012,
+        "b": {
+         "ci_hi_ns": 45910332.0,
+         "ci_lo_ns": 45508389.5,
+         "median_ns": 45769903.0
+        },
+        "kind": "criterion",
+        "median_ns": 45498432.25,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "brain_pack/profile_read/balanced_recall_v1": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 43679.44848123883,
+         "ci_lo_ns": 43617.11250560287,
+         "median_ns": 43639.80354133564
+        },
+        "aa_spread": 1.0007,
+        "b": {
+         "ci_hi_ns": 43651.04186795491,
+         "ci_lo_ns": 43559.46086956522,
+         "median_ns": 43607.920850720155
+        },
+        "kind": "criterion",
+        "median_ns": 43623.862,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "brain_pack/reset/balanced_recall_v1": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 634803.5,
+         "ci_lo_ns": 588683.75,
+         "median_ns": 608403.5
+        },
+        "aa_spread": 1.0105,
+        "b": {
+         "ci_hi_ns": 622985.5,
+         "ci_lo_ns": 591401.5,
+         "median_ns": 602103.75
+        },
+        "kind": "criterion",
+        "median_ns": 605253.625,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "brain_pack/section_posterior_gate/mean_shift_ge_0_3": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 0.035319772302853145,
+         "ci_lo_ns": 0.03531501951414083,
+         "median_ns": 0.03531745930200254
+        },
+        "aa_spread": 1.0001,
+        "b": {
+         "ci_hi_ns": 0.03531397501960733,
+         "ci_lo_ns": 0.03531087212704258,
+         "median_ns": 0.03531289749623617
+        },
+        "kind": "criterion",
+        "median_ns": 0.035,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      },
+      "brain_pack/snapshot_roundtrip/state_read_twice": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 90693.53988868275,
+         "ci_lo_ns": 90626.30381118882,
+         "median_ns": 90651.81268047396
+        },
+        "aa_spread": 1.0065,
+        "b": {
+         "ci_hi_ns": 91307.63123029735,
+         "ci_lo_ns": 91194.26106812808,
+         "median_ns": 91243.29718746166
+        },
+        "kind": "criterion",
+        "median_ns": 90947.555,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      }
+     },
+     "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+     "contract_revision": null,
+     "feature_flags": [],
+     "kind": "criterion",
+     "resolved_features": [],
+     "resolved_features_command": "cargo tree -e features --manifest-path /home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --prefix none --format '{p} {f}'",
+     "runs": {
+      "a": {
+       "busy_frac": 0.01639344262295082,
+       "clock_band": 0.005873835127670106,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3548618.5,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --bench brain_pack_bench -- --save-baseline aa-a --noplot",
+       "end": 1792866338.7160158,
+       "other_busy_max": 32.7,
+       "start": 1792866277.4273095
+      },
+      "b": {
+       "busy_frac": 0.0,
+       "clock_band": 0.006086890595772349,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3548117,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --bench brain_pack_bench -- --save-baseline aa-b --noplot",
+       "end": 1792866400.205608,
+       "other_busy_max": 19.0,
+       "start": 1792866338.7163215
+      }
+     },
+     "shift": {
+      "n": 6,
+      "value": 0.9996
+     },
+     "target": "khive-pack-brain:brain_pack_bench"
+    }
+   ],
+   "kind": "criterion"
+  },
+  "khive-pack-brain:brain_resolve": {
+   "entries": [
+    {
+     "attempt": "bb-refb-46b7d9c5",
+     "benchmarks": {
+      "brain_pack/resolve/100_bindings": {
+       "median_ns": {
+        "a": {
+         "ci_hi_ns": 42092.410477249854,
+         "ci_lo_ns": 42062.74389051808,
+         "median_ns": 42079.42641673932
+        },
+        "aa_spread": 1.0,
+        "b": {
+         "ci_hi_ns": 42096.957680491556,
+         "ci_lo_ns": 42050.44086021505,
+         "median_ns": 42077.5713793375
+        },
+        "kind": "criterion",
+        "median_ns": 42078.499,
+        "metric": "median_ns",
+        "verdict": "MEASURED"
+       }
+      }
+     },
+     "commit": "46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d",
+     "contract_revision": null,
+     "feature_flags": [],
+     "kind": "criterion",
+     "resolved_features": [],
+     "resolved_features_command": "cargo tree -e features --manifest-path /home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --prefix none --format '{p} {f}'",
+     "runs": {
+      "a": {
+       "busy_frac": 0.0,
+       "clock_band": 0.0025980305688447104,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3548842,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --bench brain_resolve -- --save-baseline aa-a --noplot",
+       "end": 1792866411.2581935,
+       "other_busy_max": 5.9,
+       "start": 1792866400.2059038
+      },
+      "b": {
+       "busy_frac": 0.0,
+       "clock_band": 0.0014619821254442085,
+       "clock_basis": "loaded-core",
+       "clock_khz_median": 3549291,
+       "command": "taskset -c 2,3 cargo bench --manifest-path=/home/ci/oss/khive/crates/Cargo.toml -p khive-pack-brain --locked --bench brain_resolve -- --save-baseline aa-b --noplot",
+       "end": 1792866422.3139844,
+       "other_busy_max": 8.0,
+       "start": 1792866411.2584944
+      }
+     },
+     "shift": {
+      "n": 1,
+      "value": 1.0
+     },
+     "target": "khive-pack-brain:brain_resolve"
+    }
+   ],
+   "kind": "criterion"
+  }
+ }
 }

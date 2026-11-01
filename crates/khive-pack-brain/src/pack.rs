@@ -532,6 +532,22 @@ impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for B
             .await
     }
 
+    async fn dispatch_search_intercepted(
+        &self,
+        params: serde_json::Value,
+        registry: &khive_runtime::pack::VerbRegistry,
+        token: &khive_runtime::NamespaceToken,
+    ) -> Result<
+        khive_runtime::pack::InterceptedDispatchResult<
+            Option<(khive_storage::note::NoteStatusSelector, u64)>,
+        >,
+        khive_runtime::RuntimeError,
+    > {
+        self.0
+            .dispatch_search_intercepted(params, registry, token)
+            .await
+    }
+
     async fn dispatch(
         &self,
         verb: &str,

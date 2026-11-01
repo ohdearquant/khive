@@ -74,7 +74,10 @@ pub use server_build::{
 };
 
 #[cfg(unix)]
-pub use server_build::{daemon_store_paths, prepare_daemon_store_plan, DaemonStorePlan};
+pub use server_build::{
+    daemon_store_paths, maintenance_store_set, prepare_daemon_store_plan, DaemonStorePlan,
+    MaintenanceTopologyRefusal,
+};
 
 #[cfg(test)]
 pub(crate) use server_build::is_strict_actor_mode;
@@ -206,7 +209,7 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(args, &server)?;
+    let prepared_background = prepare_host_background_tasks(args, &server).await?;
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
@@ -260,6 +263,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    KhiveRuntime::validated_background_limits(&base_config)?;
     base_config.prepare_engines()?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let PreparedStorageTopology {

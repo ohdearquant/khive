@@ -208,10 +208,10 @@ include!("tests/binding_and_configuration_tests.rs");
 
 // ── Regression tests ──────────────────────────────────────────────────────
 
-// MAJ-003: profile_record.total_events must stay in sync with
-// balanced_recall.total_events via BOTH the handle_feedback path AND the
-// on_dispatch hook path.  The previous fix only wired the sync helper; this
-// test pins that removing EITHER call would be caught.
+// profile_record.total_events must stay synchronized with
+// balanced_recall.total_events after both handle_feedback and
+// on_dispatch. Each path must synchronize the stored record with the
+// live fold state.
 //
 // Part A — handle_feedback path (unchanged from before).
 // Part B — on_dispatch path: introduce a deliberate desync by reaching into
@@ -308,7 +308,7 @@ async fn test_356_profile_record_total_events_synced_after_feedback() {
     );
 }
 
-// MAJ-004: brain.feedback must NOT double-count total_events.
+// brain.feedback must not double-count total_events.
 //
 // The double-count path: VerbRegistry::dispatch calls the registered pack
 // handler (handle_feedback folds once) and then calls on_dispatch on every
@@ -5302,7 +5302,7 @@ mod event_counts_tests {
     /// form must keep matching exactly as before.
     #[tokio::test]
     async fn actor_filter_matches_bare_and_prefixed_spelling() {
-        let (pack, rt) = make_pack_with_read_scope(Some("lambda:atlas"), &["lambda:khive"], &[]);
+        let (pack, rt) = make_pack_with_read_scope(Some("lambda:riley"), &["lambda:khive"], &[]);
         let registry = empty_registry();
         let token = rt
             .authorize_with_visibility(Namespace::local(), rt.visible_namespaces().to_vec())
@@ -5313,7 +5313,7 @@ mod event_counts_tests {
             &token,
             "search",
             EventKind::SearchExecuted,
-            "actor:lambda:atlas",
+            "actor:lambda:riley",
             1_000_000,
             json!({}),
         )
@@ -5335,7 +5335,7 @@ mod event_counts_tests {
                 "brain.event_counts",
                 json!({
                     "since": micros_to_iso(0),
-                    "actor": "lambda:atlas",
+                    "actor": "lambda:riley",
                 }),
                 &registry,
                 &token,
@@ -5347,7 +5347,7 @@ mod event_counts_tests {
             json!(1),
             "bare seat spelling must match the actor:-prefixed stored form: {bare}"
         );
-        assert_eq!(bare["counts_by_actor"]["actor:lambda:atlas"], json!(1));
+        assert_eq!(bare["counts_by_actor"]["actor:lambda:riley"], json!(1));
         assert!(bare["counts_by_actor"].get("actor:lambda:khive").is_none());
 
         // Already-prefixed spelling must keep matching exactly (no false widening).
@@ -5370,7 +5370,7 @@ mod event_counts_tests {
         );
         assert_eq!(prefixed["counts_by_actor"]["actor:lambda:khive"], json!(1));
         assert!(prefixed["counts_by_actor"]
-            .get("actor:lambda:atlas")
+            .get("actor:lambda:riley")
             .is_none());
     }
 

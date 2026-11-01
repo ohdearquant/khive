@@ -117,6 +117,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("gtd.assign", OperationAccess::Write),
     ("gtd.census", OperationAccess::Read),
     ("gtd.complete", OperationAccess::Write),
+    ("gtd.counts", OperationAccess::Read),
     ("gtd.next", OperationAccess::Read),
     ("gtd.repair", OperationAccess::Write),
     ("gtd.tasks", OperationAccess::Read),

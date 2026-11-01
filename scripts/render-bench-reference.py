@@ -4,7 +4,9 @@
 The input is ``crates/<crate>/perf/reference.json``.  The output is the block
 between ``<!-- bench-reference:begin -->`` and ``<!-- bench-reference:end -->``
 in that crate's ``docs/benchmarks.md``.  Everything outside the block is left
-alone.
+alone.  The block names the comparison class the file records (compiler,
+profile, CPU, cores and kernel), since every value in one file was measured in
+that class.
 
 The renderer uses only the Python standard library.  It reads the reference
 file as JSON and asks git for the committer date of each baseline commit.  It
@@ -30,6 +32,7 @@ GENERATED_NOTICE = (
     "`scripts/render-bench-reference.py`; do not edit this block."
 )
 UNMEASURED = "unmeasured"
+NOT_A_TIMING = "n/a"
 
 
 class RenderError(Exception):
@@ -136,6 +139,68 @@ def _v1_entry(data: dict[str, Any], root: pathlib.Path) -> Entry:
     return Entry(commit, date, tuple(rows))
 
 
+def _same_metric_value(left: Any, right: Any) -> bool:
+    """Compare JSON payloads without bool/number equality or float coercion."""
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        return (
+            isinstance(right, (int, float))
+            and not isinstance(right, bool)
+            and left == left and right == right
+            and left not in (float("inf"), float("-inf"))
+            and right not in (float("inf"), float("-inf"))
+            and left == right
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_metric_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_metric_value(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _validate_v2_benches(
+    raw: Any, candidates: dict[str, list[tuple[str, str, Any]]]
+) -> None:
+    """Check an optional legacy mirror; target entries remain authoritative."""
+    for benchmark, raw_record in _require_mapping(raw, "benches").items():
+        where = f"benches[{benchmark!r}]"
+        record = _require_mapping(raw_record, where)
+        target = _require_string(record["target"], f"{where}.target") if "target" in record else None
+        metric = _require_string(record["metric"], f"{where}.metric") if "metric" in record else None
+        matches = [
+            (name, key, value) for name, key, value in candidates.get(benchmark, [])
+            if (target is None or name == target) and (metric is None or key == metric)
+        ]
+        if len(matches) != 1:
+            raise RenderError(
+                f"{where} must match exactly one target/scenario/metric entry; found {len(matches)}"
+            )
+        target, metric, canonical = matches[0]
+        canonical = _require_mapping(canonical, f"{where} canonical metric")
+        payload = {
+            key: value for key, value in record.items()
+            if key not in ("target", "window", "clock_khz_median")
+        }
+        # The renderer already checks the selected metric. Its copied arm
+        # readings also need number checks, including booleans and finiteness.
+        for label, value in ((where, payload), (f"{where} canonical metric", canonical)):
+            for arm in ("a", "b"):
+                if arm in value:
+                    readings = _require_mapping(value[arm], f"{label}.{arm}")
+                    for field in ("median_ns", "ci_lo_ns", "ci_hi_ns", "value"):
+                        if field in readings:
+                            _require_number(readings[field], f"{label}.{arm}.{field}")
+        if not _same_metric_value(payload, canonical):
+            raise RenderError(
+                f"{where} differs from target {target!r}, scenario {benchmark!r}, metric {metric!r}"
+            )
+
+
 def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
     targets = data.get("targets")
     if not isinstance(targets, (dict, list)):
@@ -150,6 +215,7 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
         )
 
     entries: list[Entry] = []
+    mirrors: dict[str, list[tuple[str, str, Any]]] | None = {} if "benches" in data else None
     for target_name, target in target_items:
         target = _require_mapping(target, f"targets[{target_name!r}]")
         raw_entries = target.get("entries")
@@ -167,6 +233,10 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
             for benchmark in sorted(benchmarks):
                 where_benchmark = f"{where}.benchmarks[{benchmark!r}]"
                 record = _require_mapping(benchmarks[benchmark], where_benchmark)
+                if mirrors is not None:
+                    mirrors.setdefault(benchmark, []).extend(
+                        (target_name, metric, value) for metric, value in record.items()
+                    )
                 rows.extend(
                     _v2_rows(
                         record,
@@ -177,6 +247,8 @@ def _v2_entries(data: dict[str, Any], root: pathlib.Path) -> list[Entry]:
                     )
                 )
             entries.append(Entry(commit, date, tuple(rows)))
+    if mirrors is not None:
+        _validate_v2_benches(data["benches"], mirrors)
     return entries
 
 
@@ -187,12 +259,11 @@ def _v2_rows(
     commit: str,
     date: str,
 ) -> list[Row]:
-    """Turn one scenario record, flat or keyed by metric, into table rows."""
-    if "disposition" in record:
-        return [_v2_row(record, label, where, commit, date)]
-
+    """Turn one scenario record, keyed by metric, into table rows."""
     if not record:
-        raise RenderError(f"{where} must name a disposition or a metric")
+        raise RenderError(f"{where} must name at least one metric")
+    if "verdict" in record:
+        raise RenderError(f"{where} must be keyed by metric, each metric holding its verdict")
     rows: list[Row] = []
     for metric in sorted(record):
         metric_record = _require_mapping(record[metric], f"{where}[{metric!r}]")
@@ -208,6 +279,16 @@ def _v2_rows(
     return rows
 
 
+def _as_emitted(value: Any, where: str) -> str:
+    """A value that is not a timing, written as the benchmark emitted it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RenderError(f"{where} must be a number")
+    if isinstance(value, float):
+        _require_number(value, where)
+        return repr(value)
+    return str(value)
+
+
 def _v2_row(
     record: dict[str, Any],
     label: str,
@@ -215,26 +296,50 @@ def _v2_row(
     commit: str,
     date: str,
 ) -> Row:
-    disposition = record.get("disposition")
-    if disposition == "MEASURED":
-        if "median_ns" in record:
-            value = _duration(
-                _require_number(record.get("median_ns"), f"{where}.median_ns")
-            )
-            aa_value = record.get("aa_spread")
-        elif "value" in record:
-            unit = _require_string(record.get("unit"), f"{where}.unit")
-            number = _require_number(record.get("value"), f"{where}.value")
-            value = f"{number:.3f} {unit}"
-            aa_value = record.get("aa_spread")
+    """One metric record as the reference producer writes it.
+
+    ``verdict`` is the record's disposition in ADR-206 Amendment 3 (A3.4):
+    ``MEASURED`` or ``UNMEASURED``, the same field a v1 row holds.
+
+    A record's ``kind`` is ``criterion``, ``bench-json`` or ``allocation``.  A
+    record converted from a v1 file keeps its v1 fields as committed and has no
+    ``kind``; v1 holds only Criterion medians, so it renders as one.  A
+    bench-json statistic named ``*_ns`` is a timing; any other statistic and an
+    allocation report are not timings and have no A/A ratio.
+    """
+    verdict = record.get("verdict")
+    if isinstance(verdict, str) and verdict.upper() == UNMEASURED.upper():
+        return Row(label, UNMEASURED, UNMEASURED, commit, date)
+    if verdict != "MEASURED":
+        raise RenderError(f"{where}.verdict must be MEASURED or UNMEASURED")
+
+    kind = record.get("kind")
+    if kind is None or kind == "criterion":
+        value = _duration(_require_number(record.get("median_ns"), f"{where}.median_ns"))
+        aa = _ratio(_require_number(record.get("aa_spread"), f"{where}.aa_spread"))
+    elif kind == "bench-json":
+        statistic = _require_string(record.get("statistic"), f"{where}.statistic")
+        if statistic.endswith("_ns"):
+            value = _duration(_require_number(record.get("value"), f"{where}.value"))
+            aa = _ratio(_require_number(record.get("aa_spread"), f"{where}.aa_spread"))
         else:
-            raise RenderError(f"{where} has neither median_ns nor value")
-        aa = _ratio(_require_number(aa_value, f"{where}.aa_spread"))
-    elif isinstance(disposition, str) and disposition.upper() == UNMEASURED.upper():
-        value = UNMEASURED
-        aa = UNMEASURED
+            value = _as_emitted(record.get("value"), f"{where}.value")
+            if "unit" in record:
+                value = f"{value} {_require_string(record.get('unit'), f'{where}.unit')}"
+            aa = NOT_A_TIMING
+    elif kind == "allocation":
+        report = _require_mapping(record.get("report"), f"{where}.report")
+        fields = [
+            f"{name}={_as_emitted(report[name], f'{where}.report[{name!r}]')}"
+            for name in sorted(report)
+            if name != "scenario"
+        ]
+        if not fields:
+            raise RenderError(f"{where}.report has no counts")
+        value = ", ".join(fields)
+        aa = NOT_A_TIMING
     else:
-        raise RenderError(f"{where}.disposition must be MEASURED or UNMEASURED")
+        raise RenderError(f"{where}.kind {kind!r} is not criterion, bench-json or allocation")
     return Row(label, value, aa, commit, date)
 
 
@@ -265,6 +370,11 @@ def render_block(reference: pathlib.Path, root: pathlib.Path) -> str:
     crate, entries = entries_for(data, root)
     if not entries:
         raise RenderError(f"{reference} has no measured target entries")
+    comparison = _require_mapping(data.get("class"), "class")
+    compiler, profile, cpu, cores, kernel = (
+        _require_string(comparison.get(field), f"class.{field}")
+        for field in ("rustc", "profile", "cpu", "cores", "kernel")
+    )
 
     headers = (
         "Benchmark",
@@ -303,6 +413,9 @@ def render_block(reference: pathlib.Path, root: pathlib.Path) -> str:
         "median for each benchmark, in the unit shown; A/A is the ratio between "
         "the two same-commit runs. The date is the committer date of the "
         "baseline commit.",
+        "",
+        f"Comparison class: `{compiler}`, `{profile}` profile, {cpu}, cores {cores}, "
+        f"kernel {kernel}.",
         "",
         table_row(headers),
         "| " + " | ".join("-" * width for width in widths) + " |",

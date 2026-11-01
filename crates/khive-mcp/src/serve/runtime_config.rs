@@ -36,6 +36,7 @@ pub(super) async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    KhiveRuntime::validated_background_limits(&config)?;
     config.prepare_engines()?;
     #[cfg(unix)]
     preflight_events_socket_for_boot(&config, &[], false)?;
@@ -206,13 +207,19 @@ pub(super) fn build_pack_runtime(
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config)
-        .with_outbound_email_policy(main_runtime.outbound_email_policy().clone())
-        .with_declared_backend_db_paths(declared_backend_db_paths)
-        .with_diagnostic_backends(diagnostic_backends)
-        .with_diagnostic_observer_from(main_runtime)
-        .with_core_embedders_from(main_runtime)
-        .with_code_map_registry_from(main_runtime);
+    let rt = KhiveRuntime::from_backend_in_domain(
+        backend,
+        rt_config,
+        main_runtime
+            .background_root()
+            .expect("main runtime owns its background domain"),
+    )
+    .with_outbound_email_policy(main_runtime.outbound_email_policy().clone())
+    .with_declared_backend_db_paths(declared_backend_db_paths)
+    .with_diagnostic_backends(diagnostic_backends)
+    .with_diagnostic_observer_from(main_runtime)
+    .with_core_embedders_from(main_runtime)
+    .with_code_map_registry_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -910,5 +917,151 @@ mod code_map_registry_tests {
             .expect("pack registration")
             .generation();
         assert_eq!(pack_generation, main_generation);
+    }
+}
+
+#[cfg(test)]
+mod background_limit_host_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raw_single_host_refuses_invalid_limits_before_creating_storage() {
+        for (warm, maintenance) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+            let fixture = tempfile::tempdir().expect("isolated host target");
+            let db_path = fixture.path().join("must-not-open.db");
+            // Keep the opener lock-directory prerequisite independent of the environment so
+            // removing early validation cannot stop at a missing lock directory.
+            let lock_fixture = tempfile::tempdir().expect("isolated volume lock directory");
+            let config = RuntimeConfig {
+                db_path: Some(db_path.clone()),
+                volume_lock_dir: Some(lock_fixture.path().to_path_buf()),
+                warm_concurrency: warm,
+                maintenance_concurrency: maintenance,
+                ..RuntimeConfig::no_embeddings()
+            };
+            assert!(!db_path.exists());
+            assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
+            assert!(std::fs::read_dir(lock_fixture.path())
+                .unwrap()
+                .next()
+                .is_none());
+            // Exercise the raw public host with caller-built config, bypassing
+            // loaded-TOML validation. No opener substitute or fake store is used.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                build_single_backend_runtime(config, &KhiveConfig::default()),
+            )
+            .await
+            .expect("invalid raw host config did not refuse within wall-clock budget");
+            let error = match result {
+                Ok(_) => panic!("invalid raw host background limits were accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.downcast_ref::<khive_runtime::RuntimeError>(),
+                    Some(khive_runtime::RuntimeError::InvalidInput(_))
+                ),
+                "expected actual limit refusal, got {error:#}"
+            );
+            assert!(
+                !db_path.exists(),
+                "limit refusal occurred after the target was opened"
+            );
+            assert!(
+                std::fs::read_dir(fixture.path()).unwrap().next().is_none(),
+                "limit refusal left database, sidecar, or boot artifacts"
+            );
+            assert!(
+                std::fs::read_dir(lock_fixture.path())
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "limit refusal reached volume-lock acquisition"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_multi_host_refuses_invalid_limits_before_creating_storage() {
+        for (warm, maintenance) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+            let fixture = tempfile::tempdir().expect("isolated multi-backend targets");
+            let lock_fixture = tempfile::tempdir().expect("isolated volume lock directory");
+            let main_path = fixture.path().join("main.db");
+            let secondary_path = fixture.path().join("notes.db");
+            let config = RuntimeConfig {
+                db_path: Some(main_path.clone()),
+                volume_lock_dir: Some(lock_fixture.path().to_path_buf()),
+                warm_concurrency: warm,
+                maintenance_concurrency: maintenance,
+                packs: Vec::new(),
+                events_split: None,
+                wal_ceiling_bytes: 0,
+                wal_ceiling_configured_bytes: 0,
+                wal_ceiling_source: Default::default(),
+                wal_ceiling_env_raw: None,
+                disk_guard_environment: khive_db::DiskGuardEnvironment {
+                    reserve: None,
+                    legacy_reserve: None,
+                    deadline: None,
+                },
+                ..RuntimeConfig::no_embeddings()
+            };
+            let declared_backend = |name: &str, path: PathBuf| BackendConfig {
+                name: name.to_owned(),
+                kind: BackendKind::Sqlite,
+                path: Some(path),
+                cache_mb: None,
+                journal_mode: None,
+                served_kinds: None,
+                read_only: false,
+                wal_ceiling_bytes: Some(0),
+                disk_reserve_bytes: Some(0),
+                disk_guard_deadline_ms: Some(100),
+            };
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    declared_backend("main", main_path.clone()),
+                    declared_backend("notes", secondary_path.clone()),
+                ],
+                ..KhiveConfig::default()
+            };
+            assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
+            assert!(std::fs::read_dir(lock_fixture.path())
+                .unwrap()
+                .next()
+                .is_none());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::build_registry_for_multi_backend_inner_with_max_readers(
+                    config, &khive_cfg, None, None, None,
+                ),
+            )
+            .await
+            .expect("invalid multi-backend limits did not refuse within the wall-clock budget");
+            let error = match result {
+                Ok(_) => panic!("invalid multi-backend background limits were accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.downcast_ref::<khive_runtime::RuntimeError>(),
+                    Some(khive_runtime::RuntimeError::InvalidInput(_))
+                ),
+                "expected actual limit refusal, got {error:#}"
+            );
+            assert!(!main_path.exists() && !secondary_path.exists());
+            assert!(
+                std::fs::read_dir(fixture.path()).unwrap().next().is_none(),
+                "limit refusal left database, sidecar, or boot artifacts"
+            );
+            assert!(
+                std::fs::read_dir(lock_fixture.path())
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "limit refusal reached volume-lock acquisition"
+            );
+        }
     }
 }
