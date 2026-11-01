@@ -242,6 +242,8 @@ async fn bridge_read_and_help_never_call_the_forward_seam() {
     static FORWARD_CALLS: AtomicUsize = AtomicUsize::new(0);
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {

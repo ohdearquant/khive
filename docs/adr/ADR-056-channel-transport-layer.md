@@ -4079,6 +4079,43 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
   OQ-2 are resolved; OQ-2 as hardened by the 2026-07-02 amendment. The email adapter's
   attribution gate and quarantine disposition follow that amendment.)
 
+## Amendment 2026-11-01 -- Exchange Online intra-tenant anchor
+
+### Context
+
+Exchange Online mail submitted by an authenticated user inside the same tenant may
+arrive without `Authentication-Results` or `ARC-Authentication-Results`. Exchange
+stamps `X-MS-Exchange-Organization-AuthAs: Internal`, so the existing attribution
+gate otherwise quarantines a configured maintainer as `auth-absent`.
+
+### Decision
+
+Add `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL`, defaulting to `false`. When enabled, only
+an `auth-absent` message may use this anchor. It must have one From address whose
+domain exactly matches the configured mailbox domain, exactly one unfolded
+`X-MS-Exchange-Organization-AuthAs` field with trimmed value `Internal`, and pass
+the existing From and Sender maintainer checks. Every failed condition remains
+`auth-absent`. Other authentication outcomes are unchanged. This path never
+attributes external mail and never evaluates inbound suppression.
+
+### Operational precondition
+
+Exchange Online's header firewall removes organization-authentication headers from
+untrusted inbound mail and stamps its own value. This property is a precondition
+only for an Exchange Online mailbox. A deployment must confirm on its own mailbox
+that outside mail carrying a forged `AuthAs: Internal` arrives with a different
+stamp or with duplicate fields before enabling the option. Other mailbox hosts may
+preserve sender-supplied headers and must leave the option disabled.
+
+### Consequences
+
+- Same-tenant maintainer mail without authentication-result headers can pass the
+  attribution gate after the explicit opt-in and all three checks.
+- Duplicate stamps, a non-Internal stamp, a domain mismatch, or a failed sender
+  allowlist check remains quarantined as `auth-absent`.
+- The default deployment behavior and all messages with authentication-result
+  headers remain unchanged.
+
 ## Related ADRs
 
 - ADR-017: Pack Standard -- the Pack trait this ADR explicitly decides not to implement.

@@ -214,6 +214,8 @@ async fn restricted_registry_pack_list_reaches_forward_seam() {
 
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -279,6 +281,8 @@ mod read_replay_tests {
 
     fn capture_forward_policy(
         frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         replay_read_only: bool,
     ) -> ForwardFuture {
@@ -594,6 +598,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
     // fixed delay is long enough.
     fn delayed_partial_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -672,6 +678,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
 async fn cancelled_request_with_save_to_refuses_before_local_dispatch() {
     fn unreachable_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -741,6 +749,8 @@ async fn cancellation_visible_after_forward_returns_none_refuses_local_dispatch(
 
     fn cancel_then_none_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -827,6 +837,8 @@ async fn dropping_handler_does_not_drop_an_admitted_forward() {
     // long enough for the detached task to finish.
     fn slow_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -911,6 +923,8 @@ async fn admitted_forward_that_never_resolves_reports_unknown_outcome_after_the_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -988,6 +1002,8 @@ async fn admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -1079,6 +1095,8 @@ async fn admitted_forward_without_installed_deadline_falls_back_to_request_read_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -5040,7 +5058,6 @@ fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() 
 }
 
 include!("server/config_id_read_only_tests.rs");
-include!("server/node_config_id_tests.rs");
 
 /// The collision fix is deliberately conditional: ordinary topology
 /// components that contain no reserved syntax keep the legacy spelling

@@ -679,6 +679,7 @@ enum MarkerDisposition {
     UnkeyedNote,
     FixedNonMemoryKind,
     RuntimeReceiptUnit,
+    RestoredExport,
 }
 
 // ADR-144 A4: only RuntimeReceiptUnit adds modern atomically; constructors and
@@ -804,6 +805,16 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         "upsert_note",
         MarkerDisposition::FixedNonMemoryKind,
     ),
+    // The note importer re-inserts exported rows, keyed memories included,
+    // under their original ids and writes no epoch marker. A restored keyed
+    // memory therefore has missing provenance: exact replay of its key fails
+    // with reason receipt_epoch_unknown, and recall is unchanged.
+    (
+        "kkernel/src/import_notes.rs",
+        "run",
+        "insert_note_if_absent",
+        MarkerDisposition::RestoredExport,
+    ),
     // The atomic note create and the canonical create share one builder: an
     // ordinary create upserts, a canonical create inserts under its staged
     // identifier. Neither carries a key.
@@ -839,7 +850,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         CREATE,
-        "prepare_note_create",
+        "prepare_note_create_classified",
         "note_insert_if_absent_statement",
         MarkerDisposition::RuntimeReceiptUnit,
     ),
@@ -1041,7 +1052,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
         (CURATION, "merge_note_sql"),
-        (CREATE, "prepare_note_create"),
+        (CREATE, "prepare_note_create_classified"),
         (OPERATIONS, "restore_note"),
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
@@ -1198,7 +1209,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             r#"{"status":"archived"}"#,
         ),
         (CURATION, "merge_note_sql", "memory", "{}"),
-        (CREATE, "prepare_note_create", "memory", "{}"),
+        (CREATE, "prepare_note_create_classified", "memory", "{}"),
         (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.

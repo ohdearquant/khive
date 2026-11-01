@@ -614,7 +614,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.note_create",
-        site: "khive-runtime/src/note_create.rs::prepare_note_create",
+        site: "khive-runtime/src/note_create.rs::prepare_note_create_classified",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -858,6 +858,19 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
         acceptance: Acceptance::Test { path: "kkernel/src/code_ingest.rs::tests::direct_ingest_writers_reject_reserved_properties_before_storage" },
+    },
+    RouteInventoryEntry {
+        id: "kkernel.import_notes.note",
+        site: "kkernel/src/import_notes.rs::run",
+        expected_writes: 1,
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::SpecializedWriter,
+        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        transaction: TransactionOwner::WriterTask,
+        stamp: StampCapability::ReservationOnly,
+        family: None,
+        acceptance: Acceptance::Test { path: "kkernel/src/import_notes.rs::tests::a_row_with_a_runtime_owned_property_key_is_refused_before_any_write" },
     },
     RouteInventoryEntry {
         id: "migration.005.unique_comm_external_id",

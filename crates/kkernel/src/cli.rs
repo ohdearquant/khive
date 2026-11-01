@@ -82,7 +82,7 @@ enum Command {
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
-    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune.
+    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune, import-notes.
     #[command(subcommand)]
     Db(DbCommand),
 
@@ -296,6 +296,9 @@ enum DbCommand {
 
     /// Prune expendable polling-dispatch audit rows from an events store (ADR-212 §4). Dry run unless --apply.
     EventsPrune(crate::events_prune::EventsPruneArgs),
+
+    /// Restore exported note rows (JSONL) into a database file with their original ids and timestamps.
+    ImportNotes(crate::import_notes::ImportNotesArgs),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -912,6 +915,7 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
         DbCommand::Migrate(args) => cmd_db_migrate(args).await,
         DbCommand::Check(args) => cmd_db_check(args).await,
         DbCommand::EventsPrune(args) => crate::events_prune::run(args).await,
+        DbCommand::ImportNotes(args) => crate::import_notes::run(args).await,
     }
 }
 
