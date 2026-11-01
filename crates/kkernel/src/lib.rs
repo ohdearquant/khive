@@ -20,6 +20,7 @@ pub mod exec;
 pub mod git_annotation_repair;
 pub mod git_dedup;
 pub mod git_ingest;
+pub mod import_notes;
 pub mod kg;
 pub mod mount;
 pub mod pack_introspect;
