@@ -46,12 +46,92 @@ fn text(row: &SqlRow, col: &str) -> Option<String> {
     }
 }
 
-fn int(row: &SqlRow, col: &str) -> Option<i64> {
+// Accept legacy REAL values only when their conversion to i64 is exact.
+// i64::MAX as f64 rounds to 2^63, so the upper bound is exclusive.
+fn timestamp(row: &SqlRow, kind: &str, id: &str, col: &str) -> Result<Option<i64>, RuntimeError> {
+    let invalid = || {
+        RuntimeError::Internal(format!(
+            "invalid {kind} row {id}: SQL column {col} must be an integer timestamp or NULL"
+        ))
+    };
     match row.get(col) {
-        Some(SqlValue::Integer(i)) => Some(*i),
-        Some(SqlValue::Float(f)) => Some(*f as i64),
-        _ => None,
+        Some(SqlValue::Null) => Ok(None),
+        Some(SqlValue::Integer(value)) => Ok(Some(*value)),
+        Some(SqlValue::Float(value))
+            if value.is_finite()
+                && value.fract() == 0.0
+                && *value >= i64::MIN as f64
+                && *value < i64::MAX as f64 =>
+        {
+            Ok(Some(*value as i64))
+        }
+        _ => Err(invalid()),
     }
+}
+
+fn required_timestamp(row: &SqlRow, kind: &str, id: &str, col: &str) -> Result<i64, RuntimeError> {
+    timestamp(row, kind, id, col)?.ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "invalid {kind} row {id}: SQL column {col} must not be NULL"
+        ))
+    })
+}
+
+// SQLite evaluates activity before Rust sees a row. Rank malformed
+// timestamps first so an invalid inactive row cannot disappear into a default
+// allow. The bounds match `timestamp` and keep the upper endpoint exclusive.
+fn malformed_timestamp_sql(col: &str, required: bool) -> String {
+    let accepted = if required {
+        "'integer', 'real'"
+    } else {
+        "'integer', 'real', 'null'"
+    };
+    format!(
+        "(typeof({col}) NOT IN ({accepted}) OR (typeof({col}) = 'real' AND \
+         ({col} < -9223372036854775808.0 OR {col} >= 9223372036854775808.0 \
+          OR {col} != CAST({col} AS INTEGER))))"
+    )
+}
+
+fn malformed_policy_timestamp_sql() -> String {
+    [
+        ("created_at", true),
+        ("updated_at", false),
+        ("deleted_at", false),
+    ]
+    .into_iter()
+    .map(|(column, required)| malformed_timestamp_sql(column, required))
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
+// Keep this predicate identical to the malformed-grant partial index in 008.
+fn malformed_grant_timestamp_sql() -> String {
+    [
+        ("requested_at", true),
+        ("decided_at", false),
+        ("expires_at", false),
+        ("invalidated_at", false),
+    ]
+    .into_iter()
+    .map(|(column, required)| malformed_timestamp_sql(column, required))
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
+// Both probes are one statement: the read and write lookups must not miss a
+// malformed row inserted between checking history and selecting the live row.
+fn current_policy_sql() -> String {
+    let invalid = malformed_policy_timestamp_sql();
+    format!(
+        "SELECT {POLICY_COLUMNS} FROM tool_policy WHERE rowid = COALESCE(\
+         (SELECT rowid FROM tool_policy \
+          WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND ({invalid}) \
+          ORDER BY id ASC LIMIT 1), \
+         (SELECT rowid FROM tool_policy \
+          WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 \
+          AND deleted_at IS NULL LIMIT 1))"
+    )
 }
 
 fn opt_text(v: Option<&str>) -> SqlValue {
@@ -99,13 +179,32 @@ pub(crate) struct PolicyRow {
 
 impl PolicyRow {
     fn from_row(row: &SqlRow) -> Result<Self, RuntimeError> {
+        Self::decode(row, false)
+    }
+
+    fn from_deciding_row(row: &SqlRow) -> Result<Self, RuntimeError> {
+        Self::decode(row, true)
+    }
+
+    fn decode(row: &SqlRow, deciding_projection: bool) -> Result<Self, RuntimeError> {
         let required = |column: &str| {
             text(row, column)
                 .ok_or_else(|| RuntimeError::Internal(format!("tool policy row has no {column}")))
         };
         let id = required("id")?;
-        let created_at = int(row, "created_at")
-            .ok_or_else(|| RuntimeError::Internal(format!("tool policy {id} has no created_at")))?;
+        let created_at = required_timestamp(row, "tool_policy", &id, "created_at")?;
+        let updated_at = if deciding_projection {
+            created_at
+        } else {
+            // Legacy policy rows may have a NULL updated_at until their first
+            // correction; a missing or malformed column is still an error.
+            timestamp(row, "tool_policy", &id, "updated_at")?.unwrap_or(created_at)
+        };
+        let deleted_at = if deciding_projection {
+            None
+        } else {
+            timestamp(row, "tool_policy", &id, "deleted_at")?
+        };
         let history = text(row, "history")
             .map(|value| serde_json::from_str(&value))
             .transpose()
@@ -121,10 +220,10 @@ impl PolicyRow {
             note: text(row, "note"),
             created_at,
             created_by: text(row, "created_by"),
-            updated_at: int(row, "updated_at").unwrap_or(created_at),
+            updated_at,
             updated_by: text(row, "updated_by").or_else(|| text(row, "created_by")),
             history,
-            deleted_at: int(row, "deleted_at"),
+            deleted_at,
             deleted_by: text(row, "deleted_by"),
         })
     }
@@ -181,35 +280,68 @@ impl GrantRow {
             scope: text(row, "scope"),
             reason: text(row, "reason"),
             status: row.text("status").map_err(invalid)?.to_owned(),
-            requested_at: row.i64("requested_at").map_err(invalid)?,
-            decided_at: int(row, "decided_at"),
+            requested_at: required_timestamp(
+                row,
+                "tool_grants",
+                row.text("id").unwrap_or("<unreadable id>"),
+                "requested_at",
+            )?,
+            decided_at: timestamp(
+                row,
+                "tool_grants",
+                row.text("id").unwrap_or("<unreadable id>"),
+                "decided_at",
+            )?,
             decided_by: text(row, "decided_by"),
-            expires_at: row.opt_i64("expires_at").map_err(invalid)?,
+            expires_at: timestamp(
+                row,
+                "tool_grants",
+                row.text("id").unwrap_or("<unreadable id>"),
+                "expires_at",
+            )?,
             decision_note: text(row, "decision_note"),
             registry_id: text(row, "registry_id"),
             definition_digest: text(row, "definition_digest"),
             invalidated_by_registry_id: text(row, "invalidated_by_registry_id"),
-            invalidated_at: int(row, "invalidated_at"),
+            invalidated_at: timestamp(
+                row,
+                "tool_grants",
+                row.text("id").unwrap_or("<unreadable id>"),
+                "invalidated_at",
+            )?,
         })
     }
 
-    fn from_row(row: &SqlRow) -> Option<Self> {
-        Some(Self {
-            id: text(row, "id")?,
-            actor: text(row, "actor")?,
-            tool: text(row, "tool")?,
+    fn from_row(row: &SqlRow) -> Result<Self, RuntimeError> {
+        let id = text(row, "id").ok_or_else(|| {
+            RuntimeError::Internal(
+                "invalid tool_grants row <unreadable id>: SQL column id is missing or invalid"
+                    .into(),
+            )
+        })?;
+        let required = |column: &str| {
+            text(row, column).ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "invalid tool_grants row {id}: SQL column {column} is missing or invalid"
+                ))
+            })
+        };
+        Ok(Self {
+            id: id.clone(),
+            actor: required("actor")?,
+            tool: required("tool")?,
             scope: text(row, "scope"),
             reason: text(row, "reason"),
-            status: text(row, "status")?,
-            requested_at: int(row, "requested_at")?,
-            decided_at: int(row, "decided_at"),
+            status: required("status")?,
+            requested_at: required_timestamp(row, "tool_grants", &id, "requested_at")?,
+            decided_at: timestamp(row, "tool_grants", &id, "decided_at")?,
             decided_by: text(row, "decided_by"),
-            expires_at: int(row, "expires_at"),
+            expires_at: timestamp(row, "tool_grants", &id, "expires_at")?,
             decision_note: text(row, "decision_note"),
             registry_id: text(row, "registry_id"),
             definition_digest: text(row, "definition_digest"),
             invalidated_by_registry_id: text(row, "invalidated_by_registry_id"),
-            invalidated_at: int(row, "invalidated_at"),
+            invalidated_at: timestamp(row, "tool_grants", &id, "invalidated_at")?,
         })
     }
 
@@ -326,18 +458,41 @@ pub(crate) async fn select_deciding_policy(
              WHEN substr(CAST({col} AS BLOB), -1) = X'2A' THEN 1 ELSE 2 END"
         )
     };
+    let invalid = [
+        ("created_at", true),
+        ("updated_at", false),
+        ("deleted_at", false),
+    ]
+    .into_iter()
+    .map(|(column, required)| {
+        format!(
+            "WHEN {} THEN '{column}'",
+            malformed_timestamp_sql(column, required)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+    let malformed = malformed_policy_timestamp_sql();
+    let specificity = format!("({} + {})", rank("actor"), rank("tool"));
+    let policy_order = format!(
+        "{specificity} DESC, CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, created_at ASC, id ASC"
+    );
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT id, actor, tool, decision, created_at FROM tool_policy \
+                "WITH bad AS MATERIALIZED (\
+                 SELECT id, actor, tool, decision, created_at, \
+                 CASE {invalid} ELSE NULL END AS invalid_timestamp, \
+                 CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END AS policy_active \
+                 FROM tool_policy WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
+                 AND ({malformed}) ORDER BY policy_active DESC, {policy_order} LIMIT 1), \
+                 live AS MATERIALIZED (\
+                 SELECT id, actor, tool, decision, created_at, NULL AS invalid_timestamp, \
+                 1 AS policy_active FROM tool_policy \
                  WHERE namespace = ?1 AND deleted_at IS NULL AND {actor_match} AND {tool_match} \
-                 ORDER BY ({} + {}) DESC, \
-                 CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, \
-                 created_at ASC, id ASC \
-                 LIMIT 1",
-                rank("actor"),
-                rank("tool"),
+                 AND NOT EXISTS (SELECT 1 FROM bad) ORDER BY {policy_order} LIMIT 1) \
+                 SELECT * FROM bad UNION ALL SELECT * FROM live"
             ),
             params: vec![
                 SqlValue::Text(ns.to_string()),
@@ -347,7 +502,25 @@ pub(crate) async fn select_deciding_policy(
             label: Some("tool_policy_decide".into()),
         })
         .await?;
-    rows.first().map(PolicyRow::from_row).transpose()
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    if let Some(column) = text(row, "invalid_timestamp") {
+        let id = text(row, "id").unwrap_or_else(|| "<unreadable id>".into());
+        return Err(RuntimeError::Internal(format!(
+            "invalid tool_policy row {id}: SQL column {column} is not an exact integer timestamp"
+        )));
+    }
+    let active = row.i64("policy_active").map_err(|error| {
+        RuntimeError::Internal(format!("invalid tool_policy activity: {error}"))
+    })?;
+    match active {
+        0 => Ok(None),
+        1 => PolicyRow::from_deciding_row(row).map(Some),
+        _ => Err(RuntimeError::Internal(
+            "invalid tool_policy activity flag".into(),
+        )),
+    }
 }
 
 /// Resolve the grant that allows `(actor, tool)`, if any, in SQL.
@@ -429,13 +602,19 @@ async fn select_grant_on(
          AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL \
          AND {pinned}"
     );
-    let (sql, check_activity, label) = match selector {
+    let invalid = malformed_grant_timestamp_sql();
+    let (sql, by_id, label) = match selector {
         GrantSelector::ByActor => (
             format!(
-                "SELECT {GRANT_COLUMNS} FROM tool_grants \
-                 WHERE {activity} \
-                 ORDER BY requested_at DESC, id ASC \
-                 LIMIT 1"
+                "WITH bad AS MATERIALIZED (\
+                 SELECT {GRANT_COLUMNS}, CASE WHEN ({activity}) THEN 1 ELSE 0 END AS grant_active \
+                 FROM tool_grants WHERE {scope} AND {actor_match} AND {tool_match} \
+                 AND ({invalid}) ORDER BY grant_active DESC, requested_at DESC, id ASC LIMIT 1), \
+                 live AS MATERIALIZED (\
+                 SELECT {GRANT_COLUMNS}, 1 AS grant_active FROM tool_grants \
+                 WHERE {activity} AND NOT EXISTS (SELECT 1 FROM bad) \
+                 ORDER BY requested_at DESC, id ASC LIMIT 1) \
+                 SELECT * FROM bad UNION ALL SELECT * FROM live"
             ),
             false,
             "tool_grant_decide",
@@ -467,23 +646,22 @@ async fn select_grant_on(
     // Parse the named row even when an activity term fails. A malformed grant
     // must not be reported as absent or inactive.
     let grant = GrantRow::from_active_row(row)?;
-    let active = if check_activity {
-        let value = row.i64("grant_active").map_err(|error| {
-            RuntimeError::Internal(format!("invalid tool_grants row {}: {error}", grant.id))
-        })?;
-        match value {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(RuntimeError::Internal(format!(
-                    "invalid tool_grants row {}: grant_active must be 0 or 1",
-                    grant.id
-                )));
-            }
+    let value = row.i64("grant_active").map_err(|error| {
+        RuntimeError::Internal(format!("invalid tool_grants row {}: {error}", grant.id))
+    })?;
+    let active = match value {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(RuntimeError::Internal(format!(
+                "invalid tool_grants row {}: grant_active must be 0 or 1",
+                grant.id
+            )))
         }
-    } else {
-        true
     };
+    if !by_id && !active {
+        return Ok(None);
+    }
     Ok(Some((grant, active)))
 }
 
@@ -548,7 +726,7 @@ pub(crate) async fn upsert_policy(
     let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
         let outcome: Result<PolicyRow, RuntimeError> = async {
             let stored = writer.query_row(SqlStatement {
-                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND deleted_at IS NULL"),
+                sql: current_policy_sql(),
                 params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
                 label: Some("tool_policy_current".into()),
             }).await?;
@@ -620,7 +798,7 @@ pub(crate) async fn delete_policy(
     let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
         let outcome: Result<PolicyRow, RuntimeError> = async {
             let stored = writer.query_row(SqlStatement {
-                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND deleted_at IS NULL"),
+                sql: current_policy_sql(),
                 params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
                 label: Some("tool_policy_delete_current".into()),
             }).await?;
@@ -677,7 +855,7 @@ pub(crate) async fn list_grants(
             label: Some("tool_grants_list".into()),
         })
         .await?;
-    Ok(rows.iter().filter_map(GrantRow::from_row).collect())
+    rows.iter().map(GrantRow::from_row).collect()
 }
 
 pub(crate) async fn get_grant(
@@ -705,7 +883,10 @@ pub(crate) async fn get_grant(
             label: Some("tool_grants_get".into()),
         })
         .await?;
-    let mut found: Vec<GrantRow> = rows.iter().filter_map(GrantRow::from_row).collect();
+    let mut found: Vec<GrantRow> = rows
+        .iter()
+        .map(GrantRow::from_row)
+        .collect::<Result<_, _>>()?;
     match found.len() {
         0 => Err(RuntimeError::NotFound(format!(
             "tool grant {id:?} not found"
@@ -799,8 +980,9 @@ pub(crate) async fn set_grant_status(
             params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(prepared.id.clone())],
             label: Some("tool_grants_revalidate".into()),
         }).await?;
-        let current = row.as_ref().and_then(GrantRow::from_row);
-        let outcome = if let Some(current) = current {
+        let outcome: Result<GrantRow, RuntimeError> = async {
+        let current = row.as_ref().map(GrantRow::from_row).transpose()?;
+        if let Some(current) = current {
             if current.actor != prepared.actor || current.tool != prepared.tool {
                 Err(RuntimeError::InvalidInput(format!("grant {} changed while preparing the decision; retry", &current.id[..8])))
             } else if let Err(error) = validate_transition(&current, &status, &decided_by) {
@@ -840,11 +1022,12 @@ pub(crate) async fn set_grant_status(
                     params: vec![SqlValue::Text(ns), SqlValue::Text(prepared.id)],
                     label: Some("tool_grants_decided".into()),
                 }).await?;
-                row.as_ref().and_then(GrantRow::from_row).ok_or_else(|| RuntimeError::Internal("decided tool grant disappeared".into()))
+                row.as_ref().map(GrantRow::from_row).transpose()?.ok_or_else(|| RuntimeError::Internal("decided tool grant disappeared".into()))
             }
         } else {
             Err(RuntimeError::NotFound(format!("tool grant {:?} not found", prepared.id)))
-        };
+        }
+        }.await;
         Ok(Box::new(outcome) as Box<dyn Any + Send>)
     }))).await?;
     *result
@@ -1030,7 +1213,29 @@ pub async fn decide(
 mod tests {
     use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
 
-    use super::{pattern_matches, GrantRow};
+    use super::{
+        malformed_grant_timestamp_sql, malformed_policy_timestamp_sql, pattern_matches, GrantRow,
+    };
+
+    #[test]
+    fn malformed_index_predicates_match_the_lookup_predicates() {
+        let migration = include_str!("../sql/008-malformed-history-index.sql");
+        let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (index, predicate) in [
+            (
+                "idx_tool_policy_malformed",
+                malformed_policy_timestamp_sql(),
+            ),
+            ("idx_tool_grants_malformed", malformed_grant_timestamp_sql()),
+        ] {
+            let statement = migration
+                .split(';')
+                .find(|statement| statement.contains(index))
+                .expect("malformed index must be registered in the migration");
+            let (_, actual) = statement.split_once("WHERE ").expect("index predicate");
+            assert_eq!(normalize(actual), normalize(&predicate), "{index}");
+        }
+    }
 
     fn active_row() -> SqlRow {
         SqlRow {
@@ -1040,7 +1245,9 @@ mod tests {
                 ("tool", SqlValue::Text("tool".into())),
                 ("status", SqlValue::Text("granted".into())),
                 ("requested_at", SqlValue::Integer(1)),
+                ("decided_at", SqlValue::Null),
                 ("expires_at", SqlValue::Null),
+                ("invalidated_at", SqlValue::Null),
             ]
             .into_iter()
             .map(|(name, value)| SqlColumn {
@@ -1049,6 +1256,111 @@ mod tests {
             })
             .collect(),
         }
+    }
+
+    #[test]
+    fn timestamp_decoding_is_lossless_and_names_the_row_and_column() {
+        let mut row = active_row();
+        for (value, expected) in [
+            (SqlValue::Integer(i64::MAX), i64::MAX),
+            (SqlValue::Float(-9223372036854775808.0), i64::MIN),
+            (SqlValue::Float(9007199254740994.0), 9007199254740994),
+            (SqlValue::Float(-0.0), 0),
+        ] {
+            row.columns
+                .iter_mut()
+                .find(|field| field.name == "requested_at")
+                .unwrap()
+                .value = value;
+            assert_eq!(
+                super::required_timestamp(&row, "tool_grants", "grant-id", "requested_at").unwrap(),
+                expected
+            );
+        }
+        for value in [
+            1.5,
+            -1.5,
+            9223372036854775808.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            row.columns
+                .iter_mut()
+                .find(|field| field.name == "requested_at")
+                .unwrap()
+                .value = SqlValue::Float(value);
+            let error = super::required_timestamp(&row, "tool_grants", "grant-id", "requested_at")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("grant-id") && error.contains("requested_at"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            super::timestamp(&row, "tool_grants", "grant-id", "expires_at").unwrap(),
+            None
+        );
+        row.columns.retain(|field| field.name != "expires_at");
+        assert!(super::timestamp(&row, "tool_grants", "grant-id", "expires_at").is_err());
+    }
+
+    #[test]
+    fn full_and_active_grant_decoders_both_reject_malformed_optional_times() {
+        for column in ["decided_at", "expires_at", "invalidated_at"] {
+            let mut row = active_row();
+            row.columns
+                .iter_mut()
+                .find(|field| field.name == column)
+                .unwrap()
+                .value = SqlValue::Float(1.5);
+            for error in [
+                GrantRow::from_row(&row).unwrap_err(),
+                GrantRow::from_active_row(&row).unwrap_err(),
+            ] {
+                let error = error.to_string();
+                assert!(
+                    error.contains("grant-id") && error.contains(column),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_real_projection_decodes_integral_values_losslessly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("timestamp.sqlite3");
+        let backend =
+            std::sync::Arc::new(khive_db::StorageBackend::sqlite_for_test(&path).unwrap());
+        backend.prepare_core_schema().unwrap();
+        let runtime = khive_runtime::KhiveRuntime::from_backend(
+            backend,
+            khive_runtime::RuntimeConfig {
+                db_path: Some(path),
+                events_split: None,
+                actor_id: Some("timestamp-test".into()),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
+            },
+        );
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let rows = reader
+            .query_all(khive_storage::types::SqlStatement {
+                sql: "SELECT CAST(42 AS REAL) AS requested_at".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rows[0].get("requested_at"),
+            Some(SqlValue::Float(_))
+        ));
+        assert_eq!(
+            super::required_timestamp(&rows[0], "tool_grants", "fixture", "requested_at").unwrap(),
+            42
+        );
     }
 
     #[test]
