@@ -315,11 +315,14 @@ fn exchange_internal_anchor_admits_same_domain_maintainer() {
     );
 }
 
+/// One refusal arm: label, opt-in, From, Sender, raw header block.
+type RefusalArm<'a> = (&'a str, bool, &'a str, Option<&'a str>, &'a [u8]);
+
 #[test]
 fn exchange_internal_anchor_refuses_each_missing_condition() {
     let internal_then_anonymous: &[u8] = b"X-MS-Exchange-Organization-AuthAs: Internal\r\nX-MS-Exchange-Organization-AuthAs: Anonymous\r\n\r\n";
     let anonymous_then_internal: &[u8] = b"X-MS-Exchange-Organization-AuthAs: Anonymous\r\nX-MS-Exchange-Organization-AuthAs: Internal\r\n\r\n";
-    let cases: &[(&str, bool, &str, Option<&str>, &[u8])] = &[
+    let cases: &[RefusalArm<'_>] = &[
         (
             "opt-in off",
             false,
