@@ -6,6 +6,11 @@
 //! `NoteStore::insert_note_if_absent`, so a row whose id already exists is left exactly as it is and counted, and a
 //! re-run after an interruption writes only the rows still missing.
 //!
+//! A row whose properties carry a runtime-owned key (`khive:secret_gate`, `khive:web_receipt`) is refused, as the
+//! knowledge-graph import and code ingest refuse it: those keys are set only by the runtime's own writers. Each file is
+//! read and checked whole before any of its rows is written, so the refusal leaves that file's rows unwritten; files
+//! earlier in the argument list stay written, and a re-run writes only what is still missing.
+//!
 //! No verb runs here: no id is minted, no actor is stamped, no message is delivered, no hook fires. Derived search
 //! data is not written; run `kkernel reindex` against the destination afterwards. The destination must already
 //! carry the current schema (`kkernel db migrate --db <path>` on a fresh file), so the daemon that later opens it
@@ -15,6 +20,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
+use khive_runtime::secret_gate;
 use khive_storage::note::Note;
 use serde_json::Value;
 use uuid::Uuid;
@@ -166,6 +172,8 @@ pub async fn run(args: ImportNotesArgs) -> Result<()> {
                 .with_context(|| format!("{}:{} is not JSON", file.display(), n + 1))?;
             let note =
                 note_from_row(&row).with_context(|| format!("{}:{}", file.display(), n + 1))?;
+            secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
+                .map_err(|e| anyhow!("{}:{}: {e}", file.display(), n + 1))?;
             parsed.push(note);
         }
         for note in &parsed {
@@ -367,6 +375,49 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("1 rows differ"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_row_with_a_runtime_owned_property_key_is_refused_before_any_write() {
+        for key in [
+            secret_gate::RESERVED_SECRET_GATE_KEY,
+            secret_gate::RESERVED_WEB_RECEIPT_KEY,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("dest.db");
+            std::fs::File::create(&db).unwrap();
+            let file = dir.path().join("memory.jsonl");
+            let mut reserved = row();
+            reserved["id"] = json!("5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+            reserved["properties"] = json!({"memory_type": "episodic", key: "planted"});
+            // The clean row comes first, so a per-row write would have stored it before the refusal.
+            std::fs::write(&file, format!("{}\n{}\n", row(), reserved)).unwrap();
+            let err = run(ImportNotesArgs {
+                db: db.clone(),
+                verify: false,
+                files: vec![file],
+            })
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(key), "{key}: {err}");
+            assert!(err.to_string().contains("memory.jsonl:2"), "{key}: {err}");
+            let backend = khive_db::StorageBackend::sqlite(&db).unwrap();
+            let notes = backend.notes().unwrap();
+            for id in [
+                "87a2baf7-5e7e-4a2b-9b06-53dfc11e4136",
+                "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            ] {
+                let id = Uuid::parse_str(id).unwrap();
+                assert!(
+                    notes
+                        .get_note_including_deleted(id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{key}: {id} was written"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
   database with their original ids, namespaces and timestamps. A row whose id is already present is left
-  unchanged and counted; `--verify` reads every row back and fails when any differs.
+  unchanged and counted; `--verify` reads every row back and fails when any differs. A row carrying a
+  runtime-owned property key is refused before any row of its file is written.
 - `kkernel reindex --fts-only` rebuilds entity and note FTS documents without any embedding model, so no
   vector is dropped or written and the knowledge pass is skipped.
 
