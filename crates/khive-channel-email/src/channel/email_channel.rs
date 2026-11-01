@@ -232,7 +232,16 @@ impl EmailChannel {
         email: &RawEmail,
         inbound: Option<&InboundSuppression>,
     ) -> Result<EmailAttribution, QuarantineReason> {
-        self.evaluate_auth(email)?;
+        match self.evaluate_auth(email) {
+            Ok(()) => {}
+            Err(QuarantineReason::AuthAbsent) if self.config.trust_exchange_internal => {
+                if self.exchange_internal_maintainer(email) {
+                    return Ok(EmailAttribution::Maintainer);
+                }
+                return Err(QuarantineReason::AuthAbsent);
+            }
+            Err(reason) => return Err(reason),
+        }
         if self
             .check_sender(&email.from_addrs, email.sender_addr.as_deref())
             .is_ok()
@@ -274,6 +283,28 @@ impl EmailChannel {
             }
         }
         Err(QuarantineReason::OffAllowlist)
+    }
+
+    fn exchange_internal_maintainer(&self, email: &RawEmail) -> bool {
+        let [from] = email.from_addrs.as_slice() else {
+            return false;
+        };
+        let Some((_, domain)) = from.rsplit_once('@') else {
+            return false;
+        };
+        let Some((_, mailbox_domain)) = self.config.mailbox.rsplit_once('@') else {
+            return false;
+        };
+        if !domain.eq_ignore_ascii_case(mailbox_domain)
+            || self
+                .check_sender(&email.from_addrs, email.sender_addr.as_deref())
+                .is_err()
+        {
+            return false;
+        }
+        let values =
+            auth_results::raw_header_values(&email.raw_bytes, b"X-MS-Exchange-Organization-AuthAs");
+        values.len() == 1 && values[0].trim().eq_ignore_ascii_case("Internal")
     }
 
     /// Build the envelope recorded for a message that failed the attribution
