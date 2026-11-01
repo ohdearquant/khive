@@ -1594,8 +1594,15 @@ Create a memory note with salience and decay.
 | `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
 | `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
 | `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
+| `properties`      | object | no       | Structured fields stored beside `memory_type` and `tags` and returned on recall hits. Rules below.                                    |
 | `namespace`       | string | no       | Write namespace override. Default: caller's actor namespace (anonymous: `local`).                                                     |
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+`properties` is a JSON object of at most 32 keys. A key is 1-64 characters, a lowercase ASCII letter first,
+then lowercase letters, digits or `_`; `memory_type`, `tags` and `attribution` are reserved. A value is a
+string, a finite number, a boolean or an array of strings. The serialized object is at most 8192 bytes. An
+object that breaks a rule is refused with an invalid-input error naming the key and the rule, never
+truncated.
 
 Without `namespace`, both memory types are written to the caller's actor namespace. A caller with
 no actor (anonymous) writes to `local`; that memory is flagged with `attribution: "unresolved"` in
@@ -1635,6 +1642,8 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
 
+Each result carries `namespace` (where the memory is stored), `tags` (`[]` when none) and
+`properties` (the stored object, including `memory_type` and `tags`; `{}` when none).
 Each result carries `serve_attribution` (`profile`, `unattributed`, or
 `unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
 means a selected profile record was unreadable and downstream feedback must not
