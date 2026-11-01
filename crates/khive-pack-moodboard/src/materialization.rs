@@ -1,7 +1,7 @@
 //! Moodboard policy for the shared bounded ranked-prefix controller.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use khive_fusion::union_fusion;
@@ -113,6 +113,9 @@ enum MoodboardCandidateRow {
 type MoodboardMaterializedHits =
     MaterializedPrefix<Uuid, DeterministicScore, Value, MoodboardDropReason>;
 
+/// Validates one candidate's ordering score; the error aborts the request.
+type ScoreValidator = fn(Uuid, DeterministicScore) -> Result<f64, RuntimeError>;
+
 async fn materialize_hits_with_diagnostics(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -120,6 +123,38 @@ async fn materialize_hits_with_diagnostics(
     query_asset_id: Uuid,
     raw_hits: Vec<VectorSearchHit>,
     top_k: u32,
+) -> Result<MoodboardMaterializedHits, RuntimeError> {
+    let candidates = raw_hits
+        .into_iter()
+        .map(|hit| RankedCandidate {
+            key: hit.subject_id,
+            score: hit.score,
+        })
+        .collect();
+    materialize_ranked_candidates(
+        runtime,
+        token,
+        blob_store,
+        query_asset_id,
+        candidates,
+        top_k,
+        validated_cosine_score_value,
+    )
+    .await
+}
+
+/// Bounded ranked-prefix materialization shared by the cosine and fused modes.
+///
+/// Candidates must already be in final order (score descending, id ascending).
+/// `validate_score` decides which score range is legal for the caller's list.
+async fn materialize_ranked_candidates(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    query_asset_id: Uuid,
+    candidates: Vec<RankedCandidate<Uuid, DeterministicScore>>,
+    top_k: u32,
+    validate_score: ScoreValidator,
 ) -> Result<MoodboardMaterializedHits, RuntimeError> {
     let loader_batch_size = NonZeroUsize::new(1).expect("one is non-zero");
     let max_top_k = usize::try_from(MAX_TOP_K).expect("moodboard top_k ceiling fits usize");
@@ -141,14 +176,6 @@ async fn materialize_hits_with_diagnostics(
         .iter()
         .map(|namespace| namespace.as_str().to_string())
         .collect();
-    let candidates = raw_hits
-        .into_iter()
-        .map(|hit| RankedCandidate {
-            key: hit.subject_id,
-            score: hit.score,
-        })
-        .collect();
-
     let materialized = materialize_ranked_prefix(
         candidates,
         top_k as usize,
@@ -156,7 +183,7 @@ async fn materialize_hits_with_diagnostics(
         limits,
         |candidate| (Reverse(candidate.score), candidate.key),
         |candidate| {
-            validated_cosine_score_value(candidate.key, candidate.score)?;
+            validate_score(candidate.key, candidate.score)?;
             Ok(())
         },
         |keys| {
@@ -208,6 +235,98 @@ async fn materialize_hits_with_diagnostics(
         diagnostic_details: materialized.diagnostic_details,
         diagnostics_truncated: materialized.diagnostics_truncated,
     })
+}
+
+/// Fused scores are reciprocal-rank sums, never cosines: they must be finite
+/// and non-negative.
+pub(crate) fn validated_fused_score_value(
+    subject_id: Uuid,
+    deterministic_score: DeterministicScore,
+) -> Result<f64, RuntimeError> {
+    let score = deterministic_score.to_f64();
+    if !score.is_finite() || score < 0.0 {
+        return Err(RuntimeError::Internal(format!(
+            "moodboard fused rerank produced invalid score {score} for {subject_id} (expected finite >= 0)"
+        )));
+    }
+    Ok(score)
+}
+
+/// Position of one asset in a ranked input list: 1-based rank and the list's
+/// own score for it.
+#[derive(Clone, Copy)]
+pub(crate) struct ListPosition {
+    pub(crate) rank: u32,
+    pub(crate) score: DeterministicScore,
+}
+
+/// Where an asset appeared in the visual and caption rankings before fusion.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FusedEvidence {
+    pub(crate) visual: Option<ListPosition>,
+    pub(crate) descriptor: Option<ListPosition>,
+}
+
+/// Materialize an already fused, ordered candidate list through the same
+/// bounded ranked-prefix path as the visual mode, then attach the per-list
+/// evidence to each accepted hit.
+///
+/// `score` is the fused score. `visual_score` is the cosine (validated like the
+/// visual mode validates it) and `descriptor_score` is the caption ranking's
+/// score; each of the four evidence keys is `null` when the asset was absent
+/// from that list.
+pub(crate) async fn materialize_fused_hits(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    query_asset_id: Uuid,
+    fused: Vec<(Uuid, DeterministicScore)>,
+    evidence: &BTreeMap<Uuid, FusedEvidence>,
+    top_k: u32,
+) -> Result<Vec<Value>, RuntimeError> {
+    let candidates = fused
+        .into_iter()
+        .map(|(key, score)| RankedCandidate { key, score })
+        .collect();
+    let materialized = materialize_ranked_candidates(
+        runtime,
+        token,
+        blob_store,
+        query_asset_id,
+        candidates,
+        top_k,
+        validated_fused_score_value,
+    )
+    .await?;
+    materialized
+        .accepted
+        .into_iter()
+        .map(|item| -> Result<Value, RuntimeError> {
+            let key = item.candidate.key;
+            let found = evidence.get(&key).copied().unwrap_or_default();
+            let visual_score = match found.visual {
+                Some(position) => Value::from(validated_cosine_score_value(key, position.score)?),
+                None => Value::Null,
+            };
+            let visual_rank = found
+                .visual
+                .map_or(Value::Null, |position| Value::from(position.rank));
+            let descriptor_score = found
+                .descriptor
+                .map_or(Value::Null, |position| Value::from(position.score.to_f64()));
+            let descriptor_rank = found
+                .descriptor
+                .map_or(Value::Null, |position| Value::from(position.rank));
+            let mut output = item.output;
+            if let Some(fields) = output.as_object_mut() {
+                fields.insert("visual_score".to_string(), visual_score);
+                fields.insert("visual_rank".to_string(), visual_rank);
+                fields.insert("descriptor_score".to_string(), descriptor_score);
+                fields.insert("descriptor_rank".to_string(), descriptor_rank);
+            }
+            Ok(output)
+        })
+        .collect()
 }
 
 async fn load_moodboard_candidate_batch(
