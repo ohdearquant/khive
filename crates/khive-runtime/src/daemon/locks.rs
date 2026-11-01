@@ -1,5 +1,8 @@
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -9,14 +12,341 @@ use super::{lock_path, recoverer_lock_path};
 
 #[cfg(unix)]
 pub(super) fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    open_mutating_daemon_lock(path, false)
+}
+
+/// Open a lock for a mutating boot or recovery. The default directory may be
+/// prepared; caller-specified parent directories must already be trusted.
+#[cfg(unix)]
+pub fn open_mutating_daemon_lock(
+    path: &std::path::Path,
+    read_write: bool,
+) -> std::io::Result<std::fs::File> {
+    let is_default_lock_parent = path.parent() == Some(super::khive_dir().as_path());
+    if is_default_lock_parent {
+        super::run_daemon::prepare_default_rendezvous_directory().map_err(lock_error)?;
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
+    // Preserve recursive creation for caller-selected lock locations. The
+    // checked opener below still validates the resulting path before use.
+    if !is_default_lock_parent {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    checked_open_lock(path, true, read_write, true)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "created lock is absent"))
+}
+
+#[cfg(unix)]
+fn lock_error(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{error:#}"))
+}
+
+/// Open a basename relative to an ancestry-checked directory fd. Existing
+/// locks can be tightened without allowing creation.
+#[cfg(unix)]
+pub(super) fn checked_open_lock(
+    path: &std::path::Path,
+    create: bool,
+    read_write: bool,
+    tighten: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    checked_open_lock_with_hooks(path, create, read_write, tighten, || {}, || {})
+}
+
+#[cfg(unix)]
+pub(super) fn checked_open_lock_with_hooks(
+    path: &std::path::Path,
+    create: bool,
+    read_write: bool,
+    tighten: bool,
+    before_openat: impl FnOnce(),
+    after_open: impl FnOnce(),
+) -> std::io::Result<Option<std::fs::File>> {
+    checked_open_lock_with_faults(
+        path,
+        create,
+        read_write,
+        tighten,
+        before_openat,
+        after_open,
+        (false, false),
+    )
+}
+
+// Fault flags are used only by synthetic tests; production always passes false.
+#[cfg(unix)]
+pub(super) fn checked_open_lock_with_faults(
+    path: &std::path::Path,
+    create: bool,
+    read_write: bool,
+    tighten: bool,
+    before_openat: impl FnOnce(),
+    after_open: impl FnOnce(),
+    faults: (bool, bool),
+) -> std::io::Result<Option<std::fs::File>> {
+    checked_open_lock_with_observe_hook(
+        path,
+        create,
+        read_write,
+        tighten,
+        before_openat,
+        after_open,
+        (faults.0, faults.1, || {}),
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn checked_open_lock_with_observe_hook(
+    path: &std::path::Path,
+    create: bool,
+    read_write: bool,
+    tighten: bool,
+    before_openat: impl FnOnce(),
+    after_open: impl FnOnce(),
+    faults_and_observer: (bool, bool, impl FnOnce()),
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::ffi::OsStrExt;
+    let (fail_metadata, fail_chmod, after_observe) = faults_and_observer;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock path has no basename",
+        )
+    })?;
+    let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock basename contains NUL",
+        )
+    })?;
+    let observed_parent = match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("cannot inspect lock parent {}: {error}", parent.display()),
+            ))
+        }
+    };
+    super::ensure_pid_file_dir_is_trusted(path).map_err(lock_error)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "refusing lock parent {} (mode {:04o}): {error}",
+                    parent.display(),
+                    observed_parent.mode() & 0o7777
+                ),
+            )
+        })?;
+    let opened_parent = directory.metadata()?;
+    if !observed_parent.is_dir()
+        || !opened_parent.is_dir()
+        || observed_parent.dev() != opened_parent.dev()
+        || observed_parent.ino() != opened_parent.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "lock parent changed during open",
+        ));
+    }
+    before_openat();
+    let current_parent = std::fs::symlink_metadata(parent)?;
+    if !current_parent.is_dir()
+        || current_parent.dev() != opened_parent.dev()
+        || current_parent.ino() != opened_parent.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "lock parent changed before openat",
+        ));
+    }
+    // SAFETY: `geteuid` takes no arguments and always succeeds.
+    let uid = unsafe { libc::geteuid() } as u32;
+    let mut observed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing lock {}: owner uid {}, mode {:04o}",
+                        path.display(),
+                        metadata.uid(),
+                        metadata.mode() & 0o7777
+                    ),
+                ));
+            }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if observed.is_none() && !create {
+        return Ok(None);
+    }
+    after_observe();
+    let access = if read_write {
+        libc::O_RDWR
+    } else if tighten && !create {
+        libc::O_RDONLY
+    } else if create {
+        libc::O_WRONLY
+    } else {
+        libc::O_RDONLY
+    };
+    let mut flags = access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let mut created = observed.is_none();
+    if created {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    // SAFETY: the parent fd is live, and leaf is a NUL-terminated basename.
+    let mut fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+    if fd < 0
+        && created
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists
+    {
+        // Another opener created the lock after our absence observation. Retry
+        // once as an existing entry, retaining all no-follow and identity checks.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing lock {}: owner uid {}, mode {:04o}",
+                    path.display(),
+                    metadata.uid(),
+                    metadata.mode() & 0o7777
+                ),
+            ));
+        }
+        observed = Some(metadata);
+        created = false;
+        flags &= !(libc::O_CREAT | libc::O_EXCL);
+        // SAFETY: the validated directory descriptor and basename remain live.
+        fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+    }
+    if fd < 0
+        && !create
+        && tighten
+        && !read_write
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    {
+        flags = (flags & !libc::O_ACCMODE) | libc::O_WRONLY;
+        // SAFETY: the same validated parent fd and basename remain live.
+        fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+    }
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        let observed_mode = observed
+            .as_ref()
+            .map(|metadata| format!("{:04o}", metadata.mode() & 0o7777))
+            .unwrap_or_else(|| "absent".to_owned());
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot safely open lock {} (observed mode {observed_mode}): {error}",
+                path.display()
+            ),
+        ));
+    }
+    // SAFETY: `openat` returned a new owned file descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let identity_changed = std::cell::Cell::new(false);
+    let result = (|| -> std::io::Result<()> {
+        if fail_metadata {
+            return Err(std::io::Error::other("injected metadata failure"));
+        }
+        let opened = file.metadata()?;
+        if !opened.is_file()
+            || opened.uid() != uid
+            || opened.nlink() != 1
+            || observed.as_ref().is_some_and(|metadata| {
+                metadata.dev() != opened.dev() || metadata.ino() != opened.ino()
+            })
+        {
+            identity_changed.set(true);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "lock {} changed during open (mode {:04o})",
+                    path.display(),
+                    opened.mode() & 0o7777
+                ),
+            ));
+        }
+        after_open();
+        let check_identity = || -> std::io::Result<()> {
+            let current_parent = std::fs::symlink_metadata(parent)?;
+            let current_lock = std::fs::symlink_metadata(path)?;
+            if !current_parent.is_dir()
+                || current_parent.dev() != opened_parent.dev()
+                || current_parent.ino() != opened_parent.ino()
+                || !current_lock.is_file()
+                || current_lock.dev() != opened.dev()
+                || current_lock.ino() != opened.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "lock or parent changed during open",
+                ));
+            }
+            Ok(())
+        };
+        check_identity().inspect_err(|_| {
+            identity_changed.set(true);
+        })?;
+        if tighten {
+            let latest = file.metadata()?;
+            if !latest.is_file() || latest.uid() != uid || latest.nlink() != 1 {
+                identity_changed.set(true);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "lock ownership changed",
+                ));
+            }
+            let mode = latest.mode() & 0o7777;
+            let target = if created { 0o600 } else { mode & 0o600 };
+            if target != mode {
+                if fail_chmod {
+                    return Err(std::io::Error::other("injected chmod failure"));
+                }
+                file.set_permissions(std::fs::Permissions::from_mode(target))?;
+            }
+        }
+        check_identity().inspect_err(|_| {
+            identity_changed.set(true);
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if created {
+            let guidance = if identity_changed.get() {
+                "the lock path or its parent changed; inspect the path and do not remove the replacement"
+            } else {
+                "after confirming no daemon is running and verifying the entry is the leftover lock, remove it and retry; do not remove an unverified entry"
+            };
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to finish creating lock {}: {error}; {guidance}",
+                    path.display()
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(Some(file))
 }
 
 #[cfg(unix)]
@@ -129,6 +459,15 @@ pub type DaemonBootGuard = std::fs::File;
 /// proceeding unguarded.
 #[cfg(unix)]
 pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
+    let explicit_rendezvous = super::lifecycle::path_override(super::lifecycle::PID_PATH_ENV)
+        .is_some()
+        || super::lifecycle::path_override(super::lifecycle::SOCKET_PATH_ENV).is_some();
+    if !explicit_rendezvous {
+        super::run_daemon::prepare_default_rendezvous_directory().map_err(|error| {
+            tracing::warn!(target: "khive_runtime::daemon", %error, "cannot prepare default daemon rendezvous");
+            anyhow::anyhow!("failed to acquire daemon boot/recovery lock")
+        })?;
+    }
     acquire_recovery_lock()
         .ok_or_else(|| anyhow::anyhow!("failed to acquire daemon boot/recovery lock"))
 }

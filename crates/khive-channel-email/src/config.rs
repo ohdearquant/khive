@@ -247,6 +247,9 @@ pub struct EmailChannelConfig {
     /// instead of being dropped. Defaults to `true`. When `false`, such messages
     /// are dropped with only the IMAP UID and quarantine reason logged.
     pub quarantine_store: bool,
+    /// Trust Exchange Online's stamped internal-hop header for same-domain
+    /// maintainer mail only. Valid only when this mailbox is hosted by Exchange Online.
+    pub trust_exchange_internal: bool,
     /// Most quarantine records that may hold a stored original message at
     /// once. Every quarantined message is still recorded; once the ingest
     /// namespace holds this many live quarantine records, further records are
@@ -347,6 +350,7 @@ impl EmailChannelConfig {
         let authserv_id_raw = require_nonempty_env("KHIVE_EMAIL_AUTHSERV_ID")?;
         let trust_anchor = TrustAnchor::parse(authserv_id_raw)?;
         let quarantine_store = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE", true)?;
+        let trust_exchange_internal = optional_bool("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", false)?;
         let quarantine_max_retained = optional_count(
             "KHIVE_EMAIL_QUARANTINE_MAX_RETAINED",
             DEFAULT_QUARANTINE_MAX_RETAINED,
@@ -365,6 +369,7 @@ impl EmailChannelConfig {
             maintainer_addresses,
             trust_anchor,
             quarantine_store,
+            trust_exchange_internal,
             quarantine_max_retained,
         })
     }
@@ -787,6 +792,25 @@ mod tests {
     }
 
     #[test]
+    fn exchange_internal_flag_defaults_off_and_rejects_invalid_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let key = "KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL";
+        let _snap = EnvSnapshot::capture(&[key]);
+        std::env::remove_var(key);
+        assert!(!optional_bool(key, false).unwrap());
+        for value in ["true", "1", "yes", "on"] {
+            std::env::set_var(key, value);
+            assert!(optional_bool(key, false).unwrap(), "{value:?}");
+        }
+        for value in ["false", "0", "no", "off"] {
+            std::env::set_var(key, value);
+            assert!(!optional_bool(key, true).unwrap(), "{value:?}");
+        }
+        std::env::set_var(key, "sometimes");
+        assert!(optional_bool(key, false).is_err());
+    }
+
+    #[test]
     fn optional_bool_rejects_invalid_value() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let key = "KHIVE_EMAIL_QUARANTINE_STORE_TEST_INVALID";
@@ -1004,6 +1028,35 @@ mod tests {
                 "got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn from_env_trust_exchange_internal_defaults_off_parses_and_rejects() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&RETAINED_KEYS);
+        let _flag_snap = EnvSnapshot::capture(&["KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL"]);
+        set_minimal_valid_env();
+
+        std::env::remove_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL");
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert!(!config.trust_exchange_internal, "unset must default off");
+
+        std::env::set_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", "true");
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert!(config.trust_exchange_internal);
+
+        std::env::set_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", "off");
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert!(!config.trust_exchange_internal);
+
+        std::env::set_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", "sometimes");
+        let error = EmailChannelConfig::from_env()
+            .expect_err("an invalid boolean must fail config construction")
+            .to_string();
+        assert!(
+            error.contains("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL"),
+            "got: {error}"
+        );
     }
 
     // ── TrustAnchor sentinel parsing (Amendment 2026-07-03) ───────────────────

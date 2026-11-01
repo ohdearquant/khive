@@ -15,6 +15,10 @@ All configuration is read from environment variables; see
 [`.env.example`](.env.example) for the full, annotated template. The `kkernel`
 binary loads `~/.khive/.env` at startup.
 
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` | no | `false` | Opt in to Exchange Online's same-tenant `AuthAs: Internal` stamp for same-domain maintainer messages. Use only when the mailbox is hosted by Exchange Online. |
+
 Inbound IMAP fetches use `RFC822.SIZE` before requesting bodies. Set
 `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` (default 25 MiB) and
 `KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES` (default 50 MiB) to limit memory used per

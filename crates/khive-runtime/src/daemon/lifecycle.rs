@@ -273,7 +273,7 @@ pub(super) const PID_PATH_ENV: &str = "KHIVE_PID";
 /// boots that resolve consistently, or admit the split rendezvous it exists
 /// to stop.
 #[cfg(unix)]
-fn path_override(key: &str) -> Option<PathBuf> {
+pub(super) fn path_override(key: &str) -> Option<PathBuf> {
     match std::env::var(key) {
         Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
         _ => None,
