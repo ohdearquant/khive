@@ -25,6 +25,20 @@ pub enum TransportStatus {
     Unknown,
 }
 
+/// Build the sender transport INSERT for a first envelope as one statement, so the caller can
+/// commit it in the same atomic unit as the outbound note. Namespace and sender assurance are
+/// normalized exactly as [`KhiveRuntime::create_sender_transport`] does: the namespace comes from
+/// the token and assurance stays claimed. The envelope's `outbound_note_id` must already name the
+/// note the statement is committed beside.
+pub fn sender_transport_insert_statement(
+    token: &NamespaceToken,
+    mut envelope: SenderEnvelope,
+) -> RuntimeResult<khive_storage::SqlStatement> {
+    envelope.namespace = token.namespace().as_str().to_owned();
+    envelope.sender_assurance = SenderAssurance::Claimed;
+    Ok(khive_db::stores::note::transport::sender_envelope_insert_statement(&envelope)?)
+}
+
 impl KhiveRuntime {
     fn sender_transport_store(&self) -> SenderTransportStore {
         SenderTransportStore::new(self.backend().pool_arc())
@@ -85,6 +99,21 @@ impl KhiveRuntime {
     /// Read by durable identity. Absence means unknown; unknown is not persisted.
     pub async fn sender_transport(&self, key: EnvelopeKey) -> RuntimeResult<Option<SenderRecord>> {
         Ok(self.sender_transport_store().get(key).await?)
+    }
+    /// The current envelope for one logical message: the row with the highest envelope
+    /// sequence, whatever its state. Absence means unknown. The namespace comes from the
+    /// token, so a caller cannot read another namespace's transport rows.
+    pub async fn current_sender_transport(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        slug: &str,
+        logical_id: uuid::Uuid,
+    ) -> RuntimeResult<Option<SenderRecord>> {
+        Ok(self
+            .sender_transport_store()
+            .current_by_logical_id(token.namespace().as_str(), kind, slug, logical_id)
+            .await?)
     }
     /// Due unheld submissions for the exact configured kind and slug. Times use
     /// Unix microseconds; choosing the backoff and jitter is the caller's job.

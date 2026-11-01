@@ -348,9 +348,22 @@ pub async fn create_notes_atomic_with_attachments(
     specs: Vec<AtomicNoteSpec<'_>>,
     attachments: &[khive_storage::NewAttachment],
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    create_notes_atomic_with_extra_statements(runtime, specs, attachments, Vec::new()).await
+}
+
+/// Like [`create_notes_atomic_with_attachments`], and also commit `extra_statements` in the same
+/// writer transaction, after the last note's plan. Each statement must affect exactly one row;
+/// if any statement fails, no note and no extra row is left behind.
+pub async fn create_notes_atomic_with_extra_statements(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+    attachments: &[khive_storage::NewAttachment],
+    extra_statements: Vec<khive_storage::SqlStatement>,
+) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
     validate_note_attachments(runtime, attachments)?;
     let mut prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
     append_note_attachments(&mut prepared, attachments)?;
+    append_extra_statements(&mut prepared, extra_statements)?;
     match crate::atomic_runner::run_atomic_unit_with_note_versions(
         runtime.sql().as_ref(),
         prepared.plans,
@@ -421,6 +434,29 @@ pub(crate) fn append_note_attachments(
                 guard: Some(AffectedRowGuard::exactly(1)),
             });
         }
+    }
+    Ok(())
+}
+
+/// Append caller-built statements to the last note's plan so they commit in the same unit. Each
+/// statement must affect exactly one row.
+pub(crate) fn append_extra_statements(
+    prepared: &mut PreparedAtomicNotes,
+    statements: Vec<khive_storage::SqlStatement>,
+) -> RuntimeResult<()> {
+    if statements.is_empty() {
+        return Ok(());
+    }
+    let Some(AtomicOpPlan::AddNote(last)) = prepared.plans.last_mut() else {
+        return Err(RuntimeError::Internal(
+            "expected prepared note for extra statements".into(),
+        ));
+    };
+    for statement in statements {
+        last.statements.push(PlanStatement {
+            statement,
+            guard: Some(AffectedRowGuard::exactly(1)),
+        });
     }
     Ok(())
 }

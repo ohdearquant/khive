@@ -4,8 +4,8 @@ description: Manage work with the GTD pack — capture tasks, process and triage
 
 # Manage work over GTD
 
-khive GTD has seven verbs: `gtd.assign`, `gtd.next`, `gtd.tasks`, `gtd.transition`,
-`gtd.complete`, the read-only `gtd.census`, and explicit `gtd.repair`. The thing worth learning is the workflow pattern, not the individual verbs.
+khive GTD has eight verbs: `gtd.assign`, `gtd.next`, `gtd.tasks`, `gtd.transition`,
+`gtd.complete`, the read-only `gtd.census` and `gtd.counts`, and explicit `gtd.repair`. The thing worth learning is the workflow pattern, not the individual verbs.
 Per-verb param detail is one call away: `request(ops="gtd.assign(help=true)")`.
 
 Use `gtd.repair` only for explicit historical task corrections after inspecting exact

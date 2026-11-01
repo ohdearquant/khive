@@ -1,6 +1,7 @@
 //! SQL-backed `NoteStore` implementation.
 
 mod guarded_patch;
+pub mod node_pins;
 pub mod recipient;
 pub mod transport;
 
@@ -936,6 +937,7 @@ fn note_time_order_clause(order: NoteTimeOrder) -> &'static str {
         NoteTimeOrder::ExpiresAtOrCreatedAt => {
             " ORDER BY COALESCE(expires_at, created_at) ASC, id ASC"
         }
+        NoteTimeOrder::UpdatedAt => " ORDER BY updated_at ASC, id ASC",
     }
 }
 

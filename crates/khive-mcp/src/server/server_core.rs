@@ -76,6 +76,8 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     pub(super) config_id: String,
+    pub(super) spawn_config: Option<std::path::PathBuf>,
+    pub(super) spawn_db: Option<String>,
     /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).

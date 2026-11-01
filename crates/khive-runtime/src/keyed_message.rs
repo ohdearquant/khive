@@ -1,4 +1,7 @@
-//! A message pair publishes its outbound identity in the final atomic statement.
+//! A message pair claims its caller key before any extra statement of the unit runs.
+//!
+//! The claim decides a duplicate-key race, so a competing pair loses at the claim and replays the
+//! existing holder instead of failing at a later row.
 
 use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::{Details, KhiveError};
@@ -30,12 +33,34 @@ pub async fn create_keyed_message_pair(
     create_keyed_message_pair_with_attachments(runtime, specs, physical_key, &[]).await
 }
 
-/// Include every copy's attachments before the final key claim in the same unit.
+/// Include every copy's attachments in the same unit, ahead of the key claim.
 pub async fn create_keyed_message_pair_with_attachments(
     runtime: &KhiveRuntime,
     specs: [AtomicNoteSpec<'_>; 2],
     physical_key: &str,
     attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<KeyedMessageWrite> {
+    create_keyed_message_pair_with_extra_statements(
+        runtime,
+        specs,
+        physical_key,
+        attachments,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Like [`create_keyed_message_pair_with_attachments`], and also commit `extra_statements` in the
+/// same unit, after the attachments and after the key claim. The claim is the only statement that
+/// decides a duplicate-key race: a competing pair loses there, before any extra row is written,
+/// and the existing holder is returned. A winning pair commits the claim, the notes, the
+/// attachments and the extra rows together.
+pub async fn create_keyed_message_pair_with_extra_statements(
+    runtime: &KhiveRuntime,
+    specs: [AtomicNoteSpec<'_>; 2],
+    physical_key: &str,
+    attachments: &[khive_storage::NewAttachment],
+    extra_statements: Vec<SqlStatement>,
 ) -> RuntimeResult<KeyedMessageWrite> {
     crate::atomic_message::validate_note_attachments(runtime, attachments)?;
     let namespace = specs[0].token.namespace().as_str().to_owned();
@@ -86,6 +111,11 @@ pub async fn create_keyed_message_pair_with_attachments(
         },
         guard: Some(AffectedRowGuard::exactly(1)),
     });
+    // The claim is the only statement that decides a duplicate-key race, so it runs before the
+    // extra statements. A competing pair then rolls back here and replays the existing holder;
+    // were an extra row (for example a transport row keyed by the same logical id) placed first,
+    // the loser would fail on that row and surface as an internal error instead of a replay.
+    crate::atomic_message::append_extra_statements(&mut prepared, extra_statements)?;
 
     match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
         Ok(AtomicRunOutcome::Committed { .. }) => {

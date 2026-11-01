@@ -337,10 +337,15 @@ async fn recent_external_outbound_count(
 fn external_email_denied(verb: &str, condition: &str) -> RuntimeError {
     RuntimeError::permission_denied(
         verb,
-        format!("external email admission refused: {condition}; no message was committed by this request"),
+        format!(
+            "external email admission refused: {condition}; no message was committed by this request"
+        ),
     )
 }
 
+/// Write the outbound/inbound pair for one message with no transport row. See
+/// [`dual_write_message_with_transport`] for the variant that commits a sender transport row
+/// in the same transaction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dual_write_message_with_identity(
     runtime: &KhiveRuntime,
@@ -360,6 +365,54 @@ pub(crate) async fn dual_write_message_with_identity(
     tags: Option<&[String]>,
     attachments: &[khive_storage::NewAttachment],
     identity: Option<&crate::idempotency::MessageIdentity>,
+) -> Result<MessageWrite, RuntimeError> {
+    dual_write_message_with_transport(
+        runtime,
+        caller_token,
+        verb,
+        from,
+        to,
+        subject,
+        content,
+        thread_id,
+        sent_at,
+        sent_by_process,
+        from_actor,
+        to_actor,
+        in_reply_to_message_id,
+        references_chain,
+        tags,
+        attachments,
+        identity,
+        None,
+    )
+    .await
+}
+
+/// Write the outbound/inbound pair for one message. When `transport` is given, its sender
+/// transport row is committed in the same transaction as the notes: either the pair and the row
+/// all exist afterwards, or none of them do. The envelope's `outbound_note_id` is set here to the
+/// outbound note this call creates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dual_write_message_with_transport(
+    runtime: &KhiveRuntime,
+    caller_token: &NamespaceToken,
+    verb: &str,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    content: &str,
+    thread_id: Option<&str>,
+    sent_at: &str,
+    sent_by_process: Option<&str>,
+    from_actor: Option<&str>,
+    to_actor: Option<&str>,
+    in_reply_to_message_id: Option<&str>,
+    references_chain: Option<&str>,
+    tags: Option<&[String]>,
+    attachments: &[khive_storage::NewAttachment],
+    identity: Option<&crate::idempotency::MessageIdentity>,
+    transport: Option<khive_runtime::comm_transport::SenderEnvelope>,
 ) -> Result<MessageWrite, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
@@ -641,12 +694,27 @@ pub(crate) async fn dual_write_message_with_identity(
             properties: Some(inbound_props),
         },
     ];
+    // The transport row rides in the same atomic unit as the pair, so a failure anywhere leaves
+    // neither notes nor a row behind.
+    let extra_statements = match transport {
+        Some(mut envelope) => {
+            envelope.outbound_note_id = outbound_id;
+            vec![
+                khive_runtime::comm_transport::sender_transport_insert_statement(
+                    caller_token,
+                    envelope,
+                )?,
+            ]
+        }
+        None => Vec::new(),
+    };
     let (mut notes, embedding_truncation) = if let Some(identity) = identity {
-        match khive_runtime::keyed_message::create_keyed_message_pair_with_attachments(
+        match khive_runtime::keyed_message::create_keyed_message_pair_with_extra_statements(
             runtime,
             specs,
             &identity.physical_key(caller_token),
             attachments,
+            extra_statements,
         )
         .await
         .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
@@ -666,10 +734,11 @@ pub(crate) async fn dual_write_message_with_identity(
             }
         }
     } else {
-        khive_runtime::atomic_message::create_notes_atomic_with_attachments(
+        khive_runtime::atomic_message::create_notes_atomic_with_extra_statements(
             runtime,
             specs.into(),
             attachments,
+            extra_statements,
         )
         .await
         .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?

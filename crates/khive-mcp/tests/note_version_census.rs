@@ -821,7 +821,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         MESSAGE,
-        "create_keyed_message_pair_with_attachments",
+        "create_keyed_message_pair_with_extra_statements",
         "note_insert_if_absent_statement",
         MarkerDisposition::FixedNonMemoryKind,
     ),
@@ -839,7 +839,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         CREATE,
-        "prepare_note_create",
+        "prepare_note_create_classified",
         "note_insert_if_absent_statement",
         MarkerDisposition::RuntimeReceiptUnit,
     ),
@@ -1041,12 +1041,12 @@ fn census() -> BTreeMap<(String, String), String> {
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
         (CURATION, "merge_note_sql"),
-        (CREATE, "prepare_note_create"),
+        (CREATE, "prepare_note_create_classified"),
         (OPERATIONS, "restore_note"),
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
-        (MESSAGE, "create_keyed_message_pair_with_attachments"),
+        (MESSAGE, "create_keyed_message_pair_with_extra_statements"),
         // Guarded partial properties advance through the note version trigger.
         (GUARDED_PATCH, "note_patch_properties_statement"),
         // This feature can compile outside tests; keep its zero-row writer visible.
@@ -1198,13 +1198,13 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             r#"{"status":"archived"}"#,
         ),
         (CURATION, "merge_note_sql", "memory", "{}"),
-        (CREATE, "prepare_note_create", "memory", "{}"),
+        (CREATE, "prepare_note_create_classified", "memory", "{}"),
         (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
         (
             MESSAGE,
-            "create_keyed_message_pair_with_attachments",
+            "create_keyed_message_pair_with_extra_statements",
             "message",
             "{}",
         ),
