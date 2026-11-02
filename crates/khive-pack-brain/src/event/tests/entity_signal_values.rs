@@ -1,5 +1,5 @@
 #[test]
-fn entity_signal_for_hit() {
+fn entity_signal_for_hit_is_none() {
     let id = Uuid::new_v4();
     let sig = BrainSignal::RecallHit {
         target_id: id,
@@ -7,7 +7,22 @@ fn entity_signal_for_hit() {
         served_by_profile_id: None,
         serve_attribution: ServeAttribution::Unspecified,
     };
-    assert_eq!(entity_signal(&sig), Some((id, true)));
+    // A returned result is exposure, not a judgment.
+    assert_eq!(entity_signal(&sig), None);
+}
+
+#[test]
+fn entity_signal_for_non_judgment_signals_is_none() {
+    let id = Uuid::new_v4();
+    assert_eq!(
+        entity_signal(&BrainSignal::NoteAccessed { target_id: id }),
+        None
+    );
+    assert_eq!(
+        entity_signal(&BrainSignal::SearchCompleted { latency_us: 0 }),
+        None
+    );
+    assert_eq!(entity_signal(&BrainSignal::Irrelevant), None);
 }
 
 #[test]

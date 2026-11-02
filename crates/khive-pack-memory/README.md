@@ -72,6 +72,37 @@ let hits = registry
 
 Over MCP: `request(ops="memory.recall(query=\"Vamana intrinsic dimension\", limit=10)")`.
 
+## Storing a memory
+
+`memory.remember` takes the fact as `content`. Anything else about the memory belongs in structured fields rather than in the text: `memory_type`, `tags`, `source_id`, and an optional `properties` object that records who wrote the memory, when, where, what kind it is, and any source ids.
+
+```rust
+registry
+    .dispatch(
+        "memory.remember",
+        json!({
+            "content": "Backups run nightly at 02:00",
+            "memory_type": "semantic",
+            "properties": {"author": "ops", "system": "backups", "reviewed": true}
+        }),
+    )
+    .await?;
+```
+
+Rules for `properties`:
+
+- It is a JSON object with at most 32 keys.
+- Each key is 1-64 characters: a lowercase ASCII letter first, then lowercase letters, digits or `_`.
+- The keys `memory_type` and `tags` are reserved because they have their own parameters, and `attribution` is reserved because the runtime writes it.
+- Each value is a string, a finite number, a boolean or an array of strings. `null`, nested objects and arrays with non-string items are refused.
+- The serialized object is at most 8192 bytes. A larger object is refused with its measured size and the limit in the message; it is never truncated.
+
+A refused call returns an invalid-input error that names the offending key and the rule.
+
+Without `namespace`, both memory types are written to the caller's actor namespace. An explicit `namespace` always wins, `local` included. A caller with no actor (anonymous) writes to its own namespace, `local`, and every memory it writes, with or without `namespace`, is flagged with `attribution: "unresolved"` in its properties and in the response. Attributed writes carry no `attribution` key.
+
+Every `memory.recall` hit carries `namespace` (where the memory is stored), `tags` (`[]` when none) and `properties` (the stored object, including `memory_type` and `tags`; `{}` when none) beside the content.
+
 ## Where this sits
 
 `khive-pack-memory` sits alongside `khive-pack-gtd`, `khive-pack-comm`, and

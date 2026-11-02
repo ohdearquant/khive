@@ -63,7 +63,7 @@ pub static ENTITY_TYPES: [EntityTypeDef; 4] = [
 ];
 
 /// Pack-owned tables, applied idempotently at boot.
-pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 9] = [
+pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 10] = [
     include_str!("../sql/000-policy.sql"),
     include_str!("../sql/001-policy-index.sql"),
     include_str!("../sql/002-grants.sql"),
@@ -73,6 +73,7 @@ pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 9] = [
     include_str!("../sql/005-policy-history-consolidate.sql"),
     include_str!("../sql/006-policy-retire-duplicates.sql"),
     include_str!("../sql/007-policy-live-index.sql"),
+    include_str!("../sql/008-malformed-history-index.sql"),
 ];
 
 /// Nullable additions preserve existing policy and grant records during upgrade.

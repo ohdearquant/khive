@@ -297,6 +297,9 @@ fn bench_feedback_posteriors(c: &mut Criterion) {
         prepared.apply_signal(&recall_hit(target, 10_000));
         prepared.apply_signal(&BrainSignal::RecallMiss);
     }
+    // A recall hit no longer creates an entity posterior, so one judgment seeds
+    // the target. Feedback posterior updates do not change event counters.
+    prepared.apply_feedback_posteriors(&feedback(target, FeedbackSignal::Useful));
     let snapshot = prepared.to_snapshot();
     assert_eq!(snapshot.total_events, 50);
     assert_eq!(snapshot.entity_posteriors.len(), 1);

@@ -89,7 +89,7 @@ impl Pack for MemoryPack {
 // Illocutionary classification (Searle 1976):
 //   Commissive — commits caller to a persistent change
 //   Assertive  — retrieves/presents state of affairs
-static MEMORY_HANDLERS: [HandlerDef; 10] = [
+static MEMORY_HANDLERS: [HandlerDef; 11] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "memory.remember",
@@ -161,10 +161,17 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Structured fields stored beside memory_type and tags and returned on recall hits. Keep the memory text to the fact and put who, when, where, kind and source ids here. Rules: a JSON object; at most 32 keys; each key 1-64 chars, a lowercase ASCII letter first, then lowercase letters, digits or _; the keys memory_type, tags and attribution are reserved; each value is a string, a finite number, a boolean or an array of strings (null and nested objects are refused); the serialized object is at most 8192 bytes, and an object over the limit is refused, never truncated.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Write namespace override. When absent: episodic memories land in the actor's namespace; semantic memories land in \"local\". When present, overrides both routing rules.",
+                description: "Write namespace override. When absent, both episodic and semantic memories land in the caller's actor namespace; an anonymous caller (no actor configured) writes to \"local\" and the memory is flagged with attribution \"unresolved\". When present, the explicit namespace wins, \"local\" included; an anonymous caller's memory is flagged either way.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -472,6 +479,36 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
         category: VerbCategory::Commissive,
         params: &[],
     },
+    // Commissive: apply a chunk of memory rewrites, dry run by default
+    HandlerDef {
+        name: "memory.apply_batch",
+        description: "Apply a chunk of memory rewrites: each row supersedes an existing memory with a new one, creates a memory, skips a row, or lists a row as a deletion candidate. Dry run by default. Every row is checked before anything is written, and re-running a chunk writes only what is missing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "batch",
+                param_type: "string",
+                required: true,
+                description: "Name of the batch, at most 128 characters. It is stored on every written row as properties.batch and forms the idempotency key: <batch>:<old id>:<part> for supersede rows and <batch>:create:<part> for create rows. Re-running a chunk under the same name writes only what is missing; a corrected row needs a new part or a new batch name.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "rows",
+                param_type: "array",
+                required: true,
+                description: "1 to 200 rows, each an object {id?, part = 1, action, content?, memory_type?, salience?, properties?, tags?}; unknown fields are refused. action is one of: supersede (id is the full id of the old row; writes a new memory and a supersedes edge from it to the old row, and leaves the old row unchanged), create (no id; writes a new memory with no edge), skip (id; writes nothing), delete-candidate (id; writes nothing and lists the row). Rows are written in the caller's own namespace through the memory.remember path. supersede and create rows need content and properties.who; a stored salience above 0.4 needs properties.verified (true, or a non-empty string naming what was checked), and a semantic row that gives no salience is stored at its default 0.5; a supersede row whose old row is in the shared namespace needs properties.source_ids; properties may not contain batch, supersedes or batch_row, which the verb adds (batch_row is the SHA-256 of the row's canonical JSON). The old row must be a memory in the caller's namespace or the shared one. The result has one entry per row in input order, {id, part, action, outcome, old_namespace, new_id, reason}, with outcome one of planned, written, deduped, skipped, listed, refused, failed, and counts per outcome. A refused row carries reason {code, message} and never stops the others; codes: invalid-row, id-missing, id-not-allowed, old-unresolved, old-not-memory, old-namespace, content-invalid, salience-range, salience-unverified, who-missing, source-ids-missing, reserved-property, duplicate-key (another row of the call has the same key), secret-detected (the key, content, properties or tags hold credential-shaped text; the same scans the write runs), dedupe-name-taken (the key is taken by a row with a different batch_row). A row whose write was refused by the store after passing every check is failed with code write-failed or link-failed and can be re-run. A key already taken by an identical row is deduped and its supersedes edge is asserted again.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "dry_run",
+                param_type: "boolean",
+                required: false,
+                description: "When true (the default), check every row and report what a real run would do (planned or deduped for writing rows) without writing anything. Pass false to write. An anonymous caller is refused either way.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
 ];
 
 // ── Inventory self-registration ───────────────────────────────────────────────
@@ -589,6 +626,7 @@ impl PackRuntime for MemoryPack {
             "memory.recall_score" => self.handle_recall_score(params).await,
             "memory.prune" => self.handle_prune(token, params).await,
             "memory.vacuum" => self.handle_vacuum(params).await,
+            "memory.apply_batch" => self.handle_apply_batch(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),

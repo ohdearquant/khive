@@ -679,6 +679,7 @@ enum MarkerDisposition {
     UnkeyedNote,
     FixedNonMemoryKind,
     RuntimeReceiptUnit,
+    RestoredExport,
 }
 
 // ADR-144 A4: only RuntimeReceiptUnit adds modern atomically; constructors and
@@ -803,6 +804,16 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         "persist_ingest_note",
         "upsert_note",
         MarkerDisposition::FixedNonMemoryKind,
+    ),
+    // The note importer re-inserts exported rows, keyed memories included,
+    // under their original ids and writes no epoch marker. A restored keyed
+    // memory therefore has missing provenance: exact replay of its key fails
+    // with reason receipt_epoch_unknown, and recall is unchanged.
+    (
+        "kkernel/src/import_notes.rs",
+        "run",
+        "insert_note_if_absent",
+        MarkerDisposition::RestoredExport,
     ),
     // The atomic note create and the canonical create share one builder: an
     // ordinary create upserts, a canonical create inserts under its staged

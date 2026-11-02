@@ -283,7 +283,7 @@ def main():
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 161 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 162 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -328,11 +328,12 @@ def main():
         # kg contributes apply_changeset, the atomic apply of one canonical
         # NDJSON change-set; attach records a rendition of a record and
         # hydrates the selected roles; gtd contributes gtd.counts, one assignee's
-        # task counts by status without task bodies.
+        # task counts by status without task bodies; memory contributes
+        # memory.apply_batch, checked and resumable memory rewrites (ADR-021).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 161, (
-            f"expected 161 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 162, (
+            f"expected 162 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -362,6 +363,7 @@ def main():
             f"kg contributes attach, which records a rendition of a record and "
             f"hydrates the selected roles; "
             f"gtd contributes gtd.counts; "
+            f"memory contributes memory.apply_batch; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

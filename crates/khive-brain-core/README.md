@@ -105,8 +105,10 @@ composition converges from exploratory to exploitative without a separate code p
 Beta-posterior state for the built-in `balanced-recall-v1` profile (relevance,
 salience, temporal scalars plus per-entity posteriors). `BrainSignal` is the decoded
 signal vocabulary produced from raw events (`RecallHit`, `RecallMiss`, `Feedback`,
-`SemanticFeedback`, `NoteAccessed`, …); `entity_signal` and `is_recall_positive` map a
-`BrainSignal` to the posterior update it implies. `FeedbackSignal`
+`SemanticFeedback`, `NoteAccessed`, …). `entity_signal` maps only judgment-bearing
+signals (`Feedback`, `SemanticFeedback`) to a per-entity update and returns `None` for
+every other signal, so a recall hit or a note access never moves a per-entity posterior;
+`is_recall_positive` maps recall signals to the entity-blind recall update. `FeedbackSignal`
 (`Useful`/`NotUseful`/`Wrong`) and `FeedbackEventKind`
 (`ExplicitPositive`/`ExplicitNegative`/`ImplicitPositive`/`ImplicitNegative`/`Correction`)
 are the two closed signal enums consumed by `brain.feedback` and semantic-fold updates

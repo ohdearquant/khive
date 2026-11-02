@@ -1,7 +1,5 @@
 use khive_brain_core::{BalancedRecallState, BetaPosterior};
-#[cfg(debug_assertions)]
-use khive_pack_memory::recall_feedback::on_explicit_feedback;
-use khive_pack_memory::recall_feedback::{on_recall_hit, on_recall_miss};
+use khive_pack_memory::recall_feedback::{on_explicit_feedback, on_recall_hit, on_recall_miss};
 use khive_pack_memory::scoring::{
     contains_cjk, is_cjk_char, AdjustmentCondition, CandidateContext,
 };
@@ -26,13 +24,16 @@ fn recall_hit_preserves_temporal_boundary_and_entity_state() {
             snapshot.temporal,
             BetaPosterior::new(temporal.0, temporal.1)
         );
-        assert_eq!(snapshot.entity_posteriors.len(), 1);
+        // A recall hit is exposure, not a judgment: no entity posterior is created.
+        assert!(snapshot.entity_posteriors.is_empty());
+        assert!(!snapshot.entity_posteriors.contains_key(&id));
+        assert!(snapshot.entity_posterior_order.is_empty());
         assert_eq!(
-            snapshot.entity_posteriors[&id],
-            BetaPosterior::new(2.0, 1.0)
+            snapshot.entity_posteriors_version,
+            BalancedRecallState::new(2)
+                .to_snapshot()
+                .entity_posteriors_version
         );
-        assert_eq!(snapshot.entity_posterior_order, vec![id]);
-        assert_eq!(snapshot.entity_posteriors_version, 1);
         assert_eq!(snapshot.total_events, 1);
         assert_eq!(snapshot.exploration_epoch, 7);
     }
@@ -45,28 +46,32 @@ fn recall_miss_preserves_entity_eviction_order_and_exploration() {
     let c = Uuid::from_u128(3);
     let mut state = BalancedRecallState::new(2);
     state.exploration_epoch = 7;
-    on_recall_hit(&mut state, a, 50_000);
-    on_recall_hit(&mut state, b, 50_001);
-    on_recall_hit(&mut state, a, -1);
+    // Entity posteriors come only from judgments; a recall hit creates none.
+    on_explicit_feedback(&mut state, a, "correction");
+    on_explicit_feedback(&mut state, b, "correction");
+    on_explicit_feedback(&mut state, a, "correction");
     assert_eq!(state.entity_posteriors.order(), vec![b, a]);
-    on_recall_hit(&mut state, c, 50_000);
+    on_explicit_feedback(&mut state, c, "correction");
     let before_miss = state.to_snapshot();
     assert_eq!(before_miss.entity_posterior_order, vec![a, c]);
     assert_eq!(before_miss.entity_posteriors.len(), 2);
     assert!(!before_miss.entity_posteriors.contains_key(&b));
+    // Each correction adds 2.0 to the target's beta: `a` was judged twice.
     assert_eq!(
         before_miss.entity_posteriors[&a],
-        BetaPosterior::new(3.0, 1.0)
+        BetaPosterior::new(1.0, 5.0)
     );
     assert_eq!(
         before_miss.entity_posteriors[&c],
-        BetaPosterior::new(2.0, 1.0)
+        BetaPosterior::new(1.0, 3.0)
     );
     on_recall_miss(&mut state);
     let after_miss = state.to_snapshot();
-    assert_eq!(after_miss.relevance, BetaPosterior::new(11.0, 4.0));
-    assert_eq!(after_miss.salience, BetaPosterior::new(2.0, 8.0));
-    assert_eq!(after_miss.temporal, BetaPosterior::new(4.0, 11.0));
+    // Four corrections add 2.0 to relevance and salience beta each; the miss
+    // adds 1.0 to relevance and temporal beta.
+    assert_eq!(after_miss.relevance, BetaPosterior::new(7.0, 12.0));
+    assert_eq!(after_miss.salience, BetaPosterior::new(2.0, 16.0));
+    assert_eq!(after_miss.temporal, BetaPosterior::new(1.0, 10.0));
     assert_eq!(after_miss.entity_posteriors, before_miss.entity_posteriors);
     assert_eq!(after_miss.entity_posterior_order, vec![a, c]);
     assert_eq!(after_miss.total_events, 5);

@@ -7,8 +7,8 @@ use khive_runtime::{
 use khive_storage::{event::EventFilter, note::NoteFilter, types::PageRequest};
 use serde_json::{json, Value};
 
-// Ten routes share eight schemas; recall/candidates/fuse share RecallParams.
-const SCHEMAS: [(&str, &str); 10] = [
+// Eleven routes share nine schemas; recall/candidates/fuse share RecallParams.
+const SCHEMAS: [(&str, &str); 11] = [
     ("memory.remember", "RememberParams"),
     ("memory.recall", "RecallParams"),
     ("memory.recall_embed", "EmbedParams"),
@@ -19,6 +19,7 @@ const SCHEMAS: [(&str, &str); 10] = [
     ("memory.feedback", "FeedbackParams"),
     ("memory.prune", "PruneParams"),
     ("memory.vacuum", "VacuumParams"),
+    ("memory.apply_batch", "ApplyBatchParams"),
 ];
 
 struct Fixture {
@@ -139,6 +140,7 @@ async fn credential_unknown_field_names_are_masked_without_changing_schema_polic
         "memory.recall_fuse",
         "memory.prune",
         "memory.vacuum",
+        "memory.apply_batch",
     ] {
         for secret in credentials() {
             let message = f.refuse(verb, json!({secret.clone(): true})).await;

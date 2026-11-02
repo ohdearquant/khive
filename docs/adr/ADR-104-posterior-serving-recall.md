@@ -766,3 +766,22 @@ Acceptance: an observation window under normal agent load shows zero newly-emitt
 `implicit_positive` events from serving-profile traffic — every event is either a
 stated judgment or a typed `feedback_unjudged` row. Historical events are untouched;
 this amendment changes what may be written, never what was written.
+
+### Implementation note (2026-11-02)
+
+Items 1-4: only `Feedback` and `SemanticFeedback` yield a per-entity signal (`entity_signal`,
+`khive-brain-core/src/brain_signal.rs`), so `apply_feedback_posteriors` is the sole per-entity writer (`apply_signal` calls it for every signal); a `RecallHit`
+still moves relevance and temporal state, and a `NoteAccessed` moves no posterior.
+Replay (`replay_events`, `khive-pack-brain/src/persist.rs`) folds each event into the one profile the live path credited, in four arms:
+
+- feedback: a row with no `served_by_profile_id` key (a legacy row written before stamping) goes to balanced-recall; a string goes through `apply_feedback_signal` (`pack.rs`), the fold the feedback write path uses, which routes by `feedback_route`; a null value (no profile resolved) or any other non-string value is skipped. The mixed replay fixture covers both the absent key and the null value.
+- recall hit: `dispatch_route` follows its attribution; `unattributed` hits and hits crediting an archived profile are skipped.
+- note access and every other dispatch signal: balanced-recall.
+- `feedback_unjudged` rows are skipped; `brain.section_feedback` rows update section state only.
+
+Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_without_judgment_leaves_entity_posteriors_unchanged`,
+`note_accessed_leaves_all_posteriors_unchanged`, `judgment_still_moves_entity_posterior`. Tests in
+`khive-pack-brain/src/persist/replay_routing_tests.rs`: `replay_matches_live_routing_per_profile`, `replay_named_profile_entity_evidence_matches_own_judgments`,
+`replay_balanced_only_fixture_matches_prior_reducer`, `replay_folded_event_counts_sum_to_log_length`,
+`replay_credits_judgments_to_a_profile_archived_after_them`. Test in `khive-pack-brain/src/durable_write_tests.rs`:
+`judgments_survive_archive_and_restart`.

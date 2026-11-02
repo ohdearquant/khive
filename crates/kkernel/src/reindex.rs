@@ -54,7 +54,8 @@ pub struct ReindexArgs {
     /// Repair only this live entity or note: restore its FTS document and fill
     /// missing kind-eligible model vectors, preserving healthy indexes.
     #[arg(long, value_name = "UUID", conflicts_with_all = [
-        "model", "batch_size", "knowledge_only", "no_sections", "sections_only", "rebuild_fts"
+        "model", "batch_size", "knowledge_only", "no_sections", "sections_only", "rebuild_fts",
+        "fts_only"
     ])]
     pub id: Option<Uuid>,
 
@@ -126,6 +127,14 @@ pub struct ReindexArgs {
     /// nothing under it.
     #[arg(long, conflicts_with = "no_knowledge")]
     pub rebuild_fts: bool,
+
+    /// Rebuild entity and note FTS documents only. Every embedding model is
+    /// removed from this run, so no vector is dropped or written and the
+    /// knowledge pass is skipped. For a store whose notes are served without
+    /// vectors (a pack configured `no_embed`), where an empty `[[engines]]`
+    /// list would still fall back to the default model.
+    #[arg(long, conflicts_with_all = ["model", "knowledge_only", "sections_only", "rebuild_fts"])]
+    pub fts_only: bool,
 
     /// Print human-readable output instead of JSON.
     #[arg(long)]
@@ -607,7 +616,10 @@ async fn run_reindex_with_setup(
         brain_profile: None,
     })?;
 
-    let cfg = config_setup(cfg);
+    let mut cfg = config_setup(cfg);
+    if args.fts_only {
+        cfg.disable_embedding_models();
+    }
 
     // Capture the resolved namespace BEFORE `new` consumes cfg — when
     // `!explicit`, `resolve_runtime_config` may have applied `[actor] id` from
@@ -637,7 +649,7 @@ async fn run_reindex_with_setup(
 
     // `--sections-only` is the narrowest scope: knowledge sections alone.
     let do_graph = !args.knowledge_only && !args.sections_only; // entities + notes
-    let do_knowledge = !args.no_knowledge; // knowledge corpus
+    let do_knowledge = !args.no_knowledge && !args.fts_only; // knowledge corpus
     let do_atoms = do_knowledge && !args.sections_only;
     let do_sections = do_knowledge && !args.no_sections;
 
@@ -657,7 +669,7 @@ async fn run_reindex_with_setup(
             Some(name) => vec![name.to_string()],
             None => {
                 let names = rt.registered_embedding_model_names();
-                if names.is_empty() {
+                if names.is_empty() && !args.fts_only {
                     eprintln!("warning: no embedding model configured — skipping vector embedding; FTS backfill will still run");
                 }
                 names

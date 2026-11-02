@@ -110,7 +110,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
             self.assertIn(expected, body, f"{name} must preserve its intended embedding mode")
             self.assertTrue(body.strip().startswith(isolation("reindex/tests/mod.rs")),
                             f"{name} must enter exact child before reindex setup")
-        self.assertEqual(count, 9, "all reindex command witnesses must be counted")
+        self.assertEqual(count, 10, "all reindex command witnesses must be counted")
 
     def test_reindex_offline_setup_replaces_each_configured_provider(self):
         body = function("reindex/tests/mod.rs", "run_reindex_offline")

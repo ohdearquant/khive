@@ -102,6 +102,32 @@ pub static MOODBOARD_HANDLERS: [HandlerDef; 7] = [
                 description: "Number of non-self hits to return (default 20, maximum 100).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "rerank",
+                param_type: "string",
+                required: false,
+                description: "Ranking mode: \"visual\" (default) returns exact cosine neighbors; \"fused\" \
+merges the visual ranking with a ranking of assets whose captions match the query \
+asset's name and caption, using weighted reciprocal-rank fusion.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "descriptor_weight",
+                param_type: "number",
+                required: false,
+                description: "Share of the fused score given to the caption ranking, strictly between 0 \
+and 1 (default 0.5). The visual ranking receives the remainder. Accepted only with \
+rerank \"fused\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "rrf_k",
+                param_type: "integer",
+                required: false,
+                description: "Reciprocal-rank fusion damping constant, at least 1 (default 60). Accepted \
+only with rerank \"fused\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     HandlerDef {

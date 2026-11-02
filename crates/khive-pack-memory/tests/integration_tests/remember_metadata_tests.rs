@@ -257,3 +257,208 @@ async fn test_remember_salience_out_of_range_rejected() {
         .await;
     assert!(above.is_err(), "salience > 1 must be rejected");
 }
+
+/// `properties` passed to `memory.remember` are stored beside `memory_type`
+/// and `tags`, and `get` returns them in its `properties` object.
+#[tokio::test]
+async fn test_remember_properties_round_trip_through_get() {
+    let rt = make_runtime();
+    let registry = make_registry_with_actor(rt, "alice");
+
+    let created = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "the nightly export finishes before six",
+                "memory_type": "semantic",
+                "tags": ["ops"],
+                "properties": {
+                    "author": "alice",
+                    "confidence": 0.75,
+                    "reviewed": true,
+                    "sources": ["runbook", "pager"]
+                }
+            }),
+        )
+        .await
+        .expect("remember with properties");
+    let id = created["id"].as_str().expect("response has id").to_owned();
+
+    let got = registry
+        .dispatch("get", json!({ "id": id }))
+        .await
+        .expect("get by id");
+
+    let properties = &got["properties"];
+    assert_eq!(properties["memory_type"], "semantic");
+    assert_eq!(properties["tags"], json!(["ops"]));
+    assert_eq!(properties["author"], "alice");
+    assert_eq!(properties["confidence"], 0.75);
+    assert_eq!(properties["reviewed"], true);
+    assert_eq!(properties["sources"], json!(["runbook", "pager"]));
+}
+
+/// A recall hit reports the note's namespace, its tags and the whole stored
+/// properties object.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_recall_hit_returns_namespace_tags_and_properties() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let created = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "quartzite flooring needs sealing every spring",
+                "memory_type": "semantic",
+                "tags": ["home", "care"],
+                "properties": { "author": "casey", "revision": 2 }
+            }),
+        )
+        .await
+        .expect("remember with properties");
+    let id = created["id"].as_str().expect("response has id").to_owned();
+
+    let recalled = registry
+        .dispatch("memory.recall", json!({ "query": "quartzite flooring" }))
+        .await
+        .expect("recall");
+    let hits = recalled.as_array().expect("recall returns an array");
+    let hit = hits
+        .iter()
+        .find(|h| h["id"].as_str() == Some(id.as_str()))
+        .expect("the stored memory is recalled");
+
+    assert_eq!(hit["namespace"], "local");
+    assert_eq!(hit["tags"], json!(["home", "care"]));
+    assert_eq!(hit["properties"]["author"], "casey");
+    assert_eq!(hit["properties"]["revision"], 2);
+    assert_eq!(hit["properties"]["memory_type"], "semantic");
+    assert_eq!(hit["properties"]["tags"], hit["tags"]);
+}
+
+/// A remember without `properties` stores only `memory_type`, `tags` and, because
+/// this caller is anonymous, the `attribution` flag; a recall hit reports exactly
+/// that object: nothing else is added to the stored shape.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_remember_without_properties_keeps_the_stored_shape() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let created = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "granite countertops resist heat well",
+                "memory_type": "semantic",
+                "tags": ["kitchen"],
+                "namespace": "local"
+            }),
+        )
+        .await
+        .expect("remember without properties");
+    let id = created["id"].as_str().expect("response has id").to_owned();
+
+    let recalled = registry
+        .dispatch("memory.recall", json!({ "query": "granite countertops" }))
+        .await
+        .expect("recall");
+    let hits = recalled.as_array().expect("recall returns an array");
+    let hit = hits
+        .iter()
+        .find(|h| h["id"].as_str() == Some(id.as_str()))
+        .expect("the stored memory is recalled");
+
+    assert_eq!(
+        hit["properties"],
+        json!({
+            "attribution": "unresolved",
+            "memory_type": "semantic",
+            "tags": ["kitchen"]
+        })
+    );
+    assert_eq!(hit["tags"], json!(["kitchen"]));
+    assert_eq!(hit["namespace"], "local");
+}
+
+/// A malformed `properties` value is refused through dispatch with a message
+/// that names the offending key and the rule.
+#[tokio::test]
+async fn test_remember_refuses_invalid_properties_through_dispatch() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let reserved = registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "reserved key", "properties": { "tags": ["x"] } }),
+        )
+        .await
+        .expect_err("a reserved key is refused")
+        .to_string();
+    assert!(reserved.contains("tags"), "{reserved}");
+    assert!(reserved.contains("reserved"), "{reserved}");
+
+    let not_object = registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "not an object", "properties": "flat" }),
+        )
+        .await
+        .expect_err("a non-object is refused")
+        .to_string();
+    assert!(not_object.contains("must be a JSON object"), "{not_object}");
+
+    let nested = registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "nested", "properties": { "inner": { "a": 1 } } }),
+        )
+        .await
+        .expect_err("a nested object is refused")
+        .to_string();
+    assert!(nested.contains("inner"), "{nested}");
+    assert!(
+        nested.contains("nested objects are not allowed"),
+        "{nested}"
+    );
+}
+
+/// The unresolved flag follows the caller, not the namespace argument: an anonymous caller
+/// that names a namespace is still unattributed, so its row and response carry the flag.
+#[tokio::test]
+async fn test_anonymous_remember_with_explicit_namespace_is_flagged_unresolved() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    for memory_type in ["semantic", "episodic"] {
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("anonymous {memory_type} memory naming the shared namespace"),
+                    "memory_type": memory_type,
+                    "namespace": "local",
+                }),
+            )
+            .await
+            .expect("memory.remember must succeed");
+        assert_eq!(
+            result["attribution"], "unresolved",
+            "{memory_type}: {result}"
+        );
+        let note_id = result["id"].as_str().expect("response has id").to_owned();
+
+        let got = registry
+            .dispatch("get", json!({ "id": note_id }))
+            .await
+            .expect("get by UUID must succeed");
+        assert_eq!(got["namespace"], "local", "{memory_type}: {got}");
+        assert_eq!(
+            got["properties"]["attribution"], "unresolved",
+            "{memory_type}: {got}"
+        );
+    }
+}

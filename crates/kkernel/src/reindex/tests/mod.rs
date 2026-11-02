@@ -114,6 +114,7 @@ default = false
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     };
 
@@ -901,6 +902,137 @@ fn rebuild_fts_conflicts_with_no_knowledge() {
     let ok = ReindexArgs::try_parse_from(["reindex", "--rebuild-fts"])
         .expect("--rebuild-fts alone parses");
     assert!(ok.rebuild_fts);
+}
+
+#[test]
+fn fts_only_refuses_flags_that_need_an_embedder() {
+    for other in [
+        "--model=paraphrase",
+        "--knowledge-only",
+        "--sections-only",
+        "--rebuild-fts",
+    ] {
+        let err = ReindexArgs::try_parse_from(["reindex", "--fts-only", other])
+            .expect_err("--fts-only with an embedding flag must be rejected");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{other}"
+        );
+    }
+    let ok = ReindexArgs::try_parse_from(["reindex", "--fts-only", "--no-knowledge"])
+        .expect("--fts-only with --no-knowledge parses");
+    assert!(ok.fts_only);
+    let default_run = ReindexArgs::try_parse_from(["reindex"]).expect("bare reindex parses");
+    assert!(!default_run.fts_only);
+}
+
+#[tokio::test]
+async fn fts_only_backfills_fts_and_writes_no_vector_under_a_configured_engine() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("reindex fixture");
+    let db_path = dir.path().join("reindex.db");
+    let config = dir.path().join("khive.toml");
+    std::fs::write(
+        &config,
+        r#"
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+"#,
+    )
+    .expect("write one-engine config");
+
+    let resolve_config = |no_embed| {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db: db_path.to_str(),
+            config: Some(&config),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve reindex config")
+    };
+
+    // Store-level writes: no FTS document and no vector exist before the run.
+    let (message_id, observation_id) = {
+        let rt = KhiveRuntime::new(resolve_config(true)).expect("seed runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let notes = rt.notes(&token).expect("note store");
+        let message = Note::new("local", "message", "message body for an fts only run");
+        let observation = Note::new(
+            "local",
+            "observation",
+            "observation body for an fts only run",
+        );
+        let ids = (message.id, observation.id);
+        notes.upsert_note(message).await.expect("seed message");
+        notes
+            .upsert_note(observation)
+            .await
+            .expect("seed observation");
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        for id in [ids.0, ids.1] {
+            assert!(
+                fts.get_document("local", id)
+                    .await
+                    .expect("read FTS")
+                    .is_none(),
+                "fixture must start without an FTS document"
+            );
+        }
+        ids
+    };
+
+    let args = ReindexArgs {
+        id: None,
+        db: Some(db_path.to_str().unwrap().to_owned()),
+        config: Some(config.clone()),
+        model: None,
+        batch_size: Some(100),
+        keep_existing: false,
+        namespace: Some("local".into()),
+        knowledge_only: false,
+        no_knowledge: false,
+        best_effort: false,
+        no_sections: false,
+        sections_only: false,
+        rebuild_fts: false,
+        fts_only: true,
+        human: false,
+    };
+    run_reindex_offline(args).await.expect("fts-only reindex");
+
+    let rt = KhiveRuntime::new(resolve_config(false)).expect("verify runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let fts = rt.text_for_notes(&token).expect("FTS store");
+    for id in [message_id, observation_id] {
+        assert!(
+            fts.get_document("local", id)
+                .await
+                .expect("read FTS")
+                .is_some(),
+            "fts-only run must write the note's FTS document"
+        );
+    }
+    let primary = rt.default_embedder_name().to_owned();
+    let rows = rt
+        .vectors_for_model(&token, &primary)
+        .expect("primary vectors")
+        .batch_exists(&[message_id, observation_id], "local")
+        .await
+        .expect("primary rows");
+    assert!(
+        rows.is_empty(),
+        "fts-only run must write no vector, found {rows:?}"
+    );
 }
 
 #[test]
@@ -1988,6 +2120,7 @@ async fn run_reindex_populates_fts_without_embedding_model() {
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     };
     run_reindex_without_embeddings(args)
@@ -2273,6 +2406,7 @@ async fn run_reindex_populates_entity_fts_without_embedding_model() {
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     };
     run_reindex_without_embeddings(args)
@@ -2417,6 +2551,7 @@ async fn run_reindex_scoped_run_does_not_rebuild_fts() {
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     };
     run_reindex_offline(args)
@@ -2459,6 +2594,7 @@ async fn run_reindex_without_the_flag_does_not_rebuild_fts() {
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     };
     run_reindex_offline(args)
@@ -2500,6 +2636,7 @@ async fn run_reindex_with_the_flag_rebuilds_fts() {
         no_sections: false,
         sections_only: false,
         rebuild_fts: true,
+        fts_only: false,
         human: false,
     };
     run_reindex_offline(args)
@@ -2628,6 +2765,7 @@ fn snapshot_reindex_args(dir: &std::path::Path, best_effort: bool) -> ReindexArg
         no_sections: false,
         sections_only: false,
         rebuild_fts: false,
+        fts_only: false,
         human: false,
     }
 }
