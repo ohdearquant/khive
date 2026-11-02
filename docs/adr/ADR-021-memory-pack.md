@@ -838,8 +838,8 @@ episodic writes naming `namespace="local"` flagged the same way; and an attribut
 
 ## Amendment: batch apply for memory rewrites (2026-11-02)
 
-**Status**: Proposed 2026-11-02. Adds the `memory.apply_batch` verb. Builds on the amendment of 2026-11-01 (caller
-properties and the actor-namespace default). Requires acceptance before the implementing change merges.
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Adds the `memory.apply_batch` verb. Builds on the amendment of
+2026-11-01 (caller properties and the actor-namespace default).
 
 ### Problem
 
@@ -940,7 +940,7 @@ refused; 201 rows refused; the new row recalled at once and the old row suppress
 
 ### Delta 1: old rows in namespaces the caller owns (2026-11-02)
 
-**Status**: Proposed 2026-11-02. Changes Decision 5's namespace check only.
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Changes Decision 5's namespace check only.
 
 **Problem.** An actor that runs helper agents often gives them their own namespace, so their memories stay apart
 from the actor's own until they are checked. Under a store-wide rewrite those rows belong to the actor that ran the
