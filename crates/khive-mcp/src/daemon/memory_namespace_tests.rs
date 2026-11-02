@@ -267,17 +267,22 @@ async fn exercise(socket: &Path, config_id: &str) -> [bool; 3] {
         "actor visibility must not relocate observations"
     );
     let local_memories = ids(2);
-    assert_eq!(local_memories.len(), 3);
-    for id in [&writes[0]["id"], &writes[1]["id"], &anonymous[0]["id"]] {
+    assert_eq!(local_memories.len(), 2);
+    for id in [&writes[1]["id"], &anonymous[0]["id"]] {
         assert!(
             local_memories.contains(&id),
-            "semantic, explicit-local and anonymous writes remain local"
+            "explicit-local and anonymous writes remain local"
         );
     }
-    assert_eq!(
-        ids(3),
-        vec![&chain[1]["id"]],
+    let actor_memories = ids(3);
+    assert_eq!(actor_memories.len(), 2);
+    assert!(
+        actor_memories.contains(&&chain[1]["id"]),
         "episodic default writes use the actor namespace"
+    );
+    assert!(
+        actor_memories.contains(&&writes[0]["id"]),
+        "semantic default writes from a bound actor use the actor namespace"
     );
     let anonymous_recall = request(
         socket, config_id, None, &[],
