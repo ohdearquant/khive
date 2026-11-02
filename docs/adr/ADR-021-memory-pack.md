@@ -835,3 +835,87 @@ properties read back through `get` and through a recall hit; an attributed seman
 the actor namespace; an explicit `namespace="local"` semantic write landing in `local`; anonymous semantic and
 episodic writes landing in `local` with `attribution: "unresolved"` in the row and the response; anonymous semantic and
 episodic writes naming `namespace="local"` flagged the same way; and an attributed write with no `attribution` key.
+
+## Amendment: batch apply for memory rewrites (2026-11-02)
+
+**Status**: Proposed 2026-11-02. Adds the `memory.apply_batch` verb. Builds on the amendment of 2026-11-01 (caller
+properties and the actor-namespace default). Requires acceptance before the implementing change merges.
+
+### Problem
+
+Rewriting a store's memories means writing one new row per fact, linking it to the row it replaces, and keeping the
+old row. Done as separate `memory.remember` and `link` calls, a rewrite of thousands of rows has no dry run, no single
+place that checks each row against the rules before anything is written, and no safe way to resume after a failure:
+an unkeyed re-run writes duplicates. The kg `apply_changeset` verb is atomic but has no dry run, refuses a `tags` key in
+properties, refuses a replayed create as an error, and does not go through the memory write path.
+
+### Decision
+
+1. **The verb.** `memory.apply_batch(batch, rows, dry_run = true)`. `batch` is a name of at most 128 characters; `rows`
+   holds 1 to 200 rows; `dry_run` is true unless the caller passes `false`. An anonymous caller is refused before any
+   row is read, since every write would land in the shared namespace with no writer.
+2. **Row shape.** `{id?, part = 1, action, content?, memory_type?, salience?, properties?, tags?}`; unknown fields are
+   refused. `action` is one of:
+   - `supersede`: `id` names the old row. Writes a new memory and a `supersedes` edge from it to the old row. The old
+     row is not changed.
+   - `create`: no `id`. Writes a new memory with no edge, for a fact found in records that no memory holds.
+   - `skip`: `id` names the old row; nothing is written.
+   - `delete-candidate`: `id` names the old row; nothing is written, and the row is listed for a person to decide.
+3. **Writes.** A `supersede` or `create` row is written through the `memory.remember` path (embedding, text index,
+   decay) in the caller's own namespace; no row can name another namespace. The verb adds three properties, which a
+   row may not supply itself: `batch` (the batch name), `supersedes` (the old row's full id, `supersede` only) and
+   `batch_row` (the SHA-256 of the row's canonical JSON: action, id, part, content, memory_type, salience, properties,
+   tags). The remember idempotency key is `<batch>:<old id>:<part>` for `supersede` and `<batch>:create:<part>` for
+   `create`; two rows of one call with the same key are both refused.
+4. **Re-runs.** When the key is already taken in the caller's namespace and the stored `batch_row` equals the row's,
+   the row is `deduped` and its `supersedes` edge is asserted again (linking is idempotent), so a run that stopped
+   between the write and the edge completes. When the stored `batch_row` differs, the row is refused as
+   `dedupe-name-taken`; a corrected row needs a new `part` or a new batch name. Nothing is overwritten.
+5. **Checks, per row, identical in a dry run and a real run.** A failing row is refused with a reason and never stops
+   the others:
+   - `id` missing for `supersede`, `skip` or `delete-candidate`, or present for `create`;
+   - the old row does not resolve, is not a memory, or sits in a namespace that is neither the caller's nor the shared
+     one (the reason names the namespace found);
+   - `content` empty, or any check `memory.remember` applies to content, memory_type, tags or properties fails (the
+     reason carries remember's message);
+   - `salience` outside [0, 1], or above 0.4 while `properties.verified` is absent, `false` or empty; `verified` is
+     `true` or a non-empty string naming what was checked;
+   - `properties.who` absent or empty on a `supersede` or `create` row;
+   - `properties.source_ids` absent or empty on a `supersede` row whose old row sits in the shared namespace;
+   - a supplied `batch`, `supersedes` or `batch_row` property.
+6. **Result.** One entry per row, in input order: `{id, part, action, outcome, old_namespace, new_id, reason}`, with
+   `outcome` one of `planned`, `written`, `deduped`, `skipped`, `listed`, `refused`, `failed`. `old_namespace` is the
+   old row's namespace as read; `new_id` comes from the write itself. `failed` means the store refused a write that
+   passed every check; the row is re-runnable. Counts per outcome follow the entries. A dry run returns `planned` or
+   `deduped` where a real run would write or dedupe.
+7. **Reindex.** Rows written by the verb are embedded and indexed at write and are recallable at once. Superseded rows
+   stay stored and recall's supersedes suppression (on by default) drops any candidate with an incoming `supersedes`
+   edge the reader can see. A full re-embed after a store-wide rewrite is `kkernel reindex --namespace <ns>`, which
+   re-embeds entities, notes (memories included) and knowledge with each kind's embedding policy and fills missing
+   vectors; `--id <uuid>` repairs one record.
+
+### Consequences
+
+- A rewrite is resumable chunk by chunk: re-running a chunk writes only what is missing and refuses a changed row
+  instead of silently keeping the first version.
+- The old row is never modified or deleted by this verb; deletion stays a separate, human decision.
+- A chunk is not atomic: a storage failure leaves the rows before it written. That is the price of resumability, and the
+  result names every row's outcome.
+
+### Alternatives considered
+
+| Alternative                               | Disposition                                                                                                 |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| kg `apply_changeset`                      | Rejected: no dry run, `tags` refused in properties, replayed create is an error, not the memory write path. |
+| Caller loops `memory.remember` and `link` | Rejected: no dry run, no per-row check before writing, and an unkeyed re-run writes duplicates.             |
+| Atomic chunk                              | Rejected: a single bad row would void 199 good ones, and a re-run would still need the dedupe rule above.   |
+| Overwrite on a changed re-run             | Rejected: a corrected row would silently replace a row other readers may already have recalled and judged.  |
+
+### Validation
+
+Tests for: dry run writing nothing and reporting the same refusals as a real run; each refusal reason above; a
+`supersede` writing one row in the caller's namespace with the three added properties and one `supersedes` edge, the
+old row unchanged; a `create` writing no edge; a re-run of the same chunk returning `deduped` for every written row and
+writing nothing; a re-run with one row's properties changed refusing that row as `dedupe-name-taken`; a deduped row
+whose edge was missing getting its edge; an anonymous caller refused; 201 rows refused; the new row recalled at once
+and the old row suppressed by the edge.
