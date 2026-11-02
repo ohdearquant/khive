@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::brain_signal::{entity_signal, is_recall_positive, BrainSignal};
+use crate::brain_signal::{is_recall_positive, BrainSignal};
 use crate::posterior::{BetaPosterior, EntityPosteriors};
 use crate::signal::{FeedbackEventKind, FeedbackSignal};
 
@@ -234,6 +234,10 @@ impl BalancedRecallState {
 
     /// Apply a brain signal to update posteriors in place.
     /// This is the core profile update logic — pure, deterministic, no IO.
+    ///
+    /// Per-entity posteriors move only through `apply_feedback_posteriors`, that
+    /// is, only for judgment-bearing signals. Recall hits and note accesses never
+    /// touch the entity map.
     pub fn apply_signal(&mut self, signal: &BrainSignal) {
         self.total_events += 1;
 
@@ -260,23 +264,6 @@ impl BalancedRecallState {
             }
             BrainSignal::RecallMiss => self.temporal.update_failure(),
             _ => {}
-        }
-
-        if matches!(
-            signal,
-            BrainSignal::Feedback { .. } | BrainSignal::SemanticFeedback { .. }
-        ) {
-            return;
-        }
-        if let Some((entity_id, positive)) = entity_signal(signal) {
-            let posterior = self
-                .entity_posteriors
-                .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
-            if positive {
-                posterior.update_success();
-            } else {
-                posterior.update_failure();
-            }
         }
     }
 
