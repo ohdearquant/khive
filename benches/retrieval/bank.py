@@ -62,6 +62,25 @@ vector-only and the keyword-only strategy: that proves the copy is visible to th
 embedding model matches the store's vectors. The run waits (bounded by --ready-max-s) until the vector index answers
 without a degraded flag.
 
+`rebind-gate` decides whether one candidate profile may serve recall again. It takes two banks, one whose answers are in
+the reader's own namespace and one whose answers are in the shared pool (`local`), and asks each question twice,
+adjacent in time: with no profile, then with the candidate (`profile_id`). Every recall asks for 50 hits with score
+breakdowns and timings, at the token budget the recall help in the copy gives as its cap (`--token-budget-cap` supplies
+it when the help states none; with neither, the gate refuses). Two rounds run `--round-gap-s` apart, and every round
+serves each bank from a fresh `kkernel mcp` process. The pass is read in each round separately and must hold in both:
+    own-namespace bank   MRR@10 with the candidate is at least MRR@10 with no profile
+    shared-pool bank     MRR@10 falls by at most 0.04 (exact arithmetic, so exactly 0.04 passes) and at most one
+                         question is lost: in the no-profile top ten and outside the candidate's top ten
+Nothing runs when the runtime has a brain_profile (config, environment or command line), when a recall binding resolves
+for the caller, or when the two arms' caller, primary namespace or readable namespaces differ. A hit whose attribution is
+not its arm's (`unspecified` with no served_by_profile_id for no profile; `profile` and the candidate's id for the
+candidate) stops the run. A degraded recall, or a no-profile recall with no hits, voids its round, which runs again in
+fresh processes; a question that voids three runs in a row stops the gate and is named. Exit status: 0 pass, 10 fail,
+11 the run cannot be read (wrong attribution, repeated voids), 12 a required condition does not hold. The report adds, per
+arm and round, hit@10, the lost and gained questions, widened questions, recalls under 50 hits, the top-10 hits whose
+composite sits at its clamp (pre_entity_score 1.0; not available when a weighted reranker is configured), questions whose
+top ten differs between the rounds, and whether the candidate's entity term is 1 for every hit.
+
 Subcommands:
     check-bank        validate a bank directory and print its population
     run               score repeated banks and profiles, writing <out>/<bank_id>/<arm>.jsonl plus run.json
@@ -70,7 +89,10 @@ Subcommands:
                       is recalled live, then by the replayed profile, then live again, and the two live answers are
                       compared the same way: that A/A floor bounds how much of the live/replay difference is the
                       recall's own run-to-run variation rather than the replay
-    self-test         the measure, fusion, bank-check and response-parsing arms, no kkernel needed
+    rebind-gate       decide whether one candidate profile may serve recall again (above), writing
+                      <out>/rebind-gate.json and <out>/rebind-gate.txt
+    self-test         the measure, fusion, bank-check, response-parsing and rebind-gate decision arms, no kkernel
+                      needed
 
 Standard library only.
 """
@@ -90,6 +112,7 @@ import sys
 import tempfile
 import time
 import types
+from fractions import Fraction
 from pathlib import Path
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -278,9 +301,10 @@ def op(verb: str, **args) -> str:
     return f"{verb}(" + ", ".join(f"{k}={json.dumps(v)}" for k, v in args.items() if v is not None) + ")"
 
 
-def recall_op(**args) -> str:
-    """A memory.recall op carrying the runner's budget config. Every recall the runner sends is built here."""
-    return op("memory.recall", config=RECALL_CONFIG, **args)
+def recall_op(config: dict | None = None, **args) -> str:
+    """A memory.recall op carrying a budget config: the runner's, or the one passed. Every recall the runner sends is
+    built here."""
+    return op("memory.recall", config=RECALL_CONFIG if config is None else config, **args)
 
 
 def hit_list(result, what: str, depth: int | None = None) -> list[dict]:
@@ -321,13 +345,18 @@ def hit_id(h: dict, what: str) -> str:
     raise BankError(f"{what}: a hit carries no full UUID (fields {sorted(h)})")
 
 
+def mcp_argv(kkernel: str, db: Path) -> list[str]:
+    """The command line of every `kkernel mcp` process this runner starts."""
+    return [kkernel, "mcp", "--db", str(db), "--log", "warn"]
+
+
 class Bridge:
     """One `kkernel mcp` stdio process. Each call sends one `request` with presentation=verbose (the full shape, full
     ids) and returns the per-op results in op order."""
 
     def __init__(self, kkernel: str, db: Path, env: dict, err_path: Path):
         self.err = open(err_path, "ab")
-        self.proc = subprocess.Popen([kkernel, "mcp", "--db", str(db), "--log", "warn"], stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen(mcp_argv(kkernel, db), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=self.err, env=env, bufsize=0)
         self.next_id = 1
         self.buf = b""
@@ -1171,6 +1200,1107 @@ def cmd_calibrate_replay(args) -> int:
     return 0
 
 
+# ---- rebind-gate: may one profile serve recall again?
+#
+# Two banks (answers in the reader's own namespace, answers in the shared `local` pool) are each recalled twice per
+# question, once with no profile and once with the candidate named by profile_id, at 50 hits with breakdowns and
+# timings, in two rounds a few minutes apart. The pass is read in each round on its own and must hold in both.
+# Everything that decides a response or a verdict is a plain function of data, so the self-test feeds it synthetic
+# responses; only run_rebind_gate starts processes.
+
+GATE_TOP_K = 50
+GATE_TOP = 10
+GATE_ROUNDS = 2
+GATE_MAX_VOIDS_IN_A_ROW = 3
+GATE_SHARED_MAX_LOSS = Fraction(4, 100)
+GATE_SHARED_MAX_LOST_QUESTIONS = 1
+EXIT_PASS, EXIT_FAIL, EXIT_VOID, EXIT_REFUSED = 0, 10, 11, 12
+GATE_ARMS = ("none", "candidate")
+GATE_ROLES = ("own", "shared")
+
+
+class GateStop(Exception):
+    """The gate ends without a verdict because a run cannot be read: a hit served by the wrong profile, a question
+    that voided its round three runs in a row, a response of an unreadable shape. `code` is the exit status."""
+
+    code = EXIT_VOID
+
+
+class GateRefused(GateStop):
+    """The gate does not start, or stops, because a condition it requires does not hold."""
+
+    code = EXIT_REFUSED
+
+
+def require_store_source(args) -> None:
+    if bool(args.staged_home) == bool(args.store_main or args.store_events) or (
+            not args.staged_home and not (args.store_main and args.store_events)):
+        raise BankError("take either --staged-home, or both --store-main and --store-events")
+
+
+def parse_read_set(text: str, what: str) -> list[str]:
+    listed = text.split(",")
+    if any(not n for n in listed):
+        raise BankError(f"{what} {text!r}: name at least one namespace and no empty one")
+    require_distinct(listed, what)
+    return listed
+
+
+def require_bank_roles(own_cases: list[dict], shared_cases: list[dict]) -> None:
+    """The shared-pool bank's tagged answers are all in `local`, and none of the own-namespace bank's is."""
+    for c in shared_cases:
+        ns = case_namespace(c)
+        if ns is not None and ns != "local":
+            raise GateRefused(f"shared-pool bank case {c['case_id']} is tagged namespace:{ns}; its answers must be in "
+                              "local (are --own-bank and --shared-bank swapped?)")
+    for c in own_cases:
+        if case_namespace(c) == "local":
+            raise GateRefused(f"own-namespace bank case {c['case_id']} is tagged namespace:local; its answers must be "
+                              "in the reader's own namespace (are --own-bank and --shared-bank swapped?)")
+
+
+def require_brain_profile_unset(config_text: str, env: dict, argv: list[str]) -> dict:
+    """The serving process must start with no brain_profile: a recall without profile_id serves a configured one ahead
+    of any binding, so the no-profile arm would be a profile arm. Checks the config the process reads, its environment
+    and its command line; returns the reading to record."""
+    set_in = []
+    if any(re.search(r"\bbrain_profile\b\s*=", line.split("#", 1)[0]) for line in config_text.splitlines()):
+        set_in.append("config.toml")
+    if (env.get("KHIVE_BRAIN_PROFILE") or "").strip():
+        set_in.append("KHIVE_BRAIN_PROFILE")
+    if any(a == "--brain-profile" or a.startswith("--brain-profile=") for a in argv):
+        set_in.append("--brain-profile")
+    if set_in:
+        raise GateRefused(f"the runtime has a brain_profile set ({', '.join(set_in)}): a recall without profile_id "
+                          "would serve it, so the no-profile arm would not be the arm its name says")
+    return {"config_toml": "unset", "env_KHIVE_BRAIN_PROFILE": "unset", "cli_flag": "unset"}
+
+
+def binding_resolves(resolved) -> bool:
+    """Whether a `brain.resolve(consumer_kind=recall)` answer matched a binding for the caller. Anything but an explicit
+    false counts as matched; an answer without `matched_binding` cannot be read and is refused. The whole answer is
+    recorded, and a profile that served the no-profile arm anyway shows in the hits' attribution."""
+    if not isinstance(resolved, dict) or "matched_binding" not in resolved:
+        raise GateRefused(f"brain.resolve returned no matched_binding field ({json.dumps(resolved)[:200]}): the "
+                          "caller's recall bindings cannot be read")
+    return resolved["matched_binding"] is not False
+
+
+def require_no_binding(reads: dict) -> None:
+    for where, resolved in reads.items():
+        if binding_resolves(resolved):
+            raise GateRefused(f"the caller has a recall binding ({where}: {json.dumps(resolved)[:300]}): a recall "
+                              "without profile_id would be served by it, so the no-profile arm would not be the arm "
+                              "its name says")
+
+
+def scope_of(who) -> dict:
+    """The caller, primary namespace and readable namespaces a `whoami` answer reports."""
+    if (not isinstance(who, dict) or not isinstance(who.get("namespace"), str)
+            or not isinstance(who.get("visible_namespaces"), list)):
+        raise GateRefused(f"whoami returned no namespace scope ({json.dumps(who)[:200]})")
+    return {"actor_id": who.get("actor_id"), "namespace": who["namespace"],
+            "visible_namespaces": sorted(set(who["visible_namespaces"]))}
+
+
+def require_same_scope(scopes: dict, read_set: list[str]) -> None:
+    """Both arms run as the same caller with the same primary and readable namespaces, and the readable set is the
+    bank's read set (the primary namespace is always readable)."""
+    none, cand = scopes["none"], scopes["candidate"]
+    if none != cand:
+        raise GateRefused(f"the arms' caller or namespace scope differ: no profile {json.dumps(none)}, candidate "
+                          f"{json.dumps(cand)}; the arms are not compared")
+    expected = sorted(set(read_set) | {none["namespace"]})
+    if none["visible_namespaces"] != expected:
+        raise GateRefused(f"the readable namespaces are {none['visible_namespaces']}, the bank's read set (with the "
+                          f"primary namespace {none['namespace']!r}) is {expected}")
+
+
+def token_budget_cap_from_help(help_result) -> int | None:
+    """The token-budget cap a verb's help states: the number after "cap" in the text that follows "token budget".
+    None when it states none; two different numbers are refused."""
+    texts, stack = [], [help_result]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, str):
+            texts.append(x)
+        elif isinstance(x, dict):
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    found = {int(m.group(1).replace("_", "").replace(",", ""))
+             for t in texts for m in re.finditer(r"(?is)token[ _]budget[^\n]{0,160}?\bcap\b\W{0,6}(\d[\d_,]*)", t)}
+    if len(found) > 1:
+        raise GateRefused(f"the recall help states more than one token-budget cap: {sorted(found)}")
+    return next(iter(found), None)
+
+
+def resolve_token_budget_cap(help_result, operator_cap: int | None) -> tuple[int, str]:
+    """The budget the gate asks for, and where it was read. The help in the copy decides; an operator-given cap is used
+    only when the help states none, and must equal one it does state."""
+    stated = token_budget_cap_from_help(help_result)
+    if operator_cap is not None and operator_cap <= 0:
+        raise GateRefused(f"--token-budget-cap must be positive, got {operator_cap}")
+    if stated is not None and operator_cap is not None and operator_cap != stated:
+        raise GateRefused(f"--token-budget-cap {operator_cap} differs from the cap {stated} the recall help states")
+    if stated is not None:
+        return stated, "help"
+    if operator_cap is not None:
+        return operator_cap, "operator"
+    raise GateRefused("the recall help in the copy states no token-budget cap and no --token-budget-cap was given")
+
+
+def gate_recall_config(cap: int) -> dict:
+    """The request config of every gate recall: the budget at the pack cap, and no weighted reranker."""
+    return {"scoring": {"default_token_budget": cap}, "reranker_weights": {}}
+
+
+def gate_recall_op(case: dict, profile_id: str | None, config: dict) -> str:
+    return recall_op(config=config, query=case["query"], top_k=GATE_TOP_K, created_before=case["T"],
+                     include_breakdown=True, include_timings=True, profile_id=profile_id)
+
+
+def check_gate_attribution(hits: list[dict], arm: str, want_profile: str | None) -> None:
+    """Every no-profile hit reads `unspecified` with no served_by_profile_id; every candidate hit reads `profile` and
+    names the candidate. Anything else stops the run: the arm would not be the arm its name says."""
+    for h in hits:
+        att, by = h.get("serve_attribution"), h.get("served_by_profile_id")
+        ok = (att == "unspecified" and by is None) if want_profile is None else (att == "profile" and by == want_profile)
+        if not ok:
+            raise GateStop(f"arm {arm} expects {'serve_attribution unspecified and no served_by_profile_id' if want_profile is None else 'profile ' + want_profile}"
+                           f", a hit was served as {att!r} by {by!r}")
+
+
+def check_not_late(hits: list[dict], before: str) -> None:
+    t = parse_instant(before)
+    late = [h for h in hits if parse_instant(h.get("created_at")) >= t]
+    if late:
+        raise GateStop(f"{len(late)} hit(s) created at or after {before} despite created_before")
+
+
+def split_recall(result) -> tuple[list[dict], dict]:
+    """The hits and the envelope of a recall response: a bare array (no envelope), or an object with a results array."""
+    if isinstance(result, list):
+        hits, env = result, {}
+    elif isinstance(result, dict) and isinstance(result.get("results"), list):
+        hits, env = result["results"], result
+    else:
+        raise GateStop(f"unexpected recall response shape {type(result).__name__}")
+    if not all(isinstance(h, dict) for h in hits):
+        raise GateStop("a recall hit is not an object")
+    return hits, env
+
+
+def retrieval_rounds(timings: dict) -> int:
+    n = timings.get("retrieval_rounds")
+    if isinstance(n, int) and not isinstance(n, bool):
+        return n
+    rounds = timings.get("rounds")
+    if not isinstance(rounds, list):
+        raise GateStop("the timings report no retrieval rounds")
+    return len(rounds)
+
+
+def gate_recall_read(result, arm: str, want_profile: str | None, before: str | None = None) -> dict:
+    """Read one gate recall. Returns {"hits", "void", "degraded", "rounds", "capped"}; `void` is the reason this
+    recall voids its round, or None.
+
+    A recall voids its round when it reports degraded retrieval (each hit stamped `degraded`, or an empty response with
+    `degraded: true`), when it is empty in the verbose envelope returned for more than one embedding model (that shape
+    carries no top-level `degraded`, so an empty response cannot be told from a degraded one), or when it is a
+    no-profile recall with no hits. A candidate recall with no hits is a miss. A hit attributed to the wrong profile, a
+    late hit, a missing timings report and a hit without the breakdown terms stop the gate instead."""
+    hits, env = split_recall(result)
+    check_gate_attribution(hits, arm, want_profile)
+    if before:
+        check_not_late(hits, before)
+    timings = env.get("timings")
+    if not isinstance(timings, dict):
+        raise GateStop("the response carries no timings although include_timings was asked")
+    for h in hits:
+        b = h.get("breakdown")
+        for field in ("pre_entity_score", "entity_term"):
+            v = b.get(field) if isinstance(b, dict) else None
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise GateRefused(f"a hit has no breakdown.{field} although include_breakdown was asked: this build "
+                                  "does not report the terms of rank_score")
+    stamped, flagged = any(h.get("degraded") for h in hits), bool(env.get("degraded"))
+    void = None
+    if stamped or flagged:
+        void = "degraded:" + ("hits_stamped" if stamped else "empty_flagged" if not hits else "envelope_flagged")
+    elif not hits and "candidates" in env:
+        void = "empty_multi_model_envelope"
+    elif not hits and arm == "none":
+        void = "no_hits_without_profile"
+    return {"hits": hits, "void": void, "degraded": stamped or flagged, "rounds": retrieval_rounds(timings),
+            "capped": any(h.get("truncated") for h in hits) or bool(env.get("truncated"))}
+
+
+def summarize_recall(read: dict, what: str) -> dict:
+    """What the report keeps of one clean recall: the ranked ids, how many hits came back, how many retrieval rounds
+    ran, the top-10 hits whose composite sits at its clamp, and how many hits carry an entity term other than 1."""
+    hits = read["hits"]
+    return {"ids": list(dict.fromkeys(hit_id(h, what) for h in hits)), "returned": len(hits), "rounds": read["rounds"],
+            "capped": read["capped"],
+            "clamped_top10": sum(1 for h in hits[:GATE_TOP] if h["breakdown"]["pre_entity_score"] == 1.0),
+            "entity_hits": len(hits), "entity_not_one": sum(1 for h in hits if h["breakdown"]["entity_term"] != 1.0),
+            "weights_served": sorted({str(h["breakdown"].get("weights_served")) for h in hits})}
+
+
+def play_bank(cases: list[dict], ask, cand: str, bank_id: str) -> dict:
+    """One pass over a bank. For each case, in order, the no-profile recall and then the candidate recall, adjacent in
+    time. `ask(case, profile_id)` returns the raw response. A recall that voids its round is listed and its case is
+    left out; the caller discards the pass when anything voided."""
+    questions, voids = [], []
+    counts = {a: {"recalls": 0, "degraded": 0, "returned_fewer_than_top_k": 0, "capped": 0, "widened": []}
+              for a in GATE_ARMS}
+    for case in cases:
+        got = {}
+        for arm, pid in (("none", None), ("candidate", cand)):
+            what = f"{bank_id} {case['case_id']} {arm}"
+            read = gate_recall_read(ask(case, pid), arm, pid, case["T"])
+            c = counts[arm]
+            c["recalls"] += 1
+            c["degraded"] += int(read["degraded"])
+            if read["void"]:
+                voids.append({"bank": bank_id, "case_id": case["case_id"], "arm": arm, "reason": read["void"]})
+                continue
+            got[arm] = summarize_recall(read, what)
+            c["returned_fewer_than_top_k"] += int(got[arm]["returned"] < GATE_TOP_K)
+            c["capped"] += int(got[arm]["capped"])
+            if got[arm]["rounds"] > 1:
+                c["widened"].append(case["case_id"])
+        if len(got) == len(GATE_ARMS):
+            questions.append({"case_id": case["case_id"], **got})
+    return {"bank_id": bank_id, "questions": questions, "voids": voids, "counts": counts}
+
+
+def next_streaks(prev: dict, voided: set) -> dict:
+    """Runs in a row in which each question voided, after one more run: a question that voided this run adds one,
+    every other question starts again from zero."""
+    return {k: prev.get(k, 0) + 1 for k in voided}
+
+
+def first_gold_rank(ids: list[str], gold: set) -> int | None:
+    return next((i for i, x in enumerate(ids, 1) if x in gold), None)
+
+
+def question_outcome(case: dict, q: dict) -> dict:
+    gold = set().union(*(set(m["ids"]) for m in case["needed_info"]))
+    out = {"case_id": case["case_id"]}
+    for arm in GATE_ARMS:
+        r = first_gold_rank(q[arm]["ids"], gold)
+        inside = r is not None and r <= GATE_TOP
+        out[arm] = {"rank": r, "hit": inside, "mrr": Fraction(1, r) if inside else Fraction(0)}
+    return out
+
+
+def bank_metrics(cases: list[dict], questions: list[dict]) -> dict:
+    """MRR@10 and hit@10 per arm as exact fractions, the questions whose answer is in the no-profile top ten and outside
+    the candidate's (lost) and the reverse (gained), each with where the answer was in the arm that had it outside its
+    top ten: absent from its 50 hits, or at ranks 11 to 50."""
+    by_id = {c["case_id"]: c for c in cases}
+    outs = [question_outcome(by_id[q["case_id"]], q) for q in questions]
+    n = len(outs)
+    if n == 0:
+        raise GateStop("a bank scored no question")
+
+    def moved(a: str, b: str) -> list[dict]:
+        return [{"case_id": o["case_id"], f"{a}_rank": o[a]["rank"], f"{b}_rank": o[b]["rank"],
+                 "where": "absent_from_50" if o[b]["rank"] is None else "ranks_11_50"}
+                for o in outs if o[a]["hit"] and not o[b]["hit"]]
+
+    return {"n": n, "mrr": {a: sum(o[a]["mrr"] for o in outs) / n for a in GATE_ARMS},
+            "hit10": {a: Fraction(sum(o[a]["hit"] for o in outs), n) for a in GATE_ARMS},
+            "lost": moved("none", "candidate"), "gained": moved("candidate", "none")}
+
+
+def own_bank_passes(m: dict) -> bool:
+    return m["mrr"]["candidate"] >= m["mrr"]["none"]
+
+
+def shared_bank_passes(m: dict) -> bool:
+    return (m["mrr"]["none"] - m["mrr"]["candidate"] <= GATE_SHARED_MAX_LOSS
+            and len(m["lost"]) <= GATE_SHARED_MAX_LOST_QUESTIONS)
+
+
+def gate_verdict(rounds: list[dict]) -> dict:
+    """`rounds` holds each round's {"own": metrics, "shared": metrics}. The pass is read in each round separately and
+    must hold in every round, on both banks."""
+    if not rounds:
+        raise GateStop("no round to read")
+    per = []
+    for r in rounds:
+        own, shared = own_bank_passes(r["own"]), shared_bank_passes(r["shared"])
+        per.append({"own": own, "shared": shared, "pass": own and shared})
+    return {"rounds": per, "pass": all(p["pass"] for p in per)}
+
+
+def top10_differences(first: dict, second: dict) -> dict:
+    """Per arm, the questions whose ordered top ten differs between two rounds of one bank."""
+    a, b = ({q["case_id"]: q for q in rb["questions"]} for rb in (first, second))
+    if set(a) != set(b):
+        raise GateStop("the two rounds scored different questions")
+    return {arm: sum(1 for cid in a if a[cid][arm]["ids"][:GATE_TOP] != b[cid][arm]["ids"][:GATE_TOP])
+            for arm in GATE_ARMS}
+
+
+def f6(x: Fraction) -> float:
+    return round(float(x), 6)
+
+
+def metrics_json(m: dict) -> dict:
+    return {"n": m["n"], "MRR@10": {a: f6(m["mrr"][a]) for a in GATE_ARMS},
+            "MRR@10_exact": {a: str(m["mrr"][a]) for a in GATE_ARMS},
+            "hit@10": {a: f6(m["hit10"][a]) for a in GATE_ARMS},
+            "mrr_loss": f6(m["mrr"]["none"] - m["mrr"]["candidate"]), "lost": m["lost"], "gained": m["gained"]}
+
+
+def build_gate_report(profile: str, banks: dict, rounds: list[dict], reranker_weights: dict) -> dict:
+    """The record of a finished gate: verdict, and every figure reported beside it. `rounds` holds, per round, the
+    accepted pass of each bank (`banks`) and the round's bookkeeping."""
+    metrics = [{role: bank_metrics(banks[role]["cases"], r["banks"][role]["questions"]) for role in GATE_ROLES}
+               for r in rounds]
+    verdict = gate_verdict(metrics)
+    clamp_available = not reranker_weights
+    out_rounds = []
+    for r, m, v in zip(rounds, metrics, verdict["rounds"]):
+        entry = {"round": r["round"], "started_at": r["started_at"], "accepted_attempt": r["accepted_attempt"],
+                 "discarded_attempts": r["discarded_attempts"], "degraded_recalls": r["degraded_recalls"],
+                 "pass": v["pass"]}
+        for role in GATE_ROLES:
+            rb = r["banks"][role]
+            entry[role] = {
+                **metrics_json(m[role]), "pass": v[role],
+                "widened": {a: rb["counts"][a]["widened"] for a in GATE_ARMS},
+                "returned_fewer_than_50": {a: rb["counts"][a]["returned_fewer_than_top_k"] for a in GATE_ARMS},
+                "budget_capped": {a: rb["counts"][a]["capped"] for a in GATE_ARMS},
+                "top10_pre_entity_score_1": {a: (sum(q[a]["clamped_top10"] for q in rb["questions"])
+                                                 if clamp_available else None) for a in GATE_ARMS}}
+        out_rounds.append(entry)
+    questions = [q for r in rounds for role in GATE_ROLES for q in r["banks"][role]["questions"]]
+    cand_hits, cand_not_one = (sum(q["candidate"][k] for q in questions) for k in ("entity_hits", "entity_not_one"))
+    report = {
+        "verdict": "PASS" if verdict["pass"] else "FAIL", "profile": profile, "rounds": out_rounds,
+        "mean_of_rounds": {role: {"MRR@10": {a: f6(sum(m[role]["mrr"][a] for m in metrics) / len(metrics))
+                                             for a in GATE_ARMS},
+                                  "hit@10": {a: f6(sum(m[role]["hit10"][a] for m in metrics) / len(metrics))
+                                             for a in GATE_ARMS}} for role in GATE_ROLES},
+        "candidate_entity_term": {"hits": cand_hits, "not_one": cand_not_one,
+                                  "is_1_for_every_hit": cand_hits > 0 and cand_not_one == 0},
+        "reranker": {"reranker_weights": reranker_weights, "configured": not clamp_available,
+                     "pre_entity_score_1_count": "available" if clamp_available else "not available"},
+        "weights_served": sorted({w for q in questions for a in GATE_ARMS for w in q[a]["weights_served"]})}
+    if len(rounds) == 2:
+        report["top10_differs_between_rounds"] = {role: top10_differences(rounds[0]["banks"][role],
+                                                                          rounds[1]["banks"][role])
+                                                  for role in GATE_ROLES}
+    return report
+
+
+def render_summary(report: dict, banks: dict) -> str:
+    lines = [f"rebind-gate {report['profile']}: {report['verdict']}"]
+    for role in GATE_ROLES:
+        b = banks[role]
+        lines.append(f"{role} bank {b['meta']['bank_id']} v{b['meta']['version']}: {len(b['cases'])} questions, "
+                     f"read set {','.join(b['visible'])}")
+    for r in report["rounds"]:
+        for role in GATE_ROLES:
+            m = r[role]
+            extra = f" loss={m['mrr_loss']} lost={len(m['lost'])}" if role == "shared" else ""
+            lines.append(f"round {r['round']} {role}: MRR@10 none={m['MRR@10']['none']} candidate="
+                         f"{m['MRR@10']['candidate']} hit@10 none={m['hit@10']['none']} candidate="
+                         f"{m['hit@10']['candidate']}{extra} gained={len(m['gained'])} -> "
+                         f"{'pass' if m['pass'] else 'FAIL'}")
+        lines.append(f"round {r['round']}: degraded recalls {r['degraded_recalls']}, discarded runs "
+                     f"{len(r['discarded_attempts'])}")
+    for role in GATE_ROLES:
+        mean = report["mean_of_rounds"][role]
+        lines.append(f"mean of rounds {role}: MRR@10 none={mean['MRR@10']['none']} candidate="
+                     f"{mean['MRR@10']['candidate']} hit@10 none={mean['hit@10']['none']} candidate="
+                     f"{mean['hit@10']['candidate']}")
+    for role, d in report.get("top10_differs_between_rounds", {}).items():
+        lines.append(f"top ten differs between rounds, {role}: no profile {d['none']}, candidate {d['candidate']}")
+    lines.append(f"candidate entity term is 1 for every hit: {report['candidate_entity_term']['is_1_for_every_hit']} "
+                 f"({report['candidate_entity_term']['not_one']} of {report['candidate_entity_term']['hits']} "
+                 "hits differ)")
+    lines.append(f"top-10 hits with pre_entity_score 1.0: {report['reranker']['pre_entity_score_1_count']}"
+                 f" (reranker weights {json.dumps(report['reranker']['reranker_weights'])})")
+    lines.append("details per round (lost and gained questions, widened questions, recalls under 50 hits) are in "
+                 "the JSON record")
+    return "\n".join(lines)
+
+
+def gate_preflight(br, role: str, bank: dict, cand: str, args, state: dict, proc: dict) -> None:
+    """Runs in each bank's server process right after the handshake, before its first recall. Records the caller's
+    scope per arm and refuses arms that differ or a readable set that is not the bank's, reads the caller's recall
+    bindings and refuses when one resolves, reads the candidate, and (once) reads the token-budget cap."""
+    scopes = {arm: scope_of(br.one(op("whoami"))) for arm in GATE_ARMS}
+    proc["scopes"] = scopes
+    require_same_scope(scopes, bank["visible"])
+    primary = scopes["none"]["namespace"]
+    reads = {"default": br.one(op("brain.resolve", consumer_kind="recall")),
+             f"namespace {primary}": br.one(op("brain.resolve", consumer_kind="recall", namespace=primary))}
+    proc["bindings"] = reads
+    require_no_binding(reads)
+    prof = br.one(op("brain.profile", profile_id=cand))
+    proc["candidate_profile"] = ({k: prof.get(k) for k in ("profile_id", "lifecycle", "local_factor", "total_events",
+                                                          "posterior_means")} if isinstance(prof, dict) else prof)
+    if state["config"] is None:
+        try:
+            help_result = br.one(op("memory.recall", help=True))
+        except BankError as e:
+            help_result = None
+            state["help_error"] = str(e.code)
+        cap, source = resolve_token_budget_cap(help_result, args.token_budget_cap)
+        state.update(cap=cap, cap_source=source, config=gate_recall_config(cap))
+
+
+def run_gate_attempt(args, scratch: Path, db: Path, env: dict, banks: dict, cand: str, state: dict, tag: str,
+                     record: dict) -> dict:
+    """One pass over both banks, each in its own fresh server process on the same staged copy."""
+    results = {}
+    for role in GATE_ROLES:
+        bank = banks[role]
+        write_config(scratch, args, bank["visible"])
+        config_text = (scratch / "home" / ".khive" / "config.toml").read_text()
+        err_name = f"kkernel-mcp-gate-{tag}-{role}.err"
+        proc = {"tag": tag, "bank": role, "server_stderr": str(scratch / err_name)}
+        record["processes"].append(proc)
+        proc["brain_profile"] = require_brain_profile_unset(config_text, env, mcp_argv(args.kkernel, db))
+        proc["memory_pressure"] = require_normal_pressure("before this bank's server starts")
+        br, ready = open_bridge(args, db, env, scratch, bank["cases"][0]["query"], [cand],
+                                served_check=lambda b, role=role, bank=bank, proc=proc: gate_preflight(
+                                    b, role, bank, cand, args, state, proc),
+                                err_name=err_name)
+        proc.update(ready)
+        try:
+            results[role] = play_bank(bank["cases"], lambda case, pid: br.one(gate_recall_op(case, pid, state["config"])),
+                                      cand, bank["meta"]["bank_id"])
+        finally:
+            br.close()
+    return results
+
+
+def gate_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def run_gate_rounds(args, scratch: Path, db: Path, env: dict, banks: dict, cand: str, state: dict,
+                    record: dict) -> list[dict]:
+    """Two rounds, a gap apart. A pass over both banks with any recall that voids its round is discarded and run
+    again in fresh processes; a question that voids three runs in a row stops the gate."""
+    streaks: dict = {}
+    rounds = []
+    for round_no in range(1, GATE_ROUNDS + 1):
+        if round_no > 1:
+            gate_sleep(args.round_gap_s)
+        rnd = {"round": round_no, "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "discarded_attempts": [], "degraded_recalls": {a: 0 for a in GATE_ARMS}}
+        record["rounds"].append(rnd)
+        for attempt in range(1, args.max_round_runs + 1):
+            results = run_gate_attempt(args, scratch, db, env, banks, cand, state, f"r{round_no}a{attempt}", record)
+            voids = [v for r in results.values() for v in r["voids"]]
+            for r in results.values():
+                for a in GATE_ARMS:
+                    rnd["degraded_recalls"][a] += r["counts"][a]["degraded"]
+            if not voids:
+                rnd.update(accepted_attempt=attempt, banks=results)
+                streaks = {}
+                break
+            rnd["discarded_attempts"].append({"attempt": attempt, "voids": voids})
+            streaks = next_streaks(streaks, {(v["bank"], v["case_id"]) for v in voids})
+            stuck = sorted(k for k, n in streaks.items() if n >= GATE_MAX_VOIDS_IN_A_ROW)
+            if stuck:
+                rnd["stopped_on"] = [{"bank": b, "case_id": c, "voided_runs_in_a_row": streaks[(b, c)]}
+                                     for b, c in stuck]
+                raise GateStop(f"round {round_no}: " + "; ".join(
+                    f"question {c} of bank {b} voided {streaks[(b, c)]} runs in a row ("
+                    + ", ".join(sorted({v['reason'] for v in voids if (v['bank'], v['case_id']) == (b, c)})) + ")"
+                    for b, c in stuck))
+        else:
+            raise GateStop(f"round {round_no} did not run clean in {args.max_round_runs} runs")
+        rounds.append(rnd)
+    return rounds
+
+
+def run_rebind_gate(args) -> int:
+    require_store_source(args)
+    own_meta, own_cases = load_bank(Path(args.own_bank))
+    shared_meta, shared_cases = load_bank(Path(args.shared_bank))
+    require_distinct([own_meta["bank_id"], shared_meta["bank_id"]], "bank ids")
+    safe_name(args.profile, "profile")
+    require_bank_roles(own_cases, shared_cases)
+    visible = {own_meta["bank_id"]: parse_read_set(args.own_visible, "--own-visible"),
+               shared_meta["bank_id"]: parse_read_set(args.shared_visible, "--shared-visible")}
+    require_bank_visible([(own_meta, own_cases), (shared_meta, shared_cases)], visible)
+    banks = {"own": {"meta": own_meta, "cases": own_cases, "visible": visible[own_meta["bank_id"]],
+                     "namespaces": namespace_counts(own_cases)},
+             "shared": {"meta": shared_meta, "cases": shared_cases, "visible": visible[shared_meta["bank_id"]],
+                        "namespaces": namespace_counts(shared_cases)}}
+    read_engines(args)
+    args.bank = [args.own_bank, args.shared_bank]
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
+    out = Path(args.out)
+    if out.exists():
+        raise BankError(f"refusing to overwrite {out}")
+    scratch = scratch_dir(args, run_id)
+    out.mkdir(parents=True)
+    record = {"status": "incomplete", "profile": args.profile, "recall_shape": {
+        "top_k": GATE_TOP_K, "include_breakdown": True, "include_timings": True, "created_before": "each case's T"},
+              "banks": {role: {"bank_id": b["meta"]["bank_id"], "version": b["meta"]["version"],
+                               "cases_sha256": b["meta"]["cases_sha256"], "population": len(b["cases"]),
+                               "namespaces": b["namespaces"], "read_set": b["visible"]}
+                        for role, b in banks.items()},
+              "processes": [], "rounds": []}
+    for role, b in banks.items():
+        print(f"{role} bank {b['meta']['bank_id']} v{b['meta']['version']}: {len(b['cases'])} questions, read set "
+              f"{','.join(b['visible'])}", flush=True)
+    state = {"cap": None, "cap_source": None, "config": None}
+    code, stop = EXIT_REFUSED, None
+    try:
+        db, env, staged = stage_once(args, scratch)
+        record.update({"snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel),
+                       "run_id": run_id, **staged})
+        rounds = run_gate_rounds(args, scratch, db, env, banks, args.profile, state, record)
+        report = build_gate_report(args.profile, banks, rounds, state["config"]["reranker_weights"])
+        record.update(status="complete", report=report)
+        text = render_summary(report, banks)
+        (out / "rebind-gate.txt").write_text(text + "\n")
+        print(text, flush=True)
+        code = EXIT_PASS if report["verdict"] == "PASS" else EXIT_FAIL
+    except GateStop as e:
+        stop, code = str(e), e.code
+        record.update(status="stopped", stop={"kind": type(e).__name__, "message": stop, "exit_code": code})
+    except BankError as e:
+        stop, code = str(e.code), EXIT_REFUSED
+        record.update(status="stopped", stop={"kind": "BankError", "message": stop, "exit_code": code})
+    finally:
+        try:
+            finish_scratch(args, scratch, record)
+        finally:
+            record["token_budget"] = {"cap": state["cap"], "source": state["cap_source"],
+                                      "help_error": state.get("help_error")}
+            (out / "rebind-gate.json").write_text(json.dumps(record, indent=1) + "\n")
+    if stop is not None:
+        print(f"rebind-gate: {stop}", file=sys.stderr)
+    return code
+
+
+def cmd_rebind_gate(args) -> int:
+    """Exit status: 0 the profile passes in both rounds, 10 it does not, 11 the run cannot be read (a wrong
+    attribution, a question that voided three runs in a row), 12 a condition the gate requires does not hold or the
+    run could not complete."""
+    try:
+        return run_rebind_gate(args)
+    except GateStop as e:
+        print(f"rebind-gate: {e}", file=sys.stderr)
+        return e.code
+    except BankError as e:
+        print(f"rebind-gate: {e.code}", file=sys.stderr)
+        return EXIT_REFUSED
+
+
+def gate_self_checks(arm, with_patches) -> None:
+    """The rebind-gate arms of the self-test: the decision functions over synthetic responses, and the whole command
+    over fake server processes. `arm(name, fn)` records one check; `with_patches(patches, fn)` runs fn with module
+    globals replaced (the mutation controls)."""
+    import contextlib
+    import io
+
+    T = "2026-10-28T12:00:00Z"
+    CAND = "cand-p"
+    HELP = {"verb": "memory.recall", "params": [{"name": "config", "description":
+            "Default token budget (tokens). Server-side cap: 12345. Default: 4000."}]}
+
+    def gid(i):
+        return f"{i:08x}-0000-4000-8000-000000000000"
+
+    def hit(i, att="unspecified", by=None, pre=0.5, term=1.0, **extra):
+        idv = gid(i) if isinstance(i, int) else i
+        h = {"id": idv, "full_id": idv, "created_at": "2026-01-01T00:00:00Z", "serve_attribution": att,
+             "rank_score": 0.5, "breakdown": {"pre_entity_score": pre, "entity_term": term, "weights_served": "default"},
+             **extra}
+        if by is not None:
+            h["served_by_profile_id"] = by
+        return h
+
+    def response(hits, rounds=1, multi=False, degraded=False, truncated=False):
+        body = {"results": hits, "timings": {"total_us": 1, "retrieval_rounds": rounds, "rounds": [{}] * rounds}}
+        if multi:
+            body.update(candidates={"vector_candidates_per_model": []}, budget_capped=False, truncated_for_budget=0)
+        if degraded:
+            body.update(degraded=True, degraded_reason="ann_unavailable")
+        if truncated:
+            body["truncated"] = True
+        return body
+
+    def none_hits(n=3, **kw):
+        return [hit(i, **kw) for i in range(n)]
+
+    def cand_hits(n=3, **kw):
+        return [hit(i, att="profile", by=CAND, **kw) for i in range(n)]
+
+    def read(resp, which):
+        return gate_recall_read(resp, which, None if which == "none" else CAND, T)
+
+    def stops(fn, exc=GateStop):
+        try:
+            fn()
+        except exc:
+            return True
+        return False
+
+    def code_of(fn):
+        try:
+            fn()
+        except GateStop as e:
+            return e.code
+        return None
+
+    stamped = [hit(0, degraded="ann_unavailable"), hit(1)]
+    arm("rebind-gate: a clean recall in either arm does not void its round",
+        lambda: read(response(none_hits()), "none")["void"] is None
+        and read(response(cand_hits()), "candidate")["void"] is None)
+    arm("rebind-gate: hits stamped degraded void the round, in both arms",
+        lambda: read(response(stamped), "none")["void"] == "degraded:hits_stamped"
+        and read(response([dict(h, serve_attribution="profile", served_by_profile_id=CAND) for h in stamped]),
+                 "candidate")["void"] == "degraded:hits_stamped"
+        and read(response(stamped), "none")["degraded"])
+    arm("rebind-gate: an empty response with degraded true voids the round, in both arms",
+        lambda: all(read(response([], degraded=True), w)["void"] == "degraded:empty_flagged"
+                    and read(response([], degraded=True), w)["degraded"] for w in GATE_ARMS))
+    arm("rebind-gate: an empty verbose multi-model envelope voids the round in both arms, a non-empty one does not",
+        lambda: all(read(response([], multi=True), w)["void"] == "empty_multi_model_envelope" for w in GATE_ARMS)
+        and not read(response([], multi=True), "none")["degraded"]
+        and read(response(cand_hits(), multi=True), "candidate")["void"] is None
+        and read(response(none_hits(), multi=True), "none")["void"] is None)
+    arm("rebind-gate: a candidate recall with no hits is a miss, a no-profile recall with no hits voids its round",
+        lambda: read(response([]), "candidate")["void"] is None
+        and read(response([], truncated=True), "candidate")["void"] is None
+        and read(response([]), "none")["void"] == "no_hits_without_profile"
+        and read(response([], truncated=True), "none")["void"] == "no_hits_without_profile")
+
+    def attribution_stops():
+        return (stops(lambda: read(response([hit(0, att="profile", by=CAND)]), "none"))
+                and stops(lambda: read(response([hit(0, att="unspecified", by="other")]), "none"))
+                and stops(lambda: read(response([hit(0, att="unattributed")]), "none"))
+                and stops(lambda: read(response([hit(0, att="unspecified")]), "candidate"))
+                and stops(lambda: read(response([hit(0, att="profile", by="other")]), "candidate"))
+                and stops(lambda: read(response(none_hits() + [hit(9, att="profile", by=CAND)]), "none"))
+                and code_of(lambda: read(response([hit(0, att="profile", by=CAND)]), "none")) == EXIT_VOID
+                and not stops(lambda: read(response(none_hits()), "none"))
+                and not stops(lambda: read(response(cand_hits()), "candidate")))
+
+    arm("rebind-gate: a hit with any other attribution than its arm's voids the run (stop, exit 11)", attribution_stops)
+    arm("rebind-gate: mutation control, with the attribution check removed the attribution arm reports failure",
+        lambda: with_patches({"check_gate_attribution": lambda *a: None}, attribution_stops) is False)
+    arm("rebind-gate: a late hit, a missing timings report and a hit without the breakdown terms stop the gate",
+        lambda: stops(lambda: gate_recall_read(response([hit(0, created_at="2026-10-28T12:00:00Z")]), "none", None, T))
+        and stops(lambda: read({"results": none_hits()}, "none"))
+        and stops(lambda: read(none_hits(), "none"))
+        and code_of(lambda: read(response([dict(hit(0), breakdown={})]), "none")) == EXIT_REFUSED)
+
+    def brain_profile_refused():
+        clean = "[actor]\nid = \"a\"\n\n[[engines]]\nname = \"e\"\n"
+        env = {"HOME": "/h"}
+        argv = ["k", "mcp", "--db", "/h/khive.db"]
+        return (require_brain_profile_unset(clean, env, argv).get("config_toml") == "unset"
+                and stops(lambda: require_brain_profile_unset("[runtime]\nbrain_profile = \"p\"\n" + clean, env, argv),
+                          GateRefused)
+                and stops(lambda: require_brain_profile_unset(clean, {"KHIVE_BRAIN_PROFILE": "p"}, argv), GateRefused)
+                and stops(lambda: require_brain_profile_unset(clean, env, argv + ["--brain-profile", "p"]), GateRefused)
+                and stops(lambda: require_brain_profile_unset(clean, env, argv + ["--brain-profile=p"]), GateRefused)
+                and not stops(lambda: require_brain_profile_unset(clean + "# brain_profile = \"p\"\n",
+                                                                  {"KHIVE_BRAIN_PROFILE": "  "}, argv))
+                and code_of(lambda: require_brain_profile_unset(clean, {"KHIVE_BRAIN_PROFILE": "p"}, argv))
+                == EXIT_REFUSED)
+
+    arm("rebind-gate: the harness refuses to start when the runtime has a brain_profile (config, environment, flag)",
+        brain_profile_refused)
+    arm("rebind-gate: mutation control, with the brain_profile check removed that arm reports failure",
+        lambda: with_patches({"require_brain_profile_unset": lambda *a: {}}, brain_profile_refused) is False)
+
+    def binding_refused():
+        free = {"matched_binding": False, "profile_id": None}
+        return (not binding_resolves(free) and binding_resolves({"matched_binding": True, "profile_id": "p"})
+                and stops(lambda: require_no_binding({"default": free, "namespace local": {"matched_binding": True}}),
+                          GateRefused)
+                and stops(lambda: require_no_binding({"default": {"profile_id": None}}), GateRefused)
+                and not stops(lambda: require_no_binding({"default": free, "namespace local": free}))
+                and code_of(lambda: require_no_binding({"default": {"matched_binding": True}})) == EXIT_REFUSED)
+
+    arm("rebind-gate: the harness refuses to start when the caller has a recall binding that resolves", binding_refused)
+    arm("rebind-gate: mutation control, with the binding check removed that arm reports failure",
+        lambda: with_patches({"require_no_binding": lambda reads: None}, binding_refused) is False)
+
+    def scope_refused():
+        s = {"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local"]}
+        same = {"none": scope_of(s), "candidate": scope_of(s)}
+        other = {"none": scope_of(s), "candidate": scope_of({**s, "actor_id": "b"})}
+        narrower = {"none": scope_of(s), "candidate": scope_of({**s, "visible_namespaces": ["local"]})}
+        return (scope_of(s)["visible_namespaces"] == ["local", "team-a"]
+                and not stops(lambda: require_same_scope(same, ["team-a", "local"]))
+                and not stops(lambda: require_same_scope(same, ["team-a"]))
+                and stops(lambda: require_same_scope(other, ["team-a", "local"]), GateRefused)
+                and stops(lambda: require_same_scope(narrower, ["team-a", "local"]), GateRefused)
+                and stops(lambda: require_same_scope(same, ["team-b"]), GateRefused)
+                and stops(lambda: scope_of({"namespace": "local"}), GateRefused))
+
+    arm("rebind-gate: arms whose caller or namespace sets differ, or a readable set that is not the bank's, are refused",
+        scope_refused)
+    help_ok = {"params": [{"description": "Default token budget (tokens). Server-side cap: 16000. Default: 4000."}]}
+    arm("rebind-gate: the token-budget cap is read from the help text, an operator cap is used only when the help "
+        "states none and must agree when it does",
+        lambda: token_budget_cap_from_help(help_ok) == 16000 and token_budget_cap_from_help({"d": "no cap"}) is None
+        and resolve_token_budget_cap(help_ok, None) == (16000, "help")
+        and resolve_token_budget_cap(help_ok, 16000) == (16000, "help")
+        and resolve_token_budget_cap({"d": "no cap"}, 9000) == (9000, "operator")
+        and stops(lambda: resolve_token_budget_cap(help_ok, 9000), GateRefused)
+        and stops(lambda: resolve_token_budget_cap(None, None), GateRefused)
+        and stops(lambda: resolve_token_budget_cap({"d": "no cap"}, 0), GateRefused)
+        and stops(lambda: token_budget_cap_from_help(
+            {"a": "token budget cap: 1000", "b": "token budget cap: 2000"}), GateRefused))
+
+    # ---- scoring and the pass rules
+    def mkcases(n, prefix="c"):
+        return [{"case_id": f"c{i}", "query": f"{prefix}-q{i}", "T": T,
+                 "needed_info": [{"statement": "s", "ids": [gid(1000 + i)]}]} for i in range(n)]
+
+    def ranked(i, rank, salt):
+        ids = [gid(100_000 + i * 1000 + salt * 100 + j) for j in range(GATE_TOP_K)]
+        if rank is not None:
+            ids[rank - 1] = gid(1000 + i)
+        return ids
+
+    def summary(ids, entity_not_one=0, clamped=0):
+        return {"ids": ids, "returned": len(ids), "rounds": 1, "capped": False, "clamped_top10": clamped,
+                "entity_hits": len(ids), "entity_not_one": entity_not_one, "weights_served": ["default"]}
+
+    def bank_round(n, moves, cand_salt=1, entity_not_one=0, clamped=0):
+        """A bank's accepted pass: every question has its answer at rank 1 in both arms except those in `moves`
+        ({question: (no-profile rank, candidate rank)}, None for absent from the 50 hits)."""
+        qs = []
+        for i in range(n):
+            nr, cr = moves.get(i, (1, 1))
+            qs.append({"case_id": f"c{i}", "none": summary(ranked(i, nr, 0), clamped=clamped),
+                       "candidate": summary(ranked(i, cr, cand_salt), entity_not_one=entity_not_one, clamped=clamped)})
+        counts = {a: {"recalls": n, "degraded": 0, "returned_fewer_than_top_k": 0, "capped": 0, "widened": []}
+                  for a in GATE_ARMS}
+        return {"bank_id": "b", "questions": qs, "voids": [], "counts": counts}
+
+    def metrics(n, moves):
+        rb = bank_round(n, moves)
+        return bank_metrics(mkcases(n), rb["questions"])
+
+    exact = metrics(25, {0: (1, 2), 1: (1, 2)})
+    arm("rebind-gate: a shared-pool MRR@10 loss of exactly 0.04 passes, above 0.04 fails",
+        lambda: exact["mrr"]["none"] - exact["mrr"]["candidate"] == Fraction(4, 100) and not exact["lost"]
+        and shared_bank_passes(exact) and not shared_bank_passes(metrics(25, {0: (1, 2), 1: (1, 2), 2: (1, 2)})))
+    arm("rebind-gate: one lost shared-pool question passes, two fail even when the loss is under 0.04",
+        lambda: len(metrics(30, {0: (1, None)})["lost"]) == 1 and shared_bank_passes(metrics(30, {0: (1, None)}))
+        and not shared_bank_passes(metrics(30, {0: (3, None), 1: (3, 12)}))
+        and metrics(30, {0: (3, None), 1: (3, 12)})["mrr"]["none"] - metrics(30, {0: (3, None), 1: (3, 12)})["mrr"][
+            "candidate"] < Fraction(4, 100))
+    arm("rebind-gate: the own-namespace bank passes at equal or higher MRR@10 and fails below it",
+        lambda: own_bank_passes(metrics(30, {})) and own_bank_passes(metrics(30, {0: (2, 1)}))
+        and not own_bank_passes(metrics(30, {0: (1, 2)})))
+    split = metrics(30, {0: (1, None), 1: (1, 30), 2: (None, 4), 3: (45, 5)})
+    arm("rebind-gate: each lost question is split into absent from the 50 hits or at ranks 11 to 50, each gained one "
+        "the same way for the no-profile arm",
+        lambda: [(x["case_id"], x["where"]) for x in split["lost"]] == [("c0", "absent_from_50"), ("c1", "ranks_11_50")]
+        and [(x["case_id"], x["where"]) for x in split["gained"]] == [("c2", "absent_from_50"), ("c3", "ranks_11_50")])
+    one_loss_each_way = [{"own": metrics(30, {}), "shared": metrics(30, {0: (1, None)})}]
+    two_losses = {"own": metrics(30, {}), "shared": metrics(30, {0: (3, None), 1: (3, None)})}
+
+    def one_round_only():
+        both = gate_verdict(one_loss_each_way * 2)
+        split_rounds = gate_verdict(one_loss_each_way + [two_losses])
+        return (both["pass"] and not split_rounds["pass"] and [r["pass"] for r in split_rounds["rounds"]] == [True, False]
+                and not gate_verdict([two_losses, one_loss_each_way[0]])["pass"]
+                and not gate_verdict([{"own": metrics(30, {0: (1, 2)}), "shared": metrics(30, {})}] * 2)["pass"]
+                and stops(lambda: gate_verdict([])))
+
+    arm("rebind-gate: a profile that passes one round and not the other fails the gate", one_round_only)
+    arm("rebind-gate: mutation control, with the shared-pool rule removed that arm reports failure",
+        lambda: with_patches({"shared_bank_passes": lambda m: True}, one_round_only) is False)
+
+    # ---- one pass over a bank
+    def ask_from(table, order):
+        def ask(case, pid):
+            order.append((case["case_id"], "candidate" if pid else "none"))
+            return table[(case["case_id"], "candidate" if pid else "none")]
+        return ask
+
+    full = [hit(0, pre=1.0)] + [hit(i) for i in range(1, 20)] + [hit(20, pre=1.0)] + [hit(i) for i in range(21, 50)]
+    cand_full = ([hit(0, att="profile", by=CAND, pre=1.0), hit(1, att="profile", by=CAND, pre=1.0),
+                  hit(2, att="profile", by=CAND, term=0.9)]
+                 + [hit(i, att="profile", by=CAND) for i in range(3, 50)])
+    order = []
+    played = play_bank(mkcases(2), ask_from({
+        ("c0", "none"): response(full), ("c0", "candidate"): response(cand_full, rounds=2),
+        ("c1", "none"): response(none_hits(40)),
+        ("c1", "candidate"): response(cand_hits(50, truncated=True))}, order), CAND, "bank-x")
+    c = played["counts"]
+    arm("rebind-gate: per arm the widened questions, recalls under 50 hits, capped recalls, clamped top-10 hits and "
+        "entity terms other than 1 are counted from the responses",
+        lambda: played["voids"] == [] and c["none"]["widened"] == [] and c["candidate"]["widened"] == ["c0"]
+        and c["none"]["returned_fewer_than_top_k"] == 1 and c["candidate"]["returned_fewer_than_top_k"] == 0
+        and c["none"]["capped"] == 0 and c["candidate"]["capped"] == 1
+        and played["questions"][0]["none"]["clamped_top10"] == 1 and played["questions"][0]["candidate"]["clamped_top10"] == 2
+        and played["questions"][0]["candidate"]["entity_not_one"] == 1 and played["questions"][0]["none"]["entity_not_one"] == 0)
+    arm("rebind-gate: the arms run adjacent in time, no profile first, in the bank's question order",
+        lambda: order == [("c0", "none"), ("c0", "candidate"), ("c1", "none"), ("c1", "candidate")])
+    degraded_play = play_bank(mkcases(2), ask_from({
+        ("c0", "none"): response([hit(0, degraded="ann_unavailable")]), ("c0", "candidate"): response(cand_hits()),
+        ("c1", "none"): response(none_hits()), ("c1", "candidate"): response(cand_hits())}, []), CAND, "bank-x")
+    arm("rebind-gate: a degraded recall is counted, listed with its bank, case and arm, and its case is not scored",
+        lambda: degraded_play["counts"]["none"]["degraded"] == 1 and degraded_play["counts"]["candidate"]["degraded"] == 0
+        and degraded_play["voids"] == [{"bank": "bank-x", "case_id": "c0", "arm": "none", "reason": "degraded:hits_stamped"}]
+        and [q["case_id"] for q in degraded_play["questions"]] == ["c1"])
+    arm("rebind-gate: runs in a row restart for every question that did not void",
+        lambda: next_streaks({}, {("b", "c1")}) == {("b", "c1"): 1}
+        and next_streaks({("b", "c1"): 2, ("b", "c2"): 1}, {("b", "c1")}) == {("b", "c1"): 3}
+        and next_streaks({("b", "c1"): 2}, {("b", "c2")}) == {("b", "c2"): 1} and next_streaks({("b", "c1"): 2}, set()) == {})
+
+    # ---- the report
+    def report_for(rounds_spec, reranker=None):
+        banks_info = {"own": {"cases": mkcases(30)}, "shared": {"cases": mkcases(30)}}
+        rounds = []
+        for n, (own, shared, salt) in enumerate(rounds_spec, 1):
+            rounds.append({"round": n, "started_at": "t", "accepted_attempt": 1, "discarded_attempts": [],
+                           "degraded_recalls": {a: 0 for a in GATE_ARMS},
+                           "banks": {"own": own if "questions" in own else bank_round(30, own, salt),
+                                     "shared": shared if "questions" in shared else bank_round(30, shared, salt)}})
+        return build_gate_report(CAND, banks_info, rounds, reranker or {})
+
+    rep = report_for([({}, {0: (1, None)}, 1), ({}, {0: (1, None)}, 2)])
+    arm("rebind-gate: the report gives MRR@10 and hit@10 per arm per round and their mean, and the verdict",
+        lambda: rep["verdict"] == "PASS" and rep["rounds"][0]["own"]["MRR@10"] == {"none": 1.0, "candidate": 1.0}
+        and rep["rounds"][0]["shared"]["hit@10"] == {"none": 1.0, "candidate": round(29 / 30, 6)}
+        and rep["mean_of_rounds"]["shared"]["hit@10"]["candidate"] == round(29 / 30, 6)
+        and report_for([({}, {0: (1, None)}, 1), ({}, {0: (3, None), 1: (3, None)}, 1)])["verdict"] == "FAIL")
+    arm("rebind-gate: the questions whose top ten differs between the rounds are counted per arm",
+        lambda: rep["top10_differs_between_rounds"]["own"] == {"none": 0, "candidate": 30}
+        and report_for([({}, {}, 1), ({}, {}, 1)])["top10_differs_between_rounds"]["shared"] == {"none": 0, "candidate": 0})
+    arm("rebind-gate: the count of clamped top-10 hits is reported per arm, and not available when a weighted reranker "
+        "is configured",
+        lambda: report_for([(bank_round(30, {}, clamped=2), {}, 1)])["rounds"][0]["own"]["top10_pre_entity_score_1"]
+        == {"none": 60, "candidate": 60}
+        and report_for([(bank_round(30, {}, clamped=2), {}, 1)], {"cross_encoder": 0.5})["rounds"][0]["own"][
+            "top10_pre_entity_score_1"] == {"none": None, "candidate": None}
+        and report_for([({}, {}, 1)], {"cross_encoder": 0.5})["reranker"]["pre_entity_score_1_count"] == "not available")
+    arm("rebind-gate: the report states whether the candidate's entity term is 1 for every hit",
+        lambda: rep["candidate_entity_term"]["is_1_for_every_hit"] is True
+        and report_for([(bank_round(30, {}, entity_not_one=1), {}, 1)])["candidate_entity_term"]
+        == {"hits": 3000, "not_one": 30, "is_1_for_every_hit": False})
+
+    # ---- the whole command over fake server processes
+    def fake_stage(args, scratch):
+        kdir = scratch / "home" / ".khive"
+        kdir.mkdir(parents=True)
+        return kdir / "khive.db", {"HOME": str(scratch / "home"), "KHIVE_NO_DAEMON": "1"}, [
+            {"staged_as": "khive.db", "source_mtime_ns": 1}, {"staged_as": "khive.db.events.db", "source_mtime_ns": 1}]
+
+    def write_bank(root, bank_id, prefix, tag):
+        d = root / bank_id
+        d.mkdir()
+        (d / "cases.jsonl").write_text("".join(json.dumps({**cs, "tags": [f"namespace:{tag}"]}) + "\n"
+                                               for cs in mkcases(3, prefix)))
+        (d / "bank.json").write_text(json.dumps({"bank_id": bank_id, "version": 1,
+                                                 "cases_sha256": sha256_file(d / "cases.jsonl")}))
+        return d
+
+    def drive(plan=None, voids=None, binding=False, wrong_none=False, engines='[[engines]]\nname = "e"\n',
+              help_text=HELP, token_budget_cap=None, patches=None, out_exists=False):
+        """cmd_rebind_gate over fake processes. `plan[(role, question, nth)]` is (no-profile rank, candidate rank) the
+        nth time that question is asked; `voids[(role, question)]` is how many times the no-profile recall answers
+        degraded before it answers clean."""
+        plan, voids = plan or {}, voids or {}
+        asked, procs, sleeps, closes, ops_log = {}, [], [], [], []
+
+        class Fake:
+            def __init__(self, role, visible):
+                self.role, self.visible, self.ops = role, visible, []
+
+            def one(self, text, timeout=900):
+                self.ops.append(text)
+                verb = text.split("(", 1)[0]
+                if verb == "whoami":
+                    return {"actor_id": "bench:unbound", "namespace": "local",
+                            "visible_namespaces": sorted(set(self.visible) | {"local"})}
+                if verb == "brain.resolve":
+                    return {"matched_binding": binding, "profile_id": None}
+                if verb == "brain.profile":
+                    return {"profile_id": CAND, "lifecycle": "active", "local_factor": 0.7, "total_events": 0}
+                if "help=true" in text:
+                    return help_text
+                query = re.search(r'query="([^"]*)"', text).group(1)
+                pid = re.search(r'profile_id="([^"]+)"', text)
+                pid = pid.group(1) if pid else None
+                idx = int(query.rsplit("q", 1)[1])
+                key = (self.role, query, pid)
+                nth = asked[key] = asked.get(key, -1) + 1
+                if pid is None and nth < voids.get((self.role, idx), 0):
+                    return response([hit(0, degraded="ann_unavailable")])
+                nr, cr = plan.get((self.role, idx, nth), (1, 1))
+                att, by = ("profile", pid) if (pid or wrong_none) else ("unspecified", None)
+                ids = ranked(idx, cr if pid else nr, 1 if pid else 0)
+                return response([hit(x, att=att, by=by or (CAND if wrong_none else None)) for x in ids])
+
+            def close(self):
+                closes.append(self.role)
+
+        def fake_open_bridge(a, db, env, scr, probe, profile_ids, served_check=None, err_name="x"):
+            cfg = (scr / "home" / ".khive" / "config.toml").read_text()
+            visible = json.loads(re.search(r"visible_namespaces\s*=\s*(\[[^\]]*\])", cfg).group(1))
+            fb = Fake("own" if probe.startswith("own") else "shared", visible)
+            procs.append(fb)
+            if served_check is not None:
+                try:
+                    served_check(fb)
+                except BaseException:
+                    fb.close()
+                    raise
+            return fb, {"ready_s": 0.0, "control": {}}
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "engines.toml").write_text(engines)
+            if out_exists:
+                (td / "out").mkdir()
+            own_dir, shared_dir = write_bank(td, "own-bank", "own", "team-a"), write_bank(td, "shared-bank", "shared", "local")
+            a = types.SimpleNamespace(kkernel="k", own_bank=str(own_dir), shared_bank=str(shared_dir),
+                                      own_visible="team-a,local", shared_visible="team-a,local", profile=CAND,
+                                      store_main="m", store_events="e", staged_home=None, snapshot_id="s",
+                                      engines_file=str(td / "engines.toml"), models_dir=None, control_id=gid(0),
+                                      ready_max_s=5, scratch_parent=str(td), remove_scratch=False, copy_wal=False,
+                                      round_gap_s=7.0, max_round_runs=6, token_budget_cap=token_budget_cap,
+                                      out=str(td / "out"))
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            patched = {"stage": fake_stage, "memory_pressure": lambda: {"source": "t", "reading": "1", "normal": True},
+                       "open_bridge": fake_open_bridge, "kkernel_version": lambda p: "test",
+                       "gate_sleep": lambda s: sleeps.append(s), **(patches or {})}
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                code = with_patches(patched, lambda: cmd_rebind_gate(a))
+            record = json.loads((td / "out" / "rebind-gate.json").read_text()) if (td / "out" / "rebind-gate.json").exists() else None
+            text = (td / "out" / "rebind-gate.txt").read_text() if (td / "out" / "rebind-gate.txt").exists() else None
+        return {"code": code, "record": record, "text": text, "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue(),
+                "procs": procs, "sleeps": sleeps, "closes": closes}
+
+    def recall_ops(proc):
+        return [t for t in proc.ops if t.startswith("memory.recall(") and "help=true" not in t]
+
+    def passes_end_to_end():
+        r = drive()
+        if r["code"] != EXIT_PASS or r["record"] is None or r["record"]["report"]["verdict"] != "PASS":
+            return False
+        ops = [recall_ops(p) for p in r["procs"]]
+        first = ops[0]
+        return (len(r["procs"]) == 4 and [p.role for p in r["procs"]] == ["own", "shared", "own", "shared"]
+                and r["closes"] == ["own", "shared", "own", "shared"] and r["sleeps"] == [7.0]
+                and len(r["record"]["processes"]) == 4 and len(r["record"]["report"]["rounds"]) == 2
+                and r["record"]["token_budget"]["cap"] == 12345 and r["record"]["token_budget"]["source"] == "help"
+                and all(len(o) == 6 for o in ops)
+                and ["profile_id" in t for t in first] == [False, True] * 3
+                and [re.search(r'query="own-q(\d)"', t).group(1) for t in first] == ["0", "0", "1", "1", "2", "2"]
+                and all('"default_token_budget": 12345' in t and "top_k=50" in t and "include_breakdown=true" in t
+                        and "include_timings=true" in t and f'created_before="{T}"' in t and '"reranker_weights": {}' in t
+                        for o in ops for t in o)
+                and all(f'profile_id="{CAND}"' in t for o in ops for t in o[1::2])
+                and [t.split("(", 1)[0] for t in r["procs"][0].ops[:6]] == [
+                    "whoami", "whoami", "brain.resolve", "brain.resolve", "brain.profile", "memory.recall"]
+                and "PASS" in r["stdout"] and r["text"].startswith("rebind-gate cand-p: PASS")
+                and r["record"]["banks"]["own"]["population"] == 3 and "own bank own-bank v1: 3 questions" in r["stdout"])
+
+    arm("rebind-gate: a profile that matches on both banks in both rounds passes (exit 0); every recall asks 50 hits "
+        "with breakdowns and timings at the budget the help stated, in two rounds each in fresh processes",
+        passes_end_to_end)
+
+    def fails_in_round_two_only():
+        shared_loss = {("shared", 0, 1): (1, None), ("shared", 1, 1): (1, None)}
+        r = drive(plan=shared_loss)
+        rounds = r["record"]["report"]["rounds"] if r["record"] else []
+        return (r["code"] == EXIT_FAIL and [x["pass"] for x in rounds] == [True, False]
+                and [x["shared"]["pass"] for x in rounds] == [True, False] and r["record"]["report"]["verdict"] == "FAIL"
+                and len(rounds[1]["shared"]["lost"]) == 2)
+
+    arm("rebind-gate: a profile that fails the shared-pool rule in the second round only fails the gate (exit 10)",
+        fails_in_round_two_only)
+    arm("rebind-gate: mutation control, with the shared-pool rule removed the second-round failure passes",
+        lambda: with_patches({"shared_bank_passes": lambda m: True}, fails_in_round_two_only) is False)
+
+    def two_voids_then_clean():
+        r = drive(voids={("own", 1): 2})
+        rounds = r["record"]["report"]["rounds"] if r["record"] else []
+        return (r["code"] == EXIT_PASS and len(rounds[0]["discarded_attempts"]) == 2 and rounds[0]["accepted_attempt"] == 3
+                and rounds[0]["degraded_recalls"] == {"none": 2, "candidate": 0} and len(r["record"]["processes"]) == 8
+                and rounds[1]["discarded_attempts"] == [])
+
+    def three_voids_stop():
+        r = drive(voids={("own", 1): 3})
+        return (r["code"] == EXIT_VOID and r["record"]["status"] == "stopped" and len(r["record"]["processes"]) == 6
+                and "question c1 of bank own-bank voided 3 runs in a row" in r["stderr"]
+                and r["record"]["rounds"][0]["stopped_on"] == [
+                    {"bank": "own-bank", "case_id": "c1", "voided_runs_in_a_row": 3}])
+
+    arm("rebind-gate: a round with a degraded recall is run again in fresh processes and counted, two voids then a "
+        "clean run passes", two_voids_then_clean)
+    arm("rebind-gate: a question that voids three runs in a row stops the gate (exit 11) and is named", three_voids_stop)
+    arm("rebind-gate: mutation control, with the void check removed the three-voids arm reports failure",
+        lambda: with_patches({"next_streaks": lambda prev, voided: {}}, three_voids_stop) is False)
+
+    def attribution_stops_run():
+        r = drive(wrong_none=True)
+        return r["code"] == EXIT_VOID and "arm none expects" in r["stderr"] and r["record"]["status"] == "stopped"
+
+    arm("rebind-gate: a wrong attribution in a run stops it with exit 11", attribution_stops_run)
+    arm("rebind-gate: mutation control, with the attribution check removed the run is not stopped",
+        lambda: with_patches({"check_gate_attribution": lambda *a: None}, attribution_stops_run) is False)
+
+    def binding_stops_run():
+        r = drive(binding=True)
+        return (r["code"] == EXIT_REFUSED and "recall binding" in r["stderr"]
+                and not any(recall_ops(p) for p in r["procs"]) and r["record"]["processes"][0]["bindings"]["default"]
+                == {"matched_binding": True, "profile_id": None})
+
+    arm("rebind-gate: a caller with a recall binding is refused (exit 12) before any recall, the bindings read are recorded",
+        binding_stops_run)
+    arm("rebind-gate: mutation control, with the binding check removed the run is not refused",
+        lambda: with_patches({"require_no_binding": lambda reads: None}, binding_stops_run) is False)
+
+    def brain_profile_stops_run():
+        r = drive(engines='[[engines]]\nname = "e"\nbrain_profile = "p"\n')
+        return (r["code"] == EXIT_REFUSED and "brain_profile" in r["stderr"] and r["procs"] == []
+                and r["record"]["status"] == "stopped")
+
+    arm("rebind-gate: a runtime config with a brain_profile is refused (exit 12) before any process starts",
+        brain_profile_stops_run)
+    arm("rebind-gate: mutation control, with the brain_profile check removed the run is not refused",
+        lambda: with_patches({"require_brain_profile_unset": lambda *a: {}}, brain_profile_stops_run) is False)
+
+    def cap_arms():
+        none_stated = drive(help_text={"d": "no cap here"})
+        by_operator = drive(help_text={"d": "no cap here"}, token_budget_cap=9000)
+        return (none_stated["code"] == EXIT_REFUSED and "states no token-budget cap" in none_stated["stderr"]
+                and not any(recall_ops(p) for p in none_stated["procs"])
+                and by_operator["code"] == EXIT_PASS and by_operator["record"]["token_budget"]["source"] == "operator"
+                and all('"default_token_budget": 9000' in t for p in by_operator["procs"] for t in recall_ops(p)))
+
+    arm("rebind-gate: without a cap in the help or a --token-budget-cap the gate refuses before any recall, an operator "
+        "cap is sent and recorded as such", cap_arms)
+    def existing_out_refused():
+        r = drive(out_exists=True)
+        return (r["code"] == EXIT_REFUSED and "refusing to overwrite" in r["stderr"] and r["procs"] == []
+                and r["record"] is None)
+
+    arm("rebind-gate: an output directory that already exists is refused (exit 12) before any process starts",
+        existing_out_refused)
+    arm("rebind-gate: exit statuses are distinct: pass 0, fail 10, void 11, refused 12",
+        lambda: len({EXIT_PASS, EXIT_FAIL, EXIT_VOID, EXIT_REFUSED}) == 4 and issubclass(GateRefused, GateStop)
+        and GateStop.code == EXIT_VOID and GateRefused.code == EXIT_REFUSED)
+
+
 def self_test() -> int:
     fails = []
 
@@ -1987,8 +3117,28 @@ def self_test() -> int:
     arm("calibrate-replay: the setup path reaches write_config with a visible set and raises no AttributeError",
         calibrate_setup_reaches_write_config)
     # --- bank-visible and served-state arms (end)
+    gate_self_checks(arm, with_patches)
     print("SELF-TEST " + ("PASS" if not fails else f"FAIL ({len(fails)})"))
     return 1 if fails else 0
+
+
+def add_server_args(p) -> None:
+    """The arguments every subcommand that stages a store copy and serves it takes."""
+    p.add_argument("--kkernel", default="kkernel")
+    p.add_argument("--store-main", default=None, help="the staged copy's main store file")
+    p.add_argument("--store-events", default=None, help="the staged copy's events store file")
+    p.add_argument("--staged-home", default=None,
+                   help="a directory holding home/.khive/{khive.db,khive.db.events.db} and transfer.json from a "
+                        "guarded transfer; verified and used in place instead of copied, and never removed")
+    p.add_argument("--snapshot-id", required=True, help="written into every row")
+    p.add_argument("--engines-file", required=True, help="the [[engines]] tables the store was embedded with")
+    p.add_argument("--models-dir", default=None, help="linked as the scratch home's ~/.lattice/models")
+    p.add_argument("--control-id", required=True, help="a memory that must come back for its own content")
+    p.add_argument("--ready-max-s", type=int, default=3600)
+    p.add_argument("--scratch-parent", default=None)
+    p.add_argument("--remove-scratch", action="store_true",
+                   help="remove the scratch home and its store copy at the end (kept by default)")
+    p.add_argument("--copy-wal", action="store_true", help="stage a non-empty WAL with its store (no writer active)")
 
 
 def main() -> int:
@@ -1998,26 +3148,12 @@ def main() -> int:
     cb.add_argument("bank")
     for name in ("run", "calibrate-replay"):
         p = sub.add_parser(name)
-        p.add_argument("--kkernel", default="kkernel")
+        add_server_args(p)
         p.add_argument("--bank", action="append", required=(name == "run"),
                        help="bank directory; repeat for several banks")
-        p.add_argument("--store-main", default=None, help="the staged copy's main store file")
-        p.add_argument("--store-events", default=None, help="the staged copy's events store file")
-        p.add_argument("--staged-home", default=None,
-                       help="a directory holding home/.khive/{khive.db,khive.db.events.db} and transfer.json from a "
-                            "guarded transfer; verified and used in place instead of copied, and never removed")
-        p.add_argument("--snapshot-id", required=True, help="written into every row")
-        p.add_argument("--engines-file", required=True, help="the [[engines]] tables the store was embedded with")
-        p.add_argument("--models-dir", default=None, help="linked as the scratch home's ~/.lattice/models")
         p.add_argument("--profile", action="append", required=True, help="live profile id; repeat for comparisons")
-        p.add_argument("--control-id", required=True, help="a memory that must come back for its own content")
         p.add_argument("--feedback-actors", default="", help="comma-separated actors whose feedback events replay")
         p.add_argument("--feedback-since", default="2025-01-01T00:00:00Z")
-        p.add_argument("--ready-max-s", type=int, default=3600)
-        p.add_argument("--scratch-parent", default=None)
-        p.add_argument("--remove-scratch", action="store_true",
-                       help="remove the scratch home and its store copy at the end (kept by default)")
-        p.add_argument("--copy-wal", action="store_true", help="stage a non-empty WAL with its store (no writer active)")
         if name == "run":
             p.add_argument("--arms", default=",".join(ARMS))
             p.add_argument("--bank-visible", action="append", default=None, metavar="BANK_ID=NS[,NS...]",
@@ -2035,15 +3171,31 @@ def main() -> int:
             p.add_argument("--queries-from-events", action="store_true",
                            help="compare on n distinct queries the profile served (recall_executed), not a bank")
             p.add_argument("--out", required=True, help="the calibration report (JSON)")
+    g = sub.add_parser("rebind-gate", help="decide whether one profile may serve recall again")
+    add_server_args(g)
+    g.add_argument("--profile", required=True, help="the candidate profile id")
+    g.add_argument("--own-bank", required=True, help="bank whose answers are in the reader's own namespace")
+    g.add_argument("--shared-bank", required=True, help="bank whose answers are in the shared pool (local)")
+    g.add_argument("--own-visible", required=True, metavar="NS[,NS...]",
+                   help="the namespaces the reader reads while the own-namespace bank runs")
+    g.add_argument("--shared-visible", required=True, metavar="NS[,NS...]",
+                   help="the namespaces the reader reads while the shared-pool bank runs")
+    g.add_argument("--round-gap-s", type=float, default=300.0,
+                   help="seconds between the two rounds (default 300)")
+    g.add_argument("--max-round-runs", type=int, default=6,
+                   help="runs of one round before the gate stops, void runs included (default 6)")
+    g.add_argument("--token-budget-cap", type=int, default=None,
+                   help="the recall token-budget cap, used only when the recall help in the copy states none")
+    g.add_argument("--out", required=True, help="a new directory: rebind-gate.json and rebind-gate.txt")
     sub.add_parser("self-test")
     args = ap.parse_args()
     if args.cmd == "check-bank":
         return cmd_check_bank(args)
     if args.cmd == "self-test":
         return self_test()
-    if bool(args.staged_home) == bool(args.store_main or args.store_events) or (
-            not args.staged_home and not (args.store_main and args.store_events)):
-        raise BankError("take either --staged-home, or both --store-main and --store-events")
+    if args.cmd == "rebind-gate":
+        return cmd_rebind_gate(args)
+    require_store_source(args)
     if args.cmd == "calibrate-replay":
         require_calibration_shape(args.bank, args.queries_from_events)
         require_calibration_profiles(args.profile)
