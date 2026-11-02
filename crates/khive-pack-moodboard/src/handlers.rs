@@ -1,6 +1,6 @@
 //! Moodboard verb handlers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -9,7 +9,11 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
 
-use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_fusion::{fuse, FusionStrategy};
+use khive_runtime::{
+    entity_embedding_text, BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError,
+};
+use khive_score::DeterministicScore;
 use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
@@ -21,7 +25,9 @@ use khive_types::SubstrateKind;
 
 #[cfg(test)]
 use crate::materialization::{is_stale_candidate_error, validated_cosine_score};
-use crate::materialization::{materialize_hits, merge_visible_hits};
+use crate::materialization::{
+    materialize_fused_hits, materialize_hits, merge_visible_hits, FusedEvidence, ListPosition,
+};
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
 use crate::preprocess::{prepare_raster, PreparedRaster};
 use crate::MoodboardPack;
@@ -31,6 +37,14 @@ const VISUAL_FIELD: &str = "visual.descriptor";
 const DEFAULT_TOP_K: u32 = 20;
 pub(crate) const MAX_TOP_K: u32 = 100;
 const MAX_CANDIDATE_MULTIPLIER: u32 = 4;
+/// Arguments accepted by `moodboard.search`; kept in step with its vocab entry.
+const SEARCH_FIELDS: &[&str] = &["asset_id", "top_k", "rerank", "descriptor_weight", "rrf_k"];
+const DEFAULT_DESCRIPTOR_WEIGHT: f64 = 0.5;
+const DEFAULT_RRF_K: usize = 60;
+/// Largest accepted `rrf_k`. Fused scores are fixed-point values with 32
+/// fractional bits; far beyond this the reciprocal-rank terms of neighbouring
+/// ranks round to the same value and the fused order stops reflecting rank.
+const MAX_RRF_K: u64 = 10_000;
 static INGEST_CONTENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 
 pub(crate) async fn handle_model(
@@ -122,9 +136,10 @@ pub(crate) async fn handle_search(
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    require_fields(&params, "moodboard.search", &["asset_id", "top_k"])?;
+    require_fields(&params, "moodboard.search", SEARCH_FIELDS)?;
     let asset_id = parse_asset_id(&params)?;
     let top_k = parse_top_k(&params)?;
+    let rerank = parse_rerank(&params)?;
     let core = pack.runtime().core();
     let asset = core.get_entity(token, asset_id).await?;
     validate_visual_asset(&asset)?;
@@ -142,24 +157,20 @@ pub(crate) async fn handle_search(
         &descriptor,
     )
     .await?;
-    let hits = search_materialized_hits(
+    let (hits, rerank_report) = search_by_mode(
         pack.runtime(),
         &core,
         token,
         blob_store.as_ref(),
-        asset_id,
+        &asset,
         &descriptor,
         &embedding,
         top_k,
+        rerank,
     )
     .await?;
 
-    Ok(json!({
-        "query_asset_id": asset_id.to_string(),
-        "descriptor": descriptor,
-        "experimental": true,
-        "hits": hits,
-    }))
+    Ok(search_response(asset_id, &descriptor, hits, rerank_report))
 }
 
 // Keep the one-shot vector window and materialization together so an
@@ -184,6 +195,230 @@ async fn search_materialized_hits(
     )
     .await?;
     materialize_hits(core, token, blob_store, asset_id, raw_hits, top_k).await
+}
+
+/// Outcome of a fused search before it is rendered as a response.
+struct FusedSearch {
+    /// Materialized hits in fused order.
+    hits: Vec<Value>,
+    /// Whether the caption ranking was queried; false when the query asset has
+    /// no caption.
+    descriptor_arm_ran: bool,
+    /// Length of the visual list after removing the query asset.
+    visual_candidates: usize,
+    /// Length of the caption list after removing the query asset.
+    descriptor_candidates: usize,
+}
+
+/// Run `moodboard.search` in the requested ranking mode.
+///
+/// Returns the materialized hits and, for fused mode, the `rerank` report that
+/// the response carries. The visual mode returns no report and is exactly the
+/// exact-cosine path.
+#[allow(clippy::too_many_arguments)]
+async fn search_by_mode(
+    vector_runtime: &KhiveRuntime,
+    core: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    asset: &Entity,
+    descriptor: &DescriptorIdentity,
+    embedding: &[f32],
+    top_k: u32,
+    rerank: RerankMode,
+) -> Result<(Vec<Value>, Option<Value>), RuntimeError> {
+    match rerank {
+        RerankMode::Visual => {
+            let hits = search_materialized_hits(
+                vector_runtime,
+                core,
+                token,
+                blob_store,
+                asset.id,
+                descriptor,
+                embedding,
+                top_k,
+            )
+            .await?;
+            Ok((hits, None))
+        }
+        RerankMode::Fused {
+            descriptor_weight,
+            rrf_k,
+        } => {
+            let fused = search_fused_hits(
+                vector_runtime,
+                core,
+                token,
+                blob_store,
+                asset,
+                descriptor,
+                embedding,
+                top_k,
+                descriptor_weight,
+                rrf_k,
+            )
+            .await?;
+            let report = fused_report(descriptor_weight, rrf_k, &fused);
+            Ok((fused.hits, Some(report)))
+        }
+    }
+}
+
+/// The `rerank` block of a fused response.
+fn fused_report(descriptor_weight: f64, rrf_k: usize, fused: &FusedSearch) -> Value {
+    let descriptor_arm = if fused.descriptor_arm_ran {
+        "ran"
+    } else {
+        "skipped_no_caption"
+    };
+    json!({
+        "mode": "fused",
+        "descriptor_weight": descriptor_weight,
+        "rrf_k": rrf_k,
+        "descriptor_arm": descriptor_arm,
+        "visual_candidates": fused.visual_candidates,
+        "descriptor_candidates": fused.descriptor_candidates,
+    })
+}
+
+/// Rank assets by visual cosine and by caption match, fuse the two rankings
+/// with weighted reciprocal-rank fusion, and materialize the fused prefix.
+///
+/// The visual list is the exact cosine window `search_embedding` returns for
+/// `embedding`. The caption list is the full-text ranking of
+/// `entity_embedding_text(asset)` over visual assets; it is skipped when the
+/// query asset has no caption, because the generated default name says nothing
+/// about the image. The query asset is removed from both lists before fusion,
+/// so the candidate set is the union of the remaining assets and an asset found
+/// only by its caption can be returned.
+#[allow(clippy::too_many_arguments)]
+async fn search_fused_hits(
+    vector_runtime: &KhiveRuntime,
+    core: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    asset: &Entity,
+    descriptor: &DescriptorIdentity,
+    embedding: &[f32],
+    top_k: u32,
+    descriptor_weight: f64,
+    rrf_k: usize,
+) -> Result<FusedSearch, RuntimeError> {
+    let window = candidate_limit(top_k);
+
+    let visual: Vec<(Uuid, DeterministicScore)> =
+        search_embedding(vector_runtime, token, descriptor, embedding, window)
+            .await?
+            .into_iter()
+            .filter(|hit| hit.subject_id != asset.id)
+            .map(|hit| (hit.subject_id, hit.score))
+            .collect();
+
+    let has_caption = asset
+        .description
+        .as_deref()
+        .is_some_and(|caption| !caption.trim().is_empty());
+    let captioned: Vec<(Uuid, DeterministicScore)> = if has_caption {
+        core.hybrid_search(
+            token,
+            &entity_embedding_text(asset),
+            None,
+            window,
+            Some("artifact"),
+            Some("visual_asset"),
+            &[],
+            None,
+        )
+        .await?
+        .into_iter()
+        .filter(|hit| hit.entity_id != asset.id)
+        .map(|hit| (hit.entity_id, hit.score))
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let visual_positions = first_positions(&visual)?;
+    let descriptor_positions = first_positions(&captioned)?;
+    let evidence: BTreeMap<Uuid, FusedEvidence> = visual_positions
+        .keys()
+        .chain(descriptor_positions.keys())
+        .map(|id| {
+            (
+                *id,
+                FusedEvidence {
+                    visual: visual_positions.get(id).copied(),
+                    descriptor: descriptor_positions.get(id).copied(),
+                },
+            )
+        })
+        .collect();
+    let visual_candidates = visual.len();
+    let descriptor_candidates = captioned.len();
+
+    let strategy = FusionStrategy::WeightedRrf {
+        k: rrf_k,
+        weights: vec![1.0 - descriptor_weight, descriptor_weight],
+    };
+    let fused = fuse(
+        vec![visual, captioned],
+        &strategy,
+        usize::try_from(window).unwrap_or(usize::MAX),
+    )
+    .map_err(|error| RuntimeError::Internal(format!("moodboard fused rerank failed: {error}")))?;
+
+    let hits =
+        materialize_fused_hits(core, token, blob_store, asset.id, fused, &evidence, top_k).await?;
+    Ok(FusedSearch {
+        hits,
+        descriptor_arm_ran: has_caption,
+        visual_candidates,
+        descriptor_candidates,
+    })
+}
+
+/// First position of each asset in a ranked list: the 1-based rank that
+/// reciprocal-rank fusion assigns it, and the list's own score.
+fn first_positions(
+    list: &[(Uuid, DeterministicScore)],
+) -> Result<BTreeMap<Uuid, ListPosition>, RuntimeError> {
+    let mut positions = BTreeMap::new();
+    for (index, (id, score)) in list.iter().enumerate() {
+        if positions.contains_key(id) {
+            continue;
+        }
+        let rank = u32::try_from(index + 1).map_err(|_| {
+            RuntimeError::Internal("moodboard fused rerank list exceeds u32 ranks".to_string())
+        })?;
+        positions.insert(
+            *id,
+            ListPosition {
+                rank,
+                score: *score,
+            },
+        );
+    }
+    Ok(positions)
+}
+
+/// Render a search result; fused mode adds its `rerank` block.
+fn search_response(
+    asset_id: Uuid,
+    descriptor: &DescriptorIdentity,
+    hits: Vec<Value>,
+    rerank_report: Option<Value>,
+) -> Value {
+    let mut response = json!({
+        "query_asset_id": asset_id.to_string(),
+        "descriptor": descriptor,
+        "experimental": true,
+        "hits": hits,
+    });
+    if let Some(report) = rerank_report {
+        response["rerank"] = report;
+    }
+    response
 }
 
 pub(crate) fn candidate_limit(top_k: u32) -> u32 {
@@ -322,6 +557,102 @@ fn parse_top_k(params: &Value) -> Result<u32, RuntimeError> {
         )));
     }
     Ok(value as u32)
+}
+
+/// How `moodboard.search` ranks its candidates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RerankMode {
+    /// Exact cosine neighbours from the visual vector index.
+    Visual,
+    /// Weighted reciprocal-rank fusion of the visual ranking and a ranking of
+    /// assets whose captions match the query asset.
+    Fused {
+        /// Share of the fused score given to the caption ranking, in (0, 1).
+        descriptor_weight: f64,
+        /// Reciprocal-rank damping constant, at least 1.
+        rrf_k: usize,
+    },
+}
+
+/// Parse `rerank`, `descriptor_weight` and `rrf_k`. A JSON null counts as
+/// absent, like `top_k`. The two tuning arguments are accepted only with
+/// `rerank: "fused"`.
+fn parse_rerank(params: &Value) -> Result<RerankMode, RuntimeError> {
+    let mode = match params.get("rerank") {
+        None | Some(Value::Null) => "visual",
+        Some(Value::String(mode)) => mode.as_str(),
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "moodboard.search rerank must be \"visual\" or \"fused\", got {other}"
+            )));
+        }
+    };
+    let descriptor_weight = params
+        .get("descriptor_weight")
+        .filter(|value| !value.is_null());
+    let rrf_k = params.get("rrf_k").filter(|value| !value.is_null());
+    match mode {
+        "visual" => {
+            for (name, given) in [
+                ("descriptor_weight", descriptor_weight.is_some()),
+                ("rrf_k", rrf_k.is_some()),
+            ] {
+                if given {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "moodboard.search {name} is accepted only with rerank \"fused\""
+                    )));
+                }
+            }
+            Ok(RerankMode::Visual)
+        }
+        "fused" => Ok(RerankMode::Fused {
+            descriptor_weight: match descriptor_weight {
+                Some(value) => parse_descriptor_weight(value)?,
+                None => DEFAULT_DESCRIPTOR_WEIGHT,
+            },
+            rrf_k: match rrf_k {
+                Some(value) => parse_rrf_k(value)?,
+                None => DEFAULT_RRF_K,
+            },
+        }),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "moodboard.search rerank must be \"visual\" or \"fused\", got {other:?}"
+        ))),
+    }
+}
+
+fn parse_descriptor_weight(value: &Value) -> Result<f64, RuntimeError> {
+    let weight = value.as_f64().ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "moodboard.search descriptor_weight must be a number strictly between 0 and 1"
+                .to_string(),
+        )
+    })?;
+    validate_descriptor_weight(weight)
+}
+
+/// The caption weight must be finite and strictly between 0 and 1 so that both
+/// rankings keep a positive share of the fused score.
+fn validate_descriptor_weight(weight: f64) -> Result<f64, RuntimeError> {
+    if weight.is_finite() && weight > 0.0 && weight < 1.0 {
+        Ok(weight)
+    } else {
+        Err(RuntimeError::InvalidInput(format!(
+            "moodboard.search descriptor_weight must be finite and strictly between 0 and 1, got {weight}"
+        )))
+    }
+}
+
+fn parse_rrf_k(value: &Value) -> Result<usize, RuntimeError> {
+    let k = value.as_u64().ok_or_else(|| {
+        RuntimeError::InvalidInput("moodboard.search rrf_k must be a positive integer".to_string())
+    })?;
+    if !(1..=MAX_RRF_K).contains(&k) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard.search rrf_k must be in 1..={MAX_RRF_K}, got {k}"
+        )));
+    }
+    Ok(k as usize)
 }
 
 fn require_blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
@@ -1641,3 +1972,11 @@ mod tests {
 #[cfg(test)]
 #[path = "materialization_search_tests.rs"]
 mod materialization_search_tests;
+
+#[cfg(test)]
+#[path = "fused_search_tests.rs"]
+mod fused_search_tests;
+
+#[cfg(test)]
+#[path = "fused_search_parse_tests.rs"]
+mod fused_search_parse_tests;

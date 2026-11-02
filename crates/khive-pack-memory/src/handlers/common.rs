@@ -420,9 +420,15 @@ pub(super) struct RememberParams {
     #[serde(alias = "source")]
     pub(super) source_id: Option<String>,
     pub(super) tags: Option<Vec<String>>,
+    /// Caller-supplied structured fields stored beside `memory_type` and `tags`.
+    /// Validated by `validate_properties` in the remember handler.
+    #[serde(default)]
+    pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
+    /// Exact namespace override. Without it, both memory types use the caller's actor
+    /// namespace; an anonymous caller keeps the token's namespace. Every anonymous
+    /// memory is flagged `attribution: "unresolved"`, with or without this override.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
