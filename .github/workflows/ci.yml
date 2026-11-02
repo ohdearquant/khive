@@ -1869,7 +1869,7 @@ jobs:
     # the gate would read the timeout as a cancellation while the
     # no-measurement step never ran and never reported why. This job-level
     # value only bounds setup around the step, so it stays above it.
-    timeout-minutes: 75
+    timeout-minutes: 90
     outputs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
@@ -1953,15 +1953,16 @@ jobs:
         #
         # THE BUDGET IS SET FROM A MEASUREMENT, NOT FROM A ROUND NUMBER. The
         # original completed measurement was 29m15s, with a 1.37x margin giving
-        # 40 minutes. Recent successful Compute coverage runs reached 39 minutes
-        # (#3808), and a 40-minute run was cut just after producing its coverage
-        # value. Preserve that margin against the slower successful measurement:
-        # ceil(39 x 1.37) = ceil(53.43) = 54 minutes.
+        # 40 minutes. Successful Compute coverage runs later reached 39 minutes
+        # (#3808), giving ceil(39 x 1.37) = 54 minutes. They then reached 53m18s
+        # on main, and a 54m04s run was cut 0.1 s after printing its coverage
+        # value (#6363). Preserve the same margin against that measurement:
+        # ceil(54.07 x 1.37) = ceil(74.07) = 75 minutes.
         #
         # A miss is a red required check rather than a silent skip. The step
-        # must still expire before the 75-minute job budget so the reporting and
+        # must still expire before the 90-minute job budget so the reporting and
         # failing steps below can run; the job continues to bound genuine hangs.
-        timeout-minutes: 54
+        timeout-minutes: 75
         working-directory: crates
         # Keep #705's instrumented replay-test margin local to that test.
         # A global checkout override made unrelated recall tests wait 300s
