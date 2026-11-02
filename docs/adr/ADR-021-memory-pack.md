@@ -763,8 +763,8 @@ No implementation or executed acceptance is claimed by this documentation change
 
 ## Amendment: attributed semantic writes and caller properties (2026-11-01)
 
-**Status**: Proposed 2026-11-01. Amends §4 (the `memory.remember` arguments), §5 (the recall hit shape) and §10 (the
-semantic row of the routing table). Requires acceptance before the implementing change merges.
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-01). Amends §4 (the `memory.remember` arguments), §5 (the recall hit
+shape) and §10 (the semantic row of the routing table).
 
 ### Problem
 
