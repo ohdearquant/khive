@@ -484,7 +484,10 @@ impl KhiveMcpServer {
                     BatchTask {
                         index: i,
                         tool: task_tool,
-                        future: async move {
+                        // Boxed where it is built: the batch driver keeps several copies of
+                        // its task type in one stack frame, so an unboxed op future (tens of
+                        // KiB unoptimized) multiplies into that frame on every poll of the batch.
+                        future: Box::pin(async move {
                         // ADR-103 Amendment 2: one dispatch-accounting context
                         // per op; the entry is stamped with the frozen usage
                         // snapshot after dispatch resolves.
@@ -654,7 +657,7 @@ impl KhiveMcpServer {
                         .await;
                         stamp_usage(&mut entry, &usage_ctx);
                         entry
-                        },
+                        }),
                     }
                 });
                 let results =
@@ -868,7 +871,9 @@ impl KhiveMcpServer {
                 let budget = budget.clone();
                 let presentation_per_op = presentation_per_op.clone();
                 UnitTask {
-                    future: async move {
+                    // Boxed where it is built, as the per-op batch futures above are: the
+                    // unit driver keeps several copies of its task type in one stack frame.
+                    future: Box::pin(async move {
                         let mut entries: Vec<Value> = Vec::with_capacity(leaves.len());
                         let mut content_updates: Vec<(usize, bool)> =
                             Vec::with_capacity(leaves.len());
@@ -1021,7 +1026,7 @@ impl KhiveMcpServer {
                             entries,
                             content_updates,
                         }
-                    },
+                    }),
                 }
             })
             .collect();
