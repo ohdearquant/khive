@@ -1235,33 +1235,12 @@ impl BrainPack {
                 {
                     let serving_profile_owned = serving_profile_owned.clone();
                     move |state: &mut khive_brain_core::BrainState, brain_signal| {
-                        let serving_profile = serving_profile_owned.as_str();
-
-                        if serving_profile == "balanced-recall-v1" {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
-                        } else if state.profile_states.contains_key(serving_profile) {
-                            let ps = state
-                                .profile_states
-                                .get_mut(serving_profile)
-                                .expect("key checked above");
-                            ps.apply_signal(brain_signal);
-                            let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                            let total = ps.total_events;
-                            if let Some(record) = state.profiles.get_mut(serving_profile) {
-                                record.total_events = total;
-                                record.state_snapshot = snap;
-                            }
-                        } else {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
-                        }
-
-                        let section_state = crate::ensure_section_state_seeded(
-                            &mut state.section_states,
-                            &serving_profile_owned,
+                        // The destination rule is shared with cold-load replay.
+                        crate::apply_feedback_signal(
+                            state,
+                            serving_profile_owned.as_str(),
+                            brain_signal,
                         );
-                        section_state.apply_signal(brain_signal);
                     }
                 },
             )

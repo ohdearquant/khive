@@ -14,7 +14,7 @@ use uuid::Uuid;
 ///
 /// - `relevance`: success (a result was returned)
 /// - `temporal`: success if `latency_us` ≤ 50 ms, failure otherwise
-/// - per-entity posterior: success for `target_id`
+/// - per-entity posteriors: unchanged (a recall hit is exposure, not a judgment)
 pub fn on_recall_hit(state: &mut BalancedRecallState, target_id: Uuid, latency_us: i64) {
     state.apply_signal(&BrainSignal::RecallHit {
         target_id,
@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_hit_fast_increments_relevance_temporal_and_entity_alpha() {
+    fn recall_hit_fast_increments_relevance_and_temporal_but_not_entity() {
         let mut s = fresh();
         let id = Uuid::new_v4();
         on_recall_hit(&mut s, id, 10_000); // 10 ms — fast
@@ -87,9 +87,38 @@ mod tests {
         // temporal prior Beta(1,9): alpha should become 2
         assert!((s.temporal.alpha() - 2.0).abs() < 1e-12);
         assert!((s.temporal.beta() - 9.0).abs() < 1e-12);
-        // entity posterior: alpha 1+1=2
-        let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha() - 2.0).abs() < 1e-12);
+        // A recall hit is exposure, not a judgment: no entity posterior is created.
+        assert!(s.entity_posteriors.is_empty());
+        assert!(s.entity_posteriors.get(&id).is_none());
+    }
+
+    #[test]
+    fn recall_hit_without_judgment_leaves_entity_posteriors_unchanged() {
+        let mut s = fresh();
+        let judged = Uuid::new_v4();
+        let returned = Uuid::new_v4();
+        on_explicit_feedback(&mut s, judged, "useful");
+        let (judged_alpha, judged_beta) = {
+            let ep = s.entity_posteriors.get(&judged).unwrap();
+            (ep.alpha(), ep.beta())
+        };
+        let (rel_alpha, rel_beta) = (s.relevance.alpha(), s.relevance.beta());
+        let (tmp_alpha, tmp_beta) = (s.temporal.alpha(), s.temporal.beta());
+
+        on_recall_hit(&mut s, returned, 10_000);
+        on_recall_hit(&mut s, judged, 10_000);
+
+        // The entity-blind relevance and temporal posteriors still move.
+        assert!((s.relevance.alpha() - (rel_alpha + 2.0)).abs() < 1e-12);
+        assert!((s.relevance.beta() - rel_beta).abs() < 1e-12);
+        assert!((s.temporal.alpha() - (tmp_alpha + 2.0)).abs() < 1e-12);
+        assert!((s.temporal.beta() - tmp_beta).abs() < 1e-12);
+        // No per-entity posterior moved: the returned entity has none, and the
+        // judged entity keeps exactly the evidence its judgment produced.
+        assert!(s.entity_posteriors.get(&returned).is_none());
+        let ep = s.entity_posteriors.get(&judged).unwrap();
+        assert!((ep.alpha() - judged_alpha).abs() < 1e-12);
+        assert!((ep.beta() - judged_beta).abs() < 1e-12);
     }
 
     #[test]
