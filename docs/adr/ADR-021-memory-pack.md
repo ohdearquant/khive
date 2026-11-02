@@ -929,3 +929,11 @@ three added properties and one `supersedes` edge, the old row unchanged; a `crea
 same chunk returning `deduped` for every written row and writing nothing; a re-run with one row's properties changed
 refusing that row as `dedupe-name-taken`; a deduped row whose edge was missing getting its edge; an anonymous caller
 refused; 201 rows refused; the new row recalled at once and the old row suppressed by the edge.
+
+### Follow-ups
+
+- The dedupe name is held only by a live row: the unique index on `(namespace, kind, key)` excludes deleted rows
+  (migration 028). After the holder is pruned, a re-run of its chunk writes one new live row with the same `batch_row`.
+  That is the intended direction: the fact is written again, never lost and never duplicated among live rows.
+- #6361: compare `batch_row` when the remember write replays an existing row.
+- #6359: version the `batch_row` digest before the row shape changes.
