@@ -774,7 +774,7 @@ Items 1-4: only `Feedback` and `SemanticFeedback` yield a per-entity signal (`en
 still moves relevance and temporal state, and a `NoteAccessed` moves no posterior.
 Replay (`replay_events`, `khive-pack-brain/src/persist.rs`) folds each event into the one profile the live path credited, in four arms:
 
-- feedback: no `served_by_profile_id` goes to balanced-recall; a string goes through `feedback_route` (`pack.rs`); any other value is skipped.
+- feedback: a row with no `served_by_profile_id` key (a legacy row written before stamping) goes to balanced-recall; a string goes through `feedback_route` (`pack.rs`); a null value (no profile resolved) or any other non-string value is skipped. The mixed replay fixture covers both the absent key and the null value.
 - recall hit: `dispatch_route` follows its attribution; `unattributed` hits and hits crediting an archived profile are skipped.
 - note access and every other dispatch signal: balanced-recall.
 - `feedback_unjudged` rows are skipped; `brain.section_feedback` rows update section state only.
