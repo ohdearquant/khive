@@ -154,6 +154,7 @@ mod config_id;
 use config_id::parse_config_id;
 pub use config_id::{
     config_id_extra_embedder_exclusions, config_ids_compatible, first_config_mismatch_field,
+    no_receipt_ring_fingerprint, visibility_receipt_policy_fingerprint,
 };
 
 mod wire_frames;
