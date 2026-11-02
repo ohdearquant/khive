@@ -878,11 +878,14 @@ properties, refuses a replayed create as an error, and does not go through the m
      one (the reason names the namespace found);
    - `content` empty, or any check `memory.remember` applies to content, memory_type, tags or properties fails (the
      reason carries remember's message);
-   - `salience` outside [0, 1], or above 0.4 while `properties.verified` is absent, `false` or empty; `verified` is
-     `true` or a non-empty string naming what was checked;
+   - the salience the row would be stored with (the supplied `salience`, or the memory type's default when the row
+     gives none: 0.5 for semantic, 0.3 for episodic) outside [0, 1], or above 0.4 while `properties.verified` is
+     absent, `false` or empty; `verified` is `true` or a non-empty string naming what was checked;
    - `properties.who` absent or empty on a `supersede` or `create` row;
    - `properties.source_ids` absent or empty on a `supersede` row whose old row sits in the shared namespace;
-   - a supplied `batch`, `supersedes` or `batch_row` property.
+   - a supplied `batch`, `supersedes` or `batch_row` property;
+   - credential-shaped text in the idempotency key, the content, the properties or the tags, found by the same
+     scans the write path runs (the reason names the detector and the field, never the matched text).
 6. **Result.** One entry per row, in input order: `{id, part, action, outcome, old_namespace, new_id, reason}`, with
    `outcome` one of `planned`, `written`, `deduped`, `skipped`, `listed`, `refused`, `failed`. `old_namespace` is the
    old row's namespace as read; `new_id` comes from the write itself. `failed` means the store refused a write that
@@ -913,9 +916,9 @@ properties, refuses a replayed create as an error, and does not go through the m
 
 ### Validation
 
-Tests for: dry run writing nothing and reporting the same refusals as a real run; each refusal reason above; a
-`supersede` writing one row in the caller's namespace with the three added properties and one `supersedes` edge, the
-old row unchanged; a `create` writing no edge; a re-run of the same chunk returning `deduped` for every written row and
-writing nothing; a re-run with one row's properties changed refusing that row as `dedupe-name-taken`; a deduped row
-whose edge was missing getting its edge; an anonymous caller refused; 201 rows refused; the new row recalled at once
-and the old row suppressed by the edge.
+Tests for: dry run writing nothing and reporting the same refusals as a real run; each refusal reason above, including
+a semantic row with no salience and no `verified`; a `supersede` writing one row in the caller's namespace with the
+three added properties and one `supersedes` edge, the old row unchanged; a `create` writing no edge; a re-run of the
+same chunk returning `deduped` for every written row and writing nothing; a re-run with one row's properties changed
+refusing that row as `dedupe-name-taken`; a deduped row whose edge was missing getting its edge; an anonymous caller
+refused; 201 rows refused; the new row recalled at once and the old row suppressed by the edge.
