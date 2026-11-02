@@ -309,6 +309,27 @@ async fn judgments_survive_archive_and_restart() {
         .await
         .expect("brain.feedback");
     }
+    // A judgment commits its brain event row and its snapshot at the same
+    // instant, so the replay tail after that snapshot holds no row, the
+    // judgment's own included.
+    {
+        let sql = rt.sql();
+        let (_, judged_at) = crate::persist::load_latest_snapshot(
+            sql.as_ref(),
+            "local",
+            crate::ENTITY_CACHE_CAPACITY,
+        )
+        .await
+        .expect("load the snapshot of the last judgment")
+        .expect("the namespace has a snapshot");
+        let tail = crate::persist::load_events_since(sql.as_ref(), "local", judged_at)
+            .await
+            .expect("load the rows after the last judgment's snapshot");
+        assert!(
+            tail.events.is_empty(),
+            "the last judgment's own row replays on top of its snapshot"
+        );
+    }
     for verb in ["brain.deactivate", "brain.archive"] {
         pack.dispatch(verb, json!({"profile_id": PROFILE}), &registry, &token)
             .await
