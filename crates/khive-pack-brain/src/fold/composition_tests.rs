@@ -428,6 +428,8 @@ fn entity_eviction_order_matches_legacy_and_preserves_recency() {
     let legacy = LegacyBalancedRecallFold::new(2);
     let mut actual = fold.init(&context);
     let mut expected = legacy.init(&context);
+    // Only judgments create or touch a per-entity posterior, so the entity map
+    // is driven by feedback events; a note access would leave it empty.
     for (id, order) in [
         (10, vec![10]),
         (11, vec![10, 11]),
@@ -435,7 +437,7 @@ fn entity_eviction_order_matches_legacy_and_preserves_recency() {
         (11, vec![12, 11]),
         (13, vec![11, 13]),
     ] {
-        let event = event("get", Some(id), json!({}));
+        let event = event("brain.feedback", Some(id), json!({"signal": "useful"}));
         actual = fold.reduce(actual, &event, &context);
         expected = legacy.reduce(expected, &event, &context);
         assert_balanced_equal(&actual, &expected);
