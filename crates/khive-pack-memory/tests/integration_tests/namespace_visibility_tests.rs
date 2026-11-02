@@ -2,10 +2,11 @@
 // ADR-007 Rev 4 regression tests — additive read visible-set
 // =============================================================================
 
-/// (b) Writes stamp the local namespace even when actor.id = "lambda:khive".
+/// (b) Writes stamp the local namespace even when the visible set names another namespace.
 ///
-/// A `memory.remember` dispatched with no explicit `namespace=` param must
-/// produce a note with `namespace == "local"`. Actor identity must not route
+/// The registry has no actor, so the caller is anonymous. A `memory.remember`
+/// dispatched with no explicit `namespace=` param must produce a note with
+/// `namespace == "local"`. The visible set widens reads only; it never routes
 /// storage writes.
 #[tokio::test]
 async fn adr007_rev4_writes_stamp_local() {

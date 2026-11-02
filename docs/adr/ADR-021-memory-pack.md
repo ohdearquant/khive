@@ -760,3 +760,78 @@ land, with their changes preserved. ADR-081's real-path acceptance includes phys
 event-ID equality across repeated recalls, selected-result forwarding, legacy and
 malformed inputs, namespace isolation, task/append failures and duplicate-ID refusal.
 No implementation or executed acceptance is claimed by this documentation change.
+
+## Amendment: attributed semantic writes and caller properties (2026-11-01)
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-01). Amends §4 (the `memory.remember` arguments), §5 (the recall hit
+shape) and §10 (the semantic row of the routing table).
+
+### Problem
+
+Two gaps make it impossible to tell from a memory row who wrote it and where its fact came from.
+
+1. §10 routes a semantic write that names no namespace to the token namespace, which is `local` for every caller. The
+   fields a memory row stores carry no writer other than its namespace, so a store shared by several actors
+   accumulates semantic rows whose writer is lost for good.
+2. `memory.remember` accepts `tags` but no structured metadata. A caller that needs to record provenance (who, when,
+   where, what kind of fact, which records it came from, which row it replaces) writes it into the content. That text
+   is embedded and indexed with the fact, so provenance competes with meaning in vector and lexical ranking, and none
+   of it can be read back as a field.
+
+### Decision
+
+1. **Default write namespace.** With no `namespace=` argument, both memory types write to the caller's actor namespace
+   (`token.actor().id`). The §10 table's semantic row becomes `token.actor().id`. An explicit `namespace=X` still wins
+   for both types, `local` included: shared knowledge is written to the shared pool by choice, not by default.
+2. **Anonymous callers.** An anonymous caller's actor id is `local` (`ActorRef::anonymous`), so its writes of either
+   type land in `local` as before, and they are flagged: the runtime stores `properties.attribution = "unresolved"`
+   on the row and returns `"attribution": "unresolved"` in the response. An attributed write carries no
+   `attribution` key. Refusing anonymous writes was considered and rejected as the default, because a fresh
+   single-user install with no actor configured makes every write anonymous.
+3. **`properties` on `memory.remember`.** An optional JSON object, stored in `note.properties` beside `memory_type` and
+   `tags`. Each rule below refuses with an invalid-input error that names the key and the rule; nothing is truncated.
+   - At most 32 keys. A key is 1 to 64 characters: an ASCII lowercase letter, then lowercase letters, digits or `_`.
+   - `memory_type` and `tags` (their own parameters) and `attribution` (written by the runtime) are refused as keys.
+   - A value is a string, a finite number, a boolean, or an array of strings. Null, nested objects and arrays holding
+     anything but strings are refused.
+   - The serialized object is at most 8192 bytes; the refusal reports the measured size and the limit.
+
+   Conventional keys for provenance, not enforced: `who`, `when`, `where`, `kind`, `source_ids`, `supersedes`.
+   Changing a memory's properties later uses the generic `update` verb, whose `properties` argument already
+   shallow-merges into the note.
+4. **Recall hit shape.** Every returned hit adds `namespace`, `tags` (`[]` when none) and `properties` (the stored
+   object, `{}` when none). Existing fields keep their names and meaning.
+
+### Consequences
+
+- **Read visibility.** A semantic memory written by actor A is in A's default recall view. Actor B reads it when B's
+  `visible_namespaces` lists A ([ADR-007](ADR-007-namespace.md) Rule 3b), as episodic memories are read today. A
+  deployment that relied on every actor seeing semantic rows through `local` either lists the writers in
+  `visible_namespaces` or writes shared facts with `namespace="local"`.
+- **Existing rows stay where they are.** Rows already in `local` keep their namespace; re-attributing them is a data
+  migration outside this amendment.
+- **Prune.** `memory.prune` keeps its default namespace filter, `local`; pruning an actor's semantic memories passes
+  `namespace=<actor id>`.
+- **Trust.** Properties are caller-asserted context, never verified attribution; the write namespace remains the
+  runtime's attribution.
+- **Keyed replay.** A replay under an idempotency key compares content only, as it does for tags: a replay with the
+  same content and different properties returns the stored memory unchanged with `replayed=true`.
+- **Recall budget.** `token_budget_chars` keeps counting memory content only. A hit can carry up to 8192 bytes of
+  properties that the budget does not count; the limit is the bound.
+
+### Alternatives considered
+
+| Alternative                                                            | Disposition                                                                                                                          |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Keep semantic writes in `local` and stamp a writer key into properties | Rejected: two attribution channels for one fact, and `local` stays the default home of rows nobody owns.                             |
+| Refuse anonymous memory writes                                         | Rejected as the default: it breaks a single-user install with no actor configured.                                                   |
+| Nested, free-form properties                                           | Rejected: flat scalar and string-list values are what filters and recall output need; nesting invites storing documents in metadata. |
+
+### Validation
+
+The implementing change carries, for each rule in Decision 3, a refusing test and a passing boundary test (32 keys
+pass and 33 refuse; a 64-character key passes and 65 refuses; 8192 bytes pass and 8193 refuse); a remember with
+properties read back through `get` and through a recall hit; an attributed semantic write with no namespace landing in
+the actor namespace; an explicit `namespace="local"` semantic write landing in `local`; anonymous semantic and
+episodic writes landing in `local` with `attribution: "unresolved"` in the row and the response; anonymous semantic and
+episodic writes naming `namespace="local"` flagged the same way; and an attributed write with no `attribution` key.

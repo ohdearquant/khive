@@ -370,8 +370,9 @@ mod prune_recall_visibility_tests {
         builder.register(pack);
         let registry = builder.build().expect("registry");
 
-        // memory_type=semantic writes to the token's own namespace ("local"),
-        // matching memory.prune's default namespace filter.
+        // This registry has no actor, so the caller is anonymous: a semantic write
+        // stays in the token's own namespace ("local"), which is also
+        // memory.prune's default namespace filter.
         let remember_result = registry
             .dispatch(
                 "memory.remember",
