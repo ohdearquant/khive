@@ -232,7 +232,8 @@ no profile? It takes two banks on the same staged copy, one whose answers are in
 (`--own-bank`) and one whose answers are in the shared pool, `local` (`--shared-bank`), plus the namespaces the reader
 reads while each runs (`--own-visible`, `--shared-visible`). Each question is recalled with no profile and then with the
 candidate (`profile_id`), back to back, at `top_k=50` with score breakdowns and timings, at the token budget the recall
-help in the copy gives as its cap (`--token-budget-cap` supplies it only when the help states none). Two rounds run
+help in the copy gives as its cap (`--token-budget-cap` supplies it only when the help is read and states none; a help
+that cannot be read refuses the run). Two rounds run
 `--round-gap-s` apart (default 300), each bank in a fresh `kkernel mcp` process. The store arguments are those of `run`.
 
 ```bash

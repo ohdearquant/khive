@@ -66,8 +66,9 @@ without a degraded flag.
 the reader's own namespace and one whose answers are in the shared pool (`local`), and asks each question twice,
 adjacent in time: with no profile, then with the candidate (`profile_id`). Every recall asks for 50 hits with score
 breakdowns and timings, at the token budget the recall help in the copy gives as its cap (`--token-budget-cap` supplies
-it when the help states none; with neither, the gate refuses). Two rounds run `--round-gap-s` apart, and every round
-serves each bank from a fresh `kkernel mcp` process. The pass is read in each round separately and must hold in both:
+it when the help is read and states none; with neither, or when the help cannot be read, the gate refuses). Two rounds
+run `--round-gap-s` apart, and every round serves each bank from a fresh `kkernel mcp` process. The pass is read in
+each round separately and must hold in both:
     own-namespace bank   MRR@10 with the candidate is at least MRR@10 with no profile
     shared-pool bank     MRR@10 falls by at most 0.04 (exact arithmetic, so exactly 0.04 passes) and at most one
                          question is lost: in the no-profile top ten and outside the candidate's top ten
@@ -1650,8 +1651,11 @@ def gate_preflight(br, role: str, bank: dict, cand: str, args, state: dict, proc
         try:
             help_result = br.one(op("memory.recall", help=True))
         except BankError as e:
-            help_result = None
+            # A help that could not be read states nothing either way, so the cap is unknown: the operator cap is
+            # never taken in its place.
             state["help_error"] = str(e.code)
+            raise GateRefused(f"the recall help in the copy could not be read ({e.code}), so its token-budget cap is "
+                              "unknown") from e
         cap, source = resolve_token_budget_cap(help_result, args.token_budget_cap)
         state.update(cap=cap, cap_source=source, config=gate_recall_config(cap))
 
@@ -2134,6 +2138,8 @@ def gate_self_checks(arm, with_patches) -> None:
                 if verb == "brain.profile":
                     return {"profile_id": CAND, "lifecycle": "active", "local_factor": 0.7, "total_events": 0}
                 if "help=true" in text:
+                    if isinstance(help_text, BaseException):
+                        raise help_text
                     return help_text
                 query = re.search(r'query="([^"]*)"', text).group(1)
                 pid = re.search(r'profile_id="([^"]+)"', text)
@@ -2289,6 +2295,16 @@ def gate_self_checks(arm, with_patches) -> None:
 
     arm("rebind-gate: without a cap in the help or a --token-budget-cap the gate refuses before any recall, an operator "
         "cap is sent and recorded as such", cap_arms)
+
+    def unread_help_arms():
+        runs = [drive(help_text=BankError("tool error: help unavailable"), token_budget_cap=cap) for cap in (None, 9000)]
+        return all(r["code"] == EXIT_REFUSED and "could not be read" in r["stderr"]
+                   and not any(recall_ops(p) for p in r["procs"]) and r["record"]["status"] == "stopped"
+                   and r["record"]["token_budget"]["cap"] is None
+                   and "help unavailable" in (r["record"]["token_budget"]["help_error"] or "") for r in runs)
+
+    arm("rebind-gate: a recall help that cannot be read refuses before any recall, with or without a "
+        "--token-budget-cap, and the record names the read error", unread_help_arms)
     def existing_out_refused():
         r = drive(out_exists=True)
         return (r["code"] == EXIT_REFUSED and "refusing to overwrite" in r["stderr"] and r["procs"] == []
@@ -3185,7 +3201,7 @@ def main() -> int:
     g.add_argument("--max-round-runs", type=int, default=6,
                    help="runs of one round before the gate stops, void runs included (default 6)")
     g.add_argument("--token-budget-cap", type=int, default=None,
-                   help="the recall token-budget cap, used only when the recall help in the copy states none")
+                   help="the recall token-budget cap, used only when the recall help in the copy is read and states none")
     g.add_argument("--out", required=True, help="a new directory: rebind-gate.json and rebind-gate.txt")
     sub.add_parser("self-test")
     args = ap.parse_args()
