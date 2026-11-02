@@ -338,8 +338,9 @@ async fn test_recall_hit_returns_namespace_tags_and_properties() {
     assert_eq!(hit["properties"]["tags"], hit["tags"]);
 }
 
-/// A remember without `properties` stores only `memory_type` and `tags`, and a
-/// recall hit reports exactly that object: nothing is added to the stored shape.
+/// A remember without `properties` stores only `memory_type`, `tags` and, because
+/// this caller is anonymous, the `attribution` flag; a recall hit reports exactly
+/// that object: nothing else is added to the stored shape.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn test_remember_without_properties_keeps_the_stored_shape() {
@@ -372,7 +373,11 @@ async fn test_remember_without_properties_keeps_the_stored_shape() {
 
     assert_eq!(
         hit["properties"],
-        json!({ "memory_type": "semantic", "tags": ["kitchen"] })
+        json!({
+            "attribution": "unresolved",
+            "memory_type": "semantic",
+            "tags": ["kitchen"]
+        })
     );
     assert_eq!(hit["tags"], json!(["kitchen"]));
     assert_eq!(hit["namespace"], "local");
