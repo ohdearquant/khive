@@ -199,7 +199,9 @@ the strict `memory.feedback(id=...)` contract across requests. `full_id` is
 present under the default `json` output format in any presentation mode; the `auto`
 and `table` formats omit it unless the request sets `presentation=verbose`.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
-[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
+[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. A served
+profile scores with the configured default weights, and a profile created with `local_factor`
+multiplies the `rank_score` of rows in the shared `local` namespace by that factor. Typical
 production floor: 0.3-0.7.
 
 `memory.feedback` requires the recalled record's full UUID. It rejects prefixes because feedback

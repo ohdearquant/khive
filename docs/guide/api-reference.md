@@ -1624,24 +1624,24 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 (read-model) values — `memory_type` defaults to `episodic` when unset; `salience` and
 `decay_factor` reflect the effective defaults used for ranking.
 
-| Param               | Type    | Required | Notes                                                                     |
-| ------------------- | ------- | -------- | ------------------------------------------------------------------------- |
-| `query`             | string  | yes      | Semantic recall query.                                                    |
-| `limit`             | integer | no       | Default 10.                                                               |
-| `top_k`             | integer | no       | Overrides `limit` (max 100).                                              |
-| `min_score`         | number  | no       | Composite score floor, always in [0,1]. Typical production floor 0.3–0.7. |
-| `score_floor`       | number  | no       | Alias for `min_score`.                                                    |
-| `min_salience`      | number  | no       | Salience floor.                                                           |
-| `memory_type`       | string  | no       | Filter to this type.                                                      |
-| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
-| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
-| `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
-| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
-| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
-| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
-| `tags`              | array   | no       | Filter by `properties.tags`.                                              |
-| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
-| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
+| Param               | Type    | Required | Notes                                                                   |
+| ------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `query`             | string  | yes      | Semantic recall query.                                                  |
+| `limit`             | integer | no       | Default 10.                                                             |
+| `top_k`             | integer | no       | Overrides `limit` (max 100).                                            |
+| `min_score`         | number  | no       | Floor on `rank_score`; see below. Typical production floor 0.3–0.7.     |
+| `score_floor`       | number  | no       | Alias for `min_score`.                                                  |
+| `min_salience`      | number  | no       | Salience floor.                                                         |
+| `memory_type`       | string  | no       | Filter to this type.                                                    |
+| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.              |
+| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                         |
+| `include_breakdown` | bool    | no       | Include per-component score breakdown; see below.                       |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                          |
+| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                          |
+| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                     |
+| `tags`              | array   | no       | Filter by `properties.tags`.                                            |
+| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
+| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
 
 Each result carries `namespace` (where the memory is stored), `tags` (`[]` when none) and
 `properties` (the stored object, including `memory_type` and `tags`; `{}` when none).
@@ -1658,6 +1658,19 @@ unless the request sets `presentation=verbose`.
 `keyword_only` runs only the full-text search: the query is not embedded and the
 vector index is not searched, so such a recall never reports `degraded`.
 `vector_only` runs only the vector search.
+
+`min_score` and `score_floor` filter `rank_score`, the ranking score, not `score`. `rank_score` is the weighted
+relevance, salience and temporal composite under the configured default weights, multiplied by the per-entity posterior
+term (bounded to 0.85 to 1.15) when a profile serves the request, and by the serving profile's `local_factor` for rows in
+the `local` namespace. Under a profile with a factor, `local` rows' `rank_score` is scaled by it; rows of every other
+namespace are not. `score` stays the absolute relevance in [0, 1] and is taken before the factor.
+
+With `include_breakdown=true` each hit's `breakdown` reports `weights_served` (always `"default"`: a served profile
+scores with the configured default weights), `profile_component` (a diagnostic: the hit's composite under the weights
+the serving profile's posteriors project to, divided by its composite under the default weights; it never enters
+`rank_score`), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when none applies) and
+`duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that `rank_score` equals
+`pre_entity_score * entity_term * local_factor - duplicate_penalty` in 32-bit arithmetic evaluated left to right.
 
 `include_timings=true` adds a `timings` object: `total_us`, the stage wall times
 `embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
@@ -1871,6 +1884,11 @@ Profile metadata, latest snapshot, current state summary.
 | ------------ | ------ | -------- | ------------------------------------------------------------- |
 | `profile_id` | string | yes      | Profile ID string (e.g. `"balanced-recall-v1"`) — not a UUID. |
 
+The response also carries `posterior_means`, an object `{relevance, salience, temporal}` holding the mean of each stored
+posterior (`null` when the profile has no state snapshot), and `local_factor`, the shared-pool factor set when the profile
+was created (`null` means no factor, the same as 1). A served profile scores with the configured default weights, so
+`posterior_means` is a diagnostic of what the posteriors project to, not what recall serves.
+
 ```
 request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 ```
@@ -2081,10 +2099,16 @@ Create a new brain profile with a given name and optional seed priors.
 | `description`   | string | no       | Human-readable description.                                                                                                                                              |
 | `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                      |
 | `seed_priors`   | object | no       | Section priors only: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}}}`. Recall priors cannot be seeded at creation; other top-level keys are rejected. |
+| `local_factor`  | number | no       | Finite number in [0.5, 1]; see below. Anything else is refused and no profile is created.                                                                                |
 
 ```
 request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
 ```
+
+`local_factor` is stored with the profile record and is set only here: no verb edits it, `brain.reset` keeps it, and a
+different value is a new profile. When the profile serves a `memory.recall`, the `rank_score` of every candidate in the
+`local` namespace (the shared pool) is multiplied by it and every other candidate by 1. A profile created without it
+behaves as factor 1.
 
 ### `brain.register_adapter` — Declaration
 

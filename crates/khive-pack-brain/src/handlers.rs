@@ -65,7 +65,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.config",
-        description: "Return projected config for a named pack parameter",
+        description: "Return projected config for a named pack parameter. Diagnostic only: a served recall scores with the configured default weights, not these.",
         visibility: khive_types::Visibility::Subhandler,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -231,7 +231,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profile",
-        description: "Profile metadata, latest snapshot, current state summary",
+        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1).",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -681,6 +681,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "object",
                 required: false,
                 description: "Optional section priors only: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}}. Recall priors cannot be seeded at creation; other top-level keys are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "local_factor",
+                param_type: "number",
+                required: false,
+                description: "Optional finite number in [0.5, 1]. A recall served by this profile multiplies the rank score of every shared-pool candidate (namespace `local`) by it; every other candidate is multiplied by 1. Set only here: no verb edits it and brain.reset keeps it. A value outside the range, a non-number, or an explicit null is refused and no profile is created. Omit for no factor (same as 1).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
