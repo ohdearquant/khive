@@ -778,7 +778,8 @@ Replay (`replay_events`, `khive-pack-brain/src/persist.rs`) folds each event int
 - recall hit: `dispatch_route` follows its attribution; `unattributed` hits and hits crediting an archived profile are skipped.
 - note access and every other dispatch signal: balanced-recall.
 - `feedback_unjudged` rows are skipped; `brain.section_feedback` rows update section state only.
-  Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_without_judgment_leaves_entity_posteriors_unchanged`,
-  `note_accessed_leaves_all_posteriors_unchanged`, `judgment_still_moves_entity_posterior`. Tests in
-  `khive-pack-brain/src/persist/replay_routing_tests.rs`: `replay_matches_live_routing_per_profile`, `replay_named_profile_entity_evidence_matches_own_judgments`,
-  `replay_balanced_only_fixture_matches_prior_reducer`, `replay_folded_event_counts_sum_to_log_length`.
+
+Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_without_judgment_leaves_entity_posteriors_unchanged`,
+`note_accessed_leaves_all_posteriors_unchanged`, `judgment_still_moves_entity_posterior`. Tests in
+`khive-pack-brain/src/persist/replay_routing_tests.rs`: `replay_matches_live_routing_per_profile`, `replay_named_profile_entity_evidence_matches_own_judgments`,
+`replay_balanced_only_fixture_matches_prior_reducer`, `replay_folded_event_counts_sum_to_log_length`.
