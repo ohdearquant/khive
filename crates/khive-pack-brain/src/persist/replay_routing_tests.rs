@@ -30,6 +30,9 @@ enum Live {
     Dispatch,
     /// Folded by the feedback write path into the profile that served it.
     Feedback(&'static str),
+    /// Folded by the section feedback write path into the section state of the
+    /// profile it names.
+    Section,
     /// Not folded into any profile.
     Nothing,
 }
@@ -197,7 +200,8 @@ impl Fixture {
 
     /// Explicit judgment feedback for which no serving profile was resolved.
     /// The write path stamps `served_by_profile_id: null` on such a row and
-    /// folds it into no posterior.
+    /// folds it into no posterior and no section state. The row carries section
+    /// evidence so that a section fold would show.
     fn unresolved_feedback(&mut self, target_id: Uuid) {
         let mut event = Event::new(
             NAMESPACE,
@@ -210,6 +214,7 @@ impl Fixture {
         event.payload = serde_json::json!({
             "signal": "useful",
             "served_by_profile_id": null,
+            "section_signals": { "overview": "useful" },
         });
         assert!(
             matches!(interpret(&event), BrainSignal::Feedback { .. }),
@@ -241,7 +246,7 @@ impl Fixture {
         self.push(
             event,
             Meta {
-                live: Live::Nothing,
+                live: Live::Section,
                 folded: false,
                 judgment: None,
             },
@@ -316,7 +321,8 @@ fn foldable_fixture() -> Fixture {
 }
 
 /// Fold the log into `state` through the functions the live path folds with:
-/// the dispatch hook's and the feedback write path's.
+/// the dispatch hook's, the feedback write path's and the section feedback
+/// write path's.
 fn apply_live(state: &mut BrainState, fx: &Fixture) {
     for (event, meta) in fx.events.iter().zip(&fx.meta) {
         match meta.live {
@@ -329,8 +335,33 @@ fn apply_live(state: &mut BrainState, fx: &Fixture) {
                 let signal = interpret(event);
                 crate::apply_feedback_signal(state, profile_id, &signal);
             }
+            Live::Section => {
+                let (profile_id, signals) = crate::section_feedback::decode_event(event)
+                    .expect("decode the section feedback row");
+                crate::ensure_section_state_seeded(&mut state.section_states, profile_id)
+                    .apply_section_signals(&signals);
+            }
         }
     }
+}
+
+/// Serialized section state of every profile that holds section evidence.
+/// Replay seeds an empty section entry for the profile each dispatch row names,
+/// or the default profile, while the dispatch hook seeds none; an entry with no
+/// event holds no evidence, so it is left out of the comparison.
+fn section_snapshots(state: &BrainState) -> BTreeMap<String, serde_json::Value> {
+    state
+        .section_states
+        .iter()
+        .filter(|(_, section_state)| section_state.total_events > 0)
+        .map(|(id, section_state)| {
+            (
+                id.clone(),
+                serde_json::to_value(section_state.to_snapshot())
+                    .expect("serialize section state snapshot"),
+            )
+        })
+        .collect()
 }
 
 /// Event count stored on each profile record.
@@ -442,6 +473,11 @@ fn replay_matches_live_routing_per_profile() {
         record_counts(&replayed),
         "replayed profile records differ from the live records"
     );
+    assert_eq!(
+        section_snapshots(&live),
+        section_snapshots(&replayed),
+        "replayed section states differ from the live section states"
+    );
 
     // The comparison is not vacuous: each active profile received events and
     // the archived profile received none.
@@ -449,6 +485,16 @@ fn replay_matches_live_routing_per_profile() {
     assert!(event_count(&replayed.profile_states[PROFILE_A]) > 0);
     assert!(event_count(&replayed.profile_states[PROFILE_B]) > 0);
     assert_eq!(event_count(&replayed.profile_states[ARCHIVED_PROFILE]), 0);
+    // The section comparison holds evidence too: the section feedback row moved
+    // the default profile's section state once.
+    assert_eq!(
+        section_snapshots(&replayed)
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [DEFAULT_PROFILE]
+    );
+    assert_eq!(replayed.section_states[DEFAULT_PROFILE].total_events, 1);
 }
 
 /// Judgments credited to a profile while it was active replay into that
