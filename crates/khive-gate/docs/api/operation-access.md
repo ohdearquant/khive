@@ -227,6 +227,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `knowledge.upsert_domains`        | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L50)                     |
 | `link`                            | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L809)                    |
 | `list`                            | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L244)                    |
+| `memory.apply_batch`              | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L484)                            |
 | `memory.feedback`                 | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L173)                            |
 | `memory.prune`                    | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L390)                            |
 | `memory.recall`                   | Read   | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L196)                            |

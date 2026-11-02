@@ -21,7 +21,7 @@ An always-machine-readable copy of this page is at
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 31    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
+| `memory`    | 6     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
@@ -1576,7 +1576,7 @@ for the request shape, refusal reasons, and preserved evidence.
 
 ---
 
-## `memory` pack — 5 verbs
+## `memory` pack — 6 verbs
 
 Salience- and decay-weighted memory notes. Optional; load with
 `KHIVE_PACKS=kg,memory`.
@@ -1710,6 +1710,24 @@ Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows. No params.
 
 ```
 request(ops="memory.vacuum()")
+```
+
+### `memory.apply_batch` — Commissive
+
+Apply a chunk of memory rewrites under one batch name (ADR-021). Each row supersedes an existing memory with a new
+one and a `supersedes` edge, creates a memory, skips a row, or lists it as a deletion candidate. Every row is checked
+before anything is written; a refused row carries a reason and never stops the others. Writes go through the
+`memory.remember` path in the caller's own namespace, keyed `<batch>:<old id>:<part>` (or `<batch>:create:<part>`),
+so re-running a chunk writes only what is missing. An anonymous caller is refused.
+
+| Param     | Type   | Required | Notes                                                                                                                                                                                                                                   |
+| --------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `batch`   | string | yes      | At most 128 characters; stored on every written row as `properties.batch`.                                                                                                                                                              |
+| `rows`    | array  | yes      | 1 to 200 rows `{id?, part?, action, content?, memory_type?, salience?, properties?, tags?}`; `action` is `supersede`, `create`, `skip` or `delete-candidate`, `part` defaults to 1, and salience above 0.4 needs `properties.verified`. |
+| `dry_run` | bool   | no       | Default true: checks every row and reports the plan without writing. Pass false to write.                                                                                                                                               |
+
+```
+request(ops="memory.apply_batch(batch=\"rewrite-1\", rows=[{\"action\": \"skip\", \"id\": \"<uuid>\"}])")
 ```
 
 ---
