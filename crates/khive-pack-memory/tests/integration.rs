@@ -129,6 +129,8 @@ include!("integration_tests/supersedes_bound_tests.rs");
 
 include!("integration_tests/supersedes_batch_tests.rs");
 
+include!("integration_tests/apply_batch_tests.rs");
+
 include!("integration_tests/namespace_visibility_tests.rs");
 
 include!("integration_tests/actor_namespace_recall_tests.rs");
