@@ -49,6 +49,107 @@ fn receipt_issuance_error(error: RuntimeError, memory_id: Uuid, replayed: bool) 
         .into()
 }
 
+/// Most keys a `properties` object may carry.
+const MAX_PROPERTY_KEYS: usize = 32;
+/// Longest accepted `properties` key, in characters.
+const MAX_PROPERTY_KEY_CHARS: usize = 64;
+/// Largest accepted serialized `properties` object, in bytes.
+const MAX_PROPERTIES_BYTES: usize = 8192;
+/// Keys that have their own parameter (`memory_type`, `tags`) or are written by
+/// the runtime (`attribution`), so a caller may not set them through `properties`.
+const RESERVED_PROPERTY_KEYS: [&str; 3] = ["memory_type", "tags", "attribution"];
+
+/// A key is 1-64 characters: a lowercase ASCII letter first, then lowercase
+/// ASCII letters, digits or `_`.
+fn is_valid_property_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    key.chars().count() <= MAX_PROPERTY_KEY_CHARS
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Validate a caller-supplied `properties` value and return its entries.
+///
+/// The value must be a JSON object with at most 32 keys. Each key is 1-64
+/// characters (a lowercase ASCII letter, then lowercase letters, digits or `_`)
+/// and is not reserved. Each value is a string, a finite number, a boolean or an
+/// array of strings. The serialized object is at most 8192 bytes; an object over
+/// the limit is refused, never truncated. Every refusal is an
+/// `InvalidInput` that names the offending key and the rule.
+fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, RuntimeError> {
+    let object = raw.as_object().ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "properties must be a JSON object whose values are strings, finite numbers, booleans or arrays of strings"
+                .into(),
+        )
+    })?;
+    if object.len() > MAX_PROPERTY_KEYS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "properties has {} keys; at most {} keys are allowed",
+            object.len(),
+            MAX_PROPERTY_KEYS
+        )));
+    }
+    for (key, value) in object {
+        if !is_valid_property_key(key) {
+            let mut shown: String = key.chars().take(MAX_PROPERTY_KEY_CHARS).collect();
+            if key.chars().count() > MAX_PROPERTY_KEY_CHARS {
+                shown.push_str("...");
+            }
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {:?} is invalid: a key is 1-{} characters, a lowercase ASCII letter first, then lowercase letters, digits or '_'",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &shown),
+                MAX_PROPERTY_KEY_CHARS
+            )));
+        }
+        if RESERVED_PROPERTY_KEYS.contains(&key.as_str()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {key:?} is reserved: memory_type and tags have their own parameters and attribution is written by the runtime"
+            )));
+        }
+        let refusal: Option<&str> = match value {
+            Value::String(_) | Value::Bool(_) => None,
+            Value::Number(n) => {
+                if n.as_f64().is_some_and(f64::is_finite) {
+                    None
+                } else {
+                    Some("a number must be finite")
+                }
+            }
+            Value::Array(items) => {
+                if items.iter().all(Value::is_string) {
+                    None
+                } else {
+                    Some("an array may hold strings only")
+                }
+            }
+            Value::Null => Some("null is not allowed"),
+            Value::Object(_) => Some("nested objects are not allowed"),
+        };
+        if let Some(reason) = refusal {
+            let shown_key = mask_for_redaction_surface(RedactionSurface::GateProbe, key);
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {shown_key:?} has an invalid value: {reason}; a value is a string, a finite number, a boolean or an array of strings"
+            )));
+        }
+    }
+    let size = serde_json::to_string(raw)
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!("properties could not be serialized: {e}"))
+        })?
+        .len();
+    if size > MAX_PROPERTIES_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "properties serialize to {} bytes; the limit is {} bytes",
+            size, MAX_PROPERTIES_BYTES
+        )));
+    }
+    Ok(object.clone())
+}
+
 impl MemoryPack {
     pub(crate) async fn handle_remember(
         &self,
@@ -68,7 +169,17 @@ impl MemoryPack {
         let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
         validate_memory_type(memory_type)?;
 
-        // Explicit namespace wins; otherwise episodic uses actor scope and semantic uses local.
+        let extra_properties = match p.properties.as_ref() {
+            Some(raw) => Some(validate_properties(raw)?),
+            None => None,
+        };
+
+        // Explicit namespace wins. Otherwise both memory types are written to the caller's
+        // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
+        // namespace of its own: with no namespace argument its write stays in the token's
+        // namespace. Every anonymous write is flagged `attribution: "unresolved"` instead of
+        // being refused, whether or not it names a namespace: the flag follows the caller.
+        let unresolved_attribution = token.actor().is_anonymous();
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
         let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
         {
@@ -76,7 +187,9 @@ impl MemoryPack {
                 RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
             })?;
             Some(token.with_namespace(ns))
-        } else if memory_type == "episodic" {
+        } else if unresolved_attribution {
+            None
+        } else {
             let actor_id = token.actor().id.as_str();
             let ns = Namespace::parse(actor_id).map_err(|e| {
                 RuntimeError::InvalidInput(format!(
@@ -84,8 +197,6 @@ impl MemoryPack {
                 ))
             })?;
             Some(token.with_namespace(ns))
-        } else {
-            None
         };
         let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
 
@@ -121,6 +232,15 @@ impl MemoryPack {
             if !tags.is_empty() {
                 props["tags"] = json!(tags);
             }
+        }
+        // Validated keys never collide with `memory_type`, `tags` or `attribution`.
+        if let Some(extra) = extra_properties {
+            for (key, value) in extra {
+                props[key.as_str()] = value;
+            }
+        }
+        if unresolved_attribution {
+            props["attribution"] = json!("unresolved");
         }
 
         let mut annotates: Vec<Uuid> = vec![];
@@ -280,6 +400,9 @@ impl MemoryPack {
         }
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if unresolved_attribution {
+            response["attribution"] = json!("unresolved");
         }
         if embedding_truncation.any_truncated() {
             response["warnings"] =

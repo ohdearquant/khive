@@ -161,10 +161,17 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Structured fields stored beside memory_type and tags and returned on recall hits. Keep the memory text to the fact and put who, when, where, kind and source ids here. Rules: a JSON object; at most 32 keys; each key 1-64 chars, a lowercase ASCII letter first, then lowercase letters, digits or _; the keys memory_type, tags and attribution are reserved; each value is a string, a finite number, a boolean or an array of strings (null and nested objects are refused); the serialized object is at most 8192 bytes, and an object over the limit is refused, never truncated.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Write namespace override. When absent: episodic memories land in the actor's namespace; semantic memories land in \"local\". When present, overrides both routing rules.",
+                description: "Write namespace override. When absent, both episodic and semantic memories land in the caller's actor namespace; an anonymous caller (no actor configured) writes to \"local\" and the memory is flagged with attribution \"unresolved\". When present, the explicit namespace wins, \"local\" included; an anonymous caller's memory is flagged either way.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

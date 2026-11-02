@@ -857,3 +857,218 @@ async fn actual_seal_key_failure_retains_holder_and_unknown_disposition_on_creat
         assert!(!projected.to_string().contains("ann_write_log_seq"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// `properties` validation
+// ---------------------------------------------------------------------------
+
+/// Run the validator and return the `InvalidInput` message it refused with.
+fn refusal_message(raw: &serde_json::Value) -> String {
+    match super::validate_properties(raw) {
+        Err(RuntimeError::InvalidInput(message)) => message,
+        Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        Ok(accepted) => panic!("expected a refusal, got {accepted:?}"),
+    }
+}
+
+/// A one-entry `properties` object.
+fn single_entry(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_owned(), value);
+    serde_json::Value::Object(map)
+}
+
+/// A `properties` object with `count` distinct valid keys.
+fn object_with_keys(count: usize) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for index in 0..count {
+        map.insert(format!("key_{index}"), serde_json::json!("v"));
+    }
+    serde_json::Value::Object(map)
+}
+
+#[test]
+fn properties_must_be_an_object() {
+    for raw in [
+        serde_json::json!("text"),
+        serde_json::json!(7),
+        serde_json::json!(["a"]),
+        serde_json::json!(null),
+    ] {
+        let message = refusal_message(&raw);
+        assert!(message.contains("must be a JSON object"), "{message}");
+    }
+}
+
+#[test]
+fn properties_accept_32_keys_and_refuse_33() {
+    let accepted = super::validate_properties(&object_with_keys(32)).expect("32 keys pass");
+    assert_eq!(accepted.len(), 32);
+
+    let message = refusal_message(&object_with_keys(33));
+    assert!(message.contains("33 keys"), "{message}");
+    assert!(message.contains("at most 32 keys"), "{message}");
+}
+
+#[test]
+fn properties_accept_a_64_char_key_and_refuse_65() {
+    let at_limit = format!("a{}", "b".repeat(63));
+    assert_eq!(at_limit.chars().count(), 64);
+    super::validate_properties(&single_entry(&at_limit, serde_json::json!("v")))
+        .expect("a 64-character key passes");
+
+    let over = format!("a{}", "b".repeat(64));
+    assert_eq!(over.chars().count(), 65);
+    let message = refusal_message(&single_entry(&over, serde_json::json!("v")));
+    assert!(message.contains("is invalid"), "{message}");
+    assert!(message.contains("1-64 characters"), "{message}");
+}
+
+#[test]
+fn properties_refuse_malformed_keys() {
+    for key in [
+        "",
+        "Upper",
+        "1lead",
+        "_lead",
+        "with-dash",
+        "with space",
+        "dotted.key",
+        "\u{fc}n\u{ef}",
+    ] {
+        let message = refusal_message(&single_entry(key, serde_json::json!("v")));
+        assert!(message.contains("is invalid"), "{key:?}: {message}");
+        assert!(message.contains("1-64 characters"), "{key:?}: {message}");
+    }
+}
+
+#[test]
+fn properties_accept_well_formed_keys() {
+    for key in ["a", "z9", "source_id", "a_b_c_1"] {
+        super::validate_properties(&single_entry(key, serde_json::json!("v")))
+            .unwrap_or_else(|e| panic!("{key:?} should pass: {e:?}"));
+    }
+}
+
+#[test]
+fn properties_refuse_reserved_keys() {
+    for key in ["memory_type", "tags", "attribution"] {
+        let message = refusal_message(&single_entry(key, serde_json::json!("v")));
+        assert!(message.contains(&format!("{key:?}")), "{message}");
+        assert!(message.contains("reserved"), "{message}");
+    }
+}
+
+#[test]
+fn properties_accept_strings_numbers_booleans_and_string_arrays() {
+    let raw = serde_json::json!({
+        "text": "value",
+        "count": 3,
+        "ratio": 0.5,
+        "big": u64::MAX,
+        "flag": false,
+        "refs": ["a", "b"],
+        "empty": [],
+    });
+    let accepted = super::validate_properties(&raw).expect("every allowed value shape passes");
+    assert_eq!(accepted.len(), 7);
+    assert_eq!(accepted["refs"], serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn properties_refuse_null_nested_objects_and_non_string_arrays() {
+    let cases = [
+        (serde_json::json!(null), "null is not allowed"),
+        (
+            serde_json::json!({"inner": 1}),
+            "nested objects are not allowed",
+        ),
+        (serde_json::json!([1, 2]), "an array may hold strings only"),
+        (
+            serde_json::json!(["a", 1]),
+            "an array may hold strings only",
+        ),
+        (serde_json::json!([["a"]]), "an array may hold strings only"),
+        (serde_json::json!([null]), "an array may hold strings only"),
+        // JSON cannot carry NaN or infinity: a non-finite float becomes null
+        // before it reaches the validator, so it is refused as null.
+        (serde_json::json!(f64::NAN), "null is not allowed"),
+    ];
+    for (value, rule) in cases {
+        let message = refusal_message(&single_entry("field", value.clone()));
+        assert!(message.contains("\"field\""), "{value}: {message}");
+        assert!(message.contains(rule), "{value}: {message}");
+    }
+}
+
+#[test]
+fn properties_accept_8192_bytes_and_refuse_8193() {
+    // `{"k":"<text>"}` is 8 bytes of framing plus the text.
+    let at_limit = single_entry("k", serde_json::Value::String("x".repeat(8184)));
+    assert_eq!(
+        serde_json::to_string(&at_limit).expect("serialize").len(),
+        8192
+    );
+    super::validate_properties(&at_limit).expect("8192 bytes pass");
+
+    let over = single_entry("k", serde_json::Value::String("x".repeat(8185)));
+    assert_eq!(serde_json::to_string(&over).expect("serialize").len(), 8193);
+    let message = refusal_message(&over);
+    assert!(message.contains("8193 bytes"), "{message}");
+    assert!(message.contains("8192 bytes"), "{message}");
+}
+
+/// An exact replay is judged on content alone (`keyed_memory` compares the
+/// stored content and never the stored properties or tags). A replay that
+/// carries different `properties` therefore returns the original memory and
+/// the original properties stay; this pins that behaviour, the same one a
+/// replay with different tags has.
+#[tokio::test]
+async fn remember_replay_with_different_properties_keeps_the_stored_properties() {
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let first = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "keyed memory carrying properties",
+                "memory_type": "semantic",
+                "idempotency_key": "remember-replay-properties",
+                "properties": {"source": "first"},
+            }),
+        )
+        .await
+        .expect("first remember");
+    let second = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "keyed memory carrying properties",
+                "memory_type": "semantic",
+                "idempotency_key": "remember-replay-properties",
+                "properties": {"source": "second", "extra": "ignored"},
+            }),
+        )
+        .await
+        .expect("replay with different properties is still an exact replay");
+
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["replayed"], serde_json::json!(true));
+
+    let notes = rt
+        .notes(&token)
+        .expect("note store")
+        .get_live_notes_by_key("local", "remember-replay-properties", Some("memory"))
+        .await
+        .expect("key lookup");
+    assert_eq!(notes.len(), 1);
+    let stored = notes[0].properties.as_ref().expect("stored properties");
+    assert_eq!(stored["source"], "first");
+    assert!(stored.get("extra").is_none());
+}
