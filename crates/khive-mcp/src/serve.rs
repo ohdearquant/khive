@@ -391,6 +391,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     builder.with_gate(gate);
     builder.with_default_namespace(default_namespace.as_str());
     builder.with_visible_namespaces(visible_namespaces);
+    builder.with_owned_namespaces(default_runtime.config().owned_namespaces.clone());
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
     if default_runtime.is_read_only() {

@@ -26,6 +26,7 @@ impl KhiveMcpServer {
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         builder.with_visible_namespaces(visible_namespaces);
+        builder.with_owned_namespaces(runtime.config().owned_namespaces.clone());
         builder.with_actor_id(actor_id);
         // A read-only snapshot deliberately retains no EventStore handle; the
         // registry exposes an advisory beside each successful result instead.

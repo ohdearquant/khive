@@ -516,6 +516,21 @@ impl VerbRegistry {
             .is_ok_and(|decision| decision.is_allow())
     }
 
+    /// The caller's declared owned namespaces for one dispatch: the per-request
+    /// identity's list when an identity is supplied, else the registry's baked
+    /// list. Entries that fail `Namespace::parse` are dropped, so a malformed
+    /// declaration can only shrink what the caller owns, never widen it.
+    fn owned_namespaces_for(&self, identity: Option<&RequestIdentity>) -> Vec<Namespace> {
+        match identity {
+            Some(identity) => identity
+                .owned_namespaces
+                .iter()
+                .filter_map(|namespace| Namespace::parse(namespace).ok())
+                .collect(),
+            None => self.owned_namespaces.clone(),
+        }
+    }
+
     fn mint_intercepted_read_token(
         &self,
         gate_req: &GateRequest,
@@ -551,6 +566,7 @@ impl VerbRegistry {
                 .map(str::to_owned),
         )
         .with_request_id(identity.and_then(|identity| identity.request_id))
+        .with_owned_namespaces(self.owned_namespaces_for(identity))
         .with_process_ref(match identity {
             Some(identity) => identity.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
@@ -911,6 +927,7 @@ impl VerbRegistry {
                 .map(str::to_owned),
         )
         .with_request_id(request_id)
+        .with_owned_namespaces(self.owned_namespaces_for(identity.as_ref()))
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
@@ -1370,6 +1387,11 @@ impl VerbRegistry {
             actor_id: Some(verified_actor.into_inner()),
             visible_namespaces: self
                 .visible_namespaces
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            owned_namespaces: self
+                .owned_namespaces
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),

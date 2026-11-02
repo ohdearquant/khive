@@ -483,6 +483,7 @@ mod embedder_registry_tests {
                 "initialize_embedder",
                 serde_json::json!({"namespace": tenant.as_str()}),
                 Some(RequestIdentity {
+                    owned_namespaces: Vec::new(),
                     namespace: tenant.as_str().to_string(),
                     actor_id: Some("request-actor".to_string()),
                     visible_namespaces: vec![],

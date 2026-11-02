@@ -11,6 +11,7 @@ const NS: &str = "test";
 
 fn frame() -> DaemonRequestFrame {
     DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         plan: false,
         ops: "stats()".to_string(),
         presentation: None,
