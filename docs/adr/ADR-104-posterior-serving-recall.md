@@ -766,3 +766,19 @@ Acceptance: an observation window under normal agent load shows zero newly-emitt
 `implicit_positive` events from serving-profile traffic — every event is either a
 stated judgment or a typed `feedback_unjudged` row. Historical events are untouched;
 this amendment changes what may be written, never what was written.
+
+### Implementation note (2026-11-02)
+
+Items 1-4: only `Feedback` and `SemanticFeedback` yield a per-entity signal (`entity_signal`,
+`khive-brain-core/src/brain_signal.rs`), so `apply_feedback_posteriors` is the sole per-entity writer; a `RecallHit`
+still moves relevance and temporal state, and a `NoteAccessed` moves no posterior.
+Replay (`replay_events`, `khive-pack-brain/src/persist.rs`) folds each event into the one profile the live path credited, in four arms:
+
+- feedback: no `served_by_profile_id` goes to balanced-recall; a string goes through `feedback_route` (`pack.rs`); any other value is skipped.
+- recall hit: `dispatch_route` follows its attribution; `unattributed` hits and hits crediting an archived profile are skipped.
+- note access and every other dispatch signal: balanced-recall.
+- `feedback_unjudged` rows are skipped; `brain.section_feedback` rows update section state only.
+  Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_without_judgment_leaves_entity_posteriors_unchanged`,
+  `note_accessed_leaves_all_posteriors_unchanged`, `judgment_still_moves_entity_posterior`. Tests in
+  `khive-pack-brain/src/persist/replay_routing_tests.rs`: `replay_matches_live_routing_per_profile`, `replay_named_profile_entity_evidence_matches_own_judgments`,
+  `replay_balanced_only_fixture_matches_prior_reducer`, `replay_folded_event_counts_sum_to_log_length`.

@@ -176,23 +176,39 @@ pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     }
 }
 
-/// Apply an automatic dispatch-hook signal to the profile that served it.
+/// Where a signal is folded: nowhere, the default profile, or one named profile.
+///
+/// The live dispatch hook, the live feedback write path and cold-load replay all
+/// choose the destination through [`dispatch_route`] or [`feedback_route`], so a
+/// replayed event lands in the same profile it reached when it was first served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldRoute<'a> {
+    /// The signal is not folded into any profile.
+    Skip,
+    /// The signal is folded into the `balanced-recall-v1` state.
+    Balanced,
+    /// The signal is folded into the named profile's own state.
+    Named(&'a str),
+}
+
+/// Choose the destination of an automatic (dispatch-hook) signal.
 ///
 /// Legacy/unspecified signals retain the historical default-profile behavior.
-/// Explicitly unattributed signals are dropped, because a failed profile read
-/// proves that no profile served. A named profile that is absent from the
-/// namespace state also fails closed instead of miscrediting the default.
-pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal) {
+/// Explicitly unattributed recall hits are skipped, because a failed profile
+/// read proves that no profile served. A recall hit that names an archived
+/// profile is skipped as well. Every signal that is not a recall hit goes to
+/// the default profile.
+pub(crate) fn dispatch_route<'a>(state: &BrainState, signal: &'a BrainSignal) -> FoldRoute<'a> {
     let serving_profile = match signal {
         BrainSignal::RecallHit {
             served_by_profile_id,
             serve_attribution,
             ..
         } => match serve_attribution {
-            ServeAttribution::Unattributed => return,
+            ServeAttribution::Unattributed => return FoldRoute::Skip,
             ServeAttribution::Profile => match served_by_profile_id.as_deref() {
                 Some(profile_id) => Some(profile_id),
-                None => return,
+                None => return FoldRoute::Skip,
             },
             ServeAttribution::Unspecified => None,
         },
@@ -205,18 +221,61 @@ pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal
         .get(credited_profile)
         .is_some_and(|record| record.lifecycle == ProfileLifecycle::Archived)
     {
-        return;
+        return FoldRoute::Skip;
     }
 
     match serving_profile {
-        None | Some("balanced-recall-v1") => {
+        None | Some("balanced-recall-v1") => FoldRoute::Balanced,
+        Some(profile_id) => FoldRoute::Named(profile_id),
+    }
+}
+
+/// Choose the destination of a judgment-bearing feedback signal whose resolved
+/// serving profile is `serving_profile`.
+///
+/// The default profile, and any profile that has no state in the namespace,
+/// fold into the default profile; any other profile with state folds into its
+/// own state.
+pub(crate) fn feedback_route<'a>(state: &BrainState, serving_profile: &'a str) -> FoldRoute<'a> {
+    if serving_profile == "balanced-recall-v1"
+        || !state.profile_states.contains_key(serving_profile)
+    {
+        FoldRoute::Balanced
+    } else {
+        FoldRoute::Named(serving_profile)
+    }
+}
+
+/// Refresh a named profile's record from its live state: the event counter and
+/// the stored snapshot that profile reads and persistence use.
+pub(crate) fn refresh_named_profile_record(state: &mut BrainState, profile_id: &str) {
+    let Some(profile_state) = state.profile_states.get(profile_id) else {
+        return;
+    };
+    let snapshot = serde_json::to_value(profile_state.to_snapshot()).ok();
+    let total_events = profile_state.total_events;
+    if let Some(record) = state.profiles.get_mut(profile_id) {
+        record.total_events = total_events;
+        record.state_snapshot = snapshot;
+    }
+}
+
+/// Apply an automatic dispatch-hook signal to the profile that served it.
+///
+/// The destination comes from [`dispatch_route`]. A named profile that is
+/// absent from the namespace state fails closed instead of miscrediting the
+/// default.
+pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal) {
+    match dispatch_route(state, signal) {
+        FoldRoute::Skip => {}
+        FoldRoute::Balanced => {
             state.balanced_recall.apply_signal(signal);
             state
                 .signals_applied
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             sync_balanced_recall_record(state);
         }
-        Some(profile_id) => {
+        FoldRoute::Named(profile_id) => {
             let Some(profile_state) = state.profile_states.get_mut(profile_id) else {
                 tracing::warn!(
                     profile_id,

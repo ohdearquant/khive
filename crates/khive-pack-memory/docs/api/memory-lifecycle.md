@@ -35,7 +35,7 @@ Tier one wins over tier two. Namespace is included when dispatching to the brain
 
 ## Posterior update functions
 
-`on_recall_hit` increments total events and relevance success. Latency at or below 50,000 microseconds is a temporal success; slower hits are temporal failures. The target entity posterior receives a success.
+`on_recall_hit` increments total events and relevance success. Latency at or below 50,000 microseconds is a temporal success; slower hits are temporal failures. Per-entity posteriors are not changed: a recall hit is exposure, not a judgment, so only feedback that judges a result updates an entity posterior.
 
 `on_recall_miss` increments total events and records relevance and temporal failures without creating an entity posterior.
 

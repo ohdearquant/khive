@@ -1237,24 +1237,19 @@ impl BrainPack {
                     move |state: &mut khive_brain_core::BrainState, brain_signal| {
                         let serving_profile = serving_profile_owned.as_str();
 
-                        if serving_profile == "balanced-recall-v1" {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
-                        } else if state.profile_states.contains_key(serving_profile) {
-                            let ps = state
-                                .profile_states
-                                .get_mut(serving_profile)
-                                .expect("key checked above");
-                            ps.apply_signal(brain_signal);
-                            let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                            let total = ps.total_events;
-                            if let Some(record) = state.profiles.get_mut(serving_profile) {
-                                record.total_events = total;
-                                record.state_snapshot = snap;
+                        // The destination rule is shared with cold-load replay.
+                        match crate::feedback_route(state, serving_profile) {
+                            crate::FoldRoute::Named(profile_id) => {
+                                if let Some(ps) = state.profile_states.get_mut(profile_id) {
+                                    ps.apply_signal(brain_signal);
+                                }
+                                crate::refresh_named_profile_record(state, profile_id);
                             }
-                        } else {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
+                            crate::FoldRoute::Balanced => {
+                                state.balanced_recall.apply_signal(brain_signal);
+                                sync_balanced_recall_record(state);
+                            }
+                            crate::FoldRoute::Skip => {}
                         }
 
                         let section_state = crate::ensure_section_state_seeded(
