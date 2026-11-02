@@ -225,6 +225,47 @@ bank, or with `--queries-from-events` from n distinct queries the profile served
 `recall_executed` events and spread over time; those events undercount recalls made through `kkernel exec`
 (#6259).
 
+### Deciding whether a profile may serve recall again: `rebind-gate`
+
+`rebind-gate` answers one question for one candidate profile: does recall served by it hold up against recall served by
+no profile? It takes two banks on the same staged copy, one whose answers are in the reader's own namespace
+(`--own-bank`) and one whose answers are in the shared pool, `local` (`--shared-bank`), plus the namespaces the reader
+reads while each runs (`--own-visible`, `--shared-visible`). Each question is recalled with no profile and then with the
+candidate (`profile_id`), back to back, at `top_k=50` with score breakdowns and timings, at the token budget the recall
+help in the copy gives as its cap (`--token-budget-cap` supplies it only when the help is read and states none; a help
+that cannot be read refuses the run). Two rounds run
+`--round-gap-s` apart (default 300), each bank in a fresh `kkernel mcp` process. The store arguments are those of `run`.
+
+```bash
+uv run python bank.py rebind-gate --profile profile-x \
+  --own-bank banks/own/v1 --own-visible team-a,local \
+  --shared-bank banks/shared/v1 --shared-visible team-a,local \
+  --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models \
+  --control-id <memory uuid> --out runs/<name>
+```
+
+The pass is read in each round on its own and must hold in both. On the own-namespace bank, MRR@10 with the candidate
+must be at least MRR@10 with no profile. On the shared-pool bank, MRR@10 may fall by at most 0.04 (exact arithmetic, so
+exactly 0.04 passes) and at most one question may be lost, meaning it is in the no-profile top ten and outside the
+candidate's top ten.
+
+The gate does not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line),
+when a recall binding resolves for the caller, or when the two arms' caller, primary namespace or readable namespaces
+differ: in each case the no-profile arm would not be the arm its name says. A hit whose attribution is not its arm's
+(`serve_attribution` of `unspecified` with no `served_by_profile_id` for no profile; `profile` and the candidate's id for
+the candidate) stops the run with exit 11. A degraded recall, or a no-profile recall with no hits, voids its round, which
+runs again in fresh processes; a question that voids three runs in a row stops the gate with exit 11 and is named. A
+candidate recall with no hits is a miss. Exit status: 0 pass, 10 fail, 11 the run cannot be read, 12 a required condition
+does not hold.
+
+`<out>/rebind-gate.json` and `<out>/rebind-gate.txt` hold the verdict and, beside it, per arm and round: MRR@10 and
+hit@10 (and their mean over the two rounds), the lost and gained questions split by whether the answer was absent from
+the 50 hits or at ranks 11 to 50, the questions whose recall widened, recalls with fewer than 50 hits, degraded recalls
+per round, the questions whose top ten differs between the rounds, the top-10 hits whose `pre_entity_score` is 1.0 (not
+available when a weighted reranker is configured, with that setting recorded), and whether the candidate's entity term is
+1 for every hit.
+
 ## Determinism
 
 `generate_corpus.py` and `evaluate.py` never read the wall clock or an

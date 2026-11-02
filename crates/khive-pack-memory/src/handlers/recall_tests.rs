@@ -2279,7 +2279,8 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     assert_eq!(hits[0]["serve_attribution"], json!("unspecified"));
 }
 
-// The actor-resolved profile must both project weights and stamp the response.
+// The actor-resolved profile must stamp the response and supply the posterior state
+// behind the diagnostic `profile_component`.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
@@ -2989,11 +2990,19 @@ fn adr104_position(hits: &[Value], id: Uuid) -> usize {
         .unwrap_or_else(|| panic!("id {target} not present in recall hits: {hits:?}"))
 }
 
-/// Different profile state must flip ordering for the same corpus and query.
+/// Reads a JSON number that was serialized from an `f32` back as that `f32`.
+fn breakdown_f32(v: &Value) -> f32 {
+    v.as_f64()
+        .unwrap_or_else(|| panic!("expected a JSON number, got {v:?}")) as f32
+}
+
+/// A served profile scores with the configured default weights: even when its posterior
+/// projects to weights that would reverse the order, the order and the scores of hits
+/// without an entity posterior match an unprofiled recall.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
-async fn adr104_profile_differentiated_ranking_flips_order() {
+async fn adr104_served_profile_scores_with_default_weights_and_keeps_default_order() {
     let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
 
     registry
@@ -3014,6 +3023,7 @@ async fn adr104_profile_differentiated_ranking_flips_order() {
         "query": ADR104_QUERY,
         "fusion_strategy": "vector_only",
         "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
         "limit": 10,
     });
 
@@ -3036,10 +3046,764 @@ async fn adr104_profile_differentiated_ranking_flips_order() {
         "at configured-default weights H's relevance edge must win: {default_hits:?}"
     );
     assert!(
-        adr104_position(skewed_hits, l_id) < adr104_position(skewed_hits, h_id),
-        "under the salience-skewed profile L must overtake H — if this still \
-             matches the default ordering, the serve-time projection call is not \
-             wired into scoring: {skewed_hits:?}"
+        adr104_position(skewed_hits, h_id) < adr104_position(skewed_hits, l_id),
+        "a served profile must score with the default weights, so H keeps its lead \
+             even though the salience-skewed posterior projects weights that favour L: \
+             {skewed_hits:?}"
+    );
+
+    let l_default = &default_hits[adr104_position(default_hits, l_id)];
+    let l_skewed = &skewed_hits[adr104_position(skewed_hits, l_id)];
+    assert_eq!(
+        breakdown_f32(&l_skewed["rank_score"]),
+        breakdown_f32(&l_default["rank_score"]),
+        "L has no entity posterior and no factor applies, so its rank_score under a \
+             served profile must equal its rank_score without one"
+    );
+
+    let h_skewed = &skewed_hits[adr104_position(skewed_hits, h_id)];
+    assert_eq!(
+        h_skewed["breakdown"]["weights_served"].as_str(),
+        Some("default"),
+        "the breakdown must say the default weights were served"
+    );
+
+    let profile = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({ "profile_id": "adr104-skew-recall-v1" }),
+        )
+        .await
+        .expect("brain.profile");
+    let salience_mean = profile["posterior_means"]["salience"]
+        .as_f64()
+        .expect("brain.profile reports posterior_means.salience");
+    assert!(
+        salience_mean > 0.5,
+        "30 useful signals raise the salience posterior well above its prior mean of 0.2: \
+             {salience_mean}"
+    );
+    for key in ["relevance", "temporal"] {
+        assert!(
+            profile["posterior_means"][key].is_number(),
+            "posterior_means.{key} must be reported: {profile:?}"
+        );
+    }
+    let profile_component = h_skewed["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present under include_breakdown");
+    assert!(
+        (profile_component - 1.0).abs() > 1e-6,
+        "profile_component stays a diagnostic of the projected weights: {profile_component}"
+    );
+}
+
+/// Creates a recall profile in `ns`, carrying `local_factor` when one is given.
+async fn adr104_create_factor_profile(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    name: &str,
+    local_factor: Option<f64>,
+) {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "name": name,
+        "consumer_kind": "recall",
+    });
+    if let Some(factor) = local_factor {
+        params["local_factor"] = serde_json::json!(factor);
+    }
+    registry
+        .dispatch("brain.create_profile", params)
+        .await
+        .expect("create profile");
+}
+
+/// Recalls the ranking-corpus query with breakdowns, optionally served by `profile_id`.
+async fn adr104_recall_hits(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    profile_id: Option<&str>,
+    min_score: Option<f64>,
+) -> Vec<Value> {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
+        "limit": 10,
+    });
+    if let Some(profile_id) = profile_id {
+        params["profile_id"] = serde_json::json!(profile_id);
+    }
+    if let Some(min_score) = min_score {
+        params["min_score"] = serde_json::json!(min_score);
+    }
+    registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall")
+        .as_array()
+        .expect("bare array result")
+        .clone()
+}
+
+/// Asserts `rank_score == pre_entity_score * entity_term * local_factor - duplicate_penalty`
+/// in f32, using the values the breakdown reports.
+fn adr104_assert_rank_identity(hit: &Value) {
+    let b = &hit["breakdown"];
+    let expected = breakdown_f32(&b["pre_entity_score"])
+        * breakdown_f32(&b["entity_term"])
+        * breakdown_f32(&b["local_factor"])
+        - breakdown_f32(&b["duplicate_penalty"]);
+    assert_eq!(
+        breakdown_f32(&hit["rank_score"]),
+        expected,
+        "rank_score must follow the breakdown identity: {hit:?}"
+    );
+}
+
+/// Under a profile with `local_factor`, every `local` row's rank score is scaled by the factor
+/// while its returned `score` is unchanged, and the breakdown reports the values used.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_scales_local_rows_and_leaves_the_returned_score() {
+    let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-half-v1", Some(0.5)).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let served = adr104_recall_hits(&registry, &ns, Some("adr104-factor-half-v1"), None).await;
+    assert_eq!(
+        plain.len(),
+        served.len(),
+        "the factor must not change which rows return"
+    );
+
+    for id in [h_id, l_id] {
+        let before = &plain[adr104_position(&plain, id)];
+        let after = &served[adr104_position(&served, id)];
+        assert_eq!(after["breakdown"]["namespace"].as_str(), Some("local"));
+        assert_eq!(breakdown_f32(&after["breakdown"]["local_factor"]), 0.5_f32);
+        assert_eq!(breakdown_f32(&before["breakdown"]["local_factor"]), 1.0_f32);
+        assert_eq!(
+            breakdown_f32(&after["rank_score"]),
+            breakdown_f32(&before["rank_score"]) * 0.5_f32,
+            "a local row's rank_score under the profile is its unscaled value times the factor"
+        );
+        assert!(
+            before["score"].is_number(),
+            "a vector hit returns a score: {before:?}"
+        );
+        assert_eq!(
+            after["score"], before["score"],
+            "the returned score is taken before the factor"
+        );
+        adr104_assert_rank_identity(before);
+        adr104_assert_rank_identity(after);
+    }
+}
+
+/// A profile without `local_factor` returns the same rows, order and scores as no profile.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_profile_without_local_factor_matches_recall_without_a_profile() {
+    let (_rt, registry, ns, _h_id, _l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-none-v1", None).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let served = adr104_recall_hits(&registry, &ns, Some("adr104-factor-none-v1"), None).await;
+
+    let ids = |hits: &[Value]| -> Vec<Option<String>> {
+        hits.iter()
+            .map(|h| h["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(ids(&plain), ids(&served));
+    for (before, after) in plain.iter().zip(served.iter()) {
+        assert_eq!(
+            breakdown_f32(&after["rank_score"]),
+            breakdown_f32(&before["rank_score"])
+        );
+        assert_eq!(after["score"], before["score"]);
+        assert_eq!(breakdown_f32(&after["breakdown"]["local_factor"]), 1.0_f32);
+    }
+}
+
+/// `min_score` is applied to the factor-adjusted rank score: a floor between a row's scaled and
+/// unscaled score keeps it without a factor and drops it under the factor.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_min_score_applies_to_the_factor_adjusted_rank_score() {
+    let (_rt, registry, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-floor-v1", Some(0.5)).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let h_plain = breakdown_f32(&plain[adr104_position(&plain, h_id)]["rank_score"]);
+    assert!(h_plain > 0.0, "H needs a positive rank_score for this test");
+    let floor = f64::from(h_plain) * 0.75;
+
+    let contains = |hits: &[Value], id: Uuid| {
+        let target = id.to_string();
+        hits.iter()
+            .any(|h| h["id"].as_str() == Some(target.as_str()))
+    };
+    let unscaled = adr104_recall_hits(&registry, &ns, None, Some(floor)).await;
+    assert!(
+        contains(&unscaled, h_id),
+        "without a factor H clears the floor: {unscaled:?}"
+    );
+    let scaled =
+        adr104_recall_hits(&registry, &ns, Some("adr104-factor-floor-v1"), Some(floor)).await;
+    assert!(
+        !contains(&scaled, h_id),
+        "the floor applies to the factor-adjusted score, which is below it: {scaled:?}"
+    );
+}
+
+/// A namespace the readers below hold besides the shared pool (`local`).
+const LF_OWN_NS: &str = "lf-own";
+
+/// A recall registry whose read set is the shared pool plus [`LF_OWN_NS`].
+fn lf_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
+    use khive_pack_brain::BrainPack;
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.with_visible_namespaces(vec![Namespace::parse(LF_OWN_NS).expect("own namespace")]);
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.build().expect("registry")
+}
+
+/// Stores a memory note in `namespace` and returns its id.
+async fn lf_note(
+    rt: &TestRuntime,
+    namespace: &str,
+    content: &str,
+    salience: f64,
+    properties: Option<Value>,
+) -> Uuid {
+    let token = rt
+        .authorize(Namespace::parse(namespace).expect("namespace"))
+        .expect("authorize");
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        content,
+        Some(salience),
+        properties,
+        vec![],
+    )
+    .await
+    .expect("create note")
+    .id
+}
+
+/// Recalls `query` with breakdowns, optionally served by `profile_id`; `extra` is an object of
+/// further request parameters.
+async fn lf_recall(
+    registry: &khive_runtime::VerbRegistry,
+    query: &str,
+    profile_id: Option<&str>,
+    extra: Value,
+) -> Vec<Value> {
+    let mut params = serde_json::json!({
+        "query": query,
+        "include_breakdown": true,
+        "limit": 10,
+    });
+    if let Some(profile_id) = profile_id {
+        params["profile_id"] = serde_json::json!(profile_id);
+    }
+    for (key, value) in extra.as_object().expect("extra params object") {
+        params[key] = value.clone();
+    }
+    registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall")
+        .as_array()
+        .expect("bare array result")
+        .clone()
+}
+
+/// Request parameters that rank by decayed salience alone, so a note's unscaled rank score is its
+/// salience, and that compare duplicates on their first 12 characters.
+fn lf_salience_ranking() -> Value {
+    serde_json::json!({
+        "config": {
+            "reranker_weights": { "salience": 1.0 },
+            "scoring": { "mmr_prefix_len": 12 },
+        }
+    })
+}
+
+fn lf_rank(hit: &Value) -> f32 {
+    breakdown_f32(&hit["rank_score"])
+}
+
+fn lf_field(hit: &Value, field: &str) -> f32 {
+    breakdown_f32(&hit["breakdown"][field])
+}
+
+/// Salience decays a little between writing a note and recalling it, so values read back are
+/// compared to the nominal ones with a small tolerance.
+fn lf_assert_close(actual: f32, expected: f32, what: &str) {
+    assert!(
+        (actual - expected).abs() < 1e-4,
+        "{what}: expected about {expected}, got {actual}"
+    );
+}
+
+fn lf_has(hits: &[Value], id: Uuid) -> bool {
+    let target = id.to_string();
+    hits.iter()
+        .any(|h| h["id"].as_str() == Some(target.as_str()))
+}
+
+/// Means of a profile's three stored posteriors as `brain.profile` reports them:
+/// relevance, salience, temporal.
+async fn lf_posterior_means(registry: &khive_runtime::VerbRegistry, profile_id: &str) -> [f64; 3] {
+    let profile = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({ "profile_id": profile_id }),
+        )
+        .await
+        .expect("brain.profile");
+    ["relevance", "salience", "temporal"].map(|key| {
+        profile["posterior_means"][key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("posterior_means.{key} must be a number: {profile:?}"))
+    })
+}
+
+/// Under a profile with a factor only rows in `local` are scaled: a shared row that outranks an
+/// own-namespace row without the factor falls below it with the factor, and every breakdown names
+/// its row's namespace and the factor applied to it.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_scales_local_rows_and_no_other_namespace() {
+    let rt = build_full_rt_with_brain();
+    let shared = lf_note(&rt, "local", "lfscale probe shared pool row", 0.8, None).await;
+    let own = lf_note(&rt, LF_OWN_NS, "lfscale probe own namespace row", 0.6, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-scale-half-v1", Some(0.5)).await;
+    let ranking = serde_json::json!({ "config": { "reranker_weights": { "salience": 1.0 } } });
+
+    let plain = lf_recall(&registry, "lfscale probe", None, ranking.clone()).await;
+    assert!(
+        adr104_position(&plain, shared) < adr104_position(&plain, own),
+        "without a profile the shared row's higher salience wins: {plain:?}"
+    );
+    let plain_shared = &plain[adr104_position(&plain, shared)];
+    let plain_own = &plain[adr104_position(&plain, own)];
+    assert_eq!(plain_shared["breakdown"]["namespace"], "local");
+    assert_eq!(plain_own["breakdown"]["namespace"], LF_OWN_NS);
+    assert_eq!(lf_field(plain_shared, "local_factor"), 1.0);
+    lf_assert_close(lf_rank(plain_shared), 0.8, "unscaled shared row");
+    lf_assert_close(lf_rank(plain_own), 0.6, "unscaled own row");
+
+    let served = lf_recall(
+        &registry,
+        "lfscale probe",
+        Some("lf-scale-half-v1"),
+        ranking,
+    )
+    .await;
+    assert!(
+        adr104_position(&served, own) < adr104_position(&served, shared),
+        "the factor must put the own row ahead of the scaled shared row: {served:?}"
+    );
+    let served_shared = &served[adr104_position(&served, shared)];
+    let served_own = &served[adr104_position(&served, own)];
+    assert_eq!(served_shared["breakdown"]["namespace"], "local");
+    assert_eq!(served_own["breakdown"]["namespace"], LF_OWN_NS);
+    assert_eq!(lf_field(served_shared, "local_factor"), 0.5_f32);
+    assert_eq!(
+        lf_field(served_own, "local_factor"),
+        1.0,
+        "a row outside `local` is multiplied by 1"
+    );
+    lf_assert_close(lf_rank(served_shared), 0.4, "scaled shared row");
+    lf_assert_close(lf_rank(served_own), 0.6, "unscaled own row");
+    adr104_assert_rank_identity(served_shared);
+    adr104_assert_rank_identity(served_own);
+}
+
+/// A text-only hit has no vector similarity, so its returned `score` falls back to the rank score
+/// as it stood before the factor: the factor scales `rank_score` and leaves `score` alone.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_text_only_local_hit_keeps_its_returned_score_under_the_factor() {
+    let rt = build_full_rt_with_brain();
+    lf_note(&rt, "local", "lftext probe shared pool row", 0.4, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-text-half-v1", Some(0.5)).await;
+    let ranking = serde_json::json!({ "config": { "reranker_weights": { "salience": 1.0 } } });
+
+    let plain = lf_recall(&registry, "lftext probe", None, ranking.clone()).await;
+    let served = lf_recall(&registry, "lftext probe", Some("lf-text-half-v1"), ranking).await;
+    assert_eq!(plain.len(), 1, "{plain:?}");
+    assert_eq!(served.len(), 1, "{served:?}");
+    for hit in [&plain[0], &served[0]] {
+        assert!(
+            hit["raw_score"].is_null(),
+            "the corpus has no embedder, so the hit is text-only: {hit:?}"
+        );
+    }
+
+    let served_hit = &served[0];
+    lf_assert_close(lf_rank(served_hit), 0.2, "scaled rank score");
+    assert_eq!(
+        breakdown_f32(&served_hit["score"]),
+        lf_field(served_hit, "pre_entity_score") * lf_field(served_hit, "entity_term"),
+        "a text-only hit's score is the rank score before the factor"
+    );
+    assert_eq!(
+        breakdown_f32(&plain[0]["score"]),
+        lf_rank(&plain[0]),
+        "without a factor the two are the same number"
+    );
+    lf_assert_close(
+        breakdown_f32(&served_hit["score"]),
+        breakdown_f32(&plain[0]["score"]),
+        "score under the factor against score without a profile",
+    );
+}
+
+/// The duplicate-prefix penalty is subtracted after the factor and floors at zero. At factor 0.5 and
+/// the default penalty of 0.1, a later shared-pool copy with unscaled score 0.3 keeps 0.05 and one at
+/// 0.15 falls to zero, against 0.2 and 0.05 without the factor; a positive `min_score` then drops the
+/// zeroed copy. The breakdown identity holds with the duplicates present, with and without a weighted
+/// reranker.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_duplicate_penalty_runs_on_the_scaled_rank_score() {
+    let rt = build_full_rt_with_brain();
+    let a = lf_note(&rt, "local", "lfdup probe copy a", 0.9, None).await;
+    let b = lf_note(&rt, "local", "lfdup probe copy b", 0.3, None).await;
+    let c = lf_note(&rt, "local", "lfdup probe copy c", 0.15, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-dup-half-v1", Some(0.5)).await;
+
+    let plain = lf_recall(&registry, "lfdup probe", None, lf_salience_ranking()).await;
+    let served = lf_recall(
+        &registry,
+        "lfdup probe",
+        Some("lf-dup-half-v1"),
+        lf_salience_ranking(),
+    )
+    .await;
+    for hits in [&plain, &served] {
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        for hit in hits {
+            adr104_assert_rank_identity(hit);
+        }
+    }
+
+    let (plain_a, plain_b, plain_c) = (
+        &plain[adr104_position(&plain, a)],
+        &plain[adr104_position(&plain, b)],
+        &plain[adr104_position(&plain, c)],
+    );
+    lf_assert_close(lf_rank(plain_a), 0.9, "first copy without the factor");
+    lf_assert_close(lf_rank(plain_b), 0.2, "0.3 copy without the factor");
+    lf_assert_close(lf_rank(plain_c), 0.05, "0.15 copy without the factor");
+    assert_eq!(lf_field(plain_a, "duplicate_penalty"), 0.0);
+
+    let (served_a, served_b, served_c) = (
+        &served[adr104_position(&served, a)],
+        &served[adr104_position(&served, b)],
+        &served[adr104_position(&served, c)],
+    );
+    lf_assert_close(lf_rank(served_a), 0.45, "first copy under the factor");
+    assert_eq!(
+        lf_field(served_a, "duplicate_penalty"),
+        0.0,
+        "the highest scaled copy is the one spared"
+    );
+    lf_assert_close(lf_rank(served_b), 0.05, "0.3 copy under the factor");
+    lf_assert_close(lf_field(served_b, "duplicate_penalty"), 0.1, "full penalty");
+    assert_eq!(
+        lf_rank(served_c),
+        0.0,
+        "a copy whose scaled score is at or below the penalty falls to zero"
+    );
+    lf_assert_close(
+        lf_field(served_c, "duplicate_penalty"),
+        0.075,
+        "the penalty subtracted from a zeroed copy is its whole scaled score",
+    );
+
+    let floor = serde_json::json!({
+        "config": lf_salience_ranking()["config"].clone(),
+        "min_score": 0.01,
+    });
+    let plain_floored = lf_recall(&registry, "lfdup probe", None, floor.clone()).await;
+    let served_floored = lf_recall(&registry, "lfdup probe", Some("lf-dup-half-v1"), floor).await;
+    assert!(
+        lf_has(&plain_floored, c),
+        "without the factor the 0.15 copy keeps 0.05: {plain_floored:?}"
+    );
+    assert!(
+        lf_has(&served_floored, b) && !lf_has(&served_floored, c),
+        "under the factor a positive min_score drops only the zeroed copy: {served_floored:?}"
+    );
+
+    let default_weights = serde_json::json!({ "config": { "scoring": { "mmr_prefix_len": 12 } } });
+    let unreranked = lf_recall(
+        &registry,
+        "lfdup probe",
+        Some("lf-dup-half-v1"),
+        default_weights,
+    )
+    .await;
+    assert_eq!(unreranked.len(), 3, "{unreranked:?}");
+    for hit in &unreranked {
+        assert_eq!(lf_field(hit, "local_factor"), 0.5_f32);
+        adr104_assert_rank_identity(hit);
+    }
+    assert!(
+        unreranked
+            .iter()
+            .any(|hit| lf_field(hit, "duplicate_penalty") > 0.0),
+        "a later copy must carry the penalty it was charged: {unreranked:?}"
+    );
+}
+
+/// The copy the duplicate penalty spares is the one that ranks higher after the factor: an own copy
+/// that scores below a shared copy without the factor is spared once the factor scales the shared
+/// copy under it.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_duplicate_penalty_spares_the_own_copy_over_a_scaled_shared_copy() {
+    let rt = build_full_rt_with_brain();
+    let shared = lf_note(&rt, "local", "lfspare probe shared copy", 0.8, None).await;
+    let own = lf_note(&rt, LF_OWN_NS, "lfspare probe own copy", 0.6, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-spare-half-v1", Some(0.5)).await;
+
+    let plain = lf_recall(&registry, "lfspare probe", None, lf_salience_ranking()).await;
+    let served = lf_recall(
+        &registry,
+        "lfspare probe",
+        Some("lf-spare-half-v1"),
+        lf_salience_ranking(),
+    )
+    .await;
+    assert_eq!(plain.len(), 2, "{plain:?}");
+    assert_eq!(served.len(), 2, "{served:?}");
+
+    let plain_shared = &plain[adr104_position(&plain, shared)];
+    let plain_own = &plain[adr104_position(&plain, own)];
+    assert_eq!(
+        lf_field(plain_shared, "duplicate_penalty"),
+        0.0,
+        "without the factor the higher-scoring shared copy is spared"
+    );
+    lf_assert_close(lf_field(plain_own, "duplicate_penalty"), 0.1, "own copy");
+    lf_assert_close(lf_rank(plain_own), 0.5, "own copy without the factor");
+
+    let served_shared = &served[adr104_position(&served, shared)];
+    let served_own = &served[adr104_position(&served, own)];
+    assert_eq!(
+        lf_field(served_own, "duplicate_penalty"),
+        0.0,
+        "under the factor the own copy outranks the scaled shared copy and is spared"
+    );
+    lf_assert_close(lf_rank(served_own), 0.6, "spared own copy");
+    lf_assert_close(
+        lf_field(served_shared, "duplicate_penalty"),
+        0.1,
+        "shared copy",
+    );
+    lf_assert_close(lf_rank(served_shared), 0.3, "penalised shared copy");
+    adr104_assert_rank_identity(served_own);
+    adr104_assert_rank_identity(served_shared);
+}
+
+/// A superseded row stays suppressed through its edge when the factor scales its superseding
+/// `local` row below `min_score`. Suppression through the `supersedes` property needs the
+/// superseding row to be admitted, so that row, scaled out, no longer suppresses.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_superseded_row_stays_suppressed_by_edge_when_the_factor_drops_its_superseder() {
+    let rt = build_full_rt_with_brain();
+    let old_by_edge = lf_note(&rt, "local", "lfsup probe older by edge", 0.6, None).await;
+    let old_by_property = lf_note(&rt, "local", "lfsup probe older by property", 0.6, None).await;
+    let new_by_edge = lf_note(&rt, "local", "lfsup probe newer by edge", 0.3, None).await;
+    let new_by_property = lf_note(
+        &rt,
+        "local",
+        "lfsup probe newer by property",
+        0.3,
+        Some(serde_json::json!({ "supersedes": old_by_property.to_string() })),
+    )
+    .await;
+    let token = rt
+        .authorize(Namespace::parse("local").expect("local namespace"))
+        .expect("authorize");
+    rt.link(
+        &token,
+        new_by_edge,
+        old_by_edge,
+        khive_types::EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("supersedes edge");
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-sup-half-v1", Some(0.5)).await;
+    let params = serde_json::json!({
+        "config": { "reranker_weights": { "salience": 1.0 } },
+        "min_score": 0.2,
+    });
+
+    let plain = lf_recall(&registry, "lfsup probe", None, params.clone()).await;
+    assert!(
+        lf_has(&plain, new_by_edge) && lf_has(&plain, new_by_property),
+        "without the factor both superseding rows clear the floor: {plain:?}"
+    );
+    assert!(
+        !lf_has(&plain, old_by_edge) && !lf_has(&plain, old_by_property),
+        "so both older rows are suppressed: {plain:?}"
+    );
+
+    let served = lf_recall(&registry, "lfsup probe", Some("lf-sup-half-v1"), params).await;
+    assert!(
+        !lf_has(&served, new_by_edge) && !lf_has(&served, new_by_property),
+        "the factor scales both superseding rows below the floor: {served:?}"
+    );
+    assert!(
+        !lf_has(&served, old_by_edge),
+        "the older row is still suppressed through its incoming edge: {served:?}"
+    );
+    assert!(
+        lf_has(&served, old_by_property),
+        "a row named only by a property of a row that was not admitted is not suppressed: {served:?}"
+    );
+}
+
+/// Recalls with no judgment move a served profile's entity-blind posteriors, and the profile still
+/// scores with the default weights: the same query returns the same order, every entity term stays
+/// 1, and each rank score is unchanged, while `profile_component` shows the projection has moved.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_without_judgment_moves_the_posteriors_but_not_the_served_ranking() {
+    let (rt, _unobserved, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "brain".to_string()],
+        rt.clone(),
+        &mut builder,
+    )
+    .expect("register kg and the brain pack with its dispatch hook");
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-drift-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    let extra = serde_json::json!({
+        "namespace": ns.as_str(),
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+    });
+
+    let before = lf_recall(
+        &registry,
+        ADR104_QUERY,
+        Some("adr104-drift-v1"),
+        extra.clone(),
+    )
+    .await;
+    let means_before = lf_posterior_means(&registry, "adr104-drift-v1").await;
+    for _ in 0..8 {
+        lf_recall(
+            &registry,
+            ADR104_QUERY,
+            Some("adr104-drift-v1"),
+            extra.clone(),
+        )
+        .await;
+    }
+    let mut means_after = means_before;
+    for _ in 0..200 {
+        means_after = lf_posterior_means(&registry, "adr104-drift-v1").await;
+        if (means_after[0] - means_before[0]).abs() > 1e-6 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        means_after[0] > means_before[0] + 1e-6,
+        "recalls that return hits must move the relevance posterior: \
+         before={means_before:?} after={means_after:?}"
+    );
+
+    let after = lf_recall(&registry, ADR104_QUERY, Some("adr104-drift-v1"), extra).await;
+    let order = |hits: &[Value]| -> Vec<String> {
+        hits.iter()
+            .map(|h| h["id"].as_str().expect("id").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        order(&before),
+        order(&after),
+        "moved posteriors must not reorder a served profile's results"
+    );
+    assert!(!after.is_empty(), "the corpus must return hits");
+    for (earlier, later) in before.iter().zip(after.iter()) {
+        assert_eq!(later["breakdown"]["weights_served"], "default");
+        assert_eq!(lf_field(earlier, "entity_term"), 1.0);
+        assert_eq!(lf_field(later, "entity_term"), 1.0);
+        lf_assert_close(
+            lf_rank(later),
+            lf_rank(earlier),
+            "rank score after recalls without judgment",
+        );
+    }
+
+    let h_after = &after[adr104_position(&after, h_id)];
+    let component = h_after["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present");
+    assert!(
+        (component - 1.0).abs() > 1e-3,
+        "the projected weights have moved away from the defaults and are only reported: \
+         profile_component={component}"
     );
 }
 
@@ -3399,6 +4163,28 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
             breakdown["entity_posterior_mean"].is_null(),
             "no profile served the request => entity_posterior_mean must be absent"
         );
+        assert_eq!(breakdown["weights_served"].as_str(), Some("default"));
+        assert_eq!(breakdown["namespace"].as_str(), Some("local"));
+        assert_eq!(
+            breakdown_f32(&breakdown["local_factor"]),
+            1.0,
+            "no profile served the request => local_factor must be neutral 1"
+        );
+        assert_eq!(
+            breakdown_f32(&breakdown["duplicate_penalty"]),
+            0.0,
+            "a single hit has no duplicate to be penalised against"
+        );
+        let identity = breakdown_f32(&breakdown["pre_entity_score"])
+            * breakdown_f32(&breakdown["entity_term"])
+            * breakdown_f32(&breakdown["local_factor"])
+            - breakdown_f32(&breakdown["duplicate_penalty"]);
+        assert_eq!(
+            breakdown_f32(&hits[0]["rank_score"]),
+            identity,
+            "rank_score must equal pre_entity_score * entity_term * local_factor - \
+             duplicate_penalty in f32"
+        );
     }
 
     let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
@@ -3438,11 +4224,10 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
     let h_pos = adr104_position(hits, h_id);
     let l_pos = adr104_position(hits, l_id);
     assert!(
-        l_pos < h_pos,
-        "the component-1 salience-projection margin (matching the \
-             profile-differentiated ranking test) is wide enough that H's \
-             bounded (<=+15%) component-2 entity term does not overturn it: \
-             {hits:?}"
+        h_pos < l_pos,
+        "a served profile scores with the default weights, so H's relevance edge \
+             (plus its bounded entity term) must keep it ahead of L even though the \
+             skewed posterior projects weights that favour L: {hits:?}"
     );
 
     let h_component = hits[h_pos]["breakdown"]["profile_component"]
@@ -3467,6 +4252,32 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
         "L never received feedback => entity_posterior_mean must be absent, \
              not a guessed prior mean"
     );
+
+    for hit in [&hits[h_pos], &hits[l_pos]] {
+        let breakdown = &hit["breakdown"];
+        assert_eq!(
+            breakdown["weights_served"].as_str(),
+            Some("default"),
+            "a served profile scores with the configured default weights: {breakdown:?}"
+        );
+        assert_eq!(breakdown["namespace"].as_str(), Some("local"));
+        assert_eq!(
+            breakdown_f32(&breakdown["local_factor"]),
+            1.0,
+            "a profile without a factor leaves local rows unscaled"
+        );
+        assert_eq!(breakdown_f32(&breakdown["duplicate_penalty"]), 0.0);
+        let identity = breakdown_f32(&breakdown["pre_entity_score"])
+            * breakdown_f32(&breakdown["entity_term"])
+            * breakdown_f32(&breakdown["local_factor"])
+            - breakdown_f32(&breakdown["duplicate_penalty"]);
+        assert_eq!(
+            breakdown_f32(&hit["rank_score"]),
+            identity,
+            "rank_score must equal pre_entity_score * entity_term * local_factor - \
+             duplicate_penalty in f32: {hit:?}"
+        );
+    }
 }
 
 /// Identical store, query, and profile state must yield identical ranks and scores.
@@ -3826,11 +4637,25 @@ async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end
         "expected a near-saturated mean, got {ent_mean}"
     );
 
-    // Divide out the global component to assert the entity clamp in isolation.
+    // A served profile scores with the default weights, so the whole ratio to the unprofiled
+    // score is the entity term; the projected weights only show up in `profile_component`.
     let profile_component = hits[0]["breakdown"]["profile_component"]
         .as_f64()
         .expect("profile_component present");
-    let implied_entity_term = (saturated_score / baseline_score) / profile_component;
+    assert!(
+        (profile_component - 1.0).abs() > 1e-6,
+        "200 useful signals move the projected weights, which are reported but not served: \
+             profile_component={profile_component}"
+    );
+    let implied_entity_term = saturated_score / baseline_score;
+    let reported_entity_term = hits[0]["breakdown"]["entity_term"]
+        .as_f64()
+        .expect("entity_term present");
+    assert!(
+        (implied_entity_term - reported_entity_term).abs() < 1e-4,
+        "rank_score must differ from the unprofiled score by exactly the entity term: \
+             implied={implied_entity_term} reported={reported_entity_term}"
+    );
     assert!(
         implied_entity_term <= crate::scoring::ENTITY_POSTERIOR_CLAMP_MAX as f64 + 1e-6,
         "entity term must never exceed the +15% clamp bound: implied={implied_entity_term}"

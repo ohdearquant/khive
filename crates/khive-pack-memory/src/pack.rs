@@ -231,14 +231,14 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite under the configured default weights — nominally [0,1] — further adjusted whenever a brain profile serves the request: a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15), and, when the serving profile carries a `local_factor` (a number in [0.5, 1]), a multiplication of `local` rows' rank_score by that factor; rows of every other namespace are not scaled. So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%, and under a profile with a factor a `local` row's rank_score is scaled down. Typical production floor: 0.3–0.7.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
+                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request, and for the scaling of `local` rows' rank_score under a profile with a `local_factor`. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -312,7 +312,7 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 name: "include_breakdown",
                 param_type: "boolean",
                 required: false,
-                description: "Include per-component score breakdowns in results.",
+                description: "Include per-component score breakdowns in results. Each breakdown reports `weights_served` (always \"default\": a served profile scores with the configured default weights), `profile_component` (diagnostic only: the hit's composite under the weights the serving profile's posteriors project to, divided by its composite under the default weights; it never enters rank_score), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when no factor applies) and `duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
