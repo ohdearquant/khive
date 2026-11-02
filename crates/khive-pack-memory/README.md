@@ -99,7 +99,7 @@ Rules for `properties`:
 
 A refused call returns an invalid-input error that names the offending key and the rule.
 
-Without `namespace`, both memory types are written to the caller's actor namespace. An explicit `namespace` always wins, `local` included. A caller with no actor (anonymous) writes to its own namespace, `local`, and the memory is flagged with `attribution: "unresolved"` in its properties and in the response. Attributed writes carry no `attribution` key.
+Without `namespace`, both memory types are written to the caller's actor namespace. An explicit `namespace` always wins, `local` included. A caller with no actor (anonymous) writes to its own namespace, `local`, and every memory it writes, with or without `namespace`, is flagged with `attribution: "unresolved"` in its properties and in the response. Attributed writes carry no `attribution` key.
 
 Every `memory.recall` hit carries `namespace` (where the memory is stored), `tags` (`[]` when none) and `properties` (the stored object, including `memory_type` and `tags`; `{}` when none) beside the content.
 

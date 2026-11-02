@@ -427,8 +427,8 @@ pub(super) struct RememberParams {
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
     /// Exact namespace override. Without it, both memory types use the caller's actor
-    /// namespace; an anonymous caller keeps the token's namespace and the memory is
-    /// flagged `attribution: "unresolved"`.
+    /// namespace; an anonymous caller keeps the token's namespace. Every anonymous
+    /// memory is flagged `attribution: "unresolved"`, with or without this override.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }

@@ -176,9 +176,10 @@ impl MemoryPack {
 
         // Explicit namespace wins. Otherwise both memory types are written to the caller's
         // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
-        // namespace of its own: its write stays in the token's namespace and is flagged
-        // `attribution: "unresolved"` instead of being refused.
-        let unresolved_attribution = p.namespace.is_none() && token.actor().is_anonymous();
+        // namespace of its own: with no namespace argument its write stays in the token's
+        // namespace. Every anonymous write is flagged `attribution: "unresolved"` instead of
+        // being refused, whether or not it names a namespace: the flag follows the caller.
+        let unresolved_attribution = token.actor().is_anonymous();
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
         let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
         {

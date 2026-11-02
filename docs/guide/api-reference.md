@@ -1605,8 +1605,9 @@ object that breaks a rule is refused with an invalid-input error naming the key 
 truncated.
 
 Without `namespace`, both memory types are written to the caller's actor namespace. A caller with
-no actor (anonymous) writes to `local`; that memory is flagged with `attribution: "unresolved"` in
-its properties and in the response, and attributed writes carry no `attribution` key.
+no actor (anonymous) writes to `local`; every memory it writes, with or without `namespace`, is flagged
+with `attribution: "unresolved"` in its properties and in the response, and attributed writes carry no
+`attribution` key.
 
 With `idempotency_key`, a replay whose content matches the stored memory returns the original
 memory with `replayed=true`. Different content under the same key is refused with the conflict

@@ -420,3 +420,40 @@ async fn test_remember_refuses_invalid_properties_through_dispatch() {
         "{nested}"
     );
 }
+
+/// The unresolved flag follows the caller, not the namespace argument: an anonymous caller
+/// that names a namespace is still unattributed, so its row and response carry the flag.
+#[tokio::test]
+async fn test_anonymous_remember_with_explicit_namespace_is_flagged_unresolved() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    for memory_type in ["semantic", "episodic"] {
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("anonymous {memory_type} memory naming the shared namespace"),
+                    "memory_type": memory_type,
+                    "namespace": "local",
+                }),
+            )
+            .await
+            .expect("memory.remember must succeed");
+        assert_eq!(
+            result["attribution"], "unresolved",
+            "{memory_type}: {result}"
+        );
+        let note_id = result["id"].as_str().expect("response has id").to_owned();
+
+        let got = registry
+            .dispatch("get", json!({ "id": note_id }))
+            .await
+            .expect("get by UUID must succeed");
+        assert_eq!(got["namespace"], "local", "{memory_type}: {got}");
+        assert_eq!(
+            got["properties"]["attribution"], "unresolved",
+            "{memory_type}: {got}"
+        );
+    }
+}

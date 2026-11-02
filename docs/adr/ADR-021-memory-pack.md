@@ -833,5 +833,5 @@ The implementing change carries, for each rule in Decision 3, a refusing test an
 pass and 33 refuse; a 64-character key passes and 65 refuses; 8192 bytes pass and 8193 refuse); a remember with
 properties read back through `get` and through a recall hit; an attributed semantic write with no namespace landing in
 the actor namespace; an explicit `namespace="local"` semantic write landing in `local`; anonymous semantic and
-episodic writes landing in `local` with `attribution: "unresolved"` in the row and the response; and an attributed
-write with no `attribution` key.
+episodic writes landing in `local` with `attribution: "unresolved"` in the row and the response; anonymous semantic and
+episodic writes naming `namespace="local"` flagged the same way; and an attributed write with no `attribution` key.

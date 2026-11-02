@@ -171,7 +171,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Write namespace override. When absent, both episodic and semantic memories land in the caller's actor namespace; an anonymous caller (no actor configured) writes to \"local\" and the memory is flagged with attribution \"unresolved\". When present, the explicit namespace wins, \"local\" included.",
+                description: "Write namespace override. When absent, both episodic and semantic memories land in the caller's actor namespace; an anonymous caller (no actor configured) writes to \"local\" and the memory is flagged with attribution \"unresolved\". When present, the explicit namespace wins, \"local\" included; an anonymous caller's memory is flagged either way.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
