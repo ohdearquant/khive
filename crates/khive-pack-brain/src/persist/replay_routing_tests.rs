@@ -479,6 +479,9 @@ fn replay_credits_judgments_to_a_profile_archived_after_them() {
     assert_eq!(snapshots(&live), snapshots(&replayed));
     assert_eq!(record_counts(&live), record_counts(&replayed));
     assert_eq!(event_count(&replayed.profile_states[ARCHIVED_PROFILE]), 2);
+    // The judgment fold refreshes the profile record; replay does not refresh
+    // it separately for judgments.
+    assert_eq!(replayed.profiles[ARCHIVED_PROFILE].total_events, 2);
     assert_eq!(event_count(&replayed.balanced_recall), 0);
 }
 
