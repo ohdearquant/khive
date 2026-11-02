@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  161 public verbs (see the verb-catalog paragraph below       │
+│  162 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-010, forward-deployed,  │
@@ -296,18 +296,19 @@ must name `gtd`. Adds the `task` note kind.
 | `gtd.counts`     | `assignee`, `tag?`, `limit?`                                                 | Per-status counts for one assignee; open rows of one tag, no bodies    |
 | `gtd.repair`     | `items`, `apply?`                                                            | Preview or explicitly apply observed-value task repairs with audit     |
 
-### Memory pack verbs (5 — ADR-021)
+### Memory pack verbs (6 — ADR-021)
 
 In the default pack set; a non-empty `KHIVE_PACKS` or `--pack` list replaces that set, so it
 must name `memory`. Adds the `memory` note kind.
 
-| Verb              | Args                                                                                   | What it does                                                                                   |
-| ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                      |
-| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                             |
-| `memory.feedback` | `id`, `signal`                                                                         | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
-| `memory.prune`    | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014) |
-| `memory.vacuum`   | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                |
+| Verb                 | Args                                                                                   | What it does                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `memory.remember`    | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                                                       |
+| `memory.recall`      | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                                                              |
+| `memory.feedback`    | `id`, `signal`                                                                         | Emit explicit feedback on a recalled entity; updates recall posteriors                                                          |
+| `memory.prune`       | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014)                                  |
+| `memory.vacuum`      | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                                                 |
+| `memory.apply_batch` | `batch`, `rows`, `dry_run?`                                                            | Supersede, create, skip or list up to 200 memories under one batch name; dry run by default, re-runs write only what is missing |
 
 `get`/`update`/`delete`/`merge` resolve the substrate from the UUID, so `kind` is optional there;
 `get` also accepts a note `key` in place of `id`. `create`/`list`/`search` require `kind`.
