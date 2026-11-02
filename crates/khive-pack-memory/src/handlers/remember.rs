@@ -150,6 +150,46 @@ fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, Ru
     Ok(object.clone())
 }
 
+/// The checks `memory.remember` applies to a memory's content, type and
+/// `properties`, in that order: the content is not blank, the memory type is
+/// known (`episodic` when absent) and the `properties` object passes
+/// [`validate_properties`]. Returns the resolved memory type and the validated
+/// extra properties. Callers that need to know whether a write would be accepted
+/// without performing it, such as `memory.apply_batch`, share this function with
+/// the write path.
+pub(super) fn check_remember_fields<'a>(
+    content: &str,
+    memory_type: Option<&'a str>,
+    properties: Option<&Value>,
+) -> Result<(&'a str, Option<serde_json::Map<String, Value>>), RuntimeError> {
+    if content.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "content must not be empty".into(),
+        ));
+    }
+
+    let memory_type = memory_type.unwrap_or("episodic");
+    validate_memory_type(memory_type)?;
+
+    let extra_properties = match properties {
+        Some(raw) => Some(validate_properties(raw)?),
+        None => None,
+    };
+    Ok((memory_type, extra_properties))
+}
+
+/// The namespace a caller's own writes land in: the namespace spelled by the
+/// actor id. `memory.apply_batch` uses it to look up keyed rows and to write
+/// edges where `memory.remember` writes the rows.
+pub(super) fn actor_namespace(token: &NamespaceToken) -> Result<Namespace, RuntimeError> {
+    let actor_id = token.actor().id.as_str();
+    Namespace::parse(actor_id).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "actor id {actor_id:?} is not a valid namespace: {e}"
+        ))
+    })
+}
+
 impl MemoryPack {
     pub(crate) async fn handle_remember(
         &self,
@@ -160,19 +200,8 @@ impl MemoryPack {
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
         }
-        if p.content.trim().is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "content must not be empty".into(),
-            ));
-        }
-
-        let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
-        validate_memory_type(memory_type)?;
-
-        let extra_properties = match p.properties.as_ref() {
-            Some(raw) => Some(validate_properties(raw)?),
-            None => None,
-        };
+        let (memory_type, extra_properties) =
+            check_remember_fields(&p.content, p.memory_type.as_deref(), p.properties.as_ref())?;
 
         // Explicit namespace wins. Otherwise both memory types are written to the caller's
         // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
@@ -190,13 +219,7 @@ impl MemoryPack {
         } else if unresolved_attribution {
             None
         } else {
-            let actor_id = token.actor().id.as_str();
-            let ns = Namespace::parse(actor_id).map_err(|e| {
-                RuntimeError::InvalidInput(format!(
-                    "actor id {actor_id:?} is not a valid namespace: {e}"
-                ))
-            })?;
-            Some(token.with_namespace(ns))
+            Some(token.with_namespace(actor_namespace(token)?))
         };
         let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
 

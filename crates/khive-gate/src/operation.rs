@@ -161,6 +161,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("knowledge.upsert_domains", OperationAccess::Write),
     ("link", OperationAccess::Write),
     ("list", OperationAccess::Read),
+    ("memory.apply_batch", OperationAccess::Write),
     ("memory.feedback", OperationAccess::Write),
     ("memory.prune", OperationAccess::Write),
     ("memory.recall", OperationAccess::Read),
