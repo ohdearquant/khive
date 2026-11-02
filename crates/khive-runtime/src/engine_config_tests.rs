@@ -708,7 +708,9 @@ id = "agent:alpha"
 owned_namespaces = ["project:data", "agent:legacy"]
 "#,
     );
-    let cfg = KhiveConfig::load(Some(&path)).expect("a well-formed owned_namespaces list loads");
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("a well-formed owned_namespaces list loads")
+        .expect("file should be present");
     assert_eq!(
         cfg.actor.owned_namespaces,
         vec!["project:data".to_string(), "agent:legacy".to_string()]
@@ -725,7 +727,9 @@ fn test_owned_namespaces_defaults_to_empty_when_absent() {
 id = "agent:alpha"
 "#,
     );
-    let cfg = KhiveConfig::load(Some(&path)).expect("an actor without a declaration loads");
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("an actor without a declaration loads")
+        .expect("file should be present");
     assert!(
         cfg.actor.owned_namespaces.is_empty(),
         "no declaration means no owned namespaces"
