@@ -433,6 +433,13 @@ impl KhiveMcpServer {
         self.registry.visible_namespaces()
     }
 
+    /// This server's resolved `[actor] owned_namespaces` (ADR-021 Delta 1).
+    /// Read when building the daemon request frame so the caller's declaration
+    /// travels with its identity; see [`Self::actor_id`] for why.
+    pub fn owned_namespaces(&self) -> &[khive_runtime::Namespace] {
+        self.registry.owned_namespaces()
+    }
+
     /// The connection pool to use for background WAL checkpointing, if any.
     ///
     /// Returns `None` for in-memory or registry-only servers.

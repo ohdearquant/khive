@@ -607,6 +607,7 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
     let registry = builder.build().unwrap();
     let text = delta(&[create(201, "allowed"), create(202, "denied")]);
     let identity = RequestIdentity {
+        owned_namespaces: Vec::new(),
         namespace: "local".into(),
         actor_id: Some("lambda:canonical-test".into()),
         visible_namespaces: vec![],

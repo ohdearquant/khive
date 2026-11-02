@@ -40,6 +40,13 @@ impl KhiveMcpServer {
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
+            // ADR-021 Delta 1: the caller's own owned-namespace declaration
+            // travels with its identity, omitted from the wire when empty.
+            owned_namespaces: self
+                .owned_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
             config_id: self.config_id.clone(),
             protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
             probe_only: false,
@@ -192,6 +199,9 @@ impl KhiveMcpServer {
             // A scheduled action is scoped exactly to its event namespace;
             // it never inherits the daemon's broader read visibility.
             visible_namespaces: Vec::new(),
+            // Nor does it carry an owned-namespace declaration: ownership is
+            // read from the configured caller, not from an event's namespace.
+            owned_namespaces: Vec::new(),
             request_id: None,
         };
         self.dispatch_request_inner(p, true, Some(identity), DispatchOrigin::Local)
@@ -313,6 +323,11 @@ impl KhiveMcpServer {
                     process_ref: khive_runtime::process_ref_from_env(),
                     visible_namespaces: self
                         .visible_namespaces()
+                        .iter()
+                        .map(|ns| ns.as_str().to_string())
+                        .collect(),
+                    owned_namespaces: self
+                        .owned_namespaces()
                         .iter()
                         .map(|ns| ns.as_str().to_string())
                         .collect(),

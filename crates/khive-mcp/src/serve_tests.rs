@@ -1452,6 +1452,174 @@ fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
     );
 }
 
+/// A configured actor that declares an owned namespace (ADR-021 Delta 1).
+const OWNED_NAMESPACE_ACTOR_CONFIG: &str = r#"
+[actor]
+id = "lambda:alpha"
+owned_namespaces = ["lambda:alpha-helper"]
+"#;
+
+/// `[actor] owned_namespaces` is declared for the configured actor, so an
+/// explicit `--actor` pin to a different actor must not inherit it.
+#[test]
+#[serial]
+fn explicit_actor_pin_to_another_actor_drops_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("lambda:beta").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:beta"),
+        "the explicit pin must win as the actor"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "a pin to another actor must carry none of the configured actor's \
+         owned namespaces — got {:?}",
+        resolved.owned_namespaces
+    );
+}
+
+/// An explicit `--actor local` is a pin to the anonymous identity, which
+/// carries none of the configured actor's owned namespaces either.
+#[test]
+#[serial]
+fn explicit_actor_local_pin_drops_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("local").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id, None,
+        "explicit --actor local must resolve to anonymous"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "the anonymous pin must carry none of the configured actor's owned \
+         namespaces — got {:?}",
+        resolved.owned_namespaces
+    );
+}
+
+/// A pin to the configured actor itself keeps the list: the drop applies only
+/// when the resolved actor differs from the one the list was declared for.
+#[test]
+#[serial]
+fn explicit_actor_pin_to_configured_actor_keeps_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("lambda:alpha").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:alpha"),
+        "the explicit pin resolves to the configured actor"
+    );
+    assert_eq!(
+        resolved.owned_namespaces,
+        vec![Namespace::parse("lambda:alpha-helper").expect("ns")],
+        "a pin to the configured actor must keep its owned namespaces"
+    );
+}
+
+/// The project-actor tier replacing the database-anchored config's actor with
+/// a different one drops the owned list declared for the database-anchored
+/// actor.
+#[test]
+#[serial]
+fn project_actor_replacing_configured_actor_drops_owned_namespaces() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
+    std::env::remove_var("KHIVE_ACTOR");
+
+    // The project directory resolves a different actor than the database's.
+    let seat_dir = tempfile::tempdir().expect("seat tempdir");
+    std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+    std::fs::write(
+        seat_dir.path().join(".khive/config.toml"),
+        "[actor]\nid = \"lambda:beta\"\n",
+    )
+    .expect("write seat config");
+
+    // The database-anchored config declares the actor and its owned namespace.
+    let db_dir = tempfile::tempdir().expect("db tempdir");
+    let khive_dir = db_dir.path().join(".khive");
+    std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+    std::fs::write(khive_dir.join("config.toml"), OWNED_NAMESPACE_ACTOR_CONFIG)
+        .expect("write db-anchored config");
+    let db_path = khive_dir.join("khive.db");
+    std::fs::write(&db_path, b"").expect("touch db file");
+    let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+    let _seat_env = SeatEnv::enter(seat_dir.path());
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(&db_str),
+        config: None,
+        namespace: Namespace::parse("local").expect("ns"),
+        namespace_explicit: false,
+        actor_explicit: false,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:beta"),
+        "the project actor must replace the database-anchored actor"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "an actor swapped in by the project tier must carry none of the \
+         database-anchored actor's owned namespaces — got {:?}",
+        resolved.owned_namespaces
+    );
+}
+
 /// `config_id` must stay byte-identical across two connections that share ONE
 /// database but declare DIFFERENT `[actor]` ids via their own project/cwd
 /// config (ADR-096 Fork 2 hard invariant — `actor_id` must never feed

@@ -86,6 +86,7 @@ impl VerbRegistry {
                             gate_token.gate_explicit_namespace().map(str::to_owned),
                         )
                         .with_request_id(gate_token.request_id())
+                        .with_owned_namespaces(gate_token.owned_namespaces().to_vec())
                         .with_process_ref(gate_token.process_ref().map(str::to_owned))
                     };
                     dispatch(owner, token).await
@@ -371,6 +372,14 @@ impl VerbRegistry {
     /// override (ADR-096 Fork 1).
     pub fn visible_namespaces(&self) -> &[Namespace] {
         &self.visible_namespaces
+    }
+
+    /// This registry's construction-baked `[actor] owned_namespaces`
+    /// (ADR-021 Delta 1), used absent a per-request [`RequestIdentity`]
+    /// override. Declared by the caller, never inferred; read only by the
+    /// `memory.apply_batch` old-row namespace check.
+    pub fn owned_namespaces(&self) -> &[Namespace] {
+        &self.owned_namespaces
     }
 
     /// This registry's configured audit `EventStore`, if any (ADR-094).

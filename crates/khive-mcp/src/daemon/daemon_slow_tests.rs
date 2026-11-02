@@ -133,6 +133,7 @@ async fn a_daemon_busy_on_a_held_write_lock_answers_daemon_slow_after_write() {
         .expect("hold the store's write lock");
 
     let frame = DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         plan: false,
         ops: "create(kind=\"observation\", content=\"written behind a held lock\")".to_string(),
         presentation: None,

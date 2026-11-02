@@ -6932,6 +6932,7 @@ fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRe
 
 fn request_identity_with_visible_namespaces(ns: Vec<&str>) -> khive_runtime::RequestIdentity {
     khive_runtime::RequestIdentity {
+        owned_namespaces: Vec::new(),
         namespace: "local".to_string(),
         actor_id: None,
         visible_namespaces: ns.into_iter().map(str::to_string).collect(),
