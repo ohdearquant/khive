@@ -520,7 +520,10 @@ async fn test_apply_batch_deduped_row_gets_its_removed_edge_back() {
     let token = rt
         .authorize(Namespace::parse("alice").expect("alice namespace"))
         .expect("authorize alice");
-    rt.delete_edge(&token, edge_ids[0], false)
+    // A hard delete leaves no edge row, the state of a run that stopped after
+    // the write and before the link. A soft delete would leave a tombstone,
+    // which `link` does not resurrect.
+    rt.delete_edge(&token, edge_ids[0], true)
         .await
         .expect("remove the supersedes edge");
     assert_eq!(ab_edges(&rt, "alice", vec![old]).await.len(), 0);
@@ -603,6 +606,7 @@ async fn test_apply_batch_row_count_bounds() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_apply_batch_rewrite_is_recalled_and_the_old_row_is_not() {
     let rt = make_runtime();
     let alice = make_registry_with_actor(rt.clone(), "alice");

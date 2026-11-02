@@ -150,6 +150,10 @@ fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, Ru
     Ok(object.clone())
 }
 
+/// The resolved memory type and the validated extra properties of a
+/// `memory.remember` call, as `check_remember_fields` returns them.
+pub(super) type RememberFields<'a> = (&'a str, Option<serde_json::Map<String, Value>>);
+
 /// The checks `memory.remember` applies to a memory's content, type and
 /// `properties`, in that order: the content is not blank, the memory type is
 /// known (`episodic` when absent) and the `properties` object passes
@@ -161,7 +165,7 @@ pub(super) fn check_remember_fields<'a>(
     content: &str,
     memory_type: Option<&'a str>,
     properties: Option<&Value>,
-) -> Result<(&'a str, Option<serde_json::Map<String, Value>>), RuntimeError> {
+) -> Result<RememberFields<'a>, RuntimeError> {
     if content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "content must not be empty".into(),
