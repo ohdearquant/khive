@@ -843,6 +843,13 @@ properties and the actor-namespace default). Requires acceptance before the impl
 
 ### Problem
 
+This amendment serves the project owner's instruction of 2026-11-01, rendered: "No, that won't do: every memory has to
+be updated, without exception. This can go a little at a time; as far as possible, each agent reads its own rows
+itself." A few minutes later the same instruction set out the program, rendered: "All memory entries must be updated
+by the agents that wrote them ... as they go through, they keep records, a jsonl file for batch operations ... execute
+all these updates ... then, at rest, reindex all memory." This verb keeps and executes those records; Decision 7 names
+the reindex.
+
 Rewriting a store's memories means writing one new row per fact, linking it to the row it replaces, and keeping the
 old row. Done as separate `memory.remember` and `link` calls, a rewrite of thousands of rows has no dry run, no single
 place that checks each row against the rules before anything is written, and no safe way to resume after a failure:
