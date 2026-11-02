@@ -453,7 +453,9 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // A warm daemon must not keep issuing receipts with a superseded key ring.
     // Hash declarations only: provider resolution and secret bytes never enter
     // daemon identity. Include an explicit version even when custody is absent
-    // so pre-cutover writers cannot serve the new receipt contract.
+    // so pre-cutover writers cannot serve the new receipt contract. A client
+    // without a ring does not detect a rotated ring, so a ring change takes
+    // effect when the daemon restarts.
     let mut receipt_credentials: Vec<_> = config
         .credentials
         .iter()
@@ -483,13 +485,10 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         keys.sort();
         keys
     });
-    let mut receipt_hasher = Sha256::new();
-    receipt_hasher.update(b"khive.visibility-receipt-policy.v2");
-    receipt_hasher.update(
-        serde_json::to_vec(&(receipt_credentials, receipt_keys))
+    let visibility_receipts = khive_runtime::daemon::visibility_receipt_policy_fingerprint(
+        &serde_json::to_vec(&(receipt_credentials, receipt_keys))
             .expect("receipt configuration references are JSON serializable"),
     );
-    let visibility_receipts = format!("{:x}", receipt_hasher.finalize());
 
     // The daemon compatibility parser compares this existing `backend` field.
     // For a declared topology, main uses the same effective value as its row

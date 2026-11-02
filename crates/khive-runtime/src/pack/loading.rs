@@ -367,6 +367,7 @@ impl PackRegistry {
         builder.with_gate(runtime.config().gate.clone());
         builder.with_default_namespace(runtime.config().default_namespace.as_str());
         builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
+        builder.with_owned_namespaces(runtime.config().owned_namespaces.clone());
         builder.with_actor_id(runtime.config().actor_id.clone());
         if audit_store == IngestAuditStore::Attach {
             if runtime.is_read_only() {

@@ -165,6 +165,56 @@ fn explicit_actor_pin_retains_unrelated_configured_visibility() {
     );
 }
 
+// ADR-021 Delta 1: `[actor] owned_namespaces` is a declaration about the
+// configured actor, so a pin to any other actor must not inherit it.
+#[test]
+fn actor_pin_to_a_different_actor_clears_owned_namespaces() {
+    let mut cfg = RuntimeConfig {
+        actor_id: Some("agent:fallback".to_string()),
+        visible_namespaces: vec![Namespace::parse("agent:fallback").unwrap()],
+        owned_namespaces: vec![Namespace::parse("project:data").unwrap()],
+        ..RuntimeConfig::default()
+    };
+    apply_actor_pin_and_expectation(&mut cfg, Some("agent:cli"), None).unwrap();
+    assert!(
+        cfg.owned_namespaces.is_empty(),
+        "a pin to a different actor must drop the configured actor's owned namespaces: {:?}",
+        cfg.owned_namespaces
+    );
+}
+
+#[test]
+fn actor_pin_to_local_clears_owned_namespaces() {
+    let mut cfg = RuntimeConfig {
+        actor_id: Some("agent:fallback".to_string()),
+        visible_namespaces: vec![Namespace::parse("agent:fallback").unwrap()],
+        owned_namespaces: vec![Namespace::parse("project:data").unwrap()],
+        ..RuntimeConfig::default()
+    };
+    apply_actor_pin_and_expectation(&mut cfg, Some("local"), None).unwrap();
+    assert!(
+        cfg.owned_namespaces.is_empty(),
+        "a pin to the shared namespace must drop the configured actor's owned namespaces: {:?}",
+        cfg.owned_namespaces
+    );
+}
+
+#[test]
+fn actor_pin_to_the_configured_actor_keeps_owned_namespaces() {
+    let mut cfg = RuntimeConfig {
+        actor_id: Some("agent:fallback".to_string()),
+        visible_namespaces: vec![Namespace::parse("agent:fallback").unwrap()],
+        owned_namespaces: vec![Namespace::parse("project:data").unwrap()],
+        ..RuntimeConfig::default()
+    };
+    apply_actor_pin_and_expectation(&mut cfg, Some("agent:fallback"), None).unwrap();
+    assert_eq!(
+        cfg.owned_namespaces,
+        vec![Namespace::parse("project:data").unwrap()],
+        "re-pinning the configured actor must keep its own declaration"
+    );
+}
+
 #[test]
 fn expect_actor_alone_validates_resolved_identity() {
     let mut cfg = RuntimeConfig {

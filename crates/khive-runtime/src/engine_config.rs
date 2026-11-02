@@ -351,6 +351,18 @@ pub struct ActorConfig {
     /// for any actor that does not add this field.
     #[serde(default)]
     pub allowed_outbound_namespaces: Vec<String>,
+
+    /// Namespaces whose rows this actor may rewrite through `memory.apply_batch`
+    /// (ADR-021 Delta 1). Empty by default. Ownership is declared by name and
+    /// never inferred: `visible_namespaces` grants read access only, and a
+    /// namespace that shares this actor's id as a prefix is not owned unless it
+    /// is listed here. Each entry must be a valid `Namespace` other than `local`
+    /// and this actor's own `id`; entries must be unique, and a nonempty list
+    /// requires an explicit `id`. Validated at config-load time. The list is
+    /// read by the apply-batch old-row namespace check alone: it grants no write
+    /// into an owned namespace and widens no read.
+    #[serde(default)]
+    pub owned_namespaces: Vec<String>,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -2028,6 +2040,50 @@ impl KhiveConfig {
                     id: ns_str.clone(),
                     reason: format!("invalid visible namespace: {e}"),
                 })?;
+            }
+        }
+
+        // Validate actor.owned_namespaces (fail-closed at startup). Ownership is
+        // declared by name, so every entry is checked exactly: it must parse, must
+        // not be the shared namespace or the actor's own id, and must be unique.
+        if !self.actor.owned_namespaces.is_empty() {
+            let Some(actor_id) = self.actor.id.as_deref() else {
+                return Err(ConfigError::InvalidActorId {
+                    id: String::new(),
+                    reason: "owned_namespaces requires an explicit [actor] id".to_string(),
+                });
+            };
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for ns_str in &self.actor.owned_namespaces {
+                if ns_str.is_empty() {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces entries must not be empty".to_string(),
+                    });
+                }
+                let parsed = Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
+                    id: ns_str.clone(),
+                    reason: format!("invalid owned namespace: {e}"),
+                })?;
+                if parsed.as_str() == Namespace::LOCAL {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces must not list the shared namespace `local`"
+                            .to_string(),
+                    });
+                }
+                if parsed.as_str() == actor_id {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces must not list the actor's own id".to_string(),
+                    });
+                }
+                if !seen.insert(parsed.as_str().to_string()) {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces entries must be unique".to_string(),
+                    });
+                }
             }
         }
 

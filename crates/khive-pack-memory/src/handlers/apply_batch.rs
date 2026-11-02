@@ -368,9 +368,14 @@ impl MemoryPack {
                             ),
                         );
                     }
+                    // A namespace the caller declared it owns is checked like the
+                    // caller's own: it is not shared, so the shared-row rule below
+                    // does not apply to it (ADR-021 Delta 1).
                     if note.namespace == Namespace::LOCAL {
                         old_in_shared = true;
-                    } else if note.namespace != write_token.namespace().as_str() {
+                    } else if note.namespace != write_token.namespace().as_str()
+                        && !write_token.owns(&note.namespace)
+                    {
                         return refused(
                             echo,
                             Some(note.namespace.clone()),

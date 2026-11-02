@@ -582,6 +582,7 @@ pub fn resolve_runtime_config_with_db_anchor(
     // behavior; tiers 2-4 never touch it, per ADR-007 Rev 4 Rule 0).
     let resolved = {
         let mut resolved = resolved;
+        let configured_actor = resolved.actor_id.clone();
         let ns = resolved.default_namespace.as_str().to_string();
         if inputs.namespace_explicit && ns != "local" {
             // An explicit non-"local" namespace (CLI `--actor`/`--namespace`,
@@ -605,6 +606,12 @@ pub fn resolve_runtime_config_with_db_anchor(
             let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
                 .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
             resolved.actor_id = project_actor.or(resolved.actor_id);
+        }
+        // `[actor] owned_namespaces` was declared for the configured actor
+        // (ADR-021 Delta 1). A pin to any other actor, including anonymous,
+        // carries none of it.
+        if resolved.actor_id != configured_actor {
+            resolved.owned_namespaces.clear();
         }
         resolved
     };

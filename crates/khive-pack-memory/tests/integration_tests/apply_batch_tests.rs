@@ -568,6 +568,131 @@ async fn test_apply_batch_supersedes_a_shared_row_when_sources_are_named() {
     assert_eq!(ab_edges(&rt, "alice", vec![local_old]).await.len(), 1);
 }
 
+/// A registry for `actor_id` whose configuration declares `owned` namespaces
+/// (ADR-021 Delta 1). Tokens minted by `dispatch` carry the declaration.
+fn ab_registry_owning(
+    rt: KhiveRuntime,
+    actor_id: &str,
+    owned: &[&str],
+) -> khive_runtime::VerbRegistry {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(actor_id.to_string()));
+    builder.with_owned_namespaces(
+        owned
+            .iter()
+            .map(|ns| Namespace::parse(ns).expect("owned namespace parses"))
+            .collect(),
+    );
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
+    builder.build().expect("registry with owned namespaces builds")
+}
+
+#[tokio::test]
+async fn test_apply_batch_admits_an_old_row_in_an_owned_namespace() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let old = ab_seed(&archive, "kestrel migration tally archived original").await;
+    let alice = ab_registry_owning(rt.clone(), "alice", &["alice:archive"]);
+    let notes_before = ab_note_count(&rt, "alice").await;
+    let archive_notes_before = ab_note_count(&rt, "alice:archive").await;
+
+    let row = ab_supersede(old, "kestrel migration tally revised");
+    let result = ab_apply(&alice, "owned", vec![row], true).await;
+    assert_eq!(result["entries"][0]["outcome"], "planned");
+    assert_eq!(result["entries"][0]["old_namespace"], "alice:archive");
+    assert_eq!(result["counts"]["planned"], 1);
+    assert_eq!(result["counts"]["refused"], 0);
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before);
+    assert_eq!(
+        ab_note_count(&rt, "alice:archive").await,
+        archive_notes_before,
+        "a dry run changes no row in the owned namespace"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_batch_refuses_an_owned_namespace_row_when_the_list_is_empty() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let old = ab_seed(&archive, "curlew shoreline tally archived original").await;
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+
+    let row = ab_supersede(old, "curlew shoreline tally revised");
+    let code = ab_refusal_code(&rt, &alice, row.clone()).await;
+    assert_eq!(code, "old-namespace");
+    let dry = ab_apply(&alice, "refusals", vec![row], true).await;
+    let message = dry["entries"][0]["reason"]["message"]
+        .as_str()
+        .expect("a refusal carries a message");
+    assert!(
+        message.contains("alice:archive"),
+        "the refusal names the namespace found: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_batch_refuses_a_prefix_namespace_that_is_not_listed() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let scratch = make_registry_with_actor(rt.clone(), "alice:scratch");
+    let listed = ab_seed(&archive, "ibis nesting count listed original").await;
+    let unlisted = ab_seed(&scratch, "ibis nesting count unlisted original").await;
+    let alice = ab_registry_owning(rt.clone(), "alice", &["alice:archive"]);
+
+    // The listed namespace is admitted ...
+    let admitted = ab_apply(
+        &alice,
+        "prefix",
+        vec![ab_supersede(listed, "ibis nesting count listed revised")],
+        true,
+    )
+    .await;
+    assert_eq!(admitted["entries"][0]["outcome"], "planned");
+
+    // ... while a namespace that shares the actor's prefix but is not listed
+    // keeps the refusal it has without a declaration.
+    let code = ab_refusal_code(
+        &rt,
+        &alice,
+        ab_supersede(unlisted, "ibis nesting count unlisted revised"),
+    )
+    .await;
+    assert_eq!(code, "old-namespace");
+}
+
+#[tokio::test]
+async fn test_apply_batch_admits_an_owned_namespace_declared_by_the_request_identity() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let old = ab_seed(&archive, "heron wetland census archived original").await;
+    // The registry bakes no owned list; the request identity carries it, the
+    // way a daemon request does.
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+
+    let result = alice
+        .dispatch_with_identity(
+            "memory.apply_batch",
+            json!({
+                "batch": "identity",
+                "rows": [ab_supersede(old, "heron wetland census revised")],
+                "dry_run": true,
+            }),
+            Some(khive_runtime::RequestIdentity {
+                namespace: "alice".into(),
+                actor_id: Some("alice".into()),
+                owned_namespaces: vec!["alice:archive".into()],
+                ..khive_runtime::RequestIdentity::default()
+            }),
+        )
+        .await
+        .expect("memory.apply_batch accepts the call");
+    assert_eq!(result["entries"][0]["outcome"], "planned");
+    assert_eq!(result["entries"][0]["old_namespace"], "alice:archive");
+}
+
 #[tokio::test]
 async fn test_apply_batch_refuses_an_anonymous_caller() {
     let rt = make_runtime();
