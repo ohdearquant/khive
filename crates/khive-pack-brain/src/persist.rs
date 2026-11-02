@@ -1056,8 +1056,8 @@ fn prepare_parked_state(mut state: BrainState, entity_capacity: usize) -> BrainS
 /// - an absent field is a row written before the stamp existed; it keeps the
 ///   historical default-profile fold;
 /// - a null or any other non-string value means no serving profile was
-///   resolved; the live path folded no posterior for it, so replay folds none
-///   either.
+///   resolved; the live path folded nothing for it, neither a posterior nor a
+///   section state, so replay folds nothing either.
 fn replay_feedback_profile(event: &Event) -> Option<&str> {
     match event.payload.get("served_by_profile_id") {
         None => Some("balanced-recall-v1"),
@@ -1071,7 +1071,8 @@ fn replay_feedback_profile(event: &Event) -> Option<&str> {
 ///
 /// - judgment-bearing feedback with a serving profile (see
 ///   [`replay_feedback_profile`]) folds through [`crate::apply_feedback_signal`],
-///   the function the feedback write path folds with;
+///   the function the feedback write path folds with; judgment-bearing feedback
+///   with no resolved serving profile folds nothing;
 /// - every other signal follows [`crate::dispatch_route`];
 /// - unjudged telemetry is not folded, and section feedback is replayed into
 ///   section state only.
@@ -1106,10 +1107,12 @@ pub(crate) fn replay_events(bs: &mut BrainState, events: &[Event]) {
             signal,
             BrainSignal::Feedback { .. } | BrainSignal::SemanticFeedback { .. }
         ) {
+            // apply_feedback_signal also takes the section-state fold, so
+            // nothing below runs for judgment feedback.
             if let Some(serving_profile) = replay_feedback_profile(event) {
                 crate::apply_feedback_signal(bs, serving_profile, &signal);
-                continue;
             }
+            continue;
         } else {
             match crate::dispatch_route(bs, &signal) {
                 crate::FoldRoute::Skip => {}

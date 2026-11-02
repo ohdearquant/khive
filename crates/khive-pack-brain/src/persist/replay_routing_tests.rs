@@ -617,3 +617,58 @@ fn replay_folded_event_counts_sum_to_log_length() {
     assert_eq!(event_count(&state.profile_states[PROFILE_B]), 3);
     assert_eq!(event_count(&state.profile_states[ARCHIVED_PROFILE]), 0);
 }
+
+/// A judgment row with no resolved serving profile folds nothing on replay,
+/// section evidence included: the live path folded neither a posterior nor a
+/// section state for it. The same row stamped with a profile does move that
+/// profile's section state, so the section evidence on the row is live.
+#[test]
+fn replay_folds_nothing_for_a_judgment_with_no_serving_profile() {
+    fn judgment(stamp: serde_json::Value) -> Event {
+        let mut event = Event::new(
+            NAMESPACE,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        event.target_id = Some(target(11));
+        event.payload = serde_json::json!({
+            "signal": "useful",
+            "served_by_profile_id": stamp,
+            "section_signals": { "overview": "useful" },
+        });
+        event
+    }
+    fn section_totals(state: &BrainState) -> BTreeMap<String, u64> {
+        state
+            .section_states
+            .iter()
+            .filter(|(_, section_state)| section_state.total_events > 0)
+            .map(|(id, section_state)| (id.clone(), section_state.total_events))
+            .collect()
+    }
+
+    let before = fixture_state();
+    for stamp in [serde_json::Value::Null, serde_json::json!(7)] {
+        let mut replayed = fixture_state();
+        replay_events(&mut replayed, &[judgment(stamp.clone())]);
+        assert!(
+            section_totals(&replayed).is_empty(),
+            "a judgment stamped {stamp} moved a section state"
+        );
+        assert_eq!(
+            snapshots(&replayed),
+            snapshots(&before),
+            "a judgment stamped {stamp} moved a posterior"
+        );
+        assert_eq!(folded_total(&replayed), 0);
+    }
+
+    let mut stamped = fixture_state();
+    replay_events(&mut stamped, &[judgment(serde_json::json!(PROFILE_A))]);
+    assert_eq!(
+        section_totals(&stamped),
+        BTreeMap::from([(PROFILE_A.to_owned(), 1)])
+    );
+}
