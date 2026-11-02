@@ -139,6 +139,11 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).
 - `brain.create_profile` enforces a profile-id grammar: alphanumeric + hyphens only, no dots,
   underscores, or wildcards; leading/trailing whitespace is trimmed (issue R3-3).
+- `brain.create_profile` accepts an optional `local_factor`, a finite number in `[0.5, 1]` stored as
+  given on the profile record. Only creation sets it: no verb edits it, `brain.reset` keeps it and a
+  reload from the persisted snapshot keeps it. A record without the field loads as no factor, which
+  is the same as 1. `brain.profile` returns it as `local_factor` (`null` when absent) beside
+  `posterior_means`, the means of the three stored recall posteriors.
 - `brain.auto_feedback(namespace=...)` applies ADR-007's exact escape to both sides of the
   mutation: the feedback event/fold-gate row and the selected namespace's live + durable
   posterior state. Target IDs remain globally resolvable by ID. Direct `PackRuntime` calls must

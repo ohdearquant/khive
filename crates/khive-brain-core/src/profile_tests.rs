@@ -25,6 +25,36 @@ fn consumer_kind_from_str_rejects_unknown() {
     assert!("bogus".parse::<ConsumerKind>().is_err());
 }
 
+/// A record without a shared-pool factor serializes without the key, and a record written
+/// without the key loads with no factor, so existing records and snapshots load unchanged.
+#[test]
+fn profile_record_without_local_factor_omits_the_key_and_loads_as_none() {
+    let record = ProfileRecord::new_balanced_recall(100);
+    assert_eq!(record.local_factor, None);
+
+    let value = serde_json::to_value(&record).expect("serialize record");
+    assert!(
+        value.get("local_factor").is_none(),
+        "an absent factor must not be written: {value}"
+    );
+
+    let restored: ProfileRecord = serde_json::from_value(value).expect("deserialize record");
+    assert_eq!(restored.local_factor, None);
+}
+
+/// A stored factor survives serialization and reload exactly as given.
+#[test]
+fn profile_record_local_factor_round_trips_as_stored() {
+    let mut record = ProfileRecord::new_balanced_recall(100);
+    record.local_factor = Some(0.75);
+
+    let value = serde_json::to_value(&record).expect("serialize record");
+    assert_eq!(value["local_factor"], serde_json::json!(0.75));
+
+    let restored: ProfileRecord = serde_json::from_value(value).expect("deserialize record");
+    assert_eq!(restored.local_factor, Some(0.75));
+}
+
 /// ADR-048 Phase-1 gate: profile save/load round-trip must produce identical
 /// posteriors (snapshot == restored state).
 #[test]

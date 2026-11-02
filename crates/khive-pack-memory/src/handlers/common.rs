@@ -407,6 +407,17 @@ pub(super) fn balanced_recall_state_from_profile_response(
     ))
 }
 
+/// The shared-pool factor a served profile carries, read from its `brain.profile` response.
+///
+/// A missing, null or non-numeric `local_factor`, and a value outside [0.5, 1] (which
+/// `brain.create_profile` never stores), yield 1: no scaling.
+pub(super) fn local_factor_from_profile_response(resp: &Value) -> f32 {
+    resp.get("local_factor")
+        .and_then(Value::as_f64)
+        .filter(|factor| factor.is_finite() && (0.5..=1.0).contains(factor))
+        .map_or(1.0, |factor| factor as f32)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
@@ -649,10 +660,15 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
-        // ADR-104 §3: set to neutral/absent here; `handle_recall` overwrites
-        // both when a profile served the request (component 1 ran).
+        // Neutral/absent here; `handle_recall` overwrites these for every hit it ranks.
         profile_component: 1.0,
         entity_posterior_mean: None,
+        weights_served: "default".to_string(),
+        namespace: String::new(),
+        pre_entity_score: total as f32,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     (total, breakdown)
 }

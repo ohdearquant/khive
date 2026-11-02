@@ -302,6 +302,12 @@ fn score_breakdown_total_sums_contributions() {
         },
         profile_component: 1.0,
         entity_posterior_mean: None,
+        weights_served: "default".to_string(),
+        namespace: "local".to_string(),
+        pre_entity_score: 0.5,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     let expected = 0.35 + 0.12 + 0.03;
     let diff = (bd.total() - expected).abs();

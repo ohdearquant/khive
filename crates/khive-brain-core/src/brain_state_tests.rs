@@ -14,12 +14,48 @@ fn make_profile(id: &str, consumer_kind: &str, ts_secs: i64) -> ProfileRecord {
         state_snapshot: None,
         total_events: 0,
         exploration_epoch: 0,
+        local_factor: None,
     }
 }
 
 include!("brain_state_tests/fallback_resolution_tests.rs");
 
 include!("brain_state_tests/snapshot_values_tests.rs");
+
+/// A profile's `local_factor` is part of the persisted snapshot: it survives a posterior
+/// reset, serialization and reload, and a profile that never had one still has none.
+#[test]
+fn snapshot_round_trip_and_posterior_reset_keep_the_profile_local_factor() {
+    let capacity = 4;
+    let mut state = BrainState::new(capacity);
+    let mut record = make_profile("factor-profile", "recall", 1_000);
+    record.local_factor = Some(0.6);
+    state.profiles.insert(record.id.clone(), record);
+    state.profile_states.insert(
+        "factor-profile".to_owned(),
+        BalancedRecallState::new(capacity),
+    );
+
+    state.reset_profile_posteriors("factor-profile");
+    assert_eq!(
+        state.profiles["factor-profile"].local_factor,
+        Some(0.6),
+        "a posterior reset must not clear the factor"
+    );
+
+    let json = state.to_snapshot_json().expect("encode snapshot");
+    let snapshot: BrainStateSnapshot = serde_json::from_str(&json).expect("decode snapshot");
+    let reloaded = BrainState::from_snapshot(snapshot, capacity);
+    assert_eq!(
+        reloaded.profiles["factor-profile"].local_factor,
+        Some(0.6),
+        "a reload from the persisted snapshot must keep the factor"
+    );
+    assert_eq!(
+        reloaded.profiles["balanced-recall-v1"].local_factor, None,
+        "a profile created without a factor reloads without one"
+    );
+}
 
 /// BRAINCORE-AUD-001 regression: oversized-snapshot restore is rejected
 /// (bounded/rejected) at the capacity-aware validation boundary.
