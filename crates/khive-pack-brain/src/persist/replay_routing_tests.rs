@@ -315,8 +315,8 @@ fn foldable_fixture() -> Fixture {
     fx
 }
 
-/// Fold the log into `state` the way the live path did when it first served
-/// each event.
+/// Fold the log into `state` through the functions the live path folds with:
+/// the dispatch hook's and the feedback write path's.
 fn apply_live(state: &mut BrainState, fx: &Fixture) {
     for (event, meta) in fx.events.iter().zip(&fx.meta) {
         match meta.live {
@@ -327,18 +327,19 @@ fn apply_live(state: &mut BrainState, fx: &Fixture) {
             }
             Live::Feedback(profile_id) => {
                 let signal = interpret(event);
-                match crate::feedback_route(state, profile_id) {
-                    crate::FoldRoute::Balanced => state.balanced_recall.apply_signal(&signal),
-                    crate::FoldRoute::Named(id) => state
-                        .profile_states
-                        .get_mut(id)
-                        .expect("named profile has state")
-                        .apply_signal(&signal),
-                    crate::FoldRoute::Skip => {}
-                }
+                crate::apply_feedback_signal(state, profile_id, &signal);
             }
         }
     }
+}
+
+/// Event count stored on each profile record.
+fn record_counts(state: &BrainState) -> BTreeMap<String, u64> {
+    state
+        .profiles
+        .iter()
+        .map(|(id, record)| (id.clone(), record.total_events))
+        .collect()
 }
 
 /// Serialized snapshot of the default profile and of every named profile state.
@@ -436,6 +437,11 @@ fn replay_matches_live_routing_per_profile() {
             "replayed state of {profile} differs from the live state"
         );
     }
+    assert_eq!(
+        record_counts(&live),
+        record_counts(&replayed),
+        "replayed profile records differ from the live records"
+    );
 
     // The comparison is not vacuous: each active profile received events and
     // the archived profile received none.
@@ -443,6 +449,37 @@ fn replay_matches_live_routing_per_profile() {
     assert!(event_count(&replayed.profile_states[PROFILE_A]) > 0);
     assert!(event_count(&replayed.profile_states[PROFILE_B]) > 0);
     assert_eq!(event_count(&replayed.profile_states[ARCHIVED_PROFILE]), 0);
+}
+
+/// Judgments credited to a profile while it was active replay into that
+/// profile after it is archived: the judgment rule applies no lifecycle check,
+/// so replay from an archived state matches the live fold.
+#[test]
+fn replay_credits_judgments_to_a_profile_archived_after_them() {
+    let mut fx = Fixture::default();
+    fx.feedback(target(1), "useful", Some(ARCHIVED_PROFILE));
+    fx.feedback(target(2), "wrong", Some(ARCHIVED_PROFILE));
+
+    // Live: the profile is active while it is credited, then archived.
+    let mut live = fixture_state();
+    live.profiles
+        .get_mut(ARCHIVED_PROFILE)
+        .expect("fixture profile")
+        .lifecycle = ProfileLifecycle::Active;
+    apply_live(&mut live, &fx);
+    live.profiles
+        .get_mut(ARCHIVED_PROFILE)
+        .expect("fixture profile")
+        .lifecycle = ProfileLifecycle::Archived;
+
+    // Replay: the profile is archived in the state replay starts from.
+    let mut replayed = fixture_state();
+    replay_events(&mut replayed, &fx.events);
+
+    assert_eq!(snapshots(&live), snapshots(&replayed));
+    assert_eq!(record_counts(&live), record_counts(&replayed));
+    assert_eq!(event_count(&replayed.profile_states[ARCHIVED_PROFILE]), 2);
+    assert_eq!(event_count(&replayed.balanced_recall), 0);
 }
 
 #[test]

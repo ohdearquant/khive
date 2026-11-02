@@ -246,6 +246,34 @@ pub(crate) fn feedback_route<'a>(state: &BrainState, serving_profile: &'a str) -
     }
 }
 
+/// Apply a judgment-bearing feedback signal whose resolved serving profile is
+/// `serving_profile`: fold it into the profile [`feedback_route`] chooses,
+/// refresh that profile's record, and fold it into the serving profile's
+/// section state.
+pub(crate) fn apply_feedback_signal(
+    state: &mut BrainState,
+    serving_profile: &str,
+    signal: &BrainSignal,
+) {
+    match feedback_route(state, serving_profile) {
+        FoldRoute::Named(profile_id) => {
+            if let Some(profile_state) = state.profile_states.get_mut(profile_id) {
+                profile_state.apply_signal(signal);
+            }
+            refresh_named_profile_record(state, profile_id);
+        }
+        FoldRoute::Balanced => {
+            state.balanced_recall.apply_signal(signal);
+            sync_balanced_recall_record(state);
+        }
+        FoldRoute::Skip => {}
+    }
+
+    let section_state =
+        crate::ensure_section_state_seeded(&mut state.section_states, serving_profile);
+    section_state.apply_signal(signal);
+}
+
 /// Refresh a named profile's record from its live state: the event counter and
 /// the stored snapshot that profile reads and persistence use.
 pub(crate) fn refresh_named_profile_record(state: &mut BrainState, profile_id: &str) {
