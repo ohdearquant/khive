@@ -3268,7 +3268,7 @@ async fn recall_min_score_applies_to_the_factor_adjusted_rank_score() {
 const LF_OWN_NS: &str = "lf-own";
 
 /// A recall registry whose read set is the shared pool plus [`LF_OWN_NS`].
-fn lf_registry(rt: &TestRuntime) -> khive_runtime::VerbRegistry {
+fn lf_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
     use khive_pack_brain::BrainPack;
 
     let mut builder = VerbRegistryBuilder::new();
