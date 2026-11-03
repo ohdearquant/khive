@@ -280,7 +280,9 @@ must be at least MRR@10 with no profile. On the shared-pool bank, MRR@10 may fal
 exactly 0.04 passes) and at most one question may be lost, meaning it is in the no-profile top ten and outside the
 candidate's top ten.
 
-The gate does not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line),
+The readable namespaces each round process reports must be the bank's read set plus the primary namespace and the bench
+actor's own namespace, which the runtime adds to every actor's visible namespaces; any other set exits 12. The gate does
+not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line),
 when a recall binding resolves for the caller, or when the two arms' caller, primary namespace or readable namespaces
 differ: in each case the no-profile arm would not be the arm its name says. A hit whose attribution is not its arm's
 (`serve_attribution` of `unspecified` with no `served_by_profile_id` for no profile; `profile` and the candidate's id for
