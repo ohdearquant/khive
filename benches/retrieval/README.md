@@ -245,6 +245,36 @@ uv run python bank.py rebind-gate --profile profile-x \
   --control-id <memory uuid> --out runs/<name>
 ```
 
+The candidate must be on the staged copy: every round's server process reads it before its first recall and records it.
+Without `--create-candidate-local-factor` the gate creates nothing, so the candidate must already be there, for example
+a profile the frozen store holds. A profile's `local_factor` can only be set when the profile is created, so a candidate
+for a new value is a new profile, and a frozen store does not hold it. Pass `--create-candidate-local-factor F`, a finite
+number in [0.5, 1] checked before anything is staged (outside it, or not finite, exits 12 with no copy and no process),
+to create the candidate on the copy before round 1:
+
+```bash
+uv run python bank.py rebind-gate --profile profile-x --create-candidate-local-factor 0.8 \
+  --own-bank banks/own/v1 --own-visible team-a,local \
+  --shared-bank banks/shared/v1 --shared-visible team-a,local \
+  --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models \
+  --control-id <memory uuid> --out runs/<name>
+```
+
+One extra `kkernel mcp` process does the creation, as the same bench actor and with the own-namespace bank's read set,
+so the profile lands in the namespace the round processes run in. It reads the memory pressure and checks the runtime
+has no `brain_profile`, as every round process does, then reads `brain.profile` for the candidate. A candidate that is
+already on the copy exits 12, because the flag creates a new profile; so does any read error other than not found. It
+then calls `brain.create_profile` (consumer kind `recall`, no seed priors) and reads the candidate back, where
+`local_factor` must equal F, `total_events` must be 0 and the lifecycle must not be `archived`; anything else exits 12.
+The profile is left inactive, since a recall that names a profile by id serves it whatever its lifecycle except
+`archived`. The process runs no recall before the create, because the create commits the server's in-memory brain state
+to the copy and the credits of a recall would be committed with it. The create writes to the copy, so a copy adopted
+with `--staged-home` no longer matches its transfer record afterwards, and a later run on it is refused. The responses,
+the pressure reading, the `brain_profile` check and the stderr path are in `rebind-gate.json` under `candidate_created`,
+and `rebind-gate.txt` says whether the candidate was created by the run or found on the copy, with the `local_factor` the
+round processes read.
+
 The pass is read in each round on its own and must hold in both. On the own-namespace bank, MRR@10 with the candidate
 must be at least MRR@10 with no profile. On the shared-pool bank, MRR@10 may fall by at most 0.04 (exact arithmetic, so
 exactly 0.04 passes) and at most one question may be lost, meaning it is in the no-profile top ten and outside the
