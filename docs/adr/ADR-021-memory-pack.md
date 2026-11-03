@@ -22,6 +22,9 @@ records, and adds `properties` to `memory.remember` (#6356; accepted 2026-11-02)
 adds `memory.apply_batch`, and its
 [Delta 1](#delta-1-old-rows-in-namespaces-the-caller-owns-2026-11-02) admits old rows in namespaces the caller
 declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
+**Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
+the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
+`memory.remember` reserves the `supersedes` property (#6386; proposed).
 
 ## Context
 
@@ -798,7 +801,7 @@ Two gaps make it impossible to tell from a memory row who wrote it and where its
 3. **`properties` on `memory.remember`.** An optional JSON object, stored in `note.properties` beside `memory_type` and
    `tags`. Each rule below refuses with an invalid-input error that names the key and the rule; nothing is truncated.
    - At most 32 keys. A key is 1 to 64 characters: an ASCII lowercase letter, then lowercase letters, digits or `_`.
-   - `memory_type` and `tags` (their own parameters) and `attribution` (written by the runtime) are refused as keys.
+   - `memory_type` and `tags` have their own parameters, `attribution` is written by the runtime, and `supersedes` is written by `memory.apply_batch`; use `link(relation="supersedes")` to add a supersedes edge.
    - A value is a string, a finite number, a boolean, or an array of strings. Null, nested objects and arrays holding
      anything but strings are refused.
    - The serialized object is at most 8192 bytes; the refusal reports the measured size and the limit.
@@ -979,7 +982,8 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
 machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
 supersede there hides that actor's old rows from recall while keeping them in the store. The hiding reaches only a
 reader whose recall covers both that namespace and the caller's: the new row and its `supersedes` edge are written in
-the caller's namespace, and recall reads `supersedes` edges in the reader's own namespace, so a reader scoped to the
+the caller's namespace, and recall reads `supersedes` edges in the namespaces the reader can see
+([Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03)), so a reader scoped to the
 owning actor's namespace alone still recalls the old rows. The check is a rule of this
 verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
 isolation is a storage-layer property (Rule 9), so the declaration only bounds what `memory.apply_batch` agrees to
@@ -998,3 +1002,40 @@ owned namespace with `old_namespace` naming it; the same row refused as `old-nam
 namespace that shares the actor's prefix but is not listed refused; a daemon request frame without the field
 decoding to an empty list and a frame with an empty list omitting it; a pinned actor other than the configured one
 carrying no owned namespaces.
+
+### Delta 2: supersedes reads cover the namespaces the reader can see (2026-11-03)
+
+**Status**: Proposed 2026-11-03. Changes how recall's supersedes suppression (Decision 7) reads, and the reserved
+`properties` keys of the 2026-11-01 amendment.
+
+**Problem.** Decision 7 says recall drops any candidate with an incoming `supersedes` edge the reader can see, but the
+edge lookup read only the request's primary namespace. A request with no `namespace` argument has `local` as its
+primary namespace and sees more than `local`, so an edge that `memory.apply_batch` wrote in the caller's namespace was
+not read, and the old row was returned unless the new row was also among the candidates (#6386). Recall also drops a
+candidate named by another candidate's `properties.supersedes`. `memory.remember` accepted that key from any caller,
+while `memory.apply_batch` writes it itself after its namespace check and refuses it from a caller; and a value that
+did not parse as a UUID was used as an id prefix, so an empty or one-character value hid a candidate whose id the
+writer never named.
+
+**Decision.**
+
+1. **Edge reads.** Recall reads incoming `supersedes` edges in every namespace of the request's visible set and drops a
+   candidate that has one in any of them. A request with an explicit `namespace` sees that namespace, so it reads there
+   as before.
+2. **Reserved key.** `supersedes` joins `memory_type`, `tags` and `attribution` as a key `memory.remember` refuses in
+   `properties`; the refusal names `memory.apply_batch` and `link(relation="supersedes")`. Rows already stored keep
+   the property.
+3. **Property values.** The property path honors a full UUID, or an id prefix of at least 8 characters, each a
+   lowercase hex digit or a hyphen. Any other value hides nothing.
+
+**Consequences.** A supersede written by `memory.apply_batch` hides the old row from every recall that sees the
+caller's namespace, the default request included, which is what Decision 7 already said. The Delta 1 bound holds: a
+reader scoped to the owning actor's namespace alone does not see the caller's namespace and still recalls the old rows.
+A recall reads one batched edge query per visible namespace instead of one. A row that relied on a short or upper-case
+id prefix in `properties.supersedes` no longer hides its target; a `supersedes` edge does.
+
+**Validation.** Tests for: a default-path recall dropping a `local` memory whose `supersedes` edge sits in another
+visible namespace, with the new row outside the candidates; an explicit-namespace recall returning what it returned
+before; `memory.remember` refusing `properties.supersedes` with the refusal above; stored rows whose
+`properties.supersedes` is empty or one hex character hiding nothing, and a full UUID and an 8-character prefix still
+hiding their targets.

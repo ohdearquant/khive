@@ -1098,10 +1098,13 @@ impl MemoryPack {
                 {
                     if let Ok(uid) = target_str.parse::<Uuid>() {
                         superseded_by_prop.insert(uid);
-                    } else {
-                        let prefix = target_str.to_lowercase();
+                    } else if target_str.len() >= 8
+                        && target_str
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+                    {
                         for sn2 in &ranked {
-                            if sn2.id.as_hyphenated().to_string().starts_with(&prefix) {
+                            if sn2.id.as_hyphenated().to_string().starts_with(target_str) {
                                 superseded_by_prop.insert(sn2.id);
                                 break;
                             }
@@ -1113,24 +1116,27 @@ impl MemoryPack {
             let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
-                let graph = self.runtime.graph(token)?;
-                // One batched read for every candidate; the first element of each
-                // returned pair is the requested candidate that has an incoming
-                // `supersedes` edge.
-                superseded_by_edge = graph
-                    .batch_neighbors(
-                        &candidate_ids,
-                        NeighborQuery {
-                            direction: Direction::In,
-                            relations: Some(vec![EdgeRelation::Supersedes]),
-                            limit: Some(1),
-                            min_weight: None,
-                        },
-                    )
-                    .await?
-                    .into_iter()
-                    .map(|(candidate_id, _)| candidate_id)
-                    .collect();
+                for namespace in token.visible_namespaces() {
+                    // `graph` routes by the token's primary namespace. This token is
+                    // scoped to one namespace already present in the caller's read set.
+                    let namespace_token = token.with_namespace(namespace.clone());
+                    let graph = self.runtime.graph(&namespace_token)?;
+                    superseded_by_edge.extend(
+                        graph
+                            .batch_neighbors(
+                                &candidate_ids,
+                                NeighborQuery {
+                                    direction: Direction::In,
+                                    relations: Some(vec![EdgeRelation::Supersedes]),
+                                    limit: Some(1),
+                                    min_weight: None,
+                                },
+                            )
+                            .await?
+                            .into_iter()
+                            .map(|(candidate_id, _)| candidate_id),
+                    );
+                }
                 khive_storage::ensure_request_read_active("memory.recall")?;
             }
 

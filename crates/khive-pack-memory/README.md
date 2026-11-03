@@ -93,7 +93,7 @@ Rules for `properties`:
 
 - It is a JSON object with at most 32 keys.
 - Each key is 1-64 characters: a lowercase ASCII letter first, then lowercase letters, digits or `_`.
-- The keys `memory_type` and `tags` are reserved because they have their own parameters, and `attribution` is reserved because the runtime writes it.
+- The keys `memory_type` and `tags` have their own parameters, `attribution` is written by the runtime, and `supersedes` is written by `memory.apply_batch`. Use `link(relation="supersedes")` to add a supersedes edge.
 - Each value is a string, a finite number, a boolean or an array of strings. `null`, nested objects and arrays with non-string items are refused.
 - The serialized object is at most 8192 bytes. A larger object is refused with its measured size and the limit in the message; it is never truncated.
 

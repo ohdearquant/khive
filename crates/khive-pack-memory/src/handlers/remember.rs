@@ -55,9 +55,24 @@ const MAX_PROPERTY_KEYS: usize = 32;
 const MAX_PROPERTY_KEY_CHARS: usize = 64;
 /// Largest accepted serialized `properties` object, in bytes.
 const MAX_PROPERTIES_BYTES: usize = 8192;
-/// Keys that have their own parameter (`memory_type`, `tags`) or are written by
-/// the runtime (`attribution`), so a caller may not set them through `properties`.
-const RESERVED_PROPERTY_KEYS: [&str; 3] = ["memory_type", "tags", "attribution"];
+/// Keys a caller may not set through `properties`, each with the reason its
+/// refusal gives: `memory_type` and `tags` have their own parameters,
+/// `attribution` is written by the runtime, and `supersedes` is written by
+/// `memory.apply_batch` (recall hides the row it names).
+const RESERVED_PROPERTY_KEYS: [(&str, &str); 4] = [
+    ("memory_type", "memory_type has its own parameter"),
+    ("tags", "tags has its own parameter"),
+    ("attribution", "attribution is written by the runtime"),
+    (
+        "supersedes",
+        "supersedes is written by memory.apply_batch; use link(relation=\"supersedes\") to add a supersedes edge",
+    ),
+];
+
+/// Reserved keys `memory.apply_batch` adds to the rows it writes through the
+/// remember path. Its rows carry them past [`validate_properties`]; the batch
+/// refuses a caller-supplied one under its own `reserved-property` code.
+pub(super) const BATCH_WRITTEN_PROPERTY_KEYS: &[&str] = &["supersedes"];
 
 /// A key is 1-64 characters: a lowercase ASCII letter first, then lowercase
 /// ASCII letters, digits or `_`.
@@ -75,11 +90,15 @@ fn is_valid_property_key(key: &str) -> bool {
 ///
 /// The value must be a JSON object with at most 32 keys. Each key is 1-64
 /// characters (a lowercase ASCII letter, then lowercase letters, digits or `_`)
-/// and is not reserved. Each value is a string, a finite number, a boolean or an
+/// and is not reserved, unless it is one of the reserved keys in `permitted`.
+/// Each value is a string, a finite number, a boolean or an
 /// array of strings. The serialized object is at most 8192 bytes; an object over
 /// the limit is refused, never truncated. Every refusal is an
 /// `InvalidInput` that names the offending key and the rule.
-fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, RuntimeError> {
+fn validate_properties(
+    raw: &Value,
+    permitted: &[&str],
+) -> Result<serde_json::Map<String, Value>, RuntimeError> {
     let object = raw.as_object().ok_or_else(|| {
         RuntimeError::InvalidInput(
             "properties must be a JSON object whose values are strings, finite numbers, booleans or arrays of strings"
@@ -105,9 +124,12 @@ fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, Ru
                 MAX_PROPERTY_KEY_CHARS
             )));
         }
-        if RESERVED_PROPERTY_KEYS.contains(&key.as_str()) {
+        if let Some((_, reason)) = RESERVED_PROPERTY_KEYS
+            .iter()
+            .find(|(reserved, _)| *reserved == key.as_str() && !permitted.contains(reserved))
+        {
             return Err(RuntimeError::InvalidInput(format!(
-                "properties key {key:?} is reserved: memory_type and tags have their own parameters and attribution is written by the runtime"
+                "properties key {key:?} is reserved: {reason}"
             )));
         }
         let refusal: Option<&str> = match value {
@@ -157,14 +179,16 @@ pub(super) type RememberFields<'a> = (&'a str, Option<serde_json::Map<String, Va
 /// The checks `memory.remember` applies to a memory's content, type and
 /// `properties`, in that order: the content is not blank, the memory type is
 /// known (`episodic` when absent) and the `properties` object passes
-/// [`validate_properties`]. Returns the resolved memory type and the validated
-/// extra properties. Callers that need to know whether a write would be accepted
-/// without performing it, such as `memory.apply_batch`, share this function with
-/// the write path.
+/// [`validate_properties`] with the reserved keys in `permitted` accepted
+/// (`memory.remember` permits none). Returns the resolved memory type and the
+/// validated extra properties. Callers that need to know whether a write would
+/// be accepted without performing it, such as `memory.apply_batch`, share this
+/// function with the write path.
 pub(super) fn check_remember_fields<'a>(
     content: &str,
     memory_type: Option<&'a str>,
     properties: Option<&Value>,
+    permitted: &[&str],
 ) -> Result<RememberFields<'a>, RuntimeError> {
     if content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -176,7 +200,7 @@ pub(super) fn check_remember_fields<'a>(
     validate_memory_type(memory_type)?;
 
     let extra_properties = match properties {
-        Some(raw) => Some(validate_properties(raw)?),
+        Some(raw) => Some(validate_properties(raw, permitted)?),
         None => None,
     };
     Ok((memory_type, extra_properties))
@@ -200,12 +224,28 @@ impl MemoryPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.remember_permitting(token, params, &[]).await
+    }
+
+    /// `memory.remember` with the reserved `properties` keys in `permitted`
+    /// accepted. `memory.apply_batch` writes its rows through this with
+    /// [`BATCH_WRITTEN_PROPERTY_KEYS`]; the verb itself permits none.
+    pub(super) async fn remember_permitting(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+    ) -> Result<Value, RuntimeError> {
         let p: RememberParams = deser(params)?;
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
         }
-        let (memory_type, extra_properties) =
-            check_remember_fields(&p.content, p.memory_type.as_deref(), p.properties.as_ref())?;
+        let (memory_type, extra_properties) = check_remember_fields(
+            &p.content,
+            p.memory_type.as_deref(),
+            p.properties.as_ref(),
+            permitted,
+        )?;
 
         // Explicit namespace wins. Otherwise both memory types are written to the caller's
         // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
@@ -260,7 +300,7 @@ impl MemoryPack {
                 props["tags"] = json!(tags);
             }
         }
-        // Validated keys never collide with `memory_type`, `tags` or `attribution`.
+        // Validated keys never collide with `memory_type`, `tags`, `attribution` or `supersedes`.
         if let Some(extra) = extra_properties {
             for (key, value) in extra {
                 props[key.as_str()] = value;

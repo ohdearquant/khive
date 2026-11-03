@@ -1599,7 +1599,7 @@ Create a memory note with salience and decay.
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
 
 `properties` is a JSON object of at most 32 keys. A key is 1-64 characters, a lowercase ASCII letter first,
-then lowercase letters, digits or `_`; `memory_type`, `tags` and `attribution` are reserved. A value is a
+then lowercase letters, digits or `_`; `memory_type` and `tags` have their own parameters, `attribution` is written by the runtime, and `supersedes` is written by `memory.apply_batch`; use `link(relation="supersedes")` to add a supersedes edge. A value is a
 string, a finite number, a boolean or an array of strings. The serialized object is at most 8192 bytes. An
 object that breaks a rule is refused with an invalid-input error naming the key and the rule, never
 truncated.
