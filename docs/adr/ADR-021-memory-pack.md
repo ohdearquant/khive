@@ -965,7 +965,8 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
    from the configuration in process, and on the daemon request frame as `owned_namespaces`, omitted when empty. A
    daemon that predates the field ignores it, so an owned row is refused there as `old-namespace`: a missing
    declaration produces a refusal, never an admission. When the caller pins an actor other than the configured
-   one, the list is dropped, because it was declared for the configured actor.
+   one, the client's configuration resolver drops the list, because it was declared for the configured actor. The
+   daemon takes the list on the frame as sent and does not check it against the frame's `actor_id`.
 3. **The check.** Decision 5's namespace rule becomes: the old row's namespace is the caller's own, the shared one,
    or one listed in the caller's `owned_namespaces`; anything else is refused as `old-namespace`, and the reason
    names the namespace found. An owned row is checked like a row in the caller's own namespace, so the shared-row
