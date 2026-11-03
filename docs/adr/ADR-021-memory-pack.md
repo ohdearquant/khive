@@ -15,6 +15,13 @@ consequences (#2724 proposed it; accepted 2026-09-18).
 **Amended**: 2026-09-22, [memory admission at the proposal-note route withdraws the AddNote
 exception](#amendment-memory-admission-at-the-proposal-note-route-withdraws-the-addnote-exception-2026-09-22)
 (#2057, #2967).
+**Amended**: 2026-11-01, [attributed semantic writes and caller properties](#amendment-attributed-semantic-writes-and-caller-properties-2026-11-01) routes a semantic write with no
+namespace to the caller's actor namespace, replacing the shared-pool default in §10 that the 2026-06-19 entry
+records, and adds `properties` to `memory.remember` (#6356; accepted 2026-11-02).
+**Amended**: 2026-11-02, [batch apply for memory rewrites](#amendment-batch-apply-for-memory-rewrites-2026-11-02)
+adds `memory.apply_batch`, and its
+[Delta 1](#delta-1-old-rows-in-namespaces-the-caller-owns-2026-11-02) admits old rows in namespaces the caller
+declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 
 ## Context
 
@@ -950,8 +957,8 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
 **Decision.**
 
 1. **Declaration.** The `[actor]` table takes `owned_namespaces`, a list of namespaces, empty by default. Loading the
-   configuration refuses an entry that does not parse as a namespace, the shared namespace `local`, the actor's own
-   id, a duplicate, and a non-empty list with no `[actor] id`. Ownership is declared by name and never inferred:
+   configuration refuses an empty entry, an entry that does not parse as a namespace, the shared namespace `local`,
+   the actor's own id, a duplicate, and a non-empty list with no `[actor] id`. Ownership is declared by name and never inferred:
    `visible_namespaces` grants read access, and configurations list other actors there for reading, so it says
    nothing about ownership; a namespace that shares the actor's id as a prefix is not owned unless it is listed.
 2. **Carriage.** The list travels with the caller's identity, the same way as `actor_id` and `visible_namespaces`:
@@ -967,8 +974,12 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
 4. **Scope.** The declaration is read by this check alone. It grants no write into the owned namespace, widens no
    read, and no other verb consults it.
 
-**Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. An owned
-namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
+**Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
+machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
+supersede there hides that actor's old rows from recall while keeping them in the store. The check is a rule of this
+verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
+isolation is a storage-layer property (Rule 9), so the declaration narrows what `memory.apply_batch` agrees to
+supersede and protects no row from a caller that holds its id. An owned namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
 refusal it has today.
 
 **Alternatives considered.** Reading ownership from `visible_namespaces` (rejected: read access, and it lists other
