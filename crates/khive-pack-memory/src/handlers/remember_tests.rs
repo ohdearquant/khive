@@ -864,7 +864,7 @@ async fn actual_seal_key_failure_retains_holder_and_unknown_disposition_on_creat
 
 /// Run the validator and return the `InvalidInput` message it refused with.
 fn refusal_message(raw: &serde_json::Value) -> String {
-    match super::validate_properties(raw) {
+    match super::validate_properties(raw, &[]) {
         Err(RuntimeError::InvalidInput(message)) => message,
         Err(other) => panic!("expected InvalidInput, got {other:?}"),
         Ok(accepted) => panic!("expected a refusal, got {accepted:?}"),
@@ -902,7 +902,7 @@ fn properties_must_be_an_object() {
 
 #[test]
 fn properties_accept_32_keys_and_refuse_33() {
-    let accepted = super::validate_properties(&object_with_keys(32)).expect("32 keys pass");
+    let accepted = super::validate_properties(&object_with_keys(32), &[]).expect("32 keys pass");
     assert_eq!(accepted.len(), 32);
 
     let message = refusal_message(&object_with_keys(33));
@@ -914,7 +914,7 @@ fn properties_accept_32_keys_and_refuse_33() {
 fn properties_accept_a_64_char_key_and_refuse_65() {
     let at_limit = format!("a{}", "b".repeat(63));
     assert_eq!(at_limit.chars().count(), 64);
-    super::validate_properties(&single_entry(&at_limit, serde_json::json!("v")))
+    super::validate_properties(&single_entry(&at_limit, serde_json::json!("v")), &[])
         .expect("a 64-character key passes");
 
     let over = format!("a{}", "b".repeat(64));
@@ -945,7 +945,7 @@ fn properties_refuse_malformed_keys() {
 #[test]
 fn properties_accept_well_formed_keys() {
     for key in ["a", "z9", "source_id", "a_b_c_1"] {
-        super::validate_properties(&single_entry(key, serde_json::json!("v")))
+        super::validate_properties(&single_entry(key, serde_json::json!("v")), &[])
             .unwrap_or_else(|e| panic!("{key:?} should pass: {e:?}"));
     }
 }
@@ -1000,7 +1000,7 @@ fn properties_accept_strings_numbers_booleans_and_string_arrays() {
         "refs": ["a", "b"],
         "empty": [],
     });
-    let accepted = super::validate_properties(&raw).expect("every allowed value shape passes");
+    let accepted = super::validate_properties(&raw, &[]).expect("every allowed value shape passes");
     assert_eq!(accepted.len(), 7);
     assert_eq!(accepted["refs"], serde_json::json!(["a", "b"]));
 }
@@ -1039,7 +1039,7 @@ fn properties_accept_8192_bytes_and_refuse_8193() {
         serde_json::to_string(&at_limit).expect("serialize").len(),
         8192
     );
-    super::validate_properties(&at_limit).expect("8192 bytes pass");
+    super::validate_properties(&at_limit, &[]).expect("8192 bytes pass");
 
     let over = single_entry("k", serde_json::Value::String("x".repeat(8185)));
     assert_eq!(serde_json::to_string(&over).expect("serialize").len(), 8193);

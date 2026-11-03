@@ -455,6 +455,24 @@ async fn recall_property_suppression_requires_uuid_or_long_hex_prefix() {
             .upsert_note(source)
             .await
             .expect("store source note with legacy property");
+        // upsert_note writes the note row only. Keyword recall reads the text
+        // index, so each row gets the text document memory.remember would write.
+        let text = rt.text_for_notes(&token).expect("text store");
+        for subject_id in [target_id, source_id] {
+            text.upsert_document(khive_storage::TextDocument {
+                subject_id,
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("memory".into()),
+                namespace: "local".into(),
+                title: None,
+                body: query.clone(),
+                tags: vec![],
+                metadata: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("index note text");
+        }
         expected.push((query, supersedes, target_id, source_id));
     }
 

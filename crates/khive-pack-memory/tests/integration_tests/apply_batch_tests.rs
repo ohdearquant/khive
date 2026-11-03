@@ -279,6 +279,17 @@ async fn test_apply_batch_refusal_codes() {
                 "properties": {"who": "t", "batch": "mine"},
             }),
         ),
+        (
+            // memory.remember refuses a supplied supersedes; a batch row gets the
+            // batch's own code for it.
+            "reserved-property",
+            json!({
+                "id": old.to_string(),
+                "action": "supersede",
+                "content": "x",
+                "properties": {"who": "t", "supersedes": old.to_string()},
+            }),
+        ),
     ];
     for (expected, row) in cases {
         let code = ab_refusal_code(&rt, &alice, row).await;

@@ -24,7 +24,7 @@ use khive_storage::EdgeRelation;
 use crate::MemoryPack;
 
 use super::common::{decode_params, deser, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC};
-use super::remember::{actor_namespace, check_remember_fields};
+use super::remember::{actor_namespace, check_remember_fields, BATCH_WRITTEN_PROPERTY_KEYS};
 
 /// Longest accepted batch name, in characters.
 const MAX_BATCH_NAME_CHARS: usize = 128;
@@ -416,10 +416,13 @@ impl MemoryPack {
         }
 
         let content = row.content.as_deref().unwrap_or("");
+        // The added keys pass here so that a supplied one is refused below under
+        // its own `reserved-property` code.
         let (memory_type, extra) = match check_remember_fields(
             content,
             row.memory_type.as_deref(),
             row.properties.as_ref(),
+            BATCH_WRITTEN_PROPERTY_KEYS,
         ) {
             Ok(checked) => checked,
             Err(error) => {
@@ -514,9 +517,12 @@ impl MemoryPack {
         let properties = Value::Object(properties);
         // The stored properties carry the three added keys, so the size and key
         // limits are checked on the merged object.
-        if let Err(error) =
-            check_remember_fields(content, row.memory_type.as_deref(), Some(&properties))
-        {
+        if let Err(error) = check_remember_fields(
+            content,
+            row.memory_type.as_deref(),
+            Some(&properties),
+            BATCH_WRITTEN_PROPERTY_KEYS,
+        ) {
             return refused(
                 echo,
                 old_namespace,
@@ -666,7 +672,7 @@ impl MemoryPack {
         planned: PlannedWrite,
     ) -> Result<(&'static str, Uuid), WriteFailure> {
         let stored = self
-            .handle_remember(token, planned.params)
+            .remember_permitting(token, planned.params, BATCH_WRITTEN_PROPERTY_KEYS)
             .await
             .map_err(|error| WriteFailure {
                 code: "write-failed",
