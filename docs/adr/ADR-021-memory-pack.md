@@ -977,7 +977,10 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
 
 **Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
 machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
-supersede there hides that actor's old rows from recall while keeping them in the store. The check is a rule of this
+supersede there hides that actor's old rows from recall while keeping them in the store. The hiding reaches only a
+reader whose recall covers both that namespace and the caller's: the new row and its `supersedes` edge are written in
+the caller's namespace, and recall reads `supersedes` edges in the reader's own namespace, so a reader scoped to the
+owning actor's namespace alone still recalls the old rows. The check is a rule of this
 verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
 isolation is a storage-layer property (Rule 9), so the declaration only bounds what `memory.apply_batch` agrees to
 supersede: more than with no declaration, which refuses every row outside the caller's namespace and the shared `local` one, and less than a
