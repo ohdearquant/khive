@@ -503,9 +503,9 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         compute = step_block(measurement, "Compute coverage")
         step = re.findall(r"(?m)^        timeout-minutes: (\d+)$", compute)
         self.assertEqual((len(job), len(step)), (1, 1))
-        # Preserve the original 1.37x margin against the known 39-minute
-        # successful instrumented run, rounding up to whole minutes.
-        derived_floor = (39 * 137 + 99) // 100
+        # Preserve the 1.37x margin against the slowest completed instrumented
+        # run, 54m04s (3244 s), rounding up to whole minutes.
+        derived_floor = (3244 * 137 + 5999) // 6000
         self.assertGreaterEqual(int(step[0]), derived_floor)
         # A job-level timeout cancels the job, and a cancelled job is neither
         # success nor skipped, so the step budget has to expire first for the

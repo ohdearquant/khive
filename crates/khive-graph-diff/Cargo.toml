@@ -15,7 +15,7 @@ description = "Pure deterministic graph-state diffs over entity, edge, and note 
 bench = false
 
 [dependencies]
-khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.16.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
