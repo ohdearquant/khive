@@ -1326,15 +1326,21 @@ def scope_of(who) -> dict:
 
 def require_same_scope(scopes: dict, read_set: list[str]) -> None:
     """Both arms run as the same caller with the same primary and readable namespaces, and the readable set is the
-    bank's read set (the primary namespace is always readable)."""
+    bank's read set plus the two namespaces the runtime adds to every caller's: the primary namespace, and the
+    caller's own actor namespace (its actor id, unless that is `local`), which the runtime folds into the configured
+    visible namespaces."""
     none, cand = scopes["none"], scopes["candidate"]
     if none != cand:
         raise GateRefused(f"the arms' caller or namespace scope differ: no profile {json.dumps(none)}, candidate "
                           f"{json.dumps(cand)}; the arms are not compared")
-    expected = sorted(set(read_set) | {none["namespace"]})
+    added = {none["namespace"]}
+    actor = none["actor_id"]
+    if isinstance(actor, str) and actor and actor != "local":
+        added.add(actor)
+    expected = sorted(set(read_set) | added)
     if none["visible_namespaces"] != expected:
         raise GateRefused(f"the readable namespaces are {none['visible_namespaces']}, the bank's read set (with the "
-                          f"primary namespace {none['namespace']!r}) is {expected}")
+                          f"primary namespace {none['namespace']!r} and the actor namespace {actor!r}) is {expected}")
 
 
 def token_budget_cap_from_help(help_result) -> int | None:
@@ -2049,11 +2055,12 @@ def gate_self_checks(arm, with_patches) -> None:
         lambda: with_patches({"require_no_binding": lambda reads: None}, binding_refused) is False)
 
     def scope_refused():
-        s = {"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local"]}
+        # The runtime reports the configured set plus the primary namespace and the actor's own namespace.
+        s = {"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local", "a"]}
         same = {"none": scope_of(s), "candidate": scope_of(s)}
         other = {"none": scope_of(s), "candidate": scope_of({**s, "actor_id": "b"})}
         narrower = {"none": scope_of(s), "candidate": scope_of({**s, "visible_namespaces": ["local"]})}
-        return (scope_of(s)["visible_namespaces"] == ["local", "team-a"]
+        return (scope_of(s)["visible_namespaces"] == ["a", "local", "team-a"]
                 and not stops(lambda: require_same_scope(same, ["team-a", "local"]))
                 and not stops(lambda: require_same_scope(same, ["team-a"]))
                 and stops(lambda: require_same_scope(other, ["team-a", "local"]), GateRefused)
@@ -2063,6 +2070,23 @@ def gate_self_checks(arm, with_patches) -> None:
 
     arm("rebind-gate: arms whose caller or namespace sets differ, or a readable set that is not the bank's, are refused",
         scope_refused)
+
+    def actor_namespace_counted():
+        def both(who):
+            return {"none": scope_of(who), "candidate": scope_of(who)}
+        with_actor = both({"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local", "a"]})
+        without_actor = both({"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local"]})
+        extra = both({"actor_id": "a", "namespace": "local", "visible_namespaces": ["team-a", "local", "a", "team-c"]})
+        local_actor = both({"actor_id": "local", "namespace": "local", "visible_namespaces": ["team-a", "local"]})
+        no_actor = both({"namespace": "local", "visible_namespaces": ["team-a", "local"]})
+        return (not stops(lambda: require_same_scope(with_actor, ["team-a"]))
+                and stops(lambda: require_same_scope(without_actor, ["team-a"]), GateRefused)
+                and stops(lambda: require_same_scope(extra, ["team-a"]), GateRefused)
+                and not stops(lambda: require_same_scope(local_actor, ["team-a"]))
+                and not stops(lambda: require_same_scope(no_actor, ["team-a"])))
+
+    arm("rebind-gate: the readable set includes the caller's own actor namespace as the runtime adds it, and one with "
+        "that namespace missing or another one added is refused", actor_namespace_counted)
     help_ok = {"params": [{"description": "Default token budget (tokens). Server-side cap: 16000. Default: 4000."}]}
     arm("rebind-gate: the token-budget cap is read from the help text, an operator cap is used only when the help "
         "states none and must agree when it does",
@@ -2252,8 +2276,9 @@ def gate_self_checks(arm, with_patches) -> None:
                 self.ops.append(text)
                 verb = text.split("(", 1)[0]
                 if verb == "whoami":
-                    return {"actor_id": "bench:unbound", "namespace": "local",
-                            "visible_namespaces": sorted(set(self.visible) | {"local"})}
+                    # As the runtime reports it: the configured set, the primary namespace and the actor's own.
+                    return {"actor_id": BENCH_ACTOR, "namespace": "local",
+                            "visible_namespaces": sorted(set(self.visible) | {"local", BENCH_ACTOR})}
                 if verb == "brain.resolve":
                     return {"matched_binding": binding, "profile_id": None}
                 if verb == "brain.profile":
