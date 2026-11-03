@@ -952,11 +952,41 @@ fn properties_accept_well_formed_keys() {
 
 #[test]
 fn properties_refuse_reserved_keys() {
-    for key in ["memory_type", "tags", "attribution"] {
+    for key in ["memory_type", "tags", "attribution", "supersedes"] {
         let message = refusal_message(&single_entry(key, serde_json::json!("v")));
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("reserved"), "{message}");
     }
+}
+
+#[tokio::test]
+async fn remember_refuses_supersedes_property() {
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt));
+    let registry = builder.build().expect("registry");
+    let target = uuid::Uuid::new_v4();
+
+    let error = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "a replacement memory",
+                "properties": {"supersedes": target.to_string()}
+            }),
+        )
+        .await
+        .expect_err("memory.remember must refuse caller-supplied supersedes");
+    let RuntimeError::InvalidInput(message) = error else {
+        panic!("expected InvalidInput, got {error:?}");
+    };
+    assert!(message.contains("\"supersedes\""), "{message}");
+    assert!(message.contains("memory.apply_batch"), "{message}");
+    assert!(
+        message.contains("link(relation=\"supersedes\")"),
+        "{message}"
+    );
 }
 
 #[test]

@@ -55,9 +55,19 @@ const MAX_PROPERTY_KEYS: usize = 32;
 const MAX_PROPERTY_KEY_CHARS: usize = 64;
 /// Largest accepted serialized `properties` object, in bytes.
 const MAX_PROPERTIES_BYTES: usize = 8192;
-/// Keys that have their own parameter (`memory_type`, `tags`) or are written by
-/// the runtime (`attribution`), so a caller may not set them through `properties`.
-const RESERVED_PROPERTY_KEYS: [&str; 3] = ["memory_type", "tags", "attribution"];
+/// Keys a caller may not set through `properties`, each with the reason its
+/// refusal gives: `memory_type` and `tags` have their own parameters,
+/// `attribution` is written by the runtime, and `supersedes` is written by
+/// `memory.apply_batch` (recall hides the row it names).
+const RESERVED_PROPERTY_KEYS: [(&str, &str); 4] = [
+    ("memory_type", "memory_type has its own parameter"),
+    ("tags", "tags has its own parameter"),
+    ("attribution", "attribution is written by the runtime"),
+    (
+        "supersedes",
+        "supersedes is written by memory.apply_batch; use link(relation=\"supersedes\") to add a supersedes edge",
+    ),
+];
 
 /// A key is 1-64 characters: a lowercase ASCII letter first, then lowercase
 /// ASCII letters, digits or `_`.
@@ -105,9 +115,12 @@ fn validate_properties(raw: &Value) -> Result<serde_json::Map<String, Value>, Ru
                 MAX_PROPERTY_KEY_CHARS
             )));
         }
-        if RESERVED_PROPERTY_KEYS.contains(&key.as_str()) {
+        if let Some((_, reason)) = RESERVED_PROPERTY_KEYS
+            .iter()
+            .find(|(reserved, _)| *reserved == key.as_str())
+        {
             return Err(RuntimeError::InvalidInput(format!(
-                "properties key {key:?} is reserved: memory_type and tags have their own parameters and attribution is written by the runtime"
+                "properties key {key:?} is reserved: {reason}"
             )));
         }
         let refusal: Option<&str> = match value {
@@ -260,7 +273,7 @@ impl MemoryPack {
                 props["tags"] = json!(tags);
             }
         }
-        // Validated keys never collide with `memory_type`, `tags` or `attribution`.
+        // Validated keys never collide with `memory_type`, `tags`, `attribution` or `supersedes`.
         if let Some(extra) = extra_properties {
             for (key, value) in extra {
                 props[key.as_str()] = value;
