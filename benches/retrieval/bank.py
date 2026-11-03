@@ -82,6 +82,20 @@ arm and round, hit@10, the lost and gained questions, widened questions, recalls
 composite sits at its clamp (pre_entity_score 1.0; not available when a weighted reranker is configured), questions whose
 top ten differs between the rounds, and whether the candidate's entity term is 1 for every hit.
 
+The candidate must be on the staged copy: every round's server process reads it before its first recall and records it.
+Without `--create-candidate-local-factor` the gate creates nothing, so the candidate must already be there (for example
+a profile the frozen store holds). A profile's `local_factor` can only be set when it is created, so a different value
+is a new profile. `--create-candidate-local-factor F` (a finite number in [0.5, 1], checked before anything is staged)
+creates the candidate on the copy with that `local_factor` before round 1. One extra `kkernel mcp` process does it, as
+the same bench actor and with the own-namespace bank's read set as the round processes: it reads the candidate and
+refuses the run (exit 12) if the profile is already on the copy, calls `brain.create_profile` (consumer_kind recall,
+left inactive, since a recall that names a profile by id serves it unless it is archived), and reads it back, where
+`local_factor` must equal F, `total_events` must be 0 and the lifecycle must not be archived. It runs no recall before
+the create: the create commits the server's in-memory brain state to the copy, and a recall's credits would be
+committed with it. The responses, the pressure reading, the brain_profile check and the stderr path go in
+rebind-gate.json under `candidate_created`. The create writes to the copy, so a copy adopted with `--staged-home` no
+longer matches its transfer record afterwards and a later run on it is refused.
+
 Subcommands:
     check-bank        validate a bank directory and print its population
     run               score repeated banks and profiles, writing <out>/<bank_id>/<arm>.jsonl plus run.json
@@ -104,6 +118,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -1218,6 +1233,11 @@ GATE_SHARED_MAX_LOST_QUESTIONS = 1
 EXIT_PASS, EXIT_FAIL, EXIT_VOID, EXIT_REFUSED = 0, 10, 11, 12
 GATE_ARMS = ("none", "candidate")
 GATE_ROLES = ("own", "shared")
+# The range brain.create_profile accepts for a profile's local_factor.
+GATE_LOCAL_FACTOR_MIN, GATE_LOCAL_FACTOR_MAX = 0.5, 1.0
+GATE_CANDIDATE_DESCRIPTION = "Candidate profile created by the rebind-gate bench for one local_factor value."
+GATE_PROFILE_KEYS = ("profile_id", "lifecycle", "local_factor", "total_events", "posterior_means")
+GATE_CREATE_KEYS = ("created", "profile_id", "consumer_kind", "lifecycle", "description")
 
 
 class GateStop(Exception):
@@ -1599,8 +1619,8 @@ def build_gate_report(profile: str, banks: dict, rounds: list[dict], reranker_we
     return report
 
 
-def render_summary(report: dict, banks: dict) -> str:
-    lines = [f"rebind-gate {report['profile']}: {report['verdict']}"]
+def render_summary(report: dict, banks: dict, candidate_line: str) -> str:
+    lines = [f"rebind-gate {report['profile']}: {report['verdict']}", candidate_line]
     for role in GATE_ROLES:
         b = banks[role]
         lines.append(f"{role} bank {b['meta']['bank_id']} v{b['meta']['version']}: {len(b['cases'])} questions, "
@@ -1658,6 +1678,91 @@ def gate_preflight(br, role: str, bank: dict, cand: str, args, state: dict, proc
                               "unknown") from e
         cap, source = resolve_token_budget_cap(help_result, args.token_budget_cap)
         state.update(cap=cap, cap_source=source, config=gate_recall_config(cap))
+
+
+def require_local_factor(value) -> float:
+    """The `local_factor` a created candidate gets: a finite number in the range brain.create_profile accepts."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not GATE_LOCAL_FACTOR_MIN <= value <= GATE_LOCAL_FACTOR_MAX):
+        raise GateRefused(f"--create-candidate-local-factor must be a finite number in [{GATE_LOCAL_FACTOR_MIN}, "
+                          f"{GATE_LOCAL_FACTOR_MAX}], got {value!r}")
+    return float(value)
+
+
+def trimmed(value, keys: tuple[str, ...]):
+    """The named fields of a record answer, or the answer itself when it is not a record."""
+    return {k: value.get(k) for k in keys} if isinstance(value, dict) else value
+
+
+def require_candidate_absent(br, cand: str, created: dict) -> None:
+    """The candidate is not on the copy yet. A profile `brain.profile` does not know is answered with the error
+    `not found: profile "<id>"`; that is the expected case. An answer means the profile exists, and any other error
+    means the copy cannot be read as holding no such profile; both refuse. The read is recorded either way."""
+    try:
+        found = br.one(op("brain.profile", profile_id=cand))
+    except BankError as e:
+        message = str(e.code)
+        created["before"] = {"error": message}
+        if f'not found: profile "{cand}"' in message.replace("\\", ""):
+            return
+        raise GateRefused(f"profile {cand} could not be read on the copy before the create ({message}), so it is not "
+                          "known to be absent") from e
+    created["before"] = trimmed(found, GATE_PROFILE_KEYS)
+    raise GateRefused(f"--create-candidate-local-factor creates a new profile and {cand} is already on the copy")
+
+
+def require_created_as_asked(cand: str, local_factor: float, profile) -> None:
+    """The profile read back after the create carries the asked-for `local_factor` (an exact numeric comparison with
+    the value the runtime returns: it stores the number as given), no events, and is not archived."""
+    if not isinstance(profile, dict):
+        raise GateRefused(f"profile {cand} read back after the create is not a record ({json.dumps(profile)[:200]})")
+    got, events = profile.get("local_factor"), profile.get("total_events")
+    if isinstance(got, bool) or not isinstance(got, (int, float)) or got != local_factor:
+        raise GateRefused(f"profile {cand} read back after the create has local_factor {got!r}, not the "
+                          f"{local_factor} asked for")
+    if not isinstance(events, int) or isinstance(events, bool) or events != 0:
+        raise GateRefused(f"profile {cand} read back after the create has total_events {events!r}, not 0")
+    if profile.get("lifecycle") == "archived":
+        raise GateRefused(f"profile {cand} read back after the create is archived, so a recall naming it is refused")
+
+
+def create_gate_candidate(args, scratch: Path, db: Path, env: dict, read_set: list[str], cand: str,
+                          local_factor: float, created: dict) -> None:
+    """Create the candidate on the staged copy, in one server process of its own. It runs the checks every round
+    process runs, as the same bench actor and with the own-namespace bank's read set, and it runs no recall: the create
+    commits the server's in-memory brain state to the copy, and a recall's credits would be committed with it. No
+    activation step follows, since a recall that names a profile by id serves it whatever its lifecycle but archived.
+    `created` is the record, filled as the steps run so a refusal still shows what was read."""
+    write_config(scratch, args, read_set)
+    config_text = (scratch / "home" / ".khive" / "config.toml").read_text()
+    err_name = "kkernel-mcp-gate-create.err"
+    created["server_stderr"] = str(scratch / err_name)
+    created["brain_profile"] = require_brain_profile_unset(config_text, env, mcp_argv(args.kkernel, db))
+    created["memory_pressure"] = require_normal_pressure("before the candidate-creating server starts")
+    br = Bridge(args.kkernel, db, env, scratch / err_name)
+    try:
+        br.handshake()
+        require_candidate_absent(br, cand, created)
+        created["create"] = trimmed(br.one(op("brain.create_profile", name=cand, consumer_kind="recall",
+                                              local_factor=local_factor, description=GATE_CANDIDATE_DESCRIPTION)),
+                                    GATE_CREATE_KEYS)
+        after = br.one(op("brain.profile", profile_id=cand))
+        created["after"] = trimmed(after, GATE_PROFILE_KEYS)
+        require_created_as_asked(cand, local_factor, after)
+    finally:
+        br.close()
+
+
+def candidate_origin_line(profile: str, record: dict) -> str:
+    """One summary line: whether this run created the candidate or found it on the copy, and the `local_factor` the
+    round processes read on it."""
+    read = sorted({json.dumps(p["candidate_profile"].get("local_factor")) for p in record["processes"]
+                   if isinstance(p.get("candidate_profile"), dict)})
+    seen = f"local_factor read by the round processes: {', '.join(read) or 'not read'}"
+    created = record.get("candidate_created")
+    if created is None:
+        return f"candidate {profile}: found on the copy, not created by this run; {seen}"
+    return f"candidate {profile}: created by this run with local_factor {created['local_factor']}; {seen}"
 
 
 def run_gate_attempt(args, scratch: Path, db: Path, env: dict, banks: dict, cand: str, state: dict, tag: str,
@@ -1734,6 +1839,8 @@ def run_rebind_gate(args) -> int:
     shared_meta, shared_cases = load_bank(Path(args.shared_bank))
     require_distinct([own_meta["bank_id"], shared_meta["bank_id"]], "bank ids")
     safe_name(args.profile, "profile")
+    local_factor = (None if args.create_candidate_local_factor is None
+                    else require_local_factor(args.create_candidate_local_factor))
     require_bank_roles(own_cases, shared_cases)
     visible = {own_meta["bank_id"]: parse_read_set(args.own_visible, "--own-visible"),
                shared_meta["bank_id"]: parse_read_set(args.shared_visible, "--shared-visible")}
@@ -1766,10 +1873,13 @@ def run_rebind_gate(args) -> int:
         db, env, staged = stage_once(args, scratch)
         record.update({"snapshot_id": args.snapshot_id, "kkernel_version": kkernel_version(args.kkernel),
                        "run_id": run_id, **staged})
+        if local_factor is not None:
+            record["candidate_created"] = created = {"local_factor": local_factor}
+            create_gate_candidate(args, scratch, db, env, banks["own"]["visible"], args.profile, local_factor, created)
         rounds = run_gate_rounds(args, scratch, db, env, banks, args.profile, state, record)
         report = build_gate_report(args.profile, banks, rounds, state["config"]["reranker_weights"])
         record.update(status="complete", report=report)
-        text = render_summary(report, banks)
+        text = render_summary(report, banks, candidate_origin_line(args.profile, record))
         (out / "rebind-gate.txt").write_text(text + "\n")
         print(text, flush=True)
         code = EXIT_PASS if report["verdict"] == "PASS" else EXIT_FAIL
@@ -2116,16 +2226,27 @@ def gate_self_checks(arm, with_patches) -> None:
         return d
 
     def drive(plan=None, voids=None, binding=False, wrong_none=False, engines='[[engines]]\nname = "e"\n',
-              help_text=HELP, token_budget_cap=None, patches=None, out_exists=False):
+              help_text=HELP, token_budget_cap=None, patches=None, out_exists=False, create_factor=None,
+              on_copy=True, readback=None, shared_visible="team-a,local", read_error=None):
         """cmd_rebind_gate over fake processes. `plan[(role, question, nth)]` is (no-profile rank, candidate rank) the
         nth time that question is asked; `voids[(role, question)]` is how many times the no-profile recall answers
-        degraded before it answers clean."""
+        degraded before it answers clean. The fake server holds a profile table: the candidate is on the copy at
+        local_factor 0.7 when `on_copy`, `brain.profile` of an absent profile is a not-found error worded as the
+        runtime words it, and `brain.create_profile` adds a profile (refusing a name already there and a factor outside
+        [0.5, 1]) with `readback` fields overriding what it then reads back; `read_error` makes the creating process's
+        `brain.profile` fail with that text. `create_factor` is the new flag."""
         plan, voids = plan or {}, voids or {}
         asked, procs, sleeps, closes, ops_log = {}, [], [], [], []
+        creators, creator_closes, events, staged_calls = [], [], [], []
+        profiles = {CAND: {"profile_id": CAND, "lifecycle": "active", "local_factor": 0.7, "total_events": 0}} if on_copy else {}
 
         class Fake:
             def __init__(self, role, visible):
                 self.role, self.visible, self.ops = role, visible, []
+
+            def handshake(self):
+                self.ops.append("handshake")
+                return {}
 
             def one(self, text, timeout=900):
                 self.ops.append(text)
@@ -2136,7 +2257,25 @@ def gate_self_checks(arm, with_patches) -> None:
                 if verb == "brain.resolve":
                     return {"matched_binding": binding, "profile_id": None}
                 if verb == "brain.profile":
-                    return {"profile_id": CAND, "lifecycle": "active", "local_factor": 0.7, "total_events": 0}
+                    name = re.search(r'profile_id="([^"]+)"', text).group(1)
+                    if read_error is not None and self.role == "create":
+                        raise BankError(f"{text[:80]}: {read_error!r}")
+                    if name not in profiles:
+                        err = "not found: profile " + json.dumps(name)
+                        raise BankError(f"{text[:80]}: {err!r}")
+                    return dict(profiles[name])
+                if verb == "brain.create_profile":
+                    name = re.search(r'\(name="([^"]+)"', text).group(1)
+                    factor = json.loads(re.search(r"local_factor=([^,)]+)", text).group(1))
+                    if name in profiles:
+                        err = f"profile {json.dumps(name)} already exists"
+                        raise BankError(f"{text[:80]}: {err!r}")
+                    if not 0.5 <= factor <= 1:
+                        raise BankError(f"{text[:80]}: 'local_factor must be a finite number in [0.5, 1]'")
+                    profiles[name] = {"profile_id": name, "lifecycle": "inactive", "local_factor": factor,
+                                      "total_events": 0, **(readback or {})}
+                    return {"created": True, "profile_id": name, "consumer_kind": "recall", "lifecycle": "inactive",
+                            "description": re.search(r'description="([^"]*)"', text).group(1)}
                 if "help=true" in text:
                     if isinstance(help_text, BaseException):
                         raise help_text
@@ -2155,13 +2294,27 @@ def gate_self_checks(arm, with_patches) -> None:
                 return response([hit(x, att=att, by=by or (CAND if wrong_none else None)) for x in ids])
 
             def close(self):
-                closes.append(self.role)
+                (creator_closes if self.role == "create" else closes).append(self.role)
+
+        def fake_bridge(kkernel, db, env, err_path):
+            cfg = (err_path.parent / "home" / ".khive" / "config.toml").read_text()
+            visible = json.loads(re.search(r"visible_namespaces\s*=\s*(\[[^\]]*\])", cfg).group(1))
+            fb = Fake("create", visible)
+            fb.config, fb.err_path = cfg, err_path
+            creators.append(fb)
+            events.append("create")
+            return fb
+
+        def counting_stage(args, scratch):
+            staged_calls.append(1)
+            return fake_stage(args, scratch)
 
         def fake_open_bridge(a, db, env, scr, probe, profile_ids, served_check=None, err_name="x"):
             cfg = (scr / "home" / ".khive" / "config.toml").read_text()
             visible = json.loads(re.search(r"visible_namespaces\s*=\s*(\[[^\]]*\])", cfg).group(1))
             fb = Fake("own" if probe.startswith("own") else "shared", visible)
             procs.append(fb)
+            events.append("round")
             if served_check is not None:
                 try:
                     served_check(fb)
@@ -2177,22 +2330,25 @@ def gate_self_checks(arm, with_patches) -> None:
                 (td / "out").mkdir()
             own_dir, shared_dir = write_bank(td, "own-bank", "own", "team-a"), write_bank(td, "shared-bank", "shared", "local")
             a = types.SimpleNamespace(kkernel="k", own_bank=str(own_dir), shared_bank=str(shared_dir),
-                                      own_visible="team-a,local", shared_visible="team-a,local", profile=CAND,
+                                      own_visible="team-a,local", shared_visible=shared_visible, profile=CAND,
                                       store_main="m", store_events="e", staged_home=None, snapshot_id="s",
                                       engines_file=str(td / "engines.toml"), models_dir=None, control_id=gid(0),
                                       ready_max_s=5, scratch_parent=str(td), remove_scratch=False, copy_wal=False,
                                       round_gap_s=7.0, max_round_runs=6, token_budget_cap=token_budget_cap,
-                                      out=str(td / "out"))
+                                      create_candidate_local_factor=create_factor, out=str(td / "out"))
             out_buf, err_buf = io.StringIO(), io.StringIO()
-            patched = {"stage": fake_stage, "memory_pressure": lambda: {"source": "t", "reading": "1", "normal": True},
-                       "open_bridge": fake_open_bridge, "kkernel_version": lambda p: "test",
+            patched = {"stage": counting_stage, "memory_pressure": lambda: {"source": "t", "reading": "1", "normal": True},
+                       "open_bridge": fake_open_bridge, "Bridge": fake_bridge, "kkernel_version": lambda p: "test",
                        "gate_sleep": lambda s: sleeps.append(s), **(patches or {})}
             with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
                 code = with_patches(patched, lambda: cmd_rebind_gate(a))
             record = json.loads((td / "out" / "rebind-gate.json").read_text()) if (td / "out" / "rebind-gate.json").exists() else None
             text = (td / "out" / "rebind-gate.txt").read_text() if (td / "out" / "rebind-gate.txt").exists() else None
+            made = sorted(p.name for p in td.iterdir() if p.name.startswith("khive-question-bank-") or p.name == "out")
         return {"code": code, "record": record, "text": text, "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue(),
-                "procs": procs, "sleeps": sleeps, "closes": closes}
+                "procs": procs, "sleeps": sleeps, "closes": closes, "creators": creators,
+                "creator_closes": creator_closes, "events": events, "staged_calls": staged_calls, "profiles": profiles,
+                "made": made}
 
     def recall_ops(proc):
         return [t for t in proc.ops if t.startswith("memory.recall(") and "help=true" not in t]
@@ -2315,6 +2471,121 @@ def gate_self_checks(arm, with_patches) -> None:
     arm("rebind-gate: exit statuses are distinct: pass 0, fail 10, void 11, refused 12",
         lambda: len({EXIT_PASS, EXIT_FAIL, EXIT_VOID, EXIT_REFUSED}) == 4 and issubclass(GateRefused, GateStop)
         and GateStop.code == EXIT_VOID and GateRefused.code == EXIT_REFUSED)
+
+    # ---- creating the candidate on the copy (--create-candidate-local-factor)
+    def verbs_of(proc):
+        return [t.split("(", 1)[0] for t in proc.ops]
+
+    def creation_ops(r):
+        return verbs_of(r["creators"][0]) if len(r["creators"]) == 1 else None
+
+    def creates_candidate():
+        r = drive(create_factor=0.7, on_copy=False, shared_visible="local")
+        rec = r["record"] or {}
+        made = rec.get("candidate_created", {})
+        c = r["creators"][0] if len(r["creators"]) == 1 else None
+        return (r["code"] == EXIT_PASS and c is not None
+                and verbs_of(c) == ["handshake", "brain.profile", "brain.create_profile", "brain.profile"]
+                and c.ops[2].startswith(f'brain.create_profile(name="{CAND}", consumer_kind="recall", local_factor=0.7')
+                and not any(t.startswith("memory.recall(") for t in c.ops)
+                and r["creator_closes"] == ["create"] and r["events"] == ["create", "round", "round", "round", "round"]
+                and c.visible == ["team-a", "local"] and 'id = "bench:unbound"' in c.config
+                and len(r["procs"]) == 4 and r["profiles"][CAND]["lifecycle"] == "inactive"
+                and all(p["candidate_profile"]["local_factor"] == 0.7 and p["candidate_profile"]["lifecycle"] == "inactive"
+                        for p in rec["processes"])
+                and made["local_factor"] == 0.7 and f'not found: profile "{CAND}"' in made["before"]["error"]
+                and made["create"] == {"created": True, "profile_id": CAND, "consumer_kind": "recall",
+                                       "lifecycle": "inactive", "description": GATE_CANDIDATE_DESCRIPTION}
+                and (made["after"]["local_factor"], made["after"]["total_events"], made["after"]["lifecycle"])
+                == (0.7, 0, "inactive")
+                and made["memory_pressure"]["normal"] is True and made["brain_profile"]["config_toml"] == "unset"
+                and made["server_stderr"].endswith("/kkernel-mcp-gate-create.err")
+                and CAND not in Path(made["server_stderr"]).name
+                and "created by this run with local_factor 0.7" in r["text"])
+
+    arm("rebind-gate: with --create-candidate-local-factor and no candidate on the copy, one process of its own reads "
+        "(not found), creates, reads back, and runs no recall; the rounds then read the candidate at that factor",
+        creates_candidate)
+
+    def existing_candidate_refused():
+        r = drive(create_factor=0.9, on_copy=True)
+        rec = r["record"] or {}
+        return (r["code"] == EXIT_REFUSED and creation_ops(r) == ["handshake", "brain.profile"] and r["procs"] == []
+                and "already on the copy" in r["stderr"] and r["creator_closes"] == ["create"]
+                and r["profiles"][CAND]["local_factor"] == 0.7 and rec.get("status") == "stopped"
+                and rec["candidate_created"]["before"]["local_factor"] == 0.7)
+
+    arm("rebind-gate: --create-candidate-local-factor with the candidate already on the copy is refused (exit 12) "
+        "before any create and before any round process", existing_candidate_refused)
+    arm("rebind-gate: mutation control, with the existence check removed the already-on-the-copy arm reports failure",
+        lambda: with_patches({"require_candidate_absent": lambda br, cand, created: None},
+                             existing_candidate_refused) is False)
+
+    def unreadable_candidate_refused():
+        r = drive(create_factor=0.7, on_copy=False, read_error="storage: database is locked")
+        return (r["code"] == EXIT_REFUSED and creation_ops(r) == ["handshake", "brain.profile"] and r["procs"] == []
+                and "could not be read on the copy before the create" in r["stderr"]
+                and "database is locked" in r["stderr"] and r["profiles"] == {} and r["creator_closes"] == ["create"])
+
+    arm("rebind-gate: --create-candidate-local-factor with a candidate read that fails for any reason but not found is "
+        "refused (exit 12) before any create", unreadable_candidate_refused)
+
+    def bad_factors_refused():
+        runs = [drive(create_factor=f) for f in (0.4, 1.5, float("nan"), float("inf"), -0.7)]
+        return (all(r["code"] == EXIT_REFUSED and "--create-candidate-local-factor" in r["stderr"]
+                    and r["staged_calls"] == [] and r["procs"] == [] and r["creators"] == [] and r["made"] == []
+                    and r["record"] is None for r in runs)
+                and all(stops(lambda v=v: require_local_factor(v), GateRefused) for v in (True, "0.7", None))
+                and require_local_factor(1) == 1.0 and isinstance(require_local_factor(1), float))
+
+    arm("rebind-gate: a --create-candidate-local-factor outside [0.5, 1] or not finite is refused (exit 12) before any "
+        "copy, scratch directory, output or process", bad_factors_refused)
+
+    def boundary_factors_create():
+        runs = [(f, drive(create_factor=f, on_copy=False)) for f in (0.5, 1.0)]
+        return all(r["code"] == EXIT_PASS and r["record"]["candidate_created"]["after"]["local_factor"] == f
+                   and r["profiles"][CAND]["local_factor"] == f for f, r in runs)
+
+    arm("rebind-gate: the ends of the range, 0.5 and 1, are created and gated", boundary_factors_create)
+
+    def readback_refused(override, said):
+        r = drive(create_factor=0.7, on_copy=False, readback=override)
+        rec = r["record"] or {}
+        return (r["code"] == EXIT_REFUSED and r["procs"] == [] and said in r["stderr"]
+                and creation_ops(r) == ["handshake", "brain.profile", "brain.create_profile", "brain.profile"]
+                and r["creator_closes"] == ["create"] and rec.get("status") == "stopped"
+                and rec["candidate_created"]["create"]["created"] is True)
+
+    def readbacks_refused():
+        return all(readback_refused(o, s) for o, s in (
+            ({"local_factor": 0.6}, "local_factor 0.6"), ({"total_events": 3}, "total_events 3"),
+            ({"lifecycle": "archived"}, "is archived")))
+
+    arm("rebind-gate: a created candidate read back with another local_factor, with events, or archived is refused "
+        "(exit 12) before any round process", readbacks_refused)
+    arm("rebind-gate: mutation control, with the read-back check removed the read-back arm reports failure",
+        lambda: with_patches({"require_created_as_asked": lambda *a: None}, readbacks_refused) is False)
+
+    def no_flag_creates_nothing():
+        r = drive()
+        ops = [t for p in r["procs"] for t in p.ops]
+        return (r["code"] == EXIT_PASS and r["creators"] == [] and r["events"] == ["round"] * 4
+                and not any(t.startswith("brain.create_profile(") for t in ops)
+                and "candidate_created" not in r["record"]
+                and "candidate cand-p: found on the copy, not created by this run; local_factor read by the round "
+                    "processes: 0.7" in r["text"])
+
+    arm("rebind-gate: without the flag the gate creates nothing, records no creation, and says the candidate was "
+        "found on the copy", no_flag_creates_nothing)
+
+    def absent_without_flag_refused():
+        r = drive(on_copy=False)
+        return (r["code"] == EXIT_REFUSED and r["creators"] == [] and f'not found: profile "{CAND}"' in r["stderr"]
+                and not any(recall_ops(p) for p in r["procs"]) and r["profiles"] == {}
+                and not any(t.startswith("brain.create_profile(") for p in r["procs"] for t in p.ops))
+
+    arm("rebind-gate: without the flag a candidate that is not on the copy is refused (exit 12) by the round process, "
+        "and nothing is created", absent_without_flag_refused)
 
 
 def self_test() -> int:
@@ -3202,6 +3473,10 @@ def main() -> int:
                    help="runs of one round before the gate stops, void runs included (default 6)")
     g.add_argument("--token-budget-cap", type=int, default=None,
                    help="the recall token-budget cap, used only when the recall help in the copy is read and states none")
+    g.add_argument("--create-candidate-local-factor", type=float, default=None, metavar="F",
+                   help="create the candidate on the copy with this local_factor (a finite number in [0.5, 1]) before "
+                        "round 1; refused when the candidate is already on the copy. Without it the candidate must "
+                        "already be on the copy")
     g.add_argument("--out", required=True, help="a new directory: rebind-gate.json and rebind-gate.txt")
     sub.add_parser("self-test")
     args = ap.parse_args()
