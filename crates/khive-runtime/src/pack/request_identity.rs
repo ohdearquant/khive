@@ -38,6 +38,11 @@ pub struct VerbRegistry {
     /// still pin to `'local'`. An explicit `namespace=` request param is a
     /// precise single-namespace escape and is not widened by this set.
     pub(super) visible_namespaces: Vec<Namespace>,
+    /// Operator-declared namespaces the baked actor owns (`[actor]
+    /// owned_namespaces`, ADR-021 Delta 1). Stamped onto every minted token and
+    /// read by the `memory.apply_batch` old-row namespace check alone; it grants
+    /// no write and widens no read.
+    pub(super) owned_namespaces: Vec<Namespace>,
     /// Configured actor identity label (ADR-057). When `Some`, dispatch mints
     /// tokens carrying this actor so that `comm.inbox` applies the `to_actor`
     /// filter. When `None`, tokens carry `ActorRef::anonymous()` (party-line).
@@ -136,6 +141,12 @@ pub struct RequestIdentity {
     /// failing the whole request — a single malformed visibility entry from a
     /// caller-supplied frame must not block dispatch.
     pub visible_namespaces: Vec<String>,
+    /// Namespaces the caller declared it owns (`[actor] owned_namespaces`,
+    /// ADR-021 Delta 1), carried like `actor_id` and `visible_namespaces`.
+    /// Overrides `VerbRegistry::owned_namespaces`. Entries that fail
+    /// `Namespace::parse` are dropped. Read by the `memory.apply_batch` old-row
+    /// namespace check alone; it grants no write and widens no read.
+    pub owned_namespaces: Vec<String>,
     /// Opaque process provenance resolved by the originating request process.
     /// `None` means the origin did not set one; a warm daemon must not replace
     /// it with its own process environment. This field is attribution-only and
@@ -173,6 +184,11 @@ impl RequestIdentity {
             actor_id: token.actor().binding_id().map(str::to_string),
             visible_namespaces: token
                 .visible_namespaces()
+                .iter()
+                .map(|namespace| namespace.as_str().to_string())
+                .collect(),
+            owned_namespaces: token
+                .owned_namespaces()
                 .iter()
                 .map(|namespace| namespace.as_str().to_string())
                 .collect(),

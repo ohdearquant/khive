@@ -785,3 +785,229 @@ Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_with
 `replay_balanced_only_fixture_matches_prior_reducer`, `replay_folded_event_counts_sum_to_log_length`,
 `replay_credits_judgments_to_a_profile_archived_after_them`. Test in `khive-pack-brain/src/durable_write_tests.rs`:
 `judgments_survive_archive_and_restart`.
+
+## Amendment 4 (2026-11-02): Default weights while serving, and a fixed shared-pool factor
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Changes §1 (serve-time projection of profile weights) and adds
+a fixed rank factor carried by a profile. The implementing change lands after
+Amendment 3 Change 3 (a recall hit no longer credits the per-entity posterior of the hit it ranked first), on which
+Change 2 relies. Rebinding a named profile is gated per profile by Change 4.
+
+### Problem, measured
+
+**1. Projected weights rank worse than the defaults.** §1 serves each profile's three posterior means as its relevance,
+salience and temporal weights, with no normalization (`PackTunable::project_config`). On the measured deployment those
+posteriors move mostly on signals that are not explicit judgments: relevance gains on every recall that returns a hit,
+temporal moves with recall latency, and salience gains on every positive feedback event, implicit ones included (the
+measured export holds 8,070 implicit positive events beside 7,136 explicit judgments). The served means are near
+relevance 1.0, salience 0.8 and temporal 0, against the defaults 0.7, 0.2 and 0.1. The composite then passes 1.0 and is
+clamped, so inside the top ten clamped hits are ordered by the entity term, lowered by the duplicate penalty where
+one applies, and then by the id tiebreak, not by relevance.
+
+On a frozen copy of the deployment's store, three readers, 30 questions per bank, answers checked by hand:
+
+| Measure                                                                                  | No profile         | Profile served     |
+| ---------------------------------------------------------------------------------------- | ------------------ | ------------------ |
+| Top-10 hits at the clamp, own-namespace banks, each of four profiles in turn (see below) | 0 of 900           | 363 to 418 of 900  |
+| Top-10 hits at the clamp, shared-pool banks, each of four profiles in turn (see below)   | 0 of 900           | 378 to 416 of 900  |
+| MRR@10, answers in the reader's own namespace, the reader's own profile (90 questions)   | .297               | .273               |
+| MRR@10, answers in the shared pool, the reader's own profile (30 questions, 3 read sets) | .355 / .355 / .354 | .320 / .322 / .351 |
+
+The clamp rows count top-10 hits whose returned rank score, divided by the entity term recomputed from the stored
+posterior, is at least 0.999. A hit lowered by the duplicate penalty is not counted, and a hit just under 1.0 is, so
+the counts are close to the number of clamped hits rather than exact.
+
+hit@10 is equal between the arms on every bank: the projected weights reorder the answers already in the top ten.
+Rescoring the no-profile arm's returned hits, whose rank scores already use the default weights, with each profile's
+stored entity term gives .298 on the own-namespace questions, and with an entity term rebuilt from explicit judgments
+only, .296, against .297 without the term and .273 served. On this sample the entity term moves MRR@10 by at most .002
+once the weights are the defaults, while the served profile, projected weights and entity term together, loses .024; the
+rescoring reorders only the 50 returned hits, so it bounds the term's effect on these questions, not end to end. A live
+probe on the deployment showed the saturation directly: one query returned three hits all at `rank_score` 1.000 under
+the bound profile, so their order fell to the id tiebreak, and the same query with the binding removed returned them at
+0.693, 0.598 and 0.529, in a different order.
+
+**2. A recall that names a namespace serves only the profiles held there.** Brain state, profiles included, is loaded
+from the request's primary namespace, and an explicit `namespace=` makes that namespace primary. On a deployment whose
+profiles live in `local`, a recall with `namespace=<the caller's own>` returned `serve_attribution: "unspecified"`
+while a binding was active, and adding `profile_id` returned `profile_id ... is not a known profile`. A recall naming
+`namespace="local"`, or a namespace that holds the profile, serves it. This amendment does not change that path.
+
+**3. The shared pool outranks the caller's own rows on equal terms.** No ranking stage reads a candidate's namespace.
+Recomputing the no-profile arm's 50 returned hits with `local` rows scaled by a fixed factor `f`:
+
+| Answers in                                         | `f` = 1            | `f` = 0.7          | `f` = 0.5          |
+| -------------------------------------------------- | ------------------ | ------------------ | ------------------ |
+| Caller's own namespace, MRR@10 (90 questions)      | .297               | .375               | .444               |
+| Caller's own namespace, hit@10                     | .433               | .533               | .567               |
+| Own-namespace questions ranked lower than at f = 1 | -                  | 0 of 90            | 0 of 90            |
+| Shared pool, MRR@10, three read sets               | .355 / .355 / .354 | .355 / .355 / .315 | .346 / .338 / .282 |
+
+The cost falls on the read set that holds the most rows of its own that compete with the shared answer. These numbers
+reorder only the 50 hits the no-profile arm returned and apply the factor after admission, so they motivate the value
+and do not decide it; Change 4 decides it end to end.
+
+### Change 1: serve the default weights
+
+A served profile scores with the configured default weights; §1's projection is no longer applied to the request.
+The projection stays computed and reported:
+
+- `brain.profile` adds a top-level `posterior_means` object, `{relevance, salience, temporal}`, each the mean of the
+  stored posterior, or `null` when the profile has no state snapshot.
+- With `include_breakdown=true`, each hit's `breakdown` adds `weights_served`, the string `"default"`, and keeps
+  `profile_component` with its current definition (the hit's composite under the projected weights divided by its
+  composite under the defaults), computed for the breakdown only. It no longer enters `rank_score`.
+- `brain.config` keeps returning the projected configuration as a diagnostic; it is not what recall serves.
+- The `min_score` help text stops listing a weight-reprojection component among the terms that adjust `rank_score`.
+
+Tests that assert a projected weight reorders results (the Stage A and B ordering tests) are replaced by tests that a
+served profile's order equals the default-weight order with the same entity term, while `profile_component` still
+differs from 1.0 where the posteriors differ from the defaults. Serving a projection again requires an amendment that
+defines how explicit judgments alone train the three weight posteriors and that passes the Change 4 gate.
+
+### Change 2: a fixed shared-pool factor carried by the profile
+
+`brain.create_profile` accepts an optional `local_factor`, a finite number in [0.5, 1], stored as given and rounded to a
+32-bit float when applied to the 32-bit rank score. Scaling by a positive constant never reverses the order of two
+scores and can tie them only where they already lie within rounding of each other; the floor bounds how far a
+shared-pool row can fall below its unscaled score, and the measured values (0.7, 0.5) lie inside the range. The
+duplicate penalty is subtracted after the factor (step 3 below) and floors at zero, so a later shared-pool copy whose
+scaled rank score is at or below the penalty falls to zero, where the id tiebreak orders it against other zeroed copies
+and a positive `min_score` drops it, as happens today to an unscaled copy at or below the penalty. The factor widens
+that set to copies whose unscaled score is at most the penalty divided by the factor; the floor of 0.5 keeps it to at
+most twice the penalty. It is a field of the profile record, persisted with the record in the brain state snapshot, and returned by `brain.profile` as a
+top-level `local_factor`. Only `brain.create_profile` sets it; no verb edits it, `brain.reset` keeps it, and a different
+value is a new profile. A record without the field, every existing profile included, loads as factor 1, an exact no-op.
+`memory.recall` reads it from the `brain.profile` response beside `state_snapshot`.
+
+When such a profile serves a recall, each candidate whose namespace is `local` (`Namespace::LOCAL`, the shared pool;
+not configurable today) has its rank score multiplied by `local_factor`; every other candidate is multiplied by 1. The
+factor depends on the serving profile alone, whoever the caller is.
+
+Placement, in `memory.recall`'s order of stages:
+
+1. The returned `score`, absolute relevance in [0, 1], is taken before the factor, so it is unchanged for every hit,
+   text-only hits included.
+2. The factor multiplies the rank score at the point where the entity term is applied, after the optional weighted
+   reranker (which, when configured, replaces the composite before the entity term) and before the first `min_score`
+   admission.
+3. The duplicate penalty, supersedes suppression, the second admission, the sort, the `limit` truncation and the
+   character budget then run on adjusted rank scores, as they do today. The duplicate penalty sorts by rank score,
+   leaves the first copy of a shared content prefix unpenalized and lowers each later copy by the penalty, so the
+   copy spared is whichever ranks higher after the factor.
+4. Supersedes suppression is unchanged. When it is enabled (the default): a candidate with an incoming `supersedes` edge
+   the reader can see is dropped whatever the scores, and a candidate named in another row's `supersedes` property is
+   dropped when that row was admitted. A superseding `local` row the factor scales below `min_score` therefore still
+   suppresses through its edge, and suppresses through its property only if admitted, as for any row below `min_score`
+   today.
+
+`min_score` and `score_floor` filter the adjusted `rank_score`; their help text states that under a profile with a
+factor, `local` rows' `rank_score` is scaled by it. With `include_breakdown=true`, each hit's `breakdown` adds:
+
+- `namespace`, the hit's namespace, which the request was already permitted to read;
+- `pre_entity_score`, the rank score before the entity term: the weighted composite, or the weighted reranker's output
+  when one is configured;
+- `entity_term`, the multiplier the entity posterior applied (1 when none);
+- `local_factor`, the factor applied to the hit (1 when none);
+- `duplicate_penalty`, the amount the duplicate penalty subtracted from the hit's rank score (0 when none).
+
+A returned hit's `rank_score` then equals `pre_entity_score` × `entity_term` × `local_factor` − `duplicate_penalty`,
+since no later stage changes a score. The arithmetic is 32-bit floating point in that order, left to right, with
+`local_factor` reported as the 32-bit value applied; the breakdown reports each operand as the 32-bit value used, so a
+consumer reproduces `rank_score` exactly by repeating those operations in 32-bit arithmetic. The product of the first
+three is the rank score the first `min_score` admission saw.
+
+The factor reorders candidates the request already retrieved and was permitted to read. It adds no candidate, widens
+no visibility, writes no posterior and is not authorization. It applies only where a profile serves, which excludes the
+namespace-scoped recalls of Problem 2 that find no profile.
+
+### Change 3: storage
+
+No table and no column. `local_factor` is an optional field of the profile record, which the brain state snapshot
+already persists; a record without it loads as factor 1. Event replay rebuilds posterior state and keeps the record
+field as loaded.
+
+### Change 4: rebind gate, per profile
+
+A named profile is bound for recall again only after an end-to-end run, on a fresh copy of a frozen store, with the
+implementing change and Amendment 3 Change 3 built in:
+
+- **Arms**, per bank: no profile; and the candidate profile served by `profile_id`, which scores with the default
+  weights, its own entity term and its `local_factor`. Both arms run as the same caller, with the same primary namespace
+  (the one holding the candidate profile) and the same readable namespaces, equal to the bank's read set; the harness
+  records both sets for each arm and refuses to compare arms whose sets differ. A recall without `profile_id` still
+  serves the runtime's configured `brain_profile` when one is set, ahead of any binding, and otherwise a profile bound to
+  the caller; so the harness starts the copy's process with no `brain_profile` setting and records it unset, reads the
+  caller's bindings before the run and refuses to start if one resolves, and the candidate arm names its profile with
+  `profile_id`. Every hit the no-profile arm returns must carry `serve_attribution: "unspecified"` and no
+  `served_by_profile_id`; every hit the candidate arm returns must carry `serve_attribution: "profile"` and the
+  candidate's id. A hit carrying any other attribution voids the run. A candidate recall that returns no hits counts as a
+  miss; a no-profile recall that returns no hits voids its round, since every bank answer is present on the copy and
+  the pass is read against that arm. A candidate created for a new factor value is a new profile and starts with no per-entity posteriors, so its
+  entity term is 1 for every hit; the report states which applies.
+- **Banks**, each named with its count: the reader's own-namespace bank (answers in that reader's namespace, 30
+  questions), and the shared-pool bank under that reader's read set (answers in `local`, 30 questions). Answers in a
+  third namespace have no bank on the measured store; this gate makes no claim about them.
+- **Recall shape**: every recall in every arm asks for 50 hits (`top_k=50`), with `include_breakdown=true`,
+  `include_timings=true` and the token budget at the pack's cap. Ranks 1 to 10 of that list are the ranking under test;
+  ranks 11 to 50 make the loss split below decidable. At the default configuration the first retrieval round fetches a
+  fixed number of candidates whatever the limit, and only the widening rounds, which run while fewer eligible candidates
+  than the limit remain, fetch more at 50 than at 10; the timings report lists each retrieval round, and the report
+  counts per arm the questions that widened. A hit the token budget cuts counts as not returned, and the report counts
+  per arm the recalls that returned fewer than 50 hits. A recall that reports degraded retrieval (each hit stamped
+  `degraded`, or an empty response with `degraded: true`) voids its round, which is run again; the report counts
+  degraded recalls per arm and round. The verbose envelope returned when more than one embedding model answered
+  carries no top-level `degraded` field, so on that shape an empty response cannot be told from a degraded one and
+  also voids its round; a question that voids three runs in a row stops the gate, and the report names it.
+- **Rounds**: the arms run adjacent in time on the same copy, in the same question order, for two rounds a few minutes
+  apart, each round in a fresh process. Ranking reads the clock (row age, and expiry), so two rounds need not return
+  identical lists, and the gate draws no conclusion from where they differ. The pass below is read in each round
+  separately and must hold in both; MRR@10 and hit@10 are reported per round and as the mean of the two. Beside them
+  the report gives, per arm, the number of questions whose top ten differs between the rounds. The property the gate
+  relies on, that a recall moves neither the entity term nor the served weights, is tested by Amendment 3's acceptance
+  arm 4 (no per-entity change) and by the Validation test below that recalls without judgment leave the served
+  weights at the defaults, not by this gate.
+- **Pass**, fixed before the run, in each round: on the own bank, MRR@10 not below the no-profile arm; on the
+  shared-pool bank, MRR@10 loss at most 0.04 absolute, and at most 1 of the 30 questions whose answer is in the top ten
+  without the profile having it outside the top ten with the profile. Both banks must pass; the result is per profile
+  and rebinds only that profile.
+- **Reported beside the pass**: hit@10 per arm; for each lost question, whether its answer is absent from the profile
+  arm's 50 returned hits or returned at ranks 11 to 50; for each gained question, the same split for the no-profile arm;
+  per arm, the count of top-10 hits whose `pre_entity_score` is 1.0, which is the composite at its clamp when no
+  weighted reranker is configured; the harness records the reranker setting, and with one configured the count is
+  reported as not available, since `pre_entity_score` is then the reranker's output.
+- **Freshness**: the gate is re-run when the store changes in a way that moves answers between namespaces, such as rows
+  re-attributed to their writers.
+
+### Alternatives considered
+
+| Alternative                                                              | Disposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Normalize the projected weights instead of dropping them                 | Rejected for now: the posteriors are trained by non-judgment signals, so a normalized projection serves the same drift at a smaller scale.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Learned per-namespace multiplier from judgments                          | Deferred: profile state is held per request namespace, not per caller, and a judged target's namespace is not checked against the caller's read set. Both must hold before evidence can move a factor.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Per-class factors with a separate value for other namespaces             | Rejected: the measured arm scaled `local` only, and a third-namespace stratum has no questions on the measured store.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Set `local_factor` on existing profiles                                  | Rejected: an editable factor is a migration surface with no replay contract. A new profile version needs none.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Exempt callers whose actor namespace is `local` from the factor          | Rejected: it would silently ignore an explicit `profile_id` from such a caller, and an actor with no rows of its own is not always named `local`. The factor follows the serving profile.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| A separate field for the profile a judgment trains (`reader_profile_id`) | Deferred to its own amendment: event replay, the fold gate, the serve ledger and the event counts already key a judgment on `served_by_profile_id`, so a second field needs one resolution rule across all of them. Until then a caller names the profile its judgment trains in `served_by_profile_id`, with `serve_attribution` omitted or `"profile"`: `"unspecified"` or `"unattributed"` beside a profile id is refused. Subject to the fold gate's own admission, this trains the named profile when the feedback carries no serve ledger ids; serve ledger ids beside an explicit judgment are accepted only from `brain.auto_feedback` with `useful`, `not_useful` or `wrong` (every other path, `brain.feedback` included, refuses them with any signal but `implicit_positive` or `implicit_negative`), and then train the named profile when the serve's ledger row names no accounting profile and is stamped `"unspecified"`, as an unbound serve's row is; a row that names an accounting profile trains that profile (a different name is refused), and any other row accepts implicit feedback only. A ledger row must match the feedback's namespace and target, and a pair trains once per scorer run: a repeat returns `emitted: false` and trains nothing. |
+| Apply the factor after the duplicate penalty and supersedes suppression  | Rejected: the duplicate penalty would then keep a shared copy over an own copy the factor scales below it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Unbind named profiles and add nothing                                    | Kept as the interval state until Change 4 passes; it gives up the own-namespace gain in Problem 3.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+### Validation
+
+The implementing change carries tests for: a served profile ranking in the default-weight order while `brain.profile`
+reports its `posterior_means` and the breakdown reports `weights_served: "default"` and a `profile_component` different
+from 1.0; the same profile, after recalls with no judgment that move its entity-blind posteriors (asserted moved),
+serving the same query with the default weights, the same entity term for every hit and the same order as before
+them; a profile without `local_factor` returning results identical to no factor; `brain.create_profile` refusing a
+`local_factor` that is not finite or lies outside [0.5, 1]; at factor 0.5 and the default penalty, a later
+shared-pool copy with unscaled rank score 0.3 keeping 0.05 while one at 0.15 falls to zero, against 0.2 and 0.05 at
+factor 1; `brain.profile` returning the stored factor, and
+`brain.reset` and a snapshot reload keeping it; `local` rows scaled and every other namespace unscaled; the returned
+`score` of a text-only `local` hit unchanged by the factor; an own copy spared by the duplicate penalty over a
+higher-scoring shared copy that the factor scales below it; a superseded row staying suppressed through its edge when
+the factor scales its superseding `local` row below `min_score`; `min_score` applied to the adjusted score; each returned hit's `rank_score` equal to
+`pre_entity_score` × `entity_term` × `local_factor` − `duplicate_penalty` from its breakdown, with and without a
+weighted reranker configured and with a duplicate pair present; the gate harness failing a profile that passes
+one round and not the other; the harness voiding a round on a degraded recall in each response shape, an empty
+verbose multi-model envelope included; and the harness refusing to start when the runtime has a `brain_profile` set
+or the caller has a recall binding.

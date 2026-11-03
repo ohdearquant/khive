@@ -15,6 +15,13 @@ consequences (#2724 proposed it; accepted 2026-09-18).
 **Amended**: 2026-09-22, [memory admission at the proposal-note route withdraws the AddNote
 exception](#amendment-memory-admission-at-the-proposal-note-route-withdraws-the-addnote-exception-2026-09-22)
 (#2057, #2967).
+**Amended**: 2026-11-01, [attributed semantic writes and caller properties](#amendment-attributed-semantic-writes-and-caller-properties-2026-11-01) routes a semantic write with no
+namespace to the caller's actor namespace, replacing the shared-pool default in §10 that the 2026-06-19 entry
+records, and adds `properties` to `memory.remember` (#6356; accepted 2026-11-02).
+**Amended**: 2026-11-02, [batch apply for memory rewrites](#amendment-batch-apply-for-memory-rewrites-2026-11-02)
+adds `memory.apply_batch`, and its
+[Delta 1](#delta-1-old-rows-in-namespaces-the-caller-owns-2026-11-02) admits old rows in namespaces the caller
+declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 
 ## Context
 
@@ -838,8 +845,8 @@ episodic writes naming `namespace="local"` flagged the same way; and an attribut
 
 ## Amendment: batch apply for memory rewrites (2026-11-02)
 
-**Status**: Proposed 2026-11-02. Adds the `memory.apply_batch` verb. Builds on the amendment of 2026-11-01 (caller
-properties and the actor-namespace default). Requires acceptance before the implementing change merges.
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Adds the `memory.apply_batch` verb. Builds on the amendment of
+2026-11-01 (caller properties and the actor-namespace default).
 
 ### Problem
 
@@ -937,3 +944,57 @@ refused; 201 rows refused; the new row recalled at once and the old row suppress
   That is the intended direction: the fact is written again, never lost and never duplicated among live rows.
 - #6361: compare `batch_row` when the remember write replays an existing row.
 - #6359: version the `batch_row` digest before the row shape changes.
+
+### Delta 1: old rows in namespaces the caller owns (2026-11-02)
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Changes Decision 5's namespace check only.
+
+**Problem.** An actor that runs helper agents often gives them their own namespace, so their memories stay apart
+from the actor's own until they are checked. Under a store-wide rewrite those rows belong to the actor that ran the
+helpers, yet Decision 5 refuses them as `old-namespace`: their namespace is neither the caller's nor the shared one.
+Measured on one deployment's export: 369 rows sit in four such namespaces, one per actor.
+
+**Decision.**
+
+1. **Declaration.** The `[actor]` table takes `owned_namespaces`, a list of namespaces, empty by default. Loading the
+   configuration refuses an empty entry, an entry that does not parse as a namespace, the shared namespace `local`,
+   the actor's own id, a duplicate, and a non-empty list with no `[actor] id`. Ownership is declared by name and never inferred:
+   `visible_namespaces` grants read access, and configurations list other actors there for reading, so it says
+   nothing about ownership; a namespace that shares the actor's id as a prefix is not owned unless it is listed.
+2. **Carriage.** The list travels with the caller's identity, the same way as `actor_id` and `visible_namespaces`:
+   from the configuration in process, and on the daemon request frame as `owned_namespaces`, omitted when empty. A
+   daemon that predates the field ignores it, so an owned row is refused there as `old-namespace`: a missing
+   declaration produces a refusal, never an admission. When the caller pins an actor other than the configured
+   one, the client's configuration resolver drops the list, because it was declared for the configured actor. The
+   daemon takes the list on the frame as sent and does not check it against the frame's `actor_id`.
+3. **The check.** Decision 5's namespace rule becomes: the old row's namespace is the caller's own, the shared one,
+   or one listed in the caller's `owned_namespaces`; anything else is refused as `old-namespace`, and the reason
+   names the namespace found. An owned row is checked like a row in the caller's own namespace, so the shared-row
+   `source_ids` rule does not apply to it. The new row is written in the caller's namespace as before, and the old
+   row is not changed.
+4. **Scope.** The declaration is read by this check alone. It grants no write into the owned namespace, widens no
+   read, and no other verb consults it.
+
+**Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
+machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
+supersede there hides that actor's old rows from recall while keeping them in the store. The hiding reaches only a
+reader whose recall covers both that namespace and the caller's: the new row and its `supersedes` edge are written in
+the caller's namespace, and recall reads `supersedes` edges in the reader's own namespace, so a reader scoped to the
+owning actor's namespace alone still recalls the old rows. The check is a rule of this
+verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
+isolation is a storage-layer property (Rule 9), so the declaration only bounds what `memory.apply_batch` agrees to
+supersede: more than with no declaration, which refuses every row outside the caller's namespace and the shared `local` one, and less than a
+by-ID operation reaches. It protects no row from a caller that holds its id. An owned namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
+refusal it has today.
+
+**Alternatives considered.** Reading ownership from `visible_namespaces` (rejected: read access, and it lists other
+actors). An `<actor id>:` prefix rule (rejected: an actor's sub-actors under its prefix can be separate writers that
+rewrite their own rows, and some helper namespaces do not share the prefix). A per-call argument naming the owned
+namespaces (rejected: a choice made per call rather than once in configuration, and invisible in the configuration a
+reviewer reads).
+
+**Validation.** Tests for: each load-time refusal above and an accepted list; a dry run admitting an old row in an
+owned namespace with `old_namespace` naming it; the same row refused as `old-namespace` when the list is empty; a
+namespace that shares the actor's prefix but is not listed refused; a daemon request frame without the field
+decoding to an empty list and a frame with an empty list omitting it; a pinned actor other than the configured one
+carrying no owned namespaces.

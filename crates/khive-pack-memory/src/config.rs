@@ -495,11 +495,11 @@ pub struct ScoreBreakdown {
     pub temporal: f64,
     /// Weighted contributions summing to the total score.
     pub weighted: WeightedContributions,
-    /// ADR-104 §3: multiplicative contribution of serve-time profile-weight
-    /// projection relative to configured-default weights for this hit —
-    /// `score_with_projected_weights / score_with_default_weights`. `1.0`
-    /// when no profile served the request (component 1 never ran) or the
-    /// default-weight score is ~0 (div-by-zero guard).
+    /// This hit's composite under the weights the serving profile's posteriors
+    /// project to, divided by its composite under the configured default weights.
+    /// Reported for the breakdown only: the hit is scored with the default weights
+    /// (see `weights_served`), so this ratio never enters `rank_score`. `1.0` when no
+    /// profile served the request or the default-weight score is ~0 (div-by-zero guard).
     pub profile_component: f64,
     /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for this UUID.
     /// `None` without a serving profile or a posterior beyond the uninformative prior.
@@ -508,6 +508,37 @@ pub struct ScoreBreakdown {
     /// `None` or a mean of 0.5 is neutral. See
     /// `crates/khive-pack-memory/docs/api/configuration.md#score-breakdowns`.
     pub entity_posterior_mean: Option<f64>,
+    /// Which weights scored this hit. Always `"default"`: a served profile scores with the
+    /// configured default weights; the weights its posteriors project to appear only in
+    /// `profile_component`.
+    #[serde(default = "default_weights_served")]
+    pub weights_served: String,
+    /// Namespace of the hit.
+    #[serde(default)]
+    pub namespace: String,
+    /// Rank score before the entity term: the weighted composite, or the weighted reranker's
+    /// output when one is configured. The 32-bit value used.
+    #[serde(default)]
+    pub pre_entity_score: f32,
+    /// Multiplier the entity posterior applied (1 when none). The 32-bit value used.
+    #[serde(default = "neutral_factor")]
+    pub entity_term: f32,
+    /// Shared-pool factor applied to this hit (1 when none). The 32-bit value used.
+    #[serde(default = "neutral_factor")]
+    pub local_factor: f32,
+    /// Amount the duplicate penalty subtracted from this hit's rank score (0 when none).
+    /// A returned hit's `rank_score` equals `pre_entity_score * entity_term * local_factor
+    /// - duplicate_penalty`, in 32-bit arithmetic, evaluated left to right.
+    #[serde(default)]
+    pub duplicate_penalty: f32,
+}
+
+fn default_weights_served() -> String {
+    "default".to_string()
+}
+
+fn neutral_factor() -> f32 {
+    1.0
 }
 
 impl ScoreBreakdown {

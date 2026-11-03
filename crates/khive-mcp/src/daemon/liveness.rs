@@ -580,6 +580,7 @@ pub(super) async fn probe_daemon_identity(
     timeout_ms: u64,
 ) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         plan: false,
         ops: String::new(),
         presentation: None,

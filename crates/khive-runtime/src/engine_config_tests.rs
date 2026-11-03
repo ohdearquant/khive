@@ -695,6 +695,118 @@ id = "lambda:"
     );
 }
 
+// ADR-021 Delta 1: `[actor] owned_namespaces` is declared by name and checked
+// exactly at load.
+#[test]
+fn test_owned_namespaces_accepted_list_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["project:data", "agent:legacy"]
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("a well-formed owned_namespaces list loads")
+        .expect("file should be present");
+    assert_eq!(
+        cfg.actor.owned_namespaces,
+        vec!["project:data".to_string(), "agent:legacy".to_string()]
+    );
+}
+
+#[test]
+fn test_owned_namespaces_defaults_to_empty_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[actor]
+id = "agent:alpha"
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("an actor without a declaration loads")
+        .expect("file should be present");
+    assert!(
+        cfg.actor.owned_namespaces.is_empty(),
+        "no declaration means no owned namespaces"
+    );
+}
+
+#[test]
+fn test_owned_namespaces_refusals_at_load() {
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "no actor id",
+            r#"
+[actor]
+owned_namespaces = ["project:data"]
+"#,
+            "requires an explicit [actor] id",
+        ),
+        (
+            "empty entry",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = [""]
+"#,
+            "must not be empty",
+        ),
+        (
+            "entry that does not parse as a namespace",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["bad namespace"]
+"#,
+            "invalid owned namespace",
+        ),
+        (
+            "the shared namespace",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["local"]
+"#,
+            "shared namespace `local`",
+        ),
+        (
+            "the actor's own id",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["agent:alpha"]
+"#,
+            "actor's own id",
+        ),
+        (
+            "a duplicate entry",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["project:data", "project:data"]
+"#,
+            "must be unique",
+        ),
+    ];
+    for (label, toml, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, toml);
+        let err = KhiveConfig::load(Some(&path)).expect_err(label);
+        match config_error_root(&err) {
+            ConfigError::InvalidActorId { reason, .. } => assert!(
+                reason.contains(expected),
+                "{label}: unexpected refusal reason {reason:?}"
+            ),
+            other => panic!("{label}: expected InvalidActorId, got {other:?}"),
+        }
+    }
+}
+
 // actor.id must not become default_namespace: writes stay pinned to `local`
 // even though a non-local actor.id widens the default read visible-set.
 #[test]

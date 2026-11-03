@@ -24,6 +24,7 @@ async fn request(
     ops: String,
 ) -> Vec<Value> {
     let frame = DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         ops,
         presentation: Some("verbose".into()),
         presentation_per_op: None,

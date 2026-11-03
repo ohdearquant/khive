@@ -339,3 +339,119 @@ fn a_node_channel_on_only_one_side_refuses_daemon_reuse() {
         );
     }
 }
+
+fn with_receipts(id: &str, value: &str) -> String {
+    format!("{id};visibility_receipts={value}")
+}
+
+fn receipt_ring(seed: &str) -> String {
+    let declaration =
+        format!(r#"[[["{seed}","SigningKey","env",null,null]],[["{seed}-id","{seed}",true]]]"#);
+    super::visibility_receipt_policy_fingerprint(declaration.as_bytes())
+}
+
+#[test]
+fn the_ringless_receipt_fingerprint_hashes_an_empty_declaration() {
+    let no_ring = super::no_receipt_ring_fingerprint();
+    assert_eq!(
+        no_ring,
+        super::visibility_receipt_policy_fingerprint(b"[[],null]")
+    );
+    assert_eq!(no_ring.len(), 64);
+    assert!(no_ring
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+}
+
+#[test]
+fn a_ringless_client_is_served_by_a_daemon_with_a_receipt_ring() {
+    let client = with_receipts(&config_id("p", ""), super::no_receipt_ring_fingerprint());
+    let daemon = with_receipts(&config_id("p", ""), &receipt_ring("a"));
+    assert!(super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "unknown"
+    );
+}
+
+#[test]
+fn a_client_with_a_receipt_ring_is_refused_by_a_ringless_daemon() {
+    let client = with_receipts(&config_id("p", ""), &receipt_ring("a"));
+    let daemon = with_receipts(&config_id("p", ""), super::no_receipt_ring_fingerprint());
+    assert!(!super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "visibility_receipts"
+    );
+}
+
+#[test]
+fn different_receipt_rings_refuse_daemon_reuse_in_both_directions() {
+    let ring_a = with_receipts(&config_id("p", ""), &receipt_ring("a"));
+    let ring_b = with_receipts(&config_id("p", ""), &receipt_ring("b"));
+    for (client, daemon) in [(&ring_a, &ring_b), (&ring_b, &ring_a)] {
+        assert!(!super::config_ids_compatible(client, daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(client, Some(daemon)),
+            "visibility_receipts"
+        );
+    }
+}
+
+#[test]
+fn a_ringless_client_is_refused_by_a_daemon_id_without_the_receipt_field() {
+    let legacy = config_id("p", "");
+    let ringless = with_receipts(&legacy, super::no_receipt_ring_fingerprint());
+    for (client, daemon) in [(&ringless, &legacy), (&legacy, &ringless)] {
+        assert!(!super::config_ids_compatible(client, daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(client, Some(daemon)),
+            "visibility_receipts"
+        );
+    }
+}
+
+#[test]
+fn a_receipt_ring_with_no_keys_is_not_treated_as_no_ring() {
+    let empty_ring = super::visibility_receipt_policy_fingerprint(b"[[],[]]");
+    assert_ne!(empty_ring, super::no_receipt_ring_fingerprint());
+    let client = with_receipts(&config_id("p", ""), &empty_ring);
+    let daemon = with_receipts(&config_id("p", ""), &receipt_ring("a"));
+    assert!(!super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "visibility_receipts"
+    );
+}
+
+#[test]
+fn trailing_policy_segments_must_match_for_a_ringless_client() {
+    let tail = ";blob_file_transfers=true";
+    let client = with_receipts(
+        &config_id("p", ""),
+        &format!("{}{tail}", super::no_receipt_ring_fingerprint()),
+    );
+    let same_tail = with_receipts(&config_id("p", ""), &format!("{}{tail}", receipt_ring("a")));
+    assert!(super::config_ids_compatible(&client, &same_tail));
+
+    let no_tail = with_receipts(&config_id("p", ""), &receipt_ring("a"));
+    assert!(!super::config_ids_compatible(&client, &no_tail));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&no_tail)),
+        "visibility_receipts"
+    );
+}
+
+#[test]
+fn another_differing_field_is_still_named_for_a_ringless_client() {
+    let client = with_receipts(&config_id("p", ""), super::no_receipt_ring_fingerprint());
+    let daemon = with_receipts(
+        &config_id("p", "").replace(";telemetry=default;", ";telemetry=other;"),
+        &receipt_ring("a"),
+    );
+    assert!(!super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "telemetry"
+    );
+}

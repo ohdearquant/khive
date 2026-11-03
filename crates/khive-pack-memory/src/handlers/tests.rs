@@ -1436,3 +1436,29 @@ fn request_naming_weighted_keeps_the_configured_weights() {
         "a request naming weighted must keep the configured weights"
     );
 }
+
+// ── local_factor_from_profile_response ───────────────────────────────────
+
+#[test]
+fn local_factor_is_read_from_the_profile_response_as_an_f32() {
+    for stored in [0.5_f64, 0.7, 1.0] {
+        let resp = serde_json::json!({ "local_factor": stored });
+        assert_eq!(local_factor_from_profile_response(&resp), stored as f32);
+    }
+    let integer = serde_json::json!({ "local_factor": 1 });
+    assert_eq!(local_factor_from_profile_response(&integer), 1.0_f32);
+}
+
+#[test]
+fn local_factor_is_one_when_the_profile_response_has_no_usable_value() {
+    for resp in [
+        serde_json::json!({}),
+        serde_json::json!({ "local_factor": null }),
+        serde_json::json!({ "local_factor": "0.7" }),
+        serde_json::json!({ "local_factor": 0.49 }),
+        serde_json::json!({ "local_factor": 1.01 }),
+        serde_json::json!({ "local_factor": -0.7 }),
+    ] {
+        assert_eq!(local_factor_from_profile_response(&resp), 1.0_f32, "{resp}");
+    }
+}

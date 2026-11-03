@@ -51,13 +51,21 @@ Selection rules are original order, lowest document frequency, and highest IDF. 
 
 ## `BrainProfileHint`
 
-The hint names a profile, a result boost (default `1.3`), and a posterior threshold (default `0.6`). Modern serve-time profile projection resolves full profile state in the handler; the hint remains part of the configuration surface for compatibility.
+The hint names a profile, a result boost (default `1.3`), and a posterior threshold (default `0.6`). A served profile's full state is resolved in the handler, where it supplies the per-entity posteriors and the profile's `local_factor`; it does not change the scoring weights. The hint remains part of the configuration surface for compatibility.
 
 ## Score breakdowns
 
-`ScoreBreakdown` reports raw relevance, raw and decayed salience, temporal recency, weighted contributions, total score, profile weight projection, and the optional per-entity posterior mean.
+`ScoreBreakdown` reports raw relevance, raw and decayed salience, temporal recency, weighted contributions, total score, the profile weight projection, the optional per-entity posterior mean, and the terms that make up the returned `rank_score`.
 
-`profile_component` is the ratio of projected-weight score to default-weight score. It is `1.0` when no profile served the request or the default score is effectively zero.
+A served profile scores with the configured default weights. `weights_served` is always `"default"`. `profile_component` is a diagnostic: the ratio of the hit's score under the weights the profile's posteriors project to, to its score under the default weights. It is reported for the breakdown only and never enters `rank_score`. It is `1.0` when no profile served the request or the default score is effectively zero.
+
+`namespace`, `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty` report the terms of the returned `rank_score`, each the 32-bit value used:
+
+```text
+rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty
+```
+
+`pre_entity_score` is the weighted reranker output when `reranker_weights` is configured, and the default-weight composite otherwise. `local_factor` is the serving profile's `local_factor` for a hit in the `local` namespace, and `1` for every other namespace and whenever no profile with a factor serves the request. `duplicate_penalty` is the amount the duplicate-prefix penalty subtracted, `0` when none applied; when the penalty would take the score below zero it is the whole score, and `rank_score` is `0`.
 
 `entity_posterior_mean` reports the serving profile's per-entity Beta posterior mean for the hit's UUID. It is absent when no profile served the request or no posterior exists beyond the uninformative prior. The value also feeds the bounded rank-score multiplier `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` (ADR-104 §3). `None` and a mean of `0.5` are neutral; other means adjust `rank_score` by up to ±15% relative to the same candidate under a profile without a posterior for it. The scoring context is documented in `crates/khive-pack-memory/docs/api/scoring.md`.
 

@@ -241,6 +241,13 @@ pub(super) fn apply_actor_pin_and_expectation(
             }
         }
 
+        // `[actor] owned_namespaces` was declared for the configured actor
+        // (ADR-021 Delta 1). A pin to any other actor, including the shared
+        // namespace, carries none of it.
+        if cfg.actor_id.as_deref() != Some(parsed.as_str()) {
+            cfg.owned_namespaces.clear();
+        }
+
         cfg.actor_id = if parsed == Namespace::local() {
             None
         } else {
@@ -819,6 +826,11 @@ pub(super) async fn run_exec_inline_with_forward(
             process_ref: khive_runtime::process_ref_from_env(),
             visible_namespaces: cfg
                 .visible_namespaces
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            owned_namespaces: cfg
+                .owned_namespaces
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
