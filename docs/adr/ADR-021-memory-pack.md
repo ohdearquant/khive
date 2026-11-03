@@ -979,8 +979,9 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
 machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
 supersede there hides that actor's old rows from recall while keeping them in the store. The check is a rule of this
 verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
-isolation is a storage-layer property (Rule 9), so the declaration narrows what `memory.apply_batch` agrees to
-supersede and protects no row from a caller that holds its id. An owned namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
+isolation is a storage-layer property (Rule 9), so the declaration only bounds what `memory.apply_batch` agrees to
+supersede: more than with no declaration, which refuses every row outside the caller's namespace, and less than a
+by-ID operation reaches. It protects no row from a caller that holds its id. An owned namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
 refusal it has today.
 
 **Alternatives considered.** Reading ownership from `visible_namespaces` (rejected: read access, and it lists other
