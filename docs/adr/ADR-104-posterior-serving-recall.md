@@ -788,8 +788,8 @@ Tests in `khive-brain-core/tests/judgment_only_entity_evidence.rs`: `recall_with
 
 ## Amendment 4 (2026-11-02): Default weights while serving, and a fixed shared-pool factor
 
-**Status**: Proposed 2026-11-02. Changes §1 (serve-time projection of profile weights) and adds a fixed rank factor
-carried by a profile. Requires acceptance before the implementing change merges. The implementing change lands after
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Changes §1 (serve-time projection of profile weights) and adds
+a fixed rank factor carried by a profile. The implementing change lands after
 Amendment 3 Change 3 (a recall hit no longer credits the per-entity posterior of the hit it ranked first), on which
 Change 2 relies. Rebinding a named profile is gated per profile by Change 4.
 
