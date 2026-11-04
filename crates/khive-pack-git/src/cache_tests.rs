@@ -1206,13 +1206,13 @@ fn slot_lock_concurrent_final_drops_remove_registry_entry() {
         release: release.clone(),
         workers: Vec::new(),
     };
-    workers.workers.push(std::thread::spawn(move || drop(first)));
-    workers.workers.push(std::thread::spawn(move || drop(second)));
-    let both_arrived = (0..2).all(|_| {
-        arrived_rx
-            .recv_timeout(SLOT_LOCK_DROP_GATE_TIMEOUT)
-            .is_ok()
-    });
+    workers
+        .workers
+        .push(std::thread::spawn(move || drop(first)));
+    workers
+        .workers
+        .push(std::thread::spawn(move || drop(second)));
+    let both_arrived = (0..2).all(|_| arrived_rx.recv_timeout(SLOT_LOCK_DROP_GATE_TIMEOUT).is_ok());
     let registered_while_parked = both_arrived.then(|| {
         SLOT_LOCKS
             .lock()
@@ -1224,7 +1224,10 @@ fn slot_lock_concurrent_final_drops_remove_registry_entry() {
     let workers_joined = workers.release_and_join();
     let gate_timed_out = release.timed_out.load(std::sync::atomic::Ordering::SeqCst);
     assert!(both_arrived, "both drops must reach the post-unlock gate");
-    assert!(workers_joined, "both drop workers must finish without panic");
+    assert!(
+        workers_joined,
+        "both drop workers must finish without panic"
+    );
     assert!(!gate_timed_out, "the driver must release both drop gates");
     assert_eq!(
         registered_while_parked,
