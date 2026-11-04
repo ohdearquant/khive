@@ -974,7 +974,8 @@ async fn create_refuses_top_level_timezone_before_task_normalization() {
 
 #[tokio::test]
 async fn create_normalizes_timezone_aliases_in_raw_stored_properties() {
-    let runtime = khive_runtime::KhiveRuntime::memory().expect("create a private in-memory runtime");
+    let runtime =
+        khive_runtime::KhiveRuntime::memory().expect("create a private in-memory runtime");
     assert!(
         runtime.backend_data_dir().is_none(),
         "the raw-storage fixture must have no backend data directory"
@@ -1020,7 +1021,9 @@ async fn create_normalizes_timezone_aliases_in_raw_stored_properties() {
             .await
             .expect("read the stored task note")
             .expect("the created task note must exist in the private local store");
-        let properties = note.properties.expect("the stored task must have properties");
+        let properties = note
+            .properties
+            .expect("the stored task must have properties");
         assert_eq!(
             properties["timezone_alias_marker"],
             json!(case),
@@ -1049,12 +1052,16 @@ async fn stream_append_refuses_shadowed_invalid_nested_timezone_after_valid_base
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
-    let registry = builder.build().expect("build private KG + GTD stream registry");
+    let registry = builder
+        .build()
+        .expect("build private KG + GTD stream registry");
     runtime.install_edge_rules(registry.all_edge_rules());
     let token = runtime
         .authorize(khive_runtime::Namespace::local())
         .expect("authorize the private stream namespace");
-    let notes = runtime.notes(&token).expect("open the private stream note store");
+    let notes = runtime
+        .notes(&token)
+        .expect("open the private stream note store");
     let baseline_title = "Stream timezone validation baseline";
     let appended = registry
         .dispatch(
@@ -1084,7 +1091,9 @@ async fn stream_append_refuses_shadowed_invalid_nested_timezone_after_valid_base
         .await
         .expect("read the actual streamed task note")
         .expect("the streamed task note must exist in the private local store");
-    let baseline = note.properties.expect("the streamed task must have properties");
+    let baseline = note
+        .properties
+        .expect("the streamed task must have properties");
     assert_eq!(baseline["timezone_alias_marker"], json!("stream-baseline"));
     assert_eq!(baseline["due"], json!("2026-06-01T00:00:00-04:00"));
     assert_eq!(baseline["due_timezone"], json!("America/New_York"));
