@@ -1116,3 +1116,119 @@ fn concurrent_ensure_clone_on_same_key_never_races_the_slot() {
 
     std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
 }
+
+// Each callback runs after the registry unlocks. Its state deliberately owns
+// no slot-mutex Arc, so parking a destructor cannot affect the owner count.
+#[derive(Default)]
+struct SlotLockDropGateRelease {
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+    timed_out: std::sync::atomic::AtomicBool,
+}
+
+const SLOT_LOCK_DROP_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl SlotLockDropGateRelease {
+    fn wait(&self) {
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (released, _) = self
+            .wake
+            .wait_timeout_while(released, SLOT_LOCK_DROP_GATE_TIMEOUT, |released| !*released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*released {
+            self.timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        self.wake.notify_all();
+    }
+}
+
+struct SlotLockDropWorkers {
+    release: Arc<SlotLockDropGateRelease>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl SlotLockDropWorkers {
+    fn release_and_join(&mut self) -> bool {
+        self.release.release();
+        let mut all_joined = true;
+        for worker in self.workers.drain(..) {
+            all_joined &= worker.join().is_ok();
+        }
+        all_joined
+    }
+}
+
+impl Drop for SlotLockDropWorkers {
+    fn drop(&mut self) {
+        let _ = self.release_and_join();
+    }
+}
+
+#[test]
+fn slot_lock_concurrent_final_drops_remove_registry_entry() {
+    let _env_guard = ENV_MUTEX.blocking_lock();
+    fn require_send_sync<T: Send + Sync>() {}
+    require_send_sync::<SlotLock>();
+
+    static NEXT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!(
+        "concurrent-final-slot-lock-drop-{}-{}",
+        std::process::id(),
+        NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let mut first = slot_lock(&key);
+    let mut second = slot_lock(&key);
+    let release = Arc::new(SlotLockDropGateRelease::default());
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    for lock in [&mut first, &mut second] {
+        let arrived = arrived_tx.clone();
+        let release = release.clone();
+        lock.after_registry_unlock = Some(Box::new(move || {
+            let _ = arrived.send(());
+            release.wait();
+        }));
+    }
+    drop(arrived_tx);
+
+    let mut workers = SlotLockDropWorkers {
+        release: release.clone(),
+        workers: Vec::new(),
+    };
+    workers.workers.push(std::thread::spawn(move || drop(first)));
+    workers.workers.push(std::thread::spawn(move || drop(second)));
+    let both_arrived = (0..2).all(|_| {
+        arrived_rx
+            .recv_timeout(SLOT_LOCK_DROP_GATE_TIMEOUT)
+            .is_ok()
+    });
+    let registered_while_parked = both_arrived.then(|| {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&key)
+    });
+
+    // Complete both workers before reporting any failure, including a timeout.
+    let workers_joined = workers.release_and_join();
+    let gate_timed_out = release.timed_out.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(both_arrived, "both drops must reach the post-unlock gate");
+    assert!(workers_joined, "both drop workers must finish without panic");
+    assert!(!gate_timed_out, "the driver must release both drop gates");
+    assert_eq!(
+        registered_while_parked,
+        Some(false),
+        "concurrent final drops must remove their own registry entry"
+    );
+}
