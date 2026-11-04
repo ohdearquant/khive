@@ -671,8 +671,15 @@ impl MemoryPack {
         write_token: &NamespaceToken,
         planned: PlannedWrite,
     ) -> Result<(&'static str, Uuid), WriteFailure> {
-        let stored = self
-            .remember_permitting(token, planned.params, BATCH_WRITTEN_PROPERTY_KEYS)
+        let expected_batch_row = planned.params["properties"]["batch_row"]
+            .as_str()
+            .map(str::to_owned);
+        let key = planned.params["key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let (stored, stored_properties) = self
+            .remember_permitting_with_properties(token, planned.params, BATCH_WRITTEN_PROPERTY_KEYS)
             .await
             .map_err(|error| WriteFailure {
                 code: "write-failed",
@@ -692,6 +699,22 @@ impl MemoryPack {
             .get("replayed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if replayed {
+            let stored_batch_row = stored_properties
+                .as_ref()
+                .and_then(|properties| properties.get("batch_row"))
+                .and_then(Value::as_str);
+            if expected_batch_row.is_none() || stored_batch_row != expected_batch_row.as_deref() {
+                return Err(WriteFailure {
+                    code: "dedupe-name-taken",
+                    error: RuntimeError::InvalidInput(format!(
+                        "key {key} is already taken in namespace {} by a row with different content; use a new part or a new batch name",
+                        write_token.namespace().as_str()
+                    )),
+                    new_id: None,
+                });
+            }
+        }
         self.assert_supersedes(write_token, new_id, planned.supersedes)
             .await
             .map_err(|error| WriteFailure {
@@ -772,6 +795,19 @@ impl MemoryPack {
             );
         }
 
+        self.apply_checked_rows(token, &write_token, batch, dry_run, checked)
+            .await
+    }
+
+    /// Apply checked rows and report each write or refusal in input order.
+    async fn apply_checked_rows(
+        &self,
+        token: &NamespaceToken,
+        write_token: &NamespaceToken,
+        batch: &str,
+        dry_run: bool,
+        checked: Vec<Checked>,
+    ) -> Result<Value, RuntimeError> {
         let mut entries: Vec<Entry> = Vec::with_capacity(checked.len());
         for item in checked {
             let Checked {
@@ -792,7 +828,7 @@ impl MemoryPack {
                             ("deduped", Some(existing), None)
                         } else {
                             match self
-                                .assert_supersedes(&write_token, existing, supersedes)
+                                .assert_supersedes(write_token, existing, supersedes)
                                 .await
                             {
                                 Ok(()) => ("deduped", Some(existing), None),
@@ -808,10 +844,14 @@ impl MemoryPack {
                         if dry_run {
                             ("planned", None, None)
                         } else {
-                            match self.write_row(token, &write_token, planned).await {
+                            match self.write_row(token, write_token, planned).await {
                                 Ok((outcome, id)) => (outcome, Some(id), None),
                                 Err(failure) => (
-                                    "failed",
+                                    if failure.code == "dedupe-name-taken" {
+                                        "refused"
+                                    } else {
+                                        "failed"
+                                    },
                                     failure.new_id,
                                     Some(refusal(failure.code, error_message(&failure.error))),
                                 ),
@@ -844,3 +884,7 @@ impl MemoryPack {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "apply_batch_replay_tests.rs"]
+mod replay_tests;
