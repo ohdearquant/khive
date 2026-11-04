@@ -8,7 +8,6 @@ fn pool(path: &Path, locks: &Path) -> ConnectionPool {
         write_queue_enabled: Some(false),
         disk_guard_config: Some(EffectiveDiskGuardConfig {
             reserve_bytes: 0,
-            guard_deadline_ms: 100,
             ..Default::default()
         }),
         ..PoolConfig::for_test()
