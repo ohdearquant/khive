@@ -325,6 +325,13 @@ pub async fn create_keyed_memory_with_receipt_and_report(
             // recheck; unrelated NotFound errors must retain their meaning.
             let missing_source = matches!(error, NoteCreatePrepareError::MissingAnnotation(_));
             if !holder_seen && missing_source {
+                #[cfg(test)]
+                crate::keyed_memory_tests::checkpoint(
+                    token.namespace().as_str(),
+                    crate::keyed_memory_tests::MISSING_SOURCE_CHECKPOINT,
+                    true,
+                )
+                .await;
                 holder_seen = resolve_holder(runtime, token, spec.key).await?.is_some();
                 if holder_seen {
                     prepare_keyed_memory(runtime, token, &spec, None)

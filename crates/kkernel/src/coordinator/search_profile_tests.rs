@@ -262,8 +262,7 @@ fn memory_runtime() -> Arc<KhiveRuntime> {
     ))
 }
 
-#[path = "../../../khive-runtime/tests/support/receipt_credentials.rs"]
-mod config_lock_runtime_receipt_credentials;
+use crate::receipt_credentials as config_lock_runtime_receipt_credentials;
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(config_ledger)]
