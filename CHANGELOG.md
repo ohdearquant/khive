@@ -73,14 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
   posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
   event to the profile that served it, as the live path does.
-- Public structs gained fields, so a struct literal of any of them must set the new field:
-  `khive_runtime::RuntimeConfig`, `khive_runtime::RequestIdentity`,
-  `khive_runtime::DaemonRequestFrame` and `khive_runtime::engine_config::ActorConfig` gained
-  `owned_namespaces`. `khive_brain_core::ProfileRecord` gained `local_factor`.
-  `khive_pack_memory::config::ScoreBreakdown` gained `weights_served`, `namespace`,
-  `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty`.
-  `kkernel::reindex::ReindexArgs` gained `fts_only`.
-
 ### Fixed
 
 - `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
@@ -103,6 +95,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The supervisor's marker ownership lock is opened through the checked opener the daemon locks
   use. A symlink at the lock path is refused without touching its target. An existing lock file
   loses its group and other permission bits, and a new one is created with mode 0600.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig`, `khive_runtime::RequestIdentity`,
+  `khive_runtime::DaemonRequestFrame` and `khive_runtime::engine_config::ActorConfig` add
+  `owned_namespaces`; `khive_brain_core::ProfileRecord` adds `local_factor`;
+  `khive_pack_memory::config::ScoreBreakdown` adds `weights_served`, `namespace`,
+  `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty`; and
+  `kkernel::reindex::ReindexArgs` adds `fts_only`.
 
 ## [0.16.0] - 2026-11-01
 ### Added
