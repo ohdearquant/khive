@@ -3,9 +3,12 @@
 mod sql;
 
 #[cfg(test)]
-mod test_process;
-#[cfg(test)]
 mod daemon_recall_stack_tests;
+#[cfg(test)]
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+#[cfg(test)]
+mod test_process;
 
 mod atomic_apply;
 pub mod blob;
