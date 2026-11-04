@@ -126,7 +126,11 @@ mod tests {
     #[serial_test::serial(config_ledger)]
     async fn project_annotation_census_empty_report_is_complete_zero() {
         let (runtime, token, registry) = fixture().await;
-        let project_id = create(&registry, json!({"kind": "project", "name": "census-empty"})).await;
+        let project_id = create(
+            &registry,
+            json!({"kind": "project", "name": "census-empty"}),
+        )
+        .await;
         let mut report = IngestReport {
             done: true,
             ..IngestReport::default()
@@ -137,7 +141,10 @@ mod tests {
         assert!(report.project_annotation_census_complete);
         assert_eq!(report.project_annotation_notes_scanned, 0);
         assert!(report.missing_project_annotation_note_ids.is_empty());
-        assert!(report.done, "the diagnostic must preserve ingest completion");
+        assert!(
+            report.done,
+            "the diagnostic must preserve ingest completion"
+        );
     }
 
     #[tokio::test]
@@ -174,7 +181,11 @@ mod tests {
         assert!(!partial.complete, "the third note is a coverage sentinel");
         assert_eq!(partial.notes_scanned, 2);
         assert_eq!(partial.missing_count, 2, "the sentinel is not counted");
-        assert_eq!(partial.note_ids.len(), 1, "the display list has its own cap");
+        assert_eq!(
+            partial.note_ids.len(),
+            1,
+            "the display list has its own cap"
+        );
 
         let complete = read_census(&runtime, &token, project_id, 3, 1)
             .await
