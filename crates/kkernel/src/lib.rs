@@ -4,6 +4,8 @@ mod sql;
 
 #[cfg(test)]
 mod test_process;
+#[cfg(test)]
+mod daemon_recall_stack_tests;
 
 mod atomic_apply;
 pub mod blob;
