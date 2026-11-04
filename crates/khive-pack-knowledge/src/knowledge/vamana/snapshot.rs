@@ -204,6 +204,104 @@ pub(crate) async fn compute_fingerprint(
     })
 }
 
+/// Accumulate the decoded corpus without retaining owned SQL rows.
+///
+/// The result vectors grow amortized because a consumer does not know the row
+/// count. This avoids a corpus-sized raw-row collection; it is not a bound on
+/// the decoded corpus or on buffering inside the database engine.
+struct CorpusRows {
+    dims: usize,
+    saw_row: bool,
+    scan_watermark: u64,
+    id_map: Vec<Uuid>,
+    flat: Vec<f32>,
+}
+
+impl CorpusRows {
+    fn new(dims: usize) -> Self {
+        Self {
+            dims,
+            saw_row: false,
+            scan_watermark: 0,
+            id_map: Vec::new(),
+            flat: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Option<(Vec<f32>, Vec<Uuid>, u64)> {
+        if self.id_map.is_empty() {
+            None
+        } else {
+            Some((self.flat, self.id_map, self.scan_watermark))
+        }
+    }
+}
+
+impl khive_storage::SqlRowConsumer for CorpusRows {
+    fn push_row(
+        &mut self,
+        row: khive_storage::SqlRow,
+    ) -> khive_storage::types::StorageResult<()> {
+        // Capture the first raw row, even when that row is later skipped.
+        if !self.saw_row {
+            self.saw_row = true;
+            self.scan_watermark = row
+                .i64_or_none("log_s")
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+        }
+        let id_str = match row.get("subject_id") {
+            Some(SqlValue::Text(s)) => s.as_str(),
+            _ => return Ok(()),
+        };
+        let uuid = match Uuid::parse_str(id_str) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        let bytes = match row.get("embedding") {
+            Some(SqlValue::Blob(b)) => b.as_slice(),
+            _ => return Ok(()),
+        };
+        if bytes.len() != self.dims * 4 {
+            return Ok(());
+        }
+        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
+            return Ok(());
+        };
+        self.id_map.push(uuid);
+        self.flat.extend_from_slice(&vec);
+        Ok(())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+async fn scan_corpus_rows(
+    reader: &mut dyn khive_storage::SqlReader,
+    statement: khive_storage::SqlStatement,
+    dims: usize,
+) -> khive_storage::types::StorageResult<Option<(Vec<f32>, Vec<Uuid>, u64)>> {
+    // Unsupported is an explicit refusal; do not fall back to query_all.
+    let consumer = reader
+        .query_consume(statement, Box::new(CorpusRows::new(dims)))
+        .await?;
+    let corpus = consumer
+        .into_any()
+        .downcast::<CorpusRows>()
+        .map_err(|_| khive_storage::StorageError::Internal("unexpected corpus SQL consumer".into()))?;
+    Ok(corpus.finish())
+}
+
+fn map_corpus_scan_error(error: khive_storage::StorageError) -> RuntimeError {
+    RuntimeError::Internal(error.to_string())
+}
+
+#[cfg(test)]
+#[path = "../vamana_corpus_scan_consumer_tests.rs"]
+mod corpus_scan_consumer_tests;
+
 /// Scan the sqlite-vec corpus for `model` and return raw (un-normalized) flat
 /// vectors alongside the ordered UUID id-map.
 ///
@@ -251,51 +349,13 @@ pub(super) async fn scan_corpus_raw(
     // authoritative recovery checkpoint never regresses below the untrusted
     // segment it replaces. Future writes have a strictly larger global seq;
     // rows from sibling scopes below S are irrelevant to this corpus.
-    let rows = reader
-        .query_all(knowledge_corpus(&ns).corpus_scan(&table_name, &model_str, "vamana_corpus_scan"))
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
-    let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
-    let scan_watermark = rows
-        .first()
-        .and_then(|row| row.i64_or_none("log_s"))
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0);
-
-    for row in &rows {
-        let id_str = match row.get("subject_id") {
-            Some(SqlValue::Text(s)) => s.as_str(),
-            _ => continue,
-        };
-        let uuid = match Uuid::parse_str(id_str) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let bytes = match row.get("embedding") {
-            Some(SqlValue::Blob(b)) => b.as_slice(),
-            _ => continue,
-        };
-        if bytes.len() != dims * 4 {
-            continue;
-        }
-        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
-            continue;
-        };
-        id_map.push(uuid);
-        flat.extend_from_slice(&vec);
-    }
-
-    if id_map.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some((flat, id_map, scan_watermark)))
+    scan_corpus_rows(
+        reader.as_mut(),
+        knowledge_corpus(&ns).corpus_scan(&table_name, &model_str, "vamana_corpus_scan"),
+        dims,
+    )
+    .await
+    .map_err(map_corpus_scan_error)
 }
 
 /// Scan the sqlite-vec table and build a fresh `AnnBridge`.
