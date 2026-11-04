@@ -2205,3 +2205,64 @@ stays visible. This is bounded diagnostic hygiene, not detection of every secret
   former retains the demonstrated bare-value leakage; the latter removes parameter metadata needed
   to repair a request. Existing ordinary preview behavior and the stated heuristic residuals remain
   deliberate limits.
+
+## Amendment 8 (2026-10-28): the workspace mirror as a permanent mask-only surface
+
+**Status**: Proposed.
+
+Originating issue(s): #6081, #6083
+
+The workspace mirror stores the text of files under a configured root as `document` entities, one
+per file version, each superseding the previous version. File text is the case Amendment 2 settled
+for git ingest and session mirroring: content written for another purpose, which may hold a
+credential, and which the store must record rather than refuse. This amendment adds one named
+surface for it. It changes no other surface, grants no admission capability and adds no exemption.
+
+### Decision
+
+**Surface.** Add `RedactionSurface::WorkspaceMirror` with the same contract as the other permanent
+mask-only surfaces: mode `PermanentMaskOnly`, no stamp property and no atomic success event. The
+mirror enters the canonical detector only through `mask_for_redaction_surface`, and its tests do the
+same, so the `mask_secrets` call-site census needs no new allow-list entry.
+
+**Final stored target.** The `description` of each `document` entity the mirror creates, which holds
+the file's masked text. `redaction_surface_contract` reads it from a `WORKSPACE_MIRROR_STORED_TARGET`
+constant, and the contract test compares against that constant. Lexical and vector index rows are
+derived from the stored fields, so they hold the masked text only.
+
+**Fields that stay under write admission.** The entity's `name`, which is the file's path relative to
+the root, and its properties (`source_uri`, `source_type`, `checksum`) are not on this surface. The
+create runs ordinary write admission over them, and a detector match there refuses the write as on
+any other create. Nothing is masked in those fields and no masked variant is stored. What the mirror
+does next with a refused file belongs to the workspace mirror's own contract, not to this ADR.
+
+**No stored value derives from the unmasked bytes.** A digest of a file's unmasked bytes, stored
+beside its masked text, lets a reader test a guessed value for a masked span offline: rebuild the
+file with the guess and compare digests. Most detectors mask high-entropy shapes, where a guess
+cannot succeed, but the URL userinfo detector masks the password in `scheme://user:pass@` whatever
+its entropy, so a short or dictionary password would be recoverable this way. The mirror's
+`checksum`, and the cursor hash compared with it, are therefore computed over the stored (masked)
+text, as ADR-087 Amendment 1 (A10) already proposes. Change detection still follows what is stored:
+a change confined to a masked span leaves the stored text identical, so no new version is needed.
+
+**Contract tests.** The two exhaustive surface lists in the secret-gate tests (contract shape, and
+masking without exemption admission) gain `WorkspaceMirror`. Amendment 2's rule stands: a further
+surface or an admission mode needs an ADR amendment and the same test change.
+
+### Alternatives considered
+
+- **Route the mirror through `SessionMirror` or `GitIngest`.** Rejected. Each surface's stored-target
+  constant names where its masked text lives; borrowing one would make the contract misdescribe the
+  store.
+- **Route it through `GateProbe`.** Rejected. That surface declares no stored target because its
+  output is never stored; the mirror writes durable records.
+- **Add the workspace files to the census allow-list.** Rejected. The census exists so that every
+  masking caller is a named surface with a declared target; an allow-list entry would remove exactly
+  that.
+- **Refuse files whose text holds a detector match.** Rejected for the same reason Amendment 2 kept
+  session mirroring mask-only: a mirror of a working tree has to record the file.
+- **Keep the unmasked-bytes digest and state the residual.** Rejected because of the URL userinfo
+  case above: the residual is a working recovery path for weak passwords.
+- **A digest keyed per store over the unmasked bytes.** Rejected. It closes the guess test, but it
+  needs a store-held key and its lifecycle to reach the same result the masked-text digest reaches
+  with none.
