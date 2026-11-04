@@ -1,7 +1,7 @@
 //! One real registry-backed daemon recall route at 16 MiB, then 2 MiB.
 //! The seeded hit is lexical; deterministic query embedding is exercised, but
-//! this fixture has no populated-vector or ANN coverage. Lower-stack control
-//! calibration remains owner-native. Watchdog expiry is never semantic credit.
+//! this fixture has no populated-vector or ANN coverage. A watchdog expiry
+//! fails the test; it never counts as a completed recall.
 
 #![cfg(unix)]
 
@@ -67,7 +67,7 @@ impl WallWatchdog {
                 ) {
                     eprintln!("DAEMON_RECALL_STACK_WALL_WATCHDOG_TIMEOUT");
                     // A starved runtime cannot drive an async timeout or cleanup.
-                    // Abort only this isolated child; the timeout is not a kill.
+                    // Abort only this isolated child, so the parent test fails.
                     std::process::abort();
                 }
             })
