@@ -2398,6 +2398,192 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
     );
 }
 
+// Projection is diagnostic work: a bound profile needs it only for returned breakdowns.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_bound_profile_projects_config_only_for_breakdown() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-breakdown-projection-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(tmp.path().join("khive.db")),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        actor_id: Some("casey".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: adr104_fixed_vectors(),
+    });
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert_eq!(token.actor().id, "casey");
+
+    // Identical fixed vectors make retrieval repeatable; the reranker below excludes age.
+    let mut note_ids = Vec::new();
+    for salience in [0.1, 0.9] {
+        note_ids.push(
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_H_CONTENT,
+                Some(salience),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id,
+        );
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.with_actor_id(Some("casey".to_string()));
+    let registry = builder.build().expect("registry");
+    let profile_id = "breakdown-projection-v1";
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "casey",
+                "profile_id": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor");
+    adr104_skew_salience(&registry, profile_id, note_ids[0], 30).await;
+
+    let params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": false,
+        "limit": 10,
+        "config": {
+            "include_breakdown": false,
+            "reranker_weights": { "relevance": 1.0 },
+            "scoring": { "mmr_penalty": 0.0 },
+        },
+    });
+    let (plain, plain_calls) = crate::tunable::count_project_config_calls_6377(
+        registry.dispatch("memory.recall", params.clone()),
+    )
+    .await;
+    let plain = plain.expect("recall without breakdown");
+    assert_eq!(
+        plain_calls, 0,
+        "a recall without a breakdown must not project the serving profile"
+    );
+    let plain_hits = plain.as_array().expect("bare array result");
+    assert_eq!(
+        plain_hits.len(),
+        note_ids.len(),
+        "must return both seeded notes"
+    );
+    for hit in plain_hits {
+        assert_eq!(hit["served_by_profile_id"], profile_id);
+        assert!(hit.get("breakdown").is_none());
+    }
+
+    let mut request_verbose = params.clone();
+    request_verbose["include_breakdown"] = serde_json::json!(true);
+    let mut config_verbose = params;
+    let _ = config_verbose
+        .as_object_mut()
+        .expect("recall params object")
+        .remove("include_breakdown");
+    config_verbose["config"]["include_breakdown"] = serde_json::json!(true);
+    for (route, verbose_params) in [("request", request_verbose), ("config", config_verbose)] {
+        let (verbose, verbose_calls) = crate::tunable::count_project_config_calls_6377(
+            registry.dispatch("memory.recall", verbose_params),
+        )
+        .await;
+        let verbose = verbose.expect("recall with breakdown");
+        assert_eq!(
+            verbose_calls, 1,
+            "project once for the entire verbose recall via {route}"
+        );
+        let verbose_hits = verbose.as_array().expect("bare array result");
+        assert_eq!(verbose_hits.len(), plain_hits.len());
+        for (before, after) in plain_hits.iter().zip(verbose_hits) {
+            assert_eq!(after["full_id"], before["full_id"], "ranked IDs must match");
+            assert_eq!(after["rank_score"], before["rank_score"]);
+            assert_eq!(after["score"], before["score"]);
+            assert_eq!(after["raw_score"], before["raw_score"]);
+            assert_eq!(after["served_by_profile_id"], profile_id);
+            assert_eq!(after["breakdown"]["weights_served"], "default");
+            assert_eq!(after["breakdown"]["namespace"], ns.as_str());
+        }
+        let skewed = &verbose_hits[adr104_position(verbose_hits, note_ids[0])];
+        let profile_component = skewed["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present under include_breakdown");
+        assert!(
+            (profile_component - 1.0).abs() > 1e-6,
+            "the breakdown must use the bound profile's skewed posterior: {profile_component}"
+        );
+    }
+}
+
+// The standalone score verb always reports a breakdown with the default weight label.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_score_reports_default_weights_served() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall_score",
+            serde_json::json!({
+                "rrf": 0.7,
+                "salience": 0.6,
+                "decay_factor": 0.01,
+                "age_days": 2.0,
+            }),
+        )
+        .await
+        .expect("memory.recall_score");
+    assert_eq!(
+        result["breakdown"]["weights_served"].as_str(),
+        Some("default"),
+        "the standalone score breakdown must retain its default weight label"
+    );
+    assert_eq!(result["breakdown"]["namespace"].as_str(), Some(""));
+}
+
 // Anonymous callers must not match an explicit `actor="local"` binding.
 #[tokio::test]
 #[serial(background_tasks)]
