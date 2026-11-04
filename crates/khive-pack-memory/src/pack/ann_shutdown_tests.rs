@@ -63,6 +63,11 @@ impl ChildRun {
         );
         let stdout = File::create(directory.path().join("stdout")).expect("owned stdout");
         let stderr = File::create(directory.path().join("stderr")).expect("owned stderr");
+        let readiness_ms = if mode == "open" {
+            (SETUP + Duration::from_secs(5)).as_millis().to_string()
+        } else {
+            "1000".to_owned()
+        };
         let deadline = Instant::now() + WATCHDOG;
         let child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
@@ -75,8 +80,8 @@ impl ChildRun {
             .env(ROOT, directory.path())
             .env(NONCE, &nonce)
             .env(MODE, mode)
-            // common.rs:193-199 parses this existing key once per process, without a clamp.
-            .env("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS", "1000")
+            // ann_ready_timeout_ms parses this existing key once per process, without a clamp.
+            .env("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS", readiness_ms)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -430,6 +435,8 @@ fn run_case(mode: &'static str) {
         );
         while Instant::now() < end {
             run.receive(end).expect("held observation IPC");
+            // This records the current unbounded teardown behavior.
+            // A bounded teardown fix must flip this held-arm expectation.
             assert!(
                 !run.has("EXPIRED")
                     && !run.has("IPC_ERROR")
