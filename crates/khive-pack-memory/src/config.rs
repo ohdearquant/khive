@@ -95,9 +95,10 @@ pub struct RecallConfig {
     /// Pass `Some(1)` to disable widening entirely.
     pub ann_overfetch_max_rounds: Option<usize>,
 
-    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model` call
-    /// on the recall path before degrading that model's contribution to
-    /// FTS-only (#836). When `None`, falls back to the
+    /// Bounded receiver wait (milliseconds) for detached writable cold-miss
+    /// Warm work, including queued admission. Expiry drops only the receiver;
+    /// tracked work can continue. Not-ready results use degraded FTS/bounded
+    /// fresh-tail recall (#836). When `None`, falls back to the
     /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
     /// `handlers::common::ann_ready_timeout_ms`).
     ///

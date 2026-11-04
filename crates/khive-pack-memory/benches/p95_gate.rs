@@ -45,8 +45,8 @@
 //! its ANN-vs-sqlite-vec route variable, and its `warm_route_count` counter are all
 //! `pub(crate)` — invisible to this harness, which lives in `benches/`, a separate crate
 //! that only sees `khive-pack-memory`'s `pub` items. What *is* `pub` and crate-external is
-//! the event plane: `ensure_ann_for_model` (the only path that installs or rebuilds a
-//! model's ANN graph) emits a `memory.ann_warm` phase-started/completed event through
+//! the event plane: admitted Warm attempts append best-effort `memory.ann_warm`
+//! phase-started/completed events through
 //! `KhiveRuntime::events`, a `pub` accessor returning `khive_storage::EventStore`
 //! (`count_events`/`query_events` are both `pub` trait methods). This harness uses that:
 //! it snapshots the `memory.ann_warm` event count immediately before the timed loop and
