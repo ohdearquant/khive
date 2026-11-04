@@ -236,6 +236,20 @@ impl MemoryPack {
         params: Value,
         permitted: &[&str],
     ) -> Result<Value, RuntimeError> {
+        self.remember_permitting_with_properties(token, params, permitted)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// The remember response and, on replay, the held row's properties. Batch
+    /// writes compare those properties before reporting a replay as deduped or
+    /// asserting an edge.
+    pub(super) async fn remember_permitting_with_properties(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
         let p: RememberParams = deser(params)?;
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
@@ -475,7 +489,8 @@ impl MemoryPack {
             response["warnings"] =
                 json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
-        to_json(&response)
+        let stored_properties = if replayed { note.properties } else { None };
+        Ok((to_json(&response)?, stored_properties))
     }
 }
 
