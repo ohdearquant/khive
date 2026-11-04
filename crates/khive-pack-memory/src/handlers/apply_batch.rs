@@ -674,7 +674,10 @@ impl MemoryPack {
         let expected_batch_row = planned.params["properties"]["batch_row"]
             .as_str()
             .map(str::to_owned);
-        let key = planned.params["key"].as_str().unwrap_or_default().to_owned();
+        let key = planned.params["key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         let (stored, stored_properties) = self
             .remember_permitting_with_properties(token, planned.params, BATCH_WRITTEN_PROPERTY_KEYS)
             .await
