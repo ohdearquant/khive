@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::ann::interactive_build_test_support as gate;
+use gate::protocol::{self, ReceivedCase, Release};
 
 const SETUP: Duration = Duration::from_secs(30);
 const HELD: Duration = Duration::from_secs(5);
@@ -17,10 +18,43 @@ const SETTLE: Duration = Duration::from_secs(20);
 const FAILSAFE: Duration = Duration::from_secs(60);
 const WATCHDOG: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(20);
+const HELD_READINESS: Duration = Duration::from_secs(1);
+const OPEN_READINESS_MARGIN: Duration = Duration::from_secs(5);
 
-const ROOT: &str = "KHIVE_TEST_6339_ROOT";
-const NONCE: &str = "KHIVE_TEST_6339_NONCE";
-const MODE: &str = "KHIVE_TEST_6339_MODE";
+fn assert_timing_contract() {
+    assert!(!POLL.is_zero() && POLL < HELD, "timing_poll_contract");
+    assert!(HELD_READINESS < SETUP, "timing_readiness_contract");
+    assert!(SETUP + OPEN_READINESS_MARGIN > SETUP, "timing_open_margin");
+    assert!(HELD < SETTLE, "timing_live_cleanup_contract");
+    assert!(
+        HELD_READINESS + HELD + SETTLE < FAILSAFE,
+        "timing_gate_failsafe"
+    );
+    assert!(SETUP + FAILSAFE <= WATCHDOG, "timing_shared_watchdog");
+    // Phases share this shorter absolute cap; their maxima are not additive promises.
+    let phase_sum = SETUP + SETUP + HELD + SETTLE + SETTLE + SETTLE;
+    assert!(WATCHDOG < phase_sum, "timing_shared_phase_cap");
+}
+
+const ROOT: &str = "KHIVE_TEST_MEMORY_ANN_ROOT";
+const NONCE: &str = "KHIVE_TEST_MEMORY_ANN_NONCE";
+const MODE: &str = "KHIVE_TEST_MEMORY_ANN_MODE";
+
+#[derive(Debug)]
+enum ChildLifecycle {
+    Spawned,
+    Connected,
+    Released,
+    Reaped(ExitStatus),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupState {
+    Pending,
+    Running,
+    Passed,
+    Failed,
+}
 
 struct ChildRun {
     directory: Option<tempfile::TempDir>,
@@ -30,18 +64,16 @@ struct ChildRun {
     nonce: String,
     mode: &'static str,
     events: Vec<String>,
-    connected: bool,
-    release: Option<&'static str>,
-    status: Option<ExitStatus>,
-    cleanup_ok: bool,
-    cleanup_started: bool,
+    lifecycle: ChildLifecycle,
+    cleanup: CleanupState,
     deadline: Instant,
 }
 
 impl ChildRun {
     fn spawn(mode: &'static str) -> Self {
+        assert_timing_contract();
         let directory = tempfile::Builder::new()
-            .prefix("k6339-")
+            .prefix("ann-drop-")
             .tempdir_in(std::env::temp_dir())
             .expect("owned child directory");
         let socket = UnixDatagram::bind(directory.path().join("p")).expect("parent Unix IPC");
@@ -63,11 +95,12 @@ impl ChildRun {
         );
         let stdout = File::create(directory.path().join("stdout")).expect("owned stdout");
         let stderr = File::create(directory.path().join("stderr")).expect("owned stderr");
-        let readiness_ms = if mode == "open" {
-            (SETUP + Duration::from_secs(5)).as_millis().to_string()
+        let readiness = if mode == protocol::HELD {
+            HELD_READINESS
         } else {
-            "1000".to_owned()
+            SETUP + OPEN_READINESS_MARGIN
         };
+        let readiness_ms = readiness.as_millis().to_string();
         let deadline = Instant::now() + WATCHDOG;
         let child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
@@ -94,11 +127,8 @@ impl ChildRun {
             nonce,
             mode,
             events: Vec::new(),
-            connected: false,
-            release: None,
-            status: None,
-            cleanup_ok: true,
-            cleanup_started: false,
+            lifecycle: ChildLifecycle::Spawned,
+            cleanup: CleanupState::Pending,
             deadline,
         }
     }
@@ -108,12 +138,22 @@ impl ChildRun {
     }
 
     fn counts(&self) -> Option<(usize, usize)> {
-        let event = self
-            .events
-            .iter()
-            .find_map(|event| event.strip_prefix("COUNTS "))?;
+        let event = self.events.iter().find_map(|event| {
+            event
+                .strip_prefix(protocol::COUNTS)
+                .and_then(|event| event.strip_prefix(' '))
+        })?;
         let (captures, entries) = event.split_once(' ')?;
         Some((captures.parse().ok()?, entries.parse().ok()?))
+    }
+
+    fn mapping_result(&self, case: ReceivedCase) -> Option<(bool, bool)> {
+        let prefix = format!("{} {} ", protocol::MAPPING, case.variant());
+        self.events.iter().find_map(|event| {
+            let rest = event.strip_prefix(&prefix)?;
+            let (valid, received) = rest.split_once(' ')?;
+            Some((valid.parse().ok()?, received.parse().ok()?))
+        })
     }
 
     fn receive(&mut self, deadline: Instant) -> io::Result<bool> {
@@ -137,10 +177,6 @@ impl ChildRun {
             }
             Err(error) => return Err(error),
         };
-        if !self.connected {
-            self.socket.connect(&self.child_socket)?;
-            self.connected = true;
-        }
         if sender.as_pathname() != Some(self.child_socket.as_path()) || length == bytes.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -153,12 +189,17 @@ impl ChildRun {
             .strip_prefix(&self.nonce)
             .and_then(|message| message.strip_prefix(' '))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "child IPC nonce"))?;
-        eprintln!("6339 {}: {event}", self.mode);
+        protocol::validate(event)?;
+        if matches!(&self.lifecycle, ChildLifecycle::Spawned) {
+            self.socket.connect(&self.child_socket)?;
+            self.lifecycle = ChildLifecycle::Connected;
+        }
+        eprintln!("memory ANN {}: {event}", self.mode);
         self.events.push(event.to_owned());
         Ok(true)
     }
 
-    fn send_release(&mut self, cleanup: bool) -> io::Result<Instant> {
+    fn send_release(&mut self, release: Release) -> io::Result<Instant> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -166,35 +207,40 @@ impl ChildRun {
                 "child watchdog reached",
             ));
         }
-        self.socket.set_write_timeout(Some(POLL.min(remaining)))?;
-        if !self.connected {
-            self.socket.connect(&self.child_socket)?;
-            self.connected = true;
+        if !matches!(
+            &self.lifecycle,
+            ChildLifecycle::Connected | ChildLifecycle::Released
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "child sender not authenticated",
+            ));
         }
-        let event = if cleanup {
-            "CLEANUP_RELEASE"
-        } else {
-            "RELEASE"
-        };
+        self.socket.set_write_timeout(Some(POLL.min(remaining)))?;
+        let event = release.command();
         let frame = format!("{} {event}", self.nonce);
         let sent = self.socket.send(frame.as_bytes())?;
         let delivered_at = Instant::now();
         if sent != frame.len() {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "parent IPC frame"));
         }
-        self.release = Some(if cleanup { "CLEANUP" } else { "NORMAL" });
-        eprintln!("6339 {} parent: {event}", self.mode);
+        self.lifecycle = ChildLifecycle::Released;
+        eprintln!("memory ANN {} parent: {event}", self.mode);
         Ok(delivered_at)
     }
 
     fn poll_status(&mut self) -> io::Result<bool> {
-        if self.status.is_none() {
+        if self.status().is_none() {
             if let Some(status) = self.child.try_wait()? {
-                self.status = Some(status);
-                eprintln!("6339 {} parent: REAPED {:?}", self.mode, self.status);
+                self.lifecycle = ChildLifecycle::Reaped(status);
+                eprintln!(
+                    "memory ANN {} parent: REAPED {:?}",
+                    self.mode,
+                    self.status()
+                );
             }
         }
-        Ok(self.status.is_some())
+        Ok(self.status().is_some())
     }
 
     fn collect_until(&mut self, budget: Duration, ready: impl Fn(&Self) -> bool) -> bool {
@@ -204,13 +250,15 @@ impl ChildRun {
                 return true;
             }
             let received = self.receive(deadline).expect("owned fixture IPC");
-            assert!(
-                !self.has("EXPIRED") && !self.has("IPC_ERROR") && !self.has("WORKER_EXIT PANIC"),
-                "invalid worker outcome: {:?}",
-                self.events
-            );
-            if self.mode == "open" && self.has("ENTERED 1") && self.release.is_none() {
-                self.send_release(false).expect("open parent release");
+            assert!(!self.has(protocol::EXPIRED), "body_gate_failsafe_expired");
+            assert!(!self.has(protocol::IPC_ERROR), "body_gate_ipc_error");
+            assert!(!self.has(protocol::BODY_PANIC), "body_scope_panicked");
+            if self.mode != protocol::HELD
+                && self.has(protocol::ENTERED_ONCE)
+                && matches!(&self.lifecycle, ChildLifecycle::Connected)
+            {
+                self.send_release(Release::Normal)
+                    .expect("open parent release");
             }
             if !received && self.poll_status().expect("child status") {
                 return ready(self);
@@ -219,42 +267,59 @@ impl ChildRun {
         ready(self)
     }
 
+    fn status(&self) -> Option<&ExitStatus> {
+        match &self.lifecycle {
+            ChildLifecycle::Reaped(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    fn cleanup_ok(&self) -> bool {
+        self.cleanup == CleanupState::Passed
+    }
+
+    fn finish_cleanup(&mut self) {
+        if self.cleanup == CleanupState::Running {
+            self.cleanup = CleanupState::Passed;
+        }
+    }
+
     fn cleanup(&mut self) {
-        if self.cleanup_started {
+        if self.cleanup != CleanupState::Pending {
             return;
         }
-        self.cleanup_started = true;
+        self.cleanup = CleanupState::Running;
         let deadline = (Instant::now() + SETTLE).min(self.deadline);
-        if let Err(error) = self.poll_status() {
-            self.cleanup_failure(&format!("initial status: {error}"));
-        }
-        if self.status.is_some() {
-            self.drain_exited(deadline);
-            return;
-        }
-        if let Err(error) = self.send_release(true) {
-            match self.poll_status() {
-                Ok(true) => {}
-                Ok(false) => self.cleanup_failure(&format!("release before reap: {error}")),
-                Err(status_error) => {
-                    self.cleanup_failure(&format!("release: {error}; status: {status_error}"))
-                }
-            }
-        }
-        while Instant::now() < deadline {
-            if let Err(error) = self.receive(deadline) {
-                self.cleanup_failure(&format!("IPC: {error}"));
-            }
+        let mut release_attempted = false;
+        loop {
             match self.poll_status() {
                 Ok(true) => {
                     self.drain_exited(deadline);
+                    self.finish_cleanup();
                     return;
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    self.cleanup_failure(&format!("status: {error}"));
-                    break;
+                Err(error) => self.cleanup_failure(&format!("status: {error}")),
+            }
+            if !release_attempted
+                && matches!(
+                    &self.lifecycle,
+                    ChildLifecycle::Connected | ChildLifecycle::Released
+                )
+            {
+                release_attempted = true;
+                if let Err(error) = self.send_release(Release::Cleanup) {
+                    match self.poll_status() {
+                        Ok(true) => {}
+                        _ => self.cleanup_failure(&format!("release: {error}")),
+                    }
                 }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Err(error) = self.receive(deadline) {
+                self.cleanup_failure(&format!("IPC: {error}"));
             }
         }
         self.cleanup_failure("normal cleanup exhausted; recorded before owned child kill");
@@ -266,6 +331,7 @@ impl ChildRun {
             match self.poll_status() {
                 Ok(true) => {
                     self.drain_exited(reap_deadline);
+                    self.finish_cleanup();
                     return;
                 }
                 Ok(false) => {}
@@ -281,11 +347,11 @@ impl ChildRun {
                 self.cleanup_failure(&format!("final IPC drain: {error}"));
             }
         }
-        self.cleanup_failure("child remains unreaped at final deadline; private path retained");
+        self.cleanup_failure("child remains unreaped; private path retained");
     }
 
     fn cleanup_failure(&mut self, reason: &str) {
-        self.cleanup_ok = false;
+        self.cleanup = CleanupState::Failed;
         eprintln!("CLEANUP_FAILURE child {}: {reason}", self.child.id());
     }
 
@@ -313,7 +379,7 @@ impl ChildRun {
 
     fn close_directory(&mut self) {
         assert!(
-            self.status.is_some(),
+            self.status().is_some(),
             "never remove an unreaped child's owned path"
         );
         self.directory
@@ -326,9 +392,11 @@ impl ChildRun {
 
 impl Drop for ChildRun {
     fn drop(&mut self) {
+        // Panic unwinding can wait through two SETTLE polling stages (at most 40s),
+        // both clipped to the shared watchdog. No blocking Child::wait is used.
         self.cleanup();
         if let Some(directory) = self.directory.take() {
-            if self.status.is_some() {
+            if self.status().is_some() {
                 if let Err(error) = directory.close() {
                     eprintln!(
                         "CLEANUP_FAILURE child {} owned directory: {error}",
@@ -383,11 +451,22 @@ fn require_counts(run: &mut ChildRun) {
             output.contains("running 1 test"),
             "exact_child_test_count: {output}"
         );
+        assert!(run.cleanup_ok(), "control cleanup: {output}");
         assert!(
-            run.cleanup_ok && run.has("POST_DROP"),
-            "control cleanup: {output}"
+            run.has(protocol::POST_DROP) && run.has(protocol::CHILD_OK),
+            "control child completion: {output}"
         );
-        eprintln!("6339 missing-hook child output: {output}");
+        assert!(
+            run.status().is_some_and(|status| status.success()),
+            "control normal exit/reap: {output}"
+        );
+        if entries == 1 {
+            assert!(
+                run.has(protocol::BODY_CONFIRMED),
+                "control body-scope confirmation: {output}"
+            );
+        }
+        eprintln!("memory ANN missing-hook child output: {output}");
         run.close_directory();
     }
     assert_eq!(captures, 1, "actual_build_gate_capture_count");
@@ -396,38 +475,43 @@ fn require_counts(run: &mut ChildRun) {
 
 fn run_case(mode: &'static str) {
     let mut run = ChildRun::spawn(mode);
-    assert!(
-        run.collect_until(SETUP, |run| run.has("REQUEST_RETURNED")
-            && run.counts().is_some()),
-        "request/setup guard exhausted: {:?}",
-        run.events
-    );
+    let request_returned = run.collect_until(SETUP, |run| {
+        run.has(protocol::REQUEST_RETURNED) && run.counts().is_some()
+    });
+    if !request_returned {
+        eprintln!("memory ANN request-stage diagnostic: {:?}", run.events);
+    }
+    assert!(request_returned, "request_setup_guard");
     require_counts(&mut run);
     assert!(
-        run.has(&format!("CHILD_START {mode}")),
+        run.has(&format!("{} {mode}", protocol::START)),
         "selected exact child"
     );
     assert_eq!(
         run.events
             .iter()
-            .filter(|event| *event == "CAPTURE 1")
+            .filter(|event| *event == protocol::CAPTURE_ONCE)
             .count(),
         1
     );
     assert_eq!(
         run.events
             .iter()
-            .filter(|event| *event == "ENTERED 1")
+            .filter(|event| *event == protocol::ENTERED_ONCE)
             .count(),
         1
     );
-    assert!(
-        run.collect_until(SETUP, |run| run.has("PRE_DROP")),
-        "PRE_DROP guard"
-    );
+    let pre_drop = run.collect_until(SETUP, |run| run.has(protocol::PRE_DROP));
+    if !pre_drop {
+        eprintln!("memory ANN pre-drop diagnostic: {:?}", run.events);
+    }
+    assert!(pre_drop, "pre_drop_guard");
 
-    if mode == "held" {
-        assert!(run.has("FALLBACK_OK"), "bound readiness fallback");
+    // https://github.com/ohdearquant/khive/issues/6339 tracks this teardown dependency.
+    // Keep the fixed hold only for causal ordering; these are fixture guards, not ANN SLAs.
+    let mut held_observation = None;
+    if mode == protocol::HELD {
+        assert!(run.has(protocol::FALLBACK_OK), "bound readiness fallback");
         let end = Instant::now() + HELD;
         assert!(
             end <= run.deadline,
@@ -435,98 +519,174 @@ fn run_case(mode: &'static str) {
         );
         while Instant::now() < end {
             run.receive(end).expect("held observation IPC");
-            // This records the current unbounded teardown behavior.
-            // A bounded teardown fix must flip this held-arm expectation.
+            assert!(!run.has(protocol::EXPIRED), "body_gate_failsafe_expired");
+            assert!(!run.has(protocol::IPC_ERROR), "body_gate_ipc_error");
+            assert!(!run.has(protocol::BODY_PANIC), "body_scope_panicked");
+            let released_or_returned = run.has(protocol::BODY_RETURN)
+                || run.has(protocol::RELEASED_NORMAL)
+                || run.has(protocol::RELEASED_CLEANUP)
+                || run.has(protocol::BODY_CONFIRMED);
+            if released_or_returned {
+                eprintln!("memory ANN held-stage diagnostic: {:?}", run.events);
+            }
             assert!(
-                !run.has("EXPIRED")
-                    && !run.has("IPC_ERROR")
-                    && !run.has("WORKER_EXIT PANIC")
-                    && !run.has("WORKER_EXIT RETURN")
-                    && !run.has("RELEASED NORMAL")
-                    && !run.has("RELEASED CLEANUP")
-                    && !run.has("POST_DROP"),
-                "held worker/drop completed before parent release: {:?}",
-                run.events
+                !released_or_returned,
+                "body_scope_released_or_returned_early"
             );
             assert!(
                 !run.poll_status().expect("held child status"),
                 "held child exited"
             );
         }
-        eprintln!("C1_HELD_OBSERVED: ENTERED + FALLBACK_OK + PRE_DROP; no expiry/exit/drop");
-        let normal_release = run.send_release(false);
+        let post_drop_before_release = run.has(protocol::POST_DROP);
+        eprintln!(
+            "HELD_DROP_OBSERVED: entered/fallback/PRE_DROP; actual closure held; POST_DROP={post_drop_before_release}"
+        );
+        held_observation = Some((post_drop_before_release, run.has(protocol::BACKGROUND)));
+        eprintln!(
+            "C1_HELD_OBSERVED: pre-release POST_DROP recorded; body gate held and child alive"
+        );
+        let normal_release = run.send_release(Release::Normal);
         if normal_release.is_err() {
             run.cleanup();
             let output = run.output();
-            assert!(run.cleanup_ok, "control cleanup failed: {output}");
-            assert!(run.has("RELEASED CLEANUP") && run.has("WORKER_EXIT RETURN"));
-            assert!(run.has("POST_DROP") && run.has("CHILD_OK"));
-            assert!(run.status.as_ref().is_some_and(|status| status.success()));
+            assert!(run.cleanup_ok(), "control cleanup failed: {output}");
+            assert!(run.has(protocol::RELEASED_CLEANUP) && run.has(protocol::BODY_RETURN));
+            assert!(
+                run.has(protocol::POST_DROP)
+                    && run.has(protocol::BODY_CONFIRMED)
+                    && run.has(protocol::CHILD_OK)
+            );
+            assert!(run.status().is_some_and(|status| status.success()));
             assert!(
                 output.contains("running 1 test"),
                 "exact_child_test_count: {output}"
             );
             run.close_directory();
+            assert!(
+                held_observation == Some((true, true)),
+                "normal_release_control_preconditions"
+            );
         }
         assert!(normal_release.is_ok(), "normal_parent_release_required");
         let released_at = normal_release.expect("normal parent release");
         assert!(
             run.collect_until(SETTLE, |run| {
-                run.has("RELEASED NORMAL") && run.has("WORKER_EXIT RETURN") && run.has("POST_DROP")
+                run.has(protocol::RELEASED_NORMAL)
+                    && run.has(protocol::BODY_RETURN)
+                    && run.has(protocol::BODY_CONFIRMED)
             }),
-            "post-release completion guard"
+            "post_drop_body_scope_guard"
         );
         eprintln!(
-            "release-correlated POST_DROP observed after {:?}",
+            "post-drop body scope observed after RELEASE: {:?}",
             released_at.elapsed()
+        );
+    } else if let Some(case) = ReceivedCase::from_mode(mode) {
+        assert!(run.has(protocol::REAL_SUBMIT), "real_submit_completed");
+        assert!(
+            run.has(&format!("{} {}", protocol::REPLACED, case.variant())),
+            "received_replaced"
+        );
+        let (valid, received) = run.mapping_result(case).expect("mapping result receipt");
+        if !valid || !received {
+            run.cleanup();
+            let output = run.output();
+            eprintln!("memory ANN mapping diagnostic: {output}");
+            assert!(run.cleanup_ok(), "mapping control cleanup");
+            assert!(
+                run.has(protocol::POST_DROP)
+                    && run.has(protocol::BODY_CONFIRMED)
+                    && run.has(protocol::CHILD_OK)
+            );
+            assert!(run.has(protocol::RELEASED_NORMAL) && run.has(protocol::BODY_RETURN));
+            assert!(
+                run.status().is_some_and(|status| status.success()),
+                "mapping control normal exit/reap"
+            );
+            assert!(output.contains("running 1 test"), "exact_child_test_count");
+            run.close_directory();
+        }
+        assert!(received, "received_value_not_elapsed_or_sender_loss");
+        assert!(valid, "received_outcome_degraded");
+        assert!(
+            run.has(protocol::BACKGROUND),
+            "actual_background_build_context"
         );
     } else {
         assert!(
-            run.has("COLD_OK") && run.has("WARM_OK"),
+            run.has(protocol::COLD_OK) && run.has(protocol::WARM_OK),
             "open positive route"
         );
     }
 
-    assert!(
-        run.collect_until(SETTLE, |run| run.has("CHILD_OK") && run.has("POST_DROP")),
-        "normal child completion guard"
-    );
+    let child_completed = run.collect_until(SETTLE, |run| {
+        run.has(protocol::CHILD_OK)
+            && run.has(protocol::POST_DROP)
+            && run.has(protocol::BODY_CONFIRMED)
+    });
+    if !child_completed {
+        eprintln!("memory ANN child-completion diagnostic: {:?}", run.events);
+    }
+    assert!(child_completed, "normal_child_completion_guard");
     let end = (Instant::now() + SETTLE).min(run.deadline);
     while !run.poll_status().expect("normal child status") && Instant::now() < end {
         run.receive(end).expect("normal child IPC");
     }
     let output = run.output();
-    assert!(run.status.is_some(), "normal child exit guard: {output}");
+    assert!(run.status().is_some(), "normal child exit guard: {output}");
     run.cleanup();
-    assert!(run.cleanup_ok, "normal child cleanup: {output}");
+    assert!(run.cleanup_ok(), "normal child cleanup: {output}");
     assert!(
-        run.status.as_ref().is_some_and(|status| status.success()),
+        run.status().is_some_and(|status| status.success()),
         "normal exit/reap: {output}"
     );
     assert!(
         output.contains("running 1 test"),
         "exact_child_test_count: {output}"
     );
-    assert!(run.has("RELEASED NORMAL") && run.has("WORKER_EXIT RETURN"));
+    assert!(run.has(protocol::RELEASED_NORMAL) && run.has(protocol::BODY_RETURN));
     run.close_directory();
+    if let Some((post_drop_before_release, held_background)) = held_observation {
+        // Check the causal ordering after normal release/completion/reap in both routes.
+        assert!(post_drop_before_release, "post_drop_before_parent_release");
+        assert!(held_background, "actual_background_build_context");
+    }
 }
 
 #[test]
 fn actual_cold_miss_owned_runtime_release_witness() {
-    run_case("open");
-    run_case("held");
+    run_case(protocol::OPEN);
+    run_case(protocol::HELD);
+}
+
+#[test]
+fn received_cancelled_outcome_is_degraded() {
+    run_case(ReceivedCase::Cancelled.mode());
+}
+
+#[test]
+fn received_refused_outcome_is_degraded() {
+    run_case(ReceivedCase::Refused.mode());
+}
+
+#[test]
+fn received_finalization_timeout_outcome_is_degraded() {
+    run_case(ReceivedCase::FinalizationTimedOut.mode());
 }
 
 #[test]
 #[ignore = "selected only by the owned exact-test parent"]
 fn cold_miss_child() {
+    assert_timing_contract();
     let root = PathBuf::from(std::env::var_os(ROOT).expect("owned fixture root"));
     let nonce = std::env::var(NONCE).expect("parent nonce");
     let mode = std::env::var(MODE).expect("child mode");
-    assert!(matches!(mode.as_str(), "open" | "held"));
+    let received_case = ReceivedCase::from_mode(&mode);
+    assert!(matches!(mode.as_str(), protocol::OPEN | protocol::HELD) || received_case.is_some());
     let ipc = gate::Ipc::connect(&root.join("c"), &root.join("p"), nonce.clone(), FAILSAFE)
         .expect("child Unix IPC");
-    ipc.send(&format!("CHILD_START {mode}"));
+    ipc.send(&format!("{} {mode}", protocol::START));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -567,9 +727,13 @@ fn cold_miss_child() {
         builder.register(KgPack::new(rt.clone()));
         builder.register(pack);
         let registry = builder.build().expect("private registry");
-        let installation = gate::install(ipc.clone());
-        let query = if mode == "held" {
-            format!("nofts6339{nonce}")
+        let installation = if received_case.is_some() {
+            gate::install_received(ipc.clone(), received_case)
+        } else {
+            gate::install(ipc.clone())
+        };
+        let query = if mode != protocol::OPEN {
+            format!("absentmemoryann{nonce}")
         } else {
             "ann warm route note 7".to_owned()
         };
@@ -581,8 +745,8 @@ fn cold_miss_child() {
             )
             .await
             .expect("actual cold recall");
-        if mode == "open" {
-            ipc.send("COLD_OK");
+        if mode == protocol::OPEN {
+            ipc.send(protocol::COLD_OK);
             ann.reset_warm_route_count();
             registry
                 .dispatch_with_disposition(
@@ -593,11 +757,31 @@ fn cold_miss_child() {
                 .await
                 .expect("second recall");
             assert!(ann.warm_route_count() > 0, "second recall uses warm ANN");
-            ipc.send("WARM_OK");
+            ipc.send(protocol::WARM_OK);
+        }
+        if let Some(case) = received_case {
+            let reason = response
+                .get("degraded_reason")
+                .and_then(|value| value.as_str());
+            let valid = response.get("degraded").and_then(|value| value.as_bool()) == Some(true)
+                && reason.is_some_and(|reason| reason.contains(case.variant()));
+            let received = !reason.is_some_and(|reason| {
+                reason.contains("memory ANN not ready within bounded wait")
+                    || reason.contains("memory ANN detached build task ended without a result")
+            });
+            eprintln!(
+                "memory ANN received {}: valid={valid}, received={received}, reason={reason:?}",
+                case.variant()
+            );
+            ipc.send(&format!(
+                "{} {} {valid} {received}",
+                protocol::MAPPING,
+                case.variant()
+            ));
         }
         let (captures, entries) = installation.counts();
-        ipc.send(&format!("COUNTS {captures} {entries}"));
-        if mode == "held" && entries == 1 {
+        ipc.send(&format!("{} {captures} {entries}", protocol::COUNTS));
+        if mode == protocol::HELD && entries == 1 {
             assert!(
                 !installation.released(),
                 "fallback while worker remains held"
@@ -614,16 +798,23 @@ fn cold_miss_child() {
                 .get("degraded_reason")
                 .and_then(|v| v.as_str())
                 .is_some_and(|v| !v.is_empty()));
-            ipc.send("FALLBACK_OK");
+            ipc.send(protocol::FALLBACK_OK);
         }
-        ipc.send("REQUEST_RETURNED");
+        ipc.send(protocol::REQUEST_RETURNED);
         installation
     });
-    ipc.send("PRE_DROP");
+    ipc.send(protocol::PRE_DROP);
     drop(runtime);
-    ipc.send("POST_DROP");
-    let (captures, entries) = installation.counts();
-    assert_eq!(captures, 1, "actual_build_gate_capture_count");
-    assert_eq!(entries, 1, "actual_build_gate_entry_count");
-    ipc.send("CHILD_OK");
+    ipc.send(protocol::POST_DROP);
+    let entries = installation.counts().1;
+    if entries == 1 {
+        // Independent live cleanup after runtime drop; no competing IPC RELEASE reader.
+        assert!(
+            installation.wait_body_scope_exit(SETTLE),
+            "body-scope exit guard"
+        );
+        ipc.send(protocol::BODY_CONFIRMED);
+    }
+    // Receipts are data here: the parent asserts counts/mapping only after normal reap.
+    ipc.send(protocol::CHILD_OK);
 }
