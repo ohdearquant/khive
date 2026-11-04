@@ -514,12 +514,7 @@ pub(super) fn execute_query_consume_interruptibly(
     } else {
         // Preserve completion for a read inside an admitted writer transaction.
         scope.mark_write_committed()?;
-        super::query_execution::execute_prepared_query_consume(
-            stmt,
-            consumer,
-            || Ok(()),
-            operation,
-        )
+        super::query_execution::execute_prepared_query_consume(stmt, consumer, || Ok(()), operation)
     }
 }
 

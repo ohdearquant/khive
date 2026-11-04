@@ -1010,10 +1010,13 @@ struct ConsumedIntegers {
 impl khive_storage::SqlRowConsumer for ConsumedIntegers {
     fn push_row(&mut self, row: SqlRow) -> khive_storage::types::StorageResult<()> {
         let Some(SqlValue::Integer(value)) = row.get("value") else {
-            return Err(StorageError::Internal("consumer expected an integer".into()));
+            return Err(StorageError::Internal(
+                "consumer expected an integer".into(),
+            ));
         };
         self.values.push(*value);
-        self.visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.visits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail_after == Some(self.values.len()) {
             return Err(StorageError::Internal("deliberate consumer failure".into()));
         }
@@ -1216,8 +1219,10 @@ async fn query_consume_reader_routes_preserve_order_errors_and_read_transactions
                 }),
             )
             .await;
-        assert!(matches!(failed_inside, Err(StorageError::Internal(ref message))
-            if message == "deliberate consumer failure"));
+        assert!(
+            matches!(failed_inside, Err(StorageError::Internal(ref message))
+            if message == "deliberate consumer failure")
+        );
         reader
             .query_all(SqlStatement {
                 sql: "COMMIT".into(),
@@ -1294,11 +1299,10 @@ async fn cancelled_query_consume_stops_and_allows_a_followup_read() {
         .await
         .expect("consumer query must reach SQLite before cancellation");
         cancel_tx.send(true).unwrap();
-        let (mut reader, result) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), query)
-                .await
-                .expect("cancelled consumer read must stop promptly")
-                .unwrap();
+        let (mut reader, result) = tokio::time::timeout(std::time::Duration::from_secs(1), query)
+            .await
+            .expect("cancelled consumer read must stop promptly")
+            .unwrap();
         assert!(matches!(result, Err(StorageError::Timeout { .. })));
         let stopped_at = progress.load(std::sync::atomic::Ordering::SeqCst);
         let following = reader.query_consume(
@@ -1311,7 +1315,10 @@ async fn cancelled_query_consume_stops_and_allows_a_followup_read() {
             .and_then(consumed_integers)
             .unwrap();
         assert_eq!(recovered.values.len(), 100);
-        assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), stopped_at);
+        assert_eq!(
+            progress.load(std::sync::atomic::Ordering::SeqCst),
+            stopped_at
+        );
     }
 }
 
@@ -1357,13 +1364,14 @@ struct CancelAfterFirstRow {
 
 impl khive_storage::SqlRowConsumer for CancelAfterFirstRow {
     fn push_row(&mut self, _row: SqlRow) -> khive_storage::types::StorageResult<()> {
-        self.visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.visits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let entered = self.entered.take().ok_or_else(|| {
             StorageError::Internal("cancelled consumer visited a second row".into())
         })?;
-        entered.send(()).map_err(|()| {
-            StorageError::Internal("consumer-entry witness was dropped".into())
-        })?;
+        entered
+            .send(())
+            .map_err(|()| StorageError::Internal("consumer-entry witness was dropped".into()))?;
         // Test-only bounded handshake: cancellation happens after this visit starts.
         // A timeout here is a broken fixture, never a semantic cancellation witness.
         let fail_safe = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1431,11 +1439,10 @@ async fn query_consume_observes_cancellation_after_a_consumer_visit() {
             .expect("request must enter its first consumer visit")
             .expect("consumer must publish the entry witness");
         cancel_tx.send(true).unwrap();
-        let (mut reader, result) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), query)
-                .await
-                .expect("consumer must return after observing cancellation")
-                .unwrap();
+        let (mut reader, result) = tokio::time::timeout(std::time::Duration::from_secs(3), query)
+            .await
+            .expect("consumer must return after observing cancellation")
+            .unwrap();
         assert!(matches!(result, Err(StorageError::Timeout { .. })));
         assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), 1);
         let recovered = reader
