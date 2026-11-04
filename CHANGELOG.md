@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.17.0] - 2026-11-04
 ### Added
 
 - `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
@@ -17,6 +19,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason `receipt_epoch_unknown`; recall is unchanged.
 - `kkernel reindex --fts-only` rebuilds entity and note FTS documents without any embedding model, so no
   vector is dropped or written and the knowledge pass is skipped.
+- `memory.apply_batch` rewrites a chunk of memories in one checked call. A call carries a batch
+  name and 1 to 200 rows. A `supersede` row writes a new memory with a `supersedes` edge to the
+  old row and leaves the old row unchanged. A `create` row writes a new memory. A `skip` row
+  writes nothing, and a `delete-candidate` row writes nothing and is listed in the reply. Every
+  row is checked before anything is written, and a refused row does not stop the others. The
+  call is a dry run unless `dry_run` is `false`. Each written row stores the batch name and an
+  idempotency key derived from the batch, the old id and `part`, so re-running a chunk writes
+  only what is missing. An anonymous caller is refused.
+- `memory.remember` takes an optional `properties` object, stored beside `memory_type` and
+  `tags`. It holds at most 32 keys. Each key is 1 to 64 characters: a lowercase ASCII letter,
+  then lowercase letters, digits or `_`. Each value is a string, a finite number, a boolean or
+  an array of strings. The serialized object may be at most 8192 bytes, and a larger object is
+  refused, not truncated. The keys `memory_type`, `tags` and `attribution` are reserved.
+- `memory.recall` hits report `namespace`, `tags` (`[]` when none) and `properties` (`{}` when
+  none). Existing hit fields keep their names and meanings.
+- `memory.recall` breakdowns add `weights_served`, `namespace`, `pre_entity_score`,
+  `entity_term`, `local_factor` and `duplicate_penalty`.
+- `[actor] owned_namespaces` in `khive.toml` lists namespaces the actor owns, such as the
+  namespaces its helper processes write into. Each entry must be a valid namespace other than
+  `local` and the actor's own `id`, and entries must be unique. A non-empty list requires an
+  explicit `id`. An invalid list is refused when the configuration loads. `memory.apply_batch`
+  accepts an old row in an owned namespace. Ownership grants no write access and widens no read.
+- `brain.create_profile` takes an optional `local_factor`, a finite number from 0.5 to 1. Any
+  other value is refused. `brain.profile` reports the factor beside `posterior_means`. Recall
+  scales hits from the shared `local` namespace by a served profile's factor. A profile without
+  one applies no factor.
+- `moodboard.search` takes an optional `rerank` argument in the opt-in moodboard pack.
+  `"visual"`, the default, is the exact image-embedding cosine ranking, and its reply is
+  unchanged. `"fused"` also ranks assets by how well their captions match the query asset's
+  name and caption, then combines both rankings with weighted reciprocal-rank fusion.
+  `descriptor_weight` (default 0.5, strictly between 0 and 1) sets the caption share of the
+  score. `rrf_k` (default 60, from 1 to 10000) sets the fusion constant. Both are refused unless
+  `rerank` is `"fused"`, and an unknown `rerank` value is refused. A fused reply adds a `rerank`
+  block. Each hit reports its visual and caption rank and score, each null when the asset is
+  absent from that ranking. A query asset with no caption returns the visual ranking.
+
+### Changed
+
+- `memory.remember` without a `namespace` argument writes semantic memories to the caller's
+  actor namespace, as episodic memories already did. Semantic memories used to go to `local`.
+  A caller with no configured actor still writes to `local`. An explicit `namespace` still
+  wins, and rows already in `local` stay where they are. A
+  deployment that reads shared facts through `local` must list the writing actors in
+  `visible_namespaces` or pass `namespace="local"`. `memory.prune` still defaults to `local`.
+- A `memory.remember` write from a caller with no configured actor stores
+  `attribution: "unresolved"` in its properties, with or without a `namespace` argument. The
+  reply then includes `"attribution": "unresolved"`.
+- `memory.recall` with a served brain profile ranks hits with the configured default weights.
+  The weights the profile's posterior means project to are reported per hit as
+  `profile_component` in the breakdown and no longer change the ranking.
+- Per-entity brain posteriors move only on explicit feedback sent through `memory.feedback`. A
+  recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
+  posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
+  event to the profile that served it, as the live path does.
+### Fixed
+
+- `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
+  same way it answers an unknown id. The not-found error no longer names the requested id, and
+  a hidden cursor gets the invalid-input error an unknown cursor gets. Visible replies still
+  resolve to their thread.
+- Tool policy and grant timestamps stored as fractional or out-of-range numbers are no longer
+  truncated or silently treated as absent. A numeric timestamp is accepted only when it converts
+  to an integer without loss. A malformed row that the check consults is reported as an internal
+  error that names the row and the column.
+- The secret gate no longer refuses a note that cites a line with a backtick-quoted reference
+  such as `:1324`, followed by a later `path:line` citation near a trigger word. Assignments next
+  to a quoted reference are still refused.
+- A client whose configuration has no `[visibility_receipts]` section now matches any daemon
+  with a current receipt policy, so its requests reach the daemon instead of falling back to
+  local dispatch. A client that declares a receipt ring still needs the daemon's ring.
+
+### Security
+
+- The supervisor's marker ownership lock is opened through the checked opener the daemon locks
+  use. A symlink at the lock path is refused without touching its target. An existing lock file
+  loses its group and other permission bits, and a new one is created with mode 0600.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig`, `khive_runtime::RequestIdentity`,
+  `khive_runtime::DaemonRequestFrame` and `khive_runtime::engine_config::ActorConfig` add
+  `owned_namespaces`; `khive_brain_core::ProfileRecord` adds `local_factor`;
+  `khive_pack_memory::config::ScoreBreakdown` adds `weights_served`, `namespace`,
+  `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty`; and
+  `kkernel::reindex::ReindexArgs` adds `fts_only`.
 
 ## [0.16.0] - 2026-11-01
 ### Added
