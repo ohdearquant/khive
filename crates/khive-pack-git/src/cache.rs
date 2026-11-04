@@ -366,34 +366,44 @@ static SLOT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 
 struct SlotLock {
     key: String,
-    mutex: Arc<Mutex<()>>,
+    mutex: Option<Arc<Mutex<()>>>,
+    #[cfg(test)]
+    after_registry_unlock: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl std::ops::Deref for SlotLock {
     type Target = Mutex<()>;
 
     fn deref(&self) -> &Self::Target {
-        &self.mutex
+        self.mutex.as_deref().expect("live slot lock mutex")
     }
 }
 
 impl Drop for SlotLock {
     fn drop(&mut self) {
+        let mutex = self.mutex.take().expect("live slot lock mutex");
         let mut locks = SLOT_LOCKS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The registry and this handle are the final two owners only when no
         // waiter or guard can still reference this mutex.
-        let is_final_handle = Arc::strong_count(&self.mutex) == 2;
+        let is_final_handle = Arc::strong_count(&mutex) == 2;
         let is_registered = locks
             .get(&self.key)
-            .is_some_and(|mutex| Arc::ptr_eq(mutex, &self.mutex));
+            .is_some_and(|registered| Arc::ptr_eq(registered, &mutex));
         if is_final_handle && is_registered {
             locks.remove(&self.key);
             let live_entries = locks.len();
             if locks.capacity() > live_entries.saturating_mul(4) {
                 locks.shrink_to(live_entries);
             }
+        }
+        // A later drop must observe this owner's release in its count check.
+        drop(mutex);
+        drop(locks);
+        #[cfg(test)]
+        if let Some(gate) = self.after_registry_unlock.take() {
+            gate();
         }
     }
 }
@@ -408,9 +418,9 @@ static EVICTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Get-or-create the advisory lock for cache slot `key`. Callers hold the
 /// returned lock for the entire check-and-mutate span of their operation on
-/// that slot (see `SLOT_LOCKS`). The handle's drop check runs while holding
-/// the registry mutex, so a concurrent lookup either increments the same
-/// `Arc` first or observes the entry only after its final handle is gone.
+/// that slot (see `SLOT_LOCKS`). Drop checks and releases each owned `Arc`
+/// while holding the registry mutex, so a concurrent lookup either increments
+/// the same `Arc` first or observes the entry after its final handle is gone.
 fn slot_lock(key: &str) -> SlotLock {
     let mut locks = SLOT_LOCKS
         .lock()
@@ -420,7 +430,12 @@ fn slot_lock(key: &str) -> SlotLock {
         .entry(key.clone())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
-    SlotLock { key, mutex }
+    SlotLock {
+        key,
+        mutex: Some(mutex),
+        #[cfg(test)]
+        after_registry_unlock: None,
+    }
 }
 
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
