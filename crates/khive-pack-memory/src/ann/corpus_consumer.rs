@@ -90,7 +90,7 @@ pub(super) async fn scan(
         .into_any()
         .downcast::<CorpusConsumer>()
         .map_err(|_| StorageError::Internal("memory ANN corpus consumer type mismatch".into()))?;
-    Ok((*consumer).input)
+    Ok(consumer.input)
 }
 
 #[cfg(test)]
