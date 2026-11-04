@@ -68,6 +68,8 @@ const B_BASE: u128 = 2;
 const A_REPEAT: u128 = 3;
 const A_SINGLE: u128 = 4;
 const B_REPEAT: u128 = 5;
+// Seeded with U+F963, the CJK compatibility form of U+5317. It stays an escape in
+// the strings below so that Unicode normalization cannot turn it into U+5317.
 const A_COMPAT: u128 = 6;
 const A_TRAD: u128 = 7;
 const A_SIMPL: u128 = 8;
@@ -160,7 +162,7 @@ async fn qualify(query_text: &str, wanted: &[u128], forbidden: &[u128]) {
         ("local", A_REPEAT, "人人乐"),
         ("local", A_SINGLE, "京剧"),
         ("other", B_REPEAT, "人人乐"),
-        ("local", A_COMPAT, "北京城"),
+        ("local", A_COMPAT, "\u{F963}京城"),
         ("local", A_TRAD, "臺北"),
         ("local", A_SIMPL, "台北"),
     ] {
@@ -226,7 +228,7 @@ async fn compatibility_forward() {
 #[serial_test::serial(config_ledger)]
 #[ignore = "#1113: a CJK compatibility ideograph is not folded to its unified form, so the compatibility and unified spellings do not match"]
 async fn compatibility_reverse() {
-    qualify("北京城", &[A_BASE, A_COMPAT], &[]).await;
+    qualify("\u{F963}京城", &[A_BASE, A_COMPAT], &[]).await;
 }
 
 #[tokio::test]
