@@ -24,15 +24,17 @@ use super::validation::{parse_supplied_timestamp, validate_actor_label};
 
 /// Reasons a record may be written without its original (ADR-056, 2026-10-14
 /// and 2026-10-15 amendments). The heartbeat's `original_not_retained_reason`
-/// accepts exactly these tokens; `secondary-backend` names the drop
-/// `comm.ingest` performs itself when the runtime cannot own the original.
-const ORIGINAL_NOT_RETAINED_REASONS: [&str; 6] = [
+/// accepts exactly these tokens, including historical `secondary-backend`
+/// reports from before canonical-main ownership supported routed quarantine.
+const ORIGINAL_NOT_RETAINED_REASONS: [&str; 8] = [
     "retention-limit",
     "original-unavailable",
     "retention-count-unreadable",
     "original-store-failed",
     "quarantine-write-failed",
     "secondary-backend",
+    "blob-sweep-active",
+    "owner-mismatch",
 ];
 
 /// The two `original_retention_state` values: whether the writer kept its
@@ -40,8 +42,8 @@ const ORIGINAL_NOT_RETAINED_REASONS: [&str; 6] = [
 const ORIGINAL_RETENTION_STATES: [&str; 2] = ["retained", "failing"];
 
 /// Detach only the main-backend original owned by this already hard-deleted
-/// legacy note. The guarded delete rejects a competing replacement of the
-/// role after the owner read; it never scans for unrelated ownerless rows.
+/// routed note. The guarded delete preserves a role whose substrate or
+/// content reference changed after the owner read; it never scans for unrelated ownerless rows.
 pub(super) async fn detach_deleted_legacy_original(
     runtime: &KhiveRuntime,
     id: Uuid,
@@ -268,14 +270,13 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         if !still_due {
             continue;
         }
-        let routed_legacy = p.mode == QuarantineCleanupMode::LegacySlugless
-            && runtime.backend_id() != runtime.core().backend_id();
+        let routed_original = runtime.backend_id() != runtime.core().backend_id();
         let expected_ref = properties
             .and_then(|props| props.get("quarantine_content_ref"))
             .and_then(Value::as_str);
         // The runtime hard-delete removes incident graph edges alongside the
         // note and its local attachments in one transaction. A routed note's
-        // repaired original lives on canonical main and is detached by exact
+        // original lives on canonical main and is detached by exact
         // ID/ref only after that transaction commits.
         let delete_result = runtime.delete_note(token, id, true).await;
         // A typed post-commit error already proves the row/edge transaction
@@ -287,7 +288,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         .await?;
         if note_deleted {
             deleted += 1;
-            if routed_legacy {
+            if routed_original {
                 for attempt in 1..=3 {
                     match detach_deleted_legacy_original(runtime, id, expected_ref).await {
                         Ok(detached) => {
