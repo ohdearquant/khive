@@ -322,7 +322,8 @@ pub struct IngestReport {
     pub issues_ingested: u64,
     pub issues_skipped_existing: u64,
     /// Missing live project annotations among at most 1000 inspected issue/PR
-    /// notes. A partial census is a prefix count; null means unavailable.
+    /// notes. A partial census counts the inspected notes, which are the
+    /// lowest note IDs; null means unavailable.
     pub missing_project_annotation_count: Option<u64>,
     /// Up to 20 missing-link note IDs from the inspected prefix, sorted only
     /// for display. This sample may be capped even when the census is complete.

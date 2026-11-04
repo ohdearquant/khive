@@ -5,6 +5,7 @@ WITH project_notes AS (
       AND kind IN ('issue', 'pull_request')
       AND deleted_at IS NULL
       AND json_extract(properties, '$.project_id') = ?2
+    ORDER BY id
     LIMIT ?3
 )
 SELECT n.id,

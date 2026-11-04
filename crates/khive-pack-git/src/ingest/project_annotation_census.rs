@@ -87,7 +87,7 @@ async fn read_census(
             }
         }
     }
-    // Sorting the bounded display sample needs no SQL sort of the corpus.
+    // The display sample is sorted here, after the bounded read.
     census.note_ids.sort_unstable();
     Ok(census)
 }
@@ -194,5 +194,55 @@ mod tests {
         assert_eq!(complete.notes_scanned, 3);
         assert_eq!(complete.missing_count, 3);
         assert_eq!(complete.note_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn project_annotation_census_partial_scan_inspects_lowest_note_ids() {
+        let (runtime, token, registry) = fixture().await;
+        let project_id = create(
+            &registry,
+            json!({"kind": "project", "name": "census-order"}),
+        )
+        .await;
+        let mut ids = Vec::new();
+        // Keep adding notes until the first one created is not the lowest ID, so
+        // creation order and ID order disagree on which note comes first.
+        for number in 1..=64 {
+            let id = create(
+                &registry,
+                json!({
+                    "kind": "issue",
+                    "content": "",
+                    "properties": {
+                        "number": number,
+                        "title": format!("order issue {number}"),
+                        "project_id": project_id.to_string()
+                    }
+                }),
+            )
+            .await;
+            ids.push(id.to_string());
+            if ids.len() > 1 && ids.iter().min() != ids.first() {
+                break;
+            }
+        }
+        let lowest = ids.iter().min().cloned().expect("at least one note");
+        assert_ne!(
+            Some(&lowest),
+            ids.first(),
+            "fixture needs a first-created note that is not the lowest ID"
+        );
+
+        let partial = read_census(&runtime, &token, project_id, 1, 20)
+            .await
+            .expect("capped census");
+        assert!(!partial.complete);
+        assert_eq!(partial.notes_scanned, 1);
+        assert_eq!(
+            partial.note_ids,
+            vec![lowest],
+            "a partial census must inspect the lowest note IDs"
+        );
     }
 }
