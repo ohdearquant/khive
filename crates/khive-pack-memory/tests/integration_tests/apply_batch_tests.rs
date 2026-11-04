@@ -790,3 +790,44 @@ async fn test_apply_batch_rewrite_is_recalled_and_the_old_row_is_not() {
         "the superseded row must not be recalled, got {ids:?}"
     );
 }
+
+#[tokio::test]
+async fn test_apply_batch_pins_row_rerun_and_edge_to_one_write_namespace() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let alice = ab_registry_owning(rt.clone(), "alice", &[]);
+    let old = ab_seed(&alice, "sanderling shore survey original").await;
+    let alice_notes_before = ab_note_count(&rt, "alice").await;
+    let local_notes_before = ab_note_count(&rt, "local").await;
+    let rows = vec![ab_supersede(old, "sanderling shore survey revised")];
+
+    let first = ab_apply(&alice, "one-write-namespace", rows.clone(), false).await;
+    assert_eq!(first["entries"][0]["outcome"], "written");
+    assert_eq!(first["entries"][0]["old_namespace"], "alice");
+    assert_eq!(first["counts"]["written"], 1);
+    let new_id = ab_uuid(&first["entries"][0]["new_id"]);
+    let stored = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get the batch-written row");
+    assert_eq!(stored["namespace"], "alice");
+    assert_eq!(ab_note_count(&rt, "alice").await, alice_notes_before + 1);
+    assert_eq!(ab_note_count(&rt, "local").await, local_notes_before);
+    assert_eq!(ab_edges(&rt, "alice", vec![old]).await.len(), 1);
+    assert_eq!(ab_edges(&rt, "local", vec![old]).await.len(), 0);
+
+    // Reuse the public request rather than rebuilding its generated key.
+    let rerun = ab_apply(&alice, "one-write-namespace", rows, false).await;
+    assert_eq!(rerun["entries"][0]["outcome"], "deduped");
+    assert_eq!(rerun["entries"][0]["new_id"], new_id.to_string());
+    assert_eq!(rerun["counts"]["deduped"], 1);
+    assert_eq!(rerun["counts"]["written"], 0);
+    let stored_again = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get the deduped row");
+    assert_eq!(stored_again["namespace"], "alice");
+    assert_eq!(ab_note_count(&rt, "alice").await, alice_notes_before + 1);
+    assert_eq!(ab_note_count(&rt, "local").await, local_notes_before);
+    assert_eq!(ab_edges(&rt, "alice", vec![old]).await.len(), 1);
+    assert_eq!(ab_edges(&rt, "local", vec![old]).await.len(), 0);
+}
