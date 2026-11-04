@@ -270,49 +270,42 @@ async fn three_scalar_positive_baseline_and_namespace_isolation() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn short_two_distinct() {
     qualify("北京", &[A_BASE], &[]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn short_single() {
     qualify("京", &[A_BASE, A_SINGLE], &[]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn short_repeated() {
     qualify("人人", &[A_REPEAT], &[]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn compatibility_forward() {
     qualify("北京城", &[A_BASE, A_COMPAT], &[]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn compatibility_reverse() {
     qualify("北京城", &[A_BASE, A_COMPAT], &[]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn no_simplified_traditional_conversion() {
     qualify("台北", &[A_SIMPL], &[A_TRAD]).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-#[ignore = "CJK qualification: owner must first establish the positive baseline on the box"]
 async fn no_traditional_simplified_conversion() {
     qualify("臺北", &[A_TRAD], &[A_SIMPL]).await;
 }
