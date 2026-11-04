@@ -1061,8 +1061,12 @@ goes. A second reader of one measured row sees five of its six outgoing `superse
    whichever verb writes it. `memory.apply_batch` and `link` resolve the source row before writing and use its
    namespace; a write whose caller may not write that namespace is refused, never redirected to another namespace.
 2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
-   can see. When an edge between memory rows exists but sits outside those namespaces, the response states how many
-   such edges were left out. It does not return them or name their endpoints.
+   can see. For each row they return, and for each relation, the response also carries the number of edges between
+   memory rows that arrive at that row from rows outside those namespaces. The field is present on every filtered read,
+   with `0` when nothing was left out, so a missing field means the producer is broken, never that nothing was hidden.
+   Under rule 1 a reader already sees every outgoing edge of a row it can see, so the edges this count covers are the
+   incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
+   withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
 3. **Existing edges.** A one-time move rewrites each stored edge between memory rows whose namespace differs from its
    source row's namespace. The move has a dry run that prints per-namespace edge counts before and after and writes
    nothing; the applying run prints the same counts.
@@ -1072,13 +1076,13 @@ chain is either whole or reported as partial with a count. `link` gains one read
 endpoints are memory rows. Edges from a memory row to a non-memory record, and edges between non-memory records, keep
 their current rule.
 
-**Known limit.** A reader who can see the target row but not the source row still cannot learn that their row was
-superseded: the edge lives with the source, and the filtered count names no endpoints. That case is a follow-up, not
-solved here.
+**Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
+arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
+superseding row remains a follow-up, not solved here.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
 the same namespace (the source row's); a `link` whose caller may not write the source row's namespace refused with no
-edge written; `neighbors` from a second reader returning the visible edges plus a filtered count equal to the edges it
-cannot see; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+edge written; `neighbors` from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
+edges it cannot see; the same read with nothing hidden carrying the count as `0`, not omitting it; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
 run leaving all six in the source row's namespace.
