@@ -617,6 +617,45 @@ pub(super) fn compute_score(
     decay_factor: f64,
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
+    compute_score_inner(
+        cfg,
+        pipeline,
+        raw_relevance,
+        salience,
+        decay_factor,
+        age_days,
+        true,
+    )
+}
+
+pub(super) fn compute_score_for_recall(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    raw_relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+) -> (f64, ScoreBreakdown) {
+    compute_score_inner(
+        cfg,
+        pipeline,
+        raw_relevance,
+        salience,
+        decay_factor,
+        age_days,
+        false,
+    )
+}
+
+fn compute_score_inner(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    raw_relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+    report: bool,
+) -> (f64, ScoreBreakdown) {
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
 
     let effective_salience = cfg.decay_model.apply(
@@ -660,10 +699,14 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
-        // Neutral/absent here; `handle_recall` overwrites these for every hit it ranks.
+        // Neutral/absent here; `handle_recall` fills the fields it reports.
         profile_component: 1.0,
         entity_posterior_mean: None,
-        weights_served: "default".to_string(),
+        weights_served: if report {
+            "default".to_string()
+        } else {
+            String::new()
+        },
         namespace: String::new(),
         pre_entity_score: total as f32,
         entity_term: 1.0,

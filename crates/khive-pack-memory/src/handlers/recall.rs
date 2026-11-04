@@ -29,10 +29,10 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_for_query, make_pipeline, note_has_any_tag, note_matches_tags, plog,
-    plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
-    RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings, TextSnippetPolicy,
-    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    compute_score_for_recall, deser, fuse_for_query, make_pipeline, note_has_any_tag,
+    note_matches_tags, plog, plog_n, recall_candidate_count, to_json, validate_memory_type,
+    RecallCandidateParams, RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings,
+    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
@@ -405,6 +405,8 @@ impl MemoryPack {
         let mut cfg = p.effective_config(self.active_config());
         super::common::apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())?;
         cfg.validate()?;
+        // Used on both the empty and non-empty completion paths.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         let effective_min_score: f32 = {
             let raw = if let Some(floor) = p.score_floor {
@@ -499,17 +501,21 @@ impl MemoryPack {
         // A served profile scores with the configured default weights. The weights its
         // posteriors project to are computed only to report each hit's `profile_component`
         // in the breakdown; they never enter `rank_score`.
-        let projected_weights = profile_state.as_ref().and_then(|state| {
-            serde_json::from_value::<RecallConfig>(self.project_config(state))
-                .ok()
-                .map(|projected| {
-                    let mut weights = scoring_cfg.weights.clone();
-                    weights.relevance = projected.relevance_weight as f32;
-                    weights.salience = projected.salience_weight as f32;
-                    weights.temporal = projected.temporal_weight as f32;
-                    weights
-                })
-        });
+        let projected_weights = if is_verbose {
+            profile_state.as_ref().and_then(|state| {
+                serde_json::from_value::<RecallConfig>(self.project_config(state))
+                    .ok()
+                    .map(|projected| {
+                        let mut weights = scoring_cfg.weights.clone();
+                        weights.relevance = projected.relevance_weight as f32;
+                        weights.salience = projected.salience_weight as f32;
+                        weights.temporal = projected.temporal_weight as f32;
+                        weights
+                    })
+            })
+        } else {
+            None
+        };
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -748,9 +754,6 @@ impl MemoryPack {
             query_trimmed,
             p.embedding_model.as_deref(),
         )?;
-        // Needed on both the empty and non-empty completion paths.
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
-
         if prof {
             if let Some(ref t) = t_stage {
                 plog_n(call_id, "fusion", t.elapsed().as_micros(), fused.len());
@@ -979,7 +982,7 @@ impl MemoryPack {
 
             let age_days_f64 =
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
-            let (_, mut breakdown) = compute_score(
+            let (_, mut breakdown) = compute_score_for_recall(
                 &cfg,
                 &recall_pipeline,
                 norm_relevance as f64,
@@ -1019,7 +1022,6 @@ impl MemoryPack {
                 1.0
             };
             let final_score = unscaled_score * candidate_local_factor;
-            breakdown.namespace = note.namespace.clone();
             breakdown.pre_entity_score = pre_entity_term_score;
             breakdown.entity_term = entity_term;
             breakdown.local_factor = candidate_local_factor;
@@ -1252,7 +1254,10 @@ impl MemoryPack {
                     result["source_id"] = json!(source);
                 }
                 if is_verbose {
-                    result["breakdown"] = json!(sn.breakdown);
+                    let mut breakdown = sn.breakdown;
+                    breakdown.namespace = sn.note.namespace.clone();
+                    breakdown.weights_served = "default".to_string();
+                    result["breakdown"] = json!(breakdown);
                 }
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.
