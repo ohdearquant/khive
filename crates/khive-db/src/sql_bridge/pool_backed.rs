@@ -340,6 +340,40 @@ impl khive_storage::SqlReader for PoolBackedReader {
         .await
     }
 
+    async fn query_consume(
+        &mut self,
+        statement: SqlStatement,
+        consumer: Box<dyn khive_storage::SqlRowConsumer>,
+    ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlRowConsumer>> {
+        let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_consume")?;
+        if transaction_control.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "pool_reader.query_consume".into(),
+                message: "row consumption does not execute transaction control".into(),
+            });
+        }
+        run_pool_backed_reader_query(
+            &mut self.transaction,
+            Arc::clone(&self.pool),
+            "pool_reader.query_consume",
+            transaction_control,
+            move |scope, conn, rollback, interruptible| {
+                super::reader_capability::execute_query_consume_interruptibly(
+                    scope,
+                    conn,
+                    &statement,
+                    consumer,
+                    "pool_reader.query_consume",
+                    rollback,
+                    interruptible,
+                )
+            },
+        )
+        .await
+    }
+
     async fn query_page(
         &mut self,
         statement: SqlStatement,
