@@ -340,8 +340,16 @@ mod tests {
                 Some(embedding([0.0, 0.0])),
                 Some(text("rejected-first")),
             ),
-            1 => (Some(text(A)), Some(embedding([1.25, -2.5])), Some(text("alpha"))),
-            2 => (None, Some(embedding([0.0, 0.0])), Some(text("rejected-id-missing"))),
+            1 => (
+                Some(text(A)),
+                Some(embedding([1.25, -2.5])),
+                Some(text("alpha")),
+            ),
+            2 => (
+                None,
+                Some(embedding([0.0, 0.0])),
+                Some(text("rejected-id-missing")),
+            ),
             3 => (
                 Some(SqlValue::Integer(10)),
                 Some(embedding([0.0, 0.0])),
@@ -352,15 +360,31 @@ mod tests {
                 Some(embedding([0.0, 0.0])),
                 Some(text("rejected-id-invalid")),
             ),
-            5 => (Some(text(B)), Some(embedding([3.0, 4.0])), Some(text("beta"))),
-            6 => (Some(text(C)), None, Some(text("rejected-embedding-missing"))),
-            7 => (Some(text(C)), Some(text("not-a-blob")), Some(text("rejected-embedding-type"))),
+            5 => (
+                Some(text(B)),
+                Some(embedding([3.0, 4.0])),
+                Some(text("beta")),
+            ),
+            6 => (
+                Some(text(C)),
+                None,
+                Some(text("rejected-embedding-missing")),
+            ),
+            7 => (
+                Some(text(C)),
+                Some(text("not-a-blob")),
+                Some(text("rejected-embedding-type")),
+            ),
             8 => (
                 Some(text(C)),
                 Some(SqlValue::Blob(vec![0; 4])),
                 Some(text("rejected-embedding-length")),
             ),
-            9 => (Some(text(A)), Some(embedding([-5.0, 6.5])), Some(text("alpha"))),
+            9 => (
+                Some(text(A)),
+                Some(embedding([-5.0, 6.5])),
+                Some(text("alpha")),
+            ),
             10 => (Some(text(C)), Some(embedding([7.0, 8.0])), None),
             11 => (
                 Some(text(D)),
@@ -392,7 +416,10 @@ mod tests {
             [SqlValue::Text(model)] => assert_eq!(model, "fixture-model"),
             _ => panic!("statement parameters changed"),
         }
-        assert_eq!(statement.label.as_deref(), Some("memory_ann_corpus_fixture"));
+        assert_eq!(
+            statement.label.as_deref(),
+            Some("memory_ann_corpus_fixture")
+        );
     }
 
     fn assert_mixed_input(input: &CorpusInput) {
@@ -407,15 +434,23 @@ mod tests {
                 Uuid::from_u128(13),
             ]
         );
-        assert_eq!(input.flat, vec![1.25, -2.5, 3.0, 4.0, -5.0, 6.5, 7.0, 8.0, 9.0, 10.0]);
-        assert_eq!(input.namespaces, HashSet::from(["alpha".to_owned(), "beta".to_owned()]));
+        assert_eq!(
+            input.flat,
+            vec![1.25, -2.5, 3.0, 4.0, -5.0, 6.5, 7.0, 8.0, 9.0, 10.0]
+        );
+        assert_eq!(
+            input.namespaces,
+            HashSet::from(["alpha".to_owned(), "beta".to_owned()])
+        );
         assert_eq!(input.watermark, 91);
     }
 
     #[tokio::test]
     async fn memory_ann_corpus_stream_preserves_input_before_raw_row_high_water() {
         let (mut reader, calls) = LazyReader::new(Fixture::Mixed);
-        let input = scan(&mut reader, statement(), 2).await.expect("complete scan");
+        let input = scan(&mut reader, statement(), 2)
+            .await
+            .expect("complete scan");
         assert_mixed_input(&input);
         let calls = calls.lock().expect("calls lock");
         assert_one_statement(&calls);
@@ -436,7 +471,9 @@ mod tests {
             FirstWatermark::Zero,
         ] {
             let (mut reader, calls) = LazyReader::new(Fixture::Watermark(first));
-            let input = scan(&mut reader, statement(), 2).await.expect("complete scan");
+            let input = scan(&mut reader, statement(), 2)
+                .await
+                .expect("complete scan");
             assert_eq!(input.dimensions, 2);
             assert_eq!(input.ids, vec![Uuid::from_u128(10)]);
             assert_eq!(input.flat, vec![1.25, -2.5]);
@@ -450,7 +487,9 @@ mod tests {
     async fn memory_ann_corpus_empty_and_all_invalid_keep_empty_input() {
         for (fixture, watermark) in [(Fixture::Empty, 0), (Fixture::Invalid, 70)] {
             let (mut reader, calls) = LazyReader::new(fixture);
-            let input = scan(&mut reader, statement(), 2).await.expect("complete scan");
+            let input = scan(&mut reader, statement(), 2)
+                .await
+                .expect("complete scan");
             assert_eq!(input.dimensions, 2);
             assert!(input.ids.is_empty());
             assert!(input.flat.is_empty());
