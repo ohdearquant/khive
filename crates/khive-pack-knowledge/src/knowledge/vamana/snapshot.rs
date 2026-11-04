@@ -238,10 +238,7 @@ impl CorpusRows {
 }
 
 impl khive_storage::SqlRowConsumer for CorpusRows {
-    fn push_row(
-        &mut self,
-        row: khive_storage::SqlRow,
-    ) -> khive_storage::types::StorageResult<()> {
+    fn push_row(&mut self, row: khive_storage::SqlRow) -> khive_storage::types::StorageResult<()> {
         // Capture the first raw row, even when that row is later skipped.
         if !self.saw_row {
             self.saw_row = true;
@@ -287,10 +284,9 @@ async fn scan_corpus_rows(
     let consumer = reader
         .query_consume(statement, Box::new(CorpusRows::new(dims)))
         .await?;
-    let corpus = consumer
-        .into_any()
-        .downcast::<CorpusRows>()
-        .map_err(|_| khive_storage::StorageError::Internal("unexpected corpus SQL consumer".into()))?;
+    let corpus = consumer.into_any().downcast::<CorpusRows>().map_err(|_| {
+        khive_storage::StorageError::Internal("unexpected corpus SQL consumer".into())
+    })?;
     Ok(corpus.finish())
 }
 

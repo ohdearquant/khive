@@ -1,6 +1,6 @@
 use super::*;
-use khive_storage::{SqlReader, SqlRow, SqlRowConsumer, SqlStatement, StorageError};
 use khive_storage::types::StorageResult;
+use khive_storage::{SqlReader, SqlRow, SqlRowConsumer, SqlStatement, StorageError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,16 +35,29 @@ impl Fixture {
     fn row(self, index: usize) -> SqlRow {
         let mut columns = vec![("log_s", SqlValue::Integer(79))];
         if let Self::Ordered(_) = self {
-            columns.push(("subject_id", SqlValue::Text(Uuid::from_u128(index as u128 + 1).to_string())));
-            columns.push(("embedding", SqlValue::Blob(khive_storage::encode_f32_native(&[index as f32, -(index as f32)]))));
+            columns.push((
+                "subject_id",
+                SqlValue::Text(Uuid::from_u128(index as u128 + 1).to_string()),
+            ));
+            columns.push((
+                "embedding",
+                SqlValue::Blob(khive_storage::encode_f32_native(&[
+                    index as f32,
+                    -(index as f32),
+                ])),
+            ));
             return sql_row(columns);
         }
         if index == 0 {
             columns.clear();
             match self {
-                Self::Mixed(FirstWatermark::Missing) => {},
-                Self::Mixed(FirstWatermark::Negative) => columns.push(("log_s", SqlValue::Integer(-1))),
-                Self::Mixed(FirstWatermark::Text) => columns.push(("log_s", SqlValue::Text("71".into()))),
+                Self::Mixed(FirstWatermark::Missing) => {}
+                Self::Mixed(FirstWatermark::Negative) => {
+                    columns.push(("log_s", SqlValue::Integer(-1)))
+                }
+                Self::Mixed(FirstWatermark::Text) => {
+                    columns.push(("log_s", SqlValue::Text("71".into())))
+                }
                 _ => columns.push(("log_s", SqlValue::Integer(71))),
             }
         }
@@ -55,20 +68,26 @@ impl Fixture {
             3 => {
                 columns.push(("subject_id", SqlValue::Text(Uuid::from_u128(3).to_string())));
                 columns.push(("embedding", SqlValue::Text("not bytes".into())));
-            },
+            }
             4 => {
                 columns.push(("subject_id", SqlValue::Text(Uuid::from_u128(4).to_string())));
                 columns.push(("embedding", SqlValue::Blob(vec![1, 2, 3])));
-            },
+            }
             5 | 6 => {
-                columns.push(("subject_id", SqlValue::Text(Uuid::from_u128(index as u128).to_string())));
+                columns.push((
+                    "subject_id",
+                    SqlValue::Text(Uuid::from_u128(index as u128).to_string()),
+                ));
                 let values = if index == 5 {
                     [f32::from_bits(0x8000_0000), f32::from_bits(0x3f80_0001)]
                 } else {
                     [f32::MIN_POSITIVE, -1.25]
                 };
-                columns.push(("embedding", SqlValue::Blob(khive_storage::encode_f32_native(&values))));
-            },
+                columns.push((
+                    "embedding",
+                    SqlValue::Blob(khive_storage::encode_f32_native(&values)),
+                ));
+            }
             _ => unreachable!(),
         }
         sql_row(columns)
@@ -105,7 +124,9 @@ struct RawRowVisit<'a> {
 impl<'a> RawRowVisit<'a> {
     fn new(witness: &'a Witness) -> Self {
         let live = witness.live_raw_rows.fetch_add(1, Ordering::SeqCst) + 1;
-        witness.raw_rows_high_water.fetch_max(live, Ordering::SeqCst);
+        witness
+            .raw_rows_high_water
+            .fetch_max(live, Ordering::SeqCst);
         Self { witness }
     }
 }
@@ -146,7 +167,9 @@ impl SqlReader for LazyReader {
         let mut rows = Vec::new();
         for index in 0..self.fixture.len() {
             rows.push(self.fixture.row(index));
-            self.witness.raw_rows_high_water.fetch_max(rows.len(), Ordering::SeqCst);
+            self.witness
+                .raw_rows_high_water
+                .fetch_max(rows.len(), Ordering::SeqCst);
         }
         Ok(rows)
     }
@@ -156,13 +179,17 @@ impl SqlReader for LazyReader {
         statement: SqlStatement,
         mut consumer: Box<dyn SqlRowConsumer>,
     ) -> StorageResult<Box<dyn SqlRowConsumer>> {
-        self.witness.query_consume_calls.fetch_add(1, Ordering::SeqCst);
+        self.witness
+            .query_consume_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.witness.statements.lock().unwrap().push(statement);
         // Construct one raw row on demand and finish its visit before the next.
         // No fixture stores a Vec<SqlRow> ahead of this loop.
         for index in 0..self.fixture.len() {
             if self.fail_after == Some(index) {
-                return Err(StorageError::Internal("deliberate corpus read failure".into()));
+                return Err(StorageError::Internal(
+                    "deliberate corpus read failure".into(),
+                ));
             }
             let _visit = RawRowVisit::new(self.witness.as_ref());
             consumer.push_row(self.fixture.row(index))?;
@@ -196,18 +223,27 @@ impl SqlRowConsumer for UnexpectedConsumer {
 }
 
 fn statement() -> SqlStatement {
-    knowledge_corpus("local").corpus_scan("vec_consumer_fixture", "fixture-model", "vamana_corpus_scan")
+    knowledge_corpus("local").corpus_scan(
+        "vec_consumer_fixture",
+        "fixture-model",
+        "vamana_corpus_scan",
+    )
 }
 
 // Test-only reference: the old query_all path and its filtering order.
-async fn old_scan(reader: &mut dyn SqlReader, statement: SqlStatement, dims: usize) -> StorageResult<Corpus> {
+async fn old_scan(
+    reader: &mut dyn SqlReader,
+    statement: SqlStatement,
+    dims: usize,
+) -> StorageResult<Corpus> {
     let rows = reader.query_all(statement).await?;
     if rows.is_empty() {
         return Ok(None);
     }
     let mut id_map = Vec::with_capacity(rows.len());
     let mut flat = Vec::with_capacity(rows.len() * dims);
-    let scan_watermark = rows.first()
+    let scan_watermark = rows
+        .first()
         .and_then(|row| row.i64_or_none("log_s"))
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0);
@@ -242,12 +278,15 @@ async fn old_scan(reader: &mut dyn SqlReader, statement: SqlStatement, dims: usi
 
 fn assert_corpus_equal(actual: Corpus, expected: Corpus) {
     match (actual, expected) {
-        (None, None) => {},
+        (None, None) => {}
         (Some((flat, ids, watermark)), Some((old_flat, old_ids, old_watermark))) => {
-            assert_eq!(khive_storage::encode_f32_native(&flat), khive_storage::encode_f32_native(&old_flat));
+            assert_eq!(
+                khive_storage::encode_f32_native(&flat),
+                khive_storage::encode_f32_native(&old_flat)
+            );
             assert_eq!(ids, old_ids);
             assert_eq!(watermark, old_watermark);
-        },
+        }
         _ => panic!("corpus presence differs"),
     }
 }
@@ -261,7 +300,10 @@ async fn corpus_scan_consumer_matches_old_ordered_malformed_rows_byte_for_byte()
     let actual = scan_corpus_rows(&mut reader, statement(), 2).await.unwrap();
     let (flat, ids, watermark) = actual.as_ref().expect("two valid rows");
     assert_eq!(ids.as_slice(), &[Uuid::from_u128(5), Uuid::from_u128(6)]);
-    assert_eq!(*watermark, 71, "first raw row is malformed but owns the watermark");
+    assert_eq!(
+        *watermark, 71,
+        "first raw row is malformed but owns the watermark"
+    );
     assert_eq!(flat[0].to_bits(), 0x8000_0000);
     assert_eq!(flat[1].to_bits(), 0x3f80_0001);
     assert_corpus_equal(actual, expected);
@@ -269,19 +311,29 @@ async fn corpus_scan_consumer_matches_old_ordered_malformed_rows_byte_for_byte()
     assert_eq!(seen.len(), 1);
     let expected_statement = statement();
     assert_eq!(seen[0].sql.as_bytes(), expected_statement.sql.as_bytes());
-    assert_eq!(serde_json::to_value(&seen[0].params).unwrap(), serde_json::to_value(&expected_statement.params).unwrap());
+    assert_eq!(
+        serde_json::to_value(&seen[0].params).unwrap(),
+        serde_json::to_value(&expected_statement.params).unwrap()
+    );
     assert_eq!(seen[0].label, expected_statement.label);
 }
 
 #[tokio::test]
 async fn corpus_scan_consumer_uses_only_the_first_raw_watermark() {
-    for watermark in [FirstWatermark::Missing, FirstWatermark::Negative, FirstWatermark::Text] {
+    for watermark in [
+        FirstWatermark::Missing,
+        FirstWatermark::Negative,
+        FirstWatermark::Text,
+    ] {
         let fixture = Fixture::Mixed(watermark);
         let mut old_reader = LazyReader::new(fixture);
         let mut reader = LazyReader::new(fixture);
         let actual = scan_corpus_rows(&mut reader, statement(), 2).await.unwrap();
         assert_eq!(actual.as_ref().unwrap().2, 0);
-        assert_corpus_equal(actual, old_scan(&mut old_reader, statement(), 2).await.unwrap());
+        assert_corpus_equal(
+            actual,
+            old_scan(&mut old_reader, statement(), 2).await.unwrap(),
+        );
     }
 }
 
@@ -290,8 +342,14 @@ async fn corpus_scan_consumer_empty_and_all_invalid_are_none() {
     for fixture in [Fixture::Empty, Fixture::Invalid] {
         let mut old_reader = LazyReader::new(fixture);
         let mut reader = LazyReader::new(fixture);
-        assert!(scan_corpus_rows(&mut reader, statement(), 2).await.unwrap().is_none());
-        assert!(old_scan(&mut old_reader, statement(), 2).await.unwrap().is_none());
+        assert!(scan_corpus_rows(&mut reader, statement(), 2)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(old_scan(&mut old_reader, statement(), 2)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -300,18 +358,25 @@ async fn corpus_scan_consumer_errors_do_not_become_empty_corpora() {
     let mut reader = LazyReader::new(Fixture::Ordered(3));
     reader.fail_after = Some(1);
     let failed = scan_corpus_rows(&mut reader, statement(), 2).await;
-    assert!(matches!(failed, Err(StorageError::Internal(ref message)) if message == "deliberate corpus read failure"));
+    assert!(
+        matches!(failed, Err(StorageError::Internal(ref message)) if message == "deliberate corpus read failure")
+    );
     assert_eq!(reader.witness.live_raw_rows.load(Ordering::SeqCst), 0);
     reader.fail_after = None;
     reader.wrong_consumer = true;
     let wrong = scan_corpus_rows(&mut reader, statement(), 2).await;
-    assert!(matches!(wrong, Err(StorageError::Internal(ref message)) if message == "unexpected corpus SQL consumer"));
+    assert!(
+        matches!(wrong, Err(StorageError::Internal(ref message)) if message == "unexpected corpus SQL consumer")
+    );
 }
 
 #[tokio::test]
 async fn corpus_scan_consumer_holds_at_most_one_raw_row() {
     let mut reader = LazyReader::new(Fixture::Ordered(32));
-    let result = scan_corpus_rows(&mut reader, statement(), 2).await.unwrap().unwrap();
+    let result = scan_corpus_rows(&mut reader, statement(), 2)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(result.1.len(), 32);
     assert_eq!(reader.witness.live_raw_rows.load(Ordering::SeqCst), 0);
     let observed = reader.witness.raw_rows_high_water.load(Ordering::SeqCst);
@@ -347,7 +412,9 @@ impl SqlReader for UnsupportedReader {
 #[tokio::test]
 async fn corpus_scan_consumer_unsupported_surfaces_internal_without_query_all_fallback() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut reader = UnsupportedReader { query_all_calls: Arc::clone(&calls) };
+    let mut reader = UnsupportedReader {
+        query_all_calls: Arc::clone(&calls),
+    };
     let error = scan_corpus_rows(&mut reader, statement(), 2)
         .await
         .expect_err("unsupported consumer scan must refuse");
@@ -429,10 +496,7 @@ async fn append_native_row(rt: &KhiveRuntime, index: usize) {
                   (namespace, embedding_model, kind, field, subject_id, op) \
                   VALUES ('local', ?1, 'concept', 'knowledge.atom', ?2, 'upsert')"
                 .into(),
-            params: vec![
-                SqlValue::Text("fixture-model".into()),
-                SqlValue::Text(id),
-            ],
+            params: vec![SqlValue::Text("fixture-model".into()), SqlValue::Text(id)],
             label: None,
         })
         .await
@@ -568,7 +632,10 @@ async fn native_baseline(rt: &KhiveRuntime) -> Corpus {
     let (flat, ids, watermark) = corpus.as_ref().expect("nonempty positive baseline");
     assert_eq!(ids.as_slice(), &[Uuid::from_u128(1), Uuid::from_u128(2)]);
     assert_eq!(flat.as_slice(), &[1.0, -1.0, 2.0, -2.0]);
-    assert!(*watermark > 0, "baseline log must have a positive high-water");
+    assert!(
+        *watermark > 0,
+        "baseline log must have a positive high-water"
+    );
     corpus
 }
 
@@ -588,11 +655,7 @@ async fn corpus_scan_consumer_native_snapshot_excludes_concurrent_writer() {
     assert_eq!(visits.load(Ordering::SeqCst), 1);
     // The query is paused inside its first owned-row visit. Commit both writes
     // before it resumes, so a second watermark query would observe the change.
-    let written = tokio::time::timeout(
-        NATIVE_WAIT,
-        append_native_row(&rt, 3),
-    )
-    .await;
+    let written = tokio::time::timeout(NATIVE_WAIT, append_native_row(&rt, 3)).await;
     release.release();
     written.expect("concurrent writer must commit while the snapshot is held");
     let (mut reader, result) = tokio::time::timeout(NATIVE_WAIT, scan)
@@ -638,12 +701,10 @@ async fn corpus_scan_consumer_native_cancellation_releases_reader() {
         .expect("cancelled native scan must finish")
         .expect("cancelled native scan task");
     assert!(matches!(result, Err(StorageError::Timeout { .. })));
-    let recovered = tokio::time::timeout(
-        NATIVE_WAIT,
-        scan_corpus_rows(&mut reader, statement(), 2),
-    )
-    .await
-    .expect("reader admission must recover after cancellation")
-    .expect("following native scan succeeds");
+    let recovered =
+        tokio::time::timeout(NATIVE_WAIT, scan_corpus_rows(&mut reader, statement(), 2))
+            .await
+            .expect("reader admission must recover after cancellation")
+            .expect("following native scan succeeds");
     assert_corpus_equal(recovered, baseline);
 }
