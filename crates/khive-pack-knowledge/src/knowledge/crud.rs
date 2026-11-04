@@ -263,6 +263,55 @@ fn key_match_statements(head: &str, lead: Vec<SqlValue>, keys: &[String]) -> [Sq
     })
 }
 
+// Reader preflight protects known domains before writer admission; the same
+// queries run again under the applying writer to guard concurrent changes.
+async fn preflight_atom_delete<R: khive_storage::SqlReader + ?Sized>(
+    reader: &mut R,
+    namespace: &str,
+    keys: &[String],
+) -> khive_storage::StorageResult<Result<HashSet<String>, String>> {
+    let mut atom_ids = HashSet::new();
+    for chunk in keys.chunks(HYDRATION_ID_CHUNK) {
+        let mut domains = HashSet::new();
+        for statement in key_match_statements(
+            "SELECT id, slug FROM knowledge_domains",
+            vec![SqlValue::Text(namespace.to_string())],
+            chunk,
+        ) {
+            for row in reader.query_all(statement).await? {
+                domains.extend(row_str(&row, "id"));
+                domains.extend(row_str(&row, "slug"));
+            }
+        }
+        let mut mirrors = HashSet::new();
+        for statement in key_match_statements(
+            "SELECT id, slug, tags FROM knowledge_atoms",
+            vec![SqlValue::Text(namespace.to_string())],
+            chunk,
+        ) {
+            for row in reader.query_all(statement).await? {
+                let id = row_str(&row, "id").ok_or_else(|| {
+                    khive_storage::StorageError::Internal("atom has no id".into())
+                })?;
+                if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
+                    mirrors.insert(id.clone());
+                    mirrors.extend(row_str(&row, "slug"));
+                }
+                atom_ids.insert(id);
+            }
+        }
+        for key in chunk {
+            if domains.contains(key) {
+                return Ok(Err(format!("knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID")));
+            }
+            if mirrors.contains(key) {
+                return Ok(Err(format!("knowledge.delete_atoms cannot delete domain mirror {key:?}; use the generic delete verb by domain UUID")));
+            }
+        }
+    }
+    Ok(Ok(atom_ids))
+}
+
 impl KnowledgeHandlers {
     /// Feedback accepts IDs from knowledge retrieval only; no KG table lookup
     /// and no slug fallback. Domain mirror atoms share the domain UUID.
@@ -1387,6 +1436,15 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        Self::delete_atoms_with_sql(runtime, token, params, runtime.sql()).await
+    }
+
+    async fn delete_atoms_with_sql(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        sql: std::sync::Arc<dyn khive_storage::SqlAccess>,
+    ) -> Result<Value, RuntimeError> {
         let p: DeleteAtomsParams = deser(params)?;
         if p.cascade.is_some() {
             tracing::warn!(
@@ -1400,96 +1458,63 @@ impl KnowledgeHandlers {
         }
 
         let ns = token.namespace().as_str().to_owned();
-        let sql = runtime.sql();
         let now = now_us();
         // Keys are matched a chunk at a time so the namespace bind plus the key
         // binds stay below SQLite's portable variable ceiling.
         let keys: Vec<String> = p.ids.iter().map(|id| id.trim().to_string()).collect();
 
-        // Preflight the full request before mutating anything: knowledge.delete_atoms
-        // is documented as atom-only. A domain's canonical row and its FTS mirror
-        // atom share an id/slug, so deleting the mirror here would tombstone one
-        // half of the domain while leaving knowledge_domains live — a split-brain
-        // where direct lookup and search/suggest disagree. Domains must go through
-        // the generic delete verb, which deletes both halves together.
+        // Preserve the established refusal boundary: a known domain or mirror
+        // is rejected without acquiring a writer. Do not retain the reader
+        // lease across writer admission.
         let mut reader = sql
             .reader()
             .await
             .map_err(|e| sql_err("delete_atoms reader", e))?;
-        for chunk in keys.chunks(HYDRATION_ID_CHUNK) {
-            let mut domains: HashSet<String> = HashSet::new();
-            for statement in key_match_statements(
-                "SELECT id, slug FROM knowledge_domains",
-                vec![SqlValue::Text(ns.clone())],
-                chunk,
-            ) {
-                let rows = reader
-                    .query_all(statement)
-                    .await
-                    .map_err(|e| sql_err("delete_atoms domain preflight", e))?;
-                for row in &rows {
-                    domains.extend(row_str(row, "id"));
-                    domains.extend(row_str(row, "slug"));
-                }
-            }
-            let mut mirrors: HashSet<String> = HashSet::new();
-            for statement in key_match_statements(
-                "SELECT id, slug, tags FROM knowledge_atoms",
-                vec![SqlValue::Text(ns.clone())],
-                chunk,
-            ) {
-                let rows = reader
-                    .query_all(statement)
-                    .await
-                    .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
-                for row in &rows {
-                    let tags = row_str(row, "tags").unwrap_or_default();
-                    if has_domain_mirror_tag(&tags) {
-                        mirrors.extend(row_str(row, "id"));
-                        mirrors.extend(row_str(row, "slug"));
-                    }
-                }
-            }
-            // Keys keep request order, so the first refused key is the same one
-            // a per-key check would have stopped at.
-            for key in chunk {
-                if domains.contains(key) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID"
-                    )));
-                }
-                if mirrors.contains(key) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "knowledge.delete_atoms cannot delete domain mirror {key:?}; use the generic delete verb by domain UUID"
-                    )));
-                }
-            }
-        }
+        preflight_atom_delete(reader.as_mut(), &ns, &keys)
+            .await
+            .map_err(|e| sql_err("delete_atoms preflight", e))?
+            .map_err(RuntimeError::InvalidInput)?;
+        drop(reader);
 
-        let mut statements: Vec<SqlStatement> = Vec::new();
-        for chunk in keys.chunks(HYDRATION_ID_CHUNK) {
-            statements.extend(key_match_statements(
-                "UPDATE knowledge_atoms SET deleted_at = ?2",
-                vec![SqlValue::Text(ns.clone()), SqlValue::Integer(now)],
-                chunk,
-            ));
-        }
-        // One batch is one transaction and one writer round trip however many
-        // ids were sent. A storage error now rolls the whole request back;
-        // before, the ids ahead of the failing one stayed deleted. A repeated
-        // request converges either way, since deleted rows no longer match.
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("delete_atoms writer", e))?;
-        let deleted = writer
-            .execute_batch(statements)
-            .await
-            .map_err(|e| sql_err("delete_atoms update", e))? as usize;
+        // Re-resolve under the applying writer: slug/domain state may have
+        // changed after the preflight reader released its lease.
+        let requested = keys.len();
+        let runtime = runtime.clone();
+        let outcome = sql.atomic_unit(Box::new(move |writer| Box::pin(async move {
+            let atom_ids = match preflight_atom_delete(writer, &ns, &keys).await? {
+                Ok(ids) => ids,
+                Err(message) => return Ok(Box::new(Err::<usize, String>(message)) as Box<dyn std::any::Any + Send>),
+            };
+            let tables = khive_runtime::atomic_prepare::discover_vector_tables_in_writer(writer, &runtime).await?;
+            // Keep the exact stored spelling; parsing and re-serializing a UUID
+            // could redirect cleanup away from a historical text key.
+            let ids: Vec<String> = atom_ids.into_iter().collect();
+            let mut deleted = 0usize;
+            for chunk in ids.chunks(128) {
+                let placeholders = (3..chunk.len() + 3).map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>().join(",");
+                let mut params = vec![SqlValue::Text(ns.clone()), SqlValue::Integer(now)];
+                params.extend(chunk.iter().cloned().map(SqlValue::Text));
+                let update_head = "UPDATE knowledge_atoms SET deleted_at = ?2";
+                deleted += writer.execute(SqlStatement::new(format!(
+                    "{update_head} WHERE id IN ({placeholders}) AND +namespace = ?1 AND +deleted_at IS NULL"), params,
+                )).await? as usize;
+                for statement in khive_runtime::atomic_prepare::vector_purge_statements(
+                    &tables, &ns, chunk, Some("knowledge.atom"), "knowledge-delete-atoms",
+                )? {
+                    writer.execute(statement).await?;
+                }
+            }
+            Ok(Box::new(Ok::<usize, String>(deleted)) as Box<dyn std::any::Any + Send>)
+        }))).await.map_err(|e| sql_err("delete_atoms update", e))?;
+        let deleted = *outcome
+            .downcast::<Result<usize, String>>()
+            .map_err(|_| RuntimeError::Internal("invalid delete_atoms outcome".into()))?;
+        let deleted = deleted.map_err(RuntimeError::InvalidInput)?;
 
         Ok(json!({
             "deleted": deleted,
-            "requested": p.ids.len(),
+            "requested": requested,
         }))
     }
 

@@ -5055,3 +5055,64 @@ async fn atomic_update_edge_properties_null_value_is_stored_literally() {
         "atomic properties update must store literal null and preserve omitted metadata keys"
     );
 }
+
+#[test]
+fn vector_purge_statement_count_scales_with_chunks_and_tables() {
+    let tables: Vec<String> = (0..4).map(|n| format!("vec_scale_{n}")).collect();
+    let ids: Vec<String> = (0..520)
+        .map(|n| uuid::Uuid::from_u128(n + 1).to_string())
+        .collect();
+    let per_chunk: Vec<_> = ids
+        .chunks(128)
+        .map(|chunk| {
+            crate::atomic_prepare::vector_purge_statements(
+                &tables,
+                "local",
+                chunk,
+                Some("knowledge.atom"),
+                "scale",
+            )
+            .expect("valid vector table names")
+        })
+        .collect();
+    assert!(per_chunk
+        .iter()
+        .all(|statements| statements.len() == tables.len() * 3));
+    assert_eq!(per_chunk.iter().map(Vec::len).sum::<usize>(), 5 * 4 * 3);
+    for statements in per_chunk {
+        for triple in statements.chunks_exact(3) {
+            assert!(triple[0].sql.starts_with("INSERT INTO main.ann_write_log"));
+            assert!(triple[1].sql.starts_with("DELETE FROM main.\"vec_"));
+            assert!(triple[2]
+                .sql
+                .starts_with("DELETE FROM main.vector_provenance"));
+        }
+    }
+}
+
+#[test]
+fn public_vector_purge_rejects_bad_prefix_and_quotes_identifiers() {
+    let ids = vec![uuid::Uuid::from_u128(1).to_string()];
+    assert!(crate::atomic_prepare::vector_purge_statements(
+        &["not_a_vector".into()],
+        "local",
+        &ids,
+        Some("knowledge.atom"),
+        "test",
+    )
+    .is_err());
+    let statements = crate::atomic_prepare::vector_purge_statements(
+        &["vec_a\"; DROP TABLE knowledge_atoms; --".into()],
+        "local",
+        &ids,
+        Some("knowledge.atom"),
+        "test",
+    )
+    .expect("prefixed name is safely quoted");
+    assert!(statements[0]
+        .sql
+        .contains("\"vec_a\"\"; DROP TABLE knowledge_atoms; --\""));
+    assert!(statements[1]
+        .sql
+        .contains("\"vec_a\"\"; DROP TABLE knowledge_atoms; --\""));
+}

@@ -30,12 +30,13 @@ pub(crate) fn vector_table_names(runtime: &KhiveRuntime) -> Vec<String> {
 fn purge_index_row_statement(
     table: &str,
     namespace: &str,
-    subject_id: Uuid,
+    subject_id: &str,
     label: &str,
 ) -> PlanStatement {
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     PlanStatement {
         statement: SqlStatement {
-            sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2"),
+            sql: format!("DELETE FROM main.{quoted} WHERE namespace = ?1 AND subject_id = ?2"),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(subject_id.to_string()),
@@ -49,15 +50,13 @@ fn purge_index_row_statement(
 fn purge_vector_provenance_statement(
     table: &str,
     namespace: &str,
-    subject_id: Uuid,
+    subject_id: &str,
     label: &str,
 ) -> PlanStatement {
-    let model_key = table
-        .strip_prefix("vec_")
-        .expect("runtime vector tables use the vec_ prefix");
+    let model_key = &table[4..];
     PlanStatement {
         statement: SqlStatement {
-            sql: "DELETE FROM vector_provenance \
+            sql: "DELETE FROM main.vector_provenance \
                   WHERE model_key = ?1 AND subject_id = ?2 AND namespace = ?3"
                 .to_string(),
             params: vec![
@@ -101,16 +100,17 @@ fn purge_fts_document_statements(
 fn log_vector_row_delete_statement(
     table: &str,
     namespace: &str,
-    subject_id: Uuid,
+    subject_id: &str,
     label: &str,
 ) -> PlanStatement {
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     PlanStatement {
         statement: SqlStatement {
             sql: format!(
-                "INSERT INTO ann_write_log \
+                "INSERT INTO main.ann_write_log \
                  (namespace, embedding_model, kind, field, subject_id, op) \
                  SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                 FROM {table} WHERE namespace = ?1 AND subject_id = ?2"
+                 FROM main.{quoted} WHERE namespace = ?1 AND subject_id = ?2"
             ),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
@@ -223,26 +223,326 @@ pub(crate) fn push_index_purge_for_tables(
         subject_id,
         &format!("{label_prefix}-purge-fts"),
     ));
-    for vec_table in tables {
-        statements.push(log_vector_row_delete_statement(
-            vec_table,
+    statements.extend(
+        vector_purge_statements(
+            tables,
             namespace,
-            subject_id,
-            &format!("{label_prefix}-log-delete-vec-{vec_table}"),
-        ));
-        statements.push(purge_index_row_statement(
-            vec_table,
-            namespace,
-            subject_id,
-            &format!("{label_prefix}-purge-vec-{vec_table}"),
-        ));
-        statements.push(purge_vector_provenance_statement(
-            vec_table,
-            namespace,
-            subject_id,
-            &format!("{label_prefix}-purge-vec-provenance-{vec_table}"),
-        ));
+            &[subject_id.to_string()],
+            None,
+            label_prefix,
+        )
+        .expect("registered vector tables have a vec_ prefix")
+        .into_iter()
+        .map(|statement| PlanStatement {
+            statement,
+            guard: None,
+        }),
+    );
+}
+
+// Tokenize enough of SQLite CREATE VIRTUAL TABLE DDL to avoid interpreting
+// USING inside a quoted table name or comment as the module declaration.
+fn virtual_module(ddl: &str) -> Result<Option<String>, khive_storage::StorageError> {
+    let mut chars = ddl.chars().peekable();
+    let mut tokens: Vec<(String, bool)> = Vec::new();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return Err(khive_storage::StorageError::Internal(
+                    "unterminated DDL comment".into(),
+                ));
+            }
+            continue;
+        }
+        if matches!(c, '"' | '\'' | '`' | '[') {
+            let end = if c == '[' { ']' } else { c };
+            let mut token = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == end {
+                    if end != ']' && chars.peek() == Some(&end) {
+                        chars.next();
+                        token.push(end);
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                token.push(next);
+            }
+            if !closed {
+                return Err(khive_storage::StorageError::Internal(
+                    "unterminated DDL identifier".into(),
+                ));
+            }
+            tokens.push((token, true));
+            continue;
+        }
+        if matches!(c, '(' | ')' | ',' | ';' | '.') {
+            tokens.push((c.to_string(), false));
+            continue;
+        }
+        let mut token = String::from(c);
+        while let Some(&next) = chars.peek() {
+            if next.is_whitespace()
+                || matches!(next, '(' | ')' | ',' | ';' | '.' | '"' | '\'' | '`' | '[')
+            {
+                break;
+            }
+            if matches!(next, '-' | '/') {
+                let mut lookahead = chars.clone();
+                lookahead.next();
+                if (next == '-' && lookahead.peek() == Some(&'-'))
+                    || (next == '/' && lookahead.peek() == Some(&'*'))
+                {
+                    break;
+                }
+            }
+            token.push(next);
+            chars.next();
+        }
+        tokens.push((token, false));
     }
+    let keyword = |index: usize, word: &str| {
+        tokens
+            .get(index)
+            .is_some_and(|(token, quoted)| !quoted && token.eq_ignore_ascii_case(word))
+    };
+    if !(keyword(0, "create") && keyword(1, "virtual") && keyword(2, "table")) {
+        return Ok(None);
+    }
+    let using = (3..tokens.len())
+        .find(|&i| keyword(i, "using"))
+        .ok_or_else(|| {
+            khive_storage::StorageError::Internal("virtual table DDL missing USING".into())
+        })?;
+    let module = tokens
+        .get(using + 1)
+        .map(|(token, _)| token.clone())
+        .filter(|token| !token.is_empty() && token != "(")
+        .ok_or_else(|| {
+            khive_storage::StorageError::Internal("virtual table DDL missing module".into())
+        })?;
+    Ok(Some(module))
+}
+
+fn insert_casefolded_table_name(
+    seen: &mut std::collections::BTreeSet<String>,
+    name: &str,
+) -> Result<(), khive_storage::StorageError> {
+    if !seen.insert(name.to_ascii_lowercase()) {
+        return Err(khive_storage::StorageError::Internal(format!(
+            "duplicate case-insensitive vector table name {name}"
+        )));
+    }
+    Ok(())
+}
+
+/// Classify on the applying writer, before mutation, so historical unregistered
+/// models are included without mistaking vec0 shadow or fixture tables for models.
+pub async fn discover_vector_tables_in_writer(
+    writer: &mut dyn khive_storage::SqlWriter,
+    runtime: &KhiveRuntime,
+) -> Result<Vec<String>, khive_storage::StorageError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let rows = writer.query_all(SqlStatement::new(
+        "SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name LIKE 'vec\\_%' ESCAPE '\\'",
+        vec![],
+    ).labelled("vector-purge-discover-tables")).await?;
+    let mut names: BTreeSet<String> = vector_table_names(runtime).into_iter().collect();
+    let mut schema = BTreeMap::new();
+    for row in rows {
+        let name = match row.get("name") {
+            Some(SqlValue::Text(name)) => name.clone(),
+            _ => {
+                return Err(khive_storage::StorageError::Internal(
+                    "invalid vector table name".into(),
+                ))
+            }
+        };
+        let ddl = match row.get("sql") {
+            Some(SqlValue::Text(sql)) => sql.clone(),
+            _ => {
+                return Err(khive_storage::StorageError::Internal(format!(
+                    "missing DDL for {name}"
+                )))
+            }
+        };
+        names.insert(name.clone());
+        schema.insert(name, ddl);
+    }
+    let mut tables = Vec::new();
+    let mut folded_names = BTreeSet::new();
+    for name in names {
+        let Some(ddl) = schema.get(&name) else {
+            continue;
+        };
+        insert_casefolded_table_name(&mut folded_names, &name)?;
+        let Some(module) = virtual_module(ddl)? else {
+            continue;
+        };
+        if !module.eq_ignore_ascii_case("vec0") {
+            return Err(khive_storage::StorageError::Internal(format!(
+                "virtual vector table {name} uses unsupported module {module}"
+            )));
+        }
+        let suffix = name.get(4..).unwrap_or("");
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(khive_storage::StorageError::Internal(format!(
+                "vector table {name} has an invalid model-key suffix"
+            )));
+        }
+        let columns = writer
+            .query_all(
+                SqlStatement::new(
+                    "SELECT name FROM pragma_table_info(?1, 'main')",
+                    vec![SqlValue::Text(name.clone())],
+                )
+                .labelled("vector-purge-table-columns"),
+            )
+            .await?;
+        for required in [
+            "subject_id",
+            "namespace",
+            "field",
+            "kind",
+            "embedding_model",
+        ] {
+            if !columns.iter().any(|row| matches!(row.get("name"), Some(SqlValue::Text(column)) if column.eq_ignore_ascii_case(required))) {
+                return Err(khive_storage::StorageError::Internal(format!(
+                    "vector table {name} is missing required column {required}"
+                )));
+            }
+        }
+        tables.push(name);
+    }
+    Ok(tables)
+}
+
+/// Construct vector-only cleanup in log-before-delete order. `field = None`
+/// removes every field, matching ordinary index cleanup; a field limits both
+/// the log and vector deletion to that field. For field-limited cleanup,
+/// provenance remains if this model still has a row for the subject.
+/// Table names must have the `vec_` prefix and should come from writer-side
+/// discovery. Identifiers are quoted independently of bound values.
+pub fn vector_purge_statements(
+    tables: &[String],
+    namespace: &str,
+    subject_ids: &[String],
+    field: Option<&str>,
+    label_prefix: &str,
+) -> Result<Vec<SqlStatement>, khive_storage::StorageError> {
+    let mut statements = Vec::with_capacity(tables.len() * 3);
+    if subject_ids.is_empty() {
+        return Ok(statements);
+    }
+    for table in tables {
+        if !table
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("vec_"))
+        {
+            return Err(khive_storage::StorageError::Internal(
+                "invalid vector table name".into(),
+            ));
+        }
+        // The legacy all-field caller supplies one subject, preserving labels
+        // and the original all-field and provenance behavior.
+        if field.is_none() {
+            for subject_id in subject_ids {
+                statements.push(
+                    log_vector_row_delete_statement(
+                        table,
+                        namespace,
+                        subject_id,
+                        &format!("{label_prefix}-log-delete-vec-{table}"),
+                    )
+                    .statement,
+                );
+                statements.push(
+                    purge_index_row_statement(
+                        table,
+                        namespace,
+                        subject_id,
+                        &format!("{label_prefix}-purge-vec-{table}"),
+                    )
+                    .statement,
+                );
+                statements.push(
+                    purge_vector_provenance_statement(
+                        table,
+                        namespace,
+                        subject_id,
+                        &format!("{label_prefix}-purge-vec-provenance-{table}"),
+                    )
+                    .statement,
+                );
+            }
+            continue;
+        }
+        let field = field.expect("field checked above");
+        let model_key = &table[4..];
+        let quoted = format!("main.\"{}\"", table.replace('"', "\"\""));
+        let ids = (3..subject_ids.len() + 3)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(field.to_owned()),
+        ];
+        params.extend(subject_ids.iter().map(|id| SqlValue::Text(id.to_string())));
+        statements.push(SqlStatement {
+            sql: format!("INSERT INTO main.ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {quoted} WHERE namespace = ?1 AND field = ?2 AND subject_id IN ({ids})"),
+            params: params.clone(),
+            label: Some(format!("{label_prefix}-log-delete-vec-{table}")),
+        });
+        statements.push(SqlStatement {
+            sql: format!("DELETE FROM {quoted} WHERE namespace = ?1 AND field = ?2 AND subject_id IN ({ids})"),
+            params,
+            label: Some(format!("{label_prefix}-purge-vec-{table}")),
+        });
+        let mut provenance_params = vec![
+            SqlValue::Text(model_key.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+        ];
+        provenance_params.extend(subject_ids.iter().map(|id| SqlValue::Text(id.to_string())));
+        statements.push(SqlStatement {
+            sql: format!("DELETE FROM main.vector_provenance WHERE model_key = ?1 COLLATE NOCASE AND namespace = ?2 \
+                 AND subject_id IN ({ids}) AND NOT EXISTS (SELECT 1 FROM {quoted} AS remaining \
+                 WHERE remaining.subject_id = vector_provenance.subject_id \
+                 AND remaining.namespace = vector_provenance.namespace)"),
+            params: provenance_params,
+            label: Some(format!("{label_prefix}-purge-vec-provenance-{table}")),
+        });
+    }
+    Ok(statements)
 }
 
 /// Event-store append parity for the canonical handlers that emit a
@@ -288,4 +588,40 @@ pub(crate) fn event_append_statements(
             guard: None,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod virtual_module_tests {
+    use super::virtual_module;
+
+    #[test]
+    fn duplicate_casefold_names_are_refused() {
+        let mut seen = std::collections::BTreeSet::new();
+        super::insert_casefolded_table_name(&mut seen, "vec_Qwen3").unwrap();
+        let error = super::insert_casefolded_table_name(&mut seen, "vec_qwen3").unwrap_err();
+        assert!(error.to_string().contains("vec_qwen3"));
+    }
+
+    #[test]
+    fn ddl_classification_respects_quotes_case_and_comments() {
+        for ddl in [
+            "CREATE VIRTUAL TABLE vec_a USING vec0(subject_id TEXT PRIMARY KEY)",
+            "CREATE VIRTUAL TABLE vec_a/* USING other */USING vec0(subject_id TEXT PRIMARY KEY)",
+            "CREATE VIRTUAL TABLE vec_a-- USING other\nUSING vec0(subject_id TEXT PRIMARY KEY)",
+            "create  virtual\ntable IF NOT EXISTS \"vec_odd USING fts5\" /* USING fts5 */ USING \"VEC0\" (subject_id TEXT PRIMARY KEY)",
+        ] {
+            assert!(virtual_module(ddl).unwrap().unwrap().eq_ignore_ascii_case("vec0"));
+        }
+        assert_eq!(
+            virtual_module("CREATE TABLE vec_ordinary (value TEXT)").unwrap(),
+            None
+        );
+        assert_eq!(
+            virtual_module("CREATE VIRTUAL TABLE vec_odd USING fts5(content)")
+                .unwrap()
+                .as_deref(),
+            Some("fts5")
+        );
+        assert!(virtual_module("CREATE VIRTUAL TABLE vec_bad").is_err());
+    }
 }

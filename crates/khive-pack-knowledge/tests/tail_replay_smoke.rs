@@ -39,14 +39,18 @@ async fn knowledge_tail_rewrites_coalesce_by_subject_without_losing_raw_rows() {
 #[tokio::test]
 #[serial_test::serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
-async fn knowledge_tail_delete_distinguishes_atom_verb_from_vector_tail() {
+async fn knowledge_tail_atom_verb_emits_one_vector_delete_without_embedding_read() {
     let verb = support::measure(64, support::Arm::VerbDelete, 1, 1000.0, true).await;
     let composed = support::measure(64, support::Arm::ComposedVectorDelete, 1, 1000.0, true).await;
     assert_eq!(
-        verb.raw_rows, 0,
-        "the actual atom verb does not emit a vector delete tail"
+        verb.raw_rows, 1,
+        "the atom verb emits one vector delete tail"
     );
-    assert_eq!(verb.distinct_subjects, 0);
+    assert_eq!(verb.distinct_subjects, 1);
+    assert_eq!(
+        verb.replay_point_reads, 0,
+        "delete final states require no embedding point read"
+    );
     assert!(composed.raw_rows > 0);
     assert_eq!(composed.distinct_subjects, 1);
     assert_eq!(

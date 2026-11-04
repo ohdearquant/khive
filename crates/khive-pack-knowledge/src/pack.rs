@@ -24,6 +24,29 @@ use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
 use crate::vocab::{KNOWLEDGE_HANDLERS, KNOWLEDGE_SCHEMA_PLAN_STMTS};
 
+fn atom_vector_identity(
+    row: &khive_storage::types::SqlRow,
+) -> Result<(String, bool), khive_storage::StorageError> {
+    let namespace = match row.get("namespace") {
+        Some(SqlValue::Text(ns)) => ns.clone(),
+        _ => {
+            return Err(khive_storage::StorageError::Internal(
+                "knowledge atom namespace missing or invalid".into(),
+            ))
+        }
+    };
+    let live = match row.get("deleted_at") {
+        Some(SqlValue::Null) => true,
+        Some(SqlValue::Integer(_)) => false,
+        _ => {
+            return Err(khive_storage::StorageError::Internal(
+                "knowledge atom deleted_at missing or invalid".into(),
+            ))
+        }
+    };
+    Ok((namespace, live))
+}
+
 /// Knowledge corpus pack — atoms, domains, TF-IDF search, fold, import, and KG concept verbs.
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
@@ -514,126 +537,108 @@ impl PackByIdResolver for KnowledgePack {
     async fn delete_by_id(&self, id: Uuid, hard: bool) -> Result<serde_json::Value, RuntimeError> {
         let sql = self.runtime.sql();
         let id_str = id.to_string();
-
-        // First determine the kind (including deleted rows so hard-delete can find tombstones).
-        let kind = match self.resolve_by_id_including_deleted(id).await? {
-            Some(Resolved::PackRecord { kind, .. }) => kind,
-            _ => {
-                return Err(RuntimeError::NotFound(format!(
-                    "knowledge record not found: {id}"
-                )));
-            }
-        };
-
+        let runtime = self.runtime.clone();
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64;
-
-        let mut writer = sql
-            .writer()
+        let outcome = sql
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    // Resolve on the writer so the record and its namespace cannot
+                    // change between resolution, tombstoning, and index cleanup.
+                    let domain = writer
+                        .query_row(SqlStatement::new(
+                            khive_runtime::sql!("knowledge_resolver_domain_including_deleted"),
+                            vec![SqlValue::Text(id.to_string())],
+                        ))
+                        .await?;
+                    let atom = writer
+                        .query_row(SqlStatement::new(
+                            khive_runtime::sql!("knowledge_resolver_atom_including_deleted"),
+                            vec![SqlValue::Text(id.to_string())],
+                        ))
+                        .await?;
+                    let kind = if domain.as_ref().and_then(domain_from_row).is_some() {
+                        "domain"
+                    } else if atom.as_ref().and_then(atom_from_row).is_some() {
+                        "atom"
+                    } else {
+                        return Ok(Box::new(None::<String>) as Box<dyn std::any::Any + Send>);
+                    };
+                    let (atom_namespace, atom_live) = if let Some(row) = atom.as_ref() {
+                        let (namespace, live) = atom_vector_identity(row)?;
+                        (Some(namespace), live)
+                    } else {
+                        (None, false)
+                    };
+                    let tables = if atom_namespace.is_some() && (hard || atom_live) {
+                        khive_runtime::atomic_prepare::discover_vector_tables_in_writer(
+                            writer, &runtime,
+                        )
+                        .await?
+                    } else {
+                        Vec::new()
+                    };
+                    if hard {
+                        writer
+                            .execute(SqlStatement::new(
+                                khive_runtime::sql!("knowledge_atom_sections_delete"),
+                                vec![SqlValue::Text(id.to_string())],
+                            ))
+                            .await?;
+                        writer
+                            .execute(SqlStatement::new(
+                                khive_runtime::sql!("knowledge_atom_hard_delete"),
+                                vec![SqlValue::Text(id.to_string())],
+                            ))
+                            .await?;
+                        if kind == "domain" {
+                            writer
+                                .execute(SqlStatement::new(
+                                    khive_runtime::sql!("knowledge_domain_hard_delete"),
+                                    vec![SqlValue::Text(id.to_string())],
+                                ))
+                                .await?;
+                        }
+                    } else {
+                        if kind == "domain" {
+                            writer
+                                .execute(SqlStatement::new(
+                                    khive_runtime::sql!("knowledge_domain_soft_delete"),
+                                    vec![SqlValue::Integer(now_us), SqlValue::Text(id.to_string())],
+                                ))
+                                .await?;
+                        }
+                        writer
+                            .execute(SqlStatement::new(
+                                khive_runtime::sql!("knowledge_atom_soft_delete"),
+                                vec![SqlValue::Integer(now_us), SqlValue::Text(id.to_string())],
+                            ))
+                            .await?;
+                    }
+                    if hard || atom_live {
+                        if let Some(namespace) = atom_namespace {
+                            for statement in khive_runtime::atomic_prepare::vector_purge_statements(
+                                &tables,
+                                &namespace,
+                                &[id.to_string()],
+                                Some("knowledge.atom"),
+                                "knowledge-delete-by-id",
+                            )? {
+                                writer.execute(statement).await?;
+                            }
+                        }
+                    }
+                    Ok(Box::new(Some(kind.to_string())) as Box<dyn std::any::Any + Send>)
+                })
+            }))
             .await
-            .map_err(|e| RuntimeError::Internal(format!("knowledge delete_by_id writer: {e}")))?;
-
-        match kind.as_str() {
-            "domain" => {
-                if hard {
-                    // Hard-delete: sections → mirror atom → domain (all in one transaction).
-                    // knowledge_sections has a FK to knowledge_atoms(id) without ON DELETE
-                    // CASCADE, so sections must go before the atom row.
-                    writer
-                        .execute_batch(vec![
-                            SqlStatement {
-                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
-                                params: vec![SqlValue::Text(id_str.clone())],
-                                label: Some(
-                                    "knowledge.delete_by_id.domain_mirror_sections.hard".into(),
-                                ),
-                            },
-                            SqlStatement {
-                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
-                                params: vec![SqlValue::Text(id_str.clone())],
-                                label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
-                            },
-                            SqlStatement {
-                                sql: khive_runtime::sql!("knowledge_domain_hard_delete").into(),
-                                params: vec![SqlValue::Text(id_str.clone())],
-                                label: Some("knowledge.delete_by_id.domain.hard".into()),
-                            },
-                        ])
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!(
-                                "knowledge delete_by_id domain hard: {e}"
-                            ))
-                        })?;
-                } else {
-                    writer
-                        .execute(SqlStatement {
-                            sql: khive_runtime::sql!("knowledge_domain_soft_delete").into(),
-                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.domain.soft".into()),
-                        })
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!(
-                                "knowledge delete_by_id domain soft: {e}"
-                            ))
-                        })?;
-                    // Tombstone the mirror atom so FTS no longer surfaces it.
-                    writer
-                        .execute(SqlStatement {
-                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
-                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.domain_mirror.soft".into()),
-                        })
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!(
-                                "knowledge delete_by_id domain mirror soft: {e}"
-                            ))
-                        })?;
-                }
-            }
-            "atom" => {
-                if hard {
-                    // Hard-delete: sections first (FK constraint), then the atom row.
-                    writer
-                        .execute_batch(vec![
-                            SqlStatement {
-                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
-                                params: vec![SqlValue::Text(id_str.clone())],
-                                label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
-                            },
-                            SqlStatement {
-                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
-                                params: vec![SqlValue::Text(id_str.clone())],
-                                label: Some("knowledge.delete_by_id.atom.hard".into()),
-                            },
-                        ])
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!("knowledge delete_by_id atom hard: {e}"))
-                        })?;
-                } else {
-                    writer
-                        .execute(SqlStatement {
-                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
-                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.atom.soft".into()),
-                        })
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!("knowledge delete_by_id atom soft: {e}"))
-                        })?;
-                }
-            }
-            other => {
-                return Err(RuntimeError::Internal(format!(
-                    "knowledge delete_by_id: unexpected kind {other:?}"
-                )));
-            }
-        }
+            .map_err(|e| RuntimeError::Internal(format!("knowledge delete_by_id: {e}")))?;
+        let kind = (*outcome.downcast::<Option<String>>().map_err(|_| {
+            RuntimeError::Internal("invalid knowledge delete_by_id outcome".into())
+        })?)
+        .ok_or_else(|| RuntimeError::NotFound(format!("knowledge record not found: {id}")))?;
 
         Ok(serde_json::json!({
             "deleted": true,
@@ -651,3 +656,55 @@ mod tests;
 #[cfg(test)]
 #[path = "warm_admission_tests.rs"]
 mod warm_admission_tests;
+
+#[cfg(test)]
+mod atom_vector_identity_tests {
+    use super::*;
+    use khive_storage::types::{SqlColumn, SqlRow};
+
+    fn row(columns: Vec<(&str, SqlValue)>) -> SqlRow {
+        SqlRow {
+            columns: columns
+                .into_iter()
+                .map(|(name, value)| SqlColumn {
+                    name: name.to_string(),
+                    value,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_wrong_typed_identity_columns() {
+        let live = row(vec![
+            ("namespace", SqlValue::Text("local".into())),
+            ("deleted_at", SqlValue::Null),
+        ]);
+        assert_eq!(
+            atom_vector_identity(&live).expect("valid live row"),
+            ("local".into(), true)
+        );
+        let deleted = row(vec![
+            ("namespace", SqlValue::Text("local".into())),
+            ("deleted_at", SqlValue::Integer(1)),
+        ]);
+        assert_eq!(
+            atom_vector_identity(&deleted).expect("valid tombstone"),
+            ("local".into(), false)
+        );
+        for invalid in [
+            row(vec![("deleted_at", SqlValue::Null)]),
+            row(vec![
+                ("namespace", SqlValue::Integer(1)),
+                ("deleted_at", SqlValue::Null),
+            ]),
+            row(vec![("namespace", SqlValue::Text("local".into()))]),
+            row(vec![
+                ("namespace", SqlValue::Text("local".into())),
+                ("deleted_at", SqlValue::Text("bad".into())),
+            ]),
+        ] {
+            assert!(atom_vector_identity(&invalid).is_err());
+        }
+    }
+}
