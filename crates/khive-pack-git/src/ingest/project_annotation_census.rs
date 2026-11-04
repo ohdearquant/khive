@@ -206,8 +206,9 @@ mod tests {
         )
         .await;
         let mut ids = Vec::new();
-        // Keep adding notes until the first one created is not the lowest ID, so
-        // creation order and ID order disagree on which note comes first.
+        // Keep adding notes until the lowest ID is neither the first nor the last
+        // created, so a walk in creation order, oldest or newest first, does not
+        // reach it first.
         for number in 1..=64 {
             let id = create(
                 &registry,
@@ -223,15 +224,15 @@ mod tests {
             )
             .await;
             ids.push(id.to_string());
-            if ids.len() > 1 && ids.iter().min() != ids.first() {
+            let lowest = ids.iter().min();
+            if ids.len() > 2 && lowest != ids.first() && lowest != ids.last() {
                 break;
             }
         }
         let lowest = ids.iter().min().cloned().expect("at least one note");
-        assert_ne!(
-            Some(&lowest),
-            ids.first(),
-            "fixture needs a first-created note that is not the lowest ID"
+        assert!(
+            Some(&lowest) != ids.first() && Some(&lowest) != ids.last(),
+            "fixture needs the lowest ID to be neither the first nor the last created note"
         );
 
         let partial = read_census(&runtime, &token, project_id, 1, 20)
