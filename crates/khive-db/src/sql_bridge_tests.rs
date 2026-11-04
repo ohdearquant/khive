@@ -1000,6 +1000,456 @@ fn query_row_converts_only_the_first_matching_row() {
     ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 1));
 }
 
+#[derive(Default)]
+struct ConsumedIntegers {
+    values: Vec<i64>,
+    fail_after: Option<usize>,
+    visits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl khive_storage::SqlRowConsumer for ConsumedIntegers {
+    fn push_row(&mut self, row: SqlRow) -> khive_storage::types::StorageResult<()> {
+        let Some(SqlValue::Integer(value)) = row.get("value") else {
+            return Err(StorageError::Internal("consumer expected an integer".into()));
+        };
+        self.values.push(*value);
+        self.visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_after == Some(self.values.len()) {
+            return Err(StorageError::Internal("deliberate consumer failure".into()));
+        }
+        Ok(())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+fn consumed_integers(
+    consumer: Box<dyn khive_storage::SqlRowConsumer>,
+) -> khive_storage::types::StorageResult<ConsumedIntegers> {
+    consumer
+        .into_any()
+        .downcast::<ConsumedIntegers>()
+        .map(|consumer| *consumer)
+        .map_err(|_| StorageError::Internal("unexpected SQL consumer type".into()))
+}
+
+fn integer_consumer_statement() -> SqlStatement {
+    SqlStatement {
+        sql: "WITH RECURSIVE rows(value) AS (\
+              SELECT ?1 UNION ALL SELECT value + 1 FROM rows WHERE value < ?2\
+              ) SELECT value FROM rows ORDER BY value"
+            .into(),
+        params: vec![SqlValue::Integer(0), SqlValue::Integer(99)],
+        label: Some("query-consumer-test".into()),
+    }
+}
+
+#[test]
+fn query_consume_orders_rows_and_stops_conversion_at_consumer_failure() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let statement = integer_consumer_statement();
+    ROW_CONVERSIONS.with(|count| count.set(0));
+    let consumer = query_execution::execute_prepared_query_consume(
+        prepare_bound_statement(&conn, &statement).unwrap(),
+        Box::new(ConsumedIntegers::default()),
+        || Ok(()),
+        "query_consume",
+    )
+    .and_then(consumed_integers)
+    .unwrap();
+    assert_eq!(consumer.values, (0..100).collect::<Vec<i64>>());
+    ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 100));
+
+    let empty = SqlStatement {
+        sql: "SELECT ?1 AS value WHERE ?2 < 0".into(),
+        params: vec![SqlValue::Integer(0), SqlValue::Integer(99)],
+        label: Some("query-consumer-empty-test".into()),
+    };
+    ROW_CONVERSIONS.with(|count| count.set(0));
+    let empty_consumer = query_execution::execute_prepared_query_consume(
+        prepare_bound_statement(&conn, &empty).unwrap(),
+        Box::new(ConsumedIntegers::default()),
+        || Ok(()),
+        "query_consume",
+    )
+    .and_then(consumed_integers)
+    .unwrap();
+    assert!(empty_consumer.values.is_empty());
+    ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 0));
+
+    let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    ROW_CONVERSIONS.with(|count| count.set(0));
+    let failed = query_execution::execute_prepared_query_consume(
+        prepare_bound_statement(&conn, &statement).unwrap(),
+        Box::new(ConsumedIntegers {
+            fail_after: Some(3),
+            visits: Arc::clone(&visits),
+            ..ConsumedIntegers::default()
+        }),
+        || Ok(()),
+        "query_consume",
+    );
+    assert!(matches!(failed, Err(StorageError::Internal(ref message))
+        if message == "deliberate consumer failure"));
+    assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 3));
+}
+
+struct UnsupportedConsumerReader;
+
+#[async_trait::async_trait]
+impl khive_storage::SqlReader for UnsupportedConsumerReader {
+    async fn query_row(
+        &mut self,
+        _: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
+        Err(StorageError::Internal("unexpected fallback".into()))
+    }
+
+    async fn query_all(
+        &mut self,
+        _: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        Err(StorageError::Internal("unexpected fallback".into()))
+    }
+
+    async fn query_scalar(
+        &mut self,
+        _: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<SqlValue>> {
+        Err(StorageError::Internal("unexpected fallback".into()))
+    }
+
+    async fn explain(
+        &mut self,
+        _: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        Err(StorageError::Internal("unexpected fallback".into()))
+    }
+}
+
+#[tokio::test]
+async fn query_consume_default_refuses_without_materializing_or_visiting() {
+    let mut reader: Box<dyn khive_storage::SqlReader> = Box::new(UnsupportedConsumerReader);
+    let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result = reader
+        .query_consume(
+            integer_consumer_statement(),
+            Box::new(ConsumedIntegers {
+                visits: Arc::clone(&visits),
+                ..ConsumedIntegers::default()
+            }),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Sql,
+            ref operation,
+            ..
+        }) if operation.as_ref() == "query_consume"
+    ));
+    assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_consume_reader_routes_preserve_order_errors_and_read_transactions() {
+    for file_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: file_backed.then(|| dir.path().join("consume-route.db")),
+                max_readers: 1,
+                checkout_timeout: std::time::Duration::from_millis(500),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(Arc::clone(&pool), file_backed);
+        let mut reader = bridge.reader().await.unwrap();
+        let consumer = reader
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers::default()),
+            )
+            .await
+            .and_then(consumed_integers)
+            .unwrap();
+        assert_eq!(consumer.values, (0..100).collect::<Vec<i64>>());
+        let failure = reader
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers {
+                    fail_after: Some(3),
+                    ..ConsumedIntegers::default()
+                }),
+            )
+            .await;
+        assert!(matches!(failure, Err(StorageError::Internal(ref message))
+            if message == "deliberate consumer failure"));
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("open read transaction");
+        let consume = reader.query_consume(
+            integer_consumer_statement(),
+            Box::new(ConsumedIntegers::default()),
+        );
+        let consumer = tokio::time::timeout(std::time::Duration::from_secs(1), consume)
+            .await
+            .expect("consumer must reuse the admitted transaction")
+            .and_then(consumed_integers)
+            .unwrap();
+        assert_eq!(consumer.values, (0..100).collect::<Vec<i64>>());
+        let failed_inside = reader
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers {
+                    fail_after: Some(2),
+                    ..ConsumedIntegers::default()
+                }),
+            )
+            .await;
+        assert!(matches!(failed_inside, Err(StorageError::Internal(ref message))
+            if message == "deliberate consumer failure"));
+        reader
+            .query_all(SqlStatement {
+                sql: "COMMIT".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("transaction stays owned by reader");
+        for sql in [
+            "BEGIN DEFERRED",
+            "CREATE TABLE consume_write_probe(value INTEGER)",
+        ] {
+            let rejected = reader
+                .query_consume(
+                    SqlStatement {
+                        sql: sql.into(),
+                        params: vec![],
+                        label: None,
+                    },
+                    Box::new(ConsumedIntegers::default()),
+                )
+                .await;
+            assert!(matches!(rejected, Err(StorageError::InvalidInput { .. })));
+        }
+        let mut next = bridge.reader().await.unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next.query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers::default()),
+            ),
+        )
+        .await
+        .expect("reader admission must recover")
+        .and_then(consumed_integers)
+        .unwrap();
+        assert_eq!(recovered.values.len(), 100);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_query_consume_stops_and_allows_a_followup_read() {
+    for file_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: file_backed.then(|| dir.path().join("consume-cancel.db")),
+                max_readers: 1,
+                checkout_timeout: std::time::Duration::from_millis(500),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(Arc::clone(&pool), file_backed);
+        let mut reader = bridge.reader().await.unwrap();
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let query = tokio::spawn(crate::scope_test_read_progress(
+            Arc::clone(&progress),
+            crate::scope_request_read_cancellation(cancel_rx, async move {
+                let result = reader
+                    .query_consume(
+                        deliberately_slow_read_statement(),
+                        Box::new(ConsumedIntegers::default()),
+                    )
+                    .await;
+                (reader, result)
+            }),
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_progress(progress.as_ref()),
+        )
+        .await
+        .expect("consumer query must reach SQLite before cancellation");
+        cancel_tx.send(true).unwrap();
+        let (mut reader, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), query)
+                .await
+                .expect("cancelled consumer read must stop promptly")
+                .unwrap();
+        assert!(matches!(result, Err(StorageError::Timeout { .. })));
+        let stopped_at = progress.load(std::sync::atomic::Ordering::SeqCst);
+        let following = reader.query_consume(
+            integer_consumer_statement(),
+            Box::new(ConsumedIntegers::default()),
+        );
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(1), following)
+            .await
+            .expect("same reader must recover after cancellation")
+            .and_then(consumed_integers)
+            .unwrap();
+        assert_eq!(recovered.values.len(), 100);
+        assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), stopped_at);
+    }
+}
+
+#[tokio::test]
+async fn query_consume_writer_routes_remain_explicitly_unsupported() {
+    for file_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: file_backed.then(|| dir.path().join("consume-writer-default.db")),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(pool, file_backed);
+        let mut writer = bridge.writer().await.unwrap();
+        let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = writer
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers {
+                    visits: Arc::clone(&visits),
+                    ..ConsumedIntegers::default()
+                }),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Unsupported {
+                capability: StorageCapability::Sql,
+                ref operation,
+                ..
+            }) if operation.as_ref() == "query_consume"
+        ));
+        assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+struct CancelAfterFirstRow {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    visits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl khive_storage::SqlRowConsumer for CancelAfterFirstRow {
+    fn push_row(&mut self, _row: SqlRow) -> khive_storage::types::StorageResult<()> {
+        self.visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let entered = self.entered.take().ok_or_else(|| {
+            StorageError::Internal("cancelled consumer visited a second row".into())
+        })?;
+        entered.send(()).map_err(|()| {
+            StorageError::Internal("consumer-entry witness was dropped".into())
+        })?;
+        // Test-only bounded handshake: cancellation happens after this visit starts.
+        // A timeout here is a broken fixture, never a semantic cancellation witness.
+        let fail_safe = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !crate::read_cancellation::current_read_should_interrupt() {
+            if std::time::Instant::now() >= fail_safe {
+                return Err(StorageError::Internal(
+                    "consumer cancellation handshake timed out".into(),
+                ));
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_consume_observes_cancellation_after_a_consumer_visit() {
+    for file_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: file_backed.then(|| dir.path().join("consume-visit-cancel.db")),
+                max_readers: 1,
+                checkout_timeout: std::time::Duration::from_millis(500),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(pool, file_backed);
+        let mut reader = bridge.reader().await.unwrap();
+        let baseline = reader
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers::default()),
+            )
+            .await
+            .and_then(consumed_integers)
+            .unwrap();
+        assert_eq!(baseline.values, (0..100).collect::<Vec<i64>>());
+        let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let worker_visits = Arc::clone(&visits);
+        let query = tokio::spawn(crate::scope_request_read_cancellation(
+            cancel_rx,
+            async move {
+                let result = reader
+                    .query_consume(
+                        integer_consumer_statement(),
+                        Box::new(CancelAfterFirstRow {
+                            entered: Some(entered_tx),
+                            visits: worker_visits,
+                        }),
+                    )
+                    .await;
+                (reader, result)
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .expect("request must enter its first consumer visit")
+            .expect("consumer must publish the entry witness");
+        cancel_tx.send(true).unwrap();
+        let (mut reader, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), query)
+                .await
+                .expect("consumer must return after observing cancellation")
+                .unwrap();
+        assert!(matches!(result, Err(StorageError::Timeout { .. })));
+        assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let recovered = reader
+            .query_consume(
+                integer_consumer_statement(),
+                Box::new(ConsumedIntegers::default()),
+            )
+            .await
+            .and_then(consumed_integers)
+            .unwrap();
+        assert_eq!(recovered.values, (0..100).collect::<Vec<i64>>());
+    }
+}
+
 #[test]
 fn query_page_bounds_owned_rows_before_full_materialization() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
