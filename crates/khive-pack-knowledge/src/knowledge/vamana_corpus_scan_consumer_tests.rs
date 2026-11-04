@@ -680,26 +680,40 @@ async fn corpus_scan_consumer_native_cancellation_releases_reader() {
     let baseline = native_baseline(&rt).await;
     let (mut reader, entered, mut release, visits) = gated_reader(&rt).await;
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let scan = tokio::spawn(khive_storage::scope_request_read_cancellation(
+    let mut scan = Box::pin(khive_storage::scope_request_read_cancellation(
         cancel_rx,
         async move {
             let result = scan_corpus_rows(&mut reader, statement(), 2).await;
             (reader, result)
         },
     ));
-    tokio::time::timeout(NATIVE_WAIT, entered)
-        .await
-        .expect("cancellable native scan must enter first consumer visit")
-        .expect("cancellable native scan must publish first-row entry");
+    tokio::time::timeout(NATIVE_WAIT, async {
+        tokio::select! {
+            entered = entered => {
+                entered.expect("cancellable native scan must publish first-row entry");
+            }
+            _ = &mut scan => panic!("native scan finished before its first-row gate"),
+        }
+    })
+    .await
+    .expect("cancellable native scan must enter first consumer visit");
     assert_eq!(visits.load(Ordering::SeqCst), 1);
     cancel_tx.send(true).expect("cancel active native scan");
-    // A synchronous consumer cannot be preempted. Release its handshake so the
-    // worker can observe cancellation and give back its reader admission.
+    // Keep the worker gated until its read scope has polled cancellation.
+    // Disable cooperative yielding for this single poll so Pending cannot mean
+    // the task exhausted its budget before reaching the cancellation select.
+    let cancelled_poll = tokio::task::unconstrained(std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(scan.as_mut(), cx))
+    }))
+    .await;
+    assert!(
+        cancelled_poll.is_pending(),
+        "cancelled native scan must await its still-gated worker"
+    );
     release.release();
     let (mut reader, result) = tokio::time::timeout(NATIVE_WAIT, scan)
         .await
-        .expect("cancelled native scan must finish")
-        .expect("cancelled native scan task");
+        .expect("cancelled native scan must finish");
     assert!(matches!(result, Err(StorageError::Timeout { .. })));
     let recovered =
         tokio::time::timeout(NATIVE_WAIT, scan_corpus_rows(&mut reader, statement(), 2))
