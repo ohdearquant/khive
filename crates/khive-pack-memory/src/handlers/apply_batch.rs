@@ -679,7 +679,12 @@ impl MemoryPack {
             .unwrap_or_default()
             .to_owned();
         let (stored, stored_properties) = self
-            .remember_permitting_with_properties(token, planned.params, BATCH_WRITTEN_PROPERTY_KEYS)
+            .remember_permitting_with_properties_in_namespace(
+                token,
+                planned.params,
+                BATCH_WRITTEN_PROPERTY_KEYS,
+                write_token.namespace(),
+            )
             .await
             .map_err(|error| WriteFailure {
                 code: "write-failed",
