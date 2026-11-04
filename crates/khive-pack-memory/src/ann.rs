@@ -140,6 +140,10 @@ trait AnnBuildContext: Copy + Send + Sync {
     ) -> impl std::future::Future<Output = Result<AnnBridge, Self::Error>> + Send;
 }
 
+#[cfg(all(test, unix))]
+#[path = "ann/interactive_build_test_support.rs"]
+pub(crate) mod interactive_build_test_support;
+
 #[derive(Clone, Copy)]
 struct InteractiveAnn;
 impl AnnBuildContext for InteractiveAnn {
@@ -152,15 +156,21 @@ impl AnnBuildContext for InteractiveAnn {
         ids: Vec<Uuid>,
         namespaces: HashSet<String>,
     ) -> Result<AnnBridge, RuntimeError> {
-        tokio::task::spawn_blocking(move || AnnBridge::build(flat, dims, ids, namespaces))
-            .await
-            .map_err(|error| {
-                RuntimeError::Storage(StorageError::driver(
-                    khive_storage::StorageCapability::Vectors,
-                    "memory_ann_build",
-                    error,
-                ))
-            })?
+        #[cfg(all(test, unix))]
+        let test_gate = interactive_build_test_support::capture();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, unix))]
+            let _worker = test_gate.map(|gate| gate.enter());
+            AnnBridge::build(flat, dims, ids, namespaces)
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::Storage(StorageError::driver(
+                khive_storage::StorageCapability::Vectors,
+                "memory_ann_build",
+                error,
+            ))
+        })?
     }
 }
 
