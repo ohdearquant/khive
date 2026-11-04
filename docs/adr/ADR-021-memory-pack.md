@@ -25,6 +25,9 @@ declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 **Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
 the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
 `memory.remember` reserves the `supersedes` property (#6386; proposed).
+**Amended**: 2026-11-04, [Delta 3](#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04) of
+the batch-apply amendment: an edge between two memory rows is written in the source row's namespace by every verb,
+and edge reads report how many such edges they left out (#6380; proposed).
 
 ## Context
 
@@ -1039,3 +1042,43 @@ visible namespace, with the new row outside the candidates; an explicit-namespac
 before; `memory.remember` refusing `properties.supersedes` with the refusal above; stored rows whose
 `properties.supersedes` is empty or one hex character hiding nothing, and a full UUID and an 8-character prefix still
 hiding their targets.
+
+### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
+
+**Status**: Proposed 2026-11-04. Changes where Decision 7's `supersedes` edges, and every other edge between two
+memory rows, are written, and what an edge read reports when it leaves edges out.
+
+**Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
+`supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
+kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. Neither the episodic
+carve-out of ADR-007 Rev 6 nor the 2026-11-01 amendment for semantic writes says where an edge between memory rows
+goes. A second reader of one measured row sees five of its six outgoing `supersedes` edges, and nothing in the
+`neighbors` response says that one is missing.
+
+**Decision.**
+
+1. **Namespace rule.** An edge whose source and target are both memory rows is written in the source row's namespace,
+   whichever verb writes it. `memory.apply_batch` and `link` resolve the source row before writing and use its
+   namespace; a write whose caller may not write that namespace is refused, never redirected to another namespace.
+2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
+   can see. When an edge between memory rows exists but sits outside those namespaces, the response states how many
+   such edges were left out. It does not return them or name their endpoints.
+3. **Existing edges.** A one-time move rewrites each stored edge between memory rows whose namespace differs from its
+   source row's namespace. The move has a dry run that prints per-namespace edge counts before and after and writes
+   nothing; the applying run prints the same counts.
+
+**Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
+chain is either whole or reported as partial with a count. `link` gains one read of its source record when both
+endpoints are memory rows. Edges from a memory row to a non-memory record, and edges between non-memory records, keep
+their current rule.
+
+**Known limit.** A reader who can see the target row but not the source row still cannot learn that their row was
+superseded: the edge lives with the source, and the filtered count names no endpoints. That case is a follow-up, not
+solved here.
+
+**Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
+the same namespace (the source row's); a `link` whose caller may not write the source row's namespace refused with no
+edge written; `neighbors` from a second reader returning the visible edges plus a filtered count equal to the edges it
+cannot see; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
+run leaving all six in the source row's namespace.
