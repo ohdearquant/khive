@@ -250,6 +250,35 @@ impl MemoryPack {
         params: Value,
         permitted: &[&str],
     ) -> Result<(Value, Option<Value>), RuntimeError> {
+        self.remember_permitting_with_properties_inner(token, params, permitted, None)
+            .await
+    }
+
+    /// Remember in the batch's already resolved write namespace while retaining
+    /// the original caller identity and the replayed row's properties.
+    pub(super) async fn remember_permitting_with_properties_in_namespace(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+        write_namespace: &Namespace,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
+        self.remember_permitting_with_properties_inner(
+            token,
+            params,
+            permitted,
+            Some(write_namespace),
+        )
+        .await
+    }
+
+    async fn remember_permitting_with_properties_inner(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+        write_namespace: Option<&Namespace>,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
         let p: RememberParams = deser(params)?;
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
@@ -261,15 +290,19 @@ impl MemoryPack {
             permitted,
         )?;
 
-        // Explicit namespace wins. Otherwise both memory types are written to the caller's
-        // actor namespace. An anonymous caller (no actor configured, id `local`) has no actor
-        // namespace of its own: with no namespace argument its write stays in the token's
-        // namespace. Every anonymous write is flagged `attribution: "unresolved"` instead of
-        // being refused, whether or not it names a namespace: the flag follows the caller.
+        // An internal target wins, then an explicit namespace. Otherwise both memory
+        // types use the caller's actor namespace. An anonymous caller (no actor
+        // configured, id `local`) has no actor namespace of its own: with no namespace
+        // argument its write stays in the token's namespace. Every anonymous write is
+        // flagged `attribution: "unresolved"` instead of being refused, whether or not
+        // it names a namespace: the flag follows the caller.
         let unresolved_attribution = token.actor().is_anonymous();
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
-        let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
-        {
+        let write_token_owned: Option<NamespaceToken> = if let Some(namespace) = write_namespace {
+            // The internal batch target is already resolved and takes precedence
+            // over serialized parameters. Ordinary remember calls pass None.
+            Some(token.with_namespace(namespace.clone()))
+        } else if let Some(ns_str) = p.namespace.as_deref() {
             let ns = Namespace::parse(ns_str).map_err(|e| {
                 RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
             })?;
