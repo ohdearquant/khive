@@ -418,8 +418,25 @@ pub(crate) async fn prepare_task_create(
                 ))
             })?,
         };
+        // Validate the retained nested alias after the selected zone so its
+        // existing refusal diagnostic remains unchanged.
+        if let Some(value) = obj.get("timezone").filter(|value| !value.is_null()) {
+            let name = value.as_str().ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "properties.timezone must be a string or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
+                ))
+            })?;
+            name.parse::<chrono_tz::Tz>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
+                ))
+            })?;
+        }
         obj.insert("due".into(), json!(parse_due(due, zone)?));
         obj.insert("due_timezone".into(), json!(zone.name()));
+        obj.remove("timezone");
     }
     if let Some(ref start) = input.start {
         obj.insert("start".into(), json!(start));
