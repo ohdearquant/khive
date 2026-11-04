@@ -22,6 +22,8 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 const MODEL: &str = "keyed-memory-test-model";
 const DIMS: usize = 4;
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+// Distinct from the bounded atomic-write attempt numbers.
+pub(crate) const MISSING_SOURCE_CHECKPOINT: usize = usize::MAX;
 
 struct TestEmbeddingService;
 
@@ -981,6 +983,63 @@ async fn keyed_memory_endpoint_guard_reconciles_winner_after_source_deletion() {
         .expect("worker must finish")
         .expect("worker must not panic")
         .expect("failed endpoint guard reconciles the winning key");
+    assert_eq!(note.id, winner.id);
+    assert!(edge.is_none());
+    assert!(replayed);
+    assert_eq!(fences, winner_fences);
+    assert_rows(&runtime, &token, 1, 0).await;
+}
+
+#[tokio::test]
+async fn keyed_memory_missing_source_recheck_replays_concurrent_winner() {
+    let (runtime, token, _) = fixture("keyed-memory-missing-source-winner").await;
+    let key = "winner-after-missing-source";
+    let content = "same concurrent keyed memory";
+    let missing_source = Uuid::new_v4();
+    assert!(!runtime
+        .substrate_exists_by_id(&token, missing_source)
+        .await
+        .expect("missing source lookup"));
+    assert_rows(&runtime, &token, 0, 0).await;
+
+    let (arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
+    let worker_runtime = runtime.clone();
+    let worker_token = token.clone();
+    let worker = tokio::spawn(async move {
+        create_keyed_memory_with_receipt(
+            &worker_runtime,
+            &worker_token,
+            spec(key, content, Some(missing_source)),
+        )
+        .await
+    });
+    // The hook follows the absent first holder lookup and missing-source classification.
+    let resume = expect_checkpoint(&mut checkpoints, MISSING_SOURCE_CHECKPOINT, true).await;
+    assert_rows(&runtime, &token, 0, 0).await;
+    assert!(!runtime
+        .substrate_exists_by_id(&token, missing_source)
+        .await
+        .expect("source remains absent"));
+    // The paused operation keeps its resume channel while new callers bypass the hook.
+    drop(arm);
+    let (winner, winner_edge, replayed, winner_fences) = tokio::time::timeout(
+        CHECKPOINT_TIMEOUT,
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, None)),
+    )
+    .await
+    .expect("concurrent winner must finish before timeout")
+    .expect("concurrent winner commits");
+    assert!(!replayed);
+    assert!(winner_edge.is_none());
+    assert_eq!(winner_fences.len(), 1);
+    assert_rows(&runtime, &token, 1, 0).await;
+
+    resume.send(()).expect("resume missing-source loser");
+    let (note, edge, replayed, fences) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
+        .await
+        .expect("worker must finish")
+        .expect("worker must not panic")
+        .expect("missing-source recheck reconciles the winning key");
     assert_eq!(note.id, winner.id);
     assert!(edge.is_none());
     assert!(replayed);
