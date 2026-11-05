@@ -814,7 +814,7 @@ async fn canonical_memory_namespace_mismatch_refuses_before_any_write() {
     };
     assert_eq!(
         message,
-        "link: memory edge source namespace local does not match write namespace other; retry with namespace=local"
+        "apply_changeset: memory edge source namespace local does not match link operation namespace other; set this link operation's namespace to local and prepare the change-set again"
     );
     assert!(rt.get_edge(&token, edge_id).await.unwrap().is_none());
     assert!(rt
@@ -905,7 +905,7 @@ async fn canonical_staged_memory_source_namespace_mismatch_refuses_before_any_wr
     };
     assert_eq!(
         message,
-        "link: memory edge source namespace local does not match write namespace other; retry with namespace=local"
+        "apply_changeset: memory edge source namespace local does not match link operation namespace other; set this link operation's namespace to local and prepare the change-set again"
     );
     assert!(rt.get_edge(&token, edge_id).await.unwrap().is_none());
     assert!(rt
@@ -1069,7 +1069,7 @@ async fn canonical_memory_namespace_change_before_writer_rolls_back() {
     assert_eq!(
         message,
         RuntimeError::InvalidInput(
-            "link: memory edge source namespace other does not match write namespace local; retry with namespace=other".into()
+            "apply_changeset: memory edge source namespace other does not match link operation namespace local; set this link operation's namespace to other and prepare the change-set again".into()
         )
         .to_string()
     );
@@ -1090,4 +1090,68 @@ async fn canonical_memory_namespace_change_before_writer_rolls_back() {
     };
     assert_eq!(stored.kind, "memory");
     assert_eq!(stored.namespace.as_str(), "other");
+}
+
+#[test]
+fn memory_namespace_refusals_name_operation_and_supported_remedy() {
+    let source = Note::new("other", "memory", "source");
+    let target = Note::new("target", "memory", "target");
+    let nonmemory = Note::new("target", "observation", "nonmemory target");
+    assert_eq!(source.kind, "memory");
+    assert_eq!(source.namespace.as_str(), "other");
+    assert_eq!(target.kind, "memory");
+    assert!(source.deleted_at.is_none());
+    assert!(target.deleted_at.is_none());
+    for (operation, expected) in [
+        (
+            "restore",
+            "restore: memory edge source namespace other does not match stored edge namespace local; leave this tombstone deleted and create a replacement link in namespace=other",
+        ),
+        (
+            "apply_changeset",
+            "apply_changeset: memory edge source namespace other does not match link operation namespace local; set this link operation's namespace to other and prepare the change-set again",
+        ),
+        (
+            "link",
+            "link: memory edge source namespace other does not match write namespace local; retry with namespace=other",
+        ),
+    ] {
+        assert!(KhiveRuntime::ensure_memory_note_edge_namespace(
+            operation,
+            "other",
+            source.id,
+            target.id,
+            khive_types::EdgeRelation::Annotates,
+            &source,
+            &target,
+        )
+        .is_ok());
+        assert!(KhiveRuntime::ensure_memory_note_edge_namespace(
+            operation,
+            "local",
+            source.id,
+            nonmemory.id,
+            khive_types::EdgeRelation::Annotates,
+            &source,
+            &nonmemory,
+        )
+        .is_ok());
+        let error = KhiveRuntime::ensure_memory_note_edge_namespace(
+            operation,
+            "local",
+            source.id,
+            target.id,
+            khive_types::EdgeRelation::Annotates,
+            &source,
+            &target,
+        )
+        .unwrap_err();
+        let RuntimeError::InvalidInput(message) = error else {
+            panic!("namespace refusal must preserve InvalidInput");
+        };
+        assert_eq!(
+            message, expected,
+            "memory_namespace_refusal_identifies_operation_and_action"
+        );
+    }
 }

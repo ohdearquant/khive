@@ -222,6 +222,7 @@ pub async fn prepare_canonical_changeset(
                         (&source, &target)
                     {
                         KhiveRuntime::ensure_memory_note_edge_namespace(
+                            "apply_changeset",
                             op_token.namespace().as_str(),
                             uuid(link.source),
                             uuid(link.target),

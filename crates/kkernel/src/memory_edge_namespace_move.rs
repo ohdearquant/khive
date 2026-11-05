@@ -42,6 +42,7 @@ pub struct MemoryEdgeNamespaceMoveArgs {
 pub struct EdgeNamespaceCounts {
     pub namespace: String,
     pub relation: String,
+    /// Edge-row liveness, not endpoint-note liveness. Only live edges are counted.
     pub liveness: &'static str,
     pub before: u64,
     pub after: Option<u64>,
@@ -443,7 +444,13 @@ async fn move_on_runtime(
         target: target.path.clone(),
         backend: target.backend_name.clone(),
         count_scope: "live edges whose endpoints both resolve, including deleted notes, as notes of kind memory; excluded_edges is the BEFORE count of every other live edge",
-        after_basis: if applying { "measured" } else { "projected" },
+        after_basis: if applying {
+            "measured"
+        } else if collision_groups > 0 {
+            "before"
+        } else {
+            "projected"
+        },
         atomicity: "per-edge revision-guarded updates; complete collision preflight before writes; not one transaction",
         deleted_edge_policy: "soft-deleted edges are not counted or moved",
         counts: count_rows(&before.counts, Some(if applying || collision_groups > 0 { &before.counts } else { &projected })),
@@ -1416,10 +1423,10 @@ mod tests {
             "fixture unexpectedly initialized model storage; no semantic control credit"
         );
         assert_no_dry_run_mutation(&receipt);
-        assert_eq!(receipt["dry"]["after_basis"], "projected");
         assert_eq!(receipt["applied"]["after_basis"], "measured");
         match case {
             "six" | "paged" | "deleted-source" => {
+                assert_eq!(receipt["dry"]["after_basis"], "projected");
                 let candidates = receipt["expected_candidates"]
                     .as_u64()
                     .expect("candidate count");
@@ -1468,12 +1475,23 @@ mod tests {
                     assert_eq!(receipt[mode]["apply_blocked"], true);
                     assert_eq!(receipt[mode]["moved"], 0);
                     for count in receipt[mode]["counts"].as_array().expect("census counts") {
+                        assert_eq!(count["liveness"], "live", "counts_describe_live_edge_rows");
                         assert_eq!(
                             count["before"], count["after"],
                             "collision_after_equals_before"
                         );
                     }
                 }
+                let counts = receipt["dry"]["counts"].as_array().expect("preview counts");
+                assert!(!counts.is_empty(), "collision_fixture_has_counts");
+                assert!(
+                    counts.iter().any(|count| count["before"].as_u64().expect("before count") > 0),
+                    "collision_fixture_has_nonzero_counts"
+                );
+                assert_eq!(
+                    receipt["dry"]["after_basis"], "before",
+                    "collision_preview_after_basis_identifies_before_counts"
+                );
                 assert_eq!(receipt["applied"]["complete"], false);
                 assert!(!receipt["applied"]["failures"]
                     .as_array()
@@ -1481,6 +1499,7 @@ mod tests {
                     .is_empty());
             }
             "excluded" => {
+                assert_eq!(receipt["dry"]["after_basis"], "projected");
                 assert_eq!(
                     receipt["before_edges"], receipt["after_edges"],
                     "event_target_and_deleted_edge_untouched"
@@ -1493,6 +1512,7 @@ mod tests {
                 }
             }
             "chain" => {
+                assert_eq!(receipt["dry"]["after_basis"], "projected");
                 let before = &receipt["before_anchor"];
                 assert_eq!(
                     before["neighbors"]

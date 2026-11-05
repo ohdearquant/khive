@@ -264,6 +264,7 @@ impl KhiveRuntime {
             (Some(crate::Resolved::Note(source)), Some(crate::Resolved::Note(target))) => {
                 let both_memory = source.kind == "memory" && target.kind == "memory";
                 Self::ensure_memory_note_edge_namespace(
+                    "restore",
                     &edge.namespace,
                     edge.source_id,
                     edge.target_id,
@@ -881,25 +882,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
     }
 
     fn assert_helper_namespace_error(message: &str) {
-        let lower = message.to_ascii_lowercase();
-        let source_at = lower.find("source").expect("source namespace context");
-        let write_at = lower.find("write").expect("write namespace context");
-        let retry_at = lower.find("retry").expect("retry guidance");
-        assert!(
-            source_at < write_at && write_at < retry_at,
-            "unexpected diagnostic field order: {message}"
-        );
-        assert!(
-            lower[source_at..write_at].contains("other"),
-            "expected source namespace other: {message}"
-        );
-        assert!(
-            lower[write_at..retry_at].contains("local"),
-            "expected write namespace local: {message}"
-        );
-        assert!(
-            lower[retry_at..].contains("other"),
-            "expected retry namespace other: {message}"
+        assert_eq!(
+            message,
+            "restore: memory edge source namespace other does not match stored edge namespace local; leave this tombstone deleted and create a replacement link in namespace=other",
+            "restore_refusal_names_operation_and_supported_remedy"
         );
     }
 

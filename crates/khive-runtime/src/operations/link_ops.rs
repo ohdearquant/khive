@@ -312,6 +312,7 @@ impl KhiveRuntime {
             return Ok(());
         };
         Self::ensure_memory_note_edge_namespace(
+            "link",
             token.namespace().as_str(),
             source_id,
             target_id,
@@ -322,6 +323,7 @@ impl KhiveRuntime {
     }
 
     pub(crate) fn ensure_memory_note_edge_namespace(
+        operation: &str,
         write_namespace: &str,
         source_id: Uuid,
         target_id: Uuid,
@@ -341,10 +343,18 @@ impl KhiveRuntime {
             target.namespace.as_str()
         };
         if source_namespace != write_namespace {
-            return Err(RuntimeError::InvalidInput(format!(
-                "link: memory edge source namespace {source_namespace} does not match write namespace {}; retry with namespace={source_namespace}",
-                write_namespace
-            )));
+            let message = match operation {
+                "restore" => format!(
+                    "restore: memory edge source namespace {source_namespace} does not match stored edge namespace {write_namespace}; leave this tombstone deleted and create a replacement link in namespace={source_namespace}"
+                ),
+                "apply_changeset" => format!(
+                    "apply_changeset: memory edge source namespace {source_namespace} does not match link operation namespace {write_namespace}; set this link operation's namespace to {source_namespace} and prepare the change-set again"
+                ),
+                _ => format!(
+                    "{operation}: memory edge source namespace {source_namespace} does not match write namespace {write_namespace}; retry with namespace={source_namespace}"
+                ),
+            };
+            return Err(RuntimeError::InvalidInput(message));
         }
         Ok(())
     }
