@@ -1110,9 +1110,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors. With no explicit `limit`, the response remains a \
-                      bare array of hits. An explicit limit returns a `neighbors` page with \
-                      `requested_limit`, `effective_limit`, `limit_clamped`, and `next_after`. \
+        description: "Immediate graph neighbors. For an anchor that is not a memory row, a call \
+                      with no explicit `limit` returns a bare array of hits. An explicit limit \
+                      returns a `neighbors` page with `requested_limit`, `effective_limit`, \
+                      `limit_clamped`, and `next_after`. A call anchored on a memory row always \
+                      returns the object shape, with `next_after` null when no limit is given, \
+                      and carries `hidden_incoming_edges` once at the top: `{total, by_relation}` \
+                      counting the incoming memory edges stored in namespaces the caller cannot \
+                      read, with no endpoint id, namespace or content; `by_relation` lists each \
+                      relation of the filter, or with no filter each relation above zero, and \
+                      the count is 0 for direction `outgoing`. \
                       Each record hit carries origin_id for the queried node, edge_id, relation, \
                       weight, and the neighbor's id, kind and name; include_entity_type=true adds \
                       entity_type when the neighbor has one. This verb does not accept \
