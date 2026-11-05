@@ -20,11 +20,12 @@ use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 use khive_types::{Details, KhiveError};
 
-use crate::config::{RecallConfig, ScoreBreakdown};
+use crate::config::{CompositeFactors, RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, contains_cjk, extract_entity_candidates, normalize_min_score,
-    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput, ScoringConfig,
+    calculate_score, calculate_score_factors, contains_cjk, extract_entity_candidates,
+    normalize_min_score, normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    ScoringConfig,
 };
 use crate::MemoryPack;
 
@@ -947,7 +948,8 @@ impl MemoryPack {
                 relevance_score: norm_relevance,
                 entity_names: &entity_names,
             };
-            let rank_score = calculate_score(&score_input, &scoring_cfg);
+            let score_factors = calculate_score_factors(&score_input, &scoring_cfg);
+            let rank_score = score_factors.score;
 
             // Reported for the breakdown only: this hit's composite under the projected weights
             // divided by its composite under the default weights, which `rank_score` used.
@@ -990,6 +992,13 @@ impl MemoryPack {
                 decay_factor,
                 age_days_f64,
             );
+            breakdown.fused_score = hit.score.to_f64();
+            breakdown.composite = Some(CompositeFactors {
+                relevance_term: score_factors.relevance_term,
+                temporal_boost: score_factors.temporal_boost,
+                salience_boost: score_factors.salience_boost,
+                adjustment_factor: score_factors.adjustment_factor(),
+            });
             breakdown.profile_component = profile_component;
             breakdown.entity_posterior_mean = entity_posterior_mean;
 
