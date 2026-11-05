@@ -54,6 +54,22 @@ use khive_mcp::pending_events;
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    if args.read_only {
+        if args.plan {
+            anyhow::bail!("--read-only conflicts with --plan");
+        }
+        if args.ops_file.is_some() {
+            anyhow::bail!("--read-only conflicts with --ops-file");
+        }
+        if args.pending_events {
+            anyhow::bail!("--read-only conflicts with --pending-events");
+        }
+        if args.dry_run || args.serial || args.atomic || args.atomic_max_ops.is_some() {
+            anyhow::bail!(
+                "--read-only supports inline DSL only; it conflicts with --dry-run, --serial, --atomic and --atomic-max-ops"
+            );
+        }
+    }
     if args.plan {
         let result = plan::run(&args).await?;
         writeln!(std::io::stdout().lock(), "{result}")?;
@@ -102,6 +118,11 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // JSONL deterministically report `parse-error` regardless of whether strict
     // actor mode or `--expect-actor` would also reject a valid invocation.
     preflight_exec_mode(&mode)?;
+    if args.read_only {
+        if let ExecMode::Inline(ops) = &mode {
+            preflight_read_only_ops(ops)?;
+        }
+    }
 
     // Resolve through the SAME TOML-aware path `kkernel mcp` and `kkernel reindex`
     // use (`resolve_runtime_config`), so `kkernel exec`'s config_id and actor
@@ -188,6 +209,18 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
 
     match mode {
         ExecMode::Inline(ops) => {
+            if args.read_only {
+                return run_exec_inline_read_only(
+                    ops,
+                    cfg,
+                    args.presentation,
+                    args.output_format,
+                    args.save_file,
+                    db_context,
+                    args.strict,
+                )
+                .await;
+            }
             run_exec_inline(
                 ops,
                 cfg,
@@ -216,6 +249,803 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             .await
         }
     }
+}
+
+fn preflight_read_only_ops(ops: &str) -> Result<()> {
+    let parsed = khive_request::parse_request(ops).map_err(|error| anyhow::anyhow!("{error}"))?;
+    for op in &parsed.ops {
+        let declared_read = khive_runtime::classify_operation(&op.tool)
+            == Some(khive_runtime::OperationAccess::Read);
+        let side_effecting_assertion =
+            khive_runtime::VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&op.tool.as_str());
+        if !declared_read || side_effecting_assertion {
+            anyhow::bail!(
+                "--read-only refuses operation {:?}: it is not an allowed reviewed read operation",
+                op.tool
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod read_only_policy_tests {
+    use clap::Parser;
+    use serde_json::{json, Value};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    const CHILD_ENV: &str = "KKERNEL_READ_ONLY_POLICY_CHILD";
+    const CHILD_ROOT: &str = "KKERNEL_READ_ONLY_CHILD_ROOT";
+    const CHILD_TOKEN: &str = "KKERNEL_READ_ONLY_CHILD_TOKEN";
+    const CHILD_MARKER: &str = ".kkernel-read-only-child.json";
+    const RECEIPT: &str = "READ_ONLY_POLICY_RECEIPT ";
+    const OUTPUT_LIMIT: u64 = 1024 * 1024;
+    const OUTPUT_HEAD_LIMIT: usize = 2048;
+    const SELECTED_READ_TEST: &str =
+        "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree";
+    const STORE_BASELINE_DIR: &str = "selected-store-before";
+    const STORE_BASELINE_META: &str = ".selected-store-before.json";
+
+    struct ChildFixture {
+        root: PathBuf,
+        token: String,
+        test_name: String,
+    }
+
+    fn child_fixture(test_name: &str) -> Option<ChildFixture> {
+        let requested = std::env::var_os(CHILD_ENV)?;
+        assert_eq!(
+            requested.to_str().expect("UTF-8 child kind"),
+            test_name,
+            "invalid readonly child test kind"
+        );
+        let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("missing private child root"));
+        let token = std::env::var(CHILD_TOKEN).expect("missing private child token");
+        assert!(token.len() >= 16, "invalid private child token");
+        let root = root.canonicalize().expect("private child root must exist");
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("kkernel-read-only-"),
+            "invalid child root name"
+        );
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            root,
+            "child cwd mismatch"
+        );
+        assert_eq!(
+            PathBuf::from(std::env::var_os("HOME").expect("private HOME"))
+                .canonicalize()
+                .unwrap(),
+            root,
+            "child HOME mismatch"
+        );
+        let marker = root.join(CHILD_MARKER);
+        let metadata = std::fs::symlink_metadata(&marker).expect("missing parent child marker");
+        assert!(
+            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() < 4096,
+            "invalid child marker"
+        );
+        let marker: Value =
+            serde_json::from_slice(&std::fs::read(marker).unwrap()).expect("child marker JSON");
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert_eq!(marker["token"], token, "child token mismatch");
+        assert_eq!(marker["test_name"], test_name, "child marker kind mismatch");
+        assert_eq!(
+            marker["exe"],
+            exe.display().to_string(),
+            "child executable mismatch"
+        );
+        assert_eq!(
+            marker["root"],
+            root.display().to_string(),
+            "child marker root mismatch"
+        );
+        let parent_pid = marker["parent_pid"].as_u64().expect("missing parent pid");
+        assert!(
+            parent_pid != 0 && parent_pid != u64::from(std::process::id()),
+            "parent cannot enter child branch"
+        );
+        Some(ChildFixture {
+            root,
+            token,
+            test_name: test_name.to_string(),
+        })
+    }
+
+    fn child_receipt(fixture: &ChildFixture, mut receipt: Value) {
+        assert!(
+            !fixture.root.join(".lattice").exists(),
+            "model directory appeared in hermetic fixture"
+        );
+        receipt["fixture_token"] = json!(fixture.token);
+        receipt["test_name"] = json!(fixture.test_name);
+        receipt["child_pid"] = json!(std::process::id());
+        println!("\n{RECEIPT}{receipt}");
+    }
+
+    fn params(ops: String) -> super::RequestParams {
+        super::RequestParams {
+            plan: None,
+            ops,
+            presentation: Some("verbose".into()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".into()),
+            format_per_op: None,
+            request_id: None,
+        }
+    }
+
+    async fn create_and_read_back(server: &super::KhiveMcpServer, name: &str) -> String {
+        let created = server
+            .dispatch_request_local_for_exec(
+                params(format!("create(kind=\"concept\", name={})", json!(name))),
+                true,
+            )
+            .await
+            .expect("valid writable-fixture create must reach the real handler");
+        let created: Value = serde_json::from_str(&created).expect("create JSON");
+        assert_eq!(created["results"][0]["ok"], true, "{created}");
+        let id = created["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return the stored id")
+            .to_string();
+        let read = server
+            .dispatch_request_local_for_exec(params(format!("get(id={})", json!(id))), true)
+            .await
+            .expect("read back the real write");
+        let read: Value = serde_json::from_str(&read).expect("get JSON");
+        assert_eq!(read["results"][0]["ok"], true, "{read}");
+        let record = read["results"][0]["result"].to_string();
+        assert!(record.contains(&id), "readback omitted stored id: {read}");
+        assert!(
+            record.contains(name),
+            "readback omitted stored name: {read}"
+        );
+        id
+    }
+
+    fn file_runtime(path: &Path, packs: &[&str]) -> khive_runtime::KhiveRuntime {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(path.to_path_buf()),
+            packs: packs.iter().map(|name| (*name).to_string()).collect(),
+            actor_id: Some("actor:read-only-policy-test".into()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("model-less writable file fixture");
+        assert!(!runtime.is_read_only(), "seed must be writable");
+        runtime
+    }
+
+    async fn seed_runtime(runtime: khive_runtime::KhiveRuntime, name: &str) -> String {
+        let server = super::KhiveMcpServer::new_with_mounts_and_config(runtime, None)
+            .await
+            .expect("prepare current production pack schema");
+        let id = create_and_read_back(&server, name).await;
+        super::settle_exec_storage_before_return(server).await;
+        id
+    }
+
+    async fn seed_file(path: &Path, name: &str, packs: &[&str]) -> String {
+        seed_runtime(file_runtime(path, packs), name).await
+    }
+
+    fn try_store_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            files: &mut BTreeMap<PathBuf, Vec<u8>>,
+            total: &mut usize,
+        ) -> Result<(), String> {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("fixture metadata {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err("fixture symlink refused".into());
+            }
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path)
+                    .map_err(|error| format!("fixture directory: {error}"))?
+                {
+                    let entry = entry.map_err(|error| format!("fixture entry: {error}"))?;
+                    visit(root, &entry.path(), files, total)?;
+                }
+            } else {
+                if !metadata.is_file() {
+                    return Err("special fixture file refused".into());
+                }
+                if metadata.len() > 16 * 1024 * 1024 {
+                    return Err("oversized fixture file".into());
+                }
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("snapshot private fixture bytes: {error}"))?;
+                *total = total
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| "fixture snapshot size overflow".to_string())?;
+                if *total > 64 * 1024 * 1024 {
+                    return Err("oversized fixture snapshot".into());
+                }
+                if files.len() >= 32 {
+                    return Err("too many fixture files".into());
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("fixture relative path: {error}"))?;
+                files.insert(relative.to_path_buf(), bytes);
+            }
+            Ok(())
+        }
+        let mut files = BTreeMap::new();
+        let mut total = 0;
+        visit(root, root, &mut files, &mut total)?;
+        Ok(files)
+    }
+
+    fn store_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        try_store_snapshot(root).expect("snapshot bounded private fixture tree")
+    }
+
+    fn record_store_baseline(
+        fixture: &ChildFixture,
+        before: BTreeMap<PathBuf, Vec<u8>>,
+        record_id: &str,
+    ) {
+        let baseline = fixture.root.join(STORE_BASELINE_DIR);
+        std::fs::create_dir(&baseline).expect("private store baseline directory");
+        assert!(
+            before.contains_key(Path::new("selected.db")),
+            "missing selected database baseline"
+        );
+        for (relative, bytes) in before {
+            let target = baseline.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).expect("baseline parent directory");
+            std::fs::write(target, bytes).expect("persist private store baseline");
+        }
+        // This marker is written only after the actual seed create/readback and
+        // every baseline byte are settled, and before invoking run_exec.
+        std::fs::write(
+            fixture.root.join(STORE_BASELINE_META),
+            serde_json::to_vec(&json!({
+                "fixture_token": fixture.token,
+                "test_name": fixture.test_name,
+                "child_pid": std::process::id(),
+                "record_id": record_id,
+                "complete": true,
+            }))
+            .unwrap(),
+        )
+        .expect("persist private baseline marker");
+    }
+
+    #[derive(Debug)]
+    struct ParentStoreWitness {
+        record_id: String,
+        changed_paths: Vec<PathBuf>,
+    }
+
+    fn parent_store_witness(
+        root: &Path,
+        token: &str,
+        test_name: &str,
+        child_pid: u32,
+    ) -> Result<Option<ParentStoreWitness>, String> {
+        if test_name != SELECTED_READ_TEST {
+            return Ok(None);
+        }
+        let marker_path = root.join(STORE_BASELINE_META);
+        let metadata = std::fs::symlink_metadata(&marker_path)
+            .map_err(|error| format!("missing selected-store baseline: {error}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() >= 4096 {
+            return Err("invalid selected-store baseline marker".into());
+        }
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(marker_path)
+                .map_err(|error| format!("read baseline marker: {error}"))?,
+        )
+        .map_err(|error| format!("baseline marker JSON: {error}"))?;
+        if marker["fixture_token"] != token
+            || marker["test_name"] != test_name
+            || marker["child_pid"].as_u64() != Some(u64::from(child_pid))
+            || marker["complete"] != true
+        {
+            return Err("selected-store baseline attribution mismatch".into());
+        }
+        let record_id = marker["record_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "baseline record id missing".to_string())?
+            .to_string();
+        let before = try_store_snapshot(&root.join(STORE_BASELINE_DIR))?;
+        let after = try_store_snapshot(&root.join("stores"))?;
+        if !before.contains_key(Path::new("selected.db")) {
+            return Err("selected database absent from baseline".into());
+        }
+        let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let changed_paths = paths
+            .into_iter()
+            .filter(|path| before.get(path) != after.get(path))
+            .collect();
+        Ok(Some(ParentStoreWitness {
+            record_id,
+            changed_paths,
+        }))
+    }
+
+    fn stream_diagnostic(name: &str, bytes: &[u8]) -> String {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_HEAD_LIMIT)]);
+        format!(
+            "{name}: captured_bytes={}, limit_reached={}, first_{}KiB={head:?}",
+            bytes.len(),
+            bytes.len() >= OUTPUT_LIMIT as usize,
+            OUTPUT_HEAD_LIMIT / 1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree() {
+        if let Some(fixture) = child_fixture(
+            "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree",
+        ) {
+            let cwd = &fixture.root;
+            let stores = cwd.join("stores");
+            std::fs::create_dir(&stores).unwrap();
+            let db = stores.join("selected.db");
+            let name = "read-only-explicit-database-row";
+            let id = seed_file(&db, name, &["kg"]).await;
+            let config = cwd.join("inspection.toml");
+            std::fs::write(&config, "engines = []\n").unwrap();
+            let output = cwd.join("explicit-read.jsonl");
+            let before = store_snapshot(&stores);
+            record_store_baseline(&fixture, before, &id);
+            // The explicit database holds a distinct actual record; the HOME
+            // default database does not exist and must remain absent.
+            let invocation = super::ExecArgs::try_parse_from([
+                "exec",
+                &format!("get(id={})", json!(id)),
+                "--read-only",
+                "--db",
+                db.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            super::run_exec(invocation)
+                .await
+                .expect("readonly explicit-database get");
+            let rows = std::fs::read_to_string(output).expect("saved get result");
+            let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+            assert_eq!(row["ok"], true, "{row}");
+            let record = row["result"].to_string();
+            assert!(
+                record.contains(&id) && record.contains(name),
+                "wrong store: {row}"
+            );
+            assert!(
+                !cwd.join(".khive/khive.db").exists(),
+                "created HOME default db"
+            );
+            // The parent compares actual disk bytes independently of capture.
+            // A semantic byte difference must not dump a SQLite Vec<u8> here,
+            // abort the child before receipt, or become a capture-limit failure.
+            child_receipt(
+                &fixture,
+                json!({
+                    "explicit_database_actual_record": true,
+                    "home_default_absent": true,
+                    "id": id,
+                }),
+            );
+            return;
+        }
+        let receipt = isolated_child(
+            "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree",
+            "kg",
+        )
+        .await;
+        assert_eq!(
+            receipt["explicit_database_actual_record"], true,
+            "{receipt}"
+        );
+        assert_eq!(
+            receipt["selected_store_tree_unchanged"], true,
+            "readonly store bytes changed: {receipt}"
+        );
+        assert_eq!(receipt["home_default_absent"], true, "{receipt}");
+    }
+
+    #[tokio::test]
+    async fn missing_registered_pack_column_refuses_read_only_boot_without_ddl() {
+        if let Some(fixture) =
+            child_fixture("missing_registered_pack_column_refuses_read_only_boot_without_ddl")
+        {
+            let cwd = &fixture.root;
+            let stores = cwd.join("stores");
+            std::fs::create_dir(&stores).unwrap();
+            let current = stores.join("current.db");
+            let current_id = seed_file(
+                &current,
+                "read-only-current-session-schema",
+                &["kg", "session"],
+            )
+            .await;
+            let config = cwd.join("inspection.toml");
+            std::fs::write(&config, "engines = []\n").unwrap();
+            let current_output = cwd.join("current-read.jsonl");
+            let before_current = store_snapshot(&stores);
+            let current_args = super::ExecArgs::try_parse_from([
+                "exec",
+                &format!("get(id={})", json!(current_id)),
+                "--read-only",
+                "--db",
+                current.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                current_output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            super::run_exec(current_args)
+                .await
+                .expect("current registered-pack schema must boot");
+            let saved = std::fs::read_to_string(current_output).unwrap();
+            let row: Value = serde_json::from_str(saved.lines().next().unwrap()).unwrap();
+            assert_eq!(row["ok"], true, "{row}");
+            assert!(row["result"].to_string().contains(&current_id), "{row}");
+            assert_eq!(
+                store_snapshot(&stores),
+                before_current,
+                "current readonly baseline changed store bytes"
+            );
+
+            // KG-only setup preserves the exact released historical cursor
+            // shape while keeping the core and KG schemas current.
+            let stale = stores.join("stale.db");
+            let runtime = file_runtime(&stale, &["kg"]);
+            let mut writer = runtime.sql().writer().await.expect("private seed writer");
+            writer.execute_script(
+                "CREATE TABLE session_mirror_cursor (file_path TEXT PRIMARY KEY, session_id TEXT, byte_offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)".to_string(),
+            ).await.expect("released historical session cursor schema");
+            drop(writer);
+            let stale_id = seed_runtime(runtime, "read-only-stale-session-schema").await;
+            let before_stale = store_snapshot(&stores);
+            let stale_output = cwd.join("stale-read.jsonl");
+            let stale_args = super::ExecArgs::try_parse_from([
+                "exec",
+                &format!("get(id={})", json!(stale_id)),
+                "--read-only",
+                "--db",
+                stale.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                stale_output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            let error = super::run_exec(stale_args)
+                .await
+                .expect_err("missing registered pack column must refuse boot");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("read-only schema validation failed"),
+                "wrong boot refusal: {message}"
+            );
+            assert!(
+                message.contains("session_mirror_cursor.file_identity"),
+                "wrong missing column: {message}"
+            );
+            assert!(
+                message.contains("open the database writable"),
+                "missing repair guidance: {message}"
+            );
+            assert!(!stale_output.exists(), "reserved export before failed boot");
+            assert_eq!(
+                store_snapshot(&stores),
+                before_stale,
+                "readonly stale schema performed DDL or changed store bytes"
+            );
+            child_receipt(
+                &fixture,
+                json!({
+                    "compatible_registered_schema_positive": true,
+                    "named_missing_pack_column_refused": true,
+                    "selected_store_tree_unchanged": true,
+                    "output_not_reserved": true,
+                }),
+            );
+            return;
+        }
+        let receipt = isolated_child(
+            "missing_registered_pack_column_refuses_read_only_boot_without_ddl",
+            "kg,session",
+        )
+        .await;
+        for key in [
+            "compatible_registered_schema_positive",
+            "named_missing_pack_column_refused",
+            "selected_store_tree_unchanged",
+            "output_not_reserved",
+        ] {
+            assert_eq!(receipt[key], true, "{receipt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn declaration_gate_blocks_actual_writable_dispatch() {
+        if let Some(fixture) = child_fixture("declaration_gate_blocks_actual_writable_dispatch") {
+            let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+                db_path: None,
+                packs: vec!["kg".into()],
+                actor_id: Some("actor:read-only-policy-test".into()),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
+            })
+            .expect("model-less writable in-memory fixture");
+            let server = super::KhiveMcpServer::new_with_mounts_and_config(runtime, None)
+                .await
+                .expect("wire the real handler fixture");
+            // Qualify the same write kind and readback before interpreting the
+            // policy result. Setup and storage failures earn no gate credit.
+            let baseline_id = create_and_read_back(&server, "read-only-policy-baseline").await;
+            let probe = "create(kind=\"concept\", name=\"read-only-policy-probe\")";
+            let blocked = super::preflight_read_only_ops(probe).is_err();
+            let probe_id = if blocked {
+                None
+            } else {
+                Some(create_and_read_back(&server, "read-only-policy-probe").await)
+            };
+            super::settle_exec_storage_before_return(server).await;
+            child_receipt(
+                &fixture,
+                json!({
+                    "baseline_id": baseline_id,
+                    "baseline_handler_and_readback": true,
+                    "policy_blocked": blocked,
+                    "probe_handler_and_readback": probe_id.is_some(),
+                    "probe_id": probe_id,
+                }),
+            );
+            return;
+        }
+        let receipt =
+            isolated_child("declaration_gate_blocks_actual_writable_dispatch", "kg").await;
+        assert_eq!(receipt["baseline_handler_and_readback"], true, "{receipt}");
+        assert!(receipt["baseline_id"].as_str().is_some(), "{receipt}");
+        if receipt["policy_blocked"] == false {
+            assert_eq!(receipt["probe_handler_and_readback"], true, "{receipt}");
+            assert!(receipt["probe_id"].as_str().is_some(), "{receipt}");
+        }
+        assert_eq!(
+            receipt["policy_blocked"], true,
+            "read_only_dispatch_not_reached: {receipt}"
+        );
+        assert_eq!(receipt["probe_handler_and_readback"], false, "{receipt}");
+    }
+
+    async fn isolated_child(test_name: &str, packs: &str) -> Value {
+        let root = tempfile::Builder::new()
+            .prefix("kkernel-read-only-")
+            .tempdir()
+            .expect("private policy fixture");
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let token = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            root.path().file_name().unwrap().to_string_lossy(),
+        );
+        std::fs::write(
+            root.path().join(CHILD_MARKER),
+            serde_json::to_vec(&json!({
+                "token": token,
+                "test_name": test_name,
+                "exe": exe.display().to_string(),
+                "root": root.path().canonicalize().unwrap().display().to_string(),
+                "parent_pid": std::process::id(),
+            }))
+            .unwrap(),
+        )
+        .expect("parent-owned child marker");
+        let filter = module_path!().split_once("::").expect("test module").1;
+        let mut command = tokio::process::Command::new(exe);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("KHIVE_")
+                || name.to_string_lossy().starts_with("KKERNEL_READ_ONLY_")
+            {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args(["--exact", &format!("{filter}::{test_name}"), "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .env(CHILD_ROOT, root.path())
+            .env(CHILD_TOKEN, &token)
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("HOME", root.path())
+            .env("KHIVE_PACKS", packs)
+            .env("KHIVE_EVENTS_SPLIT", "0")
+            .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
+            .current_dir(root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn isolated policy test");
+        let child_pid = child.id().expect("spawned child pid");
+        let out = child.stdout.take().expect("child stdout");
+        let err = child.stderr.take().expect("child stderr");
+        let out = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            out.take(OUTPUT_LIMIT).read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let err = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            err.take(OUTPUT_LIMIT).read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+            Ok(result) => result.expect("wait policy child"),
+            Err(_) => {
+                let _ = child.start_kill();
+                let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                out.abort();
+                err.abort();
+                assert!(matches!(reaped, Ok(Ok(_))), "policy child was not reaped");
+                let disk_witness = parent_store_witness(root.path(), &token, test_name, child_pid);
+                root.close().expect("remove timed-out private fixture");
+                panic!("policy fixture watchdog expired; no semantic gate credit; selected_store_witness={disk_witness:?}");
+            }
+        };
+        let out = out.await.expect("join stdout").expect("read stdout");
+        let err = err.await.expect("join stderr").expect("read stderr");
+        let capture_valid = out.len() < OUTPUT_LIMIT as usize && err.len() < OUTPUT_LIMIT as usize;
+        let capture_diagnostic = format!(
+            "{}; {}",
+            stream_diagnostic("stdout", &out),
+            stream_diagnostic("stderr", &err)
+        );
+        // This disk verdict is captured after reaping and before deleting the
+        // private fixture, regardless of cap/exit/receipt validity. It is only a
+        // diagnostic until every existing fixture-validity guard below passes.
+        let disk_witness = parent_store_witness(root.path(), &token, test_name, child_pid);
+        let out = String::from_utf8_lossy(&out);
+        let rows: Vec<_> = out
+            .lines()
+            .filter_map(|line| line.strip_prefix(RECEIPT))
+            .collect();
+        root.close().expect("remove completed private fixture");
+        assert!(
+            capture_valid,
+            "invalid policy fixture: child output reached the capture limit; {capture_diagnostic}; selected_store_witness={disk_witness:?}"
+        );
+        assert!(
+            status.success(),
+            "invalid policy fixture exit ({status}); {capture_diagnostic}; selected_store_witness={disk_witness:?}"
+        );
+        assert_eq!(rows.len(), 1, "missing/duplicate child receipt; {capture_diagnostic}; selected_store_witness={disk_witness:?}");
+        let mut receipt: Value = serde_json::from_str(rows[0]).expect("policy receipt JSON");
+        assert_eq!(
+            receipt["fixture_token"], token,
+            "child receipt token mismatch"
+        );
+        assert_eq!(
+            receipt["test_name"], test_name,
+            "child receipt kind mismatch"
+        );
+        assert_eq!(
+            receipt["child_pid"].as_u64(),
+            Some(u64::from(child_pid)),
+            "child receipt pid mismatch"
+        );
+        if let Some(witness) =
+            disk_witness.expect("invalid selected-store baseline; no semantic gate credit")
+        {
+            assert_eq!(
+                receipt["explicit_database_actual_record"], true,
+                "missing actual selected-database readback"
+            );
+            assert_eq!(
+                receipt["id"].as_str(),
+                Some(witness.record_id.as_str()),
+                "baseline/readback record mismatch"
+            );
+            receipt["selected_store_tree_unchanged"] = json!(witness.changed_paths.is_empty());
+            receipt["selected_store_changed_paths"] = json!(witness.changed_paths);
+        }
+        receipt
+    }
+}
+
+async fn run_exec_inline_read_only(
+    ops: String,
+    cfg: RuntimeConfig,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    db_context: ExecDbContext,
+    strict: bool,
+) -> Result<()> {
+    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+        return Err(report_invocation_refusal(
+            Some(&ops),
+            RefusalReason::AnonymousActor,
+            error,
+        ));
+    }
+    let (khive_cfg, _) = load_exec_config(&db_context)?;
+    if !khive_cfg.backends.is_empty() {
+        anyhow::bail!("--read-only does not support declared backends");
+    }
+    if !cfg.mounts.is_empty() {
+        anyhow::bail!("--read-only does not support configured mounts");
+    }
+    if cfg.db_path.is_none() {
+        anyhow::bail!("--read-only requires an existing file-backed database");
+    }
+    validate_wal_ceiling_topology(&cfg, &khive_cfg.backends, false)?;
+    let path = cfg
+        .db_path
+        .as_deref()
+        .expect("file-backed path checked above");
+    if !path.is_file() {
+        anyhow::bail!(
+            "--read-only requires an existing file-backed database: {}",
+            path.display()
+        );
+    }
+    disclose_resolved_database(&cfg, &khive_cfg, false);
+    disclose_resolved_actor(&cfg);
+    // This path never takes the writable construction guard, prepares host
+    // schema/cutover state or forwards to a daemon. The runtime validates the
+    // existing schema and the registry validates pack columns without DDL.
+    let runtime = khive_runtime::KhiveRuntime::new_readonly(cfg)?;
+    if !runtime.is_read_only() {
+        anyhow::bail!("--read-only requires a read-only file-backed runtime");
+    }
+    let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
+    let server = KhiveMcpServer::new_with_mounts_and_config(runtime, Some(&khive_cfg))
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .with_default_output_format(env_fmt);
+    let params = RequestParams {
+        plan: None,
+        ops,
+        presentation,
+        presentation_per_op: None,
+        save_to: save_file,
+        format: output_format,
+        format_per_op: None,
+        request_id: None,
+    };
+    let result = server
+        .dispatch_request_local_for_exec(params, strict)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"));
+    let result = match result {
+        Ok(raw_output) => {
+            let output = prepare_exec_output(&raw_output, strict);
+            println!("{output}");
+            enforce_strict_batch_result(&output, strict)
+        }
+        Err(error) => Err(error),
+    };
+    settle_exec_storage_before_return(server).await;
+    result
 }
 
 /// Apply the explicit exec actor tier and validate an optional identity

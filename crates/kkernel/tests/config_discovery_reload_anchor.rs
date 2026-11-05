@@ -107,6 +107,7 @@ path = "{}"
     std::env::set_current_dir(project_dir.path()).expect("chdir into isolated project dir");
 
     let args = ExecArgs {
+        read_only: false,
         plan: false,
         ops: Some("stats()".to_string()),
         pending_events: false,
