@@ -1088,6 +1088,136 @@ mod tests {
         }))
     }
 
+    async fn chain_child(root: &Path) -> Result<Value> {
+        let runtime = fixture_runtime(root).await?;
+        let mut seed_paths = Vec::new();
+        let source = memory(&runtime, SOURCE, "chain source memory", &mut seed_paths).await?;
+        let mut ids = Vec::new();
+        let mut target_ids = Vec::new();
+        for index in 0..6 {
+            let target = memory(
+                &runtime,
+                SOURCE,
+                &format!("chain target {index}"),
+                &mut seed_paths,
+            )
+            .await?;
+            let namespace = if index == 0 { SOURCE } else { "local" };
+            ids.push(legacy_edge(&runtime, namespace, source, target, "supersedes", false).await?);
+            target_ids.push(target);
+        }
+        let reader = {
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_actor_id(Some(SOURCE.to_string()));
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.build().expect("chain KgPack reader registry")
+        };
+        let before_anchor = reader
+            .dispatch_with_disposition(
+                "neighbors",
+                json!({
+                    "namespace": SOURCE, "id": source.to_string(), "direction": "both",
+                    "relations": ["supersedes"],
+                }),
+                None,
+            )
+            .await
+            .expect("actual source-only chain anchor read; invalid setup is not control credit");
+        let before_default_anchor = reader
+            .dispatch_with_disposition(
+                "neighbors",
+                json!({
+                    "id": source.to_string(), "direction": "both", "relations": ["supersedes"],
+                }),
+                None,
+            )
+            .await
+            .expect("actual default chain anchor contrast");
+        let mut before_hidden_targets = Vec::new();
+        for target in target_ids.iter().skip(1) {
+            let response = reader
+                .dispatch_with_disposition(
+                    "neighbors",
+                    json!({
+                        "namespace": SOURCE, "id": target.to_string(), "direction": "in",
+                        "relations": ["supersedes"],
+                    }),
+                    None,
+                )
+                .await
+                .expect("actual source-only chain target read");
+            before_hidden_targets.push(json!({"target_id": target, "response": response}));
+        }
+        drop(reader);
+        settle(runtime).await?;
+        let before = records(root, &ids).await?;
+        ensure!(before.len() == 6, "chain fixture lost an edge");
+        ensure!(
+            before
+                .iter()
+                .filter(|edge| edge["namespace"] == SOURCE)
+                .count()
+                == 1,
+            "chain fixture source namespace distribution is wrong"
+        );
+        ensure!(
+            before
+                .iter()
+                .filter(|edge| edge["namespace"] == "local")
+                .count()
+                == 5,
+            "chain fixture local namespace distribution is wrong"
+        );
+        for (edge, target) in before.iter().zip(&target_ids) {
+            ensure!(
+                edge["source_id"] == json!(source)
+                    && edge["target_id"] == json!(target)
+                    && edge["relation"] == "supersedes"
+                    && edge["deleted_at"].is_null(),
+                "chain fixture endpoints, relation or liveness differ"
+            );
+        }
+        let before_files = store_files(root)?;
+        let dry = memory_edge_namespace_move(&args(root, false)).await?;
+        ensure!(dry.complete, "chain dry run did not complete");
+        let file_witness = compare_store_files(before_files, store_files(root)?);
+        let dry_edges = records(root, &ids).await?;
+        let applied = memory_edge_namespace_move(&args(root, true)).await?;
+        ensure!(applied.complete, "chain apply did not complete");
+        let after = records(root, &ids).await?;
+        let runtime = fixture_runtime(root).await?;
+        let reader = {
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_actor_id(Some(SOURCE.to_string()));
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.build().expect("chain post-apply reader registry")
+        };
+        let after_anchor = reader
+            .dispatch_with_disposition(
+                "neighbors",
+                json!({
+                    "namespace": SOURCE, "id": source.to_string(), "direction": "both",
+                    "relations": ["supersedes"],
+                }),
+                None,
+            )
+            .await
+            .expect("actual post-apply source-only chain read");
+        drop(reader);
+        settle(runtime).await?;
+        let rerun = memory_edge_namespace_move(&args(root, true)).await?;
+        ensure!(rerun.complete, "chain idempotent apply did not complete");
+        Ok(json!({
+            "baseline_valid": true, "seed_paths": seed_paths,
+            "before_edges": before, "files": file_witness, "dry_edges": dry_edges,
+            "dry": dry, "applied": applied, "after_edges": after, "rerun": rerun,
+            "expected_candidates": 5, "source_was_soft_deleted": false,
+            "before_anchor": before_anchor, "before_default_anchor": before_default_anchor,
+            "before_hidden_targets": before_hidden_targets, "after_anchor": after_anchor,
+            "target_ids": target_ids,
+        }))
+    }
+
     fn validate_child(case: &str, test_name: &str) -> Result<Option<PathBuf>> {
         let Some(root) = std::env::var_os(CHILD_ROOT) else {
             ensure!(
@@ -1192,6 +1322,7 @@ mod tests {
                 "six" | "paged" | "deleted-source" => moving_child(&root, case).await?,
                 "projected" | "live" | "deleted" => collision_child(&root, case).await?,
                 "excluded" => excluded_child(&root).await?,
+                "chain" => chain_child(&root).await?,
                 _ => anyhow::bail!("unknown private fixture case"),
             };
             fs::write(root.join("receipt.json"), serde_json::to_vec(&receipt)?)?;
@@ -1361,6 +1492,122 @@ mod tests {
                     assert_eq!(receipt[mode]["moved"], 0);
                 }
             }
+            "chain" => {
+                let before = &receipt["before_anchor"];
+                assert_eq!(
+                    before["neighbors"]
+                        .as_array()
+                        .expect("before anchor neighbors")
+                        .len(),
+                    1,
+                    "whole_chain_before_anchor_visible_edge_count"
+                );
+                assert_eq!(
+                    before["hidden_incoming_edges"]["total"],
+                    json!(0),
+                    "whole_chain_before_anchor_incoming_count_zero"
+                );
+                let default = &receipt["before_default_anchor"];
+                let default_neighbors = default["neighbors"]
+                    .as_array()
+                    .expect("default anchor neighbors");
+                assert!(
+                    default_neighbors.len() >= 5,
+                    "whole_chain_default_view_sees_local_edges"
+                );
+                let default_bytes =
+                    serde_json::to_string(default_neighbors).expect("default neighbor bytes");
+                for edge in receipt["before_edges"]
+                    .as_array()
+                    .expect("original chain edges")
+                    .iter()
+                    .filter(|edge| edge["namespace"] == "local")
+                {
+                    assert!(
+                        default_bytes
+                            .contains(edge["id"].as_str().expect("local edge UUID string")),
+                        "whole_chain_default_view_returns_each_local_edge"
+                    );
+                }
+                assert_eq!(
+                    default["hidden_incoming_edges"]["total"],
+                    json!(0),
+                    "whole_chain_default_view_has_zero_hidden_count"
+                );
+                assert_eq!(
+                    receipt["dry"]["candidates"],
+                    json!(5),
+                    "whole_chain_dry_candidates"
+                );
+                assert_eq!(
+                    receipt["dry"]["moved"],
+                    json!(0),
+                    "whole_chain_dry_moved_zero"
+                );
+                assert_eq!(receipt["dry"]["apply_blocked"], json!(false));
+                assert_eq!(
+                    receipt["applied"]["moved"],
+                    json!(5),
+                    "whole_chain_apply_moved_five"
+                );
+                assert_eq!(receipt["applied"]["remaining"], json!(0));
+                assert_eq!(receipt["applied"]["complete"], json!(true));
+                for mode in ["dry", "applied"] {
+                    let counts = receipt[mode]["counts"]
+                        .as_array()
+                        .expect("whole chain namespace census");
+                    let source = counts
+                        .iter()
+                        .find(|row| row["namespace"] == SOURCE && row["relation"] == "supersedes")
+                        .expect("whole chain source census");
+                    let local = counts
+                        .iter()
+                        .find(|row| row["namespace"] == "local" && row["relation"] == "supersedes")
+                        .expect("whole chain local census");
+                    assert_eq!(source["liveness"], "live");
+                    assert_eq!(local["liveness"], "live");
+                    assert_eq!(source["before"], json!(1));
+                    assert_eq!(source["after"], json!(6));
+                    assert_eq!(local["before"], json!(5));
+                    assert_eq!(local["after"], json!(0));
+                }
+                assert_eq!(receipt["rerun"]["candidates"], json!(0));
+                assert_eq!(receipt["rerun"]["moved"], json!(0));
+                assert_eq!(receipt["rerun"]["remaining"], json!(0));
+                assert_applied_identity(&receipt);
+                let target_ids = receipt["target_ids"]
+                    .as_array()
+                    .expect("whole chain target ids");
+                assert_eq!(target_ids.len(), 6, "whole_chain_target_ids");
+                let after = receipt["after_anchor"]["neighbors"]
+                    .as_array()
+                    .expect("after anchor neighbors");
+                assert_eq!(after.len(), 6, "whole_chain_after_apply_six_visible_edges");
+                let bytes = serde_json::to_string(after).expect("after neighbor bytes");
+                for target in target_ids {
+                    assert!(
+                        bytes.contains(target.as_str().expect("target UUID string")),
+                        "whole_chain_after_apply_contains_every_target"
+                    );
+                }
+                let targets = receipt["before_hidden_targets"]
+                    .as_array()
+                    .expect("before target readings");
+                assert_eq!(targets.len(), 5, "whole_chain_hidden_target_readings");
+                for (target, id) in targets.iter().zip(target_ids.iter().skip(1)) {
+                    assert_eq!(&target["target_id"], id, "whole_chain_target_read_is_bound");
+                    assert_eq!(
+                        target["response"]["hidden_incoming_edges"]["total"],
+                        json!(1),
+                        "whole_chain_before_target_hidden_count"
+                    );
+                    assert_eq!(
+                        target["response"]["hidden_incoming_edges"]["by_relation"],
+                        json!({"supersedes": 1}),
+                        "whole_chain_target_relation_count"
+                    );
+                }
+            }
             _ => unreachable!("qualified case"),
         }
         Ok(())
@@ -1371,6 +1618,15 @@ mod tests {
         run_case(
             "six",
             "memory_edge_namespace_move::tests::dry_run_then_apply_moves_six_edges",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn hidden_incoming_chain_before_and_after_move() -> Result<()> {
+        run_case(
+            "chain",
+            "memory_edge_namespace_move::tests::hidden_incoming_chain_before_and_after_move",
         )
         .await
     }

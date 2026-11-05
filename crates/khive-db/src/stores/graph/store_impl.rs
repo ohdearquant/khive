@@ -826,6 +826,55 @@ impl GraphStore for SqlGraphStore {
         })
         .await
     }
+    async fn count_hidden_incoming_memory_edges(
+        &self,
+        target_ids: &[String],
+        relations: Option<&[String]>,
+        visible_namespaces: &[String],
+    ) -> Result<Vec<(String, String, u64)>, StorageError> {
+        let target_ids_json = serde_json::json!(target_ids).to_string();
+        let namespaces_json = serde_json::json!(visible_namespaces).to_string();
+        let relations_json = relations.map(|scope| serde_json::json!(scope).to_string());
+        self.with_reader("count_hidden_incoming_memory_edges", move |conn| {
+            let mut where_clause = " WHERE graph_edges.deleted_at IS NULL \
+                AND graph_edges.namespace NOT IN (SELECT value FROM json_each(?1)) \
+                AND graph_edges.target_id IN (SELECT value FROM json_each(?2)) \
+                AND EXISTS (SELECT 1 FROM notes n \
+                    WHERE n.id = graph_edges.source_id AND n.kind = 'memory') \
+                AND EXISTS (SELECT 1 FROM notes n \
+                    WHERE n.id = graph_edges.target_id AND n.kind = 'memory')"
+                .to_string();
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(namespaces_json), Box::new(target_ids_json)];
+            if let Some(scope) = relations_json {
+                where_clause
+                    .push_str(" AND graph_edges.relation IN (SELECT value FROM json_each(?3))");
+                params.push(Box::new(scope));
+            }
+            let sql = format!(
+                "SELECT target_id, relation, COUNT(*) FROM graph_edges{} \
+                 GROUP BY target_id, relation",
+                with_live_endpoints(&where_clause)
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut counts = Vec::new();
+            for row in rows {
+                let (target_id, relation, count) = row?;
+                counts.push((target_id, relation, count as u64));
+            }
+            Ok(counts)
+        })
+        .await
+    }
 
     async fn query_edges_in_namespaces(
         &self,
