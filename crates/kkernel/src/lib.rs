@@ -27,6 +27,7 @@ pub mod git_dedup;
 pub mod git_ingest;
 pub mod import_notes;
 pub mod kg;
+pub mod memory_edge_namespace_move;
 pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;

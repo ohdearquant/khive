@@ -60,7 +60,8 @@ impl KhiveRuntime {
             // Source must be a note. By-ID endpoint resolution is namespace-agnostic:
             // link consumes two by-ID endpoints, so it must resolve exactly what
             // get() resolves, regardless of caller namespace.
-            match self.resolve_edge_endpoint(token, source_id).await? {
+            let source = self.resolve_edge_endpoint(token, source_id).await?;
+            match source.as_ref() {
                 Some(Resolved::Note(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -80,7 +81,8 @@ impl KhiveRuntime {
                 }
             }
             // Target may be any substrate (entity, note, event, or edge) — by-ID, unfiltered.
-            let target_kind = match self.resolve_edge_endpoint(token, target_id).await? {
+            let target = self.resolve_edge_endpoint(token, target_id).await?;
+            let target_kind = match target.as_ref() {
                 Some(Resolved::Entity(_)) => EdgeEndpointKind::Entity,
                 Some(Resolved::Note(_)) => EdgeEndpointKind::Note,
                 Some(Resolved::Event(_)) => EdgeEndpointKind::Event,
@@ -99,6 +101,14 @@ impl KhiveRuntime {
                     Err(error) => return Err(error),
                 },
             };
+            Self::ensure_memory_edge_namespace(
+                token,
+                source_id,
+                target_id,
+                relation,
+                source.as_ref(),
+                target.as_ref(),
+            )?;
             return Ok((EdgeEndpointKind::Note, target_kind));
         } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
@@ -158,6 +168,14 @@ impl KhiveRuntime {
                     Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
                 }
                 (Resolved::Note(_), Resolved::Note(_)) => {
+                    Self::ensure_memory_edge_namespace(
+                        token,
+                        source_id,
+                        target_id,
+                        relation,
+                        Some(&src),
+                        Some(&tgt),
+                    )?;
                     Ok((EdgeEndpointKind::Note, EdgeEndpointKind::Note))
                 }
                 (Resolved::Event(_), _) => {
@@ -205,6 +223,14 @@ impl KhiveRuntime {
                     Some(Resolved::Note(_)) => Some(EdgeEndpointKind::Note),
                     _ => None,
                 };
+                Self::ensure_memory_edge_namespace(
+                    token,
+                    source_id,
+                    target_id,
+                    relation,
+                    src_res.as_ref(),
+                    tgt_res.as_ref(),
+                )?;
                 return match (kind(src_res.as_ref()), kind(tgt_res.as_ref())) {
                     (Some(source_kind), Some(target_kind)) => Ok((source_kind, target_kind)),
                     _ => Err(RuntimeError::Internal(
@@ -272,6 +298,37 @@ impl KhiveRuntime {
             }
         }
         Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
+    }
+
+    fn ensure_memory_edge_namespace(
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        source: Option<&Resolved>,
+        target: Option<&Resolved>,
+    ) -> RuntimeResult<()> {
+        let (Some(Resolved::Note(source)), Some(Resolved::Note(target))) = (source, target) else {
+            return Ok(());
+        };
+        if source.kind != "memory" || target.kind != "memory" {
+            return Ok(());
+        }
+        // Base symmetric relations are entity-only today. Use the persisted
+        // canonical source for the namespace rule, without changing canonicalization.
+        let (canonical_source, _) = canonical_edge_endpoints(relation, source_id, target_id);
+        let source_namespace = if canonical_source == source_id {
+            source.header.namespace.as_str()
+        } else {
+            target.header.namespace.as_str()
+        };
+        if source_namespace != token.namespace().as_str() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "link: memory edge source namespace {source_namespace} does not match write namespace {}; retry with namespace={source_namespace}",
+                token.namespace().as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Public delegator for cross-backend link validation.
@@ -752,6 +809,23 @@ impl KhiveRuntime {
             canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
         let (source_id, target_id) = (canonical_source, canonical_target);
         validate_edge_metadata(relation, metadata.as_ref())?;
+        if target_backend.is_none()
+            && matches!(source_kind, EdgeEndpointKind::Note)
+            && matches!(target_kind, EdgeEndpointKind::Note)
+        {
+            // This public entry can bypass shared validation. Two by-ID resolutions
+            // here also protect direct same-backend callers; remote Some is unchanged.
+            let source = self.resolve_edge_endpoint(token, source_id).await?;
+            let target = self.resolve_edge_endpoint(token, target_id).await?;
+            Self::ensure_memory_edge_namespace(
+                token,
+                source_id,
+                target_id,
+                relation,
+                source.as_ref(),
+                target.as_ref(),
+            )?;
+        }
         let metadata = if relation == EdgeRelation::DependsOn && target_backend.is_none() {
             // Same-backend coordinator calls have both records here. Cross-backend
             // callers prepare metadata from records on their respective runtimes.

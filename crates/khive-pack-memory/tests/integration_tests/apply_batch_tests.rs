@@ -128,6 +128,288 @@ fn ab_create(part: u32, content: &str) -> Value {
     })
 }
 
+async fn ab_source_namespace_edges(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    targets: Vec<Uuid>,
+    relation: EdgeRelation,
+) -> Vec<khive_storage::types::Edge> {
+    let token = rt
+        .authorize(Namespace::parse(namespace).expect("namespace parses"))
+        .expect("authorize namespace");
+    let edges = rt
+        .graph(&token)
+        .expect("graph store")
+        .query_edges(
+            EdgeFilter {
+                target_ids: targets,
+                relations: vec![relation],
+                ..EdgeFilter::default()
+            },
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 1000,
+            },
+        )
+        .await
+        .expect("query stored edges")
+        .items;
+    assert!(
+        edges.iter().all(|edge| edge.namespace == namespace),
+        "d1_fixture_namespace_scope"
+    );
+    edges
+}
+
+#[tokio::test]
+async fn test_apply_batch_and_kg_link_share_source_namespace_then_refuse_mismatch() {
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let old = ab_seed(&alice, "source namespace crosswriter original").await;
+    let result = ab_apply(
+        &alice,
+        "source-namespace-crosswriter",
+        vec![ab_supersede(old, "source namespace crosswriter revised")],
+        false,
+    )
+    .await;
+    assert_eq!(result["entries"][0]["outcome"], "written");
+    let source_id = ab_uuid(&result["entries"][0]["new_id"]);
+    let source = alice
+        .dispatch("get", json!({"id": source_id.to_string()}))
+        .await
+        .expect("get actual source memory row");
+    assert_eq!(source["namespace"], "alice");
+    let memory_edges =
+        ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(memory_edges.len(), 1, "apply_batch_source_namespace_edge");
+    assert_eq!(memory_edges[0].namespace, "alice");
+    assert_eq!(memory_edges[0].source_id, source_id);
+    assert_eq!(memory_edges[0].target_id, old);
+
+    alice
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source_id,
+                "target_id": old,
+                "relation": "supersedes",
+                "weight": 1.0,
+                "namespace": "alice"
+            }),
+        )
+        .await
+        .expect("KG link accepts its source write namespace");
+    let linked =
+        ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(linked.len(), 1, "crosswriters_share_source_namespace");
+    assert_eq!(linked[0].namespace, "alice");
+    assert_eq!(
+        Uuid::from(linked[0].id),
+        Uuid::from(memory_edges[0].id),
+        "crosswriter_natural_key_keeps_persisted_id"
+    );
+
+    let alice_before = ab_edges(&rt, "alice", vec![old]).await.len();
+    let local_before = ab_edges(&rt, "local", vec![old]).await.len();
+    assert_eq!(local_before, 0, "same_source_positive_has_no_local_edge");
+    let mismatch = alice
+        .dispatch(
+            "link",
+            json!({"source_id": source_id, "target_id": old, "relation": "supersedes", "weight": 1.0}),
+        )
+        .await;
+    let alice_after = ab_edges(&rt, "alice", vec![old]).await.len();
+    let local_after = ab_edges(&rt, "local", vec![old]).await.len();
+    assert!(
+        mismatch.is_err(),
+        "memory_source_namespace_mismatch_refused"
+    );
+    let error = format!("{:?}", mismatch.expect_err("mismatched namespace is refused"));
+    assert!(error.contains("link") && error.contains("namespace=alice"));
+    assert_eq!(alice_after, alice_before, "mismatch_keeps_source_edge_count");
+    assert_eq!(local_after, local_before, "mismatch_writes_no_local_edge");
+}
+
+#[tokio::test]
+async fn test_apply_batch_nonlocal_source_accepts_local_superseded_target() {
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let local = make_registry_with_actor(rt.clone(), "local");
+    let old = ab_seed(&local, "local target for nonlocal source").await;
+    let old_row = local
+        .dispatch("get", json!({"id": old.to_string()}))
+        .await
+        .expect("get local target");
+    assert_eq!(old_row["namespace"], "local");
+    let alice_before = ab_edges(&rt, "alice", vec![old]).await.len();
+    let local_before = ab_edges(&rt, "local", vec![old]).await.len();
+    let result = ab_apply(
+        &alice,
+        "nonlocal-source-local-target",
+        vec![ab_supersede(old, "nonlocal source replacing local target")],
+        false,
+    )
+    .await;
+    assert_eq!(result["entries"][0]["outcome"], "written");
+    let source_id = ab_uuid(&result["entries"][0]["new_id"]);
+    let source = alice
+        .dispatch("get", json!({"id": source_id.to_string()}))
+        .await
+        .expect("get new nonlocal source");
+    assert_eq!(source["namespace"], "alice");
+    let edges =
+        ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(edges.len(), alice_before + 1);
+    assert!(edges.iter().any(|edge| {
+        edge.source_id == source_id && edge.target_id == old && edge.namespace == "alice"
+    }));
+    assert_eq!(ab_edges(&rt, "local", vec![old]).await.len(), local_before);
+}
+
+#[tokio::test]
+async fn test_memory_link_many_mixed_source_namespaces_refuses_before_any_edge() {
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let bob = make_registry_with_actor(rt.clone(), "bob");
+    let local = make_registry_with_actor(rt.clone(), "local");
+    let source_alice = ab_seed(&alice, "mixed bulk source alice").await;
+    let source_bob = ab_seed(&bob, "mixed bulk source bob").await;
+    let target = ab_seed(&local, "mixed bulk local target").await;
+    let token = rt
+        .authorize_with_visibility(
+            Namespace::parse("alice").expect("alice namespace"),
+            vec![Namespace::parse("bob").expect("bob namespace"), Namespace::local()],
+        )
+        .expect("read visibility is not another write grant");
+    let before = [
+        ab_edges(&rt, "alice", vec![target]).await.len(),
+        ab_edges(&rt, "bob", vec![target]).await.len(),
+        ab_edges(&rt, "local", vec![target]).await.len(),
+    ];
+    assert_eq!(before, [0, 0, 0], "mixed_bulk_fixture_starts_without_edges");
+    let specs = [source_alice, source_bob]
+        .into_iter()
+        .map(|source_id| khive_runtime::LinkSpec {
+            namespace: None,
+            source_id,
+            target_id: target,
+            relation: EdgeRelation::Supersedes,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        })
+        .collect();
+    let result = rt.link_many(&token, specs).await;
+    let after = [
+        ab_edges(&rt, "alice", vec![target]).await.len(),
+        ab_edges(&rt, "bob", vec![target]).await.len(),
+        ab_edges(&rt, "local", vec![target]).await.len(),
+    ];
+    assert!(result.is_err(), "mixed_memory_namespace_bulk_refused");
+    assert_eq!(after, before, "mixed_bulk_has_no_partial_edge_write");
+}
+
+#[tokio::test]
+async fn test_entity_link_keeps_token_namespace_for_non_memory_endpoints() {
+    let rt = make_runtime();
+    let registry = ab_anonymous_registry(rt.clone());
+    let entity_token = rt
+        .authorize(Namespace::parse("alice").expect("alice namespace"))
+        .expect("entity seed namespace");
+    let mut ids = Vec::new();
+    for name in ["nonmemory source", "nonmemory target"] {
+        let id = Uuid::new_v4();
+        let mut entity = khive_storage::Entity::new("alice", "concept", name);
+        entity.id = id;
+        rt.entities(&entity_token)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity outside the edge write namespace");
+        ids.push(id);
+    }
+    registry
+        .dispatch(
+            "link",
+            json!({"source_id": ids[0], "target_id": ids[1], "relation": "supports", "weight": 1.0}),
+        )
+        .await
+        .expect("non-memory rule remains token namespace");
+    let local =
+        ab_source_namespace_edges(&rt, "local", vec![ids[1]], EdgeRelation::Supports).await;
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].namespace, "local");
+    assert!(ab_source_namespace_edges(&rt, "alice", vec![ids[1]], EdgeRelation::Supports)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_local_memory_none_stamp_refuses_mismatch_remote_some_out_of_scope() {
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let local = make_registry_with_actor(rt.clone(), "local");
+    let source = ab_seed(&alice, "direct None memory source").await;
+    let target = ab_seed(&local, "direct None local target").await;
+    let source_token = rt
+        .authorize(Namespace::parse("alice").expect("alice namespace"))
+        .expect("source write token");
+    let accepted = rt
+        .link_with_target_backend_observed(
+            &source_token,
+            source,
+            target,
+            khive_runtime::EdgeEndpointKind::Note,
+            khive_runtime::EdgeEndpointKind::Note,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("direct same-backend None accepts matching memory source namespace");
+    assert_eq!(accepted.edge.namespace, "alice");
+    let before = [
+        ab_edges(&rt, "alice", vec![target]).await.len(),
+        ab_edges(&rt, "local", vec![target]).await.len(),
+    ];
+    assert_eq!(before, [1, 0], "direct_none_positive_has_only_source_edge");
+    let wrong_token = rt
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse("alice").expect("alice namespace")],
+        )
+        .expect("source read visibility grants no source write authority");
+    let mismatch = rt
+        .link_with_target_backend_observed(
+            &wrong_token,
+            source,
+            target,
+            khive_runtime::EdgeEndpointKind::Note,
+            khive_runtime::EdgeEndpointKind::Note,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+            None,
+            false,
+        )
+        .await;
+    let after = [
+        ab_edges(&rt, "alice", vec![target]).await.len(),
+        ab_edges(&rt, "local", vec![target]).await.len(),
+    ];
+    assert!(
+        mismatch.is_err(),
+        "direct_none_memory_namespace_mismatch_refused"
+    );
+    let error = format!("{:?}", mismatch.expect_err("direct None mismatch refused"));
+    assert!(error.contains("link") && error.contains("namespace=alice"));
+    assert_eq!(after, before, "direct_none_mismatch_writes_no_edge");
+}
+
 /// Run one row as a dry run and as a real run; both must refuse it with the
 /// same code and neither may store anything. Returns the code.
 async fn ab_refusal_code(
