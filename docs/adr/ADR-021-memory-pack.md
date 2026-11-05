@@ -1067,9 +1067,11 @@ goes. A second reader of one measured row sees five of its six outgoing `superse
    Under rule 1 a reader already sees every outgoing edge of a row it can see, so the edges this count covers are the
    incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
    withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
-3. **Existing edges.** A one-time move rewrites each stored edge between memory rows whose namespace differs from its
-   source row's namespace. The move has a dry run that prints per-namespace edge counts before and after and writes
-   nothing; the applying run prints the same counts.
+3. **Existing edges.** A one-time move rewrites each live edge between memory rows whose namespace differs from its
+   source row's namespace, keeping the edge's id. Soft-deleted edges stay where they are: no read returns them, and
+   edge listing does not enumerate them. A move that would put an edge on a (source, target, relation) already present
+   in the source row's namespace, live or soft-deleted, is refused before anything is written. The move has a dry run
+   that prints per-namespace edge counts before and after and writes nothing; the applying run prints the same counts.
 
 **Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
 chain is either whole or reported as partial with a count. `link` gains one read of its source record when both
