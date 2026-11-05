@@ -708,7 +708,7 @@ impl KhiveRuntime {
 #[cfg(test)]
 pub(super) mod memory_edge_namespace_restore_tests {
     use crate::{KhiveRuntime, Resolved, RuntimeError};
-    use khive_storage::{Note, SqlAccess, SqlStatement, SqlValue, SqlWriter};
+    use khive_storage::{Note, SqlStatement, SqlValue};
     use khive_types::{EdgeRelation, Namespace};
     use std::sync::Mutex;
     use std::time::Duration;
