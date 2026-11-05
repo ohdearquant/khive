@@ -1071,31 +1071,37 @@ any namespace times the smallest `rank_score` among those 50 hits, both sides in
 fails the rule is reported as uncertified and is not counted for or against the rule.
 
 What a certified recall establishes, and the one condition it rests on. With `min_score` 0 and no `score_floor`, first
-admission keeps every scored candidate in both arms, since a factor in (0, 1] never makes a score negative, so
-supersedes suppression drops the same candidates in both. A candidate scored but not returned was cut by the sort and
+admission keeps every scored candidate in both arms, since a factor in (0, 1] never makes a score negative. Supersedes
+suppression then drops the same candidates in both, with one exception: a `supersedes` property holding an abbreviated
+id suppresses the first candidate in rank order whose id starts with it, so where two candidates share that prefix the
+factor can change which one is dropped. A candidate scored but not returned was cut by the sort and
 `limit`, so its `rank_score` was at most the smallest returned one; no multiplier exceeds the largest, and the strict
 comparison leaves no tie for the id order to break, so it cannot reach the tenth score while its duplicate penalty is
-unchanged. Candidates the retrieval stage never produced are absent from both arms alike. The condition is that no
-duplicate penalty changes copy. The engine picks the unpenalized copy of each duplicate pair after the factors
+unchanged. Candidates the retrieval stage never produced are absent from both arms alike. Two conditions remain:
+no duplicate penalty changes copy, and no abbreviated `supersedes` value matches two candidates. The engine picks the unpenalized copy of each duplicate pair after the factors
 (Amendment 4 Change 2, step 3), so a rule that reorders a pair moves the penalty, by at most the configured amount (0.1
 by default), and a returned record cannot show whether it happened: a pair whose second copy was not returned, or was
-suppressed, is invisible to it. The penalty-margin column counts recalls that the rule certifies whose tenth score also
+suppressed, is invisible to it. The same holds for an abbreviated `supersedes` value, since the record holds the
+returned ids only; the prefix is at least 8 hexadecimal digits, so two of a recall's candidates sharing it is unlikely
+but not excluded. The penalty-margin column counts recalls that the rule certifies whose tenth score also
 clears the bound plus the penalty, with no penalized hit among the 50. It rules out an unreturned copy that loses its
 penalty and enters; it does not rule out a returned hit that gains one.
 
-Two measurements bear on the condition on this store: 6 of the 6,000 no-profile hits carry a penalty, and the replay of
+Two measurements bear on the conditions on this store: 6 of the 6,000 no-profile hits carry a penalty, and the replay of
 `local_factor` 0.7 reproduces the candidate arm's served top ten in all 120 recalls, including the 40 the margin form
 does not count. The replay table is therefore an estimate that held exactly at one setting. The live arm below is the
-measurement, and its comparison with the replay is the test of the condition at the proposed setting. Recording each
-recall's duplicate groups over all scored candidates would remove the condition; this amendment does not add that.
+measurement, and its comparison with the replay is the test of the conditions at the proposed setting. Recording, for each recall, the duplicate groups over all
+scored candidates and the candidate each abbreviated `supersedes` value resolved to would remove both conditions; this
+amendment does not add that.
 
 With a positive `min_score` or `score_floor` the rule does not apply: a factor can move a row below first admission,
 and a row it suppressed through its `supersedes` property can then return.
 
 ### Change: an optional `own_namespace` and `outside_factor` on the profile
 
-`brain.create_profile` accepts an optional pair: `own_namespace`, a namespace name, and `outside_factor`, a finite
-number in [0.5, 1]. A request giving one without the other is refused. Both take the same storage, persistence,
+`brain.create_profile` accepts an optional pair: `own_namespace`, a namespace name validated by the same parser as every
+other namespace argument (`Namespace::parse`, so an empty or malformed name is refused at creation rather than stored to
+match nothing), and `outside_factor`, a finite number in [0.5, 1]. A request giving one without the other is refused. Both take the same storage, persistence,
 `brain.profile` reporting and immutability as `local_factor` (Amendment 4 Changes 2 and 3), and the factor is rounded
 to a 32-bit float when applied. A record without them loads as factor 1, an exact no-op, so every existing profile
 ranks as it does today.
@@ -1163,15 +1169,17 @@ measurement alone.
 
 The implementing change carries tests for: a profile without the pair returning results identical to no factor;
 `brain.create_profile` refusing an `outside_factor` that is not finite or lies outside [0.5, 1], and refusing either
-field without the other; `brain.profile`, `brain.reset` and a snapshot reload keeping both fields; rows in
+field without the other, and refusing an empty or malformed `own_namespace`; `brain.profile`, `brain.reset` and a snapshot reload keeping both fields; rows in
 `own_namespace` unscaled and every other namespace scaled; a `local` row scaled by the product of both factors; a
 profile whose `own_namespace` is `local` scaling the other namespaces' rows only by `outside_factor`; the same profile
-ranking identically for two callers with different request namespaces, one recall naming an explicit namespace and
-one with a multi-namespace visible set; a positive `score_floor` overriding `min_score` on the adjusted score; an active
+ranking identically for two callers with different request namespaces over the same candidate set; the factor applied
+the same way whether the profile is named by `profile_id` or resolved through a binding; a positive `score_floor` overriding `min_score` on the adjusted score; an active
 weighted reranker, the factor applying after it; two scores that tie after 32-bit rounding ordered by id; a row lowered
-below a positive `min_score` releasing the candidate its `supersedes` property named; a duplicate pair whose order the
+below a positive `min_score` releasing the candidate its `supersedes` property named; an abbreviated `supersedes` value
+shared by two candidates whose order the factor reverses; a duplicate pair whose order the
 factor reverses moving the penalty, the zero floor on the penalty included; an entity term above 1 with both factors
 at 1; a snapshot written before this amendment loading with factor 1; the
 returned `score` unchanged by the factor; `min_score` applied to the adjusted score; and each returned hit's
 `rank_score` equal to the five-term expression from its breakdown, with and without a duplicate pair present. The gate
-harness records `outside_factor` among the per-hit terms and refuses a response missing it.
+harness records `outside_factor` among the per-hit terms and refuses a response missing it, and its replay reports as
+uncertified any recall that returned fewer hits than requested or was cut by the character budget.
