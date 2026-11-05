@@ -22,6 +22,37 @@ const ROOT: &str = "KHIVE_TEST_6339_ROOT";
 const NONCE: &str = "KHIVE_TEST_6339_NONCE";
 const MODE: &str = "KHIVE_TEST_6339_MODE";
 
+enum ExitReceive {
+    Frame,
+    Poll,
+    PeerClosed,
+}
+
+// A false result is only a poll timeout, not EOF. UnixDatagram zero-length
+// frames still fail receive's nonce validation; only a distinct error can close.
+fn classify_exit_receive(result: io::Result<bool>, complete: bool) -> io::Result<ExitReceive> {
+    match result {
+        Ok(true) => Ok(ExitReceive::Frame),
+        Ok(false) => Ok(ExitReceive::Poll),
+        Err(error)
+            if complete
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                ) =>
+        {
+            Ok(ExitReceive::PeerClosed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InjectedPeerClose {
+    before_child_ok: bool,
+    kind: io::ErrorKind,
+}
+
 struct ChildRun {
     directory: Option<tempfile::TempDir>,
     child: Child,
@@ -35,6 +66,7 @@ struct ChildRun {
     status: Option<ExitStatus>,
     cleanup_ok: bool,
     cleanup_started: bool,
+    terminal_ipc_closed: bool,
     deadline: Instant,
 }
 
@@ -99,6 +131,7 @@ impl ChildRun {
             status: None,
             cleanup_ok: true,
             cleanup_started: false,
+            terminal_ipc_closed: false,
             deadline,
         }
     }
@@ -156,6 +189,32 @@ impl ChildRun {
         eprintln!("6339 {}: {event}", self.mode);
         self.events.push(event.to_owned());
         Ok(true)
+    }
+
+    fn accept_exit_receive(&mut self, result: io::Result<bool>) -> io::Result<bool> {
+        let complete = self.has("CHILD_OK") && self.has("POST_DROP");
+        match classify_exit_receive(result, complete)? {
+            ExitReceive::Frame => Ok(true),
+            ExitReceive::Poll => Ok(false),
+            ExitReceive::PeerClosed => {
+                self.terminal_ipc_closed = true;
+                Ok(false)
+            }
+        }
+    }
+
+    fn receive_for_exit(&mut self, deadline: Instant) -> io::Result<bool> {
+        if self.terminal_ipc_closed {
+            let remaining = deadline
+                .min(self.deadline)
+                .saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(POLL.min(remaining));
+            }
+            return Ok(false);
+        }
+        let received = self.receive(deadline);
+        self.accept_exit_receive(received)
     }
 
     fn send_release(&mut self, cleanup: bool) -> io::Result<Instant> {
@@ -242,7 +301,7 @@ impl ChildRun {
             }
         }
         while Instant::now() < deadline {
-            if let Err(error) = self.receive(deadline) {
+            if let Err(error) = self.receive_for_exit(deadline) {
                 self.cleanup_failure(&format!("IPC: {error}"));
             }
             match self.poll_status() {
@@ -277,7 +336,7 @@ impl ChildRun {
             if Instant::now() >= reap_deadline {
                 break;
             }
-            if let Err(error) = self.receive(reap_deadline) {
+            if let Err(error) = self.receive_for_exit(reap_deadline) {
                 self.cleanup_failure(&format!("final IPC drain: {error}"));
             }
         }
@@ -290,8 +349,8 @@ impl ChildRun {
     }
 
     fn drain_exited(&mut self, deadline: Instant) {
-        while Instant::now() < deadline {
-            match self.receive(deadline) {
+        while !self.terminal_ipc_closed && Instant::now() < deadline {
+            match self.receive_for_exit(deadline) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -395,6 +454,10 @@ fn require_counts(run: &mut ChildRun) {
 }
 
 fn run_case(mode: &'static str) {
+    run_case_with_peer_close(mode, None);
+}
+
+fn run_case_with_peer_close(mode: &'static str, injected_close: Option<InjectedPeerClose>) {
     let mut run = ChildRun::spawn(mode);
     assert!(
         run.collect_until(SETUP, |run| run.has("REQUEST_RETURNED")
@@ -487,13 +550,44 @@ fn run_case(mode: &'static str) {
         );
     }
 
+    // Fault scheduling changes only when the synthetic I/O result is delivered.
+    // Classification always uses the actually collected receipts.
+    let (injected_close_consumed, premature_close_error) = if let Some(fault) = injected_close {
+        assert!(
+            run.collect_until(SETTLE, |run| {
+                run.has("POST_DROP") && (fault.before_child_ok || run.has("CHILD_OK"))
+            }),
+            "peer_close_injection_stage_guard"
+        );
+        assert_eq!(
+            run.has("CHILD_OK"),
+            !fault.before_child_ok,
+            "peer_close_injection_position"
+        );
+        assert!(
+            !run.terminal_ipc_closed,
+            "peer_close_injection_not_already_closed"
+        );
+        eprintln!(
+            "INJECTED_PEER_CLOSE before_child_ok={} kind={:?}",
+            fault.before_child_ok, fault.kind
+        );
+        let result = run.accept_exit_receive(Err(io::Error::new(
+            fault.kind,
+            "injected terminal peer close",
+        )));
+        (true, result.err())
+    } else {
+        (false, None)
+    };
+
     assert!(
         run.collect_until(SETTLE, |run| run.has("CHILD_OK") && run.has("POST_DROP")),
         "normal child completion guard"
     );
     let end = (Instant::now() + SETTLE).min(run.deadline);
     while !run.poll_status().expect("normal child status") && Instant::now() < end {
-        run.receive(end).expect("normal child IPC");
+        run.receive_for_exit(end).expect("normal child IPC");
     }
     let output = run.output();
     assert!(run.status.is_some(), "normal child exit guard: {output}");
@@ -509,12 +603,38 @@ fn run_case(mode: &'static str) {
     );
     assert!(run.has("RELEASED NORMAL") && run.has("WORKER_EXIT RETURN"));
     run.close_directory();
+    if injected_close.is_some() {
+        assert!(injected_close_consumed, "injected_peer_close_consumed");
+        // The rejection is retained even if cleanup later collected CHILD_OK.
+        assert!(
+            premature_close_error.is_none(),
+            "premature_terminal_ipc_close: {premature_close_error:?}"
+        );
+        assert!(run.terminal_ipc_closed, "qualified_peer_close_recorded");
+    }
 }
 
 #[test]
 fn actual_cold_miss_owned_runtime_release_witness() {
     run_case("open");
     run_case("held");
+}
+
+#[test]
+fn terminal_peer_close_after_child_ok_is_accepted() {
+    // Real cold/warm and held/release positives precede fault sensitivity.
+    run_case("open");
+    run_case("held");
+    let before_child_ok = false;
+    for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::UnexpectedEof] {
+        run_case_with_peer_close(
+            "open",
+            Some(InjectedPeerClose {
+                before_child_ok,
+                kind,
+            }),
+        );
+    }
 }
 
 #[test]
