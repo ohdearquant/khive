@@ -756,7 +756,10 @@ async fn canonical_memory_namespace_mismatch_refuses_before_any_write() {
     let f = fixture();
     let rt = &f.runtime;
     let source_token = rt.authorize(Namespace::local()).unwrap();
-    let token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    // Keep the source namespace readable for this diagnostic assertion.
+    let token = rt
+        .authorize_with_visibility(Namespace::parse("other").unwrap(), vec![Namespace::local()])
+        .unwrap();
     assert_eq!(token.namespace().as_str(), "other");
     let source = Note::new("local", "memory", "source");
     let target = Note::new("local", "memory", "target");
@@ -831,7 +834,10 @@ async fn canonical_staged_memory_source_namespace_mismatch_refuses_before_any_wr
     let f = fixture();
     let rt = &f.runtime;
     let source_token = rt.authorize(Namespace::local()).unwrap();
-    let token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    // Keep the source namespace readable for this diagnostic assertion.
+    let token = rt
+        .authorize_with_visibility(Namespace::parse("other").unwrap(), vec![Namespace::local()])
+        .unwrap();
     assert_eq!(token.namespace().as_str(), "other");
     let target = Note::new("local", "memory", "target");
     let (source_id, target_id, edge_id, side_id) =
@@ -982,7 +988,10 @@ async fn canonical_memory_to_nonmemory_keeps_op_namespace() {
 async fn canonical_memory_namespace_change_before_writer_rolls_back() {
     let f = fixture();
     let rt = &f.runtime;
-    let token = rt.authorize(Namespace::local()).unwrap();
+    // The drifted source remains readable, so its namespace may be named.
+    let token = rt
+        .authorize_with_visibility(Namespace::local(), vec![Namespace::parse("other").unwrap()])
+        .unwrap();
     let moved_token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
     let source = Note::new("local", "memory", "source");
     let target = Note::new("local", "memory", "target");
@@ -1092,8 +1101,13 @@ async fn canonical_memory_namespace_change_before_writer_rolls_back() {
     assert_eq!(stored.namespace.as_str(), "other");
 }
 
-#[test]
-fn memory_namespace_refusals_name_operation_and_supported_remedy() {
+#[tokio::test]
+async fn memory_namespace_refusals_name_operation_and_supported_remedy() {
+    let f = fixture();
+    let token = f
+        .runtime
+        .authorize_with_visibility(Namespace::local(), vec![Namespace::parse("other").unwrap()])
+        .unwrap();
     let source = Note::new("other", "memory", "source");
     let target = Note::new("target", "memory", "target");
     let nonmemory = Note::new("target", "observation", "nonmemory target");
@@ -1117,30 +1131,30 @@ fn memory_namespace_refusals_name_operation_and_supported_remedy() {
         ),
     ] {
         assert!(KhiveRuntime::ensure_memory_note_edge_namespace(
+            &token,
             operation,
             "other",
-            source.id,
-            target.id,
+            (source.id, target.id),
             khive_types::EdgeRelation::Annotates,
             &source,
             &target,
         )
         .is_ok());
         assert!(KhiveRuntime::ensure_memory_note_edge_namespace(
+            &token,
             operation,
             "local",
-            source.id,
-            nonmemory.id,
+            (source.id, nonmemory.id),
             khive_types::EdgeRelation::Annotates,
             &source,
             &nonmemory,
         )
         .is_ok());
         let error = KhiveRuntime::ensure_memory_note_edge_namespace(
+            &token,
             operation,
             "local",
-            source.id,
-            target.id,
+            (source.id, target.id),
             khive_types::EdgeRelation::Annotates,
             &source,
             &target,
@@ -1154,4 +1168,306 @@ fn memory_namespace_refusals_name_operation_and_supported_remedy() {
             "memory_namespace_refusal_identifies_operation_and_action"
         );
     }
+}
+
+#[tokio::test]
+async fn link_refusal_hides_unreadable_memory_source_namespace() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let source_namespace = "guard-private-source";
+    let source_token = rt
+        .authorize(Namespace::parse(source_namespace).unwrap())
+        .unwrap();
+    let readable = rt
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse(source_namespace).unwrap()],
+        )
+        .unwrap();
+    let unreadable = rt
+        .authorize_with_visibility(Namespace::local(), Vec::new())
+        .unwrap();
+    assert!(readable
+        .visible_namespaces()
+        .iter()
+        .any(|ns| ns.as_str() == source_namespace));
+    assert!(!unreadable
+        .visible_namespaces()
+        .iter()
+        .any(|ns| ns.as_str() == source_namespace));
+    let source = Note::new(source_namespace, "memory", "source");
+    let target = Note::new(source_namespace, "memory", "target");
+    let (source_id, target_id) = (source.id, target.id);
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(source)
+        .await
+        .unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(target)
+        .await
+        .unwrap();
+    for id in [source_id, target_id] {
+        let Some(Resolved::Note(stored)) = rt
+            .resolve_by_id_including_deleted(&source_token, id)
+            .await
+            .unwrap()
+        else {
+            panic!("setup requires a stored memory note");
+        };
+        assert_eq!(stored.kind, "memory");
+        assert_eq!(stored.namespace.as_str(), source_namespace);
+        assert!(stored.deleted_at.is_none());
+    }
+    let edge = rt
+        .link(
+            &source_token,
+            source_id,
+            target_id,
+            khive_types::EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .expect("matching source namespace must admit the link");
+    assert_eq!(edge.namespace.as_str(), source_namespace);
+    let RuntimeError::InvalidInput(message) = rt
+        .link(
+            &readable,
+            source_id,
+            target_id,
+            khive_types::EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap_err()
+    else {
+        panic!("readable mismatch must preserve InvalidInput");
+    };
+    assert_eq!(message, format!("link: memory edge source namespace {source_namespace} does not match write namespace local; retry with namespace={source_namespace}"));
+    let RuntimeError::InvalidInput(message) = rt
+        .link(
+            &unreadable,
+            source_id,
+            target_id,
+            khive_types::EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap_err()
+    else {
+        panic!("unreadable mismatch must preserve InvalidInput");
+    };
+    assert!(
+        !message.contains(source_namespace),
+        "link_unreadable_source_namespace_not_disclosed"
+    );
+    assert!(!message.contains(&source_id.to_string()));
+    assert!(!message.contains(&target_id.to_string()));
+    assert_eq!(message, "link: memory edge source row is in a namespace the caller cannot read; the edge cannot be written under request namespace local");
+    let stored = rt
+        .get_edge(&source_token, Uuid::from(edge.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.namespace.as_str(), source_namespace);
+    assert_eq!(stored.source_id, source_id);
+    assert_eq!(stored.target_id, target_id);
+}
+
+#[tokio::test]
+async fn canonical_prepare_refusal_hides_unreadable_memory_source_namespace() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let source_namespace = "guard-private-source";
+    let source_token = rt
+        .authorize(Namespace::parse(source_namespace).unwrap())
+        .unwrap();
+    let readable = rt
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse(source_namespace).unwrap()],
+        )
+        .unwrap();
+    let unreadable = rt
+        .authorize_with_visibility(Namespace::local(), Vec::new())
+        .unwrap();
+    assert!(readable
+        .visible_namespaces()
+        .iter()
+        .any(|ns| ns.as_str() == source_namespace));
+    assert!(!unreadable
+        .visible_namespaces()
+        .iter()
+        .any(|ns| ns.as_str() == source_namespace));
+    let source = Note::new(source_namespace, "memory", "source");
+    let target = Note::new(source_namespace, "memory", "target");
+    let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(source)
+        .await
+        .unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(target)
+        .await
+        .unwrap();
+    for id in [source_id, target_id] {
+        let Some(Resolved::Note(stored)) = rt
+            .resolve_by_id_including_deleted(&source_token, id)
+            .await
+            .unwrap()
+        else {
+            panic!("setup requires a stored memory note");
+        };
+        assert_eq!(stored.kind, "memory");
+        assert_eq!(stored.namespace.as_str(), source_namespace);
+        assert!(stored.deleted_at.is_none());
+    }
+    let edge = rt
+        .link(
+            &source_token,
+            source_id,
+            target_id,
+            khive_types::EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .expect("matching source namespace must admit the fixture relation");
+    assert_eq!(edge.namespace.as_str(), source_namespace);
+    let cs = changeset(vec![Op::Link(khive_changeset::LinkOp {
+        id: id128(edge_id),
+        namespace: Namespace::local(),
+        source: id128(source_id),
+        target: id128(target_id),
+        relation: khive_types::EdgeRelation::Annotates,
+        weight: 1.0,
+        properties: Default::default(),
+    })]);
+    let visible_error = match prepare_canonical_changeset(rt, &registry(), &readable, &cs).await {
+        Err(error) => error,
+        Ok(_) => panic!("readable mismatch must refuse during prepare"),
+    };
+    let RuntimeError::CanonicalAdmission { op_index, source } = visible_error else {
+        panic!("readable mismatch must preserve CanonicalAdmission");
+    };
+    assert_eq!(op_index, 0);
+    let RuntimeError::InvalidInput(message) = *source else {
+        panic!("readable mismatch must preserve InvalidInput");
+    };
+    assert_eq!(message, format!("apply_changeset: memory edge source namespace {source_namespace} does not match link operation namespace local; set this link operation's namespace to {source_namespace} and prepare the change-set again"));
+    let hidden_error = match prepare_canonical_changeset(rt, &registry(), &unreadable, &cs).await {
+        Err(error) => error,
+        Ok(_) => panic!("unreadable mismatch must refuse during prepare"),
+    };
+    let RuntimeError::CanonicalAdmission { op_index, source } = hidden_error else {
+        panic!("unreadable mismatch must preserve CanonicalAdmission");
+    };
+    assert_eq!(op_index, 0);
+    let RuntimeError::InvalidInput(message) = *source else {
+        panic!("unreadable mismatch must preserve InvalidInput");
+    };
+    assert!(
+        !message.contains(source_namespace),
+        "canonical_prepare_unreadable_source_namespace_not_disclosed"
+    );
+    assert!(!message.contains(&source_id.to_string()));
+    assert!(!message.contains(&target_id.to_string()));
+    assert_eq!(message, "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace local");
+    assert!(rt.get_edge(&unreadable, edge_id).await.unwrap().is_none());
+
+    // Prepare with a local source, then move it outside the original caller's
+    // readable set. Writer-local diagnostics must use that original scope too.
+    let writer_source = Note::new("local", "memory", "writer source");
+    let writer_target = Note::new("local", "memory", "writer target");
+    let (writer_source_id, writer_target_id, writer_edge_id) =
+        (writer_source.id, writer_target.id, Uuid::new_v4());
+    rt.notes(&unreadable)
+        .unwrap()
+        .upsert_note(writer_source)
+        .await
+        .unwrap();
+    rt.notes(&unreadable)
+        .unwrap()
+        .upsert_note(writer_target)
+        .await
+        .unwrap();
+    let writer_cs = changeset(vec![Op::Link(khive_changeset::LinkOp {
+        id: id128(writer_edge_id),
+        namespace: Namespace::local(),
+        source: id128(writer_source_id),
+        target: id128(writer_target_id),
+        relation: khive_types::EdgeRelation::Annotates,
+        weight: 1.0,
+        properties: Default::default(),
+    })]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &unreadable, &writer_cs)
+        .await
+        .expect("matching namespace must prepare before writer drift");
+    assert_eq!(plans.len(), 1);
+    let statement = SqlStatement::new(
+        "UPDATE notes SET namespace = ?1 WHERE id = ?2",
+        vec![
+            SqlValue::Text(source_namespace.into()),
+            SqlValue::Text(writer_source_id.to_string()),
+        ],
+    );
+    let drift: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let affected = writer.execute(statement).await?;
+            Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+        })
+    });
+    let changed = khive_storage::SqlAccess::atomic_unit(rt.sql().as_ref(), drift)
+        .await
+        .expect("private fixture namespace drift");
+    let affected = match changed.downcast::<u64>() {
+        Ok(affected) => *affected,
+        Err(_) => panic!("namespace drift result type"),
+    };
+    assert_eq!(
+        affected, 1,
+        "fixture must move exactly one writer source row"
+    );
+    let Some(Resolved::Note(stored)) = rt
+        .resolve_by_id_including_deleted(&source_token, writer_source_id)
+        .await
+        .unwrap()
+    else {
+        panic!("setup requires the drifted stored memory source");
+    };
+    assert_eq!(stored.kind, "memory");
+    assert_eq!(stored.namespace.as_str(), source_namespace);
+    assert!(stored.deleted_at.is_none());
+    let outcome = crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap();
+    let crate::AtomicRunOutcome::RolledBack { failure, .. } = outcome else {
+        panic!("canonical writer namespace mismatch must roll back");
+    };
+    let AtomicOpFailure::SqlError {
+        statement_label,
+        message,
+    } = failure
+    else {
+        panic!("writer mismatch must preserve the canonical SQL failure");
+    };
+    assert_eq!(statement_label.as_deref(), Some("canonical-materialize"));
+    assert!(
+        !message.contains(source_namespace),
+        "canonical_writer_unreadable_source_namespace_not_disclosed"
+    );
+    assert!(!message.contains(&writer_source_id.to_string()));
+    assert!(!message.contains(&writer_target_id.to_string()));
+    assert_eq!(message, RuntimeError::InvalidInput("apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace local".into()).to_string());
+    assert!(rt
+        .get_edge(&unreadable, writer_edge_id)
+        .await
+        .unwrap()
+        .is_none());
 }

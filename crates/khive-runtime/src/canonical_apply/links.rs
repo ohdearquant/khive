@@ -104,6 +104,7 @@ pub(super) fn draft(
 pub(super) async fn materialize(
     writer: &mut dyn SqlWriter,
     token: &NamespaceToken,
+    read_scope: &NamespaceToken,
     edge: &Edge,
     rules: &[EdgeEndpointRule],
 ) -> Result<AtomicOpPlan, AtomicOpFailure> {
@@ -117,10 +118,10 @@ pub(super) async fn materialize(
         endpoints(&source, &target, edge.relation, rules).map_err(|e| failure(e.to_string()))?;
     if let (Record::Note(source_note), Record::Note(target_note)) = (&source, &target) {
         crate::KhiveRuntime::ensure_memory_note_edge_namespace(
+            read_scope,
             "apply_changeset",
             edge.namespace.as_str(),
-            edge.source_id,
-            edge.target_id,
+            (edge.source_id, edge.target_id),
             edge.relation,
             source_note,
             target_note,

@@ -264,10 +264,10 @@ impl KhiveRuntime {
             (Some(crate::Resolved::Note(source)), Some(crate::Resolved::Note(target))) => {
                 let both_memory = source.kind == "memory" && target.kind == "memory";
                 Self::ensure_memory_note_edge_namespace(
+                    token,
                     "restore",
                     &edge.namespace,
-                    edge.source_id,
-                    edge.target_id,
+                    (edge.source_id, edge.target_id),
                     edge.relation,
                     &source,
                     &target,
@@ -892,7 +892,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
     #[tokio::test]
     async fn restore_edge_rejects_legacy_tombstone_with_mismatched_memory_source_namespace() {
         let (runtime, _dir) = fixture();
-        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        // Keep the source namespace readable for this diagnostic assertion.
+        let local_token = runtime
+            .authorize_with_visibility(Namespace::local(), vec![Namespace::parse("other").unwrap()])
+            .unwrap();
         let other_token = runtime
             .authorize(Namespace::parse("other").unwrap())
             .unwrap();
@@ -1465,5 +1468,101 @@ pub(super) mod memory_edge_namespace_restore_tests {
             .expect("restored edge should remain readable");
         assert_eq!(after_restore.namespace, "local");
         assert!(after_restore.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_refusal_hides_unreadable_memory_source_namespace() {
+        let (runtime, _dir) = fixture();
+        let source_namespace = "guard-private-source";
+        let source_token = runtime
+            .authorize(Namespace::parse(source_namespace).unwrap())
+            .unwrap();
+        let readable = runtime
+            .authorize_with_visibility(
+                Namespace::local(),
+                vec![Namespace::parse(source_namespace).unwrap()],
+            )
+            .unwrap();
+        let unreadable = runtime
+            .authorize_with_visibility(Namespace::local(), Vec::new())
+            .unwrap();
+        assert!(readable
+            .visible_namespaces()
+            .iter()
+            .any(|ns| ns.as_str() == source_namespace));
+        assert!(!unreadable
+            .visible_namespaces()
+            .iter()
+            .any(|ns| ns.as_str() == source_namespace));
+        let source = Note::new(source_namespace, "memory", "source");
+        let target = Note::new(source_namespace, "memory", "target");
+        let (source_id, target_id) = (source.id, target.id);
+        runtime
+            .notes(&source_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&source_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
+        assert_memory_note_in_namespace(&runtime, &source_token, source_id, source_namespace).await;
+        assert_memory_note_in_namespace(&runtime, &source_token, target_id, source_namespace).await;
+        let edge = runtime
+            .link(
+                &source_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .expect("matching source namespace must admit the fixture link");
+        assert_eq!(edge.namespace.as_str(), source_namespace);
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, source_namespace, "local").await,
+            1
+        );
+        let before = runtime
+            .get_edge_including_deleted(&unreadable, edge_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.namespace.as_str(), "local");
+        assert!(before.deleted_at.is_some());
+        let RuntimeError::InvalidInput(message) =
+            runtime.restore_edge(&readable, edge_id).await.unwrap_err()
+        else {
+            panic!("readable mismatch must preserve InvalidInput");
+        };
+        assert_eq!(message, format!("restore: memory edge source namespace {source_namespace} does not match stored edge namespace local; leave this tombstone deleted and create a replacement link in namespace={source_namespace}"));
+        let RuntimeError::InvalidInput(message) = runtime
+            .restore_edge(&unreadable, edge_id)
+            .await
+            .unwrap_err()
+        else {
+            panic!("unreadable mismatch must preserve InvalidInput");
+        };
+        assert!(
+            !message.contains(source_namespace),
+            "restore_unreadable_source_namespace_not_disclosed"
+        );
+        assert!(!message.contains(&source_id.to_string()));
+        assert!(!message.contains(&target_id.to_string()));
+        assert_eq!(message, "restore: memory edge source row is in a namespace the caller cannot read; the edge cannot be restored under stored edge namespace local");
+        let after = runtime
+            .get_edge_including_deleted(&unreadable, edge_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.namespace.as_str(), "local");
+        assert_eq!(after.source_id, source_id);
+        assert_eq!(after.target_id, target_id);
+        assert!(after.deleted_at.is_some());
     }
 }

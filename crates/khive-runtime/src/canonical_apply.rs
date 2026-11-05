@@ -1,6 +1,7 @@
 //! Ordered canonical changesets use ordinary atomic plans after writer-local checks.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use khive_changeset::{
     CanonicalRecordRef, ChangeSet, CreateTarget, DeleteOp, Op, UpdateOp, UpdatePatch,
@@ -33,12 +34,25 @@ mod projection;
 mod rows;
 
 /// An opaque, admitted operation. Only this module can construct its captured state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CanonicalMutationPlan {
     token: NamespaceToken,
+    request_scope: Arc<NamespaceToken>,
     target_id: Uuid,
     now: i64,
     mutation: Mutation,
+}
+
+impl std::fmt::Debug for CanonicalMutationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve the admitted operation's existing fields without formatting caller scope.
+        f.debug_struct("CanonicalMutationPlan")
+            .field("token", &self.token)
+            .field("target_id", &self.target_id)
+            .field("now", &self.now)
+            .field("mutation", &self.mutation)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +173,8 @@ pub async fn prepare_canonical_changeset(
     let mut shadow: HashMap<Uuid, Option<Record>> = HashMap::new();
     let mut plans = Vec::with_capacity(changeset.ops.len());
     let mut hook_links: HashMap<String, (usize, Vec<crate::LinkSpec>)> = HashMap::new();
+    // Operation tokens narrow visibility; retain the caller scope only for diagnostic disclosure.
+    let request_scope = Arc::new(token.clone());
     for (op_index, op) in changeset.ops.iter().enumerate() {
         let prepared: RuntimeResult<AtomicOpPlan> = async {
             let (verb, id, args) = gate_args(op)?;
@@ -222,10 +238,10 @@ pub async fn prepare_canonical_changeset(
                         (&source, &target)
                     {
                         KhiveRuntime::ensure_memory_note_edge_namespace(
+                            request_scope.as_ref(),
                             "apply_changeset",
                             op_token.namespace().as_str(),
-                            uuid(link.source),
-                            uuid(link.target),
+                            (uuid(link.source), uuid(link.target)),
                             link.relation,
                             source_note,
                             target_note,
@@ -382,6 +398,7 @@ pub async fn prepare_canonical_changeset(
             };
             Ok(AtomicOpPlan::Canonical(Box::new(CanonicalMutationPlan {
                 token: op_token,
+                request_scope: Arc::clone(&request_scope),
                 target_id: id,
                 now,
                 mutation,
@@ -569,7 +586,14 @@ pub(crate) async fn materialize(
         }
         Mutation::Link { edge, rules } => {
             identity_absent(writer, id).await?;
-            links::materialize(writer, &plan.token, edge, rules).await
+            links::materialize(
+                writer,
+                &plan.token,
+                plan.request_scope.as_ref(),
+                edge,
+                rules,
+            )
+            .await
         }
         mutation => {
             let live = read_writer(writer, id)
