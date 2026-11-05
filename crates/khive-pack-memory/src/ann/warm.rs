@@ -372,6 +372,7 @@ pub(super) async fn refresh_rotated_segment(
 ///
 /// The actual attempt emits one best-effort `ann_warm` phase span. See
 /// `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
+#[cfg(test)]
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -544,6 +545,7 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
 }
 
 /// Restore or rebuild after the caller has established its generation floor.
+#[cfg(test)]
 pub(super) async fn ensure_ann_for_model_inner(
     rt: &KhiveRuntime,
     token: &NamespaceToken,

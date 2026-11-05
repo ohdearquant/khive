@@ -1964,35 +1964,32 @@ async fn collect_model_ann_hits_inner(
             None
         }
         Ok(None) => {
+            use khive_runtime::resource_admission::JobOutcome;
+
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let rt_detached = runtime.clone();
-            let token_detached = token.clone();
-            let ann_detached = ann.clone();
+            let readiness = tokio::time::timeout(
+                std::time::Duration::from_millis(ann_ready_timeout_ms),
+                done_rx,
+            );
+            let (tracking, attempt) = ann::submit_recall_miss(
+                runtime.clone(),
+                token.clone(),
+                ann.clone(),
+                model_name.clone(),
+            );
+            #[cfg(test)]
             let model_detached = model_name.clone();
-            khive_runtime::track_named_background_task("memory_ann_build", async move {
+            drop(tokio::spawn(async move {
+                let _tracking = tracking;
                 #[cfg(test)]
                 retrieval_failpoints::before_ann_build(&model_detached).await;
-                let result = ann::ensure_ann_for_model(
-                    &rt_detached,
-                    &token_detached,
-                    &ann_detached,
-                    &model_detached,
-                )
-                .await;
+                let result = attempt.await;
                 #[cfg(test)]
                 retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
-            });
-            match khive_storage::await_request_read_phase(
-                "memory.recall",
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(ann_ready_timeout_ms),
-                    done_rx,
-                ),
-            )
-            .await?
-            {
-                Ok(Ok(Ok(status))) => {
+            }));
+            match khive_storage::await_request_read_phase("memory.recall", readiness).await? {
+                Ok(Ok(JobOutcome::Completed(Ok(status)))) => {
                     tracing::debug!(
                         ?status,
                         model = %model_name,
@@ -2004,7 +2001,46 @@ async fn collect_model_ann_hits_inner(
                     khive_storage::ensure_request_read_active("memory.recall")?;
                     searched
                 }
-                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Ok(JobOutcome::Completed(Err(e)))) => return Err(e),
+                Ok(Ok(JobOutcome::Cancelled)) => {
+                    tracing::warn!(
+                        outcome = "Cancelled",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Cancelled; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::Refused(_))) => {
+                    tracing::warn!(
+                        outcome = "Refused",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Refused; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::FinalizationTimedOut)) => {
+                    tracing::warn!(
+                        outcome = "FinalizationTimedOut",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt FinalizationTimedOut; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
                 Ok(Err(_sender_dropped)) => {
                     // A detached-task panic degrades this model instead of failing recall.
                     tracing::warn!(

@@ -1045,7 +1045,7 @@ hiding their targets.
 
 ### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
 
-**Status**: Proposed 2026-11-04. Changes where Decision 7's `supersedes` edges, and every other edge between two
+**Status**: Accepted 2026-11-05 (Proposed 2026-11-04). Changes where Decision 7's `supersedes` edges, and every other edge between two
 memory rows, are written, and what an edge read reports when it leaves edges out.
 
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
