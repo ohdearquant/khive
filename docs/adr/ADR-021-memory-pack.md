@@ -1062,11 +1062,14 @@ goes. A second reader of one measured row sees five of its six outgoing `superse
    namespace; a write whose caller may not write that namespace is refused, never redirected to another namespace.
 2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
    can see. For the row whose edges the read lists (recall: each returned row; `neighbors`: the anchor row), and for each
-   relation, the response also carries the number of edges between memory rows that arrive at that row from rows
-   outside those namespaces. The field is present on every filtered read, with `0` when nothing was left out, so a
-   missing field means the producer is broken, never that nothing was hidden.
-   Under rule 1 a reader already sees every outgoing edge of a row it can see, so the edges this count covers are the
-   incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
+   relation, the response also carries the number of edges between memory rows that arrive at that row and that the
+   read leaves out because they are stored in a namespace outside that set. Each such edge is one the reader would
+   have been given if it could see that namespace, so an edge with a soft-deleted endpoint, which no read returns,
+   is not counted. The field is present on every filtered read, with `0` when nothing was left out, so a missing field
+   means the producer is broken, never that nothing was hidden. Under rule 1 an edge is stored in its source row's
+   namespace, so after the move in rule 3 the counted edges are exactly those from rows outside the reader's
+   namespaces, and a reader already sees every outgoing edge of a row it can see; the edges this count covers are
+   the incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
    withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
    The field is `hidden_incoming_edges`, shaped `{"total": n, "by_relation": {"<relation>": n}}`; `total` is always
    present. Recall carries it on every returned row, for `supersedes`. A `neighbors` call anchored on a memory row always
