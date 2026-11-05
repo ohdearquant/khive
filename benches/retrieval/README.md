@@ -296,7 +296,9 @@ hit@10 (and their mean over the two rounds), the lost and gained questions split
 the 50 hits or at ranks 11 to 50, the questions whose recall widened, recalls with fewer than 50 hits, degraded recalls
 per round, the questions whose top ten differs between the rounds, the top-10 hits whose `pre_entity_score` is 1.0 (not
 available when a weighted reranker is configured, with that setting recorded), and whether the candidate's entity term is
-1 for every hit.
+1 for every hit. The JSON record also keeps, per recall, each hit in served order with its namespace, `rank_score` and the
+breakdown terms `pre_entity_score`, `entity_term` and `local_factor`, so another ranking rule over those terms can be
+replayed from the record without a second run.
 
 ## Determinism
 
