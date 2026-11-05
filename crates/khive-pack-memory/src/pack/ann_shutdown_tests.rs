@@ -686,53 +686,50 @@ fn run_case_with_peer_close(mode: &'static str, injected_close: Option<InjectedP
 
     // Inject only after the real protocol receipts establish the selected side
     // of the completion boundary. The synthetic error never replaces a child frame.
-    let (
-        injected_close_consumed,
-        premature_close_error,
-        terminal_closed_at_injection,
-    ) = if let Some(fault) = injected_close {
-        assert!(
-            run.collect_until(SETTLE, |run| {
-                let at_boundary = if fault.inject_before_child_ok {
-                    run.has(protocol::BODY_CONFIRMED) && !run.has(protocol::CHILD_OK)
-                } else {
-                    run.has(protocol::BODY_CONFIRMED) && run.has(protocol::CHILD_OK)
-                };
-                run.has(protocol::POST_DROP) && at_boundary
-            }),
-            "peer_close_injection_stage_guard"
-        );
-        assert_eq!(
-            run.has(protocol::CHILD_OK),
-            !fault.inject_before_child_ok,
-            "peer_close_injection_position"
-        );
-        assert!(
-            !run.terminal_ipc_closed,
-            "peer_close_injection_not_already_closed"
-        );
-        let control = if fault.expect_rejection {
-            "BEFORE_CHILD_OK_RESET"
-        } else if fault.kind == io::ErrorKind::ConnectionReset {
-            "C2_POST_CHILD_OK_CONNECTION_RESET"
-        } else if fault.kind == io::ErrorKind::UnexpectedEof {
-            "C2_POST_CHILD_OK_UNEXPECTED_EOF"
+    let (injected_close_consumed, premature_close_error, terminal_closed_at_injection) =
+        if let Some(fault) = injected_close {
+            assert!(
+                run.collect_until(SETTLE, |run| {
+                    let at_boundary = if fault.inject_before_child_ok {
+                        run.has(protocol::BODY_CONFIRMED) && !run.has(protocol::CHILD_OK)
+                    } else {
+                        run.has(protocol::BODY_CONFIRMED) && run.has(protocol::CHILD_OK)
+                    };
+                    run.has(protocol::POST_DROP) && at_boundary
+                }),
+                "peer_close_injection_stage_guard"
+            );
+            assert_eq!(
+                run.has(protocol::CHILD_OK),
+                !fault.inject_before_child_ok,
+                "peer_close_injection_position"
+            );
+            assert!(
+                !run.terminal_ipc_closed,
+                "peer_close_injection_not_already_closed"
+            );
+            let control = if fault.expect_rejection {
+                "BEFORE_CHILD_OK_RESET"
+            } else if fault.kind == io::ErrorKind::ConnectionReset {
+                "C2_POST_CHILD_OK_CONNECTION_RESET"
+            } else if fault.kind == io::ErrorKind::UnexpectedEof {
+                "C2_POST_CHILD_OK_UNEXPECTED_EOF"
+            } else {
+                "C2_POST_CHILD_OK_OTHER_ERROR"
+            };
+            eprintln!(
+                "{control}: injected_before_child_ok={} expected_rejection={} kind={:?}",
+                fault.inject_before_child_ok, fault.expect_rejection, fault.kind
+            );
+            let result = run.accept_exit_receive(Err(io::Error::new(
+                fault.kind,
+                "injected terminal peer close",
+            )));
+            let terminal_closed_at_injection = run.terminal_ipc_closed;
+            (true, result.err(), terminal_closed_at_injection)
         } else {
-            "C2_POST_CHILD_OK_OTHER_ERROR"
+            (false, None, false)
         };
-        eprintln!(
-            "{control}: injected_before_child_ok={} expected_rejection={} kind={:?}",
-            fault.inject_before_child_ok, fault.expect_rejection, fault.kind
-        );
-        let result = run.accept_exit_receive(Err(io::Error::new(
-            fault.kind,
-            "injected terminal peer close",
-        )));
-        let terminal_closed_at_injection = run.terminal_ipc_closed;
-        (true, result.err(), terminal_closed_at_injection)
-    } else {
-        (false, None, false)
-    };
 
     let child_completed = run.collect_until(SETTLE, |run| {
         run.has(protocol::CHILD_OK)
