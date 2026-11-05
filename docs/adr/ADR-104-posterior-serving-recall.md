@@ -1012,12 +1012,13 @@ one round and not the other; the harness voiding a round on a degraded recall in
 verbose multi-model envelope included; and the harness refusing to start when the runtime has a `brain_profile` set
 or the caller has a recall binding.
 
-## Amendment 5 (2026-11-05): A fixed factor on rows outside the caller's namespace
+## Amendment 5 (2026-11-05): A fixed factor on rows outside a profile's own namespace
 
-**Status**: Proposed. Amends Amendment 4 Change 2 (a fixed rank factor carried by a profile) by adding a second factor,
-and Amendment 4's Alternatives row "Per-class factors with a separate value for other namespaces", which this
-amendment revisits with the measurement below. Every other part of Amendment 4 stands, Change 4's gate included; a
-profile carrying the new factor rebinds only by passing that gate.
+**Status**: Proposed. Amends Amendment 4 Change 2 (a fixed rank factor carried by a profile) by adding a second factor
+and replacing its four-term `rank_score` identity with the five-term one below; extends Change 3's storage rules to the
+two new profile fields; and revisits Amendment 4's Alternatives row "Per-class factors with a separate value for other
+namespaces" with the measurement below. Every other part of Amendment 4 stands, Change 4's gate included; a profile
+carrying the new factor rebinds only by passing that gate.
 
 ### Problem, measured
 
@@ -1033,59 +1034,79 @@ copy source, binary and banks as the Amendment 4 measurement; candidate at `loca
 run's metrics exactly, and its record holds 240 recalls and 12,000 hits with every term present. Replaying the
 no-profile arm with 0.7 on `local` rows reproduces the candidate arm's served top ten in 120 of 120 recalls.
 
-Replayed over the no-profile arm, with `local_factor` f on `local` rows and a factor r on every row outside the
-reader's namespace (`local` rows get f × r; rows in the reader's namespace get 1):
+Replayed over the no-profile arm, with `local_factor` f on `local` rows and a factor r on every row outside
+`lambda:khive`, the namespace whose questions form the own bank (`local` rows get f × r; `lambda:khive` rows get 1).
+The gate's recalls run as one actor whose request namespace is `local` in both banks, so the favoured namespace in
+this rule comes from the bank, never from the request:
 
-| f    | r     | Own bank MRR@10 / hit@10 | Shared-pool bank MRR@10 / hit@10 | Certified | Certified, strict form |
-| ---- | ----- | ------------------------ | -------------------------------- | --------- | ---------------------- |
-| 1    | 1     | 0.065 / 0.133            | 0.326 / 0.533                    | 120       | 114                    |
-| 0.7  | 1     | 0.141 / 0.300            | 0.310 / 0.533                    | 120       | 80                     |
-| 1    | 0.8   | 0.107 / 0.200            | 0.326 / 0.533                    | 120       | 98                     |
-| 0.85 | 0.8   | 0.146 / 0.300            | 0.325 / 0.533                    | 120       | 48                     |
-| 1    | 0.667 | 0.150 / 0.300            | 0.325 / 0.533                    | 120       | 38                     |
+| f    | r     | Own bank MRR@10 / hit@10 | Shared-pool bank MRR@10 / hit@10 | Certified | Certified, clear by the penalty |
+| ---- | ----- | ------------------------ | -------------------------------- | --------- | ------------------------------- |
+| 1    | 1     | 0.065 / 0.133            | 0.326 / 0.533                    | 120       | 114                             |
+| 0.7  | 1     | 0.141 / 0.300            | 0.310 / 0.533                    | 120       | 80                              |
+| 1    | 0.8   | 0.107 / 0.200            | 0.326 / 0.533                    | 120       | 98                              |
+| 0.85 | 0.8   | 0.146 / 0.300            | 0.325 / 0.533                    | 120       | 48                              |
+| 1    | 0.667 | 0.150 / 0.300            | 0.325 / 0.533                    | 120       | 38                              |
+| 0.85 | 0.667 | 0.222 / 0.333            | 0.325 / 0.533                    | 112       | 8                               |
+| 0.7  | 0.8   | 0.221 / 0.333            | 0.309 / 0.533                    | 112       | 6                               |
+| 0.7  | 0.667 | 0.229 / 0.333            | 0.297 / 0.533                    | 42        | 2                               |
+| 0.5  | 1     | 0.224 / 0.333            | 0.294 / 0.533                    | 92        | 4                               |
 
 Each metric is the mean over two rounds of 30 questions; the certified columns count recalls out of 120 under the rule
-below and its strict form.
+below and under its penalty-margin form. Scores are recomputed in 32-bit arithmetic in the engine's order.
 
 The first two rows equal the measured no-profile and candidate arms. At r = 0.667 with no `local_factor`, the own bank
-gains as much as `local_factor` 0.7 gives, and the shared-pool bank stays within 0.001 of no profile. Settings that
-scale further gain more on the own bank but leave recalls uncertified under the rule below (f 0.85 with r 0.667: 8 of
-120; f 0.7 with r 0.8: 8; f 0.7 with r 0.667: 78; f 0.5 alone: 28), so the replay does not establish them.
+gains as much as `local_factor` 0.7 gives, and the shared-pool bank stays within 0.001 of no profile. The last four
+rows scale further and gain more on the own bank, but leave recalls uncertified even under the rule, so the replay
+does not establish them.
 
 **Population.** The sample is one reader's 30 own-namespace questions and 30 shared-pool questions, asked twice against
 one frozen copy of one deployment's store. The claim is about that reader on that store and nothing wider. Answers in a
 third namespace have no bank on this store, as under Amendment 4, so the replay makes no claim about third-namespace
 rows, which this factor lowers.
 
-**Certification rule (verbatim; the live arm is compared against it).** A replayed top ten is certified when its tenth
-score is at least the largest multiplier the rule applies to any namespace times the smallest `rank_score` among the
-no-profile arm's 50 returned hits. A hit the no-profile arm did not return had a `rank_score` at most that smallest
-one, and no multiplier exceeds the largest, so no unreturned hit can enter the replayed top ten while its duplicate
-penalty is unchanged. A recall that fails the rule is reported as uncertified and is not counted for or against the
-rule.
+**Certification rule (verbatim; the live arm is compared against it).** A replayed top ten is certified when the
+recall asked with `min_score` 0 and no `score_floor`, the no-profile arm returned all 50 requested hits with no
+character-budget cut, and the replayed tenth score is strictly greater than the largest multiplier the rule applies to
+any namespace times the smallest `rank_score` among those 50 hits, both sides in 32-bit arithmetic. A recall that
+fails the rule is reported as uncertified and is not counted for or against the rule.
 
-The replay holds each hit's duplicate penalty at its no-profile value. The engine re-picks the unpenalized copy of a
-duplicate pair after the factor (Amendment 4 Change 2, step 3), so a rule that reorders the two copies moves the
-penalty, by at most the configured amount (0.1 by default). The rule is exact only when no penalty moves. The strict
-form drops that assumption: it requires the tenth score to clear the bound plus the penalty, and certifies no recall
-with a penalized hit. Two measurements bear on the assumption on this store: 6 of the 6,000 no-profile hits carry a
-penalty, and the replay of `local_factor` 0.7, certified by the rule and not by the strict form on 40 recalls,
-reproduces the candidate arm's served top ten in all 120. The live arm below is the test of the assumption at the
-proposed setting.
+What a certified recall establishes, and the one condition it rests on. With `min_score` 0 and no `score_floor`, first
+admission keeps every scored candidate in both arms, since a factor in (0, 1] never makes a score negative, so
+supersedes suppression drops the same candidates in both. A candidate scored but not returned was cut by the sort and
+`limit`, so its `rank_score` was at most the smallest returned one; no multiplier exceeds the largest, and the strict
+comparison leaves no tie for the id order to break, so it cannot reach the tenth score while its duplicate penalty is
+unchanged. Candidates the retrieval stage never produced are absent from both arms alike. The condition is that no
+duplicate penalty changes copy. The engine picks the unpenalized copy of each duplicate pair after the factors
+(Amendment 4 Change 2, step 3), so a rule that reorders a pair moves the penalty, by at most the configured amount (0.1
+by default), and a returned record cannot show whether it happened: a pair whose second copy was not returned, or was
+suppressed, is invisible to it. The penalty-margin column counts recalls that the rule certifies whose tenth score also
+clears the bound plus the penalty, with no penalized hit among the 50. It rules out an unreturned copy that loses its
+penalty and enters; it does not rule out a returned hit that gains one.
 
-### Change: an optional `outside_factor` on the profile
+Two measurements bear on the condition on this store: 6 of the 6,000 no-profile hits carry a penalty, and the replay of
+`local_factor` 0.7 reproduces the candidate arm's served top ten in all 120 recalls, including the 40 the margin form
+does not count. The replay table is therefore an estimate that held exactly at one setting. The live arm below is the
+measurement, and its comparison with the replay is the test of the condition at the proposed setting. Recording each
+recall's duplicate groups over all scored candidates would remove the condition; this amendment does not add that.
 
-`brain.create_profile` accepts an optional `outside_factor`, a finite number in [0.5, 1], with the same storage,
-rounding, persistence, `brain.profile` reporting and immutability as `local_factor` (Amendment 4 Changes 2 and 3). A
-record without it loads as factor 1, an exact no-op, so every existing profile ranks as it does today.
+With a positive `min_score` or `score_floor` the rule does not apply: a factor can move a row below first admission,
+and a row it suppressed through its `supersedes` property can then return.
 
-When such a profile serves a recall, each candidate whose namespace differs from the request's primary namespace has its
-rank score multiplied by `outside_factor`; a candidate in the request's primary namespace is multiplied by 1. A `local`
-candidate outside the primary namespace is multiplied by both factors. When the primary namespace is `local` itself,
-`outside_factor` scales the other namespaces' rows and `local_factor` applies as Amendment 4 defines. Unlike
-`local_factor`, which depends on the serving profile alone, this factor also depends on the request: the same profile
-lowers different rows for callers with different primary namespaces. That is the intent, since the measured gain comes
-from ranking the reader's own rows above everyone else's.
+### Change: an optional `own_namespace` and `outside_factor` on the profile
+
+`brain.create_profile` accepts an optional pair: `own_namespace`, a namespace name, and `outside_factor`, a finite
+number in [0.5, 1]. A request giving one without the other is refused. Both take the same storage, persistence,
+`brain.profile` reporting and immutability as `local_factor` (Amendment 4 Changes 2 and 3), and the factor is rounded
+to a 32-bit float when applied. A record without them loads as factor 1, an exact no-op, so every existing profile
+ranks as it does today.
+
+When such a profile serves a recall, each candidate whose namespace is not `own_namespace` has its rank score
+multiplied by `outside_factor`, and a candidate in `own_namespace` is multiplied by 1. A `local` candidate is
+multiplied by both `local_factor` and `outside_factor`, unless `own_namespace` is `local`, in which case
+`outside_factor` scales every other namespace and `local_factor` applies to `local` as Amendment 4 defines. As with
+`local_factor`, the factor depends on the serving profile alone, whoever the caller is and whatever the request's
+namespace. The profile serving a reader is chosen by Amendment 4's bindings, so a profile naming the reader's own
+namespace is the one bound to that reader.
 
 Placement is Amendment 4 Change 2's: the factor multiplies where the entity term and `local_factor` apply, before the
 first `min_score` admission and before the duplicate penalty, supersedes suppression, the second admission, the sort,
@@ -1093,22 +1114,31 @@ first `min_score` admission and before the duplicate penalty, supersedes suppres
 `min_score` more outside rows fall below it; their help text says so. The returned `score` is taken before any factor
 and is unchanged.
 
-**Why a factor at most 1, rather than a boost on own rows.** A boost g on the reader's own rows orders candidates the
-same way as the factor 1/g on every other row, except where the duplicate penalty or `min_score` compares a score with
-a fixed amount. The boost can lift `rank_score` above 1, and Amendment 4 Problem 1 measured what a composite at its
-clamp does to ordering. A factor at most 1 keeps every `rank_score` at or below its unscaled value, so it stays in
-[0, 1] with no clamp. On the measured record only 6 of 6,000 hits carry a duplicate penalty, and the table above is the
-same in either form. The floor of 0.5 bounds how far an outside row can fall, for the same reason as `local_factor`'s.
+**Why a factor at most 1, rather than a boost on own rows.** In exact arithmetic and before any threshold, a boost g on
+the profile's own rows orders candidates the same way as the factor 1/g on every other row. The two differ where a
+score is compared with a fixed amount (the duplicate penalty, and `min_score` or `score_floor`, whichever applies), and
+where 32-bit rounding ties two scores and hands their order to the id. `rank_score` is not bounded by 1 today: the
+composite before the entity term is clamped to [0, 1], and the entity term lies in [0.85, 1.15], so `rank_score` lies
+in [0, 1.15]. A boost would raise that ceiling, and Amendment 4 Problem 1 measured what a score at a clamp does to
+ordering. A factor at most 1 never raises a `rank_score` above its unscaled value, so it keeps every score inside
+today's range and adds no clamp. The replay computed in both forms gives the same metrics, and the same counts under the
+rule, in every row above. The floor of 0.5 bounds how far an outside row can fall, for the same reason as `local_factor`'s.
 
 With `include_breakdown=true`, each hit's `breakdown` adds `outside_factor`, the factor applied to the hit (1 when none),
 and a returned hit's `rank_score` equals
 `pre_entity_score × entity_term × local_factor × outside_factor − duplicate_penalty`, in 32-bit arithmetic in that order.
-The factor reorders candidates the request already retrieved and was permitted to read; it adds no candidate, widens
-no visibility, writes no posterior and is not authorization.
+The factor reorders candidates the request already retrieved and was permitted to read: it adds no retrieval
+candidate, widens no visibility, writes no posterior and is not authorization. Like any ranking change it changes
+which retrieved candidates are returned, and under a positive `min_score` that includes a candidate another row's
+`supersedes` property no longer suppresses, because that row fell below admission. Each hit already reports its
+namespace, so the breakdown discloses nothing new about it. Naming a namespace in `own_namespace` grants nothing on it:
+rows the caller cannot read are never candidates, so a profile naming such a namespace scales every candidate it
+serves.
 
 ### Live arm and comparison with the replay
 
-The candidate is a new profile created with `outside_factor` 0.667 and no `local_factor`, measured by Amendment 4
+The candidate is a new profile created with `own_namespace` `lambda:khive`, `outside_factor` 0.667 and no
+`local_factor`, measured by Amendment 4
 Change 4's gate unchanged: same arms, banks, recall shape, two rounds, and its pass fixed before the run. The live run
 uses a fresh copy of the same frozen store, so both arms see the same candidate sets as the replay.
 
@@ -1121,20 +1151,27 @@ measurement alone.
 
 ### Alternatives considered
 
-| Alternative                                                 | Disposition                                                                                                                                                                                                   |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A boost above 1 on the reader's own rows                    | Rejected: it can lift `rank_score` above 1 and needs a clamp, which Amendment 4 Problem 1 showed collapses ordering at the top.                                                                               |
-| Lower `local_factor` further                                | Rejected: it moves the own-bank gain and the shared-pool cost together; at 0.5 the replayed shared-pool MRR@10 falls to 0.294 (92 of 120 recalls certified).                                                  |
-| A factor on third-namespace rows only, leaving `local` at 1 | Not chosen: no bank on the measured store has third-namespace answers, so that stratum cannot be measured; the measured gain comes from scaling `local` and other rows together relative to the reader's own. |
-| Learned per-namespace multipliers                           | Deferred for the reasons Amendment 4 gives.                                                                                                                                                                   |
+| Alternative                                                 | Disposition                                                                                                                                                                                                                                                                |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A boost above 1 on the reader's own rows                    | Rejected: it can lift `rank_score` above 1 and needs a clamp, which Amendment 4 Problem 1 showed collapses ordering at the top.                                                                                                                                            |
+| Lower `local_factor` further                                | Rejected: it moves the own-bank gain and the shared-pool cost together; at 0.5 the replayed shared-pool MRR@10 falls to 0.294 (92 of 120 recalls certified).                                                                                                               |
+| A factor on third-namespace rows only, leaving `local` at 1 | Not chosen: no bank on the measured store has third-namespace answers, so that stratum cannot be measured; the measured gain comes from scaling `local` and other rows together relative to the reader's own.                                                              |
+| Key the factor on the request's primary namespace           | Rejected: the measured gate recalls with request namespace `local` while the favoured rows are `lambda:khive`, so a request-keyed rule would measure a different rule from the one replayed; and a ranking that changes with the caller departs from Amendment 4 Change 2. |
+| Learned per-namespace multipliers                           | Deferred for the reasons Amendment 4 gives.                                                                                                                                                                                                                                |
 
 ### Validation
 
-The implementing change carries tests for: a profile without `outside_factor` returning results identical to no
-factor; `brain.create_profile` refusing an `outside_factor` that is not finite or lies outside [0.5, 1];
-`brain.profile`, `brain.reset` and a snapshot reload keeping the stored factor; rows in the request's primary namespace
-unscaled and every other namespace scaled; a `local` row outside the primary namespace scaled by the product of both
-factors; a request whose primary namespace is `local` scaling the other namespaces' rows only by `outside_factor`; the
+The implementing change carries tests for: a profile without the pair returning results identical to no factor;
+`brain.create_profile` refusing an `outside_factor` that is not finite or lies outside [0.5, 1], and refusing either
+field without the other; `brain.profile`, `brain.reset` and a snapshot reload keeping both fields; rows in
+`own_namespace` unscaled and every other namespace scaled; a `local` row scaled by the product of both factors; a
+profile whose `own_namespace` is `local` scaling the other namespaces' rows only by `outside_factor`; the same profile
+ranking identically for two callers with different request namespaces, one recall naming an explicit namespace and
+one with a multi-namespace visible set; a positive `score_floor` overriding `min_score` on the adjusted score; an active
+weighted reranker, the factor applying after it; two scores that tie after 32-bit rounding ordered by id; a row lowered
+below a positive `min_score` releasing the candidate its `supersedes` property named; a duplicate pair whose order the
+factor reverses moving the penalty, the zero floor on the penalty included; an entity term above 1 with both factors
+at 1; a snapshot written before this amendment loading with factor 1; the
 returned `score` unchanged by the factor; `min_score` applied to the adjusted score; and each returned hit's
 `rank_score` equal to the five-term expression from its breakdown, with and without a duplicate pair present. The gate
 harness records `outside_factor` among the per-hit terms and refuses a response missing it.
