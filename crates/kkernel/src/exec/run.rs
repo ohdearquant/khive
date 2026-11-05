@@ -272,7 +272,7 @@ fn preflight_read_only_ops(ops: &str) -> Result<()> {
 mod read_only_policy_tests {
     use clap::Parser;
     use serde_json::{json, Value};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::time::Duration;
@@ -284,6 +284,11 @@ mod read_only_policy_tests {
     const CHILD_MARKER: &str = ".kkernel-read-only-child.json";
     const RECEIPT: &str = "READ_ONLY_POLICY_RECEIPT ";
     const OUTPUT_LIMIT: u64 = 1024 * 1024;
+    const OUTPUT_HEAD_LIMIT: usize = 2048;
+    const SELECTED_READ_TEST: &str =
+        "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree";
+    const STORE_BASELINE_DIR: &str = "selected-store-before";
+    const STORE_BASELINE_META: &str = ".selected-store-before.json";
 
     struct ChildFixture {
         root: PathBuf,
@@ -432,36 +437,154 @@ mod read_only_policy_tests {
         seed_runtime(file_runtime(path, packs), name).await
     }
 
-    fn store_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn try_store_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {
         fn visit(
             root: &Path,
             path: &Path,
             files: &mut BTreeMap<PathBuf, Vec<u8>>,
             total: &mut usize,
-        ) {
-            let metadata = std::fs::symlink_metadata(path).expect("fixture metadata");
-            assert!(
-                !metadata.file_type().is_symlink(),
-                "fixture symlink refused"
-            );
+        ) -> Result<(), String> {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("fixture metadata {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err("fixture symlink refused".into());
+            }
             if metadata.is_dir() {
-                for entry in std::fs::read_dir(path).expect("fixture directory") {
-                    visit(root, &entry.unwrap().path(), files, total);
+                for entry in std::fs::read_dir(path)
+                    .map_err(|error| format!("fixture directory: {error}"))?
+                {
+                    let entry = entry.map_err(|error| format!("fixture entry: {error}"))?;
+                    visit(root, &entry.path(), files, total)?;
                 }
             } else {
-                assert!(metadata.is_file(), "special fixture file refused");
-                assert!(metadata.len() <= 16 * 1024 * 1024, "oversized fixture file");
-                let bytes = std::fs::read(path).expect("snapshot private fixture bytes");
-                *total += bytes.len();
-                assert!(*total <= 64 * 1024 * 1024, "oversized fixture snapshot");
-                assert!(files.len() < 32, "too many fixture files");
-                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+                if !metadata.is_file() {
+                    return Err("special fixture file refused".into());
+                }
+                if metadata.len() > 16 * 1024 * 1024 {
+                    return Err("oversized fixture file".into());
+                }
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("snapshot private fixture bytes: {error}"))?;
+                *total = total
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| "fixture snapshot size overflow".to_string())?;
+                if *total > 64 * 1024 * 1024 {
+                    return Err("oversized fixture snapshot".into());
+                }
+                if files.len() >= 32 {
+                    return Err("too many fixture files".into());
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("fixture relative path: {error}"))?;
+                files.insert(relative.to_path_buf(), bytes);
             }
+            Ok(())
         }
         let mut files = BTreeMap::new();
         let mut total = 0;
-        visit(root, root, &mut files, &mut total);
-        files
+        visit(root, root, &mut files, &mut total)?;
+        Ok(files)
+    }
+
+    fn store_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        try_store_snapshot(root).expect("snapshot bounded private fixture tree")
+    }
+
+    fn record_store_baseline(
+        fixture: &ChildFixture,
+        before: BTreeMap<PathBuf, Vec<u8>>,
+        record_id: &str,
+    ) {
+        let baseline = fixture.root.join(STORE_BASELINE_DIR);
+        std::fs::create_dir(&baseline).expect("private store baseline directory");
+        assert!(
+            before.contains_key(Path::new("selected.db")),
+            "missing selected database baseline"
+        );
+        for (relative, bytes) in before {
+            let target = baseline.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).expect("baseline parent directory");
+            std::fs::write(target, bytes).expect("persist private store baseline");
+        }
+        // This marker is written only after the actual seed create/readback and
+        // every baseline byte are settled, and before invoking run_exec.
+        std::fs::write(
+            fixture.root.join(STORE_BASELINE_META),
+            serde_json::to_vec(&json!({
+                "fixture_token": fixture.token,
+                "test_name": fixture.test_name,
+                "child_pid": std::process::id(),
+                "record_id": record_id,
+                "complete": true,
+            }))
+            .unwrap(),
+        )
+        .expect("persist private baseline marker");
+    }
+
+    #[derive(Debug)]
+    struct ParentStoreWitness {
+        record_id: String,
+        changed_paths: Vec<PathBuf>,
+    }
+
+    fn parent_store_witness(
+        root: &Path,
+        token: &str,
+        test_name: &str,
+        child_pid: u32,
+    ) -> Result<Option<ParentStoreWitness>, String> {
+        if test_name != SELECTED_READ_TEST {
+            return Ok(None);
+        }
+        let marker_path = root.join(STORE_BASELINE_META);
+        let metadata = std::fs::symlink_metadata(&marker_path)
+            .map_err(|error| format!("missing selected-store baseline: {error}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() >= 4096 {
+            return Err("invalid selected-store baseline marker".into());
+        }
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(marker_path)
+                .map_err(|error| format!("read baseline marker: {error}"))?,
+        )
+        .map_err(|error| format!("baseline marker JSON: {error}"))?;
+        if marker["fixture_token"] != token
+            || marker["test_name"] != test_name
+            || marker["child_pid"].as_u64() != Some(u64::from(child_pid))
+            || marker["complete"] != true
+        {
+            return Err("selected-store baseline attribution mismatch".into());
+        }
+        let record_id = marker["record_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "baseline record id missing".to_string())?
+            .to_string();
+        let before = try_store_snapshot(&root.join(STORE_BASELINE_DIR))?;
+        let after = try_store_snapshot(&root.join("stores"))?;
+        if !before.contains_key(Path::new("selected.db")) {
+            return Err("selected database absent from baseline".into());
+        }
+        let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let changed_paths = paths
+            .into_iter()
+            .filter(|path| before.get(path) != after.get(path))
+            .collect();
+        Ok(Some(ParentStoreWitness {
+            record_id,
+            changed_paths,
+        }))
+    }
+
+    fn stream_diagnostic(name: &str, bytes: &[u8]) -> String {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_HEAD_LIMIT)]);
+        format!(
+            "{name}: captured_bytes={}, limit_reached={}, first_{}KiB={head:?}",
+            bytes.len(),
+            bytes.len() >= OUTPUT_LIMIT as usize,
+            OUTPUT_HEAD_LIMIT / 1024,
+        )
     }
 
     #[tokio::test]
@@ -479,6 +602,7 @@ mod read_only_policy_tests {
             std::fs::write(&config, "engines = []\n").unwrap();
             let output = cwd.join("explicit-read.jsonl");
             let before = store_snapshot(&stores);
+            record_store_baseline(&fixture, before, &id);
             // The explicit database holds a distinct actual record; the HOME
             // default database does not exist and must remain absent.
             let invocation = super::ExecArgs::try_parse_from([
@@ -510,16 +634,13 @@ mod read_only_policy_tests {
                 !cwd.join(".khive/khive.db").exists(),
                 "created HOME default db"
             );
-            assert_eq!(
-                store_snapshot(&stores),
-                before,
-                "readonly store bytes changed"
-            );
+            // The parent compares actual disk bytes independently of capture.
+            // A semantic byte difference must not dump a SQLite Vec<u8> here,
+            // abort the child before receipt, or become a capture-limit failure.
             child_receipt(
                 &fixture,
                 json!({
                     "explicit_database_actual_record": true,
-                    "selected_store_tree_unchanged": true,
                     "home_default_absent": true,
                     "id": id,
                 }),
@@ -535,7 +656,10 @@ mod read_only_policy_tests {
             receipt["explicit_database_actual_record"], true,
             "{receipt}"
         );
-        assert_eq!(receipt["selected_store_tree_unchanged"], true, "{receipt}");
+        assert_eq!(
+            receipt["selected_store_tree_unchanged"], true,
+            "readonly store bytes changed: {receipt}"
+        );
         assert_eq!(receipt["home_default_absent"], true, "{receipt}");
     }
 
@@ -782,29 +906,39 @@ mod read_only_policy_tests {
                 out.abort();
                 err.abort();
                 assert!(matches!(reaped, Ok(Ok(_))), "policy child was not reaped");
+                let disk_witness = parent_store_witness(root.path(), &token, test_name, child_pid);
                 root.close().expect("remove timed-out private fixture");
-                panic!("policy fixture watchdog expired; no semantic gate credit");
+                panic!("policy fixture watchdog expired; no semantic gate credit; selected_store_witness={disk_witness:?}");
             }
         };
         let out = out.await.expect("join stdout").expect("read stdout");
         let err = err.await.expect("join stderr").expect("read stderr");
+        let capture_valid = out.len() < OUTPUT_LIMIT as usize && err.len() < OUTPUT_LIMIT as usize;
+        let capture_diagnostic = format!(
+            "{}; {}",
+            stream_diagnostic("stdout", &out),
+            stream_diagnostic("stderr", &err)
+        );
+        // This disk verdict is captured after reaping and before deleting the
+        // private fixture, regardless of cap/exit/receipt validity. It is only a
+        // diagnostic until every existing fixture-validity guard below passes.
+        let disk_witness = parent_store_witness(root.path(), &token, test_name, child_pid);
         let out = String::from_utf8_lossy(&out);
-        let err = String::from_utf8_lossy(&err);
         let rows: Vec<_> = out
             .lines()
             .filter_map(|line| line.strip_prefix(RECEIPT))
             .collect();
         root.close().expect("remove completed private fixture");
         assert!(
-            out.len() < OUTPUT_LIMIT as usize && err.len() < OUTPUT_LIMIT as usize,
-            "invalid policy fixture: child output reached the capture limit"
+            capture_valid,
+            "invalid policy fixture: child output reached the capture limit; {capture_diagnostic}; selected_store_witness={disk_witness:?}"
         );
         assert!(
             status.success(),
-            "invalid policy fixture exit: {out}\n{err}"
+            "invalid policy fixture exit ({status}); {capture_diagnostic}; selected_store_witness={disk_witness:?}"
         );
-        assert_eq!(rows.len(), 1, "missing/duplicate child receipt: {out}");
-        let receipt: Value = serde_json::from_str(rows[0]).expect("policy receipt JSON");
+        assert_eq!(rows.len(), 1, "missing/duplicate child receipt; {capture_diagnostic}; selected_store_witness={disk_witness:?}");
+        let mut receipt: Value = serde_json::from_str(rows[0]).expect("policy receipt JSON");
         assert_eq!(
             receipt["fixture_token"], token,
             "child receipt token mismatch"
@@ -818,6 +952,21 @@ mod read_only_policy_tests {
             Some(u64::from(child_pid)),
             "child receipt pid mismatch"
         );
+        if let Some(witness) =
+            disk_witness.expect("invalid selected-store baseline; no semantic gate credit")
+        {
+            assert_eq!(
+                receipt["explicit_database_actual_record"], true,
+                "missing actual selected-database readback"
+            );
+            assert_eq!(
+                receipt["id"].as_str(),
+                Some(witness.record_id.as_str()),
+                "baseline/readback record mismatch"
+            );
+            receipt["selected_store_tree_unchanged"] = json!(witness.changed_paths.is_empty());
+            receipt["selected_store_changed_paths"] = json!(witness.changed_paths);
+        }
         receipt
     }
 }
