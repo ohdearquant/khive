@@ -3718,3 +3718,91 @@ async fn replay_empty_and_delete_only_do_not_resolve_a_vector_store() {
     assert!(bridge.index.is_tombstoned(0));
     assert!(!bridge.index.is_tombstoned(1));
 }
+
+#[test]
+fn reverse_map_for_recent_tail_scan_bound() {
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+    let id_map = vec![id_a, id_b, unrelated, id_a, id_b, id_a, id_a, id_b];
+    let vectors = [1.0, 0.0, 0.0].repeat(id_map.len());
+    let mut bridge = AnnBridge::build(vectors, 3, id_map).expect("build bridge");
+    bridge.index.tombstone(6).expect("tombstone newest id_a");
+    bridge.index.tombstone(7).expect("tombstone newest id_b");
+
+    let reverse = bridge.reverse_map_for([id_a, id_a, id_b, id_b]);
+    assert_eq!(reverse.len(), 2, "only distinct requested live owners");
+    assert_eq!(reverse.get(&id_a), Some(&5), "highest live id_a wins");
+    assert_eq!(reverse.get(&id_b), Some(&4), "highest live id_b wins");
+    assert!(!reverse.contains_key(&unrelated));
+    assert_eq!(
+        AnnBridge::reverse_map_for_scanned_entries(),
+        4,
+        "recent_tail_scan_bound"
+    );
+}
+
+#[test]
+fn reverse_map_for_hashed_duplicate_subjects_stop_at_distinct_tail() {
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+    let id_map = vec![id_a, id_b, unrelated, id_a, id_b, id_a, id_a, id_b];
+    let vectors = [1.0, 0.0, 0.0].repeat(id_map.len());
+    let mut bridge = AnnBridge::build(vectors, 3, id_map).expect("build bridge");
+    bridge.index.tombstone(6).expect("tombstone newest id_a");
+    bridge.index.tombstone(7).expect("tombstone newest id_b");
+
+    let reverse = bridge.reverse_map_for([id_a, id_b, id_a, id_b, id_a]);
+    assert_eq!(reverse.len(), 2, "only distinct requested live owners");
+    assert_eq!(reverse.get(&id_a), Some(&5), "highest live id_a wins");
+    assert_eq!(reverse.get(&id_b), Some(&4), "highest live id_b wins");
+    assert!(!reverse.contains_key(&unrelated));
+    assert_eq!(
+        AnnBridge::reverse_map_for_scanned_entries(),
+        4,
+        "hashed_recent_tail_scan_bound"
+    );
+}
+
+#[test]
+fn reverse_map_for_missing_and_empty_subjects_keep_map_contract() {
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+    let id_map = vec![id_a, id_b, unrelated, id_a, id_b, id_a, id_a, id_b];
+    let vectors = [1.0, 0.0, 0.0].repeat(id_map.len());
+    let mut bridge = AnnBridge::build(vectors, 3, id_map).expect("build bridge");
+    bridge.index.tombstone(6).expect("tombstone newest id_a");
+    bridge.index.tombstone(7).expect("tombstone newest id_b");
+    let absent = Uuid::new_v4();
+
+    for subjects in [
+        vec![id_a, absent, id_a],
+        vec![id_a, absent, id_a, absent, id_a],
+    ] {
+        let reverse = bridge.reverse_map_for(subjects);
+        assert_eq!(reverse.len(), 1, "missing subject has no owner");
+        assert_eq!(reverse.get(&id_a), Some(&5), "highest live id_a wins");
+        assert!(!reverse.contains_key(&id_b));
+        assert!(!reverse.contains_key(&unrelated));
+        assert!(!reverse.contains_key(&absent));
+        assert_eq!(
+            AnnBridge::reverse_map_for_scanned_entries(),
+            8,
+            "missing subjects require a full scan"
+        );
+    }
+
+    let reverse = bridge.reverse_map_for([absent, absent]);
+    assert!(reverse.is_empty(), "absent-only request has no owner");
+    assert_eq!(AnnBridge::reverse_map_for_scanned_entries(), 8);
+
+    let reverse = bridge.reverse_map_for([]);
+    assert!(reverse.is_empty(), "empty request has no owner");
+    assert_eq!(
+        AnnBridge::reverse_map_for_scanned_entries(),
+        0,
+        "empty request resets the prior per-call count"
+    );
+}
