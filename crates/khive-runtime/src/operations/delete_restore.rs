@@ -256,8 +256,10 @@ impl KhiveRuntime {
             return Ok(Some((edge, false)));
         }
         let both_memory_at_check = match (
-            self.resolve_by_id_including_deleted(token, edge.source_id).await?,
-            self.resolve_by_id_including_deleted(token, edge.target_id).await?,
+            self.resolve_by_id_including_deleted(token, edge.source_id)
+                .await?,
+            self.resolve_by_id_including_deleted(token, edge.target_id)
+                .await?,
         ) {
             (Some(crate::Resolved::Note(source)), Some(crate::Resolved::Note(target))) => {
                 let both_memory = source.kind == "memory" && target.kind == "memory";
@@ -864,7 +866,11 @@ pub(super) mod memory_edge_namespace_restore_tests {
         id: Uuid,
         expected_namespace: &str,
     ) {
-        match runtime.resolve_by_id_including_deleted(token, id).await.unwrap() {
+        match runtime
+            .resolve_by_id_including_deleted(token, id)
+            .await
+            .unwrap()
+        {
             Some(Resolved::Note(note)) => {
                 assert_eq!(note.namespace, expected_namespace);
                 assert_eq!(note.kind, "memory");
@@ -901,14 +907,26 @@ pub(super) mod memory_edge_namespace_restore_tests {
     async fn restore_edge_rejects_legacy_tombstone_with_mismatched_memory_source_namespace() {
         let (runtime, _dir) = fixture();
         let local_token = runtime.authorize(Namespace::local()).unwrap();
-        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+        let other_token = runtime
+            .authorize(Namespace::parse("other").unwrap())
+            .unwrap();
 
         let source = Note::new("other", "memory", "restore source");
         let source_id = source.id;
         let target = Note::new("other", "memory", "restore target");
         let target_id = target.id;
-        runtime.notes(&other_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -973,14 +991,26 @@ pub(super) mod memory_edge_namespace_restore_tests {
     async fn restore_edge_rechecks_memory_source_namespace_at_writer_after_precheck() {
         let (runtime, _dir) = fixture();
         let local_token = runtime.authorize(Namespace::local()).unwrap();
-        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+        let other_token = runtime
+            .authorize(Namespace::parse("other").unwrap())
+            .unwrap();
 
         let source = Note::new("local", "memory", "moving restore source");
         let source_id = source.id;
         let target = Note::new("local", "memory", "stable restore target");
         let target_id = target.id;
-        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -998,7 +1028,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
         assert_eq!(edge.source_id, source_id);
         assert_eq!(edge.target_id, target_id);
         assert_eq!(edge.relation, EdgeRelation::Annotates);
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "local", "local").await,
+            1
+        );
         let edge_before_restore = runtime
             .get_edge_including_deleted(&local_token, edge_id)
             .await
@@ -1070,8 +1103,18 @@ pub(super) mod memory_edge_namespace_restore_tests {
         let source_id = source.id;
         let target = Note::new("local", "memory", "live restore target");
         let target_id = target.id;
-        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -1086,7 +1129,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
             .unwrap();
         let edge_id = Uuid::from(edge.id);
         assert_eq!(edge.namespace, "local");
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "local", "local").await,
+            1
+        );
         assert_memory_note_in_namespace(&runtime, &local_token, source_id, "local").await;
         assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
 
@@ -1150,8 +1196,18 @@ pub(super) mod memory_edge_namespace_restore_tests {
         let source_id = source.id;
         let target = Note::new("local", "memory", "live restore target");
         let target_id = target.id;
-        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -1165,7 +1221,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
             .await
             .unwrap();
         let edge_id = Uuid::from(edge.id);
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "local", "local").await,
+            1
+        );
         let stored_edge = runtime
             .get_edge_including_deleted(&local_token, edge_id)
             .await
@@ -1192,7 +1251,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
         install_before_writer_hook(edge_id, entered_tx, None);
         let outcome = runtime.restore_edge(&local_token, edge_id).await;
         remove_before_writer_hook(edge_id);
-        assert!(matches!(entered_rx.try_recv(), Ok(())), "fixture did not reach writer fence");
+        assert!(
+            matches!(entered_rx.try_recv(), Ok(())),
+            "fixture did not reach writer fence"
+        );
         match outcome {
             Err(RuntimeError::InvalidInput(_)) => {}
             Ok(Some((_, true))) => panic!("restore_memory_predeleted_source_admitted"),
@@ -1210,13 +1272,33 @@ pub(super) mod memory_edge_namespace_restore_tests {
     async fn restore_edge_rechecks_current_memory_pair_after_nonmemory_precheck() {
         let (runtime, _dir) = fixture();
         let local_token = runtime.authorize(Namespace::local()).unwrap();
-        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
-        let source = Note::new("other", "memory", "memory source before current-pair change");
+        let other_token = runtime
+            .authorize(Namespace::parse("other").unwrap())
+            .unwrap();
+        let source = Note::new(
+            "other",
+            "memory",
+            "memory source before current-pair change",
+        );
         let source_id = source.id;
-        let target = Note::new("other", "observation", "nonmemory target before current-pair change");
+        let target = Note::new(
+            "other",
+            "observation",
+            "nonmemory target before current-pair change",
+        );
         let target_id = target.id;
-        runtime.notes(&other_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -1230,7 +1312,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
             .await
             .unwrap();
         let edge_id = Uuid::from(edge.id);
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "other", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "other", "local").await,
+            1
+        );
         let edge_before_restore = runtime
             .get_edge_including_deleted(&local_token, edge_id)
             .await
@@ -1268,7 +1353,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
             .expect("ordinary nonmemory-pair restore should remain readable");
         assert_eq!(ordinary_restore.namespace, "local");
         assert!(ordinary_restore.deleted_at.is_none());
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "local", "local").await,
+            1
+        );
         let edge_before_race = runtime
             .get_edge_including_deleted(&local_token, edge_id)
             .await
@@ -1294,7 +1382,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
             panic!("fixture did not positively cross the outside check before writer");
         }
 
-        assert_eq!(change_note_kind(&runtime, target_id, "observation", "memory").await, 1);
+        assert_eq!(
+            change_note_kind(&runtime, target_id, "observation", "memory").await,
+            1
+        );
         match runtime
             .resolve_by_id_including_deleted(&local_token, target_id)
             .await
@@ -1331,14 +1422,26 @@ pub(super) mod memory_edge_namespace_restore_tests {
     async fn restore_edge_allows_memory_target_in_another_namespace() {
         let (runtime, _dir) = fixture();
         let local_token = runtime.authorize(Namespace::local()).unwrap();
-        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+        let other_token = runtime
+            .authorize(Namespace::parse("other").unwrap())
+            .unwrap();
 
         let source = Note::new("local", "memory", "local restore source");
         let source_id = source.id;
         let target = Note::new("other", "memory", "foreign restore target");
         let target_id = target.id;
-        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
-        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+        runtime
+            .notes(&local_token)
+            .unwrap()
+            .upsert_note(source)
+            .await
+            .unwrap();
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(target)
+            .await
+            .unwrap();
 
         let edge = runtime
             .link(
@@ -1355,7 +1458,10 @@ pub(super) mod memory_edge_namespace_restore_tests {
         assert_eq!(edge.namespace, "local");
         assert_eq!(edge.source_id, source_id);
         assert_eq!(edge.target_id, target_id);
-        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "local", "local").await,
+            1
+        );
         assert_memory_note_in_namespace(&runtime, &local_token, source_id, "local").await;
         assert_memory_note_in_namespace(&runtime, &local_token, target_id, "other").await;
 

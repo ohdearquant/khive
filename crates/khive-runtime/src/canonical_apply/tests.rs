@@ -761,8 +761,16 @@ async fn canonical_memory_namespace_mismatch_refuses_before_any_write() {
     let source = Note::new("local", "memory", "source");
     let target = Note::new("local", "memory", "target");
     let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
-    rt.notes(&source_token).unwrap().upsert_note(source).await.unwrap();
-    rt.notes(&source_token).unwrap().upsert_note(target).await.unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(source)
+        .await
+        .unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(target)
+        .await
+        .unwrap();
     for id in [source_id, target_id] {
         let stored = rt
             .resolve_by_id_including_deleted(&token, id)
@@ -828,7 +836,11 @@ async fn canonical_staged_memory_source_namespace_mismatch_refuses_before_any_wr
     let target = Note::new("local", "memory", "target");
     let (source_id, target_id, edge_id, side_id) =
         (Uuid::new_v4(), target.id, Uuid::new_v4(), Uuid::new_v4());
-    rt.notes(&source_token).unwrap().upsert_note(target).await.unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(target)
+        .await
+        .unwrap();
     let stored = rt
         .resolve_by_id_including_deleted(&token, target_id)
         .await
@@ -851,14 +863,10 @@ async fn canonical_staged_memory_source_namespace_mismatch_refuses_before_any_wr
             decay_factor: None,
         }),
     });
-    let setup_plans = prepare_canonical_changeset(
-        rt,
-        &registry(),
-        &token,
-        &changeset(vec![staged.clone()]),
-    )
-    .await
-    .expect("setup must admit the staged memory kind");
+    let setup_plans =
+        prepare_canonical_changeset(rt, &registry(), &token, &changeset(vec![staged.clone()]))
+            .await
+            .expect("setup must admit the staged memory kind");
     assert_eq!(setup_plans.len(), 1);
     drop(setup_plans);
     assert!(rt
@@ -924,7 +932,11 @@ async fn canonical_memory_to_nonmemory_keeps_op_namespace() {
     let source = Note::new("local", "memory", "source");
     let target = Note::new("other", "observation", "target");
     let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
-    rt.notes(&source_token).unwrap().upsert_note(source).await.unwrap();
+    rt.notes(&source_token)
+        .unwrap()
+        .upsert_note(source)
+        .await
+        .unwrap();
     rt.notes(&token).unwrap().upsert_note(target).await.unwrap();
     for (id, kind, namespace) in [
         (source_id, "memory", "local"),
@@ -1046,7 +1058,11 @@ async fn canonical_memory_namespace_change_before_writer_rolls_back() {
     let crate::AtomicRunOutcome::RolledBack { failure, .. } = outcome else {
         panic!("expected a canonical writer rollback");
     };
-    let AtomicOpFailure::SqlError { statement_label, message } = failure else {
+    let AtomicOpFailure::SqlError {
+        statement_label,
+        message,
+    } = failure
+    else {
         panic!("expected the canonical namespace SQL failure");
     };
     assert_eq!(statement_label.as_deref(), Some("canonical-materialize"));

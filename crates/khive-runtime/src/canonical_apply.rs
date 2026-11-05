@@ -218,7 +218,9 @@ pub async fn prepare_canonical_changeset(
                         .ok_or_else(|| RuntimeError::NotFound("canonical link target".into()))?;
                     let rules = runtime.pack_edge_rules();
                     links::endpoints(&source, &target, link.relation, &rules)?;
-                    if let (Record::Note(source_note), Record::Note(target_note)) = (&source, &target) {
+                    if let (Record::Note(source_note), Record::Note(target_note)) =
+                        (&source, &target)
+                    {
                         KhiveRuntime::ensure_memory_note_edge_namespace(
                             op_token.namespace().as_str(),
                             uuid(link.source),
