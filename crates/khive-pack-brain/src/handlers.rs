@@ -218,7 +218,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profiles",
-        description: "List profiles, optionally filtered by lifecycle",
+        description: "List profiles in the selected namespace catalog, optionally filtered by lifecycle. The response namespace identifies the catalog listed.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -231,14 +231,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profile",
-        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1).",
+        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1). The response namespace identifies the selected catalog.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
             name: "profile_id",
             param_type: "string",
             required: true,
-            description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier. Alias: id.",
+            description: "Profile ID string (e.g. \"balanced-recall-v1\"), unique within a namespace. NOT a UUID — use the string identifier. Alias: id.",
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
@@ -266,7 +266,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Namespace for binding resolution. Defaults to \"*\" wildcard match.",
+                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -544,7 +544,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: true,
-                description: "Profile ID to bind (must exist).",
+                description: "Profile ID to bind (must exist in this namespace catalog; IDs are unique within a namespace).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -558,7 +558,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Namespace to match. Default \"*\" (all namespaces).",
+                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -579,7 +579,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.unbind",
-        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required.",
+        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required. No matching rows succeeds with removed=0 and unbound=0.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -587,7 +587,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Remove bindings for this profile ID. All filters use AND semantics. At least one filter is required.",
+                description: "Remove bindings for this profile ID in this namespace catalog. Profile IDs are unique within a namespace. All filters use AND semantics. At least one filter is required.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -601,7 +601,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Remove bindings for this namespace.",
+                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -615,7 +615,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.bindings",
-        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller.",
+        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller. The response namespace identifies the catalog read.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -623,7 +623,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by profile ID.",
+                description: "Filter bindings by profile ID in this namespace catalog; IDs are unique within a namespace.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -637,7 +637,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by namespace.",
+                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -897,8 +897,16 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.events" => self.handle_events(token, params).await,
             "brain.event_page" => self.handle_event_page(token, params).await,
             "brain.event_counts" => self.handle_event_counts(token, params).await,
-            "brain.profiles" => self.handle_profiles(params).await,
-            "brain.profile" => self.handle_profile(params).await,
+            "brain.profiles" => {
+                let mut answer = self.handle_profiles(params).await?;
+                answer["namespace"] = json!(token.namespace().as_str());
+                Ok(answer)
+            }
+            "brain.profile" => {
+                let mut answer = self.handle_profile(params).await?;
+                answer["namespace"] = json!(token.namespace().as_str());
+                Ok(answer)
+            }
             "brain.resolve" => self.handle_resolve(token, params, registry).await,
             "brain.bindings" => self.handle_bindings(token, params).await,
             // Commissive
