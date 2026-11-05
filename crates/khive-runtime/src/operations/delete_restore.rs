@@ -267,7 +267,7 @@ impl KhiveRuntime {
                     &edge.namespace,
                     edge.source_id,
                     edge.target_id,
-                    edge.relation.clone(),
+                    edge.relation,
                     &source,
                     &target,
                 )?;
