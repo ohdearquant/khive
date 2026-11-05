@@ -1028,11 +1028,13 @@ is returned.
 
 The `namespace` parameter on `brain.bind`, `brain.unbind`, `brain.bindings`, and
 `brain.resolve` selects the profile catalog these calls read or write. When supplied,
-that same namespace is the binding match context. When omitted, the call uses the local
-catalog and the wildcard match context `*`: `brain.bind` stores the binding with
-namespace `*`, so it matches every namespace; `brain.resolve` matches only bindings
+that same namespace is the binding match context. When omitted, the call uses the
+caller's default catalog (the request identity's namespace when one is attached,
+otherwise the runtime's default namespace, `local` unless configured) and the wildcard
+match context `*`: `brain.bind` stores the binding with namespace `*`, so it matches
+every namespace context within that catalog; `brain.resolve` matches only bindings
 stored with `*`; `brain.bindings` and `brain.unbind` apply no namespace filter, so they
-match bindings of every namespace in the local catalog, subject to their other filters.
+match bindings of every namespace in that catalog, subject to their other filters.
 Profile IDs are unique within each catalog. Bindings resolve only in the selected
 catalog; cross-catalog resolution is outside this workflow and needs a separate ADR.
 
