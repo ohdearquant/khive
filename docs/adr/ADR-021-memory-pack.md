@@ -1050,16 +1050,23 @@ memory rows, are written, and what an edge read reports when it leaves edges out
 
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
 `supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
-kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. Neither the episodic
-carve-out of ADR-007 Rev 6 nor the 2026-11-01 amendment for semantic writes says where an edge between memory rows
-goes. A second reader of one measured row sees five of its six outgoing `supersedes` edges, and nothing in the
+kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. ADR-007 Rev 6 Rule 0's scope
+note says every non-memory write, edges included, keeps the `local` default, and neither it nor the 2026-11-01
+amendment for semantic writes treats an edge between two memory rows differently. This delta narrows that sentence for
+edges whose source and target are both memory rows; ADR-007 is otherwise unchanged. A second reader of one measured row sees five of its six outgoing `supersedes` edges, and nothing in the
 `neighbors` response says that one is missing.
 
 **Decision.**
 
 1. **Namespace rule.** An edge whose source and target are both memory rows is written in the source row's namespace,
-   whichever verb writes it. `memory.apply_batch` and `link` resolve the source row before writing and use its
-   namespace; a write whose caller may not write that namespace is refused, never redirected to another namespace.
+   whichever verb writes it. Three verbs write such an edge: `memory.apply_batch`, `link`, and a link op in
+   `apply_changeset`. Each reads the source row and compares its stored namespace with the request's write namespace,
+   the one the gate checked: the caller's own, or the explicit `namespace` argument, or for `apply_changeset` the op's
+   own `namespace` field. The two must be equal. A mismatch is refused before anything is written and names the source
+   row's namespace to retry with; the edge is never redirected and an op's namespace is never overridden.
+   `memory.apply_batch` writes the edge from the row it has just written in the caller's namespace, so its two
+   namespaces always agree. This is a placement rule and grants nothing: who may write a namespace stays the gate's
+   decision on the request (ADR-007 Rev 8 Rule 9), and no read or by-id operation on either row is refused by it.
 2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
    can see. For the row whose edges the read lists (recall: each returned row; `neighbors`: the anchor row), and for each
    relation, the response also carries the number of edges between memory rows that arrive at that row and that the
@@ -1080,8 +1087,14 @@ goes. A second reader of one measured row sees five of its six outgoing `superse
    reader's visible namespaces and returns numbers only; no read is opened in a namespace the reader cannot see.
 3. **Existing edges.** A one-time move rewrites each live edge between memory rows whose namespace differs from its
    source row's namespace, keeping the edge's id. Soft-deleted edges stay where they are: no read returns them, and
-   edge listing does not enumerate them. A move that would put an edge on a (source, target, relation) already present
-   in the source row's namespace, live or soft-deleted, is refused before anything is written. The move has a dry run
+   edge listing does not enumerate them. Before its first write the move computes the destination of every edge it
+   would move, as (source row's namespace, source, target, relation), over the whole set. If an edge already holds one
+   of those destinations, live or soft-deleted, or two moving edges share one, the whole run is refused and nothing is
+   written. The applying run is not one transaction: it updates each edge under a revision guard, so an edge changed
+   by another writer stops the run instead of being overwritten, and it then counts again independently of its own
+   progress. A run that stops part way reports how many edges it moved and how many remain; running it again moves only
+   the remaining ones, because a moved edge already sits in its source row's namespace. Other writers are stopped
+   while it runs. The move has a dry run
    that prints per-namespace edge counts before and after and writes nothing; the applying run prints the same counts.
 
 **Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
@@ -1094,8 +1107,8 @@ arrive from rows it cannot see, never which rows, which namespace, or their cont
 superseding row remains a follow-up, not solved here.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
-the same namespace (the source row's); a `link` whose caller may not write the source row's namespace refused with no
-edge written; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
+the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
+written; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
 edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
 run leaving all six in the source row's namespace.
