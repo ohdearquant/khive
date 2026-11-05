@@ -1067,6 +1067,13 @@ goes. A second reader of one measured row sees five of its six outgoing `superse
    Under rule 1 a reader already sees every outgoing edge of a row it can see, so the edges this count covers are the
    incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
    withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
+   The field is `hidden_incoming_edges`, shaped `{"total": n, "by_relation": {"<relation>": n}}`; `total` is always
+   present. Recall carries it on every returned row, for `supersedes`. `neighbors` carries it once, for the row whose
+   edges it lists, on its object-shaped response (any call with `limit`, `after`, `neighbor_kinds` or a non-record
+   projection); `by_relation` lists each relation of the request's filter, or with no filter each relation whose count is
+   above zero. The bare-array `neighbors` response keeps its shape and carries no count, so a caller that needs the count
+   passes `limit`. The count comes from one storage query that is given the reader's visible namespaces and returns
+   numbers only; no read is opened in a namespace the reader cannot see.
 3. **Existing edges.** A one-time move rewrites each live edge between memory rows whose namespace differs from its
    source row's namespace, keeping the edge's id. Soft-deleted edges stay where they are: no read returns them, and
    edge listing does not enumerate them. A move that would put an edge on a (source, target, relation) already present
@@ -1084,7 +1091,7 @@ superseding row remains a follow-up, not solved here.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
 the same namespace (the source row's); a `link` whose caller may not write the source row's namespace refused with no
-edge written; `neighbors` from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
-edges it cannot see; the same read with nothing hidden carrying the count as `0`, not omitting it; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+edge written; `neighbors` with a `limit` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
+edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
 run leaving all six in the source row's namespace.
