@@ -171,6 +171,67 @@ criterion_group!(
     bench_assign,
     bench_next,
     bench_tasks,
+    bench_transition_fixed_population,
     bench_transition
 );
 criterion_main!(gtd_benches);
+
+/// Time one transition at each fixed seeded task population, including the action task.
+///
+/// Every operation owns a fresh in-memory fixture. Setup, validation, and fixture
+/// destruction are outside the reported duration but still cost calibration wall
+/// time and memory. The duration includes runtime entry and registry dispatch;
+/// it does not measure external request transport or process memory.
+fn bench_transition_fixed_population(c: &mut Criterion) {
+    use std::time::{Duration, Instant};
+
+    let mut group = c.benchmark_group("gtd");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &n_tasks in &[10usize, 100] {
+        group.bench_with_input(
+            BenchmarkId::new("transition_fixed_population", n_tasks),
+            &n_tasks,
+            |b, &n_tasks| {
+                b.iter_custom(|iterations| {
+                    (0..iterations)
+                        .map(|_| {
+                            let fixture = build_fixture();
+                            seed_tasks(&fixture, n_tasks - 1);
+                            let created = fixture
+                                .rt
+                                .block_on(fixture.registry.dispatch(
+                                    "gtd.assign",
+                                    json!({ "title": "transition-action", "status": "inbox" }),
+                                ))
+                                .expect("action assign");
+                            let full_id = created["full_id"].as_str().expect("full_id");
+                            let params = black_box(json!({ "id": full_id, "status": "next" }));
+                            drop(created);
+
+                            let start = Instant::now();
+                            let result = fixture
+                                .rt
+                                .block_on(fixture.registry.dispatch("gtd.transition", params));
+                            let elapsed = start.elapsed();
+
+                            let result = result.expect("transition ok");
+                            assert_eq!(
+                                result["transitioned"].as_bool(),
+                                Some(true),
+                                "expected a real transition"
+                            );
+                            drop(black_box(result));
+                            drop(fixture);
+                            elapsed
+                        })
+                        .sum::<Duration>()
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
