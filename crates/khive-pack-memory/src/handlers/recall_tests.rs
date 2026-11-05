@@ -4466,6 +4466,110 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
     }
 }
 
+/// Recalls three `local` memories that share the query's leading terms, with breakdowns, under
+/// the default configuration (RRF fusion, default scoring weights and adjustments).
+async fn breakdown_probe_hits() -> Vec<Value> {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    for content in [
+        "breakdown probe composite alpha beta gamma",
+        "breakdown probe composite alpha beta",
+        "breakdown probe composite alpha",
+    ] {
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "breakdown probe composite alpha beta gamma",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall");
+    result.as_array().expect("bare array result").clone()
+}
+
+/// `relevance` is the value the ranking composite received, not that value scaled a second
+/// time. Under the default RRF fusion every ranked relevance lies in the calibrated band
+/// [0.15, 0.82]; a second `min(x * (k + 1), 1.0)` scaling with `k = 10` reports `1.0` for every
+/// value at or above 1/11, so each hit here would have read `1.0`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_relevance_is_the_ranked_value_not_a_saturated_one() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let relevance = breakdown["relevance"].as_f64().expect("relevance");
+        assert!(
+            relevance < 1.0,
+            "breakdown relevance must be the ranked value, not saturated at 1.0: {breakdown:?}"
+        );
+        assert!(
+            (0.15 - 1e-6..=0.82 + 1e-6).contains(&relevance),
+            "breakdown relevance must lie in the normalized band [0.15, 0.82]: {breakdown:?}"
+        );
+        let fused_score = breakdown["fused_score"]
+            .as_f64()
+            .expect("breakdown reports the fused score beside relevance");
+        assert!(
+            fused_score > 0.0,
+            "the fused score before normalization is positive: {breakdown:?}"
+        );
+    }
+}
+
+/// With no reranker weights the composite factors reported in the breakdown multiply back to
+/// `pre_entity_score`, and `relevance_term` is the default relevance weight times the reported
+/// `relevance`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_composite_factors_reproduce_pre_entity_score() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    let relevance_weight = crate::scoring::ScoringConfig::default().weights.relevance;
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let composite = &breakdown["composite"];
+        let relevance_term = breakdown_f32(&composite["relevance_term"]);
+        let temporal_boost = breakdown_f32(&composite["temporal_boost"]);
+        let salience_boost = breakdown_f32(&composite["salience_boost"]);
+        let adjustment_factor = breakdown_f32(&composite["adjustment_factor"]);
+        let pre_entity_score = breakdown_f32(&breakdown["pre_entity_score"]);
+
+        let product = relevance_term * temporal_boost * salience_boost * adjustment_factor;
+        assert!(
+            (product - pre_entity_score).abs() <= 1e-5 * pre_entity_score.abs().max(1.0),
+            "relevance_term * temporal_boost * salience_boost * adjustment_factor must equal \
+             pre_entity_score: product {product}, pre_entity_score {pre_entity_score}: {hit:?}"
+        );
+
+        let relevance = breakdown_f32(&breakdown["relevance"]);
+        assert!(
+            (relevance_term - relevance_weight * relevance).abs() <= 1e-6,
+            "relevance_term must be the relevance weight times the reported relevance: \
+             {hit:?}"
+        );
+    }
+}
+
 /// Identical store, query, and profile state must yield identical ranks and scores.
 #[tokio::test]
 #[serial(background_tasks)]

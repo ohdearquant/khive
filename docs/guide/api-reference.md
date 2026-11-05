@@ -1665,7 +1665,14 @@ term (bounded to 0.85 to 1.15) when a profile serves the request, and by the ser
 the `local` namespace. Under a profile with a factor, `local` rows' `rank_score` is scaled by it; rows of every other
 namespace are not. `score` stays the absolute relevance in [0, 1] and is taken before the factor.
 
-With `include_breakdown=true` each hit's `breakdown` reports `weights_served` (always `"default"`: a served profile
+With `include_breakdown=true` each hit's `breakdown` reports `relevance` (the value the ranking composite received,
+after the calibrated normalization and with no further scaling), `fused_score` (the fused score before that
+normalization) and `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`, the
+factors of the multiplicative composite that ranks the hit; with no `reranker_weights` their product is
+`pre_entity_score`, and `adjustment_factor` is `null` when the other three do not multiply to a positive number). The
+additive `weighted` contributions and the `temporal` and `salience_decayed` values are not the ranking composite:
+without `reranker_weights` a recall ranks by `composite`. The breakdown also reports `weights_served` (always
+`"default"`: a served profile
 scores with the configured default weights), `profile_component` (a diagnostic: the hit's composite under the weights
 the serving profile's posteriors project to, divided by its composite under the default weights; it never enters
 `rank_score`), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when none applies) and

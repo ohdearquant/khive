@@ -617,21 +617,26 @@ pub(super) fn compute_score(
     decay_factor: f64,
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
-    compute_score_inner(
+    let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
+    let (total, mut breakdown) = compute_score_inner(
         cfg,
         pipeline,
-        raw_relevance,
+        relevance,
         salience,
         decay_factor,
         age_days,
         true,
-    )
+    );
+    breakdown.fused_score = raw_relevance;
+    (total, breakdown)
 }
 
+/// Breakdown for a hit `handle_recall` has already normalized: `relevance` is the value the
+/// ranking composite received, and the breakdown reports it unchanged.
 pub(super) fn compute_score_for_recall(
     cfg: &RecallConfig,
     pipeline: &MemoryRecallPipeline,
-    raw_relevance: f64,
+    relevance: f64,
     salience: f64,
     decay_factor: f64,
     age_days: f64,
@@ -639,7 +644,7 @@ pub(super) fn compute_score_for_recall(
     compute_score_inner(
         cfg,
         pipeline,
-        raw_relevance,
+        relevance,
         salience,
         decay_factor,
         age_days,
@@ -650,14 +655,12 @@ pub(super) fn compute_score_for_recall(
 fn compute_score_inner(
     cfg: &RecallConfig,
     pipeline: &MemoryRecallPipeline,
-    raw_relevance: f64,
+    relevance: f64,
     salience: f64,
     decay_factor: f64,
     age_days: f64,
     report: bool,
 ) -> (f64, ScoreBreakdown) {
-    let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
-
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -691,6 +694,8 @@ fn compute_score_inner(
 
     let breakdown = ScoreBreakdown {
         relevance,
+        // The caller holds the score before normalization and sets it.
+        fused_score: 0.0,
         salience_raw: salience,
         salience_decayed: effective_salience,
         temporal,
@@ -700,6 +705,7 @@ fn compute_score_inner(
             temporal_contribution: t_contrib,
         },
         // Neutral/absent here; `handle_recall` fills the fields it reports.
+        composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
         weights_served: if report {
