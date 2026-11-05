@@ -318,9 +318,9 @@ impl KhiveRuntime {
         // canonical source for the namespace rule, without changing canonicalization.
         let (canonical_source, _) = canonical_edge_endpoints(relation, source_id, target_id);
         let source_namespace = if canonical_source == source_id {
-            source.header.namespace.as_str()
+            source.namespace.as_str()
         } else {
-            target.header.namespace.as_str()
+            target.namespace.as_str()
         };
         if source_namespace != token.namespace().as_str() {
             return Err(RuntimeError::InvalidInput(format!(

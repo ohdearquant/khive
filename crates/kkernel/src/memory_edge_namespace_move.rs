@@ -246,7 +246,7 @@ async fn classify_endpoints(
             if source.kind == "memory" && target.kind == "memory" =>
         {
             EndpointClass::MemoryPair {
-                source_namespace: source.header.namespace.as_str().to_owned(),
+                source_namespace: source.namespace.as_str().to_owned(),
             }
         }
         _ => EndpointClass::Excluded,
@@ -697,13 +697,13 @@ mod tests {
             .expect("fixture create_note(memory) after KhiveRuntime::new(resolve_runtime_config with no_embed=true) failed; setup failure, never control credit");
         ensure!(note.kind == "memory", "fixture note kind is not memory");
         ensure!(
-            note.header.namespace.as_str() == namespace,
+            note.namespace.as_str() == namespace,
             "fixture note namespace differs"
         );
-        let id = Uuid::from(note.header.id);
+        let id = note.id;
         ensure!(
             matches!(runtime.resolve_by_id_including_deleted(&token, id).await?,
-                Some(Resolved::Note(stored)) if stored.kind == "memory" && stored.header.namespace.as_str() == namespace),
+                Some(Resolved::Note(stored)) if stored.kind == "memory" && stored.namespace.as_str() == namespace),
             "fixture memory note did not persist with its kind and namespace"
         );
         seed_paths.push("create_note");
@@ -845,7 +845,7 @@ mod tests {
             );
             ensure!(
                 matches!(runtime.resolve_by_id_including_deleted(&token, source).await?,
-                    Some(Resolved::Note(note)) if note.kind == "memory" && note.header.namespace.as_str() == SOURCE),
+                    Some(Resolved::Note(note)) if note.kind == "memory" && note.namespace.as_str() == SOURCE),
                 "soft-deleted fixture source did not retain memory kind and stored namespace"
             );
         }
