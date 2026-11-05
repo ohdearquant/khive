@@ -8190,3 +8190,76 @@ async fn test_hidden_incoming_budget_counts_only_returned_hit() {
         "budget hidden source omitted"
     );
 }
+
+#[tokio::test]
+async fn hidden_incoming_timings_distinguish_zero_count_from_skipped_step() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory timing fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("timing local token");
+    let target = rt
+        .create_note(
+            &local,
+            "memory",
+            None,
+            "hiddenincomingstageprobe",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("timing fixture note");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("timing fixture registry");
+    let params = |query| {
+        json!({
+            "namespace": "local",
+            "query": query,
+            "fusion_strategy": "keyword_only",
+            "min_score": 0.0,
+            "limit": 1,
+            "include_timings": true,
+        })
+    };
+    let entered = registry
+        .dispatch_with_disposition("memory.recall", params("hiddenincomingstageprobe"), None)
+        .await
+        .expect("entered count recall");
+    let hits = entered["results"].as_array().expect("timed recall results");
+    assert_eq!(hits.len(), 1, "the count step has one ranked target");
+    assert_eq!(hits[0]["id"], target.id.to_string());
+    assert_eq!(hits[0]["hidden_incoming_edges"]["total"], json!(0));
+    assert!(
+        entered["timings"]["hidden_incoming_us"].as_u64().is_some(),
+        "an entered count returning zero keeps its measured duration: {entered:?}"
+    );
+
+    let skipped = registry
+        .dispatch_with_disposition("memory.recall", params("nohitstageprobe"), None)
+        .await
+        .expect("empty ranking recall");
+    assert!(
+        skipped["results"]
+            .as_array()
+            .expect("empty timed results")
+            .is_empty(),
+        "the skipped arm has no ranked targets"
+    );
+    assert!(
+        skipped["timings"]
+            .get("hidden_incoming_us")
+            .expect("the skipped count stage is reported")
+            .is_null(),
+        "a skipped count has no measured duration: {skipped:?}"
+    );
+}

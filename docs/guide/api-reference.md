@@ -1678,7 +1678,9 @@ stage did not run; the text and vector searches run concurrently, so the stages 
 not add up), `retrieval_rounds`, and `rounds[]` with each round's
 `candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
 and stage times. An array response becomes `{results, timings}`; an object
-response keeps its fields and gains `timings`.
+response keeps its fields and gains `timings`. `hidden_incoming_us` measures the
+post-ranking hidden incoming count, including graph access and the awaited query;
+it is `null` when the step is skipped and remains numeric when the count is zero.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")

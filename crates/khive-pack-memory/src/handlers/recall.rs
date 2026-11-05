@@ -684,10 +684,11 @@ impl MemoryPack {
             }
         }
         let candidate_limit = current_candidate_limit;
-        let timings_report: Option<Value> = include_timings.then(|| {
+        let mut timings_report: Option<Value> = include_timings.then(|| {
             let mut report = recall_stage_timings.stage_report();
             report["retrieval_rounds"] = json!(round_reports.len());
             report["rounds"] = Value::Array(round_reports);
+            report["hidden_incoming_us"] = Value::Null;
             report
         });
 
@@ -1191,14 +1192,21 @@ impl MemoryPack {
                     .map(|namespace| namespace.as_str().to_string())
                     .collect();
                 let relations = vec!["supersedes".to_string()];
-                self.runtime
+                let hidden_started = include_timings.then(Instant::now);
+                let counts = self
+                    .runtime
                     .graph(&effective_token)?
                     .count_hidden_incoming_memory_edges(
                         &hidden_target_ids,
                         Some(&relations),
                         &namespaces,
                     )
-                    .await?
+                    .await?;
+                if let (Some(report), Some(started)) = (timings_report.as_mut(), hidden_started) {
+                    report["hidden_incoming_us"] =
+                        json!(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+                }
+                counts
                     .into_iter()
                     .map(|(target_id, _, count)| (target_id, count))
                     .collect()
