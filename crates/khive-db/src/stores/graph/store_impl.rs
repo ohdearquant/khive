@@ -1689,6 +1689,15 @@ mod hidden_incoming_memory_edge_index_tests {
         assert_eq!(scoped, expected);
 
         let connection = Connection::open(&path).unwrap();
+        // Production stores are usually never analyzed, so the plan must hold
+        // without planner statistics as well as with them.
+        for scope in [None, Some(relation_scope.as_slice())] {
+            let plan = query_plan(&connection, &visible_namespaces, &target_ids, scope);
+            assert!(
+                uses_target_leading_index_without_graph_edge_scan(&plan),
+                "without ANALYZE the production SQL must SEARCH graph_edges through idx_graph_edges_target_relation: {plan:?}"
+            );
+        }
         connection.execute_batch("ANALYZE graph_edges;").unwrap();
         let plans = [
             (
