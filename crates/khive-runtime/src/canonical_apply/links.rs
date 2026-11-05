@@ -115,6 +115,18 @@ pub(super) async fn materialize(
         .ok_or_else(|| failure("canonical link target is missing"))?;
     let (source_kind, target_kind) =
         endpoints(&source, &target, edge.relation, rules).map_err(|e| failure(e.to_string()))?;
+    if let (Record::Note(source_note), Record::Note(target_note)) = (&source, &target) {
+        crate::KhiveRuntime::ensure_memory_note_edge_namespace(
+            "apply_changeset",
+            edge.namespace.as_str(),
+            edge.source_id,
+            edge.target_id,
+            edge.relation,
+            source_note,
+            target_note,
+        )
+        .map_err(|e| failure(e.to_string()))?;
+    }
     let rows = writer
         .query_all(
             SqlStatement::new(

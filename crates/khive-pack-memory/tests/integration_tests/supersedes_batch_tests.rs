@@ -585,10 +585,23 @@ async fn test_recall_supersedes_lookup_is_one_batched_statement() {
         CANDIDATES.div_ceil(BATCH_CHUNK),
         "the candidates' supersedes edges must be read in ceil(N / 880) statements"
     );
+    let is_hidden_count = |sql: &str| {
+        sql.contains("COUNT(*) FROM graph_edges") && sql.contains("json_each(")
+    };
+    let hidden_counts = statements
+        .iter()
+        .filter(|statement| is_hidden_count(&statement.sql))
+        .count();
+    assert_eq!(
+        hidden_counts, 1,
+        "the hidden incoming edge count must be one grouped statement per recall"
+    );
     let per_candidate = statements
         .iter()
         .filter(|statement| {
-            statement.sql.contains("target_id IN (") && statement.sql.contains("relation IN (")
+            statement.sql.contains("target_id IN (")
+                && statement.sql.contains("relation IN (")
+                && !is_hidden_count(&statement.sql)
         })
         .count();
     assert_eq!(

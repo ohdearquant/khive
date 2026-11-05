@@ -37,6 +37,25 @@ use super::{
     NAMESPACE_COUNT_CHUNK_SIZE,
 };
 
+fn count_hidden_incoming_memory_edges_sql(has_relation_scope: bool) -> String {
+    let mut where_clause = " WHERE graph_edges.deleted_at IS NULL \
+        AND graph_edges.namespace NOT IN (SELECT value FROM json_each(?1)) \
+        AND graph_edges.target_id IN (SELECT value FROM json_each(?2)) \
+        AND EXISTS (SELECT 1 FROM notes n \
+            WHERE n.id = graph_edges.source_id AND n.kind = 'memory') \
+        AND EXISTS (SELECT 1 FROM notes n \
+            WHERE n.id = graph_edges.target_id AND n.kind = 'memory')"
+        .to_string();
+    if has_relation_scope {
+        where_clause.push_str(" AND graph_edges.relation IN (SELECT value FROM json_each(?3))");
+    }
+    format!(
+        "SELECT target_id, relation, COUNT(*) FROM graph_edges{} \
+         GROUP BY target_id, relation",
+        with_live_endpoints(&where_clause)
+    )
+}
+
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn update_symmetric_edge_if_unchanged(
@@ -826,6 +845,42 @@ impl GraphStore for SqlGraphStore {
         })
         .await
     }
+    async fn count_hidden_incoming_memory_edges(
+        &self,
+        target_ids: &[String],
+        relations: Option<&[String]>,
+        visible_namespaces: &[String],
+    ) -> Result<Vec<(String, String, u64)>, StorageError> {
+        let target_ids_json = serde_json::json!(target_ids).to_string();
+        let namespaces_json = serde_json::json!(visible_namespaces).to_string();
+        let relations_json = relations.map(|scope| serde_json::json!(scope).to_string());
+        let has_relation_scope = relations_json.is_some();
+        self.with_reader("count_hidden_incoming_memory_edges", move |conn| {
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(namespaces_json), Box::new(target_ids_json)];
+            if let Some(scope) = relations_json {
+                params.push(Box::new(scope));
+            }
+            let sql = count_hidden_incoming_memory_edges_sql(has_relation_scope);
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut counts = Vec::new();
+            for row in rows {
+                let (target_id, relation, count) = row?;
+                counts.push((target_id, relation, count as u64));
+            }
+            Ok(counts)
+        })
+        .await
+    }
 
     async fn query_edges_in_namespaces(
         &self,
@@ -1515,5 +1570,155 @@ impl GraphStore for SqlGraphStore {
             Ok(stmt.raw_execute()? as u64)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod hidden_incoming_memory_edge_index_tests {
+    use super::count_hidden_incoming_memory_edges_sql;
+    use crate::backend::StorageBackend;
+    use chrono::Utc;
+    use khive_storage::types::Edge;
+    use khive_storage::{GraphStore, Note, NoteStore};
+    use khive_types::EdgeRelation;
+    use rusqlite::{params_from_iter, types::Value, Connection};
+    use uuid::Uuid;
+
+    fn edge(source_id: Uuid, target_id: Uuid) -> Edge {
+        Edge {
+            id: Uuid::new_v4().into(),
+            namespace: "private".into(),
+            source_id,
+            target_id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        }
+    }
+
+    fn query_plan(
+        connection: &Connection,
+        visible_namespaces: &[String],
+        target_ids: &[String],
+        relations: Option<&[String]>,
+    ) -> Vec<String> {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            count_hidden_incoming_memory_edges_sql(relations.is_some())
+        );
+        let mut params = vec![
+            Value::Text(serde_json::json!(visible_namespaces).to_string()),
+            Value::Text(serde_json::json!(target_ids).to_string()),
+        ];
+        if let Some(scope) = relations {
+            params.push(Value::Text(serde_json::json!(scope).to_string()));
+        }
+        let mut statement = connection.prepare(&sql).unwrap();
+        let rows = statement
+            .query_map(params_from_iter(params), |row| row.get::<_, String>(3))
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    fn uses_target_leading_index_without_graph_edge_scan(plan: &[String]) -> bool {
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH graph_edges")
+                && detail.contains("idx_graph_edges_target_relation")
+        }) && !plan
+            .iter()
+            .any(|detail| detail.contains("SCAN graph_edges"))
+    }
+
+    #[tokio::test]
+    async fn hidden_incoming_memory_edge_query_uses_target_leading_index_with_and_without_relation_scope(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hidden-memory-edge-index.db");
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
+        let schema_version = backend.prepare_core_schema().unwrap();
+        assert!(
+            schema_version >= 65,
+            "the plan fixture must run the migration that creates the target-leading index"
+        );
+
+        let source = Note::new("private", "memory", "hidden edge source");
+        let target = Note::new("local", "memory", "hidden edge target");
+        let source_id = source.id;
+        let target_id = target.id;
+        NoteStore::upsert_note(&backend, source).await.unwrap();
+        NoteStore::upsert_note(&backend, target).await.unwrap();
+        GraphStore::upsert_edge(&backend, edge(source_id, target_id))
+            .await
+            .unwrap();
+        for _ in 0..128 {
+            let decoy_target = Note::new("private", "memory", "decoy edge target");
+            let decoy_target_id = decoy_target.id;
+            NoteStore::upsert_note(&backend, decoy_target)
+                .await
+                .unwrap();
+            GraphStore::upsert_edge(&backend, edge(source_id, decoy_target_id))
+                .await
+                .unwrap();
+        }
+
+        let visible_namespaces = vec!["local".to_string()];
+        let target_ids = vec![target_id.to_string()];
+        let relation_scope = vec!["annotates".to_string()];
+        let expected = vec![(target_id.to_string(), "annotates".to_string(), 1_u64)];
+        let unscoped = GraphStore::count_hidden_incoming_memory_edges(
+            &backend,
+            &target_ids,
+            None,
+            &visible_namespaces,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unscoped, expected);
+        let scoped = GraphStore::count_hidden_incoming_memory_edges(
+            &backend,
+            &target_ids,
+            Some(&relation_scope),
+            &visible_namespaces,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped, expected);
+
+        let connection = Connection::open(&path).unwrap();
+        // Production stores are usually never analyzed, so the plan must hold
+        // without planner statistics as well as with them.
+        for scope in [None, Some(relation_scope.as_slice())] {
+            let plan = query_plan(&connection, &visible_namespaces, &target_ids, scope);
+            assert!(
+                uses_target_leading_index_without_graph_edge_scan(&plan),
+                "without ANALYZE the production SQL must SEARCH graph_edges through idx_graph_edges_target_relation: {plan:?}"
+            );
+        }
+        connection.execute_batch("ANALYZE graph_edges;").unwrap();
+        let plans = [
+            (
+                "unscoped",
+                query_plan(&connection, &visible_namespaces, &target_ids, None),
+            ),
+            (
+                "relation-scoped",
+                query_plan(
+                    &connection,
+                    &visible_namespaces,
+                    &target_ids,
+                    Some(&relation_scope),
+                ),
+            ),
+        ];
+        assert!(
+            plans.iter().all(|(_, plan)| {
+                uses_target_leading_index_without_graph_edge_scan(plan)
+            }),
+            "both exact production SQL forms must SEARCH graph_edges through idx_graph_edges_target_relation and avoid SCAN graph_edges: {plans:?}"
+        );
     }
 }

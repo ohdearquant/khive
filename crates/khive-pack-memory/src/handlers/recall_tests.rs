@@ -8026,3 +8026,167 @@ async fn keyword_only_widening_ignores_vector_leg_candidates() {
 #[cfg(test)]
 #[path = "recall_boundary_tests.rs"]
 mod recall_boundary_tests;
+
+#[tokio::test]
+async fn test_hidden_incoming_budget_counts_only_returned_hit() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory budget fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("budget local token");
+    let first_content = "d2budgettoken one";
+    let second_content = "d2budgettoken two";
+    assert_eq!(
+        first_content.len(),
+        second_content.len(),
+        "equal ASCII content budget"
+    );
+    assert!(first_content.is_ascii() && second_content.is_ascii());
+    let mut targets = Vec::new();
+    for content in [first_content, second_content] {
+        let note = rt
+            .create_note(&local, "memory", None, content, Some(0.7), None, Vec::new())
+            .await
+            .expect("budget create_note failed; setup failure, never control credit");
+        assert_eq!(note.kind, "memory");
+        assert_eq!(note.namespace, "local");
+        targets.push(note.id);
+    }
+    let params = || {
+        serde_json::json!({
+            "namespace": "local", "query": "d2budgettoken", "fusion_strategy": "keyword_only",
+            "min_score": 0.0, "limit": 10, "full_content": true,
+        })
+    };
+    let mut baseline_builder = khive_runtime::VerbRegistryBuilder::new();
+    baseline_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    baseline_builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let baseline_registry = baseline_builder.build().expect("budget baseline registry");
+    let baseline = baseline_registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual unbounded keyword recall; invalid setup is not control credit");
+    let baseline_hits = baseline.as_array().expect("nonempty keyword recall array");
+    assert_eq!(baseline_hits.len(), 2, "budget_fixture_two_ranked_hits");
+    for target in &targets {
+        assert!(
+            baseline_hits
+                .iter()
+                .any(|hit| hit["id"] == target.to_string()),
+            "both actual fixture hits are returned before the cap"
+        );
+    }
+    for hit in baseline_hits {
+        assert_eq!(
+            hit["hidden_incoming_edges"],
+            serde_json::json!({
+                "total": 0, "by_relation": {"supersedes": 0},
+            }),
+            "uncapped fixture zero baseline"
+        );
+    }
+    drop(baseline_registry);
+
+    let pack = crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
+    {
+        let mut config = pack.config.lock().expect("budget scoring config");
+        config.scoring = Some(crate::scoring::ScoringConfig {
+            default_token_budget: first_content.len(),
+            chars_per_token: 1,
+            ..Default::default()
+        });
+    }
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("capped budget registry");
+    let capped_baseline = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped keyword recall baseline");
+    let capped_hits = capped_baseline.as_array().expect("nonempty capped array");
+    assert_eq!(capped_hits.len(), 1, "budget_fixture_one_returned_hit");
+    assert_eq!(
+        capped_hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget cut is visible on its hit"
+    );
+    assert_eq!(
+        capped_hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(0)
+    );
+
+    let hidden_ns = "d2-budget-hidden";
+    let hidden_token = rt
+        .authorize(khive_runtime::Namespace::parse(hidden_ns).expect("budget hidden namespace"))
+        .expect("budget hidden seed token");
+    let hidden_source = rt
+        .create_note(
+            &hidden_token,
+            "memory",
+            None,
+            "private budget source",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("budget hidden source failed; setup failure, never control credit");
+    for (index, target) in targets.iter().enumerate() {
+        let edge = serde_json::from_value(serde_json::json!({
+            "id": format!("70000000-0000-7000-9000-{:012x}", index + 1),
+            "namespace": hidden_ns, "source_id": hidden_source.id, "target_id": target,
+            "relation": "supersedes", "weight": 0.75,
+            "created_at": "2026-11-04T00:00:00Z", "updated_at": "2026-11-04T00:00:00Z",
+            "deleted_at": null, "metadata": {"fixture": "budget-hidden"}, "target_backend": null,
+        }))
+        .expect("budget edge representation");
+        rt.graph(&hidden_token)
+            .expect("budget hidden seed graph")
+            .upsert_edge(edge)
+            .await
+            .expect("budget edge failed; setup failure, never control credit");
+    }
+    let response = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped recall with hidden edges");
+    let hits = response.as_array().expect("nonempty capped result array");
+    assert_eq!(hits.len(), 1, "budget_capped_recall_returns_one_hit");
+    assert!(
+        targets
+            .iter()
+            .any(|target| hits[0]["id"] == target.to_string()),
+        "budget result belongs to the two seeded candidates"
+    );
+    assert_eq!(
+        hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget_capped_hit_is_stamped"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(1),
+        "budget_capped_recall_hidden_count"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["by_relation"],
+        serde_json::json!({"supersedes": 1})
+    );
+    let bytes = response.to_string();
+    assert!(
+        !bytes.contains(hidden_ns),
+        "budget hidden namespace omitted"
+    );
+    assert!(
+        !bytes.contains(&hidden_source.id.to_string()),
+        "budget hidden source omitted"
+    );
+}

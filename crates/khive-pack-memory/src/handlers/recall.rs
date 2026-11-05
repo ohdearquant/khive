@@ -1180,6 +1180,29 @@ impl MemoryPack {
             ranked.truncate(cut);
         }
         let budget_capped = ranked.len() < pre_budget_count;
+        let hidden_target_ids: Vec<String> = ranked.iter().map(|hit| hit.id.to_string()).collect();
+        let hidden_supersedes: std::collections::HashMap<String, u64> =
+            if hidden_target_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let namespaces: Vec<String> = effective_token
+                    .visible_namespaces()
+                    .iter()
+                    .map(|namespace| namespace.as_str().to_string())
+                    .collect();
+                let relations = vec!["supersedes".to_string()];
+                self.runtime
+                    .graph(&effective_token)?
+                    .count_hidden_incoming_memory_edges(
+                        &hidden_target_ids,
+                        Some(&relations),
+                        &namespaces,
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|(target_id, _, count)| (target_id, count))
+                    .collect()
+            };
 
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
@@ -1235,6 +1258,10 @@ impl MemoryPack {
                     };
                 let (hit_properties, hit_tags) =
                     hit_properties_and_tags(sn.note.properties.as_ref());
+                let hidden_count = hidden_supersedes
+                    .get(&sn.id.to_string())
+                    .copied()
+                    .unwrap_or(0);
                 let mut result = json!({
                     "id": sn.id.to_string(),
                     "full_id": sn.id.to_string(),
@@ -1249,6 +1276,10 @@ impl MemoryPack {
                     "namespace": sn.note.namespace,
                     "tags": hit_tags,
                     "properties": hit_properties,
+                    "hidden_incoming_edges": {
+                        "total": hidden_count,
+                        "by_relation": {"supersedes": hidden_count},
+                    },
                 });
                 if let Some(source) = source_ids.get(&sn.id) {
                     result["source_id"] = json!(source);

@@ -783,3 +783,5 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
 }
 
 include!("integration_tests/final_mmr_score_floor_tests.rs");
+
+include!("integration_tests/hidden_incoming_edges_tests.rs");
