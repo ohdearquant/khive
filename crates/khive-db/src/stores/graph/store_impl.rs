@@ -47,8 +47,7 @@ fn count_hidden_incoming_memory_edges_sql(has_relation_scope: bool) -> String {
             WHERE n.id = graph_edges.target_id AND n.kind = 'memory')"
         .to_string();
     if has_relation_scope {
-        where_clause
-            .push_str(" AND graph_edges.relation IN (SELECT value FROM json_each(?3))");
+        where_clause.push_str(" AND graph_edges.relation IN (SELECT value FROM json_each(?3))");
     }
     format!(
         "SELECT target_id, relation, COUNT(*) FROM graph_edges{} \
@@ -1635,7 +1634,8 @@ mod hidden_incoming_memory_edge_index_tests {
     }
 
     #[tokio::test]
-    async fn hidden_incoming_memory_edge_query_uses_target_leading_index_with_and_without_relation_scope() {
+    async fn hidden_incoming_memory_edge_query_uses_target_leading_index_with_and_without_relation_scope(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hidden-memory-edge-index.db");
         let backend = StorageBackend::sqlite_for_test(&path).unwrap();
@@ -1657,7 +1657,9 @@ mod hidden_incoming_memory_edge_index_tests {
         for _ in 0..128 {
             let decoy_target = Note::new("private", "memory", "decoy edge target");
             let decoy_target_id = decoy_target.id;
-            NoteStore::upsert_note(&backend, decoy_target).await.unwrap();
+            NoteStore::upsert_note(&backend, decoy_target)
+                .await
+                .unwrap();
             GraphStore::upsert_edge(&backend, edge(source_id, decoy_target_id))
                 .await
                 .unwrap();

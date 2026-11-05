@@ -1485,7 +1485,9 @@ mod tests {
                 let counts = receipt["dry"]["counts"].as_array().expect("preview counts");
                 assert!(!counts.is_empty(), "collision_fixture_has_counts");
                 assert!(
-                    counts.iter().any(|count| count["before"].as_u64().expect("before count") > 0),
+                    counts
+                        .iter()
+                        .any(|count| count["before"].as_u64().expect("before count") > 0),
                     "collision_fixture_has_nonzero_counts"
                 );
                 assert_eq!(
