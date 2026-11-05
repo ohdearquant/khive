@@ -252,14 +252,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
 }
 
 fn preflight_read_only_ops(ops: &str) -> Result<()> {
-    let parsed = khive_request::parse_request(ops)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let parsed = khive_request::parse_request(ops).map_err(|error| anyhow::anyhow!("{error}"))?;
     for op in &parsed.ops {
         let declared_read = khive_runtime::classify_operation(&op.tool)
             == Some(khive_runtime::OperationAccess::Read);
         let side_effecting_assertion =
-            khive_runtime::VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS
-                .contains(&op.tool.as_str());
+            khive_runtime::VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&op.tool.as_str());
         if !declared_read || side_effecting_assertion {
             anyhow::bail!(
                 "--read-only refuses operation {:?}: it is not an allowed reviewed read operation",
@@ -294,33 +292,73 @@ mod read_only_policy_tests {
     }
 
     fn child_fixture(test_name: &str) -> Option<ChildFixture> {
-        let Some(requested) = std::env::var_os(CHILD_ENV) else {
-            return None;
-        };
-        assert_eq!(requested.to_str().expect("UTF-8 child kind"), test_name, "invalid readonly child test kind");
+        let requested = std::env::var_os(CHILD_ENV)?;
+        assert_eq!(
+            requested.to_str().expect("UTF-8 child kind"),
+            test_name,
+            "invalid readonly child test kind"
+        );
         let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("missing private child root"));
         let token = std::env::var(CHILD_TOKEN).expect("missing private child token");
         assert!(token.len() >= 16, "invalid private child token");
         let root = root.canonicalize().expect("private child root must exist");
-        assert!(root.file_name().unwrap().to_string_lossy().starts_with("kkernel-read-only-"), "invalid child root name");
-        assert_eq!(std::env::current_dir().unwrap().canonicalize().unwrap(), root, "child cwd mismatch");
-        assert_eq!(PathBuf::from(std::env::var_os("HOME").expect("private HOME")).canonicalize().unwrap(), root, "child HOME mismatch");
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("kkernel-read-only-"),
+            "invalid child root name"
+        );
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            root,
+            "child cwd mismatch"
+        );
+        assert_eq!(
+            PathBuf::from(std::env::var_os("HOME").expect("private HOME"))
+                .canonicalize()
+                .unwrap(),
+            root,
+            "child HOME mismatch"
+        );
         let marker = root.join(CHILD_MARKER);
         let metadata = std::fs::symlink_metadata(&marker).expect("missing parent child marker");
-        assert!(metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() < 4096, "invalid child marker");
-        let marker: Value = serde_json::from_slice(&std::fs::read(marker).unwrap()).expect("child marker JSON");
+        assert!(
+            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() < 4096,
+            "invalid child marker"
+        );
+        let marker: Value =
+            serde_json::from_slice(&std::fs::read(marker).unwrap()).expect("child marker JSON");
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
         assert_eq!(marker["token"], token, "child token mismatch");
         assert_eq!(marker["test_name"], test_name, "child marker kind mismatch");
-        assert_eq!(marker["exe"], exe.display().to_string(), "child executable mismatch");
-        assert_eq!(marker["root"], root.display().to_string(), "child marker root mismatch");
+        assert_eq!(
+            marker["exe"],
+            exe.display().to_string(),
+            "child executable mismatch"
+        );
+        assert_eq!(
+            marker["root"],
+            root.display().to_string(),
+            "child marker root mismatch"
+        );
         let parent_pid = marker["parent_pid"].as_u64().expect("missing parent pid");
-        assert!(parent_pid != 0 && parent_pid != u64::from(std::process::id()), "parent cannot enter child branch");
-        Some(ChildFixture { root, token, test_name: test_name.to_string() })
+        assert!(
+            parent_pid != 0 && parent_pid != u64::from(std::process::id()),
+            "parent cannot enter child branch"
+        );
+        Some(ChildFixture {
+            root,
+            token,
+            test_name: test_name.to_string(),
+        })
     }
 
     fn child_receipt(fixture: &ChildFixture, mut receipt: Value) {
-        assert!(!fixture.root.join(".lattice").exists(), "model directory appeared in hermetic fixture");
+        assert!(
+            !fixture.root.join(".lattice").exists(),
+            "model directory appeared in hermetic fixture"
+        );
         receipt["fixture_token"] = json!(fixture.token);
         receipt["test_name"] = json!(fixture.test_name);
         receipt["child_pid"] = json!(std::process::id());
@@ -362,7 +400,10 @@ mod read_only_policy_tests {
         assert_eq!(read["results"][0]["ok"], true, "{read}");
         let record = read["results"][0]["result"].to_string();
         assert!(record.contains(&id), "readback omitted stored id: {read}");
-        assert!(record.contains(name), "readback omitted stored name: {read}");
+        assert!(
+            record.contains(name),
+            "readback omitted stored name: {read}"
+        );
         id
     }
 
@@ -399,7 +440,10 @@ mod read_only_policy_tests {
             total: &mut usize,
         ) {
             let metadata = std::fs::symlink_metadata(path).expect("fixture metadata");
-            assert!(!metadata.file_type().is_symlink(), "fixture symlink refused");
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "fixture symlink refused"
+            );
             if metadata.is_dir() {
                 for entry in std::fs::read_dir(path).expect("fixture directory") {
                     visit(root, &entry.unwrap().path(), files, total);
@@ -422,7 +466,9 @@ mod read_only_policy_tests {
 
     #[tokio::test]
     async fn zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree() {
-        if let Some(fixture) = child_fixture("zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree") {
+        if let Some(fixture) = child_fixture(
+            "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree",
+        ) {
             let cwd = &fixture.root;
             let stores = cwd.join("stores");
             std::fs::create_dir(&stores).unwrap();
@@ -436,62 +482,108 @@ mod read_only_policy_tests {
             // The explicit database holds a distinct actual record; the HOME
             // default database does not exist and must remain absent.
             let invocation = super::ExecArgs::try_parse_from([
-                "exec", &format!("get(id={})", json!(id)), "--read-only",
-                "--db", db.to_str().unwrap(),
-                "--config", config.to_str().unwrap(),
-                "--save-file", output.to_str().unwrap(),
-                "--actor", "actor:read-only-policy-test",
-            ]).unwrap();
-            super::run_exec(invocation).await.expect("readonly explicit-database get");
+                "exec",
+                &format!("get(id={})", json!(id)),
+                "--read-only",
+                "--db",
+                db.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            super::run_exec(invocation)
+                .await
+                .expect("readonly explicit-database get");
             let rows = std::fs::read_to_string(output).expect("saved get result");
             let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
             assert_eq!(row["ok"], true, "{row}");
             let record = row["result"].to_string();
-            assert!(record.contains(&id) && record.contains(name), "wrong store: {row}");
-            assert!(!cwd.join(".khive/khive.db").exists(), "created HOME default db");
-            assert_eq!(store_snapshot(&stores), before, "readonly store bytes changed");
-            child_receipt(&fixture, json!({
-                "explicit_database_actual_record": true,
-                "selected_store_tree_unchanged": true,
-                "home_default_absent": true,
-                "id": id,
-            }));
+            assert!(
+                record.contains(&id) && record.contains(name),
+                "wrong store: {row}"
+            );
+            assert!(
+                !cwd.join(".khive/khive.db").exists(),
+                "created HOME default db"
+            );
+            assert_eq!(
+                store_snapshot(&stores),
+                before,
+                "readonly store bytes changed"
+            );
+            child_receipt(
+                &fixture,
+                json!({
+                    "explicit_database_actual_record": true,
+                    "selected_store_tree_unchanged": true,
+                    "home_default_absent": true,
+                    "id": id,
+                }),
+            );
             return;
         }
         let receipt = isolated_child(
             "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree",
             "kg",
-        ).await;
-        assert_eq!(receipt["explicit_database_actual_record"], true, "{receipt}");
+        )
+        .await;
+        assert_eq!(
+            receipt["explicit_database_actual_record"], true,
+            "{receipt}"
+        );
         assert_eq!(receipt["selected_store_tree_unchanged"], true, "{receipt}");
         assert_eq!(receipt["home_default_absent"], true, "{receipt}");
     }
 
     #[tokio::test]
     async fn missing_registered_pack_column_refuses_read_only_boot_without_ddl() {
-        if let Some(fixture) = child_fixture("missing_registered_pack_column_refuses_read_only_boot_without_ddl") {
+        if let Some(fixture) =
+            child_fixture("missing_registered_pack_column_refuses_read_only_boot_without_ddl")
+        {
             let cwd = &fixture.root;
             let stores = cwd.join("stores");
             std::fs::create_dir(&stores).unwrap();
             let current = stores.join("current.db");
-            let current_id = seed_file(&current, "read-only-current-session-schema", &["kg", "session"]).await;
+            let current_id = seed_file(
+                &current,
+                "read-only-current-session-schema",
+                &["kg", "session"],
+            )
+            .await;
             let config = cwd.join("inspection.toml");
             std::fs::write(&config, "engines = []\n").unwrap();
             let current_output = cwd.join("current-read.jsonl");
             let before_current = store_snapshot(&stores);
             let current_args = super::ExecArgs::try_parse_from([
-                "exec", &format!("get(id={})", json!(current_id)), "--read-only",
-                "--db", current.to_str().unwrap(),
-                "--config", config.to_str().unwrap(),
-                "--save-file", current_output.to_str().unwrap(),
-                "--actor", "actor:read-only-policy-test",
-            ]).unwrap();
-            super::run_exec(current_args).await.expect("current registered-pack schema must boot");
+                "exec",
+                &format!("get(id={})", json!(current_id)),
+                "--read-only",
+                "--db",
+                current.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                current_output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            super::run_exec(current_args)
+                .await
+                .expect("current registered-pack schema must boot");
             let saved = std::fs::read_to_string(current_output).unwrap();
             let row: Value = serde_json::from_str(saved.lines().next().unwrap()).unwrap();
             assert_eq!(row["ok"], true, "{row}");
             assert!(row["result"].to_string().contains(&current_id), "{row}");
-            assert_eq!(store_snapshot(&stores), before_current, "current readonly baseline changed store bytes");
+            assert_eq!(
+                store_snapshot(&stores),
+                before_current,
+                "current readonly baseline changed store bytes"
+            );
 
             // KG-only setup preserves the exact released historical cursor
             // shape while keeping the core and KG schemas current.
@@ -506,31 +598,57 @@ mod read_only_policy_tests {
             let before_stale = store_snapshot(&stores);
             let stale_output = cwd.join("stale-read.jsonl");
             let stale_args = super::ExecArgs::try_parse_from([
-                "exec", &format!("get(id={})", json!(stale_id)), "--read-only",
-                "--db", stale.to_str().unwrap(),
-                "--config", config.to_str().unwrap(),
-                "--save-file", stale_output.to_str().unwrap(),
-                "--actor", "actor:read-only-policy-test",
-            ]).unwrap();
-            let error = super::run_exec(stale_args).await.expect_err("missing registered pack column must refuse boot");
+                "exec",
+                &format!("get(id={})", json!(stale_id)),
+                "--read-only",
+                "--db",
+                stale.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--save-file",
+                stale_output.to_str().unwrap(),
+                "--actor",
+                "actor:read-only-policy-test",
+            ])
+            .unwrap();
+            let error = super::run_exec(stale_args)
+                .await
+                .expect_err("missing registered pack column must refuse boot");
             let message = format!("{error:#}");
-            assert!(message.contains("read-only schema validation failed"), "wrong boot refusal: {message}");
-            assert!(message.contains("session_mirror_cursor.file_identity"), "wrong missing column: {message}");
-            assert!(message.contains("open the database writable"), "missing repair guidance: {message}");
+            assert!(
+                message.contains("read-only schema validation failed"),
+                "wrong boot refusal: {message}"
+            );
+            assert!(
+                message.contains("session_mirror_cursor.file_identity"),
+                "wrong missing column: {message}"
+            );
+            assert!(
+                message.contains("open the database writable"),
+                "missing repair guidance: {message}"
+            );
             assert!(!stale_output.exists(), "reserved export before failed boot");
-            assert_eq!(store_snapshot(&stores), before_stale, "readonly stale schema performed DDL or changed store bytes");
-            child_receipt(&fixture, json!({
-                "compatible_registered_schema_positive": true,
-                "named_missing_pack_column_refused": true,
-                "selected_store_tree_unchanged": true,
-                "output_not_reserved": true,
-            }));
+            assert_eq!(
+                store_snapshot(&stores),
+                before_stale,
+                "readonly stale schema performed DDL or changed store bytes"
+            );
+            child_receipt(
+                &fixture,
+                json!({
+                    "compatible_registered_schema_positive": true,
+                    "named_missing_pack_column_refused": true,
+                    "selected_store_tree_unchanged": true,
+                    "output_not_reserved": true,
+                }),
+            );
             return;
         }
         let receipt = isolated_child(
             "missing_registered_pack_column_refuses_read_only_boot_without_ddl",
             "kg,session",
-        ).await;
+        )
+        .await;
         for key in [
             "compatible_registered_schema_positive",
             "named_missing_pack_column_refused",
@@ -565,23 +683,30 @@ mod read_only_policy_tests {
                 Some(create_and_read_back(&server, "read-only-policy-probe").await)
             };
             super::settle_exec_storage_before_return(server).await;
-            child_receipt(&fixture, json!({
-                "baseline_id": baseline_id,
-                "baseline_handler_and_readback": true,
-                "policy_blocked": blocked,
-                "probe_handler_and_readback": probe_id.is_some(),
-                "probe_id": probe_id,
-            }));
+            child_receipt(
+                &fixture,
+                json!({
+                    "baseline_id": baseline_id,
+                    "baseline_handler_and_readback": true,
+                    "policy_blocked": blocked,
+                    "probe_handler_and_readback": probe_id.is_some(),
+                    "probe_id": probe_id,
+                }),
+            );
             return;
         }
-        let receipt = isolated_child("declaration_gate_blocks_actual_writable_dispatch", "kg").await;
+        let receipt =
+            isolated_child("declaration_gate_blocks_actual_writable_dispatch", "kg").await;
         assert_eq!(receipt["baseline_handler_and_readback"], true, "{receipt}");
         assert!(receipt["baseline_id"].as_str().is_some(), "{receipt}");
         if receipt["policy_blocked"] == false {
             assert_eq!(receipt["probe_handler_and_readback"], true, "{receipt}");
             assert!(receipt["probe_id"].as_str().is_some(), "{receipt}");
         }
-        assert_eq!(receipt["policy_blocked"], true, "read_only_dispatch_not_reached: {receipt}");
+        assert_eq!(
+            receipt["policy_blocked"], true,
+            "read_only_dispatch_not_reached: {receipt}"
+        );
         assert_eq!(receipt["probe_handler_and_readback"], false, "{receipt}");
     }
 
@@ -594,16 +719,24 @@ mod read_only_policy_tests {
         let token = format!(
             "{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             root.path().file_name().unwrap().to_string_lossy(),
         );
-        std::fs::write(root.path().join(CHILD_MARKER), serde_json::to_vec(&json!({
-            "token": token,
-            "test_name": test_name,
-            "exe": exe.display().to_string(),
-            "root": root.path().canonicalize().unwrap().display().to_string(),
-            "parent_pid": std::process::id(),
-        })).unwrap()).expect("parent-owned child marker");
+        std::fs::write(
+            root.path().join(CHILD_MARKER),
+            serde_json::to_vec(&json!({
+                "token": token,
+                "test_name": test_name,
+                "exe": exe.display().to_string(),
+                "root": root.path().canonicalize().unwrap().display().to_string(),
+                "parent_pid": std::process::id(),
+            }))
+            .unwrap(),
+        )
+        .expect("parent-owned child marker");
         let filter = module_path!().split_once("::").expect("test module").1;
         let mut command = tokio::process::Command::new(exe);
         for (name, _) in std::env::vars_os() {
@@ -657,18 +790,34 @@ mod read_only_policy_tests {
         let err = err.await.expect("join stderr").expect("read stderr");
         let out = String::from_utf8_lossy(&out);
         let err = String::from_utf8_lossy(&err);
-        let rows: Vec<_> = out.lines().filter_map(|line| line.strip_prefix(RECEIPT)).collect();
+        let rows: Vec<_> = out
+            .lines()
+            .filter_map(|line| line.strip_prefix(RECEIPT))
+            .collect();
         root.close().expect("remove completed private fixture");
         assert!(
             out.len() < OUTPUT_LIMIT as usize && err.len() < OUTPUT_LIMIT as usize,
             "invalid policy fixture: child output reached the capture limit"
         );
-        assert!(status.success(), "invalid policy fixture exit: {out}\n{err}");
+        assert!(
+            status.success(),
+            "invalid policy fixture exit: {out}\n{err}"
+        );
         assert_eq!(rows.len(), 1, "missing/duplicate child receipt: {out}");
         let receipt: Value = serde_json::from_str(rows[0]).expect("policy receipt JSON");
-        assert_eq!(receipt["fixture_token"], token, "child receipt token mismatch");
-        assert_eq!(receipt["test_name"], test_name, "child receipt kind mismatch");
-        assert_eq!(receipt["child_pid"].as_u64(), Some(u64::from(child_pid)), "child receipt pid mismatch");
+        assert_eq!(
+            receipt["fixture_token"], token,
+            "child receipt token mismatch"
+        );
+        assert_eq!(
+            receipt["test_name"], test_name,
+            "child receipt kind mismatch"
+        );
+        assert_eq!(
+            receipt["child_pid"].as_u64(),
+            Some(u64::from(child_pid)),
+            "child receipt pid mismatch"
+        );
         receipt
     }
 }
@@ -700,7 +849,10 @@ async fn run_exec_inline_read_only(
         anyhow::bail!("--read-only requires an existing file-backed database");
     }
     validate_wal_ceiling_topology(&cfg, &khive_cfg.backends, false)?;
-    let path = cfg.db_path.as_deref().expect("file-backed path checked above");
+    let path = cfg
+        .db_path
+        .as_deref()
+        .expect("file-backed path checked above");
     if !path.is_file() {
         anyhow::bail!(
             "--read-only requires an existing file-backed database: {}",

@@ -5,8 +5,7 @@ use tempfile::TempDir;
 fn args(root: &TempDir, ops: &str) -> ExecArgs {
     let db = root.path().join("missing.db");
     let config = root.path().join("khive.toml");
-    std::fs::write(&config, "engines = []\n")
-        .expect("write isolated config");
+    std::fs::write(&config, "engines = []\n").expect("write isolated config");
     ExecArgs::try_parse_from([
         "exec",
         ops,
@@ -22,10 +21,15 @@ fn args(root: &TempDir, ops: &str) -> ExecArgs {
 }
 
 async fn assert_refusal(args: ExecArgs, message: &str, root: &TempDir) {
-    let error = run_exec(args).await.expect_err("invocation must be refused");
+    let error = run_exec(args)
+        .await
+        .expect_err("invocation must be refused");
     assert!(error.to_string().contains(message), "{error:#}");
     assert!(!root.path().join("missing.db").exists(), "opened a writer");
-    assert!(!root.path().join("output.jsonl").exists(), "reserved save output");
+    assert!(
+        !root.path().join("output.jsonl").exists(),
+        "reserved save output"
+    );
 }
 
 #[tokio::test]
@@ -52,7 +56,12 @@ async fn read_only_refuses_pending_events_before_running_the_drain() {
     let mut invocation = args(&root, "whoami()");
     invocation.ops = None;
     invocation.pending_events = true;
-    assert_refusal(invocation, "--read-only conflicts with --pending-events", &root).await;
+    assert_refusal(
+        invocation,
+        "--read-only conflicts with --pending-events",
+        &root,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -76,8 +85,12 @@ async fn read_only_refuses_memory_storage() {
     let root = tempfile::tempdir().unwrap();
     let mut invocation = args(&root, "whoami()");
     invocation.db = Some(":memory:".into());
-    assert_refusal(invocation, "--read-only requires an existing file-backed database", &root)
-        .await;
+    assert_refusal(
+        invocation,
+        "--read-only requires an existing file-backed database",
+        &root,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -108,7 +121,12 @@ async fn read_only_refuses_any_declared_backends_before_opening_storage() {
             ));
         }
         std::fs::write(invocation.config.as_ref().unwrap(), config).unwrap();
-        assert_refusal(invocation, "--read-only does not support declared backends", &root).await;
+        assert_refusal(
+            invocation,
+            "--read-only does not support declared backends",
+            &root,
+        )
+        .await;
         assert!(!other.exists(), "opened the secondary backend");
     }
 }
@@ -122,5 +140,10 @@ async fn read_only_refuses_configured_mounts_before_starting_a_producer() {
         "engines = []\n\n[[mounts]]\nname = \"fixture-mount\"\ntransport = \"stdio\"\ncommand = \"/bin/true\"\n",
     )
     .unwrap();
-    assert_refusal(invocation, "--read-only does not support configured mounts", &root).await;
+    assert_refusal(
+        invocation,
+        "--read-only does not support configured mounts",
+        &root,
+    )
+    .await;
 }
