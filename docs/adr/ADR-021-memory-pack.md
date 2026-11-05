@@ -25,6 +25,9 @@ declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 **Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
 the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
 `memory.remember` reserves the `supersedes` property (#6386; proposed).
+**Amended**: 2026-11-04, [Delta 3](#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04) of
+the batch-apply amendment: an edge between two memory rows is written in the source row's namespace by every verb,
+and edge reads report how many such edges they left out (#6380; proposed).
 
 ## Context
 
@@ -1039,3 +1042,83 @@ visible namespace, with the new row outside the candidates; an explicit-namespac
 before; `memory.remember` refusing `properties.supersedes` with the refusal above; stored rows whose
 `properties.supersedes` is empty or one hex character hiding nothing, and a full UUID and an 8-character prefix still
 hiding their targets.
+
+### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
+
+**Status**: Proposed 2026-11-04. Changes where Decision 7's `supersedes` edges, and every other edge between two
+memory rows, are written, and what an edge read reports when it leaves edges out.
+
+**Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
+`supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
+kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. ADR-007 Rev 6 Rule 0's scope
+note says every non-memory write, edges included, keeps the `local` default, and neither it nor the 2026-11-01
+amendment for semantic writes treats an edge between two memory rows differently. This delta narrows that sentence for
+edges whose source and target are both memory rows, and ADR-007 Rule 9's qualifications and Rule 8 constraints 1
+and 4 now name the placement rule below beside `restore`'s ownership comparison. A second reader of one measured row sees five of its six outgoing `supersedes` edges, and nothing in the
+`neighbors` response says that one is missing.
+
+**Decision.**
+
+1. **Namespace rule.** An edge whose source and target are both memory rows is written in the source row's namespace,
+   whichever verb writes it. Three verbs write such an edge: `memory.apply_batch`, `link`, and a link op in
+   `apply_changeset`, and `restore` revives one. Each of the three writers reads the source row and compares its stored namespace with the request's write namespace,
+   the one the gate checked: the caller's own, or the explicit `namespace` argument, or for `apply_changeset` the op's
+   own `namespace` field. The two must be equal. A mismatch is refused before anything is written and names the source
+   row's namespace to retry with; the edge is never redirected and an op's namespace is never overridden.
+   `memory.apply_batch` writes the edge from the row it has just written in the caller's namespace, so its two
+   namespaces always agree. `restore` of a soft-deleted edge between memory rows compares the edge's stored namespace
+   with its source row's and refuses a mismatch, so a tombstone the move leaves in place cannot come back live in the
+   wrong namespace. This is a placement rule and grants nothing: who may write a namespace stays the gate's decision on
+   the request (ADR-007 Rev 8 Rule 9). It refuses no read; the only by-id effect it changes is where an edge between
+   memory rows may be written or revived, recorded as an ADR-007 Rule 9 qualification.
+2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
+   can see. For the row whose edges the read lists (recall: each returned row; `neighbors`: the anchor row), and for each
+   relation, the response also carries the number of edges between memory rows that arrive at that row and that the
+   read leaves out because they are stored in a namespace outside that set. Each such edge is one the reader would
+   have been given if it could see that namespace, so an edge with a soft-deleted endpoint, which no read returns,
+   is not counted. The field is present on every filtered read, with `0` when nothing was left out, so a missing field
+   means the producer is broken, never that nothing was hidden. Under rule 1 an edge is stored in its source row's
+   namespace, so after the move in rule 3 the counted edges are exactly those from rows outside the reader's
+   namespaces, and a reader already sees every outgoing edge of a row it can see; the edges this count covers are
+   the incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
+   withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
+   The field is `hidden_incoming_edges`, shaped `{"total": n, "by_relation": {"<relation>": n}}`; `total` is always
+   present. Recall carries it on every returned row, for `supersedes`. A `neighbors` call anchored on a memory row always
+   returns the object-shaped response and carries the field once, at the top; `by_relation` lists each relation of the
+   request's filter, or with no filter each relation whose count is above zero. This is a breaking change for that
+   anchor kind only: a call anchored on a memory row with no `limit` used to return a bare array. A `neighbors` call
+   anchored on any other record keeps its current shape. The count comes from one storage query that is given the
+   reader's visible namespaces and returns numbers only; no read is opened in a namespace the reader cannot see.
+3. **Existing edges.** A one-time move rewrites each live edge between memory rows whose namespace differs from its
+   source row's namespace, keeping the edge's id. Soft-deleted edges stay where they are: no read returns them, and
+   edge listing does not enumerate them. Before its first write the move computes the destination of every edge it
+   would move, as (source row's namespace, source, target, relation), over the whole set. If an edge already holds one
+   of those destinations, live or soft-deleted, or two moving edges share one, the whole run is refused and nothing is
+   written. The applying run is not one transaction: it replaces each edge only if the edge's stored `updated_at` and
+   `deleted_at` still equal what the preflight read, so an edge changed by another writer stops the run instead of
+   being overwritten. If another write takes an edge's destination after the preflight, that edge's update fails on the
+   unique (namespace, source, target, relation) index and the run stops there in the same way. After it stops or
+   finishes, it counts the misplaced edges again from the store rather than subtracting what it moved. A run that
+   stops part way reports how many edges it moved and how many remain; every run, a re-run included, repeats the whole
+   preflight before its first write and moves only the edges still misplaced. Other writers are stopped while it runs. The move has a dry run
+   that prints per-namespace edge counts before and after and writes nothing; the applying run prints the same counts.
+
+**Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
+chain is either whole or reported as partial with a count. `link` gains one read of its source record when both
+endpoints are memory rows. Edges from a memory row to a non-memory record, and edges between non-memory records, keep
+their current rule.
+
+**Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
+arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
+superseding row remains a follow-up, not solved here. Two further disclosures follow from the design: a refused write
+names the source row's namespace, so a caller holding a memory row's id can learn its namespace (namespace is
+attribution under ADR-007 Rev 8, not a secret); and the count covers only edges whose endpoints are live, so it falls
+when a hidden source row is soft-deleted, which shows a reader that a row it cannot see was deleted.
+
+**Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
+the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
+written; `restore` of a soft-deleted edge between memory rows whose namespace differs from its source row's refused
+with the edge left soft-deleted; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
+edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
+run leaving all six in the source row's namespace.
