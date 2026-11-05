@@ -1446,7 +1446,7 @@ def gate_recall_read(result, arm: str, want_profile: str | None, before: str | N
         raise GateStop("the response carries no timings although include_timings was asked")
     for h in hits:
         b = h.get("breakdown")
-        for field in ("pre_entity_score", "entity_term"):
+        for field in ("pre_entity_score", "entity_term", "local_factor", "duplicate_penalty"):
             v = b.get(field) if isinstance(b, dict) else None
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise GateRefused(f"a hit has no breakdown.{field} although include_breakdown was asked: this build "
@@ -1465,10 +1465,15 @@ def gate_recall_read(result, arm: str, want_profile: str | None, before: str | N
 
 def summarize_recall(read: dict, what: str) -> dict:
     """What the report keeps of one clean recall: the ranked ids, how many hits came back, how many retrieval rounds
-    ran, the top-10 hits whose composite sits at its clamp, and how many hits carry an entity term other than 1."""
+    ran, the top-10 hits whose composite sits at its clamp, how many hits carry an entity term other than 1, and per
+    hit in served order its namespace, rank_score and every term of rank_score = pre_entity_score * entity_term *
+    local_factor - duplicate_penalty, so a ranking rule over those terms can be replayed from the record."""
     hits = read["hits"]
+    hit_terms = [{"id": hit_id(h, what), "namespace": h.get("namespace"), "rank_score": h.get("rank_score"),
+                  **{t: h["breakdown"][t] for t in ("pre_entity_score", "entity_term", "local_factor",
+                                                    "duplicate_penalty")}} for h in hits]
     return {"ids": list(dict.fromkeys(hit_id(h, what) for h in hits)), "returned": len(hits), "rounds": read["rounds"],
-            "capped": read["capped"],
+            "capped": read["capped"], "hit_terms": hit_terms,
             "clamped_top10": sum(1 for h in hits[:GATE_TOP] if h["breakdown"]["pre_entity_score"] == 1.0),
             "entity_hits": len(hits), "entity_not_one": sum(1 for h in hits if h["breakdown"]["entity_term"] != 1.0),
             "weights_served": sorted({str(h["breakdown"].get("weights_served")) for h in hits})}
@@ -1939,7 +1944,8 @@ def gate_self_checks(arm, with_patches) -> None:
     def hit(i, att="unspecified", by=None, pre=0.5, term=1.0, **extra):
         idv = gid(i) if isinstance(i, int) else i
         h = {"id": idv, "full_id": idv, "created_at": "2026-01-01T00:00:00Z", "serve_attribution": att,
-             "rank_score": 0.5, "breakdown": {"pre_entity_score": pre, "entity_term": term, "weights_served": "default"},
+             "rank_score": 0.5, "breakdown": {"pre_entity_score": pre, "entity_term": term, "local_factor": 1.0,
+                                              "duplicate_penalty": 0.0, "weights_served": "default"},
              **extra}
         if by is not None:
             h["served_by_profile_id"] = by
@@ -2019,7 +2025,10 @@ def gate_self_checks(arm, with_patches) -> None:
         lambda: stops(lambda: gate_recall_read(response([hit(0, created_at="2026-10-28T12:00:00Z")]), "none", None, T))
         and stops(lambda: read({"results": none_hits()}, "none"))
         and stops(lambda: read(none_hits(), "none"))
-        and code_of(lambda: read(response([dict(hit(0), breakdown={})]), "none")) == EXIT_REFUSED)
+        and code_of(lambda: read(response([dict(hit(0), breakdown={})]), "none")) == EXIT_REFUSED
+        and all(code_of(lambda t=t: read(response([dict(hit(0), breakdown={k: v for k, v in hit(0)["breakdown"].items()
+                                                                           if k != t})]), "none")) == EXIT_REFUSED
+                for t in ("pre_entity_score", "entity_term", "local_factor", "duplicate_penalty")))
 
     def brain_profile_refused():
         clean = "[actor]\nid = \"a\"\n\n[[engines]]\nname = \"e\"\n"
@@ -2170,7 +2179,7 @@ def gate_self_checks(arm, with_patches) -> None:
             return table[(case["case_id"], "candidate" if pid else "none")]
         return ask
 
-    full = [hit(0, pre=1.0)] + [hit(i) for i in range(1, 20)] + [hit(20, pre=1.0)] + [hit(i) for i in range(21, 50)]
+    full = [hit(0, pre=1.0, namespace="local")] + [hit(i) for i in range(1, 20)] + [hit(20, pre=1.0)] + [hit(i) for i in range(21, 50)]
     cand_full = ([hit(0, att="profile", by=CAND, pre=1.0), hit(1, att="profile", by=CAND, pre=1.0),
                   hit(2, att="profile", by=CAND, term=0.9)]
                  + [hit(i, att="profile", by=CAND) for i in range(3, 50)])
@@ -2187,6 +2196,14 @@ def gate_self_checks(arm, with_patches) -> None:
         and c["none"]["capped"] == 0 and c["candidate"]["capped"] == 1
         and played["questions"][0]["none"]["clamped_top10"] == 1 and played["questions"][0]["candidate"]["clamped_top10"] == 2
         and played["questions"][0]["candidate"]["entity_not_one"] == 1 and played["questions"][0]["none"]["entity_not_one"] == 0)
+    arm("rebind-gate: each recall keeps, per hit in served order, its id, namespace, rank_score and rank_score terms",
+        lambda: len(played["questions"][0]["none"]["hit_terms"]) == 50
+        and played["questions"][0]["none"]["hit_terms"][0] == {"id": gid(0), "namespace": "local", "rank_score": 0.5,
+                                                                "pre_entity_score": 1.0, "entity_term": 1.0,
+                                                                "local_factor": 1.0, "duplicate_penalty": 0.0}
+        and played["questions"][0]["candidate"]["hit_terms"][2]["entity_term"] == 0.9
+        and list(dict.fromkeys(h["id"] for h in played["questions"][0]["candidate"]["hit_terms"]))
+        == played["questions"][0]["candidate"]["ids"])
     arm("rebind-gate: the arms run adjacent in time, no profile first, in the bank's question order",
         lambda: order == [("c0", "none"), ("c0", "candidate"), ("c1", "none"), ("c1", "candidate")])
     degraded_play = play_bank(mkcases(2), ask_from({
