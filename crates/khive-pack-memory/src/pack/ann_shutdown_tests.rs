@@ -40,6 +40,38 @@ const ROOT: &str = "KHIVE_TEST_MEMORY_ANN_ROOT";
 const NONCE: &str = "KHIVE_TEST_MEMORY_ANN_NONCE";
 const MODE: &str = "KHIVE_TEST_MEMORY_ANN_MODE";
 
+enum ExitReceive {
+    Frame,
+    Poll,
+    PeerClosed,
+}
+
+// A false result is only a poll timeout, not EOF. UnixDatagram zero-length
+// frames still fail protocol validation; only a distinct error can close.
+fn classify_exit_receive(result: io::Result<bool>, complete: bool) -> io::Result<ExitReceive> {
+    match result {
+        Ok(true) => Ok(ExitReceive::Frame),
+        Ok(false) => Ok(ExitReceive::Poll),
+        Err(error)
+            if complete
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                ) =>
+        {
+            Ok(ExitReceive::PeerClosed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InjectedPeerClose {
+    inject_before_child_ok: bool,
+    expect_rejection: bool,
+    kind: io::ErrorKind,
+}
+
 #[derive(Debug)]
 enum ChildLifecycle {
     Spawned,
@@ -66,6 +98,7 @@ struct ChildRun {
     events: Vec<String>,
     lifecycle: ChildLifecycle,
     cleanup: CleanupState,
+    terminal_ipc_closed: bool,
     deadline: Instant,
 }
 
@@ -129,6 +162,7 @@ impl ChildRun {
             events: Vec::new(),
             lifecycle: ChildLifecycle::Spawned,
             cleanup: CleanupState::Pending,
+            terminal_ipc_closed: false,
             deadline,
         }
     }
@@ -197,6 +231,32 @@ impl ChildRun {
         eprintln!("memory ANN {}: {event}", self.mode);
         self.events.push(event.to_owned());
         Ok(true)
+    }
+
+    fn accept_exit_receive(&mut self, result: io::Result<bool>) -> io::Result<bool> {
+        let complete = self.has(protocol::CHILD_OK) && self.has(protocol::POST_DROP);
+        match classify_exit_receive(result, complete)? {
+            ExitReceive::Frame => Ok(true),
+            ExitReceive::Poll => Ok(false),
+            ExitReceive::PeerClosed => {
+                self.terminal_ipc_closed = true;
+                Ok(false)
+            }
+        }
+    }
+
+    fn receive_for_exit(&mut self, deadline: Instant) -> io::Result<bool> {
+        if self.terminal_ipc_closed {
+            let remaining = deadline
+                .min(self.deadline)
+                .saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(POLL.min(remaining));
+            }
+            return Ok(false);
+        }
+        let received = self.receive(deadline);
+        self.accept_exit_receive(received)
     }
 
     fn send_release(&mut self, release: Release) -> io::Result<Instant> {
@@ -318,7 +378,7 @@ impl ChildRun {
             if Instant::now() >= deadline {
                 break;
             }
-            if let Err(error) = self.receive(deadline) {
+            if let Err(error) = self.receive_for_exit(deadline) {
                 self.cleanup_failure(&format!("IPC: {error}"));
             }
         }
@@ -343,7 +403,7 @@ impl ChildRun {
             if Instant::now() >= reap_deadline {
                 break;
             }
-            if let Err(error) = self.receive(reap_deadline) {
+            if let Err(error) = self.receive_for_exit(reap_deadline) {
                 self.cleanup_failure(&format!("final IPC drain: {error}"));
             }
         }
@@ -356,8 +416,8 @@ impl ChildRun {
     }
 
     fn drain_exited(&mut self, deadline: Instant) {
-        while Instant::now() < deadline {
-            match self.receive(deadline) {
+        while !self.terminal_ipc_closed && Instant::now() < deadline {
+            match self.receive_for_exit(deadline) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -474,6 +534,10 @@ fn require_counts(run: &mut ChildRun) {
 }
 
 fn run_case(mode: &'static str) {
+    run_case_with_peer_close(mode, None);
+}
+
+fn run_case_with_peer_close(mode: &'static str, injected_close: Option<InjectedPeerClose>) {
     let mut run = ChildRun::spawn(mode);
     let request_returned = run.collect_until(SETUP, |run| {
         run.has(protocol::REQUEST_RETURNED) && run.counts().is_some()
@@ -620,6 +684,56 @@ fn run_case(mode: &'static str) {
         );
     }
 
+    // Inject only after the real protocol receipts establish the selected side
+    // of the completion boundary. The synthetic error never replaces a child frame.
+    let (
+        injected_close_consumed,
+        premature_close_error,
+        terminal_closed_at_injection,
+    ) = if let Some(fault) = injected_close {
+        assert!(
+            run.collect_until(SETTLE, |run| {
+                let at_boundary = if fault.inject_before_child_ok {
+                    run.has(protocol::BODY_CONFIRMED) && !run.has(protocol::CHILD_OK)
+                } else {
+                    run.has(protocol::BODY_CONFIRMED) && run.has(protocol::CHILD_OK)
+                };
+                run.has(protocol::POST_DROP) && at_boundary
+            }),
+            "peer_close_injection_stage_guard"
+        );
+        assert_eq!(
+            run.has(protocol::CHILD_OK),
+            !fault.inject_before_child_ok,
+            "peer_close_injection_position"
+        );
+        assert!(
+            !run.terminal_ipc_closed,
+            "peer_close_injection_not_already_closed"
+        );
+        let control = if fault.expect_rejection {
+            "BEFORE_CHILD_OK_RESET"
+        } else if fault.kind == io::ErrorKind::ConnectionReset {
+            "C2_POST_CHILD_OK_CONNECTION_RESET"
+        } else if fault.kind == io::ErrorKind::UnexpectedEof {
+            "C2_POST_CHILD_OK_UNEXPECTED_EOF"
+        } else {
+            "C2_POST_CHILD_OK_OTHER_ERROR"
+        };
+        eprintln!(
+            "{control}: injected_before_child_ok={} expected_rejection={} kind={:?}",
+            fault.inject_before_child_ok, fault.expect_rejection, fault.kind
+        );
+        let result = run.accept_exit_receive(Err(io::Error::new(
+            fault.kind,
+            "injected terminal peer close",
+        )));
+        let terminal_closed_at_injection = run.terminal_ipc_closed;
+        (true, result.err(), terminal_closed_at_injection)
+    } else {
+        (false, None, false)
+    };
+
     let child_completed = run.collect_until(SETTLE, |run| {
         run.has(protocol::CHILD_OK)
             && run.has(protocol::POST_DROP)
@@ -631,7 +745,7 @@ fn run_case(mode: &'static str) {
     assert!(child_completed, "normal_child_completion_guard");
     let end = (Instant::now() + SETTLE).min(run.deadline);
     while !run.poll_status().expect("normal child status") && Instant::now() < end {
-        run.receive(end).expect("normal child IPC");
+        run.receive_for_exit(end).expect("normal child IPC");
     }
     let output = run.output();
     assert!(run.status().is_some(), "normal child exit guard: {output}");
@@ -647,6 +761,29 @@ fn run_case(mode: &'static str) {
     );
     assert!(run.has(protocol::RELEASED_NORMAL) && run.has(protocol::BODY_RETURN));
     run.close_directory();
+    if let Some(fault) = injected_close {
+        assert!(injected_close_consumed, "injected_peer_close_consumed");
+        if fault.expect_rejection {
+            assert_eq!(
+                premature_close_error.as_ref().map(io::Error::kind),
+                Some(fault.kind),
+                "premature_terminal_ipc_close"
+            );
+            assert!(
+                !terminal_closed_at_injection,
+                "premature_close_does_not_mark_terminal_at_injection"
+            );
+        } else {
+            assert!(
+                premature_close_error.is_none(),
+                "premature_terminal_ipc_close: {premature_close_error:?}"
+            );
+            assert!(
+                terminal_closed_at_injection,
+                "qualified_peer_close_recorded_at_injection"
+            );
+        }
+    }
     if let Some((post_drop_before_release, held_background)) = held_observation {
         // Check the causal ordering after normal release/completion/reap in both routes.
         assert!(post_drop_before_release, "post_drop_before_parent_release");
@@ -658,6 +795,31 @@ fn run_case(mode: &'static str) {
 fn actual_cold_miss_owned_runtime_release_witness() {
     run_case(protocol::OPEN);
     run_case(protocol::HELD);
+}
+
+#[test]
+fn terminal_peer_close_after_child_ok_is_accepted() {
+    // Establish real cold/warm and held/release positives before synthetic errors.
+    run_case(protocol::OPEN);
+    run_case(protocol::HELD);
+    for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::UnexpectedEof] {
+        run_case_with_peer_close(
+            protocol::OPEN,
+            Some(InjectedPeerClose {
+                inject_before_child_ok: false,
+                expect_rejection: false,
+                kind,
+            }),
+        );
+    }
+    run_case_with_peer_close(
+        protocol::OPEN,
+        Some(InjectedPeerClose {
+            inject_before_child_ok: true,
+            expect_rejection: true,
+            kind: io::ErrorKind::ConnectionReset,
+        }),
+    );
 }
 
 #[test]
