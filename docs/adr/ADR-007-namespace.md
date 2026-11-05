@@ -11,6 +11,9 @@ replaces Rule 4's TenantGate clause if accepted.
 **Qualified**: 2026-09-18, [memory creation admission](#qualification-memory-creation-admission)
 partially amends Rev 6's generic-memory-create equivalence; routing for
 `memory.remember` and Rules 1–8 are unchanged (#2724 proposed it; accepted 2026-09-18).
+**Qualified**: 2026-11-05, [ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)
+places an edge between two memory rows in its source row's namespace; Rule 9's qualifications and
+Rule 8 constraints 1 and 4 name it beside `restore`'s ownership comparison. No read gains a check.
 **Superseded by**: [ADR-050](ADR-050-kg-token-namespace-contract.md) for the historical
 KG-pack namespace-rebinding clause only; the remainder of this record stays authoritative.
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
@@ -199,7 +202,9 @@ The following constraints apply:
 
 1. **The shared local substrate is unaffected.** Rules 0 through 7 apply in full to the
    KG, memory, gtd, brain, schedule, and knowledge packs and to any pack that uses the
-   shared SQLite backend. No post-fetch namespace check is added to by-ID ops. The Gate
+   shared SQLite backend. No post-fetch namespace check is added to by-ID ops beyond the two
+   write-effect comparisons named in Rule 9's qualifications (`restore`'s ownership comparison and
+   the memory-edge placement rule of ADR-021 Delta 3); neither decides access to a record. The Gate
    remains the single enforcement seam for the shared substrate.
 
 2. **A pack with a principal-scoped backend carries its own isolation contract.** That
@@ -217,7 +222,9 @@ The following constraints apply:
    `record.namespace == caller_namespace` checks on by-ID ops of the shared substrate —
    inline namespace equality checks scattered through handlers and stores. Rule 8 is about
    a backend whose isolation is enforced at connection time, not at per-record read time.
-   No by-ID namespace check is added anywhere in the shared substrate layer.
+   No by-ID namespace check is added anywhere in the shared substrate layer, other than those two
+   write-effect comparisons, which compare stored namespaces with each other or with the
+   gate-checked write namespace and never gate a read.
 
 5. **The local degenerate case of such a pack is a view-layer scope, not a security
    boundary.** When a principal-scoped pack runs against the shared local SQLite backend
@@ -256,7 +263,12 @@ carrying it, which is why the rule is written against the contract rather than a
 Qualifications apply because the declaration governs _resolution_ and not everything that follows
 it. `restore` resolves by id unscoped and then compares the resolved record's namespace against
 the caller's, refusing a mismatch, so unscoped resolution is not unscoped effect for that verb —
-read the handler, not only the declaration. And the contract has narrower siblings on other verbs:
+read the handler, not only the declaration. An edge whose source and target are both memory rows
+is qualified the same way ([ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)):
+`link` resolves both ids unscoped, then compares the source row's stored namespace with the request's
+write namespace and refuses a mismatch, and `restore` of such an edge compares the edge's stored
+namespace with its source row's. These comparisons decide where an edge may be written, never who
+may reach a record; the gate still decides the request. And the contract has narrower siblings on other verbs:
 several parameters declare prefix-scoped-to-primary resolution instead, `neighbors(node_id)` among
 them, where the _prefix_ form resolves within the caller's primary namespace while a full UUID is
 still unchecked. Those are smaller openings rather than exceptions to the rule.

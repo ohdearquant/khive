@@ -16,6 +16,18 @@ pub struct ExecArgs {
     /// Mutually exclusive with `--pending-events` and `--ops-file`.
     pub ops: Option<String>,
 
+    /// Open an existing file-backed database read-only for inline DSL inspection.
+    ///
+    /// Runs in-process without forwarding to a writable daemon. Every operation
+    /// must have a reviewed Read declaration and must not be a side-effecting
+    /// assertion; writes and unknown operations are refused before dispatch.
+    /// Requires an existing database; in-memory storage, declared backend
+    /// topologies, configured mounts, plan, ops-file and pending-event modes are
+    /// unsupported.
+    /// Explicitly requested `--save-file` output is still written.
+    #[arg(long, conflicts_with_all = ["plan", "ops_file", "pending_events"])]
+    pub read_only: bool,
+
     /// Check grammar and list stages without executing operations.
     ///
     /// Requires an already-running daemon with matching configuration. Prints

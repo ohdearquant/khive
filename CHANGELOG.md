@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.17.0] - 2026-11-04
 ### Added
 
 - `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
@@ -17,12 +19,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason `receipt_epoch_unknown`; recall is unchanged.
 - `kkernel reindex --fts-only` rebuilds entity and note FTS documents without any embedding model, so no
   vector is dropped or written and the knowledge pass is skipped.
+- `memory.apply_batch` rewrites a chunk of memories in one checked call. A call carries a batch
+  name and 1 to 200 rows. A `supersede` row writes a new memory with a `supersedes` edge to the
+  old row and leaves the old row unchanged. A `create` row writes a new memory. A `skip` row
+  writes nothing, and a `delete-candidate` row writes nothing and is listed in the reply. Every
+  row is checked before anything is written, and a refused row does not stop the others. The
+  call is a dry run unless `dry_run` is `false`. Each written row stores the batch name and an
+  idempotency key derived from the batch, the old id and `part`, so re-running a chunk writes
+  only what is missing. An anonymous caller is refused.
+- `memory.remember` takes an optional `properties` object, stored beside `memory_type` and
+  `tags`. It holds at most 32 keys. Each key is 1 to 64 characters: a lowercase ASCII letter,
+  then lowercase letters, digits or `_`. Each value is a string, a finite number, a boolean or
+  an array of strings. The serialized object may be at most 8192 bytes, and a larger object is
+  refused, not truncated. The keys `memory_type`, `tags` and `attribution` are reserved.
+- `memory.recall` hits report `namespace`, `tags` (`[]` when none) and `properties` (`{}` when
+  none). Existing hit fields keep their names and meanings.
+- `memory.recall` breakdowns add `weights_served`, `namespace`, `pre_entity_score`,
+  `entity_term`, `local_factor` and `duplicate_penalty`.
+- `[actor] owned_namespaces` in `khive.toml` lists namespaces the actor owns, such as the
+  namespaces its helper processes write into. Each entry must be a valid namespace other than
+  `local` and the actor's own `id`, and entries must be unique. A non-empty list requires an
+  explicit `id`. An invalid list is refused when the configuration loads. `memory.apply_batch`
+  accepts an old row in an owned namespace. Ownership grants no write access and widens no read.
+- `brain.create_profile` takes an optional `local_factor`, a finite number from 0.5 to 1. Any
+  other value is refused. `brain.profile` reports the factor beside `posterior_means`. Recall
+  scales hits from the shared `local` namespace by a served profile's factor. A profile without
+  one applies no factor.
+- `moodboard.search` takes an optional `rerank` argument in the opt-in moodboard pack.
+  `"visual"`, the default, is the exact image-embedding cosine ranking, and its reply is
+  unchanged. `"fused"` also ranks assets by how well their captions match the query asset's
+  name and caption, then combines both rankings with weighted reciprocal-rank fusion.
+  `descriptor_weight` (default 0.5, strictly between 0 and 1) sets the caption share of the
+  score. `rrf_k` (default 60, from 1 to 10000) sets the fusion constant. Both are refused unless
+  `rerank` is `"fused"`, and an unknown `rerank` value is refused. A fused reply adds a `rerank`
+  block. Each hit reports its visual and caption rank and score, each null when the asset is
+  absent from that ranking. A query asset with no caption returns the visual ranking.
+
+### Changed
+
+- `memory.remember` without a `namespace` argument writes semantic memories to the caller's
+  actor namespace, as episodic memories already did. Semantic memories used to go to `local`.
+  A caller with no configured actor still writes to `local`. An explicit `namespace` still
+  wins, and rows already in `local` stay where they are. A
+  deployment that reads shared facts through `local` must list the writing actors in
+  `visible_namespaces` or pass `namespace="local"`. `memory.prune` still defaults to `local`.
+- A `memory.remember` write from a caller with no configured actor stores
+  `attribution: "unresolved"` in its properties, with or without a `namespace` argument. The
+  reply then includes `"attribution": "unresolved"`.
+- `memory.recall` with a served brain profile ranks hits with the configured default weights.
+  The weights the profile's posterior means project to are reported per hit as
+  `profile_component` in the breakdown and no longer change the ranking.
+- Per-entity brain posteriors move only on explicit feedback sent through `memory.feedback`. A
+  recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
+  posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
+  event to the profile that served it, as the live path does.
+### Fixed
+
+- `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
+  same way it answers an unknown id. The not-found error no longer names the requested id, and
+  a hidden cursor gets the invalid-input error an unknown cursor gets. Visible replies still
+  resolve to their thread.
+- Tool policy and grant timestamps stored as fractional or out-of-range numbers are no longer
+  truncated or silently treated as absent. A numeric timestamp is accepted only when it converts
+  to an integer without loss. A malformed row that the check consults is reported as an internal
+  error that names the row and the column.
+- The secret gate no longer refuses a note that cites a line with a backtick-quoted reference
+  such as `:1324`, followed by a later `path:line` citation near a trigger word. Assignments next
+  to a quoted reference are still refused.
+- A client whose configuration has no `[visibility_receipts]` section now matches any daemon
+  with a current receipt policy, so its requests reach the daemon instead of falling back to
+  local dispatch. A client that declares a receipt ring still needs the daemon's ring.
+
+### Security
+
+- The supervisor's marker ownership lock is opened through the checked opener the daemon locks
+  use. A symlink at the lock path is refused without touching its target. An existing lock file
+  loses its group and other permission bits, and a new one is created with mode 0600.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig`, `khive_runtime::RequestIdentity`,
+  `khive_runtime::DaemonRequestFrame` and `khive_runtime::engine_config::ActorConfig` add
+  `owned_namespaces`; `khive_brain_core::ProfileRecord` adds `local_factor`;
+  `khive_pack_memory::config::ScoreBreakdown` adds `weights_served`, `namespace`,
+  `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty`; and
+  `kkernel::reindex::ReindexArgs` adds `fts_only`.
+
+## [0.16.0] - 2026-11-01
+### Added
+
+- `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task
+  bodies. `by_status` has an entry for every task status, zeros included; `open` sums the
+  non-terminal statuses and `total` sums all of them. With `tag`, the reply adds the
+  assignee's open tasks carrying exactly that tag: at most `limit` rows (default 50, 1 to
+  200) of `id`, `title`, `status`, `priority` and `updated_at`, ordered by priority and then
+  oldest update, with `truncated` true when more are open. The gtd pack now has eight
+  verbs, 161 in total.
+- `khive_storage::note::NoteTimeOrder::UpdatedAt` (`updated_at ASC, id ASC`).
+- `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` (default `false`): for a mailbox hosted by Exchange
+  Online, a message from a maintainer on the mailbox's own domain that arrives with a single
+  Exchange same-tenant `AuthAs: Internal` stamp and no authentication-results header is
+  attributed to that maintainer instead of reading as `auth-absent`. Every other message keeps its
+  existing result. Use it only for Exchange Online mailboxes: the rule relies on Exchange removing
+  organization authentication headers from mail arriving from outside the tenant and stamping its
+  own. Before enabling it, confirm on the mailbox that outside mail carrying a forged
+  `AuthAs: Internal` arrives with a different stamp or with a second copy of the field. Other mail
+  hosts may keep sender-supplied headers and must leave it off (ADR-056, Amendment 2026-11-01).
+- A routing seam for node addresses in `comm.send`. An embedder installs a
+  `khive_pack_comm::node_route::NodeSendRoute` with `CommPack::with_node_route`; a recipient
+  written as a node address (`khive1:`, scheme matched case-insensitively) is then sealed by
+  that route and stored as a sender transport row, and two racing sends with the same
+  idempotency key replay the first result. `khive_runtime` keeps the history of confirmed
+  node public keys (`retain_confirmed_node_pins`, `NodePinKey`, `NodePinRecord`) in a new
+  `comm_node_confirmed_pin` table (migration 064); a retained key is never overwritten or
+  deleted. This release installs no route.
+- The configuration file accepts a `[channel]` section whose only key is a `[channel.node]`
+  table. The table is held as given and is not read; any other key under `[channel]` is
+  rejected.
+
+### Changed
+
+- `comm.send` to a node address (`khive1:`) is refused before anything is written when no
+  node route is installed, which is the default. Such a recipient never falls through to a
+  local mailbox, and a node address with surrounding whitespace is refused, never trimmed.
+
+### Performance
+
+- Consolidating a memory-mapped vector index no longer copies the whole mapped corpus into
+  owned memory first. Inserting into a mapped index still does.
+
+### Fixed
+
+- A keyed `memory.remember` that matches a stored memory returns the stored note even when
+  the replay names a source record that was never created or has since been deleted. A new
+  key still refuses a missing source and writes nothing.
+- Entity `search` drops a candidate that is deleted or hidden between candidate retrieval
+  and the metadata fetch, instead of returning it with null metadata. A page can therefore
+  hold fewer hits than `limit`.
+- When an MCP session starts a daemon, the bridge now passes the session's `--config` and
+  `--db` overrides to it, so the started daemon opens the store the session named.
+- Stale daemon cleanup keeps a reachable or ambiguous socket when the PID file is missing,
+  invalid or unreadable, and removes a socket or PID file only after confirming it is the
+  same file it inspected.
+- The exec pack's run-directory capture skips an entry whose name is not valid UTF-8 and
+  reports it by its escaped bytes and parent path, instead of replacing the name lossily.
 
 ### Removed
 
-- The `khive-channel-node` crate and the `channel-node` feature, with their wiring in `khive-mcp`,
-  `khive-pack-comm`, `khive-runtime` and `kkernel` and the node section of the configuration
-  reference. The hosted service builds the node client.
+- The unpublished `khive-channel-node` crate. The hosted service builds the node client;
+  this repository keeps the routing seam described under Added.
+
+### Security
+
+- Daemon lock files that are written to are opened relative to a validated parent
+  directory. Unsafe paths, such as a symlinked lock, an unsafe ancestor directory or a
+  directory another user owns, are refused, and owned lock files have their permissions
+  tightened through the opened file. An owned default lock directory is repaired to mode 0700.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` adds `channel`, the `[channel]` section. Direct struct literals
+  must set it or use `Default`.
+- `khive_channel_email::EmailChannelConfig` adds `trust_exchange_internal`. Direct struct
+  literals must set it.
+- New enum variants: `khive_runtime::ConfigError::InvalidNodeConfig` and
+  `khive_storage::note::NoteTimeOrder::UpdatedAt`. Neither enum is `#[non_exhaustive]`, so
+  downstream exhaustive matches must handle them.
 
 ## [0.15.0] - 2026-10-31
 
