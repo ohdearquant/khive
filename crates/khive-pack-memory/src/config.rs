@@ -504,11 +504,13 @@ pub struct ScoreBreakdown {
     pub temporal: f64,
     /// Additive split of the `RecallConfig` weights over `relevance`, the amplified
     /// `salience_decayed` and `temporal`: the composite `memory.recall_score` scores with. A
-    /// recall ranks by the multiplicative composite in `composite` instead, so in a recall these
-    /// do not sum to `pre_entity_score`.
+    /// recall without `reranker_weights` ranks by the multiplicative composite in `composite`
+    /// instead, so in a recall these do not sum to `pre_entity_score`.
     pub weighted: WeightedContributions,
-    /// The factors of the multiplicative composite a recall ranks by. Absent from
-    /// `memory.recall_score`, which scores additively.
+    /// The factors of the multiplicative composite a recall ranks by when no `reranker_weights`
+    /// are configured; with them, `pre_entity_score` is the reranker output and these describe
+    /// the default composite. Absent from `memory.recall_score`, which scores additively, and
+    /// absent when the composite arithmetic fell back to a zero score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite: Option<CompositeFactors>,
     /// This hit's composite under the weights the serving profile's posteriors
@@ -575,7 +577,7 @@ pub struct WeightedContributions {
     pub temporal_contribution: f64,
 }
 
-/// The factors of the composite a recall ranks by. All four are the 32-bit values used, and
+/// The factors of the default multiplicative composite. All four are the 32-bit values used, and
 /// with no `reranker_weights` configured
 /// `relevance_term * temporal_boost * salience_boost * adjustment_factor` is the hit's
 /// `pre_entity_score`.
@@ -588,8 +590,8 @@ pub struct CompositeFactors {
     /// `1 + weights.salience × salience`.
     pub salience_boost: f32,
     /// Net multiplier of the configured score adjustments and the final clamp to `[0, 1]`.
-    /// `None` when the product of the other three is zero: the adjustments then act on zero, and
-    /// no multiplier describes the score they leave.
+    /// `None` when the product of the other three is not a positive finite number: the
+    /// adjustments then act on zero or less, and no multiplier describes the score they leave.
     pub adjustment_factor: Option<f32>,
 }
 

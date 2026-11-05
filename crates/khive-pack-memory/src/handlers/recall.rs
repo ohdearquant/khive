@@ -993,7 +993,8 @@ impl MemoryPack {
                 age_days_f64,
             );
             breakdown.fused_score = hit.score.to_f64();
-            breakdown.composite = Some(CompositeFactors {
+            // A composite whose arithmetic fell back to a zero score has no factors to report.
+            breakdown.composite = score_factors.complete.then(|| CompositeFactors {
                 relevance_term: score_factors.relevance_term,
                 temporal_boost: score_factors.temporal_boost,
                 salience_boost: score_factors.salience_boost,

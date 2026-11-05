@@ -859,11 +859,14 @@ pub(crate) struct ScoreFactors {
     pub(crate) base: f32,
     /// The value `calculate_score` returns.
     pub(crate) score: f32,
+    /// False when the arithmetic fell back to a zero score (a boost or the composite was not a
+    /// finite number): the other fields then do not describe a computed composite.
+    pub(crate) complete: bool,
 }
 
 impl ScoreFactors {
-    /// The terms of a candidate whose arithmetic fell back to a zero score: the relevance term
-    /// is kept, and the boosts and the base are zero.
+    /// The terms of a candidate whose boost arithmetic fell back to a zero score: the relevance
+    /// term is kept, no boost was computed, and the result is marked incomplete.
     fn fallback(relevance_term: f32) -> Self {
         Self {
             relevance_term,
@@ -871,6 +874,7 @@ impl ScoreFactors {
             salience_boost: 0.0,
             base: 0.0,
             score: 0.0,
+            complete: false,
         }
     }
 
@@ -953,6 +957,7 @@ fn score_factors_with_reporter(
             salience_boost,
             base,
             score: 0.0,
+            complete: false,
         };
     }
     ScoreFactors {
@@ -961,6 +966,7 @@ fn score_factors_with_reporter(
         salience_boost,
         base,
         score: score.clamp(0.0, 1.0),
+        complete: true,
     }
 }
 

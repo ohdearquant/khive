@@ -1669,9 +1669,10 @@ With `include_breakdown=true` each hit's `breakdown` reports `relevance` (the va
 after the calibrated normalization and with no further scaling), `fused_score` (the fused score before that
 normalization) and `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`, the
 factors of the multiplicative composite that ranks the hit; with no `reranker_weights` their product is
-`pre_entity_score`, and `adjustment_factor` is `null` when the other three multiply to zero). The additive `weighted`
-contributions and the `temporal` and `salience_decayed` values are not the ranking composite: a recall ranks by
-`composite`. The breakdown also reports `weights_served` (always `"default"`: a served profile
+`pre_entity_score`, and `adjustment_factor` is `null` when the other three do not multiply to a positive number). The
+additive `weighted` contributions and the `temporal` and `salience_decayed` values are not the ranking composite:
+without `reranker_weights` a recall ranks by `composite`. The breakdown also reports `weights_served` (always
+`"default"`: a served profile
 scores with the configured default weights), `profile_component` (a diagnostic: the hit's composite under the weights
 the serving profile's posteriors project to, divided by its composite under the default weights; it never enters
 `rank_score`), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when none applies) and
