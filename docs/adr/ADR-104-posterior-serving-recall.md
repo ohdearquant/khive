@@ -1090,9 +1090,10 @@ penalty and enters; it does not rule out a returned hit that gains one.
 Two measurements bear on the conditions on this store: 6 of the 6,000 no-profile hits carry a penalty, and the replay of
 `local_factor` 0.7 reproduces the candidate arm's served top ten in all 120 recalls, including the 40 the margin form
 does not count. The replay table is therefore an estimate that held exactly at one setting. The live arm below is the
-measurement, and its comparison with the replay is the test of the conditions at the proposed setting. Recording, for each recall, the duplicate groups over all
-scored candidates and the candidate each abbreviated `supersedes` value resolved to would remove both conditions; this
-amendment does not add that.
+measurement, and its comparison with the replay is the test of the conditions at the proposed setting. Recording, for each recall, the inputs of both stages for every scored
+candidate (its id, its rank-score terms, its content prefix and its `supersedes` property, and the candidates that carry
+an incoming `supersedes` edge), and replaying the duplicate-penalty and suppression stages under the rule rather than
+reading their no-profile results, would remove both conditions; this amendment does not add that.
 
 With a positive `min_score` or `score_floor` the rule does not apply: a factor can move a row below first admission,
 and a row it suppressed through its `supersedes` property can then return.
