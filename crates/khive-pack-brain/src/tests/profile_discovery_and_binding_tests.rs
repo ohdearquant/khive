@@ -296,3 +296,165 @@ async fn dispatch_unbind_reports_zero_when_selector_matches_nothing() {
     assert_eq!(result["removed"], json!(0u64));
     assert_eq!(result["unbound"], json!(0u64));
 }
+
+#[tokio::test]
+async fn dispatch_bind_team_catalog_resolves_only_in_team_catalog() {
+    use core::convert::TryFrom;
+
+    let (pack, rt) = make_pack_with_actor("catalog-match");
+    let registry = empty_registry();
+    let local = rt.authorize(Namespace::local()).unwrap();
+    let team = rt.authorize(Namespace::try_from("team-a").unwrap()).unwrap();
+    let profile_id = "team-catalog-profile";
+    let created = pack
+        .dispatch(
+            "brain.create_profile",
+            json!({"name": profile_id, "consumer_kind": "recall"}),
+            &registry,
+            &team,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(created["profile_id"], json!(profile_id));
+    pack.dispatch("brain.activate", json!({"profile_id": profile_id}), &registry, &team)
+        .await
+        .unwrap();
+    let profiles = pack.dispatch("brain.profiles", json!({}), &registry, &team).await.unwrap();
+    assert_eq!(profiles["namespace"], json!("team-a"));
+    assert!(profiles["profiles"].as_array().unwrap().iter().any(|p| p["id"] == json!(profile_id)));
+    let profile = pack
+        .dispatch("brain.profile", json!({"profile_id": profile_id}), &registry, &team)
+        .await
+        .unwrap();
+    assert_eq!(profile["namespace"], json!("team-a"));
+    assert_eq!(profile["id"], json!(profile_id));
+    assert_eq!(profile["lifecycle"], json!("active"));
+    let local_profiles = pack.dispatch("brain.profiles", json!({}), &registry, &local).await.unwrap();
+    assert_eq!(local_profiles["namespace"], json!("local"));
+    assert!(!local_profiles["profiles"].as_array().unwrap().iter().any(|p| p["id"] == json!(profile_id)));
+    let local_profile = pack
+        .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}), &registry, &local)
+        .await
+        .unwrap();
+    assert_eq!(local_profile["namespace"], json!("local"));
+    assert_eq!(local_profile["id"], json!("balanced-recall-v1"));
+
+    let bound = pack
+        .dispatch(
+            "brain.bind",
+            json!({"profile_id": profile_id, "actor": "catalog-match", "namespace": "team-a", "consumer_kind": "recall"}),
+            &registry,
+            &team,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound["bound"], json!(true));
+    assert_eq!(bound["namespace"], json!("team-a"));
+    let bindings = pack
+        .dispatch("brain.bindings", json!({"actor": "catalog-match", "namespace": "team-a"}), &registry, &team)
+        .await
+        .unwrap();
+    assert_eq!(bindings["namespace"], json!("team-a"));
+    assert_eq!(bindings["count"], json!(1));
+    assert_eq!(bindings["bindings"][0]["profile_id"], json!(profile_id));
+    assert_eq!(bindings["bindings"][0]["namespace"], json!("team-a"));
+    let resolved = pack
+        .dispatch(
+            "brain.resolve",
+            json!({"actor": "catalog-match", "namespace": "team-a", "consumer_kind": "recall"}),
+            &registry,
+            &team,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved["resolved_profile_id"], json!(profile_id));
+    assert_eq!(resolved["matched_binding"], json!(true));
+    let local_resolved = pack
+        .dispatch(
+            "brain.resolve",
+            json!({"actor": "catalog-match", "namespace": "local", "consumer_kind": "recall"}),
+            &registry,
+            &local,
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_resolved["matched_binding"], json!(false));
+    assert_ne!(local_resolved["resolved_profile_id"], json!(profile_id));
+    let local_bindings = pack
+        .dispatch("brain.bindings", json!({"actor": "catalog-match", "namespace": "local"}), &registry, &local)
+        .await
+        .unwrap();
+    assert_eq!(local_bindings["namespace"], json!("local"));
+    assert_eq!(local_bindings["count"], json!(0));
+}
+
+#[tokio::test]
+async fn dispatch_bind_missing_profile_names_searched_catalog() {
+    use core::convert::TryFrom;
+
+    let (pack, rt) = make_pack_with_actor("catalog-refusal");
+    let registry = empty_registry();
+    let local = rt.authorize(Namespace::local()).unwrap();
+    let team = rt.authorize(Namespace::try_from("team-a").unwrap()).unwrap();
+    let profile_id = "local-only-profile";
+    let created = pack
+        .dispatch(
+            "brain.create_profile",
+            json!({"name": profile_id, "consumer_kind": "recall"}),
+            &registry,
+            &local,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(created["profile_id"], json!(profile_id));
+    let local_profiles = pack.dispatch("brain.profiles", json!({}), &registry, &local).await.unwrap();
+    assert_eq!(local_profiles["namespace"], json!("local"));
+    assert!(local_profiles["profiles"].as_array().unwrap().iter().any(|p| p["id"] == json!(profile_id)));
+    let local_profile = pack
+        .dispatch("brain.profile", json!({"profile_id": profile_id}), &registry, &local)
+        .await
+        .unwrap();
+    assert_eq!(local_profile["namespace"], json!("local"));
+    assert_eq!(local_profile["id"], json!(profile_id));
+    let team_profiles = pack.dispatch("brain.profiles", json!({}), &registry, &team).await.unwrap();
+    assert_eq!(team_profiles["namespace"], json!("team-a"));
+    assert!(!team_profiles["profiles"].as_array().unwrap().iter().any(|p| p["id"] == json!(profile_id)));
+    let team_profile = pack
+        .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}), &registry, &team)
+        .await
+        .unwrap();
+    assert_eq!(team_profile["namespace"], json!("team-a"));
+    assert_eq!(team_profile["id"], json!("balanced-recall-v1"));
+    let before = pack
+        .dispatch("brain.bindings", json!({"actor": "catalog-refusal", "namespace": "team-a"}), &registry, &team)
+        .await
+        .unwrap();
+    assert_eq!(before["namespace"], json!("team-a"));
+    assert_eq!(before["count"], json!(0));
+
+    let error = pack
+        .dispatch(
+            "brain.bind",
+            json!({"profile_id": profile_id, "actor": "catalog-refusal", "namespace": "team-a", "consumer_kind": "recall"}),
+            &registry,
+            &team,
+        )
+        .await
+        .unwrap_err();
+    let RuntimeError::NotFound(message) = error else {
+        panic!("bind must refuse a profile absent from the selected catalog with NotFound");
+    };
+    assert_eq!(
+        message,
+        r#"profile "local-only-profile" not found in namespace "team-a"; a profile created with namespace=X is bound with namespace=X"#,
+        "bind_not_found_names_searched_catalog"
+    );
+    let after = pack
+        .dispatch("brain.bindings", json!({"actor": "catalog-refusal", "namespace": "team-a"}), &registry, &team)
+        .await
+        .unwrap();
+    assert_eq!(after["namespace"], json!("team-a"));
+    assert_eq!(after["count"], json!(0));
+}

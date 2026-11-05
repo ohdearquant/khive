@@ -1643,6 +1643,7 @@ impl BrainPack {
 
         let profile_id = p.profile_id;
         let priority = p.priority.unwrap_or(0);
+        let catalog_namespace = token.namespace().as_str().to_owned();
         let event_payload = json!({
             "profile_id": profile_id,
             "actor": actor,
@@ -1669,7 +1670,9 @@ impl BrainPack {
                 // Verify the profile exists and is not archived (archived = terminal, no new bindings).
                 match state.profiles.get(&profile_id) {
                     None => {
-                        return Err(RuntimeError::NotFound(format!("profile {:?}", profile_id)));
+                        return Err(RuntimeError::NotFound(format!(
+                            "profile {profile_id:?} not found in namespace {catalog_namespace:?}; a profile created with namespace=X is bound with namespace=X"
+                        )));
                     }
                     Some(record) if record.lifecycle == ProfileLifecycle::Archived => {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -1832,7 +1835,11 @@ impl BrainPack {
             })
             .collect();
 
-        Ok(json!({ "count": rows.len(), "bindings": rows }))
+        Ok(json!({
+            "namespace": token.namespace().as_str(),
+            "count": rows.len(),
+            "bindings": rows,
+        }))
     }
 
     // ── brain.create_profile ──────────────────────────────────────────────

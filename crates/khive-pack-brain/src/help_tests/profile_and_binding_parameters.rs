@@ -8,6 +8,8 @@ fn brain_profile_params_has_required_profile_id() {
             .any(|p| p.name == "profile_id" && p.required),
         "brain.profile must have required profile_id param"
     );
+    let profile_id = h.params.iter().find(|p| p.name == "profile_id").unwrap();
+    assert!(profile_id.description.contains("unique within a namespace"));
 }
 
 #[test]
@@ -38,6 +40,15 @@ fn brain_resolve_params_has_consumer_kind_required() {
         h.params.iter().any(|p| p.name == "namespace"),
         "brain.resolve must document optional namespace"
     );
+    for verb in ["brain.bind", "brain.unbind", "brain.bindings", "brain.resolve"] {
+        let handler = find_handler(verb);
+        let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
+        assert_eq!(
+            namespace.description,
+            "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+            "{verb} namespace help must describe the catalog"
+        );
+    }
 }
 
 #[test]
