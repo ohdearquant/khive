@@ -245,14 +245,21 @@ async fn test_apply_batch_nonlocal_source_accepts_local_superseded_target() {
     assert_eq!(old_row["namespace"], "local");
     let alice_before = ab_edges(&rt, "alice", vec![old]).await.len();
     let local_before = ab_edges(&rt, "local", vec![old]).await.len();
+    let mut row = ab_supersede(old, "nonlocal source replacing local target");
+    row["properties"]["source_ids"] = json!(["census-2026"]);
     let result = ab_apply(
         &alice,
         "nonlocal-source-local-target",
-        vec![ab_supersede(old, "nonlocal source replacing local target")],
+        vec![row],
         false,
     )
     .await;
-    assert_eq!(result["entries"][0]["outcome"], "written");
+    assert_eq!(
+        result["entries"][0]["outcome"],
+        "written",
+        "nonlocal source/shared-local target entry: {}",
+        result["entries"][0]
+    );
     let source_id = ab_uuid(&result["entries"][0]["new_id"]);
     let source = alice
         .dispatch("get", json!({"id": source_id.to_string()}))
