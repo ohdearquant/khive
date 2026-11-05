@@ -255,6 +255,24 @@ impl KhiveRuntime {
         if edge.deleted_at.is_none() {
             return Ok(Some((edge, false)));
         }
+        let both_memory_at_check = match (
+            self.resolve_by_id_including_deleted(token, edge.source_id).await?,
+            self.resolve_by_id_including_deleted(token, edge.target_id).await?,
+        ) {
+            (Some(crate::Resolved::Note(source)), Some(crate::Resolved::Note(target))) => {
+                let both_memory = source.kind == "memory" && target.kind == "memory";
+                Self::ensure_memory_note_edge_namespace(
+                    &edge.namespace,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.relation.clone(),
+                    &source,
+                    &target,
+                )?;
+                both_memory
+            }
+            _ => false,
+        };
         let updated_at = Utc::now();
         let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
@@ -262,12 +280,26 @@ impl KhiveRuntime {
             statements: vec![PlanStatement {
                 statement: SqlStatement {
                     sql: "UPDATE graph_edges SET deleted_at=NULL, updated_at=?1 \
-                          WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                          WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL \
+                            AND ((?4 = 0 AND ( \
+                                  NOT EXISTS (SELECT 1 FROM notes AS source_memory \
+                                       WHERE source_memory.id=graph_edges.source_id \
+                                         AND source_memory.kind='memory') \
+                                  OR NOT EXISTS (SELECT 1 FROM notes AS target_memory \
+                                       WHERE target_memory.id=graph_edges.target_id \
+                                         AND target_memory.kind='memory') \
+                                 )) \
+                                 OR EXISTS (SELECT 1 FROM notes AS source_match \
+                                      WHERE source_match.id=graph_edges.source_id \
+                                        AND source_match.namespace=graph_edges.namespace \
+                                        AND source_match.kind='memory' \
+                                        AND source_match.deleted_at IS NULL))"
                         .into(),
                     params: vec![
                         SqlValue::Integer(updated_at.timestamp_micros()),
                         SqlValue::Text(id.to_string()),
                         SqlValue::Text(edge.namespace.clone()),
+                        SqlValue::Integer(if both_memory_at_check { 1 } else { 0 }),
                     ],
                     label: Some("edge-restore".into()),
                 },
@@ -281,12 +313,27 @@ impl KhiveRuntime {
             note_vector_purge: None,
             note_embedding_inheritance: None,
         }));
+        #[cfg(test)]
+        memory_edge_namespace_restore_tests::before_writer(id).await;
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 let mut restored = edge;
                 restored.deleted_at = None;
                 restored.updated_at = updated_at;
                 Ok(Some((restored, true)))
+            }
+            Ok(AtomicRunOutcome::RolledBack {
+                failure:
+                    AtomicOpFailure::GuardFailed {
+                        statement_label: Some(label),
+                        expected,
+                        observed: 0,
+                    },
+                ..
+            }) if label == "edge-restore" && expected == AffectedRowGuard::exactly(1) => {
+                Err(RuntimeError::InvalidInput(
+                    "edge restore preconditions changed before commit; retry against the current edge and endpoint state".into(),
+                ))
             }
             Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
                 format!("edge restore rolled back: {failure:?}"),
@@ -654,5 +701,677 @@ impl KhiveRuntime {
             AttachmentSubstrate::Entity,
         );
         Ok(core.sql().writer().await?.execute(statement).await? > 0)
+    }
+}
+#[cfg(test)]
+pub(super) mod memory_edge_namespace_restore_tests {
+    use crate::{KhiveRuntime, Resolved, RuntimeError};
+    use khive_storage::{Note, SqlAccess, SqlStatement, SqlValue, SqlWriter};
+    use khive_types::{EdgeRelation, Namespace};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    struct BeforeWriterHook {
+        edge_id: Uuid,
+        entered: oneshot::Sender<()>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    static BEFORE_WRITER_HOOKS: Mutex<Vec<BeforeWriterHook>> = Mutex::new(Vec::new());
+
+    fn install_before_writer_hook(
+        edge_id: Uuid,
+        entered: oneshot::Sender<()>,
+        release: Option<oneshot::Receiver<()>>,
+    ) {
+        let mut hooks = BEFORE_WRITER_HOOKS.lock().unwrap();
+        assert!(!hooks.iter().any(|hook| hook.edge_id == edge_id));
+        hooks.push(BeforeWriterHook {
+            edge_id,
+            entered,
+            release,
+        });
+    }
+
+    fn remove_before_writer_hook(edge_id: Uuid) {
+        BEFORE_WRITER_HOOKS
+            .lock()
+            .unwrap()
+            .retain(|hook| hook.edge_id != edge_id);
+    }
+
+    pub(super) async fn before_writer(edge_id: Uuid) {
+        let hook = {
+            let mut hooks = BEFORE_WRITER_HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|hook| hook.edge_id == edge_id)
+                .map(|index| hooks.remove(index))
+        };
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            if let Some(release) = hook.release {
+                let _ = release.await;
+            }
+        }
+    }
+
+    fn fixture() -> (KhiveRuntime, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = KhiveRuntime::new_for_test(crate::RuntimeConfig {
+            db_path: Some(dir.path().join("restore-edge-memory-namespace.db")),
+            embedding_model: None,
+            additional_embedding_models: Vec::new(),
+            ..Default::default()
+        })
+        .unwrap();
+        (runtime, dir)
+    }
+
+    async fn execute_private_write(runtime: &KhiveRuntime, statement: SqlStatement) -> u64 {
+        let result = runtime
+            .sql()
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    let affected = writer.execute(statement).await?;
+                    Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+                })
+            }))
+            .await
+            .unwrap();
+        *result.downcast::<u64>().unwrap()
+    }
+
+    async fn prepare_tombstone(
+        runtime: &KhiveRuntime,
+        edge_id: Uuid,
+        from_namespace: &str,
+        stored_namespace: &str,
+    ) -> u64 {
+        let statement = SqlStatement {
+            sql: "UPDATE graph_edges SET namespace=?1, deleted_at=?2 \
+                  WHERE id=?3 AND namespace=?4 AND deleted_at IS NULL"
+                .into(),
+            params: vec![
+                SqlValue::Text(stored_namespace.into()),
+                SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
+                SqlValue::Text(edge_id.to_string()),
+                SqlValue::Text(from_namespace.into()),
+            ],
+            label: Some("test-prepare-restore-tombstone".into()),
+        };
+        execute_private_write(runtime, statement).await
+    }
+
+    async fn move_memory_source_namespace(
+        runtime: &KhiveRuntime,
+        source_id: Uuid,
+        from_namespace: &str,
+        to_namespace: &str,
+    ) -> u64 {
+        let statement = SqlStatement {
+            sql: "UPDATE notes SET namespace=?1 \
+                  WHERE id=?2 AND namespace=?3 AND kind='memory' AND deleted_at IS NULL"
+                .into(),
+            params: vec![
+                SqlValue::Text(to_namespace.into()),
+                SqlValue::Text(source_id.to_string()),
+                SqlValue::Text(from_namespace.into()),
+            ],
+            label: Some("test-move-memory-source-between-check-and-restore".into()),
+        };
+        execute_private_write(runtime, statement).await
+    }
+
+    async fn soft_delete_memory_source(runtime: &KhiveRuntime, source_id: Uuid) -> u64 {
+        let statement = SqlStatement {
+            sql: "UPDATE notes SET deleted_at=?1 \
+                  WHERE id=?2 AND namespace=?3 AND kind='memory' AND deleted_at IS NULL"
+                .into(),
+            params: vec![
+                SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
+                SqlValue::Text(source_id.to_string()),
+                SqlValue::Text("local".into()),
+            ],
+            label: Some("test-soft-delete-memory-source-between-check-and-restore".into()),
+        };
+        execute_private_write(runtime, statement).await
+    }
+
+    async fn change_note_kind(
+        runtime: &KhiveRuntime,
+        note_id: Uuid,
+        from_kind: &str,
+        to_kind: &str,
+    ) -> u64 {
+        let statement = SqlStatement {
+            sql: "UPDATE notes SET kind=?1 WHERE id=?2 AND kind=?3 AND deleted_at IS NULL".into(),
+            params: vec![
+                SqlValue::Text(to_kind.into()),
+                SqlValue::Text(note_id.to_string()),
+                SqlValue::Text(from_kind.into()),
+            ],
+            label: Some("test-promote-target-to-memory-between-check-and-restore".into()),
+        };
+        execute_private_write(runtime, statement).await
+    }
+
+    async fn assert_memory_note_in_namespace(
+        runtime: &KhiveRuntime,
+        token: &crate::NamespaceToken,
+        id: Uuid,
+        expected_namespace: &str,
+    ) {
+        match runtime.resolve_by_id_including_deleted(token, id).await.unwrap() {
+            Some(Resolved::Note(note)) => {
+                assert_eq!(note.namespace, expected_namespace);
+                assert_eq!(note.kind, "memory");
+                assert!(note.deleted_at.is_none());
+            }
+            _ => panic!("fixture endpoint was not a live memory note"),
+        }
+    }
+
+    fn assert_helper_namespace_error(message: &str) {
+        let lower = message.to_ascii_lowercase();
+        let source_at = lower.find("source").expect("source namespace context");
+        let write_at = lower.find("write").expect("write namespace context");
+        let retry_at = lower.find("retry").expect("retry guidance");
+        assert!(
+            source_at < write_at && write_at < retry_at,
+            "unexpected diagnostic field order: {message}"
+        );
+        assert!(
+            lower[source_at..write_at].contains("other"),
+            "expected source namespace other: {message}"
+        );
+        assert!(
+            lower[write_at..retry_at].contains("local"),
+            "expected write namespace local: {message}"
+        );
+        assert!(
+            lower[retry_at..].contains("other"),
+            "expected retry namespace other: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_edge_rejects_legacy_tombstone_with_mismatched_memory_source_namespace() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+
+        let source = Note::new("other", "memory", "restore source");
+        let source_id = source.id;
+        let target = Note::new("other", "memory", "restore target");
+        let target_id = target.id;
+        runtime.notes(&other_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &other_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(edge.namespace, "other");
+        assert_eq!(edge.source_id, source_id);
+        assert_eq!(edge.target_id, target_id);
+        assert_eq!(edge.relation, EdgeRelation::Annotates);
+
+        assert_eq!(
+            prepare_tombstone(&runtime, edge_id, "other", "local").await,
+            1
+        );
+        let stored_edge = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("synthetic legacy edge row should remain addressable");
+        assert_eq!(stored_edge.namespace, "local");
+        assert_eq!(stored_edge.source_id, source_id);
+        assert_eq!(stored_edge.target_id, target_id);
+        assert_eq!(stored_edge.relation, EdgeRelation::Annotates);
+        assert!(stored_edge.deleted_at.is_some());
+        assert_memory_note_in_namespace(&runtime, &local_token, source_id, "other").await;
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "other").await;
+
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        install_before_writer_hook(edge_id, entered_tx, None);
+        let outcome = runtime.restore_edge(&local_token, edge_id).await;
+        remove_before_writer_hook(edge_id);
+        let writer_boundary_reached = matches!(entered_rx.try_recv(), Ok(()));
+        match outcome {
+            Err(RuntimeError::InvalidInput(message)) => {
+                if writer_boundary_reached {
+                    panic!("restore_memory_namespace_guard_bypassed_writer_reached");
+                }
+                assert_helper_namespace_error(&message);
+            }
+            Ok(Some((_, true))) => panic!("restore_memory_namespace_mismatch_admitted"),
+            _ => panic!("fixture did not reach the targeted restore refusal"),
+        }
+
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("refused restore must preserve the tombstone row");
+        assert_eq!(after_refusal.namespace, "local");
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_edge_rechecks_memory_source_namespace_at_writer_after_precheck() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+
+        let source = Note::new("local", "memory", "moving restore source");
+        let source_id = source.id;
+        let target = Note::new("local", "memory", "stable restore target");
+        let target_id = target.id;
+        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &local_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(edge.namespace, "local");
+        assert_eq!(edge.source_id, source_id);
+        assert_eq!(edge.target_id, target_id);
+        assert_eq!(edge.relation, EdgeRelation::Annotates);
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        let edge_before_restore = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("tombstone should be present before restore");
+        assert_eq!(edge_before_restore.namespace, "local");
+        assert!(edge_before_restore.deleted_at.is_some());
+        assert_memory_note_in_namespace(&runtime, &local_token, source_id, "local").await;
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
+
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        install_before_writer_hook(edge_id, entered_tx, Some(release_rx));
+        let mut restore = Box::pin(runtime.restore_edge(&local_token, edge_id));
+        let crossed_precheck = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut restore => false,
+                reached = &mut entered_rx => reached.is_ok(),
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !crossed_precheck {
+            remove_before_writer_hook(edge_id);
+            panic!("fixture did not positively cross the outside guard before writer");
+        }
+
+        assert_eq!(
+            move_memory_source_namespace(&runtime, source_id, "local", "other").await,
+            1
+        );
+        assert_memory_note_in_namespace(&runtime, &other_token, source_id, "other").await;
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
+        let edge_while_paused = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("edge must still exist while restore is held before writer");
+        assert_eq!(edge_while_paused.namespace, "local");
+        assert!(edge_while_paused.deleted_at.is_some());
+
+        assert!(release_tx.send(()).is_ok());
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut restore)
+            .await
+            .expect("restore did not complete after release");
+        match outcome {
+            Err(RuntimeError::InvalidInput(_)) => {}
+            Ok(Some((_, true))) => {
+                panic!("restore_memory_namespace_drift_admitted_after_precheck")
+            }
+            _ => panic!("writer-fence fixture did not return the expected refusal class"),
+        }
+
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("writer-fence refusal must preserve the tombstone");
+        assert_eq!(after_refusal.namespace, "local");
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_edge_rechecks_memory_source_liveness_at_writer_after_precheck() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+
+        let source = Note::new("local", "memory", "soft-deleted restore source");
+        let source_id = source.id;
+        let target = Note::new("local", "memory", "live restore target");
+        let target_id = target.id;
+        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &local_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(edge.namespace, "local");
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_memory_note_in_namespace(&runtime, &local_token, source_id, "local").await;
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
+
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        install_before_writer_hook(edge_id, entered_tx, Some(release_rx));
+        let mut restore = Box::pin(runtime.restore_edge(&local_token, edge_id));
+        let crossed_precheck = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut restore => false,
+                reached = &mut entered_rx => reached.is_ok(),
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !crossed_precheck {
+            remove_before_writer_hook(edge_id);
+            panic!("fixture did not positively cross the outside guard before writer");
+        }
+
+        assert_eq!(soft_delete_memory_source(&runtime, source_id).await, 1);
+        match runtime
+            .resolve_by_id_including_deleted(&local_token, source_id)
+            .await
+            .unwrap()
+        {
+            Some(Resolved::Note(note)) => {
+                assert_eq!(note.namespace, "local");
+                assert_eq!(note.kind, "memory");
+                assert!(note.deleted_at.is_some());
+            }
+            _ => panic!("fixture source did not remain as an included-deleted memory note"),
+        }
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
+
+        assert!(release_tx.send(()).is_ok());
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut restore)
+            .await
+            .expect("restore did not complete after release");
+        match outcome {
+            Err(RuntimeError::InvalidInput(_)) => {}
+            Ok(Some((_, true))) => {
+                panic!("restore_memory_source_soft_delete_admitted_after_precheck")
+            }
+            _ => panic!("source-liveness fence fixture did not return the expected refusal class"),
+        }
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("source-liveness refusal must preserve the tombstone");
+        assert_eq!(after_refusal.namespace, "local");
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_edge_rejects_preexisting_soft_deleted_memory_source() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        let source = Note::new("local", "memory", "already deleted restore source");
+        let source_id = source.id;
+        let target = Note::new("local", "memory", "live restore target");
+        let target_id = target.id;
+        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&local_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &local_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        let stored_edge = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("fixture tombstone should be addressable before source deletion");
+        assert_eq!(stored_edge.namespace, "local");
+        assert!(stored_edge.deleted_at.is_some());
+        assert_eq!(soft_delete_memory_source(&runtime, source_id).await, 1);
+        match runtime
+            .resolve_by_id_including_deleted(&local_token, source_id)
+            .await
+            .unwrap()
+        {
+            Some(Resolved::Note(note)) => {
+                assert_eq!(note.namespace, "local");
+                assert_eq!(note.kind, "memory");
+                assert!(note.deleted_at.is_some());
+            }
+            _ => panic!("fixture source did not remain as an included-deleted memory note"),
+        }
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "local").await;
+
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        install_before_writer_hook(edge_id, entered_tx, None);
+        let outcome = runtime.restore_edge(&local_token, edge_id).await;
+        remove_before_writer_hook(edge_id);
+        assert!(matches!(entered_rx.try_recv(), Ok(())), "fixture did not reach writer fence");
+        match outcome {
+            Err(RuntimeError::InvalidInput(_)) => {}
+            Ok(Some((_, true))) => panic!("restore_memory_predeleted_source_admitted"),
+            _ => panic!("predeleted-source fixture did not return the expected refusal class"),
+        }
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("predeleted-source refusal must preserve the tombstone");
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_edge_rechecks_current_memory_pair_after_nonmemory_precheck() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+        let source = Note::new("other", "memory", "memory source before current-pair change");
+        let source_id = source.id;
+        let target = Note::new("other", "observation", "nonmemory target before current-pair change");
+        let target_id = target.id;
+        runtime.notes(&other_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &other_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "other", "local").await, 1);
+        let edge_before_restore = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("current-pair fixture tombstone should be addressable");
+        assert_eq!(edge_before_restore.namespace, "local");
+        assert_eq!(edge_before_restore.source_id, source_id);
+        assert_eq!(edge_before_restore.target_id, target_id);
+        assert!(edge_before_restore.deleted_at.is_some());
+        assert_memory_note_in_namespace(&runtime, &local_token, source_id, "other").await;
+        match runtime
+            .resolve_by_id_including_deleted(&local_token, target_id)
+            .await
+            .unwrap()
+        {
+            Some(Resolved::Note(note)) => {
+                assert_eq!(note.namespace, "other");
+                assert_eq!(note.kind, "observation");
+                assert!(note.deleted_at.is_none());
+            }
+            _ => panic!("fixture target was not the expected nonmemory Note"),
+        }
+
+        match runtime.restore_edge(&local_token, edge_id).await {
+            Ok(Some((restored, true))) => {
+                assert_eq!(restored.namespace, "local");
+                assert!(restored.deleted_at.is_none());
+            }
+            _ => panic!("ordinary memory-to-observation restore should preserve existing behavior"),
+        }
+        let ordinary_restore = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("ordinary nonmemory-pair restore should remain readable");
+        assert_eq!(ordinary_restore.namespace, "local");
+        assert!(ordinary_restore.deleted_at.is_none());
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        let edge_before_race = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("retombstoned edge should be addressable before current-pair race");
+        assert_eq!(edge_before_race.namespace, "local");
+        assert!(edge_before_race.deleted_at.is_some());
+
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        install_before_writer_hook(edge_id, entered_tx, Some(release_rx));
+        let mut restore = Box::pin(runtime.restore_edge(&local_token, edge_id));
+        let crossed_precheck = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut restore => false,
+                reached = &mut entered_rx => reached.is_ok(),
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !crossed_precheck {
+            remove_before_writer_hook(edge_id);
+            panic!("fixture did not positively cross the outside check before writer");
+        }
+
+        assert_eq!(change_note_kind(&runtime, target_id, "observation", "memory").await, 1);
+        match runtime
+            .resolve_by_id_including_deleted(&local_token, target_id)
+            .await
+            .unwrap()
+        {
+            Some(Resolved::Note(note)) => {
+                assert_eq!(note.namespace, "other");
+                assert_eq!(note.kind, "memory");
+                assert!(note.deleted_at.is_none());
+            }
+            _ => panic!("fixture target did not become a live memory Note"),
+        }
+        assert!(release_tx.send(()).is_ok());
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut restore)
+            .await
+            .expect("restore did not complete after release");
+        match outcome {
+            Err(RuntimeError::InvalidInput(_)) => {}
+            Ok(Some((_, true))) => {
+                panic!("restore_current_memory_pair_source_namespace_admitted")
+            }
+            _ => panic!("current-pair fixture did not return the expected refusal class"),
+        }
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("current-pair refusal must preserve the tombstone");
+        assert_eq!(after_refusal.namespace, "local");
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_edge_allows_memory_target_in_another_namespace() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime.authorize(Namespace::local()).unwrap();
+        let other_token = runtime.authorize(Namespace::parse("other").unwrap()).unwrap();
+
+        let source = Note::new("local", "memory", "local restore source");
+        let source_id = source.id;
+        let target = Note::new("other", "memory", "foreign restore target");
+        let target_id = target.id;
+        runtime.notes(&local_token).unwrap().upsert_note(source).await.unwrap();
+        runtime.notes(&other_token).unwrap().upsert_note(target).await.unwrap();
+
+        let edge = runtime
+            .link(
+                &local_token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert_eq!(edge.namespace, "local");
+        assert_eq!(edge.source_id, source_id);
+        assert_eq!(edge.target_id, target_id);
+        assert_eq!(prepare_tombstone(&runtime, edge_id, "local", "local").await, 1);
+        assert_memory_note_in_namespace(&runtime, &local_token, source_id, "local").await;
+        assert_memory_note_in_namespace(&runtime, &local_token, target_id, "other").await;
+
+        match runtime.restore_edge(&local_token, edge_id).await {
+            Ok(Some((restored, true))) => {
+                assert_eq!(restored.namespace, "local");
+                assert!(restored.deleted_at.is_none());
+            }
+            _ => panic!("source-local memory edge with a cross-namespace target should restore"),
+        }
+        let after_restore = runtime
+            .get_edge_including_deleted(&local_token, edge_id)
+            .await
+            .unwrap()
+            .expect("restored edge should remain readable");
+        assert_eq!(after_restore.namespace, "local");
+        assert!(after_restore.deleted_at.is_none());
     }
 }

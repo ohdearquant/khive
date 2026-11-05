@@ -703,3 +703,375 @@ async fn restore_refuses_the_whole_changeset_before_preparation() {
         before
     );
 }
+
+#[tokio::test]
+async fn canonical_memory_link_equal_namespace_keeps_source_namespace() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let source = Note::new("local", "memory", "source");
+    let target = Note::new("local", "memory", "target");
+    let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
+    rt.notes(&token).unwrap().upsert_note(source).await.unwrap();
+    rt.notes(&token).unwrap().upsert_note(target).await.unwrap();
+    for id in [source_id, target_id] {
+        let stored = rt
+            .resolve_by_id_including_deleted(&token, id)
+            .await
+            .unwrap();
+        let Some(Resolved::Note(stored)) = stored else {
+            panic!("setup requires a stored note");
+        };
+        assert_eq!(stored.kind, "memory");
+        assert_eq!(stored.namespace.as_str(), "local");
+        assert!(stored.deleted_at.is_none());
+    }
+    let cs = changeset(vec![Op::Link(khive_changeset::LinkOp {
+        id: id128(edge_id),
+        namespace: Namespace::local(),
+        source: id128(source_id),
+        target: id128(target_id),
+        relation: khive_types::EdgeRelation::Annotates,
+        weight: 1.0,
+        properties: Default::default(),
+    })]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap(),
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let edge = rt.get_edge(&token, edge_id).await.unwrap().unwrap();
+    assert_eq!(Uuid::from(edge.id), edge_id);
+    assert_eq!(edge.source_id, source_id);
+    assert_eq!(edge.target_id, target_id);
+    assert_eq!(edge.namespace.as_str(), "local");
+}
+
+#[tokio::test]
+async fn canonical_memory_namespace_mismatch_refuses_before_any_write() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let source_token = rt.authorize(Namespace::local()).unwrap();
+    let token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    assert_eq!(token.namespace().as_str(), "other");
+    let source = Note::new("local", "memory", "source");
+    let target = Note::new("local", "memory", "target");
+    let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
+    rt.notes(&source_token).unwrap().upsert_note(source).await.unwrap();
+    rt.notes(&source_token).unwrap().upsert_note(target).await.unwrap();
+    for id in [source_id, target_id] {
+        let stored = rt
+            .resolve_by_id_including_deleted(&token, id)
+            .await
+            .unwrap();
+        let Some(Resolved::Note(stored)) = stored else {
+            panic!("setup requires a readable stored note");
+        };
+        assert_eq!(stored.kind, "memory");
+        assert_eq!(stored.namespace.as_str(), "local");
+        assert!(stored.deleted_at.is_none());
+    }
+    let side_id = Uuid::new_v4();
+    let mut side = entity_create(side_id, "earlier side op");
+    let Op::Create(create) = &mut side else {
+        panic!("setup requires an entity create");
+    };
+    create.namespace = Namespace::parse("other").unwrap();
+    let cs = changeset(vec![
+        side,
+        Op::Link(khive_changeset::LinkOp {
+            id: id128(edge_id),
+            namespace: Namespace::parse("other").unwrap(),
+            source: id128(source_id),
+            target: id128(target_id),
+            relation: khive_types::EdgeRelation::Annotates,
+            weight: 1.0,
+            properties: Default::default(),
+        }),
+    ]);
+    let error = match prepare_canonical_changeset(rt, &registry(), &token, &cs).await {
+        Err(error) => error,
+        Ok(_) => panic!("canonical_memory_namespace_mismatch_admitted"),
+    };
+    let RuntimeError::CanonicalAdmission { op_index, source } = error else {
+        panic!("expected canonical namespace admission refusal");
+    };
+    assert_eq!(op_index, 1);
+    let RuntimeError::InvalidInput(message) = *source else {
+        panic!("expected the memory namespace rule");
+    };
+    assert_eq!(
+        message,
+        "link: memory edge source namespace local does not match write namespace other; retry with namespace=local"
+    );
+    assert!(rt.get_edge(&token, edge_id).await.unwrap().is_none());
+    assert!(rt
+        .entities(&token)
+        .unwrap()
+        .get_entity(side_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn canonical_staged_memory_source_namespace_mismatch_refuses_before_any_write() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let source_token = rt.authorize(Namespace::local()).unwrap();
+    let token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    assert_eq!(token.namespace().as_str(), "other");
+    let target = Note::new("local", "memory", "target");
+    let (source_id, target_id, edge_id, side_id) =
+        (Uuid::new_v4(), target.id, Uuid::new_v4(), Uuid::new_v4());
+    rt.notes(&source_token).unwrap().upsert_note(target).await.unwrap();
+    let stored = rt
+        .resolve_by_id_including_deleted(&token, target_id)
+        .await
+        .unwrap();
+    let Some(Resolved::Note(stored)) = stored else {
+        panic!("setup requires a readable stored target note");
+    };
+    assert_eq!(stored.kind, "memory");
+    assert_eq!(stored.namespace.as_str(), "local");
+    assert!(stored.deleted_at.is_none());
+    let staged = Op::Create(khive_changeset::CreateOp {
+        id: id128(source_id),
+        namespace: Namespace::local(),
+        target: CreateTarget::Note(khive_changeset::NoteCreateFields {
+            note_kind: "memory".into(),
+            content: "staged source".into(),
+            properties: Default::default(),
+            tags: Vec::new(),
+            salience: None,
+            decay_factor: None,
+        }),
+    });
+    let setup_plans = prepare_canonical_changeset(
+        rt,
+        &registry(),
+        &token,
+        &changeset(vec![staged.clone()]),
+    )
+    .await
+    .expect("setup must admit the staged memory kind");
+    assert_eq!(setup_plans.len(), 1);
+    drop(setup_plans);
+    assert!(rt
+        .resolve_by_id_including_deleted(&token, source_id)
+        .await
+        .unwrap()
+        .is_none());
+    let mut side = entity_create(side_id, "earlier side op");
+    let Op::Create(create) = &mut side else {
+        panic!("setup requires an entity create");
+    };
+    create.namespace = Namespace::parse("other").unwrap();
+    let cs = changeset(vec![
+        side,
+        staged,
+        Op::Link(khive_changeset::LinkOp {
+            id: id128(edge_id),
+            namespace: Namespace::parse("other").unwrap(),
+            source: id128(source_id),
+            target: id128(target_id),
+            relation: khive_types::EdgeRelation::Annotates,
+            weight: 1.0,
+            properties: Default::default(),
+        }),
+    ]);
+    let error = match prepare_canonical_changeset(rt, &registry(), &token, &cs).await {
+        Err(error) => error,
+        Ok(_) => panic!("canonical_staged_memory_namespace_mismatch_admitted"),
+    };
+    let RuntimeError::CanonicalAdmission { op_index, source } = error else {
+        panic!("expected canonical namespace admission refusal");
+    };
+    assert_eq!(op_index, 2);
+    let RuntimeError::InvalidInput(message) = *source else {
+        panic!("expected the memory namespace rule");
+    };
+    assert_eq!(
+        message,
+        "link: memory edge source namespace local does not match write namespace other; retry with namespace=local"
+    );
+    assert!(rt.get_edge(&token, edge_id).await.unwrap().is_none());
+    assert!(rt
+        .resolve_by_id_including_deleted(&token, source_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(rt
+        .entities(&token)
+        .unwrap()
+        .get_entity(side_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn canonical_memory_to_nonmemory_keeps_op_namespace() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let source_token = rt.authorize(Namespace::local()).unwrap();
+    let token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    assert_eq!(token.namespace().as_str(), "other");
+    let source = Note::new("local", "memory", "source");
+    let target = Note::new("other", "observation", "target");
+    let (source_id, target_id, edge_id) = (source.id, target.id, Uuid::new_v4());
+    rt.notes(&source_token).unwrap().upsert_note(source).await.unwrap();
+    rt.notes(&token).unwrap().upsert_note(target).await.unwrap();
+    for (id, kind, namespace) in [
+        (source_id, "memory", "local"),
+        (target_id, "observation", "other"),
+    ] {
+        let stored = rt
+            .resolve_by_id_including_deleted(&token, id)
+            .await
+            .unwrap();
+        let Some(Resolved::Note(stored)) = stored else {
+            panic!("setup requires a readable stored note");
+        };
+        assert_eq!(stored.kind, kind);
+        assert_eq!(stored.namespace.as_str(), namespace);
+        assert!(stored.deleted_at.is_none());
+    }
+    let cs = changeset(vec![Op::Link(khive_changeset::LinkOp {
+        id: id128(edge_id),
+        namespace: Namespace::parse("other").unwrap(),
+        source: id128(source_id),
+        target: id128(target_id),
+        relation: khive_types::EdgeRelation::Annotates,
+        weight: 1.0,
+        properties: Default::default(),
+    })]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap(),
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let edge = rt.get_edge(&token, edge_id).await.unwrap().unwrap();
+    assert_eq!(Uuid::from(edge.id), edge_id);
+    assert_eq!(edge.source_id, source_id);
+    assert_eq!(edge.target_id, target_id);
+    assert_eq!(edge.namespace.as_str(), "other");
+}
+
+#[tokio::test]
+async fn canonical_memory_namespace_change_before_writer_rolls_back() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let moved_token = rt.authorize(Namespace::parse("other").unwrap()).unwrap();
+    let source = Note::new("local", "memory", "source");
+    let target = Note::new("local", "memory", "target");
+    let (source_id, target_id, edge_id, side_id) =
+        (source.id, target.id, Uuid::new_v4(), Uuid::new_v4());
+    rt.notes(&token).unwrap().upsert_note(source).await.unwrap();
+    rt.notes(&token).unwrap().upsert_note(target).await.unwrap();
+    for id in [source_id, target_id] {
+        let stored = rt
+            .resolve_by_id_including_deleted(&token, id)
+            .await
+            .unwrap();
+        let Some(Resolved::Note(stored)) = stored else {
+            panic!("setup requires a stored note");
+        };
+        assert_eq!(stored.kind, "memory");
+        assert_eq!(stored.namespace.as_str(), "local");
+        assert!(stored.deleted_at.is_none());
+    }
+    let cs = changeset(vec![
+        entity_create(side_id, "earlier side op"),
+        Op::Link(khive_changeset::LinkOp {
+            id: id128(edge_id),
+            namespace: Namespace::local(),
+            source: id128(source_id),
+            target: id128(target_id),
+            relation: khive_types::EdgeRelation::Annotates,
+            weight: 1.0,
+            properties: Default::default(),
+        }),
+    ]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+        .await
+        .expect("equal-namespace prepare must succeed before drift");
+    assert_eq!(plans.len(), 2);
+    let statement = SqlStatement::new(
+        "UPDATE notes SET namespace = ?1 WHERE id = ?2",
+        vec![
+            SqlValue::Text("other".into()),
+            SqlValue::Text(source_id.to_string()),
+        ],
+    );
+    let drift: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let affected = writer.execute(statement).await?;
+            Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+        })
+    });
+    let changed = khive_storage::SqlAccess::atomic_unit(rt.sql().as_ref(), drift)
+        .await
+        .expect("private fixture namespace drift");
+    let affected = match changed.downcast::<u64>() {
+        Ok(affected) => *affected,
+        Err(_) => panic!("namespace drift result type"),
+    };
+    assert_eq!(affected, 1, "fixture must move exactly one source row");
+    let stored = rt
+        .resolve_by_id_including_deleted(&moved_token, source_id)
+        .await
+        .unwrap();
+    let Some(Resolved::Note(stored)) = stored else {
+        panic!("setup requires the drifted stored source");
+    };
+    assert_eq!(stored.kind, "memory");
+    assert_eq!(stored.namespace.as_str(), "other");
+    assert!(stored.deleted_at.is_none());
+    let outcome = crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap();
+    if matches!(&outcome, crate::AtomicRunOutcome::Committed { .. }) {
+        panic!("canonical_memory_writer_namespace_mismatch_admitted");
+    }
+    let crate::AtomicRunOutcome::RolledBack { failure, .. } = outcome else {
+        panic!("expected a canonical writer rollback");
+    };
+    let AtomicOpFailure::SqlError { statement_label, message } = failure else {
+        panic!("expected the canonical namespace SQL failure");
+    };
+    assert_eq!(statement_label.as_deref(), Some("canonical-materialize"));
+    assert_eq!(
+        message,
+        RuntimeError::InvalidInput(
+            "link: memory edge source namespace other does not match write namespace local; retry with namespace=other".into()
+        )
+        .to_string()
+    );
+    assert!(rt.get_edge(&token, edge_id).await.unwrap().is_none());
+    assert!(rt
+        .entities(&token)
+        .unwrap()
+        .get_entity(side_id)
+        .await
+        .unwrap()
+        .is_none());
+    let stored = rt
+        .resolve_by_id_including_deleted(&moved_token, source_id)
+        .await
+        .unwrap();
+    let Some(Resolved::Note(stored)) = stored else {
+        panic!("external namespace drift must remain stored");
+    };
+    assert_eq!(stored.kind, "memory");
+    assert_eq!(stored.namespace.as_str(), "other");
+}

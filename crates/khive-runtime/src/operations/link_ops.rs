@@ -311,6 +311,24 @@ impl KhiveRuntime {
         let (Some(Resolved::Note(source)), Some(Resolved::Note(target))) = (source, target) else {
             return Ok(());
         };
+        Self::ensure_memory_note_edge_namespace(
+            token.namespace().as_str(),
+            source_id,
+            target_id,
+            relation,
+            source,
+            target,
+        )
+    }
+
+    pub(crate) fn ensure_memory_note_edge_namespace(
+        write_namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        source: &khive_storage::Note,
+        target: &khive_storage::Note,
+    ) -> RuntimeResult<()> {
         if source.kind != "memory" || target.kind != "memory" {
             return Ok(());
         }
@@ -322,10 +340,10 @@ impl KhiveRuntime {
         } else {
             target.namespace.as_str()
         };
-        if source_namespace != token.namespace().as_str() {
+        if source_namespace != write_namespace {
             return Err(RuntimeError::InvalidInput(format!(
                 "link: memory edge source namespace {source_namespace} does not match write namespace {}; retry with namespace={source_namespace}",
-                token.namespace().as_str()
+                write_namespace
             )));
         }
         Ok(())
