@@ -45,7 +45,7 @@ fn brain_resolve_params_has_consumer_kind_required() {
         let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
         assert_eq!(
             namespace.description,
-            "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
+            "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
             "{verb} namespace help must describe the catalog"
         );
     }

@@ -266,7 +266,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
+                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -558,7 +558,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
+                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -601,7 +601,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
+                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -637,7 +637,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. The binding matches resolves in this catalog.",
+                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
