@@ -1045,9 +1045,10 @@ hiding their targets.
 
 ### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
 
-**Status**: Accepted 2026-11-05 (Proposed 2026-11-04). Changes where Decision 7's `supersedes` edges, and every other edge between two
-memory rows, are written, and what an edge read reports when it leaves edges out. Rule 1's refusal text amended
-2026-11-05 (proposed): a refusal names the source row's namespace only when the caller can read it.
+**Status**: Accepted 2026-11-05 (Proposed 2026-11-04), except the amendment to rule 1's refusal text, which is Proposed
+(2026-11-05): a refusal names the source row's namespace only when the caller can read it. Changes where Decision 7's
+`supersedes` edges, and every other edge between two memory rows, are written, and what an edge read reports when it
+leaves edges out.
 
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
 `supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
@@ -1116,10 +1117,13 @@ their current rule.
 **Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
 arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
 superseding row remains a follow-up, not solved here. A refused write names the source row's namespace only when the
-caller can already read that namespace, so rule 1 discloses no namespace that rule 2 withholds; a caller holding the
-id of a row in a namespace it cannot read learns only that the row is in such a namespace. One further disclosure
-follows from the design: the count covers only edges whose endpoints are live, so it falls when a hidden source row is
-soft-deleted, which shows a reader that a row it cannot see was deleted.
+caller can already read that namespace, so rule 1 discloses no namespace that rule 2 withholds. The refusal still tells
+a caller holding a row's id that the row exists, that it is a memory row (the rule applies only when both endpoints are
+memory rows, so a missing or non-memory endpoint is not refused by it), and that its namespace is one the caller cannot
+read. Rule 1 does not stop the namespace being learned another way: by-id `get` returns any live note, its namespace
+included, without a visibility check. That read is the remaining namespace disclosure, and closing it is a separate
+decision. One further disclosure follows from the design: the count covers only edges whose endpoints are live, so it
+falls when a hidden source row is soft-deleted, which shows a reader that a row it cannot see was deleted.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
 the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
