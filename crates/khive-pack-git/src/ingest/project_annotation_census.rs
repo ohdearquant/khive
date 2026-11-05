@@ -206,28 +206,28 @@ mod tests {
         )
         .await;
         let mut ids = Vec::new();
-        // Keep adding notes until the lowest ID is neither the first nor the last
-        // created, so a walk in creation order, oldest or newest first, does not
-        // reach it first.
-        for number in 1..=64 {
-            let id = create(
-                &registry,
-                json!({
-                    "kind": "issue",
-                    "content": "",
-                    "properties": {
-                        "number": number,
-                        "title": format!("order issue {number}"),
-                        "project_id": project_id.to_string()
-                    }
-                }),
-            )
-            .await;
+        // The lowest ID is in the middle, independently of generated IDs.
+        for (number, id) in [
+            (1, "64140000-0000-4000-8000-000000000003"),
+            (2, "64140000-0000-4000-8000-000000000001"),
+            (3, "64140000-0000-4000-8000-000000000002"),
+        ] {
+            let title = format!("order issue {number}");
+            let mut note = khive_storage::Note::new("local", "issue", title.as_str());
+            note.id = Uuid::parse_str(id).expect("fixed fixture UUID");
+            note.properties = Some(json!({
+                "number": number,
+                "title": title,
+                "project_id": project_id.to_string()
+            }));
+            let id = note.id;
+            runtime
+                .notes(&token)
+                .expect("local note store")
+                .upsert_note(note)
+                .await
+                .expect("insert fixed-ID issue note");
             ids.push(id.to_string());
-            let lowest = ids.iter().min();
-            if ids.len() > 2 && lowest != ids.first() && lowest != ids.last() {
-                break;
-            }
         }
         let lowest = ids.iter().min().cloned().expect("at least one note");
         assert!(
