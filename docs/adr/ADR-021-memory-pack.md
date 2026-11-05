@@ -1046,7 +1046,8 @@ hiding their targets.
 ### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
 
 **Status**: Accepted 2026-11-05 (Proposed 2026-11-04). Changes where Decision 7's `supersedes` edges, and every other edge between two
-memory rows, are written, and what an edge read reports when it leaves edges out.
+memory rows, are written, and what an edge read reports when it leaves edges out. Rule 1's refusal text amended
+2026-11-05 (proposed): a refusal names the source row's namespace only when the caller can read it.
 
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
 `supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
@@ -1063,8 +1064,12 @@ and 4 now name the placement rule below beside `restore`'s ownership comparison.
    whichever verb writes it. Three verbs write such an edge: `memory.apply_batch`, `link`, and a link op in
    `apply_changeset`, and `restore` revives one. Each of the three writers reads the source row and compares its stored namespace with the request's write namespace,
    the one the gate checked: the caller's own, or the explicit `namespace` argument, or for `apply_changeset` the op's
-   own `namespace` field. The two must be equal. A mismatch is refused before anything is written and names the source
-   row's namespace to retry with; the edge is never redirected and an op's namespace is never overridden.
+   own `namespace` field. The two must be equal. A mismatch is refused before anything is written. When the source
+   row's namespace is one of the namespaces the request can read, the refusal names it as the namespace to retry with.
+   When it is not, the refusal says that the source row is in a namespace the caller cannot read and that the edge
+   cannot be written under the request's namespace, and it names no namespace. A refused `restore` and a refused
+   `apply_changeset` link op follow the same split. The edge is never redirected and an op's namespace is never
+   overridden.
    `memory.apply_batch` writes the edge from the row it has just written in the caller's namespace, so its two
    namespaces always agree. `restore` of a soft-deleted edge between memory rows compares the edge's stored namespace
    with its source row's and refuses a mismatch, so a tombstone the move leaves in place cannot come back live in the
@@ -1110,14 +1115,16 @@ their current rule.
 
 **Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
 arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
-superseding row remains a follow-up, not solved here. Two further disclosures follow from the design: a refused write
-names the source row's namespace, so a caller holding a memory row's id can learn its namespace (namespace is
-attribution under ADR-007 Rev 8, not a secret); and the count covers only edges whose endpoints are live, so it falls
-when a hidden source row is soft-deleted, which shows a reader that a row it cannot see was deleted.
+superseding row remains a follow-up, not solved here. A refused write names the source row's namespace only when the
+caller can already read that namespace, so rule 1 discloses no namespace that rule 2 withholds; a caller holding the
+id of a row in a namespace it cannot read learns only that the row is in such a namespace. One further disclosure
+follows from the design: the count covers only edges whose endpoints are live, so it falls when a hidden source row is
+soft-deleted, which shows a reader that a row it cannot see was deleted.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
 the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
-written; `restore` of a soft-deleted edge between memory rows whose namespace differs from its source row's refused
+written; the same refusal, for `link`, an `apply_changeset` link op and `restore`, naming the source row's namespace
+when the caller can read it and carrying no namespace other than the request's when it cannot; `restore` of a soft-deleted edge between memory rows whose namespace differs from its source row's refused
 with the edge left soft-deleted; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
 edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
