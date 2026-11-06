@@ -1378,7 +1378,7 @@ async fn canonical_prepare_refusal_hides_unreadable_memory_source_namespace() {
     );
     assert!(!message.contains(&source_id.to_string()));
     assert!(!message.contains(&target_id.to_string()));
-    assert_eq!(message, "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace local");
+    assert_eq!(message, "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under link operation namespace local");
     assert!(rt.get_edge(&unreadable, edge_id).await.unwrap().is_none());
 
     // Prepare with a local source, then move it outside the original caller's
@@ -1464,7 +1464,7 @@ async fn canonical_prepare_refusal_hides_unreadable_memory_source_namespace() {
     );
     assert!(!message.contains(&writer_source_id.to_string()));
     assert!(!message.contains(&writer_target_id.to_string()));
-    assert_eq!(message, RuntimeError::InvalidInput("apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace local".into()).to_string());
+    assert_eq!(message, RuntimeError::InvalidInput("apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under link operation namespace local".into()).to_string());
     assert!(rt
         .get_edge(&unreadable, writer_edge_id)
         .await

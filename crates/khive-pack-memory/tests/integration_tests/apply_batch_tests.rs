@@ -1120,3 +1120,378 @@ async fn test_apply_batch_pins_row_rerun_and_edge_to_one_write_namespace() {
     assert_eq!(ab_edges(&rt, "alice", vec![old]).await.len(), 1);
     assert_eq!(ab_edges(&rt, "local", vec![old]).await.len(), 0);
 }
+
+fn ab_payload_row(old: Uuid, part: u32, content: &str) -> Value {
+    let mut row = ab_supersede(old, content);
+    row["part"] = json!(part);
+    row["memory_type"] = json!("episodic");
+    row["salience"] = json!(0.3);
+    row["properties"]["source_ids"] = json!(["reed-warbler-field-sheet"]);
+    row["tags"] = json!(["wetland", "field"]);
+    row
+}
+
+async fn ab_payload_apply(
+    registry: &khive_runtime::VerbRegistry, batch: &str, rows: Vec<Value>, dry_run: bool,
+) -> Value {
+    let count = rows.len();
+    let result = ab_apply(registry, batch, rows, dry_run).await;
+    assert_eq!(result["entries"].as_array().expect("entries array").len(), count);
+    assert_eq!(result["counts"]["failed"], 0, "a storage/link failure is not a grouping result");
+    result
+}
+
+fn ab_payload_id(result: &Value, index: usize) -> Uuid {
+    ab_uuid(&result["entries"][index]["new_id"])
+}
+
+fn ab_payload_duplicate(result: &Value, index: usize, winner_index: usize, winner_part: u32) {
+    let entry = &result["entries"][index];
+    assert_eq!(entry["reason"]["code"], "duplicate-payload", "later matching New row must be refused");
+    assert_eq!(entry["outcome"], "refused");
+    assert!(entry["new_id"].is_null(), "refusal must not expose a second successor");
+    let message = entry["reason"]["message"].as_str().expect("duplicate reason message");
+    let words: Vec<&str> = message.split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
+        .collect();
+    let index_text = winner_index.to_string();
+    let part_text = winner_part.to_string();
+    assert!(words.windows(2).any(|pair| pair == ["index", index_text.as_str()]),
+        "winner index is zero-based in the whole input: {message}");
+    assert!(words.windows(2).any(|pair| pair == ["part", part_text.as_str()]),
+        "winner part is the actual row's part: {message}");
+}
+
+fn ab_payload_targets(rows: &[Value]) -> Vec<Uuid> {
+    let mut targets = Vec::new();
+    for row in rows {
+        if row["action"] == "supersede" {
+            let id = ab_uuid(&row["id"]);
+            if !targets.contains(&id) { targets.push(id); }
+        }
+    }
+    targets
+}
+
+async fn ab_payload_counts(rt: &KhiveRuntime, targets: &[Uuid]) -> (usize, usize) {
+    (ab_note_count(rt, "alice").await, ab_edges(rt, "alice", targets.to_vec()).await.len())
+}
+
+async fn ab_payload_stored(
+    registry: &khive_runtime::VerbRegistry, batch: &str, old: Uuid, id: Uuid,
+) -> Value {
+    let stored = registry.dispatch("get", json!({"id":id.to_string()}))
+        .await.expect("get the actual stored successor");
+    assert_eq!(stored["namespace"], "alice");
+    assert_eq!(stored["properties"]["batch"], batch);
+    assert_eq!(stored["properties"]["supersedes"], old.to_string());
+    let digest = stored["properties"]["batch_row"].as_str().expect("stored batch_row digest");
+    assert_eq!(digest.len(), 64);
+    assert!(digest.chars().all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()));
+    stored
+}
+
+async fn ab_payload_two_successors(
+    rt: &KhiveRuntime, registry: &khive_runtime::VerbRegistry, batch: &str, rows: Vec<Value>,
+) -> [Uuid; 2] {
+    assert_eq!(rows.len(), 2);
+    let targets = ab_payload_targets(&rows);
+    let before = ab_payload_counts(rt, &targets).await;
+    let dry = ab_payload_apply(registry, batch, rows.clone(), true).await;
+    assert_eq!(dry["counts"]["planned"], 2, "different complete payloads stay independently planned");
+    assert_eq!(dry["counts"]["refused"], 0);
+    assert_eq!(ab_payload_counts(rt, &targets).await, before, "positive dry run writes nothing");
+    let result = ab_payload_apply(registry, batch, rows.clone(), false).await;
+    assert_eq!(result["counts"]["written"], 2, "different payloads positively write two successors");
+    assert_eq!(result["counts"]["refused"], 0);
+    let ids = [ab_payload_id(&result, 0), ab_payload_id(&result, 1)];
+    assert_ne!(ids[0], ids[1], "the two successful rows name distinct stored notes");
+    assert_eq!(ab_payload_counts(rt, &targets).await, (before.0 + 2, before.1 + 2),
+        "positive fixture stores two notes and two supersedes edges");
+    for index in 0..2 {
+        assert_eq!(result["entries"][index]["outcome"], "written");
+        ab_payload_stored(registry, batch, ab_uuid(&rows[index]["id"]), ids[index]).await;
+    }
+    ids
+}
+
+async fn ab_payload_fixture(label: &str) -> (KhiveRuntime, khive_runtime::VerbRegistry, Uuid) {
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let old = ab_seed(&alice, &format!("reed warbler original observation {label}")).await;
+    let stored = alice.dispatch("get", json!({"id":old.to_string()}))
+        .await.expect("resolve the real named-actor seed before grouping assertions");
+    assert_eq!(stored["namespace"], "alice");
+    ab_payload_two_successors(&rt, &alice, &format!("payload-positive-{label}"), vec![
+        ab_payload_row(old, 1, "reed warbler positive first revision"),
+        ab_payload_row(old, 2, "reed warbler positive different revision"),
+    ]).await;
+    (rt, alice, old)
+}
+
+async fn ab_payload_duplicate_group(
+    rt: &KhiveRuntime, registry: &khive_runtime::VerbRegistry, batch: &str,
+    old: Uuid, rows: Vec<Value>, winner: usize, loser: usize,
+) {
+    let winner_part = u32::try_from(rows[winner]["part"].as_u64().expect("winner part")).expect("u32 part");
+    let before = ab_payload_counts(rt, &[old]).await;
+    let dry = ab_payload_apply(registry, batch, rows.clone(), true).await;
+    ab_payload_duplicate(&dry, loser, winner, winner_part);
+    assert_eq!(dry["entries"][winner]["outcome"], "planned");
+    assert_eq!(dry["counts"]["planned"], 1);
+    assert_eq!(dry["counts"]["refused"], 1);
+    assert_eq!(ab_payload_counts(rt, &[old]).await, before, "duplicate dry run writes nothing");
+    let result = ab_payload_apply(registry, batch, rows.clone(), false).await;
+    ab_payload_duplicate(&result, loser, winner, winner_part);
+    assert_eq!(result["entries"][winner]["outcome"], "written");
+    assert_eq!(result["counts"]["written"], 1);
+    assert_eq!(result["counts"]["refused"], 1);
+    assert_eq!(ab_payload_counts(rt, &[old]).await, (before.0 + 1, before.1 + 1),
+        "duplicate refusal must leave no second successor memory or supersedes edge");
+    for index in 0..rows.len() {
+        if index != winner && index != loser {
+            assert_eq!(rows[index]["action"], "skip");
+            assert_eq!(result["entries"][index]["outcome"], "skipped");
+        }
+    }
+    let new_id = ab_payload_id(&result, winner);
+    ab_payload_stored(registry, batch, old, new_id).await;
+    let replay = ab_payload_apply(registry, batch, vec![rows[winner].clone()], false).await;
+    assert_eq!(replay["entries"][0]["outcome"], "deduped", "single-key replay remains unchanged");
+    assert_eq!(ab_payload_id(&replay, 0), new_id);
+    assert_eq!(replay["counts"]["written"], 0);
+    assert_eq!(ab_payload_counts(rt, &[old]).await, (before.0 + 1, before.1 + 1));
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_uses_first_input_and_global_index() {
+    let (rt, alice, old) = ab_payload_fixture("first-input").await;
+    let first = ab_payload_row(old, 2, "reed warbler census revised");
+    let second = ab_payload_row(old, 1, "reed warbler census revised");
+    ab_payload_duplicate_group(&rt, &alice, "payload-first", old,
+        vec![first.clone(), second.clone()], 0, 1).await;
+    ab_payload_duplicate_group(&rt, &alice, "payload-global", old,
+        vec![json!({"id":old.to_string(), "action":"skip"}), first, second], 1, 2).await;
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_preserves_historical_replay_in_either_position() {
+    let (rt, alice, old) = ab_payload_fixture("historical").await;
+    for (batch, new_first) in [("payload-held-first", false), ("payload-held-last", true)] {
+        let held = ab_payload_row(old, 2, "reed warbler historical successor");
+        let new = ab_payload_row(old, 1, "reed warbler historical successor");
+        let before_seed = ab_payload_counts(&rt, &[old]).await;
+        let seeded = ab_payload_apply(&alice, batch, vec![held.clone()], false).await;
+        assert_eq!(seeded["entries"][0]["outcome"], "written", "historical row is a successful prior write");
+        assert_eq!(ab_payload_counts(&rt, &[old]).await, (before_seed.0 + 1, before_seed.1 + 1));
+        let held_id = ab_payload_id(&seeded, 0);
+        ab_payload_stored(&alice, batch, old, held_id).await;
+        let rows = if new_first { vec![new, held.clone()] } else { vec![held.clone(), new] };
+        let held_index = usize::from(new_first);
+        let new_index = 1 - held_index;
+        let before = ab_payload_counts(&rt, &[old]).await;
+        for dry_run in [true, false] {
+            let result = ab_payload_apply(&alice, batch, rows.clone(), dry_run).await;
+            ab_payload_duplicate(&result, new_index, held_index, 2);
+            assert_eq!(result["entries"][held_index]["outcome"], "deduped");
+            assert_eq!(ab_payload_id(&result, held_index), held_id);
+            assert_eq!(result["counts"]["deduped"], 1);
+            assert_eq!(result["counts"]["written"], 0);
+            assert_eq!(result["counts"]["refused"], 1);
+            assert_eq!(ab_payload_counts(&rt, &[old]).await, before,
+                "historical replay dominates matching New regardless of array position");
+        }
+        let replay = ab_payload_apply(&alice, batch, vec![held], false).await;
+        assert_eq!(replay["entries"][0]["outcome"], "deduped");
+        assert_eq!(ab_payload_id(&replay, 0), held_id);
+        assert_eq!(ab_payload_counts(&rt, &[old]).await, before);
+    }
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_preserves_two_existing_replays() {
+    let (rt, alice, old) = ab_payload_fixture("both-held").await;
+    let batch = "payload-two-held";
+    let first = ab_payload_row(old, 1, "reed warbler prior independently written successor");
+    let second = ab_payload_row(old, 2, "reed warbler prior independently written successor");
+    let before = ab_payload_counts(&rt, &[old]).await;
+    let one = ab_payload_apply(&alice, batch, vec![first.clone()], false).await;
+    assert_eq!(one["entries"][0]["outcome"], "written");
+    assert_eq!(ab_payload_counts(&rt, &[old]).await, (before.0 + 1, before.1 + 1));
+    let two = ab_payload_apply(&alice, batch, vec![second.clone()], false).await;
+    assert_eq!(two["entries"][0]["outcome"], "written", "separate calls are outside in-call grouping");
+    assert_eq!(ab_payload_counts(&rt, &[old]).await, (before.0 + 2, before.1 + 2));
+    let ids = [ab_payload_id(&one, 0), ab_payload_id(&two, 0)];
+    assert_ne!(ids[0], ids[1]);
+    let stored_one = ab_payload_stored(&alice, batch, old, ids[0]).await;
+    let stored_two = ab_payload_stored(&alice, batch, old, ids[1]).await;
+    assert_ne!(stored_one["properties"]["batch_row"], stored_two["properties"]["batch_row"],
+        "stored batch_row identity still includes the part");
+    for dry_run in [true, false] {
+        let result = ab_payload_apply(&alice, batch, vec![second.clone(), first.clone()], dry_run).await;
+        assert_eq!(result["counts"]["deduped"], 2);
+        assert_eq!(result["counts"]["written"], 0);
+        assert_eq!(result["counts"]["refused"], 0, "existing Deduped plans are preserved");
+        assert_eq!(ab_payload_id(&result, 0), ids[1]);
+        assert_eq!(ab_payload_id(&result, 1), ids[0]);
+        assert_eq!(ab_payload_counts(&rt, &[old]).await, (before.0 + 2, before.1 + 2));
+    }
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_keeps_complete_typed_field_differences() {
+    let (rt, alice, old) = ab_payload_fixture("typed-fields").await;
+    let first = ab_payload_row(old, 1, "reed warbler typed successor");
+    let second = ab_payload_row(old, 2, "reed warbler typed successor");
+    let mut cases: Vec<(&str, Value, Value)> = Vec::new();
+    let mut changed = second.clone();
+    changed["content"] = json!("reed warbler typed successor ");
+    cases.push(("content-not-trimmed", first.clone(), changed));
+    let mut changed = second.clone();
+    changed["memory_type"] = json!("semantic");
+    cases.push(("memory-type", first.clone(), changed));
+    let mut changed = second.clone();
+    changed["salience"] = json!(0.2);
+    cases.push(("salience", first.clone(), changed));
+    let mut left = first.clone();
+    let mut right = second.clone();
+    left["properties"]["site"] = json!("north-marsh");
+    right["properties"]["site"] = json!("south-marsh");
+    cases.push(("property-value", left, right));
+    let mut changed = second.clone();
+    changed["tags"] = json!(["wetland", "forest"]);
+    cases.push(("tag-value", first.clone(), changed));
+    let mut changed = second.clone();
+    changed["tags"] = json!(["field", "wetland"]);
+    cases.push(("tag-order", first.clone(), changed));
+    let mut left = first.clone();
+    let mut right = second.clone();
+    left["properties"]["source_ids"] = json!(["sheet-a", "sheet-b"]);
+    right["properties"]["source_ids"] = json!(["sheet-b", "sheet-a"]);
+    cases.push(("property-array-order", left, right));
+    let mut omitted = first.clone();
+    omitted.as_object_mut().expect("row object").remove("memory_type");
+    cases.push(("omitted-type", omitted, second.clone()));
+    let mut omitted = first.clone();
+    omitted.as_object_mut().expect("row object").remove("salience");
+    omitted["properties"]["verified"] = json!(true);
+    let mut explicit = second.clone();
+    explicit["properties"]["verified"] = json!(true);
+    cases.push(("omitted-salience", omitted, explicit));
+    let mut omitted = first.clone();
+    omitted.as_object_mut().expect("row object").remove("tags");
+    let mut explicit = second.clone();
+    explicit["tags"] = json!([]);
+    cases.push(("omitted-tags", omitted, explicit));
+    for (name, left, right) in cases {
+        ab_payload_two_successors(&rt, &alice, &format!("payload-field-{name}"), vec![left, right]).await;
+    }
+    let other_old = ab_seed(&alice, "reed warbler other old observation").await;
+    let stored = alice.dispatch("get", json!({"id":other_old.to_string()}))
+        .await.expect("resolve the second real old memory");
+    assert_eq!(stored["namespace"], "alice");
+    ab_payload_two_successors(&rt, &alice, "payload-different-old",
+        vec![first, ab_payload_row(other_old, 2, "reed warbler typed successor")]).await;
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_canonical_uuid_and_object_order_match() {
+    let (rt, alice, old) = ab_payload_fixture("canonical").await;
+    let mut first = ab_payload_row(old, 2, "reed warbler canonical successor");
+    let mut second = ab_payload_row(old, 1, "reed warbler canonical successor");
+    let mut first_properties = serde_json::Map::new();
+    first_properties.insert("who".to_string(), json!("batch-tester"));
+    first_properties.insert("source_ids".to_string(), json!(["sheet-a", "sheet-b"]));
+    first_properties.insert("site".to_string(), json!("north-marsh"));
+    let mut second_properties = serde_json::Map::new();
+    second_properties.insert("site".to_string(), json!("north-marsh"));
+    second_properties.insert("source_ids".to_string(), json!(["sheet-a", "sheet-b"]));
+    second_properties.insert("who".to_string(), json!("batch-tester"));
+    first["properties"] = Value::Object(first_properties);
+    second["properties"] = Value::Object(second_properties);
+    second["id"] = json!(old.to_string().replace('-', "").to_ascii_uppercase());
+    ab_payload_duplicate_group(&rt, &alice, "payload-canonical", old, vec![first, second], 0, 1).await;
+}
+
+async fn ab_payload_precedence_case(
+    rt: &KhiveRuntime, registry: &khive_runtime::VerbRegistry, batch: &str, old: Uuid,
+    rows: Vec<Value>, codes: &[Option<&str>], winner: usize,
+) -> Value {
+    assert_eq!(rows.len(), codes.len(),
+        "batch={batch} dry_run=unavailable winner_index={winner} winner_refusal_code=unavailable phase=before-result");
+    let before = ab_payload_counts(rt, &[old]).await;
+    let mut applied = Value::Null;
+    for dry_run in [true, false] {
+        let result = ab_payload_apply(registry, batch, rows.clone(), dry_run).await;
+        let context = format!(
+            "batch={batch} dry_run={dry_run} winner_index={winner} winner_refusal_code={}",
+            result["entries"][winner]["reason"]["code"],
+        );
+        for (index, code) in codes.iter().enumerate() {
+            if let Some(code) = code {
+                assert_eq!(result["entries"][index]["reason"]["code"], *code,
+                    "{context} entry_index={index}: refusal precedence");
+                assert_eq!(result["entries"][index]["outcome"], "refused",
+                    "{context} entry_index={index}: refused-row outcome");
+                assert!(result["entries"][index]["new_id"].is_null(),
+                    "{context} entry_index={index}: refused row has no successor id");
+            } else {
+                assert_eq!(index, winner, "{context} entry_index={index}: designated winner");
+                assert_eq!(result["entries"][index]["outcome"], if dry_run { "planned" } else { "written" },
+                    "{context} entry_index={index}: winner-row outcome");
+            }
+        }
+        assert_eq!(result["counts"]["refused"], json!(rows.len() - 1), "{context}: refused count");
+        if dry_run {
+            assert_eq!(result["counts"]["written"], 0, "{context}: dry-run written count");
+            assert_eq!(ab_payload_counts(rt, &[old]).await, before, "{context}: dry-run note/edge counts");
+        } else {
+            assert_eq!(result["counts"]["written"], 1, "{context}: real written count");
+            assert_eq!(ab_payload_counts(rt, &[old]).await, (before.0 + 1, before.1 + 1),
+                "{context}: refused rows neither win nor cause extra note/edge writes");
+            ab_payload_stored(registry, batch, old, ab_payload_id(&result, winner)).await;
+            applied = result;
+        }
+    }
+    applied
+}
+
+#[tokio::test]
+async fn test_apply_batch_duplicate_payload_preserves_invalid_and_key_refusals() {
+    let (rt, alice, old) = ab_payload_fixture("precedence").await;
+    let candidate = "reed warbler precedence successor";
+    let mut invalid = ab_payload_row(old, 2, candidate);
+    invalid["unrecognized"] = json!(true);
+    let result = ab_payload_precedence_case(&rt, &alice, "payload-invalid", old,
+        vec![invalid, ab_payload_row(old, 1, candidate), ab_payload_row(old, 3, candidate)],
+        &[Some("invalid-row"), None, Some("duplicate-payload")], 1).await;
+    ab_payload_duplicate(&result, 2, 1, 1);
+    ab_payload_precedence_case(&rt, &alice, "payload-key-peers", old,
+        vec![ab_payload_row(old, 2, candidate), ab_payload_row(old, 2, candidate), ab_payload_row(old, 1, candidate)],
+        &[Some("duplicate-key"), Some("duplicate-key"), None], 2).await;
+    let mut missing_who = ab_payload_row(old, 2, candidate);
+    missing_who["properties"].as_object_mut().expect("properties object").remove("who");
+    ab_payload_precedence_case(&rt, &alice, "payload-who-precedence", old,
+        vec![missing_who, ab_payload_row(old, 2, candidate), ab_payload_row(old, 1, candidate)],
+        &[Some("who-missing"), Some("duplicate-key"), None], 2).await;
+    let mut default_part = ab_payload_row(old, 1, candidate);
+    default_part.as_object_mut().expect("row object").remove("part");
+    ab_payload_precedence_case(&rt, &alice, "payload-default-part", old,
+        vec![default_part, ab_payload_row(old, 1, candidate), ab_payload_row(old, 2, candidate)],
+        &[Some("duplicate-key"), Some("duplicate-key"), None], 2).await;
+
+    let batch = "payload-held-refusal";
+    let before_seed = ab_payload_counts(&rt, &[old]).await;
+    let held = ab_payload_apply(&alice, batch,
+        vec![ab_payload_row(old, 2, "reed warbler already stored different payload")], false).await;
+    assert_eq!(held["entries"][0]["outcome"], "written");
+    assert_eq!(ab_payload_counts(&rt, &[old]).await, (before_seed.0 + 1, before_seed.1 + 1));
+    let held_id = ab_payload_id(&held, 0);
+    let stored_before = ab_payload_stored(&alice, batch, old, held_id).await;
+    let result = ab_payload_precedence_case(&rt, &alice, batch, old,
+        vec![ab_payload_row(old, 2, candidate), ab_payload_row(old, 1, candidate)],
+        &[Some("dedupe-name-taken"), None], 1).await;
+    assert_ne!(ab_payload_id(&result, 1), held_id);
+    assert_eq!(ab_payload_stored(&alice, batch, old, held_id).await, stored_before,
+        "held-key refusal preserves its previously stored note");
+}
