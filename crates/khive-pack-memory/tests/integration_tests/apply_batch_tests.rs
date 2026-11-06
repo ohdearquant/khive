@@ -1417,29 +1417,38 @@ async fn ab_payload_precedence_case(
     rt: &KhiveRuntime, registry: &khive_runtime::VerbRegistry, batch: &str, old: Uuid,
     rows: Vec<Value>, codes: &[Option<&str>], winner: usize,
 ) -> Value {
-    assert_eq!(rows.len(), codes.len());
+    assert_eq!(rows.len(), codes.len(),
+        "batch={batch} dry_run=unavailable winner_index={winner} winner_refusal_code=unavailable phase=before-result");
     let before = ab_payload_counts(rt, &[old]).await;
     let mut applied = Value::Null;
     for dry_run in [true, false] {
         let result = ab_payload_apply(registry, batch, rows.clone(), dry_run).await;
+        let context = format!(
+            "batch={batch} dry_run={dry_run} winner_index={winner} winner_refusal_code={}",
+            result["entries"][winner]["reason"]["code"],
+        );
         for (index, code) in codes.iter().enumerate() {
             if let Some(code) = code {
-                assert_eq!(result["entries"][index]["reason"]["code"], *code, "refusal precedence at input index {index}");
-                assert_eq!(result["entries"][index]["outcome"], "refused");
-                assert!(result["entries"][index]["new_id"].is_null());
+                assert_eq!(result["entries"][index]["reason"]["code"], *code,
+                    "{context} entry_index={index}: refusal precedence");
+                assert_eq!(result["entries"][index]["outcome"], "refused",
+                    "{context} entry_index={index}: refused-row outcome");
+                assert!(result["entries"][index]["new_id"].is_null(),
+                    "{context} entry_index={index}: refused row has no successor id");
             } else {
-                assert_eq!(index, winner);
-                assert_eq!(result["entries"][index]["outcome"], if dry_run { "planned" } else { "written" });
+                assert_eq!(index, winner, "{context} entry_index={index}: designated winner");
+                assert_eq!(result["entries"][index]["outcome"], if dry_run { "planned" } else { "written" },
+                    "{context} entry_index={index}: winner-row outcome");
             }
         }
-        assert_eq!(result["counts"]["refused"], json!(rows.len() - 1));
+        assert_eq!(result["counts"]["refused"], json!(rows.len() - 1), "{context}: refused count");
         if dry_run {
-            assert_eq!(result["counts"]["written"], 0);
-            assert_eq!(ab_payload_counts(rt, &[old]).await, before);
+            assert_eq!(result["counts"]["written"], 0, "{context}: dry-run written count");
+            assert_eq!(ab_payload_counts(rt, &[old]).await, before, "{context}: dry-run note/edge counts");
         } else {
-            assert_eq!(result["counts"]["written"], 1);
+            assert_eq!(result["counts"]["written"], 1, "{context}: real written count");
             assert_eq!(ab_payload_counts(rt, &[old]).await, (before.0 + 1, before.1 + 1),
-                "refused rows neither win nor cause extra note/edge writes");
+                "{context}: refused rows neither win nor cause extra note/edge writes");
             ab_payload_stored(registry, batch, old, ab_payload_id(&result, winner)).await;
             applied = result;
         }
