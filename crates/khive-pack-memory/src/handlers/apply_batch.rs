@@ -143,6 +143,7 @@ struct Checked {
     echo: Echo,
     old_namespace: Option<String>,
     plan: Plan,
+    supersede_payload: Option<(String, u32)>,
 }
 
 /// One entry of the result.
@@ -261,6 +262,27 @@ fn batch_row_hash(row: &RowInput, old_id: Option<Uuid>) -> String {
     sha256_hex(&text)
 }
 
+/// A per-call supersede identity, separate from the stored part-bearing hash.
+/// Keep every original typed field except part; the part is only peer metadata.
+fn supersede_payload_identity(row: &RowInput, old_id: Option<Uuid>) -> Option<(String, u32)> {
+    if row.action != Action::Supersede {
+        return None;
+    }
+    let old_id = old_id?;
+    let canonical = json!({
+        "action": row.action.as_str(),
+        "id": old_id.to_string(),
+        "content": row.content,
+        "memory_type": row.memory_type,
+        "salience": row.salience,
+        "properties": row.properties,
+        "tags": row.tags,
+    });
+    let mut text = String::new();
+    write_canonical(&canonical, &mut text);
+    Some((sha256_hex(&text), row.part))
+}
+
 /// A row after parsing: the fields its entry echoes, and the row itself or the
 /// reason it did not parse.
 struct Parsed {
@@ -292,7 +314,40 @@ fn refused(
         echo,
         old_namespace,
         plan: Plan::Refused(why),
+        supersede_payload: None,
     })
+}
+
+/// Preserve historical replays, otherwise keep the earliest matching new row.
+/// Existing refusals are not peers, and all decisions precede the first write.
+fn refuse_duplicate_supersede_payloads(checked: &mut [Checked]) {
+    let mut peers: HashMap<String, (usize, u32)> = HashMap::new();
+    for (index, item) in checked.iter().enumerate() {
+        if matches!(&item.plan, Plan::Deduped { .. }) {
+            if let Some((payload, part)) = &item.supersede_payload {
+                peers.entry(payload.clone()).or_insert((index, *part));
+            }
+        }
+    }
+    for (index, item) in checked.iter_mut().enumerate() {
+        if !matches!(&item.plan, Plan::New(_)) {
+            continue;
+        }
+        let Some((payload, part)) = &item.supersede_payload else {
+            continue;
+        };
+        if let Some(&(matched_index, matched_part)) = peers.get(payload) {
+            let duplicate = refusal(
+                "duplicate-payload",
+                format!(
+                    "duplicate supersede payload; matched row at index {matched_index} (part {matched_part})"
+                ),
+            );
+            item.plan = Plan::Refused(duplicate);
+        } else {
+            peers.insert(payload.clone(), (index, *part));
+        }
+    }
 }
 
 impl MemoryPack {
@@ -403,6 +458,7 @@ impl MemoryPack {
                     echo,
                     old_namespace,
                     plan: Plan::Skipped,
+                    supersede_payload: None,
                 })
             }
             Action::DeleteCandidate => {
@@ -410,6 +466,7 @@ impl MemoryPack {
                     echo,
                     old_namespace,
                     plan: Plan::Listed,
+                    supersede_payload: None,
                 })
             }
             Action::Supersede | Action::Create => {}
@@ -590,6 +647,7 @@ impl MemoryPack {
                         existing: existing.id,
                         supersedes: old_id,
                     },
+                    supersede_payload: supersede_payload_identity(&row, old_id),
                 });
             }
             return refused(
@@ -625,6 +683,7 @@ impl MemoryPack {
                 params,
                 supersedes: old_id,
             }),
+            supersede_payload: supersede_payload_identity(&row, old_id),
         })
     }
 }
@@ -811,14 +870,16 @@ impl MemoryPack {
         write_token: &NamespaceToken,
         batch: &str,
         dry_run: bool,
-        checked: Vec<Checked>,
+        mut checked: Vec<Checked>,
     ) -> Result<Value, RuntimeError> {
+        refuse_duplicate_supersede_payloads(&mut checked);
         let mut entries: Vec<Entry> = Vec::with_capacity(checked.len());
         for item in checked {
             let Checked {
                 echo,
                 old_namespace,
                 plan,
+                ..
             } = item;
             let (outcome, new_id, reason): (&'static str, Option<Uuid>, Option<Refusal>) =
                 match plan {
