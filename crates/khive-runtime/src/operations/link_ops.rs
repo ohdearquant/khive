@@ -312,10 +312,10 @@ impl KhiveRuntime {
             return Ok(());
         };
         Self::ensure_memory_note_edge_namespace(
+            token,
             "link",
             token.namespace().as_str(),
-            source_id,
-            target_id,
+            (source_id, target_id),
             relation,
             source,
             target,
@@ -323,10 +323,10 @@ impl KhiveRuntime {
     }
 
     pub(crate) fn ensure_memory_note_edge_namespace(
+        read_scope: &NamespaceToken,
         operation: &str,
         write_namespace: &str,
-        source_id: Uuid,
-        target_id: Uuid,
+        endpoints: (Uuid, Uuid),
         relation: EdgeRelation,
         source: &khive_storage::Note,
         target: &khive_storage::Note,
@@ -334,6 +334,7 @@ impl KhiveRuntime {
         if source.kind != "memory" || target.kind != "memory" {
             return Ok(());
         }
+        let (source_id, target_id) = endpoints;
         // Base symmetric relations are entity-only today. Use the persisted
         // canonical source for the namespace rule, without changing canonicalization.
         let (canonical_source, _) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -343,16 +344,34 @@ impl KhiveRuntime {
             target.namespace.as_str()
         };
         if source_namespace != write_namespace {
-            let message = match operation {
-                "restore" => format!(
-                    "restore: memory edge source namespace {source_namespace} does not match stored edge namespace {write_namespace}; leave this tombstone deleted and create a replacement link in namespace={source_namespace}"
-                ),
-                "apply_changeset" => format!(
-                    "apply_changeset: memory edge source namespace {source_namespace} does not match link operation namespace {write_namespace}; set this link operation's namespace to {source_namespace} and prepare the change-set again"
-                ),
-                _ => format!(
-                    "{operation}: memory edge source namespace {source_namespace} does not match write namespace {write_namespace}; retry with namespace={source_namespace}"
-                ),
+            let source_is_readable = read_scope
+                .visible_namespaces()
+                .iter()
+                .any(|namespace| namespace.as_str() == source_namespace);
+            let message = if source_is_readable {
+                match operation {
+                    "restore" => format!(
+                        "restore: memory edge source namespace {source_namespace} does not match stored edge namespace {write_namespace}; leave this tombstone deleted and create a replacement link in namespace={source_namespace}"
+                    ),
+                    "apply_changeset" => format!(
+                        "apply_changeset: memory edge source namespace {source_namespace} does not match link operation namespace {write_namespace}; set this link operation's namespace to {source_namespace} and prepare the change-set again"
+                    ),
+                    _ => format!(
+                        "{operation}: memory edge source namespace {source_namespace} does not match write namespace {write_namespace}; retry with namespace={source_namespace}"
+                    ),
+                }
+            } else {
+                match operation {
+                    "restore" => format!(
+                        "restore: memory edge source row is in a namespace the caller cannot read; the edge cannot be restored under stored edge namespace {write_namespace}"
+                    ),
+                    "apply_changeset" => format!(
+                        "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace {write_namespace}"
+                    ),
+                    _ => format!(
+                        "{operation}: memory edge source row is in a namespace the caller cannot read; the edge cannot be written under request namespace {write_namespace}"
+                    ),
+                }
             };
             return Err(RuntimeError::InvalidInput(message));
         }
