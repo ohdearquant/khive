@@ -168,15 +168,17 @@ async fn assert_default_inbox_reminder(server: &KhiveMcpServer, content: &str) {
     .await;
     assert_eq!(response["results"][0]["ok"], true, "{response}");
     let inbox = &response["results"][0]["result"];
-    let messages = inbox["messages"].as_array().expect("public inbox messages");
+    let messages = inbox["messages"].as_array();
     let matching = messages
-        .iter()
+        .into_iter()
+        .flatten()
         .filter(|message| message["content"] == content)
         .count();
     assert_eq!(
         matching, 1,
         "reminder_reaches_creator_default_inbox: exactly one matching reminder; {inbox}"
     );
+    let messages = messages.expect("matching reminder requires the public inbox messages array");
     assert_eq!(inbox["count"], 1, "{inbox}");
     assert_eq!(messages.len(), 1, "{inbox}");
 }
