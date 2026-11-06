@@ -31,11 +31,11 @@
 //! ## Namespace isolation
 //!
 //! Scheduled payloads fire in the event namespace, injected as each action's
-//! `namespace=` parameter. Reminder delivery uses the default mailbox path;
-//! its claims and receipts still belong to the event namespace. Replay derives
-//! its actor from an immutable,
-//! target-bound provenance event written by the schedule handler;
-//! `created_by_actor` note metadata is never an authorization source. A
+//! `namespace=` parameter. Reminder delivery uses the default mailbox path and
+//! `local` gate namespace; its claims and receipts still belong to the event
+//! namespace. Replay derives its actor from an immutable, target-bound provenance
+//! event written by the schedule handler. The `created_by_actor` note metadata
+//! is never an authorization source. A
 //! generic legacy row without provenance fails closed instead of inheriting
 //! daemon authority.
 //!

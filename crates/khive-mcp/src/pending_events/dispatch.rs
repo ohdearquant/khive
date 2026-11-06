@@ -114,17 +114,24 @@ pub(super) async fn verified_creator_for_event(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum NamespaceInjection {
+    EventNamespace,
+    DefaultPath,
+}
+
 /// Dispatch a DSL action string in the given namespace while renewing its
 /// claim through the claim-bound durable outcome write.
 ///
 /// Scheduled payloads have the event namespace injected into every action.
 /// Reminder deliveries instead use the default path, so their message lands
-/// where the creator's default inbox reads. Dispatch uses the verified creator as the
-/// effective request identity and preserves public-surface visibility, so a
-/// delayed action cannot invoke an internal subhandler. Together these
+/// where the creator's default inbox reads, with `local` as its gate namespace.
+/// Dispatch uses the verified creator as the effective request identity and
+/// preserves public-surface visibility, so delayed actions cannot invoke an
+/// internal subhandler. Together these
 /// preserve the original authority boundary: gate/audit decisions never inherit
-/// daemon authority. Lease renewal and outcome writes stay in the event namespace. The
-/// returned receipt result is already persisted (or carries the persistence
+/// daemon authority. Lease renewal and outcome writes stay in the event namespace.
+/// The returned receipt result is already persisted (or carries the persistence
 /// error); callers must not perform another outcome write.
 pub(super) struct DispatchLeaseTarget<'a> {
     pub(super) rt: &'a KhiveRuntime,
@@ -137,7 +144,7 @@ pub(super) async fn dispatch_with_renewable_lease(
     target: DispatchLeaseTarget<'_>,
     lease: DispatchLeaseConfig,
     action_dsl: &str,
-    reminder_delivery: bool,
+    namespace_injection: NamespaceInjection,
     creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
     verbose: bool,
@@ -189,11 +196,15 @@ pub(super) async fn dispatch_with_renewable_lease(
         }
     }));
 
-    let dispatch_result = if reminder_delivery {
-        dispatch_action_inner(action_dsl, namespace, creator_actor, server, verbose, true).await
-    } else {
-        dispatch_action(action_dsl, namespace, creator_actor, server, verbose).await
-    };
+    let dispatch_result = dispatch_action(
+        action_dsl,
+        namespace,
+        creator_actor,
+        server,
+        verbose,
+        namespace_injection,
+    )
+    .await;
     // If the renewal task already ended before the action did, its failure is
     // part of the action outcome. Otherwise keep it alive while the durable
     // outcome CAS waits for the writer; relinquishing the lease first would
@@ -363,17 +374,7 @@ pub(super) async fn dispatch_action(
     creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
     verbose: bool,
-) -> std::result::Result<(), DispatchActionError> {
-    dispatch_action_inner(action_dsl, namespace, creator_actor, server, verbose, false).await
-}
-
-async fn dispatch_action_inner(
-    action_dsl: &str,
-    namespace: &str,
-    creator_actor: Option<VerifiedActor>,
-    server: &KhiveMcpServer,
-    verbose: bool,
-    reminder_delivery: bool,
+    namespace_injection: NamespaceInjection,
 ) -> std::result::Result<(), DispatchActionError> {
     let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
         let masked_dsl = khive_runtime::secret_gate::bounded_masked_log_text(action_dsl);
@@ -399,16 +400,19 @@ async fn dispatch_action_inner(
             };
             args.insert(k.clone(), val.clone());
         }
-        if reminder_delivery {
-            // Only the generated reminder action takes this branch, after
-            // the drain verifies its immutable creator/event-type provenance.
-            // The ordinary default-path token writes where comm.inbox reads.
-            args.remove("namespace");
-        } else {
-            args.insert(
-                "namespace".to_string(),
-                Value::String(namespace.to_string()),
-            );
+        match namespace_injection {
+            NamespaceInjection::DefaultPath => {
+                // Only the generated reminder action takes this branch, after
+                // the drain verifies its immutable creator/event-type provenance.
+                // The ordinary default-path token writes where comm.inbox reads.
+                args.remove("namespace");
+            }
+            NamespaceInjection::EventNamespace => {
+                args.insert(
+                    "namespace".to_string(),
+                    Value::String(namespace.to_string()),
+                );
+            }
         }
         ops_json.push(json!({ "tool": op.tool, "args": Value::Object(args) }));
     }
@@ -419,8 +423,12 @@ async fn dispatch_action_inner(
         )))
     })?;
 
+    let replay_namespace = match namespace_injection {
+        NamespaceInjection::DefaultPath => "local",
+        NamespaceInjection::EventNamespace => namespace,
+    };
     if verbose {
-        eprintln!("[pending-events] dispatch ns={namespace}: {ops_str}");
+        eprintln!("[pending-events] dispatch event_ns={namespace} replay_ns={replay_namespace}: {ops_str}");
     }
 
     let result = server
@@ -435,7 +443,7 @@ async fn dispatch_action_inner(
                 format_per_op: None,
                 request_id: None,
             },
-            namespace,
+            replay_namespace,
             creator_actor,
         )
         .await

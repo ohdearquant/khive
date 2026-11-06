@@ -20,16 +20,17 @@ const EVENT_NAMESPACE: &str = "lambda:reminder-event";
 
 #[derive(Debug, Default)]
 struct AllowReminderNamespacesGate {
-    delivery_actors: std::sync::Mutex<Vec<(String, String)>>,
+    deliveries: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 impl Gate for AllowReminderNamespacesGate {
     fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
         if request.verb == "comm.send" {
-            self.delivery_actors
-                .lock()
-                .expect("delivery actors")
-                .push((request.actor.kind.clone(), request.actor.id.clone()));
+            self.deliveries.lock().expect("delivery requests").push((
+                request.actor.kind.clone(),
+                request.actor.id.clone(),
+                request.namespace.to_string(),
+            ));
         }
         Ok(GateDecision::allow())
     }
@@ -184,13 +185,27 @@ async fn assert_default_inbox_reminder(server: &KhiveMcpServer, content: &str) {
 }
 
 fn assert_delivery_uses_creator(gate: &AllowReminderNamespacesGate) {
-    let actors = gate.delivery_actors.lock().expect("delivery actors");
-    assert!(!actors.is_empty(), "delivery must pass through the gate");
+    let deliveries = gate.deliveries.lock().expect("delivery requests");
     assert!(
-        actors
+        !deliveries.is_empty(),
+        "delivery must pass through the gate"
+    );
+    assert!(
+        deliveries
             .iter()
-            .all(|(kind, id)| kind == "actor" && id == CREATOR),
-        "reminder delivery must retain its verified creator: {actors:?}"
+            .all(|(kind, id, _)| kind == "actor" && id == CREATOR),
+        "reminder delivery must retain its verified creator: {deliveries:?}"
+    );
+}
+
+fn assert_delivery_gate_namespace_is_local(gate: &AllowReminderNamespacesGate) {
+    let deliveries = gate.deliveries.lock().expect("delivery requests");
+    assert!(
+        !deliveries.is_empty()
+            && deliveries
+                .iter()
+                .all(|(_, _, namespace)| namespace == "local"),
+        "reminder_delivery_gate_namespace_is_local: actual comm.send gate requests must match the default mailbox namespace; {deliveries:?}"
     );
 }
 
@@ -201,10 +216,12 @@ async fn reminder_with_frame_default_and_explicit_namespace_reaches_creator_defa
     let content = "explicit event namespace still reaches the creator default inbox";
     let id = create_reminder(&server, Some(EVENT_NAMESPACE), content).await;
     make_reminder_due(&rt, id).await;
+    gate.deliveries.lock().expect("delivery requests").clear();
 
     drain_reminder(&rt, &server, id, EVENT_NAMESPACE).await;
     assert_default_inbox_reminder(&server, content).await;
     assert_delivery_uses_creator(&gate);
+    assert_delivery_gate_namespace_is_local(&gate);
 }
 
 #[tokio::test]
@@ -214,6 +231,7 @@ async fn reminder_without_explicit_namespace_keeps_default_inbox_delivery() {
     let content = "default namespace reminder still reaches the creator default inbox";
     let id = create_reminder(&server, None, content).await;
     make_reminder_due(&rt, id).await;
+    gate.deliveries.lock().expect("delivery requests").clear();
 
     drain_reminder(&rt, &server, id, "local").await;
     assert_default_inbox_reminder(&server, content).await;
