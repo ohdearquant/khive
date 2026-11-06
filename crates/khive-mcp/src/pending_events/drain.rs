@@ -866,6 +866,7 @@ pub(super) async fn run_pending_events_on_with_lease(
                     },
                     lease,
                     dsl,
+                    event_type == "remind",
                     dispatch_actor,
                     server,
                     verbose,

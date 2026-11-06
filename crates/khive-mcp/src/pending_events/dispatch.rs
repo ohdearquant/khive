@@ -117,13 +117,13 @@ pub(super) async fn verified_creator_for_event(
 /// Dispatch a DSL action string in the given namespace while renewing its
 /// claim through the claim-bound durable outcome write.
 ///
-/// The action is wrapped as a JSON-form batch with `namespace` injected into
-/// each op's args so the VerbRegistry mints a token scoped to the event's
-/// namespace. Dispatch also uses the provenance-verified creator as the
+/// Scheduled payloads have the event namespace injected into every action.
+/// Reminder deliveries instead use the default path, so their message lands
+/// where the creator's default inbox reads. Dispatch uses the verified creator as the
 /// effective request identity and preserves public-surface visibility, so a
 /// delayed action cannot invoke an internal subhandler. Together these
-/// preserve the original authority boundary: writes land in the event's
-/// namespace and gate/audit decisions never inherit daemon authority. The
+/// preserve the original authority boundary: gate/audit decisions never inherit
+/// daemon authority. Lease renewal and outcome writes stay in the event namespace. The
 /// returned receipt result is already persisted (or carries the persistence
 /// error); callers must not perform another outcome write.
 pub(super) struct DispatchLeaseTarget<'a> {
@@ -137,6 +137,7 @@ pub(super) async fn dispatch_with_renewable_lease(
     target: DispatchLeaseTarget<'_>,
     lease: DispatchLeaseConfig,
     action_dsl: &str,
+    reminder_delivery: bool,
     creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
     verbose: bool,
@@ -188,8 +189,11 @@ pub(super) async fn dispatch_with_renewable_lease(
         }
     }));
 
-    let dispatch_result =
-        dispatch_action(action_dsl, namespace, creator_actor, server, verbose).await;
+    let dispatch_result = if reminder_delivery {
+        dispatch_action_inner(action_dsl, namespace, creator_actor, server, verbose, true).await
+    } else {
+        dispatch_action(action_dsl, namespace, creator_actor, server, verbose).await
+    };
     // If the renewal task already ended before the action did, its failure is
     // part of the action outcome. Otherwise keep it alive while the durable
     // outcome CAS waits for the writer; relinquishing the lease first would
@@ -360,6 +364,17 @@ pub(super) async fn dispatch_action(
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> std::result::Result<(), DispatchActionError> {
+    dispatch_action_inner(action_dsl, namespace, creator_actor, server, verbose, false).await
+}
+
+async fn dispatch_action_inner(
+    action_dsl: &str,
+    namespace: &str,
+    creator_actor: Option<VerifiedActor>,
+    server: &KhiveMcpServer,
+    verbose: bool,
+    reminder_delivery: bool,
+) -> std::result::Result<(), DispatchActionError> {
     let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
         let masked_dsl = khive_runtime::secret_gate::bounded_masked_log_text(action_dsl);
         DispatchActionError::known(DispatchFailure::plain(format!(
@@ -384,11 +399,17 @@ pub(super) async fn dispatch_action(
             };
             args.insert(k.clone(), val.clone());
         }
-        // Inject the event's namespace so the registry writes to it.
-        args.insert(
-            "namespace".to_string(),
-            Value::String(namespace.to_string()),
-        );
+        if reminder_delivery {
+            // Only the generated reminder action takes this branch, after
+            // the drain verifies its immutable creator/event-type provenance.
+            // The ordinary default-path token writes where comm.inbox reads.
+            args.remove("namespace");
+        } else {
+            args.insert(
+                "namespace".to_string(),
+                Value::String(namespace.to_string()),
+            );
+        }
         ops_json.push(json!({ "tool": op.tool, "args": Value::Object(args) }));
     }
 
