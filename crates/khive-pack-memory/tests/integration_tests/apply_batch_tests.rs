@@ -1471,12 +1471,12 @@ async fn test_apply_batch_duplicate_payload_preserves_invalid_and_key_refusals()
         &[Some("duplicate-key"), Some("duplicate-key"), None], 2).await;
     let mut missing_who = ab_payload_row(old, 2, candidate);
     missing_who["properties"].as_object_mut().expect("properties object").remove("who");
-    ab_payload_precedence_case(&rt, &alice, "payload-who-before-key", old,
+    ab_payload_precedence_case(&rt, &alice, "payload-who-precedence", old,
         vec![missing_who, ab_payload_row(old, 2, candidate), ab_payload_row(old, 1, candidate)],
         &[Some("who-missing"), Some("duplicate-key"), None], 2).await;
     let mut default_part = ab_payload_row(old, 1, candidate);
     default_part.as_object_mut().expect("row object").remove("part");
-    ab_payload_precedence_case(&rt, &alice, "payload-default-key", old,
+    ab_payload_precedence_case(&rt, &alice, "payload-default-part", old,
         vec![default_part, ab_payload_row(old, 1, candidate), ab_payload_row(old, 2, candidate)],
         &[Some("duplicate-key"), Some("duplicate-key"), None], 2).await;
 
