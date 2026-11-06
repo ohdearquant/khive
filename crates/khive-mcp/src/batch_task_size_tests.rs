@@ -2,14 +2,15 @@
 
 use crate::server::KhiveMcpServer;
 use crate::tools::request::RequestParams;
+use khive_request::{parse_request, ExecutionMode};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use serde_json::Value;
 
 const SERVER_ENTRY_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-async fn make_server(db_path: &str) -> KhiveMcpServer {
+async fn make_server() -> KhiveMcpServer {
     let cfg = RuntimeConfig {
-        db_path: Some(std::path::PathBuf::from(db_path)),
+        db_path: None,
         default_namespace: Namespace::parse("local").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -38,7 +39,23 @@ fn dispatch_on_large_current_thread_stack(
                 .build()
                 .expect("current-thread runtime");
             runtime.block_on(Box::pin(async move {
-                let server = make_server(":memory:").await;
+                let parsed = parse_request(ops).expect("server-entry fixture uses valid batch DSL");
+                assert_eq!(parsed.mode, ExecutionMode::Parallel);
+                assert_eq!(parsed.ops.len(), expected_rows);
+                let expected_ranges = if check_chain_indices {
+                    vec![0..2, 2..4]
+                } else {
+                    vec![0..1, 1..2]
+                };
+                assert_eq!(parsed.ranges, expected_ranges);
+                // execution.rs selects UnitTask only for a range longer than
+                // one leaf; the flat bracketed batch must take BatchTask.
+                assert_eq!(
+                    parsed.ranges.iter().any(|range| range.len() > 1),
+                    check_chain_indices,
+                    "fixture must select its intended task constructor"
+                );
+                let server = make_server().await;
                 let response = server
                     .dispatch_request_local(RequestParams {
                         ops: ops.to_string(),
@@ -67,6 +84,9 @@ fn dispatch_on_large_current_thread_stack(
                         assert_eq!(row["op_index"], index, "{envelope}");
                         assert_eq!(row["unit_index"], index / 2, "{envelope}");
                         assert_eq!(row["step_index"], index % 2, "{envelope}");
+                    } else {
+                        assert!(row.get("unit_index").is_none(), "{envelope}");
+                        assert!(row.get("step_index").is_none(), "{envelope}");
                     }
                 }
             }));
@@ -83,7 +103,7 @@ fn dispatch_on_large_current_thread_stack(
 fn plain_batch_dispatch_checks_boxed_batch_task_size() {
     dispatch_on_large_current_thread_stack(
         "khive-batch-task-size-server-entry",
-        "stats(),stats()",
+        "[stats(), stats()]",
         2,
         false,
     );
