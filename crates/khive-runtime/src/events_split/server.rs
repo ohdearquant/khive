@@ -127,7 +127,12 @@ pub(super) async fn serve_events_conn(
             Ok(Err(_)) | Err(_) => return,
         };
         let response = match serde_json::from_slice::<EventsRequest>(&payload) {
-            Ok(request) if request.count_budget_secs().is_some() => {
+            // Page reads share disconnect cancellation with counts, while
+            // operator-budget attribution remains specific to count requests.
+            Ok(request)
+                if request.count_budget_secs().is_some()
+                    || matches!(&request, EventsRequest::QueryEvents { .. }) =>
+            {
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let dispatch = khive_storage::scope_request_read_cancellation(
                     cancel_rx,
@@ -207,7 +212,7 @@ pub(super) async fn count_peer_disconnected(stream: &UnixStream) {
         let mut byte = [0u8; 1];
         match stream.try_read(&mut byte) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-            // Count clients own a one-request socket; extra bytes also end that exchange.
+            // These read clients own a one-request socket; extra bytes also end that exchange.
             _ => return,
         }
     }
