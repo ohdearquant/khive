@@ -9,7 +9,9 @@ use super::stores::{ForwardingEventStore, SplitEventStore};
 use crate::daemon::{read_frame, write_frame};
 use async_trait::async_trait;
 use khive_db::StorageBackend;
-use khive_storage::event::EventGroupBy;
+use khive_storage::event::{
+    EventGroupBy, EventOrderKey, EventPageQuery, EventPageRow, EventPageWindow,
+};
 use khive_storage::{
     capture_request_read_context, scope_request_read_deadline_at, RequestReadDeadline, SqlAccess,
     SqlStatement, SqlValue, StorageCapability,
@@ -675,6 +677,42 @@ impl QueryStore {
             message: "only query reads are supported".into(),
         }
     }
+
+    async fn read_fixture_sql(&self, label: &'static str) -> StorageResult<()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let result = async {
+            let mut reader = self.sql.reader().await?;
+            let sql = match self.work {
+                QueryWork::Fast => "SELECT COUNT(*) FROM count_fixture",
+                // Finite real SQLite work, interrupted through the owned read context.
+                QueryWork::Slow => "SELECT COUNT(*) FROM events CROSS JOIN count_fixture d",
+            };
+            reader
+                .count(SqlStatement {
+                    sql: sql.into(),
+                    params: vec![],
+                    label: Some(label.into()),
+                })
+                .await
+        }
+        .await;
+        // The owned reader scope has ended; a dropped dispatch cannot set this witness.
+        self.finished.store(true, Ordering::SeqCst);
+        result.map(|_| ())
+    }
+
+    fn fixture_event() -> Event {
+        let mut event = Event::new(
+            "local",
+            "cursor.fixture",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Note,
+            "cursor-reader",
+        );
+        event.id = Uuid::from_u128(1);
+        event.created_at = 100;
+        event
+    }
 }
 
 #[async_trait]
@@ -689,40 +727,30 @@ impl EventStore for QueryStore {
         Err(Self::unsupported())
     }
     async fn query_events(&self, _: EventFilter, _: PageRequest) -> StorageResult<Page<Event>> {
-        self.started.fetch_add(1, Ordering::SeqCst);
-        let result = async {
-            let mut reader = self.sql.reader().await?;
-            let sql = match self.work {
-                QueryWork::Fast => "SELECT COUNT(*) FROM count_fixture",
-                // Finite real SQLite work, interrupted through the owned read context.
-                QueryWork::Slow => "SELECT COUNT(*) FROM events CROSS JOIN count_fixture d",
-            };
-            reader
-                .count(SqlStatement {
-                    sql: sql.into(),
-                    params: vec![],
-                    label: Some("fixture.events.query".into()),
-                })
-                .await
-        }
-        .await;
-        // The owned reader scope has ended; a dropped dispatch cannot set this witness.
-        self.finished.store(true, Ordering::SeqCst);
-        result.map(|_| {
-            let mut event = Event::new(
-                "local",
-                "cursor.fixture",
-                khive_types::EventKind::Audit,
-                khive_types::SubstrateKind::Note,
-                "cursor-reader",
-            );
-            event.id = Uuid::from_u128(1);
-            event.created_at = 100;
-            // This typed fixture exercises routing/lifetime, not production event decoding.
-            Page {
-                items: vec![event],
-                total: None,
-            }
+        self.read_fixture_sql("fixture.events.query")
+            .await
+            .map(|_| {
+                // This typed fixture exercises routing/lifetime, not production event decoding.
+                Page {
+                    items: vec![Self::fixture_event()],
+                    total: None,
+                }
+            })
+    }
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        crate::event_page::validate_page_query(&query)?;
+        self.read_fixture_sql("fixture.events.query_page").await?;
+        let event = Self::fixture_event();
+        // Typed fixture output after real SQL work, not a production decoder witness.
+        Ok(EventPageWindow {
+            rows: vec![EventPageRow {
+                order_key: EventOrderKey {
+                    created_at_us: event.created_at,
+                    physical_id: event.id.to_string(),
+                },
+                event,
+            }],
+            budget_stop: None,
         })
     }
     async fn count_events(&self, _: EventFilter) -> StorageResult<u64> {
@@ -745,6 +773,22 @@ fn query_request() -> EventsRequest {
         page: PageRequest {
             offset: 0,
             limit: 1,
+        },
+    }
+}
+
+fn event_page_request() -> EventsRequest {
+    EventsRequest::QueryEventPage {
+        protocol_version: EVENTS_PROTOCOL_VERSION,
+        namespace: "local".into(),
+        query: EventPageQuery {
+            since_us: 50,
+            until_us: 150,
+            kinds: vec![],
+            actors: vec![],
+            exclude_namespaces: vec![],
+            after: None,
+            max_rows: 1,
         },
     }
 }
@@ -846,12 +890,55 @@ async fn assert_framed_query_page(fixture: &Arc<SqlFixture>) {
     assert_query_resources_returned(fixture);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
-    let fixture = Arc::new(SqlFixture::new());
-    assert_framed_query_page(&fixture).await;
-    eprintln!("query_events_nonempty_sqlite_baseline_ok");
+async fn assert_framed_event_page_window(fixture: &Arc<SqlFixture>) {
+    let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Fast);
+    fixture
+        .stores
+        .lock()
+        .unwrap()
+        .insert("local".into(), store.clone());
+    let payload = serde_json::to_vec(&event_page_request()).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let (cleanup, cleanup_rx) = tokio::sync::watch::channel(false);
+    let task = serve_query_with_cleanup(fixture, server, cleanup_rx);
+    let sent = write_frame(&mut client, &payload).await;
+    let response = if sent.is_ok() {
+        Some(tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client)).await)
+    } else {
+        None
+    };
+    drop(client);
+    cleanup_query_peer(task, cleanup, fixture).await;
+    assert!(sent.is_ok(), "event_page_fixture_valid_frame_write");
+    let bytes = response
+        .expect("event_page_fixture_response_started")
+        .expect("event_page_fixture_response_deadline")
+        .expect("event_page_fixture_response_read");
+    let EventsResponse::EventPageWindow { window } =
+        serde_json::from_slice(&bytes).expect("event_page_fixture_typed_response")
+    else {
+        panic!("event_page_fixture_nonempty_window_required");
+    };
+    assert_eq!(
+        window.rows.len(),
+        1,
+        "event_page_fixture_nonempty_window_required"
+    );
+    assert!(window.budget_stop.is_none());
+    let row = &window.rows[0];
+    assert_eq!(row.event.id, Uuid::from_u128(1));
+    assert_eq!(row.event.created_at, 100);
+    assert_eq!(row.order_key.created_at_us, row.event.created_at);
+    assert_eq!(row.order_key.physical_id, row.event.id.to_string());
+    assert_eq!(store.started.load(Ordering::SeqCst), 1);
+    assert!(store.finished.load(Ordering::SeqCst));
+    assert_query_resources_returned(fixture);
+}
 
+async fn query_disconnect_evidence_and_recover_same_pool(
+    fixture: &Arc<SqlFixture>,
+    request: EventsRequest,
+) -> (bool, bool, bool, bool) {
     let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Slow);
     fixture
         .stores
@@ -859,10 +946,10 @@ async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
         .unwrap()
         .insert("local".into(), store.clone());
     fixture.progress.store(0, Ordering::SeqCst);
-    let payload = serde_json::to_vec(&query_request()).unwrap();
+    let payload = serde_json::to_vec(&request).unwrap();
     let (mut client, server) = UnixStream::pair().unwrap();
     let (cleanup, cleanup_rx) = tokio::sync::watch::channel(false);
-    let task = serve_query_with_cleanup(&fixture, server, cleanup_rx);
+    let task = serve_query_with_cleanup(fixture, server, cleanup_rx);
     let sent = write_frame(&mut client, &payload).await;
     let observed_progress = if sent.is_ok() {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -902,7 +989,7 @@ async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
         fixture.frame_budget.available_permits() == MAX_INFLIGHT_REQUEST_BYTES;
 
     // This watch is outside the server's optional peer-disconnect scope, including under C1.
-    cleanup_query_peer(task, cleanup, &fixture).await;
+    cleanup_query_peer(task, cleanup, fixture).await;
     assert!(
         setup_valid,
         "query_fixture_sql_progress_reader_and_frame_required"
@@ -911,7 +998,7 @@ async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
         store.finished.load(Ordering::SeqCst),
         "query_fixture_cleanup_must_settle_sql"
     );
-    assert_query_resources_returned(&fixture);
+    assert_query_resources_returned(fixture);
     let count = fixture
         .sql
         .reader()
@@ -925,11 +1012,50 @@ async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
         .await
         .unwrap();
     assert_eq!(count, 1000, "query_fixture_same_pool_reuse");
+    (
+        settled_before_cleanup,
+        reader_returned_before_cleanup,
+        admission_returned_before_cleanup,
+        frame_returned_before_cleanup,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
+    let fixture = Arc::new(SqlFixture::new());
+    assert_framed_query_page(&fixture).await;
+    eprintln!("query_events_nonempty_sqlite_baseline_ok");
+    let (
+        settled_before_cleanup,
+        reader_returned_before_cleanup,
+        admission_returned_before_cleanup,
+        frame_returned_before_cleanup,
+    ) = query_disconnect_evidence_and_recover_same_pool(&fixture, query_request()).await;
     assert_framed_query_page(&fixture).await;
 
     assert!(
         settled_before_cleanup && reader_returned_before_cleanup
             && admission_returned_before_cleanup && frame_returned_before_cleanup,
         "query_peer_disconnect_settled_resources_before_cleanup: settled={settled_before_cleanup} reader={reader_returned_before_cleanup} admission={admission_returned_before_cleanup} frame={frame_returned_before_cleanup}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_event_page_disconnect_settles_sqlite_and_recovers_same_pool() {
+    let fixture = Arc::new(SqlFixture::new());
+    assert_framed_event_page_window(&fixture).await;
+    eprintln!("query_event_page_nonempty_sqlite_baseline_ok");
+    let (
+        settled_before_cleanup,
+        reader_returned_before_cleanup,
+        admission_returned_before_cleanup,
+        frame_returned_before_cleanup,
+    ) = query_disconnect_evidence_and_recover_same_pool(&fixture, event_page_request()).await;
+    assert_framed_event_page_window(&fixture).await;
+
+    assert!(
+        settled_before_cleanup && reader_returned_before_cleanup
+            && admission_returned_before_cleanup && frame_returned_before_cleanup,
+        "query_event_page_peer_disconnect_settled_resources_before_cleanup: settled={settled_before_cleanup} reader={reader_returned_before_cleanup} admission={admission_returned_before_cleanup} frame={frame_returned_before_cleanup}"
     );
 }
