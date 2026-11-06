@@ -9,9 +9,14 @@ use khive_storage::types::{SqlStatement, SqlValue, VectorRecord};
 use khive_types::SubstrateKind;
 
 use super::schema::{Atom, IndexParams};
-use super::util::{atom_embed_text, atom_from_row, deser, sql_err, DEFAULT_EMBED_BATCH};
+use super::util::{atom_embed_text, atom_from_row, deser, row_str, sql_err, DEFAULT_EMBED_BATCH};
 use super::vamana;
 use super::KnowledgeHandlers;
+
+enum IndexAtoms {
+    Explicit(Vec<Atom>),
+    CatalogueIds(Vec<String>),
+}
 
 impl KnowledgeHandlers {
     pub(crate) async fn index(
@@ -42,7 +47,7 @@ impl KnowledgeHandlers {
         // transacted DELETE+INSERT regardless of this flag.
         let _insert_only = p.insert_only.unwrap_or(false);
 
-        let atoms: Vec<Atom> = if let Some(ref ids) = p.ids {
+        let atoms = if let Some(ref ids) = p.ids {
             let mut out = Vec::with_capacity(ids.len());
             let mut reader = sql.reader().await.map_err(|e| sql_err("index reader", e))?;
             for id_or_slug in ids {
@@ -63,7 +68,7 @@ impl KnowledgeHandlers {
                     }
                 }
             }
-            out
+            IndexAtoms::Explicit(out)
         } else {
             let mut out = Vec::new();
             let mut offset = 0i64;
@@ -87,16 +92,28 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("index page", e))?;
                 let n = rows.len();
-                out.extend(rows.iter().filter_map(atom_from_row));
+                // Keep the existing decode eligibility and the stored ID spelling.
+                // Only IDs survive this page; payloads are reloaded before embedding.
+                out.extend(rows.iter().filter_map(|row| {
+                    atom_from_row(row)?;
+                    row_str(row, "id")
+                }));
                 if n < batch_size {
                     break;
                 }
                 offset += n as i64;
             }
-            out
+            IndexAtoms::CatalogueIds(out)
         };
 
-        let total = atoms.len();
+        let total = match &atoms {
+            IndexAtoms::Explicit(atoms) => atoms.len(),
+            IndexAtoms::CatalogueIds(ids) => ids.len(),
+        };
+        #[cfg(test)]
+        if matches!(&atoms, IndexAtoms::CatalogueIds(_)) {
+            super::index_catalogue_tests::after_capture().await;
+        }
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
@@ -107,7 +124,45 @@ impl KnowledgeHandlers {
             cb(0, total as u64);
         }
 
-        for chunk in atoms.chunks(batch_size) {
+        for start in (0..total).step_by(batch_size) {
+            let end = (start + batch_size).min(total);
+            let reloaded;
+            let chunk: &[Atom] = match &atoms {
+                IndexAtoms::Explicit(atoms) => &atoms[start..end],
+                IndexAtoms::CatalogueIds(ids) => {
+                    let rows = match async {
+                        let mut reader = sql
+                            .reader()
+                            .await
+                            .map_err(|e| sql_err("index page reader", e))?;
+                        reader
+                            .query_all(SqlStatement {
+                                sql: khive_runtime::sql!("knowledge_index_atom_batch").into(),
+                                params: vec![
+                                    SqlValue::Text(ns.clone()),
+                                    SqlValue::Text(json!(&ids[start..end]).to_string()),
+                                ],
+                                label: None,
+                            })
+                            .await
+                            .map_err(|e| sql_err("index page", e))
+                    }
+                    .await
+                    {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            if indexed > 0 {
+                                vamana::invalidate_snapshot(runtime, &ns).await;
+                                vamana::clear_namespace(ann, &ns).await;
+                            }
+                            return Err(error);
+                        }
+                    };
+                    reloaded = rows.iter().filter_map(atom_from_row).collect::<Vec<_>>();
+                    skipped += (end - start).saturating_sub(reloaded.len());
+                    reloaded.as_slice()
+                }
+            };
             let mut staged: Vec<(uuid::Uuid, String)> = Vec::with_capacity(chunk.len());
             for atom in chunk {
                 let text = atom_embed_text(atom);
@@ -118,6 +173,9 @@ impl KnowledgeHandlers {
                 staged.push((atom.id, text));
             }
             if staged.is_empty() {
+                if let Some(cb) = on_progress {
+                    cb(end as u64, total as u64);
+                }
                 continue;
             }
 
@@ -148,7 +206,7 @@ impl KnowledgeHandlers {
                 .merge(outcome.truncation);
 
             if let Some(cb) = on_progress {
-                cb(indexed as u64, total as u64);
+                cb(end as u64, total as u64);
             }
         }
 
