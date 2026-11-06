@@ -644,3 +644,292 @@ async fn original_client_expiry_closes_socket_then_awaits_actual_sqlite_settleme
     // Client Timeout alone is deliberately insufficient: join the real connection task.
     fixture.await_settlement_and_reuse(task).await;
 }
+
+#[derive(Clone, Copy)]
+enum QueryWork {
+    Fast,
+    Slow,
+}
+
+struct QueryStore {
+    sql: Arc<dyn SqlAccess>,
+    work: QueryWork,
+    started: AtomicUsize,
+    finished: AtomicBool,
+}
+
+impl QueryStore {
+    fn new(sql: Arc<dyn SqlAccess>, work: QueryWork) -> Arc<Self> {
+        Arc::new(Self {
+            sql,
+            work,
+            started: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn unsupported() -> StorageError {
+        StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "query fixture".into(),
+            message: "only query reads are supported".into(),
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for QueryStore {
+    async fn append_event(&self, _: Event) -> StorageResult<()> {
+        Err(Self::unsupported())
+    }
+    async fn append_events(&self, _: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+        Err(Self::unsupported())
+    }
+    async fn get_event(&self, _: Uuid) -> StorageResult<Option<Event>> {
+        Err(Self::unsupported())
+    }
+    async fn query_events(&self, _: EventFilter, _: PageRequest) -> StorageResult<Page<Event>> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let result = async {
+            let mut reader = self.sql.reader().await?;
+            let sql = match self.work {
+                QueryWork::Fast => "SELECT COUNT(*) FROM count_fixture",
+                // Finite real SQLite work, interrupted through the owned read context.
+                QueryWork::Slow => "SELECT COUNT(*) FROM events CROSS JOIN count_fixture d",
+            };
+            reader
+                .count(SqlStatement {
+                    sql: sql.into(),
+                    params: vec![],
+                    label: Some("fixture.events.query".into()),
+                })
+                .await
+        }
+        .await;
+        // The owned reader scope has ended; a dropped dispatch cannot set this witness.
+        self.finished.store(true, Ordering::SeqCst);
+        result.map(|_| {
+            let mut event = Event::new(
+                "local",
+                "cursor.fixture",
+                khive_types::EventKind::Audit,
+                khive_types::SubstrateKind::Note,
+                "cursor-reader",
+            );
+            event.id = Uuid::from_u128(1);
+            event.created_at = 100;
+            // This typed fixture exercises routing/lifetime, not production event decoding.
+            Page {
+                items: vec![event],
+                total: None,
+            }
+        })
+    }
+    async fn count_events(&self, _: EventFilter) -> StorageResult<u64> {
+        Err(Self::unsupported())
+    }
+    async fn count_events_grouped(
+        &self,
+        _: EventFilter,
+        _: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        Err(Self::unsupported())
+    }
+}
+
+fn query_request() -> EventsRequest {
+    EventsRequest::QueryEvents {
+        protocol_version: EVENTS_PROTOCOL_VERSION,
+        namespace: "local".into(),
+        filter: EventFilter::default(),
+        page: PageRequest {
+            offset: 0,
+            limit: 1,
+        },
+    }
+}
+
+fn serve_query_with_cleanup(
+    fixture: &SqlFixture,
+    stream: UnixStream,
+    cleanup: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let (backend, stores, budget, progress) = (
+        Arc::clone(&fixture.backend),
+        Arc::clone(&fixture.stores),
+        Arc::clone(&fixture.frame_budget),
+        Arc::clone(&fixture.progress),
+    );
+    tokio::spawn(async move {
+        khive_storage::scope_request_read_cancellation(
+            cleanup,
+            khive_db::scope_test_read_progress(progress, async move {
+                serve_events_conn(stream, backend, stores, budget).await;
+            }),
+        )
+        .await;
+    })
+}
+
+async fn cleanup_query_peer(
+    mut task: JoinHandle<()>,
+    cleanup: tokio::sync::watch::Sender<bool>,
+    fixture: &Arc<SqlFixture>,
+) {
+    let _ = cleanup.send(true);
+    match tokio::time::timeout(
+        khive_db::sqlite_interrupt_grace_from_env() + Duration::from_secs(2),
+        &mut task,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // Keep private files available if a panicking task left settlement unknown.
+            std::mem::forget(Arc::clone(fixture));
+            panic!("query_fixture_server_panicked; private fixture retained");
+        }
+        Err(_) => {
+            std::mem::forget(task);
+            std::mem::forget(Arc::clone(fixture));
+            panic!("query_fixture_cleanup_unjoined; task and private fixture retained");
+        }
+    }
+}
+
+fn assert_query_resources_returned(fixture: &SqlFixture) {
+    let state = fixture.pool.reader_acquisition_snapshot();
+    assert_eq!(state.active_pooled_checkouts, 0);
+    assert_eq!(state.available_reader_admission_slots, 1);
+    assert_eq!(
+        fixture.frame_budget.available_permits(),
+        MAX_INFLIGHT_REQUEST_BYTES
+    );
+}
+
+async fn assert_framed_query_page(fixture: &Arc<SqlFixture>) {
+    let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Fast);
+    fixture
+        .stores
+        .lock()
+        .unwrap()
+        .insert("local".into(), store.clone());
+    let payload = serde_json::to_vec(&query_request()).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let (cleanup, cleanup_rx) = tokio::sync::watch::channel(false);
+    let task = serve_query_with_cleanup(fixture, server, cleanup_rx);
+    let sent = write_frame(&mut client, &payload).await;
+    let response = if sent.is_ok() {
+        Some(tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client)).await)
+    } else {
+        None
+    };
+    drop(client);
+    cleanup_query_peer(task, cleanup, fixture).await;
+    // Baseline assertions occur only after the owned server task has joined.
+    assert!(sent.is_ok(), "query_fixture_valid_frame_write");
+    let bytes = response
+        .expect("query_fixture_response_started")
+        .expect("query_fixture_response_deadline")
+        .expect("query_fixture_response_read");
+    let EventsResponse::Pageful { page } =
+        serde_json::from_slice(&bytes).expect("query_fixture_typed_response")
+    else {
+        panic!("query_fixture_nonempty_page_required");
+    };
+    assert_eq!(page.items.len(), 1, "query_fixture_nonempty_page_required");
+    assert!(page.total.is_none());
+    assert_eq!(page.items[0].id, Uuid::from_u128(1));
+    assert_eq!(page.items[0].created_at, 100);
+    assert_eq!(store.started.load(Ordering::SeqCst), 1);
+    assert!(store.finished.load(Ordering::SeqCst));
+    assert_query_resources_returned(fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_events_disconnect_settles_sqlite_and_recovers_same_pool() {
+    let fixture = Arc::new(SqlFixture::new());
+    assert_framed_query_page(&fixture).await;
+    eprintln!("query_events_nonempty_sqlite_baseline_ok");
+
+    let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Slow);
+    fixture
+        .stores
+        .lock()
+        .unwrap()
+        .insert("local".into(), store.clone());
+    fixture.progress.store(0, Ordering::SeqCst);
+    let payload = serde_json::to_vec(&query_request()).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let (cleanup, cleanup_rx) = tokio::sync::watch::channel(false);
+    let task = serve_query_with_cleanup(&fixture, server, cleanup_rx);
+    let sent = write_frame(&mut client, &payload).await;
+    let observed_progress = if sent.is_ok() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.progress.load(Ordering::SeqCst) == 0 && !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+            && fixture.progress.load(Ordering::SeqCst) > 0
+    } else {
+        false
+    };
+    let active = fixture.pool.reader_acquisition_snapshot();
+    let setup_valid = sent.is_ok()
+        && observed_progress
+        && !task.is_finished()
+        && store.started.load(Ordering::SeqCst) == 1
+        && active.active_pooled_checkouts == 1
+        && fixture.frame_budget.available_permits() == MAX_INFLIGHT_REQUEST_BYTES - payload.len();
+    drop(client);
+
+    if setup_valid {
+        let until = tokio::time::Instant::now()
+            + khive_db::sqlite_interrupt_grace_from_env()
+            + Duration::from_secs(2);
+        while !task.is_finished() && tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    // Save actual settlement/resource evidence before independent cleanup can change it.
+    let settled_before_cleanup = task.is_finished() && store.finished.load(Ordering::SeqCst);
+    let before = fixture.pool.reader_acquisition_snapshot();
+    let reader_returned_before_cleanup = before.active_pooled_checkouts == 0;
+    let admission_returned_before_cleanup = before.available_reader_admission_slots == 1;
+    let frame_returned_before_cleanup =
+        fixture.frame_budget.available_permits() == MAX_INFLIGHT_REQUEST_BYTES;
+
+    // This watch is outside the server's optional peer-disconnect scope, including under C1.
+    cleanup_query_peer(task, cleanup, &fixture).await;
+    assert!(
+        setup_valid,
+        "query_fixture_sql_progress_reader_and_frame_required"
+    );
+    assert!(
+        store.finished.load(Ordering::SeqCst),
+        "query_fixture_cleanup_must_settle_sql"
+    );
+    assert_query_resources_returned(&fixture);
+    let count = fixture
+        .sql
+        .reader()
+        .await
+        .unwrap()
+        .count(SqlStatement {
+            sql: "SELECT COUNT(*) FROM count_fixture".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1000, "query_fixture_same_pool_reuse");
+    assert_framed_query_page(&fixture).await;
+
+    assert!(
+        settled_before_cleanup && reader_returned_before_cleanup
+            && admission_returned_before_cleanup && frame_returned_before_cleanup,
+        "query_peer_disconnect_settled_resources_before_cleanup: settled={settled_before_cleanup} reader={reader_returned_before_cleanup} admission={admission_returned_before_cleanup} frame={frame_returned_before_cleanup}"
+    );
+}
