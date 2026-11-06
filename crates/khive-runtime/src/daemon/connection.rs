@@ -156,6 +156,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
             return;
         }
     };
+    drop(raw);
     let supervisor_probe = frame.probe_only;
     let handover_accepted = handover_requested
         && supervisor_probe
