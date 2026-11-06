@@ -127,12 +127,9 @@ pub(super) async fn serve_events_conn(
             Ok(Err(_)) | Err(_) => return,
         };
         let response = match serde_json::from_slice::<EventsRequest>(&payload) {
-            // Page reads share disconnect cancellation with counts, while
+            // Both query shapes share disconnect cancellation with counts, while
             // operator-budget attribution remains specific to count requests.
-            Ok(request)
-                if request.count_budget_secs().is_some()
-                    || matches!(&request, EventsRequest::QueryEvents { .. }) =>
-            {
+            Ok(request) if request.disconnect_cancellable() => {
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let dispatch = khive_storage::scope_request_read_cancellation(
                     cancel_rx,
@@ -141,7 +138,7 @@ pub(super) async fn serve_events_conn(
                 tokio::pin!(dispatch);
                 tokio::select! {
                     response = &mut dispatch => response,
-                    _ = count_peer_disconnected(&stream) => {
+                    _ = read_peer_disconnected(&stream) => {
                         let _ = cancel_tx.send(true);
                         // The SQLite owner must interrupt and join before this frame's permit drops.
                         let _ = dispatch.await;
@@ -204,7 +201,7 @@ pub(super) async fn serve_events_conn(
 }
 
 #[cfg(unix)]
-pub(super) async fn count_peer_disconnected(stream: &UnixStream) {
+pub(super) async fn read_peer_disconnected(stream: &UnixStream) {
     loop {
         if stream.readable().await.is_err() {
             return;
