@@ -1739,6 +1739,9 @@ one and a `supersedes` edge, creates a memory, skips a row, or lists it as a del
 before anything is written; a refused row carries a reason and never stops the others. Writes go through the
 `memory.remember` path in the caller's own namespace, keyed `<batch>:<old id>:<part>` (or `<batch>:create:<part>`),
 so re-running a chunk writes only what is missing. An anonymous caller is refused.
+Within a call, identical `supersede` payloads apart from `part` preserve all existing keyed replays or, if
+none exist, the earliest new row, and refuse other new rows with `duplicate-payload`, the matched row's
+zero-based index, and its part.
 
 | Param     | Type   | Required | Notes                                                                                                                                                                                                                                   |
 | --------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
