@@ -609,3 +609,39 @@ async fn catalogue_replacement_between_passes_does_not_enter_captured_set() {
     assert!(texts[0].contains("cataloguereplacementmarker"));
     assert!(!texts[0].contains("catalogueoriginalmarker"));
 }
+
+#[tokio::test]
+async fn catalogue_batch_reload_probes_atoms_by_primary_key() {
+    let (rt, _registry, _calls) = runtime();
+    let reload = khive_runtime::sql!("knowledge_index_atom_batch");
+    let plan = rt
+        .backend()
+        .pool_arc()
+        .writer()
+        .expect("writer")
+        .autocommit(|connection| {
+            let mut explain = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {reload}"))
+                .expect("plan prepares");
+            let plan = explain
+                .query_map(rusqlite::params!["local", "[\"a\",\"b\"]"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("plan runs")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("plan rows");
+            Ok(plan)
+        })
+        .expect("plan");
+    // The selected IDs drive the loop and each atom is one primary-key probe, so a
+    // batch costs the same whatever the namespace holds.
+    let selected = plan
+        .iter()
+        .position(|detail| detail.contains("selected"))
+        .unwrap_or_else(|| panic!("selected IDs are scanned: {plan:?}"));
+    let atom = plan
+        .iter()
+        .position(|detail| detail.starts_with("SEARCH atom") && detail.contains("(id=?)"))
+        .unwrap_or_else(|| panic!("atoms are probed by primary key: {plan:?}"));
+    assert!(selected < atom, "selected IDs drive the join: {plan:?}");
+}
