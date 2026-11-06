@@ -366,7 +366,7 @@ impl KhiveRuntime {
                         "restore: memory edge source row is in a namespace the caller cannot read; the edge cannot be restored under stored edge namespace {write_namespace}"
                     ),
                     "apply_changeset" => format!(
-                        "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under request namespace {write_namespace}"
+                        "apply_changeset: memory edge source row is in a namespace the caller cannot read; this link operation cannot be written under link operation namespace {write_namespace}"
                     ),
                     _ => format!(
                         "{operation}: memory edge source row is in a namespace the caller cannot read; the edge cannot be written under request namespace {write_namespace}"
