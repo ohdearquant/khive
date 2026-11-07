@@ -40,7 +40,7 @@ fn brain_resolve_params_has_consumer_kind_required() {
         h.params.iter().any(|p| p.name == "namespace"),
         "brain.resolve must document optional namespace"
     );
-    for verb in ["brain.bind", "brain.unbind", "brain.bindings", "brain.resolve"] {
+    for verb in ["brain.bind", "brain.bindings", "brain.resolve"] {
         let handler = find_handler(verb);
         let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
         assert_eq!(
@@ -49,6 +49,11 @@ fn brain_resolve_params_has_consumer_kind_required() {
             "{verb} namespace help must describe the catalog"
         );
     }
+    let unbind = find_handler("brain.unbind");
+    let namespace = unbind.params.iter().find(|p| p.name == "namespace").unwrap();
+    assert!(namespace.description.contains("every namespace"));
+    assert!(namespace.description.contains("default catalog"));
+    assert!(unbind.description.contains("removed_by_namespace"));
 }
 
 #[test]

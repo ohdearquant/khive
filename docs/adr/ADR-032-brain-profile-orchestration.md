@@ -1035,6 +1035,7 @@ match context `*`: `brain.bind` stores the binding with namespace `*`, so it mat
 every namespace context within that catalog; `brain.resolve` matches only bindings
 stored with `*`; `brain.bindings` and `brain.unbind` apply no namespace filter, so they
 match bindings of every namespace in that catalog, subject to their other filters.
+`brain.unbind` returns `removed_by_namespace`, an object mapping each removed binding's namespace to its count (empty when none match), alongside the unchanged `removed` and `unbound` totals.
 Profile IDs are unique within each catalog. Bindings resolve only in the selected
 catalog; cross-catalog resolution is outside this workflow and needs a separate ADR.
 

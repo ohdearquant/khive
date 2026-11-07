@@ -1763,6 +1763,7 @@ impl BrainPack {
             ENTITY_CACHE_CAPACITY,
             move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
                 let before = state.bindings.len();
+                let mut removed_by_namespace = std::collections::BTreeMap::<String, usize>::new();
 
                 state.bindings.retain(|b| {
                     let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
@@ -1775,7 +1776,11 @@ impl BrainPack {
                     // Retain if this binding does NOT match ALL of the provided filters.
                     // A filter that is absent (None) matches everything — only bindings
                     // satisfying every supplied criterion are removed.
-                    !(pid_match && actor_match && ns_match && kind_match)
+                    let should_remove = pid_match && actor_match && ns_match && kind_match;
+                    if should_remove {
+                        *removed_by_namespace.entry(b.namespace.clone()).or_default() += 1;
+                    }
+                    !should_remove
                 });
 
                 let removed = before - state.bindings.len();
@@ -1784,7 +1789,11 @@ impl BrainPack {
                 // tests. In particular, both fields remain present at zero so
                 // a successful no-op cannot be mistaken for a confirmed
                 // removal.
-                Ok(json!({ "removed": removed, "unbound": removed }))
+                Ok(json!({
+                    "removed": removed,
+                    "unbound": removed,
+                    "removed_by_namespace": removed_by_namespace,
+                }))
             },
         )
         .await

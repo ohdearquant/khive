@@ -579,7 +579,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.unbind",
-        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required. No matching rows succeeds with removed=0 and unbound=0.",
+        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required. The result includes removed and unbound counts plus removed_by_namespace, an object mapping each removed binding namespace to its count (empty when none match).",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -601,7 +601,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The catalog this call reads and writes and the binding namespace to match. If omitted, bindings of every namespace in the caller's default catalog can match the other filters.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
