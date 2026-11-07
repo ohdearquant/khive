@@ -481,7 +481,7 @@ impl KhiveMcpServer {
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
                     let parse_content = parse_content[i];
-                    BatchTask {
+                    BatchTask::checked_inline_size(BatchTask {
                         index: i,
                         tool: task_tool,
                         // Boxed where it is built: the batch driver keeps several copies of
@@ -658,7 +658,7 @@ impl KhiveMcpServer {
                         stamp_usage(&mut entry, &usage_ctx);
                         entry
                         }),
-                    }
+                    })
                 });
                 let results =
                     execute_bounded_batch(futures, response_budget, max_batch_concurrency).await;
@@ -870,7 +870,7 @@ impl KhiveMcpServer {
                 let participants = conflict_ops[range.clone()].to_vec();
                 let budget = budget.clone();
                 let presentation_per_op = presentation_per_op.clone();
-                UnitTask {
+                UnitTask::checked_inline_size(UnitTask {
                     // Boxed where it is built, as the per-op batch futures above are: the
                     // unit driver keeps several copies of its task type in one stack frame.
                     future: Box::pin(async move {
@@ -1027,7 +1027,7 @@ impl KhiveMcpServer {
                             content_updates,
                         }
                     }),
-                }
+                })
             })
             .collect();
 
