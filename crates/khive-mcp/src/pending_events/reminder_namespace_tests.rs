@@ -17,6 +17,7 @@ const CREATOR: &str = "lambda:reminder-owner";
 const DAEMON: &str = "lambda:replacement-daemon";
 const DAEMON_NAMESPACE: &str = "lambda:replacement-daemon";
 const EVENT_NAMESPACE: &str = "lambda:reminder-event";
+const CREATOR_HOME_NAMESPACE: &str = "lambda:reminder-home";
 
 #[derive(Debug, Default)]
 struct AllowReminderNamespacesGate {
@@ -73,7 +74,14 @@ fn creator_identity() -> RequestIdentity {
     }
 }
 
-async fn dispatch_as_creator(server: &KhiveMcpServer, ops: Value) -> Value {
+fn creator_identity_in(namespace: &str) -> RequestIdentity {
+    RequestIdentity {
+        namespace: namespace.to_string(),
+        ..creator_identity()
+    }
+}
+
+async fn dispatch_as(server: &KhiveMcpServer, identity: RequestIdentity, ops: Value) -> Value {
     let response = server
         .dispatch_request_inner(
             RequestParams {
@@ -81,7 +89,7 @@ async fn dispatch_as_creator(server: &KhiveMcpServer, ops: Value) -> Value {
                 ..Default::default()
             },
             true,
-            Some(creator_identity()),
+            Some(identity),
             crate::server::DispatchOrigin::Daemon,
         )
         .await
@@ -94,6 +102,15 @@ async fn create_reminder(
     namespace: Option<&str>,
     content: &str,
 ) -> uuid::Uuid {
+    create_reminder_as(server, creator_identity(), namespace, content).await
+}
+
+async fn create_reminder_as(
+    server: &KhiveMcpServer,
+    identity: RequestIdentity,
+    namespace: Option<&str>,
+    content: &str,
+) -> uuid::Uuid {
     let mut args = json!({
         "content": content,
         "at": "2099-01-01T00:00:00Z",
@@ -101,8 +118,12 @@ async fn create_reminder(
     if let Some(namespace) = namespace {
         args["namespace"] = json!(namespace);
     }
-    let result =
-        dispatch_as_creator(server, json!([{"tool": "schedule.remind", "args": args}])).await;
+    let result = dispatch_as(
+        server,
+        identity,
+        json!([{"tool": "schedule.remind", "args": args}]),
+    )
+    .await;
     assert_eq!(result["results"][0]["ok"], true, "{result}");
     result["results"][0]["result"]["full_id"]
         .as_str()
@@ -161,9 +182,18 @@ async fn drain_reminder(
 }
 
 async fn assert_default_inbox_reminder(server: &KhiveMcpServer, content: &str) {
+    assert_default_inbox_reminder_as(server, creator_identity(), content).await;
+}
+
+async fn assert_default_inbox_reminder_as(
+    server: &KhiveMcpServer,
+    identity: RequestIdentity,
+    content: &str,
+) {
     // Omit namespace: this must exercise the creator's ordinary inbox read.
-    let response = dispatch_as_creator(
+    let response = dispatch_as(
         server,
+        identity,
         json!([{"tool": "comm.inbox", "args": {"status": "all"}}]),
     )
     .await;
@@ -235,5 +265,20 @@ async fn reminder_without_explicit_namespace_keeps_default_inbox_delivery() {
 
     drain_reminder(&rt, &server, id, "local").await;
     assert_default_inbox_reminder(&server, content).await;
+    assert_delivery_uses_creator(&gate);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn reminder_from_creator_with_non_local_identity_namespace_reaches_default_inbox() {
+    let (_temp, _db_path, rt, server, gate) = fixture();
+    let creator = creator_identity_in(CREATOR_HOME_NAMESPACE);
+    let content = "creator with a non-local identity namespace still reads the reminder";
+    let id = create_reminder_as(&server, creator.clone(), None, content).await;
+    make_reminder_due(&rt, id).await;
+    gate.deliveries.lock().expect("delivery requests").clear();
+
+    drain_reminder(&rt, &server, id, "local").await;
+    assert_default_inbox_reminder_as(&server, creator, content).await;
     assert_delivery_uses_creator(&gate);
 }
