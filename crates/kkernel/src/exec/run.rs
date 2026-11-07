@@ -134,64 +134,15 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // from the daemon's TOML-resolved fingerprint, so the daemon rejected the
     // forwarded frame as a `ConfigMismatch` and `exec` silently fell back to an
     // in-process, TOML-blind, effectively-anonymous dispatch (issue #581).
-    let namespace = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (mut cfg, db_anchor) =
-        khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
-            db: args.db.as_deref(),
-            config: args.config.as_deref(),
-            namespace,
-            // `--namespace` has a clap `default_value = "local"`, so it is always
-            // present — there is no way to distinguish "operator typed --namespace
-            // local" from "operator didn't pass --namespace at all". `true` is the
-            // conservative, behavior-preserving choice: it keeps exec's pre-existing
-            // semantics (the CLI/default value always becomes `default_namespace`,
-            // matching what `resolve_runtime_config`'s embed path already did
-            // unconditionally). It is also empirically inert for config_id parity:
-            // in the embed path (`no_embed: false`, exec's only mode), this flag
-            // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
-            // — and `compute_config_id` never reads identity fields (`actor_id` or
-            // `visible_namespaces`; namespace is carried separately per its own doc
-            // comment). See the
-            // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
-            // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
-            // below, which construct both arms and assert this directly rather than
-            // assuming it.
-            namespace_explicit: true,
-            actor_explicit: false,
-            no_embed: false,
-            packs: None,
-            brain_profile: None,
-        })?;
-
-    // ADR-170 embedded mode: `kkernel exec`'s in-process fallback is a
-    // one-shot — a socket forwarder would be reaped at process exit before
-    // delivering, losing every event. The shared resolver already emits
-    // direct (socket-less) mode for exactly this class of host; only the
-    // resident daemon entrypoints upgrade to forwarding
-    // (`enable_events_forwarding_for_daemon`). SQLite's per-file
-    // cross-process exclusion covers direct appends overlapping a running
-    // events daemon.
-    debug_assert!(cfg
-        .events_split
-        .as_ref()
-        .is_none_or(|split| split.socket_path.is_none()));
-
-    // Apply the explicit actor only AFTER the shared resolver has loaded the
-    // project/config/environment fallbacks. This makes the CLI value the true
-    // highest-precedence tier without coupling identity to storage namespace.
-    // Keeping the selected identity in `cfg` also sends every execution mode
-    // through its existing gate seam: daemon request identity, local registry
-    // dispatch, ops-file dispatch, or atomic apply's pre-write authorization.
-    if let Err(error) = apply_actor_pin_and_expectation(
-        &mut cfg,
-        args.actor.as_deref(),
-        args.expect_actor.as_deref(),
-    ) {
-        if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
-            return Err(report_mode_refusal(&mode, refusal.reason, &refusal.message));
+    let (cfg, db_anchor) = match resolve_exec_runtime_config(&args) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                return Err(report_mode_refusal(&mode, refusal.reason, &refusal.message));
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
 
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
@@ -1048,6 +999,67 @@ async fn run_exec_inline_read_only(
     result
 }
 
+fn resolve_exec_runtime_config(args: &ExecArgs) -> Result<(RuntimeConfig, Option<PathBuf>)> {
+    let namespace =
+        Namespace::parse(&args.namespace).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let (mut config, db_anchor, ownership) =
+        khive_mcp::serve::resolve_runtime_config_with_actor_ownership(RuntimeConfigInputs {
+            db: args.db.as_deref(),
+            config: args.config.as_deref(),
+            namespace,
+            // `--namespace` has a clap `default_value = "local"`, so it is always
+            // present: there is no way to distinguish "operator typed --namespace
+            // local" from "operator didn't pass --namespace at all". `true` is the
+            // conservative, behavior-preserving choice: it keeps exec's pre-existing
+            // semantics (the CLI/default value always becomes `default_namespace`,
+            // matching what `resolve_runtime_config`'s embed path already did
+            // unconditionally). It is also empirically inert for config_id parity:
+            // in the embed path (`no_embed: false`, exec's only mode), this flag
+            // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
+            // and `compute_config_id` never reads identity fields (`actor_id` or
+            // `visible_namespaces`; namespace is carried separately per its own doc
+            // comment). See the
+            // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
+            // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
+            // in `exec_tests/config_identity_tests.rs`, which construct both arms and
+            // assert this directly rather than assuming it.
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })?;
+
+    // ADR-170 embedded mode: `kkernel exec`'s in-process fallback is a
+    // one-shot: a socket forwarder would be reaped at process exit before
+    // delivering, losing every event. The shared resolver already emits
+    // direct (socket-less) mode for exactly this class of host; only the
+    // resident daemon entrypoints upgrade to forwarding
+    // (`enable_events_forwarding_for_daemon`). SQLite's per-file
+    // cross-process exclusion covers direct appends overlapping a running
+    // events daemon.
+    debug_assert!(config
+        .events_split
+        .as_ref()
+        .is_none_or(|split| split.socket_path.is_none()));
+
+    // Apply the explicit actor only AFTER the shared resolver has loaded the
+    // project/config/environment fallbacks. This makes the CLI value the true
+    // highest-precedence tier without coupling identity to storage namespace.
+    // Keeping the selected identity in `cfg` also sends every execution mode
+    // through its existing gate seam: daemon request identity, local registry
+    // dispatch, ops-file dispatch, or atomic apply's pre-write authorization.
+    // `[actor] owned_namespaces` is finalized only after that pin, against the
+    // actor whose configuration declared it (ADR-021 Delta 1).
+    apply_actor_pin_and_expectation(
+        &mut config,
+        args.actor.as_deref(),
+        args.expect_actor.as_deref(),
+    )?;
+    ownership.finalize(&mut config);
+    Ok((config, db_anchor))
+}
+
 /// Apply the explicit exec actor tier and validate an optional identity
 /// expectation before any daemon forwarding or local dispatch occurs.
 pub(super) fn apply_actor_pin_and_expectation(
@@ -1070,14 +1082,6 @@ pub(super) fn apply_actor_pin_and_expectation(
                 cfg.visible_namespaces.retain(|ns| *ns != prev_ns);
             }
         }
-
-        // `[actor] owned_namespaces` was declared for the configured actor
-        // (ADR-021 Delta 1). A pin to any other actor, including the shared
-        // namespace, carries none of it.
-        if cfg.actor_id.as_deref() != Some(parsed.as_str()) {
-            cfg.owned_namespaces.clear();
-        }
-
         cfg.actor_id = if parsed == Namespace::local() {
             None
         } else {
@@ -2274,3 +2278,7 @@ mod settle_exec_stages_tests {
         assert!(start.elapsed() >= Duration::from_millis(150));
     }
 }
+
+#[cfg(test)]
+#[path = "actor_pin_tests.rs"]
+mod actor_pin_tests;
