@@ -9,13 +9,88 @@ use khive_storage::types::{SqlStatement, SqlValue, VectorRecord};
 use khive_types::SubstrateKind;
 
 use super::schema::{Atom, IndexParams};
-use super::util::{atom_embed_text, atom_from_row, deser, row_str, sql_err, DEFAULT_EMBED_BATCH};
+use super::util::{
+    atom_embed_text, atom_from_row, deser, row_i64, row_str, sql_err, DEFAULT_EMBED_BATCH,
+};
 use super::vamana;
 use super::KnowledgeHandlers;
 
 enum IndexAtoms {
     Explicit(Vec<Atom>),
     CatalogueIds(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct IndexCursor {
+    pub(super) created_at: i64,
+    pub(super) id: String,
+}
+
+pub(super) struct CataloguePage {
+    pub(super) ids: Vec<String>,
+    pub(super) cursor: Option<IndexCursor>,
+    pub(super) raw_len: usize,
+}
+
+/// Read one short-lived page in the catalogue's `(created_at, id)` order.
+/// Advance past the last raw row even when that row cannot decode as an atom.
+/// Continuously live rows with unchanged ordering keys are visited once. Rows
+/// created, deleted or restored during traversal may or may not be visited. A
+/// namespace move counts as leaving or entering the namespace and has the same
+/// may-or-may-not guarantee.
+pub(super) async fn read_catalogue_page(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    batch_size: usize,
+    cursor: Option<&IndexCursor>,
+) -> Result<CataloguePage, RuntimeError> {
+    let mut params = vec![
+        SqlValue::Text(namespace.to_owned()),
+        SqlValue::Integer(batch_size as i64),
+    ];
+    let query = if let Some(cursor) = cursor {
+        params.push(SqlValue::Integer(cursor.created_at));
+        params.push(SqlValue::Text(cursor.id.clone()));
+        khive_runtime::sql!("knowledge_index_atom_after")
+    } else {
+        khive_runtime::sql!("knowledge_index_atom_page")
+    };
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("index page reader", e))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: query.into(),
+            params,
+            label: None,
+        })
+        .await
+        .map_err(|e| sql_err("index page", e))?;
+    drop(reader);
+    let cursor = rows
+        .last()
+        .map(|row| {
+            let created_at = row_i64(row, "created_at")
+                .ok_or_else(|| sql_err("index page cursor", "missing raw creation timestamp"))?;
+            let id = row_str(row, "id")
+                .ok_or_else(|| sql_err("index page cursor", "missing raw atom ID"))?;
+            Ok::<_, RuntimeError>(IndexCursor { created_at, id })
+        })
+        .transpose()?;
+    let ids = rows
+        .iter()
+        .filter_map(|row| {
+            atom_from_row(row)?;
+            row_str(row, "id")
+        })
+        .collect();
+    Ok(CataloguePage {
+        ids,
+        cursor,
+        raw_len: rows.len(),
+    })
 }
 
 impl KnowledgeHandlers {
@@ -71,37 +146,15 @@ impl KnowledgeHandlers {
             IndexAtoms::Explicit(out)
         } else {
             let mut out = Vec::new();
-            let mut offset = 0i64;
+            let mut cursor = None;
             loop {
-                let mut reader = sql
-                    .reader()
-                    .await
-                    .map_err(|e| sql_err("index page reader", e))?;
-                let rows = reader
-                    .query_all(SqlStatement {
-                        // #1671: `id` tiebreak — the batch re-embed sweep pages the
-                        // full atom table; a non-total order would duplicate/skip atoms.
-                        sql: khive_runtime::sql!("knowledge_index_atom_page").into(),
-                        params: vec![
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Integer(batch_size as i64),
-                            SqlValue::Integer(offset),
-                        ],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("index page", e))?;
-                let n = rows.len();
-                // Keep the existing decode eligibility and the stored ID spelling.
+                let page = read_catalogue_page(runtime, &ns, batch_size, cursor.as_ref()).await?;
                 // Only IDs survive this page; payloads are reloaded before embedding.
-                out.extend(rows.iter().filter_map(|row| {
-                    atom_from_row(row)?;
-                    row_str(row, "id")
-                }));
-                if n < batch_size {
+                out.extend(page.ids);
+                if page.raw_len < batch_size {
                     break;
                 }
-                offset += n as i64;
+                cursor = page.cursor;
             }
             IndexAtoms::CatalogueIds(out)
         };
