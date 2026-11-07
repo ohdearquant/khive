@@ -14,10 +14,45 @@ pub(super) struct BatchTask<F> {
     pub(super) future: F,
 }
 
+impl<F> BatchTask<F> {
+    /// Check the actual task before the driver stores it in its polling frame.
+    #[inline]
+    pub(super) fn checked_inline_size(self) -> Self {
+        // Allow both thin and fat boxed-future pointers, plus the named metadata.
+        const MAX_INLINE_BYTES: usize = std::mem::size_of::<usize>()
+            + std::mem::size_of::<String>()
+            + 2 * std::mem::size_of::<usize>();
+        debug_assert!(
+            std::mem::size_of_val(&self) <= MAX_INLINE_BYTES,
+            "batch_task_inline_layout_bound: actual={} budget={} future={}",
+            std::mem::size_of_val(&self),
+            MAX_INLINE_BYTES,
+            std::mem::size_of_val(&self.future),
+        );
+        self
+    }
+}
+
 /// One bracketed-batch unit's future (ADR-016 Amendment 2): a linear chain
 /// dispatched under [`execute_bounded_units`]'s concurrency cap.
 pub(super) struct UnitTask<F> {
     pub(super) future: F,
+}
+
+impl<F> UnitTask<F> {
+    /// Check the actual unit task, including any future task fields.
+    #[inline]
+    pub(super) fn checked_inline_size(self) -> Self {
+        const MAX_INLINE_BYTES: usize = 2 * std::mem::size_of::<usize>();
+        debug_assert!(
+            std::mem::size_of_val(&self) <= MAX_INLINE_BYTES,
+            "unit_task_inline_layout_bound: actual={} budget={} future={}",
+            std::mem::size_of_val(&self),
+            MAX_INLINE_BYTES,
+            std::mem::size_of_val(&self.future),
+        );
+        self
+    }
 }
 
 /// One unit's flattened leaf entries plus the `parse_content` recomputations
