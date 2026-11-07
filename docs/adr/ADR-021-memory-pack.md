@@ -891,7 +891,8 @@ properties, refuses a replayed create as an error, and does not go through the m
    the row is `deduped` and its `supersedes` edge is asserted again (linking is idempotent), so a run that stopped
    between the write and the edge completes. When the stored `batch_row` differs, the row is refused as
    `dedupe-name-taken`; a corrected row needs a new `part` or a new batch name. Nothing is overwritten.
-5. **Checks, per row, identical in a dry run and a real run.** A failing row is refused with a reason and never stops
+5. **Checks, per row, identical in a dry run and a real run.** A batch name whose required row-key shapes fail the
+   content gate is refused at intake, including in a dry run. A failing row is refused with a reason and never stops
    the others:
    - `id` missing for `supersede`, `skip` or `delete-candidate`, or present for `create`;
    - the old row does not resolve, is not a memory, or sits in a namespace that is neither the caller's nor the shared
