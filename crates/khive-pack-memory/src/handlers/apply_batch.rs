@@ -812,7 +812,8 @@ impl MemoryPack {
         // The longest key a row of this call can need: a `supersede` row with a
         // hyphenated UUID and the largest part number. A batch name that cannot
         // form it cannot form any row's key.
-        validate_memory_key(&format!("{batch}:{}:{}", Uuid::nil(), u32::MAX)).map_err(|error| {
+        let supersede_key = format!("{batch}:{}:{}", Uuid::nil(), u32::MAX);
+        validate_memory_key(&supersede_key).map_err(|error| {
             RuntimeError::InvalidInput(format!(
                 "batch name cannot form a valid idempotency key: {}",
                 error_message(&error)
@@ -840,6 +841,27 @@ impl MemoryPack {
                     .map_err(|message| refusal("invalid-row", message)),
             })
             .collect();
+
+        // Check only key shapes used by parsed writing rows, before any lookup
+        // or write. Create-only batches do not introduce a UUID into their keys.
+        for (action, key) in [
+            (Action::Supersede, supersede_key),
+            (Action::Create, format!("{batch}:create:{}", u32::MAX)),
+        ] {
+            if parsed.iter().any(|row| {
+                row.row
+                    .as_ref()
+                    .is_ok_and(|row| row.action == action && row_key(batch, row).is_some())
+            }) {
+                secret_gate::check_at(&key, "note", "key").map_err(|error| match error {
+                    RuntimeError::SecretDetected(matched) => RuntimeError::InvalidInput(format!(
+                        "batch name cannot form a note key accepted by the content gate (detector: {}); choose another batch name",
+                        matched.detector
+                    )),
+                    other => other,
+                })?;
+            }
+        }
 
         let mut key_counts: HashMap<String, usize> = HashMap::new();
         for parsed_row in &parsed {
