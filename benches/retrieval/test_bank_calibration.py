@@ -98,6 +98,16 @@ class CalibrationScoreTests(unittest.TestCase):
             "max_abs_rank_score_diff": 3.5,
         })
 
+    def test_out_of_float_range_difference_is_refused(self):
+        with self.assertRaisesRegex(bank.BankError, "out of float range"):
+            bank.compare([hit(IDS[0], 10 ** 400)], [hit(IDS[0], 0.5)])
+
+    def test_refusal_names_the_rejected_value(self):
+        for label, score, shown in (("null", None, "None"), ("text", "0.25", "'0.25'"), ("true", True, "True")):
+            with self.subTest(score=label):
+                with self.assertRaisesRegex(bank.BankError, "got " + shown.replace("(", "\\(")):
+                    bank.compare([hit(IDS[0], score)], [hit(IDS[0], 0.25)])
+
     def test_empty_and_valid_no_overlap_comparisons_keep_zero_difference(self):
         pairs = (
             ([], []),

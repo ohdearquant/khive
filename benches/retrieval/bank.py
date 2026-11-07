@@ -1151,14 +1151,17 @@ def compare(x: list[dict], y: list[dict]) -> dict:
             score = hit.get("rank_score")
             if (isinstance(score, bool) or not isinstance(score, (int, float))
                     or (isinstance(score, float) and not math.isfinite(score))):
-                raise BankError(f"calibrate {side} hit {index}: rank_score must be a finite int or float, not bool")
+                raise BankError(f"calibrate {side} hit {index}: rank_score must be a finite int or float, got {score!r}")
             out[ident] = score
         return out
 
     rx = scores(x, "left")
     ry = scores(y, "right")
     shared = [i for i in rx if i in ry]
-    diffs = [abs(rx[i] - ry[i]) for i in shared]
+    try:
+        diffs = [abs(rx[i] - ry[i]) for i in shared]
+    except OverflowError as error:
+        raise BankError(f"calibrate: rank_score difference is out of float range: {error}") from error
     return {"overlap@10": len(shared) / max(len(rx), 1), "same_order": list(rx) == list(ry),
             "max_abs_rank_score_diff": max(diffs, default=0.0)}
 
