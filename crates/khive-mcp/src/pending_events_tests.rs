@@ -2102,6 +2102,7 @@ async fn dispatch_action_rejects_non_literal_prev_reference() {
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -2126,6 +2127,7 @@ async fn replay_defense_rejects_legacy_internal_subhandler_payload() {
         Some(VerifiedActor::new("lambda:scheduler").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -6291,6 +6293,7 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -6314,6 +6317,7 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
