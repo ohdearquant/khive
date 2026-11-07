@@ -1144,10 +1144,27 @@ def run_arms(args, arms, run_id, cases, br, out, summary, base, bank_id) -> None
 def compare(x: list[dict], y: list[dict]) -> dict:
     """Top-10 overlap relative to x, whether the two lists are the same ids in the same order, and the largest
     rank-score gap on a shared id."""
-    rx = {hit_id(h, "calibrate"): h.get("rank_score") for h in x}
-    ry = {hit_id(h, "calibrate"): h.get("rank_score") for h in y}
+    def scores(hits: list[dict], side: str) -> dict:
+        out = {}
+        for index, hit in enumerate(hits):
+            ident = hit_id(hit, "calibrate")
+            score = hit.get("rank_score")
+            if (isinstance(score, bool) or not isinstance(score, (int, float))
+                    or (isinstance(score, float) and not math.isfinite(score))):
+                raise BankError(f"calibrate {side} hit {index}: rank_score must be a finite int or float, got {score!r}")
+            out[ident] = score
+        return out
+
+    rx = scores(x, "left")
+    ry = scores(y, "right")
     shared = [i for i in rx if i in ry]
-    diffs = [abs(rx[i] - ry[i]) for i in shared if isinstance(rx[i], (int, float)) and isinstance(ry[i], (int, float))]
+    try:
+        diffs = [abs(rx[i] - ry[i]) for i in shared]
+    except OverflowError as error:
+        raise BankError(f"calibrate: rank_score difference is out of float range: {error}") from error
+    for i, d in zip(shared, diffs):
+        if isinstance(d, float) and not math.isfinite(d):
+            raise BankError(f"calibrate: rank_score difference is out of float range: {rx[i]!r} and {ry[i]!r}")
     return {"overlap@10": len(shared) / max(len(rx), 1), "same_order": list(rx) == list(ry),
             "max_abs_rank_score_diff": max(diffs, default=0.0)}
 
