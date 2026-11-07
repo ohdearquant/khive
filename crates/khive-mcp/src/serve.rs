@@ -98,8 +98,9 @@ mod runtime_config;
 pub use runtime_config::{
     apply_env_output_format, build_single_backend_runtime, config_discovery_db_anchor,
     enable_events_forwarding_for_daemon, install_resolved_blob_store, resolve_runtime_config,
-    resolve_runtime_config_with_db_anchor, resolved_actor_disclosure, resolved_database_disclosure,
-    resolved_volume_lock_disclosure, resolved_wal_ceiling_disclosure, RuntimeConfigInputs,
+    resolve_runtime_config_with_actor_ownership, resolve_runtime_config_with_db_anchor,
+    resolved_actor_disclosure, resolved_database_disclosure, resolved_volume_lock_disclosure,
+    resolved_wal_ceiling_disclosure, ConfiguredActorOwnership, RuntimeConfigInputs,
 };
 
 use runtime_config::{
