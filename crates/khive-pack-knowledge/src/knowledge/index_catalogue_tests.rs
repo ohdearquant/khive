@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use super::index_handler::{read_catalogue_page, IndexCursor};
 use crate::KnowledgePack;
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
@@ -644,4 +645,258 @@ async fn catalogue_batch_reload_probes_atoms_by_primary_key() {
         .position(|detail| detail.starts_with("SEARCH atom") && detail.contains("(id=?)"))
         .unwrap_or_else(|| panic!("atoms are probed by primary key: {plan:?}"));
     assert!(selected < atom, "selected IDs drive the join: {plan:?}");
+}
+
+async fn seed_cursor_atom(registry: &VerbRegistry, slug: &str) -> String {
+    seed_atom(registry, slug, slug, slug).await;
+    registry
+        .dispatch("knowledge.get", json!({"id": slug}))
+        .await
+        .expect("read cursor fixture atom")["id"]
+        .as_str()
+        .expect("cursor fixture ID")
+        .to_owned()
+}
+
+fn set_cursor_created_at(runtime: &KhiveRuntime, id: &str, created_at: i64) {
+    let updated = runtime
+        .backend()
+        .pool_arc()
+        .writer()
+        .expect("cursor fixture writer")
+        .autocommit(|connection| {
+            Ok(connection
+                .execute(
+                    "UPDATE knowledge_atoms SET created_at=?1 WHERE namespace='local' AND id=?2",
+                    rusqlite::params![created_at, id],
+                )
+                .expect("set cursor fixture timestamp"))
+        })
+        .expect("cursor timestamp update");
+    assert_eq!(updated, 1, "one public atom receives a fixture timestamp");
+}
+
+fn set_cursor_id(runtime: &KhiveRuntime, id: &str, replacement: &str) {
+    let updated = runtime
+        .backend()
+        .pool_arc()
+        .writer()
+        .expect("raw cursor fixture writer")
+        .autocommit(|connection| {
+            Ok(connection
+                .execute(
+                    "UPDATE knowledge_atoms SET id=?1 WHERE namespace='local' AND id=?2",
+                    rusqlite::params![replacement, id],
+                )
+                .expect("make raw ID undecodable"))
+        })
+        .expect("raw cursor fixture update");
+    assert_eq!(updated, 1, "one raw row receives a fixture ID");
+}
+
+#[tokio::test]
+async fn catalogue_cursor_visits_tied_timestamps_in_id_order_exactly_once() {
+    let (runtime, registry, _calls) = runtime();
+    let mut expected = Vec::new();
+    for index in 0..5 {
+        let id = seed_cursor_atom(&registry, &format!("cursor-tied-{index}")).await;
+        set_cursor_created_at(&runtime, &id, 100);
+        expected.push(id);
+    }
+    expected.sort();
+    let first = read_catalogue_page(&runtime, "local", 2, None)
+        .await
+        .expect("first tied cursor page");
+    assert_eq!(
+        first.ids,
+        expected[..2].to_vec(),
+        "catalogue_cursor_first_page_orders_tied_ids"
+    );
+    let mut seen = first.ids;
+    let mut cursor = first.cursor;
+    for _ in 0..3 {
+        let page = read_catalogue_page(&runtime, "local", 2, cursor.as_ref())
+            .await
+            .expect("next tied cursor page");
+        let done = page.raw_len < 2;
+        seen.extend(page.ids);
+        cursor = page.cursor;
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "catalogue_cursor_ties_visit_every_live_id_once"
+    );
+}
+
+#[tokio::test]
+async fn catalogue_cursor_advances_from_last_raw_row_when_uuid_decode_skips_it() {
+    let (runtime, registry, _calls) = runtime();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let id = seed_cursor_atom(&registry, &format!("cursor-raw-{index}")).await;
+        set_cursor_created_at(&runtime, &id, index + 1);
+        ids.push(id);
+    }
+    let bad_id = "cursor-middle-not-a-uuid";
+    set_cursor_id(&runtime, &ids[1], bad_id);
+    let first = read_catalogue_page(&runtime, "local", 2, None)
+        .await
+        .expect("raw cursor first page");
+    assert_eq!(
+        first.ids,
+        vec![ids[0].clone()],
+        "only valid UUIDs are captured"
+    );
+    assert_eq!(first.raw_len, 2, "raw page includes the undecodable row");
+    assert_eq!(
+        first.cursor,
+        Some(IndexCursor {
+            created_at: 2,
+            id: bad_id.to_string(),
+        }),
+        "catalogue_cursor_uses_last_raw_row"
+    );
+    let next = read_catalogue_page(&runtime, "local", 2, first.cursor.as_ref())
+        .await
+        .expect("page after undecodable raw cursor");
+    assert_eq!(next.ids, vec![ids[2].clone()], "later valid row is reached");
+    assert_eq!(next.raw_len, 1);
+}
+
+#[tokio::test]
+async fn catalogue_cursor_deleting_visited_prefix_does_not_skip_survivors() {
+    let (runtime, registry, _calls) = runtime();
+    let mut ids = Vec::new();
+    for index in 0..4 {
+        let id = seed_cursor_atom(&registry, &format!("cursor-delete-{index}")).await;
+        set_cursor_created_at(&runtime, &id, index + 1);
+        ids.push(id);
+    }
+    let first = read_catalogue_page(&runtime, "local", 2, None)
+        .await
+        .expect("cursor page before prefix deletion");
+    assert_eq!(first.ids, ids[..2].to_vec(), "visited prefix is ordered");
+    let deleted = registry
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({"ids": ["cursor-delete-0"]}),
+        )
+        .await
+        .expect("delete already visited cursor prefix");
+    assert_eq!(deleted["deleted"].as_u64(), Some(1));
+    let mut cursor = first.cursor;
+    let mut later = Vec::new();
+    for _ in 0..3 {
+        let page = read_catalogue_page(&runtime, "local", 2, cursor.as_ref())
+            .await
+            .expect("cursor page after prefix deletion");
+        let done = page.raw_len < 2;
+        later.extend(page.ids);
+        cursor = page.cursor;
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        later,
+        ids[2..].to_vec(),
+        "catalogue_cursor_prefix_delete_keeps_later_live_rows_once"
+    );
+}
+
+#[tokio::test]
+async fn catalogue_cursor_empty_raw_and_all_invalid_pages_have_distinct_progress() {
+    let (runtime, registry, _calls) = runtime();
+    let empty = read_catalogue_page(&runtime, "local", 2, None)
+        .await
+        .expect("empty catalogue page");
+    assert!(
+        empty.ids.is_empty() && empty.raw_len == 0 && empty.cursor.is_none(),
+        "catalogue_cursor_empty_catalogue_is_exhausted"
+    );
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let id = seed_cursor_atom(&registry, &format!("cursor-empty-{index}")).await;
+        set_cursor_created_at(&runtime, &id, index + 1);
+        ids.push(id);
+    }
+    set_cursor_id(&runtime, &ids[0], "cursor-invalid-first");
+    set_cursor_id(&runtime, &ids[1], "cursor-invalid-second");
+    let first = read_catalogue_page(&runtime, "local", 2, None)
+        .await
+        .expect("all-invalid decoded page");
+    assert!(first.ids.is_empty());
+    assert_eq!(first.raw_len, 2);
+    assert_eq!(
+        first.cursor,
+        Some(IndexCursor {
+            created_at: 2,
+            id: "cursor-invalid-second".to_string(),
+        }),
+        "catalogue_cursor_all_invalid_page_keeps_raw_progress"
+    );
+    let next = read_catalogue_page(&runtime, "local", 2, first.cursor.as_ref())
+        .await
+        .expect("valid row after all-invalid decoded page");
+    assert_eq!(next.ids, vec![ids[2].clone()]);
+    assert_eq!(next.raw_len, 1);
+}
+
+#[tokio::test]
+async fn catalogue_cursor_page_plans_use_cursor_index_and_range_bound() {
+    let (runtime, _registry, _calls) = runtime();
+    let first_sql = khive_runtime::sql!("knowledge_index_atom_page");
+    let after_sql = khive_runtime::sql!("knowledge_index_atom_after");
+    let (first, after) = runtime
+        .backend()
+        .pool_arc()
+        .writer()
+        .expect("cursor plan writer")
+        .autocommit(|connection| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {first_sql}"))
+                .expect("first cursor plan prepares");
+            let first = statement
+                .query_map(rusqlite::params!["local", 2], |row| row.get::<_, String>(3))
+                .expect("first cursor plan runs")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("first cursor plan rows");
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {after_sql}"))
+                .expect("continuation cursor plan prepares");
+            let after = statement
+                .query_map(
+                    rusqlite::params!["local", 2, 100, "00000000-0000-0000-0000-000000000001"],
+                    |row| row.get::<_, String>(3),
+                )
+                .expect("continuation cursor plan runs")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("continuation cursor plan rows");
+            Ok((first, after))
+        })
+        .expect("cursor plans");
+    for (shape, plan) in [("first", &first), ("after", &after)] {
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_knowledge_atoms_cursor")),
+            "catalogue_cursor_page_uses_cursor_index: {shape}: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.to_ascii_uppercase().contains("TEMP B-TREE")),
+            "catalogue_cursor_page_avoids_temporary_sort: {shape}: {plan:?}"
+        );
+    }
+    assert!(
+        after.iter().any(|detail| {
+            let compact: String = detail.chars().filter(|ch| !ch.is_whitespace()).collect();
+            compact.starts_with("SEARCH")
+                && compact.contains("idx_knowledge_atoms_cursor")
+                && (compact.contains("(created_at,id)>(?,?)") || compact.contains("created_at>?"))
+        }),
+        "catalogue_cursor_continuation_is_range_bounded: {after:?}"
+    );
 }
