@@ -102,6 +102,10 @@ class CalibrationScoreTests(unittest.TestCase):
         with self.assertRaisesRegex(bank.BankError, "out of float range"):
             bank.compare([hit(IDS[0], 10 ** 400)], [hit(IDS[0], 0.5)])
 
+    def test_float_difference_that_overflows_to_infinity_is_refused(self):
+        with self.assertRaisesRegex(bank.BankError, "out of float range"):
+            bank.compare([hit(IDS[0], 1e308)], [hit(IDS[0], -1e308)])
+
     def test_refusal_names_the_rejected_value(self):
         for label, score, shown in (("null", None, "None"), ("text", "0.25", "'0.25'"), ("true", True, "True")):
             with self.subTest(score=label):

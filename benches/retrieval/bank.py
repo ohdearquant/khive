@@ -1162,6 +1162,9 @@ def compare(x: list[dict], y: list[dict]) -> dict:
         diffs = [abs(rx[i] - ry[i]) for i in shared]
     except OverflowError as error:
         raise BankError(f"calibrate: rank_score difference is out of float range: {error}") from error
+    for i, d in zip(shared, diffs):
+        if isinstance(d, float) and not math.isfinite(d):
+            raise BankError(f"calibrate: rank_score difference is out of float range: {rx[i]!r} and {ry[i]!r}")
     return {"overlap@10": len(shared) / max(len(rx), 1), "same_order": list(rx) == list(ry),
             "max_abs_rank_score_diff": max(diffs, default=0.0)}
 
