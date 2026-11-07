@@ -86,6 +86,16 @@ impl EventsRequest {
         }
     }
 
+    pub(super) fn disconnect_cancellable(&self) -> bool {
+        matches!(
+            self,
+            Self::CountEvents { .. }
+                | Self::CountEventsGrouped { .. }
+                | Self::QueryEvents { .. }
+                | Self::QueryEventPage { .. }
+        )
+    }
+
     pub(super) fn count_budget_secs(&self) -> Option<Option<u64>> {
         match self {
             Self::CountEvents {
