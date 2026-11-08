@@ -7,6 +7,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-08
+### Added
+
+- `kkernel exec --read-only` runs inline DSL against an existing file-backed database through a
+  read-only runtime. It runs in process, never forwards to a daemon, and does not prepare or upgrade
+  the schema, so a database whose core or pack schema is not already compatible is refused. Every
+  operation must be a declared read: a write, an unclassified operation or a side-effecting assertion
+  is refused before dispatch. An explicit `--save-file` is still written. The flag is refused with
+  in-memory storage, a missing database, declared backends, configured mounts, `--plan`, `--ops-file`,
+  `--pending-events`, `--dry-run`, `--serial`, `--atomic` and `--atomic-max-ops`.
+- `kkernel memory-edge-namespace-move` reports, and with `--apply` repairs, live edges between two
+  memory rows that are stored outside their source row's namespace. The default is a dry run that
+  reads a private snapshot and writes nothing. `--db` and `--config` select the database and the
+  configuration. It is an offline repair, so stop other writers while it runs. Apply is refused before
+  its first edge write when the projected keys collide, moves each edge under a revision guard, leaves
+  soft-deleted edges alone, and reports partial progress when it stops early.
+- `memory.recall` hits report `hidden_incoming_edges`, `{"total": n, "by_relation": {"supersedes": n}}`,
+  the number of incoming `supersedes` edges from memory rows in namespaces the caller cannot read. It
+  is 0 when there are none and discloses no id, namespace or content of those rows. Migration 065 adds
+  an index on `graph_edges(target_id, relation)` that serves the count.
+- `memory.recall` breakdowns add `fused_score`, the fused score before normalization, and `composite`,
+  the factors of the multiplicative composite that ranks the hit: `relevance_term`, `temporal_boost`,
+  `salience_boost` and `adjustment_factor`. With no reranker weights configured their product is
+  `pre_entity_score`. `adjustment_factor` is null when the other three do not multiply to a positive
+  number, and `composite` is absent from a hit whose composite arithmetic fell back to a zero score.
+  `memory.recall_score` breakdowns add `fused_score` and carry no `composite`.
+- `memory.recall` with `include_timings=true` adds `hidden_incoming_us` to its timings, the time spent
+  counting hidden incoming `supersedes` edges after ranking. It is null when no ranked hit needed a
+  count and a number otherwise, including when the count is zero.
+- `brain.unbind` replies add `removed_by_namespace`, an object mapping the namespace of each removed
+  binding to its count, which is empty when nothing matched. `removed` and `unbound` are unchanged.
+  With no `namespace` argument the call matches bindings of every namespace, subject to its other
+  filters.
+- `git.digest` replies report issue and pull request notes that lack their project annotation:
+  `missing_project_annotation_count` (null when the census is unavailable),
+  `missing_project_annotation_note_ids` (at most 20 ids), `project_annotation_census_complete` and
+  `project_annotation_notes_scanned`. Each ingest pass counts notes whose `project_id` names the
+  repository anchor but that have no live `annotates` edge to it, including notes older than the remote
+  ingest floor or already acknowledged by a checkpoint. It classifies at most 1000 notes, the ones with
+  the lowest ids, and changes no edge or cursor. A failed census adds a warning to the reply and does
+  not fail the pass.
+- `khive_storage::SqlReader::query_consume` and the `khive_storage::SqlRowConsumer` trait consume a
+  read-only statement one row at a time into caller-owned state without collecting the rows. The
+  provided method returns an unsupported error and never falls back to `query_all`; the SQLite readers
+  implement it and keep their transaction and cancellation handling. The memory and knowledge ANN
+  corpus loads decode their rows through it.
+- `khive_storage::GraphStore::count_hidden_incoming_memory_edges` counts live incoming edges between
+  live memory rows, by target and relation, that sit outside a given set of visible namespaces, and
+  returns no source id or namespace. The provided method returns an unsupported error and the SQLite
+  store implements it. `khive_db::backend::StorageBackend::list_edge_namespaces` lists the distinct
+  namespaces that hold edges.
+- `khive_mcp::serve::resolve_runtime_config_with_actor_ownership` and
+  `khive_mcp::serve::ConfiguredActorOwnership` resolve a configuration and defer the
+  `[actor] owned_namespaces` decision. The configuration it returns has no owned namespaces until
+  `ConfiguredActorOwnership::finalize` keeps them, which it does only when the final actor is the actor
+  whose configuration declared them.
+
+### Changed
+
+- An edge between two memory rows now lives in the namespace of its source row. `link` and an
+  `apply_changeset` link operation refuse to write such an edge under any other namespace, before
+  anything is written, and a bulk `link` that mixes namespaces fails before its first write. Restoring
+  a soft-deleted memory-to-memory edge is refused when the stored edge's namespace differs from its
+  source row's, with advice to leave the tombstone deleted and create a replacement link in the source
+  namespace. A restore whose preconditions change before it commits now returns an invalid-input error
+  that asks for a retry, where it returned an internal error. A refusal names the source row's
+  namespace as the one to use only when the request can read that namespace, and otherwise says that
+  the source row is in a namespace the caller cannot read. Edges with a non-memory endpoint are
+  unchanged. `kkernel memory-edge-namespace-move` repairs edges already stored elsewhere.
+- `neighbors` anchored on a memory row always returns an object with `neighbors`, `next_after` and
+  `hidden_incoming_edges`. Without `limit` it used to return a bare array of hits, and `next_after`
+  is now null in that case. `hidden_incoming_edges` is `{"total": n, "by_relation": {...}}`, the
+  count of incoming memory edges stored in namespaces the caller cannot read, with no id, namespace
+  or content. It is 0 for direction `outgoing`. `by_relation` lists each relation of the filter, or
+  with no filter each relation above zero. Other anchors keep their reply shapes.
+- `memory.remember` now also reserves the `properties` key `supersedes`, which `memory.apply_batch`
+  writes. The refusal points to `link(relation="supersedes")`. `memory.apply_batch` still writes the
+  key on the rows it creates and refuses a batch row that supplies it, with `reserved-property`.
+  Stored rows keep the property.
+- `memory.apply_batch` refuses, before any lookup or write and in a dry run as well as a real run, a
+  batch name whose row keys the content gate would refuse. The error names the batch name as the
+  cause and gives the detector, and it does not show the derived key. Only the key shapes that valid
+  writing rows of the call would use are checked, so create-only batches keep their key format.
+- A cold-miss `memory.recall` on a writable store now runs its detached ANN build as admitted warm
+  work, so shutdown can wait for it, cancel it or report it like other admitted work. The build used
+  to run outside warm admission. Warm admission is one permit pool for the runtime
+  (`[runtime] warm_concurrency`, default 1), so a cold recall for one embedding model can queue behind
+  another embedding model's build and, past `ann_ready_timeout_ms`, return the degraded reply while
+  its own build stays queued. A build that is cancelled, refused or times out in finalization also
+  returns the degraded reply, each with its own reason.
+- `brain.profiles`, `brain.profile` and `brain.bindings` replies include `namespace`, the namespace
+  the call ran in. `brain.bind` of an unknown profile now names that namespace in its not-found error
+  and says that a profile created with `namespace=X` is bound with `namespace=X`. Binding matching is
+  unchanged: with no `namespace`, `brain.bind` stores the binding with `*`, `brain.resolve` matches
+  only bindings stored with `*`, and `brain.bindings` and `brain.unbind` apply no namespace filter.
+- A full `knowledge.index` pass (no `ids`) selects atom ids first and reloads each batch's payloads by
+  id just before embedding. An atom edited after selection is indexed from its updated payload, an atom
+  deleted after selection counts as skipped, and an atom created after selection waits for the next
+  run. Progress counts processed ids, including batches in which every selected atom is gone.
+
+### Performance
+
+- A full `knowledge.index` pass reads the atom catalogue by seeking past the last row of the previous
+  page instead of using `OFFSET`, so reading a page no longer walks and discards the rows before it.
+  It also keeps only atom ids while selecting, so it no longer holds the whole catalogue's text across
+  embedding calls.
+
+### Fixed
+
+- A full `knowledge.index` pass no longer skips live atoms when atoms earlier in the catalogue order
+  are deleted while it runs. An atom that stays live with unchanged ordering keys is visited once; one
+  that is created, deleted, restored or moved to another namespace during the pass may or may not be
+  visited.
+- A reminder created with an explicit `namespace` is delivered to its creator's default `comm.inbox`.
+  It fired and its receipt read `succeeded`, but the message was stored in the reminder's namespace,
+  which a default `comm.inbox` call does not read. The delivery now goes out as the verified creator on
+  the default path, and a gate policy sees it as a default-path `comm.send` in `local`. Scheduled
+  actions other than reminders still run in the event's namespace, and the claim and outcome receipt
+  stay in the event's namespace.
+- `memory.recall` hides a row that a `supersedes` edge names when the edge sits in any namespace the
+  caller can read. The lookup used to read only the request's primary namespace, so a default recall
+  returned the old row after `memory.apply_batch` wrote the edge in the caller's own namespace. A
+  recall with an explicit `namespace` reads where it did before.
+- A `supersedes` property now hides a recall candidate only when it is a full UUID or an id prefix of
+  at least 8 lowercase hexadecimal or hyphen characters. It used to match any prefix, so an empty or
+  one-character value hid an unrelated candidate.
+- `memory.recall` with `include_breakdown=true` reports the relevance a hit was ranked with. The value
+  was normalized a second time, so a hit under the default reciprocal-rank fusion read 1.0 where its
+  ranked relevance was lower. Ranking and scores are unchanged, and `weighted.*_contribution` is now
+  computed from the ranked relevance.
+- `memory.apply_batch` refuses a row whose key is held by a memory with a different stored
+  `batch_row`, with `dedupe-name-taken`, when that holder appears after the up-front check. It used to
+  report such a replay as deduped and assert its `supersedes` edge. The row now reports `refused` and
+  no edge is written.
+- `memory.apply_batch` refuses a later `supersede` row that carries the same typed payload as an
+  earlier row with a different `part`, with `duplicate-payload` naming the earlier row's index and
+  part. One call could store the same successor twice. A row that replays an existing stored key wins
+  over a new row wherever it sits, and rows whose typed payloads differ in any field stay separate
+  writes.
+- A task written with a `due` deadline refuses a `properties.timezone` that is not an IANA zone name
+  or null, even when a valid zone was chosen elsewhere, as with a `stream.append` task record. The
+  stored task keeps the canonical `due_timezone` and no longer keeps the raw `timezone` property.
+- `[actor] owned_namespaces` follows one rule in `kkernel exec` and the MCP entry point: the list is
+  kept only when the final actor, after any `--actor` pin, is the actor whose configuration declared
+  it. `kkernel exec --actor` naming the declaring actor after a project configuration selected a
+  different actor used to drop the list and now keeps it. Any other final actor, including an
+  anonymous caller, gets none of it.
+- The events server cancels an in-flight `QueryEvents` or `QueryEventPage` read when its client
+  disconnects, as it already did for count reads. The read used to run to completion while it held a
+  reader and an admission slot.
+- Dropping a `khive_db::maintenance::DeclarationWriter` releases its claim even while a duplicate or
+  inherited descriptor of the claim file stays open, so a new claim on the same root no longer reports
+  `Busy` after the writer is gone. A process that only reuses the process id does not release a claim
+  it did not take.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_pack_memory::config::ScoreBreakdown` adds `fused_score` and `composite`, whose type
+  `khive_pack_memory::config::CompositeFactors` is new; `khive_pack_git::ingest::IngestReport` adds
+  `missing_project_annotation_count`, `missing_project_annotation_note_ids`,
+  `project_annotation_census_complete` and `project_annotation_notes_scanned`; and
+  `kkernel::exec::ExecArgs` adds `read_only`.
 
 ## [0.17.0] - 2026-11-04
 ### Added
