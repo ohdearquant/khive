@@ -92,6 +92,14 @@ impl KgPack {
                 .is_some_and(|kinds| !kinds.is_empty())
             || !matches!(projection, NeighborProjection::Record);
         let enrich = !matches!(projection, NeighborProjection::Edge);
+        let hidden_relations: Option<Vec<String>> = relations
+            .as_ref()
+            .filter(|scope| !scope.is_empty())
+            .map(|scope| scope.iter().map(|relation| relation.to_string()).collect());
+        let count_hidden_incoming = matches!(
+            &direction,
+            khive_storage::Direction::In | khive_storage::Direction::Both
+        );
         let mut query = NeighborQuery {
             direction,
             relations,
@@ -106,6 +114,10 @@ impl KgPack {
                     .await?
             }
         };
+        let memory_anchor = matches!(
+            &origin,
+            Some(Resolved::Note(note)) if note.kind == "memory"
+        );
         let anchor_permitted = match &origin {
             Some(Resolved::Note(note)) => mailbox_view.permits_message_note(token, note),
             Some(_) => true,
@@ -285,6 +297,40 @@ impl KgPack {
             };
             responses.push(response);
         }
+        let hidden_incoming_edges = if memory_anchor {
+            let mut by_relation = serde_json::Map::new();
+            if let Some(scope) = &hidden_relations {
+                for relation in scope {
+                    by_relation.insert(relation.clone(), serde_json::json!(0_u64));
+                }
+            }
+            let mut total = 0_u64;
+            if count_hidden_incoming {
+                let namespaces: Vec<String> = token
+                    .visible_namespaces()
+                    .iter()
+                    .map(|namespace| namespace.as_str().to_string())
+                    .collect();
+                let counts = self
+                    .runtime
+                    .graph(token)?
+                    .count_hidden_incoming_memory_edges(
+                        &[node_id.to_string()],
+                        hidden_relations.as_deref(),
+                        &namespaces,
+                    )
+                    .await?;
+                for (_, relation, count) in counts {
+                    total = total.checked_add(count).ok_or_else(|| {
+                        RuntimeError::Internal("hidden incoming edge count overflow".into())
+                    })?;
+                    by_relation.insert(relation, serde_json::json!(count));
+                }
+            }
+            Some(serde_json::json!({ "total": total, "by_relation": by_relation }))
+        } else {
+            None
+        };
         if let Some(requested) = requested_limit {
             let report = LimitReport::new(requested, effective_limit.unwrap_or(requested)).value();
             let mut response = serde_json::json!({
@@ -295,6 +341,9 @@ impl KgPack {
             if scan_incomplete {
                 response["scan_incomplete"] = serde_json::json!(true);
             }
+            if let Some(hidden) = &hidden_incoming_edges {
+                response["hidden_incoming_edges"] = hidden.clone();
+            }
             if let Some(fields) = report.as_object() {
                 response
                     .as_object_mut()
@@ -302,6 +351,13 @@ impl KgPack {
                     .extend(fields.clone());
             }
             return Ok(response);
+        }
+        if let Some(hidden) = hidden_incoming_edges {
+            return Ok(serde_json::json!({
+                "neighbors": responses,
+                "next_after": null,
+                "hidden_incoming_edges": hidden,
+            }));
         }
         to_json(&responses)
     }

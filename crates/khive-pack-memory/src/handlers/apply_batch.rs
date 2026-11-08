@@ -24,7 +24,7 @@ use khive_storage::EdgeRelation;
 use crate::MemoryPack;
 
 use super::common::{decode_params, deser, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC};
-use super::remember::{actor_namespace, check_remember_fields};
+use super::remember::{actor_namespace, check_remember_fields, BATCH_WRITTEN_PROPERTY_KEYS};
 
 /// Longest accepted batch name, in characters.
 const MAX_BATCH_NAME_CHARS: usize = 128;
@@ -143,6 +143,7 @@ struct Checked {
     echo: Echo,
     old_namespace: Option<String>,
     plan: Plan,
+    supersede_payload: Option<(String, u32)>,
 }
 
 /// One entry of the result.
@@ -261,6 +262,27 @@ fn batch_row_hash(row: &RowInput, old_id: Option<Uuid>) -> String {
     sha256_hex(&text)
 }
 
+/// A per-call supersede identity, separate from the stored part-bearing hash.
+/// Keep every original typed field except part; the part is only peer metadata.
+fn supersede_payload_identity(row: &RowInput, old_id: Option<Uuid>) -> Option<(String, u32)> {
+    if row.action != Action::Supersede {
+        return None;
+    }
+    let old_id = old_id?;
+    let canonical = json!({
+        "action": row.action.as_str(),
+        "id": old_id.to_string(),
+        "content": row.content,
+        "memory_type": row.memory_type,
+        "salience": row.salience,
+        "properties": row.properties,
+        "tags": row.tags,
+    });
+    let mut text = String::new();
+    write_canonical(&canonical, &mut text);
+    Some((sha256_hex(&text), row.part))
+}
+
 /// A row after parsing: the fields its entry echoes, and the row itself or the
 /// reason it did not parse.
 struct Parsed {
@@ -292,7 +314,40 @@ fn refused(
         echo,
         old_namespace,
         plan: Plan::Refused(why),
+        supersede_payload: None,
     })
+}
+
+/// Preserve historical replays, otherwise keep the earliest matching new row.
+/// Existing refusals are not peers, and all decisions precede the first write.
+fn refuse_duplicate_supersede_payloads(checked: &mut [Checked]) {
+    let mut peers: HashMap<String, (usize, u32)> = HashMap::new();
+    for (index, item) in checked.iter().enumerate() {
+        if matches!(&item.plan, Plan::Deduped { .. }) {
+            if let Some((payload, part)) = &item.supersede_payload {
+                peers.entry(payload.clone()).or_insert((index, *part));
+            }
+        }
+    }
+    for (index, item) in checked.iter_mut().enumerate() {
+        if !matches!(&item.plan, Plan::New(_)) {
+            continue;
+        }
+        let Some((payload, part)) = &item.supersede_payload else {
+            continue;
+        };
+        if let Some(&(matched_index, matched_part)) = peers.get(payload) {
+            let duplicate = refusal(
+                "duplicate-payload",
+                format!(
+                    "duplicate supersede payload; matched row at index {matched_index} (part {matched_part})"
+                ),
+            );
+            item.plan = Plan::Refused(duplicate);
+        } else {
+            peers.insert(payload.clone(), (index, *part));
+        }
+    }
 }
 
 impl MemoryPack {
@@ -403,6 +458,7 @@ impl MemoryPack {
                     echo,
                     old_namespace,
                     plan: Plan::Skipped,
+                    supersede_payload: None,
                 })
             }
             Action::DeleteCandidate => {
@@ -410,16 +466,20 @@ impl MemoryPack {
                     echo,
                     old_namespace,
                     plan: Plan::Listed,
+                    supersede_payload: None,
                 })
             }
             Action::Supersede | Action::Create => {}
         }
 
         let content = row.content.as_deref().unwrap_or("");
+        // The added keys pass here so that a supplied one is refused below under
+        // its own `reserved-property` code.
         let (memory_type, extra) = match check_remember_fields(
             content,
             row.memory_type.as_deref(),
             row.properties.as_ref(),
+            BATCH_WRITTEN_PROPERTY_KEYS,
         ) {
             Ok(checked) => checked,
             Err(error) => {
@@ -514,9 +574,12 @@ impl MemoryPack {
         let properties = Value::Object(properties);
         // The stored properties carry the three added keys, so the size and key
         // limits are checked on the merged object.
-        if let Err(error) =
-            check_remember_fields(content, row.memory_type.as_deref(), Some(&properties))
-        {
+        if let Err(error) = check_remember_fields(
+            content,
+            row.memory_type.as_deref(),
+            Some(&properties),
+            BATCH_WRITTEN_PROPERTY_KEYS,
+        ) {
             return refused(
                 echo,
                 old_namespace,
@@ -584,6 +647,7 @@ impl MemoryPack {
                         existing: existing.id,
                         supersedes: old_id,
                     },
+                    supersede_payload: supersede_payload_identity(&row, old_id),
                 });
             }
             return refused(
@@ -619,6 +683,7 @@ impl MemoryPack {
                 params,
                 supersedes: old_id,
             }),
+            supersede_payload: supersede_payload_identity(&row, old_id),
         })
     }
 }
@@ -665,8 +730,20 @@ impl MemoryPack {
         write_token: &NamespaceToken,
         planned: PlannedWrite,
     ) -> Result<(&'static str, Uuid), WriteFailure> {
-        let stored = self
-            .handle_remember(token, planned.params)
+        let expected_batch_row = planned.params["properties"]["batch_row"]
+            .as_str()
+            .map(str::to_owned);
+        let key = planned.params["key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let (stored, stored_properties) = self
+            .remember_permitting_with_properties_in_namespace(
+                token,
+                planned.params,
+                BATCH_WRITTEN_PROPERTY_KEYS,
+                write_token.namespace(),
+            )
             .await
             .map_err(|error| WriteFailure {
                 code: "write-failed",
@@ -686,6 +763,22 @@ impl MemoryPack {
             .get("replayed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if replayed {
+            let stored_batch_row = stored_properties
+                .as_ref()
+                .and_then(|properties| properties.get("batch_row"))
+                .and_then(Value::as_str);
+            if expected_batch_row.is_none() || stored_batch_row != expected_batch_row.as_deref() {
+                return Err(WriteFailure {
+                    code: "dedupe-name-taken",
+                    error: RuntimeError::InvalidInput(format!(
+                        "key {key} is already taken in namespace {} by a row with different content; use a new part or a new batch name",
+                        write_token.namespace().as_str()
+                    )),
+                    new_id: None,
+                });
+            }
+        }
         self.assert_supersedes(write_token, new_id, planned.supersedes)
             .await
             .map_err(|error| WriteFailure {
@@ -719,7 +812,8 @@ impl MemoryPack {
         // The longest key a row of this call can need: a `supersede` row with a
         // hyphenated UUID and the largest part number. A batch name that cannot
         // form it cannot form any row's key.
-        validate_memory_key(&format!("{batch}:{}:{}", Uuid::nil(), u32::MAX)).map_err(|error| {
+        let supersede_key = format!("{batch}:{}:{}", Uuid::nil(), u32::MAX);
+        validate_memory_key(&supersede_key).map_err(|error| {
             RuntimeError::InvalidInput(format!(
                 "batch name cannot form a valid idempotency key: {}",
                 error_message(&error)
@@ -748,6 +842,27 @@ impl MemoryPack {
             })
             .collect();
 
+        // Check only key shapes used by parsed writing rows, before any lookup
+        // or write. Create-only batches do not introduce a UUID into their keys.
+        for (action, key) in [
+            (Action::Supersede, supersede_key),
+            (Action::Create, format!("{batch}:create:{}", u32::MAX)),
+        ] {
+            if parsed.iter().any(|row| {
+                row.row
+                    .as_ref()
+                    .is_ok_and(|row| row.action == action && row_key(batch, row).is_some())
+            }) {
+                secret_gate::check_at(&key, "note", "key").map_err(|error| match error {
+                    RuntimeError::SecretDetected(matched) => RuntimeError::InvalidInput(format!(
+                        "batch name cannot form a note key accepted by the content gate (detector: {}); choose another batch name",
+                        matched.detector
+                    )),
+                    other => other,
+                })?;
+            }
+        }
+
         let mut key_counts: HashMap<String, usize> = HashMap::new();
         for parsed_row in &parsed {
             if let Ok(row) = &parsed_row.row {
@@ -766,12 +881,27 @@ impl MemoryPack {
             );
         }
 
+        self.apply_checked_rows(token, &write_token, batch, dry_run, checked)
+            .await
+    }
+
+    /// Apply checked rows and report each write or refusal in input order.
+    async fn apply_checked_rows(
+        &self,
+        token: &NamespaceToken,
+        write_token: &NamespaceToken,
+        batch: &str,
+        dry_run: bool,
+        mut checked: Vec<Checked>,
+    ) -> Result<Value, RuntimeError> {
+        refuse_duplicate_supersede_payloads(&mut checked);
         let mut entries: Vec<Entry> = Vec::with_capacity(checked.len());
         for item in checked {
             let Checked {
                 echo,
                 old_namespace,
                 plan,
+                ..
             } = item;
             let (outcome, new_id, reason): (&'static str, Option<Uuid>, Option<Refusal>) =
                 match plan {
@@ -786,7 +916,7 @@ impl MemoryPack {
                             ("deduped", Some(existing), None)
                         } else {
                             match self
-                                .assert_supersedes(&write_token, existing, supersedes)
+                                .assert_supersedes(write_token, existing, supersedes)
                                 .await
                             {
                                 Ok(()) => ("deduped", Some(existing), None),
@@ -802,10 +932,14 @@ impl MemoryPack {
                         if dry_run {
                             ("planned", None, None)
                         } else {
-                            match self.write_row(token, &write_token, planned).await {
+                            match self.write_row(token, write_token, planned).await {
                                 Ok((outcome, id)) => (outcome, Some(id), None),
                                 Err(failure) => (
-                                    "failed",
+                                    if failure.code == "dedupe-name-taken" {
+                                        "refused"
+                                    } else {
+                                        "failed"
+                                    },
                                     failure.new_id,
                                     Some(refusal(failure.code, error_message(&failure.error))),
                                 ),
@@ -838,3 +972,7 @@ impl MemoryPack {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "apply_batch_replay_tests.rs"]
+mod replay_tests;

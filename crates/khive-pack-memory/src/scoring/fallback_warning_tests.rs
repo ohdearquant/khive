@@ -2,8 +2,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    calculate_score, calculate_score_with_reporter, AdjustmentCondition, AdjustmentOp,
-    ScoreAdjustment, ScoreFallbackWarnings, ScoreInput, ScoringConfig, ScoringWeights,
+    calculate_score, calculate_score_factors, calculate_score_with_reporter, AdjustmentCondition,
+    AdjustmentOp, ScoreAdjustment, ScoreFallbackWarnings, ScoreInput, ScoringConfig,
+    ScoringWeights,
 };
 
 const TARGET: &str = "khive.memory.scoring";
@@ -170,6 +171,23 @@ fn finite_zero_and_positive_scores_emit_no_fallback_warning() {
         );
     });
     assert_fallbacks(&events, &[reason]);
+}
+
+#[test]
+fn score_factors_mark_every_arithmetic_fallback_incomplete() {
+    let names = [ENTITY.to_owned()];
+    let input = input(&names);
+    let finite = calculate_score_factors(&self::input(&[]), &finite_config());
+    assert!(finite.complete, "a computed composite is complete");
+    assert_eq!(finite.score, 0.25);
+    for (config, reason) in failure_cases() {
+        let factors = calculate_score_factors(&input, &config);
+        assert!(
+            !factors.complete,
+            "{reason}: a fallback must not read as a computed composite"
+        );
+        assert_eq!(factors.score, 0.0, "{reason}");
+    }
 }
 
 #[test]

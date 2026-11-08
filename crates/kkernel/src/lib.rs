@@ -3,6 +3,11 @@
 mod sql;
 
 #[cfg(test)]
+mod daemon_recall_stack_tests;
+#[cfg(test)]
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+#[cfg(test)]
 mod test_process;
 
 mod atomic_apply;
@@ -22,6 +27,7 @@ pub mod git_dedup;
 pub mod git_ingest;
 pub mod import_notes;
 pub mod kg;
+pub mod memory_edge_namespace_move;
 pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;

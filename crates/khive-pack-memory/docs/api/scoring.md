@@ -12,7 +12,7 @@ score = w_rel * relevance
       * (1 + w_imp * salience)
 ```
 
-Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`.
+Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`. A recall with `include_breakdown` reports the factors of this product in `breakdown.composite` (see `configuration.md#score-breakdowns`).
 
 `ScoreInput` groups candidate fields to keep the function interface manageable: salience, memory type, content, creation time, decay factor, current time, normalized relevance, and entity names.
 

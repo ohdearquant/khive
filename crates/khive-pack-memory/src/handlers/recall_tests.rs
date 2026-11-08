@@ -2398,6 +2398,192 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
     );
 }
 
+// Projection is diagnostic work: a bound profile needs it only for returned breakdowns.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_bound_profile_projects_config_only_for_breakdown() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-breakdown-projection-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(tmp.path().join("khive.db")),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        actor_id: Some("casey".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: adr104_fixed_vectors(),
+    });
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert_eq!(token.actor().id, "casey");
+
+    // Identical fixed vectors make retrieval repeatable; the reranker below excludes age.
+    let mut note_ids = Vec::new();
+    for salience in [0.1, 0.9] {
+        note_ids.push(
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_H_CONTENT,
+                Some(salience),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id,
+        );
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.with_actor_id(Some("casey".to_string()));
+    let registry = builder.build().expect("registry");
+    let profile_id = "breakdown-projection-v1";
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "casey",
+                "profile_id": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor");
+    adr104_skew_salience(&registry, profile_id, note_ids[0], 30).await;
+
+    let params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": false,
+        "limit": 10,
+        "config": {
+            "include_breakdown": false,
+            "reranker_weights": { "relevance": 1.0 },
+            "scoring": { "mmr_penalty": 0.0 },
+        },
+    });
+    let (plain, plain_calls) = crate::tunable::count_project_config_calls_6377(
+        registry.dispatch("memory.recall", params.clone()),
+    )
+    .await;
+    let plain = plain.expect("recall without breakdown");
+    assert_eq!(
+        plain_calls, 0,
+        "a recall without a breakdown must not project the serving profile"
+    );
+    let plain_hits = plain.as_array().expect("bare array result");
+    assert_eq!(
+        plain_hits.len(),
+        note_ids.len(),
+        "must return both seeded notes"
+    );
+    for hit in plain_hits {
+        assert_eq!(hit["served_by_profile_id"], profile_id);
+        assert!(hit.get("breakdown").is_none());
+    }
+
+    let mut request_verbose = params.clone();
+    request_verbose["include_breakdown"] = serde_json::json!(true);
+    let mut config_verbose = params;
+    let _ = config_verbose
+        .as_object_mut()
+        .expect("recall params object")
+        .remove("include_breakdown");
+    config_verbose["config"]["include_breakdown"] = serde_json::json!(true);
+    for (route, verbose_params) in [("request", request_verbose), ("config", config_verbose)] {
+        let (verbose, verbose_calls) = crate::tunable::count_project_config_calls_6377(
+            registry.dispatch("memory.recall", verbose_params),
+        )
+        .await;
+        let verbose = verbose.expect("recall with breakdown");
+        assert_eq!(
+            verbose_calls, 1,
+            "project once for the entire verbose recall via {route}"
+        );
+        let verbose_hits = verbose.as_array().expect("bare array result");
+        assert_eq!(verbose_hits.len(), plain_hits.len());
+        for (before, after) in plain_hits.iter().zip(verbose_hits) {
+            assert_eq!(after["full_id"], before["full_id"], "ranked IDs must match");
+            assert_eq!(after["rank_score"], before["rank_score"]);
+            assert_eq!(after["score"], before["score"]);
+            assert_eq!(after["raw_score"], before["raw_score"]);
+            assert_eq!(after["served_by_profile_id"], profile_id);
+            assert_eq!(after["breakdown"]["weights_served"], "default");
+            assert_eq!(after["breakdown"]["namespace"], ns.as_str());
+        }
+        let skewed = &verbose_hits[adr104_position(verbose_hits, note_ids[0])];
+        let profile_component = skewed["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present under include_breakdown");
+        assert!(
+            (profile_component - 1.0).abs() > 1e-6,
+            "the breakdown must use the bound profile's skewed posterior: {profile_component}"
+        );
+    }
+}
+
+// The standalone score verb always reports a breakdown with the default weight label.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_score_reports_default_weights_served() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall_score",
+            serde_json::json!({
+                "rrf": 0.7,
+                "salience": 0.6,
+                "decay_factor": 0.01,
+                "age_days": 2.0,
+            }),
+        )
+        .await
+        .expect("memory.recall_score");
+    assert_eq!(
+        result["breakdown"]["weights_served"].as_str(),
+        Some("default"),
+        "the standalone score breakdown must retain its default weight label"
+    );
+    assert_eq!(result["breakdown"]["namespace"].as_str(), Some(""));
+}
+
 // Anonymous callers must not match an explicit `actor="local"` binding.
 #[tokio::test]
 #[serial(background_tasks)]
@@ -4276,6 +4462,110 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
             identity,
             "rank_score must equal pre_entity_score * entity_term * local_factor - \
              duplicate_penalty in f32: {hit:?}"
+        );
+    }
+}
+
+/// Recalls three `local` memories that share the query's leading terms, with breakdowns, under
+/// the default configuration (RRF fusion, default scoring weights and adjustments).
+async fn breakdown_probe_hits() -> Vec<Value> {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    for content in [
+        "breakdown probe composite alpha beta gamma",
+        "breakdown probe composite alpha beta",
+        "breakdown probe composite alpha",
+    ] {
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "breakdown probe composite alpha beta gamma",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall");
+    result.as_array().expect("bare array result").clone()
+}
+
+/// `relevance` is the value the ranking composite received, not that value scaled a second
+/// time. Under the default RRF fusion every ranked relevance lies in the calibrated band
+/// [0.15, 0.82]; a second `min(x * (k + 1), 1.0)` scaling with `k = 10` reports `1.0` for every
+/// value at or above 1/11, so each hit here would have read `1.0`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_relevance_is_the_ranked_value_not_a_saturated_one() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let relevance = breakdown["relevance"].as_f64().expect("relevance");
+        assert!(
+            relevance < 1.0,
+            "breakdown relevance must be the ranked value, not saturated at 1.0: {breakdown:?}"
+        );
+        assert!(
+            (0.15 - 1e-6..=0.82 + 1e-6).contains(&relevance),
+            "breakdown relevance must lie in the normalized band [0.15, 0.82]: {breakdown:?}"
+        );
+        let fused_score = breakdown["fused_score"]
+            .as_f64()
+            .expect("breakdown reports the fused score beside relevance");
+        assert!(
+            fused_score > 0.0,
+            "the fused score before normalization is positive: {breakdown:?}"
+        );
+    }
+}
+
+/// With no reranker weights the composite factors reported in the breakdown multiply back to
+/// `pre_entity_score`, and `relevance_term` is the default relevance weight times the reported
+/// `relevance`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_composite_factors_reproduce_pre_entity_score() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    let relevance_weight = crate::scoring::ScoringConfig::default().weights.relevance;
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let composite = &breakdown["composite"];
+        let relevance_term = breakdown_f32(&composite["relevance_term"]);
+        let temporal_boost = breakdown_f32(&composite["temporal_boost"]);
+        let salience_boost = breakdown_f32(&composite["salience_boost"]);
+        let adjustment_factor = breakdown_f32(&composite["adjustment_factor"]);
+        let pre_entity_score = breakdown_f32(&breakdown["pre_entity_score"]);
+
+        let product = relevance_term * temporal_boost * salience_boost * adjustment_factor;
+        assert!(
+            (product - pre_entity_score).abs() <= 1e-5 * pre_entity_score.abs().max(1.0),
+            "relevance_term * temporal_boost * salience_boost * adjustment_factor must equal \
+             pre_entity_score: product {product}, pre_entity_score {pre_entity_score}: {hit:?}"
+        );
+
+        let relevance = breakdown_f32(&breakdown["relevance"]);
+        assert!(
+            (relevance_term - relevance_weight * relevance).abs() <= 1e-6,
+            "relevance_term must be the relevance weight times the reported relevance: \
+             {hit:?}"
         );
     }
 }
@@ -7840,3 +8130,240 @@ async fn keyword_only_widening_ignores_vector_leg_candidates() {
 #[cfg(test)]
 #[path = "recall_boundary_tests.rs"]
 mod recall_boundary_tests;
+
+#[tokio::test]
+async fn test_hidden_incoming_budget_counts_only_returned_hit() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory budget fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("budget local token");
+    let first_content = "d2budgettoken one";
+    let second_content = "d2budgettoken two";
+    assert_eq!(
+        first_content.len(),
+        second_content.len(),
+        "equal ASCII content budget"
+    );
+    assert!(first_content.is_ascii() && second_content.is_ascii());
+    let mut targets = Vec::new();
+    for content in [first_content, second_content] {
+        let note = rt
+            .create_note(&local, "memory", None, content, Some(0.7), None, Vec::new())
+            .await
+            .expect("budget create_note failed; setup failure, never control credit");
+        assert_eq!(note.kind, "memory");
+        assert_eq!(note.namespace, "local");
+        targets.push(note.id);
+    }
+    let params = || {
+        serde_json::json!({
+            "namespace": "local", "query": "d2budgettoken", "fusion_strategy": "keyword_only",
+            "min_score": 0.0, "limit": 10, "full_content": true,
+        })
+    };
+    let mut baseline_builder = khive_runtime::VerbRegistryBuilder::new();
+    baseline_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    baseline_builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let baseline_registry = baseline_builder.build().expect("budget baseline registry");
+    let baseline = baseline_registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual unbounded keyword recall; invalid setup is not control credit");
+    let baseline_hits = baseline.as_array().expect("nonempty keyword recall array");
+    assert_eq!(baseline_hits.len(), 2, "budget_fixture_two_ranked_hits");
+    for target in &targets {
+        assert!(
+            baseline_hits
+                .iter()
+                .any(|hit| hit["id"] == target.to_string()),
+            "both actual fixture hits are returned before the cap"
+        );
+    }
+    for hit in baseline_hits {
+        assert_eq!(
+            hit["hidden_incoming_edges"],
+            serde_json::json!({
+                "total": 0, "by_relation": {"supersedes": 0},
+            }),
+            "uncapped fixture zero baseline"
+        );
+    }
+    drop(baseline_registry);
+
+    let pack = crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
+    {
+        let mut config = pack.config.lock().expect("budget scoring config");
+        config.scoring = Some(crate::scoring::ScoringConfig {
+            default_token_budget: first_content.len(),
+            chars_per_token: 1,
+            ..Default::default()
+        });
+    }
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("capped budget registry");
+    let capped_baseline = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped keyword recall baseline");
+    let capped_hits = capped_baseline.as_array().expect("nonempty capped array");
+    assert_eq!(capped_hits.len(), 1, "budget_fixture_one_returned_hit");
+    assert_eq!(
+        capped_hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget cut is visible on its hit"
+    );
+    assert_eq!(
+        capped_hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(0)
+    );
+
+    let hidden_ns = "d2-budget-hidden";
+    let hidden_token = rt
+        .authorize(khive_runtime::Namespace::parse(hidden_ns).expect("budget hidden namespace"))
+        .expect("budget hidden seed token");
+    let hidden_source = rt
+        .create_note(
+            &hidden_token,
+            "memory",
+            None,
+            "private budget source",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("budget hidden source failed; setup failure, never control credit");
+    for (index, target) in targets.iter().enumerate() {
+        let edge = serde_json::from_value(serde_json::json!({
+            "id": format!("70000000-0000-7000-9000-{:012x}", index + 1),
+            "namespace": hidden_ns, "source_id": hidden_source.id, "target_id": target,
+            "relation": "supersedes", "weight": 0.75,
+            "created_at": "2026-11-04T00:00:00Z", "updated_at": "2026-11-04T00:00:00Z",
+            "deleted_at": null, "metadata": {"fixture": "budget-hidden"}, "target_backend": null,
+        }))
+        .expect("budget edge representation");
+        rt.graph(&hidden_token)
+            .expect("budget hidden seed graph")
+            .upsert_edge(edge)
+            .await
+            .expect("budget edge failed; setup failure, never control credit");
+    }
+    let response = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped recall with hidden edges");
+    let hits = response.as_array().expect("nonempty capped result array");
+    assert_eq!(hits.len(), 1, "budget_capped_recall_returns_one_hit");
+    assert!(
+        targets
+            .iter()
+            .any(|target| hits[0]["id"] == target.to_string()),
+        "budget result belongs to the two seeded candidates"
+    );
+    assert_eq!(
+        hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget_capped_hit_is_stamped"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(1),
+        "budget_capped_recall_hidden_count"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["by_relation"],
+        serde_json::json!({"supersedes": 1})
+    );
+    let bytes = response.to_string();
+    assert!(
+        !bytes.contains(hidden_ns),
+        "budget hidden namespace omitted"
+    );
+    assert!(
+        !bytes.contains(&hidden_source.id.to_string()),
+        "budget hidden source omitted"
+    );
+}
+
+#[tokio::test]
+async fn hidden_incoming_timings_distinguish_zero_count_from_skipped_step() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory timing fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("timing local token");
+    let target = rt
+        .create_note(
+            &local,
+            "memory",
+            None,
+            "hiddenincomingstageprobe",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("timing fixture note");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("timing fixture registry");
+    let params = |query| {
+        json!({
+            "namespace": "local",
+            "query": query,
+            "fusion_strategy": "keyword_only",
+            "min_score": 0.0,
+            "limit": 1,
+            "include_timings": true,
+        })
+    };
+    let entered = registry
+        .dispatch_with_disposition("memory.recall", params("hiddenincomingstageprobe"), None)
+        .await
+        .expect("entered count recall");
+    let hits = entered["results"].as_array().expect("timed recall results");
+    assert_eq!(hits.len(), 1, "the count step has one ranked target");
+    assert_eq!(hits[0]["id"], target.id.to_string());
+    assert_eq!(hits[0]["hidden_incoming_edges"]["total"], json!(0));
+    assert!(
+        entered["timings"]["hidden_incoming_us"].as_u64().is_some(),
+        "an entered count returning zero keeps its measured duration: {entered:?}"
+    );
+
+    let skipped = registry
+        .dispatch_with_disposition("memory.recall", params("nohitstageprobe"), None)
+        .await
+        .expect("empty ranking recall");
+    assert!(
+        skipped["results"]
+            .as_array()
+            .expect("empty timed results")
+            .is_empty(),
+        "the skipped arm has no ranked targets"
+    );
+    assert!(
+        skipped["timings"]
+            .get("hidden_incoming_us")
+            .expect("the skipped count stage is reported")
+            .is_null(),
+        "a skipped count has no measured duration: {skipped:?}"
+    );
+}

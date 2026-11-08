@@ -45,6 +45,11 @@ impl PackTunable for MemoryPack {
 
     /// Project posterior means into a recall config, retaining active values when absent.
     fn project_config(&self, state: &BalancedRecallState) -> Value {
+        #[cfg(test)]
+        let _ = PROJECT_CONFIG_CALLS_6377.try_with(|calls| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
         let current = self.active_config();
 
         let relevance = state.relevance.mean();
@@ -186,4 +191,21 @@ mod tests {
         assert!((def.prior_alpha - 7.0).abs() < 1e-12);
         assert!((def.prior_beta - 3.0).abs() < 1e-12);
     }
+}
+
+// Each counted recall owns its counter, independent of concurrently running fixtures.
+#[cfg(test)]
+tokio::task_local! {
+    static PROJECT_CONFIG_CALLS_6377: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+pub(crate) async fn count_project_config_calls_6377<F>(future: F) -> (F::Output, usize)
+where
+    F: std::future::Future,
+{
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let output = PROJECT_CONFIG_CALLS_6377.scope(calls.clone(), future).await;
+    let count = calls.load(std::sync::atomic::Ordering::Relaxed);
+    (output, count)
 }

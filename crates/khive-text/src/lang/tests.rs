@@ -218,3 +218,16 @@ fn unicode_symbol_only_queries_are_not_meaningful() {
     assert!(is_meaningful_query("BM25"));
     assert!(is_meaningful_query("5"));
 }
+
+#[test]
+fn cjk_single_and_distinct_char_queries_are_meaningful() {
+    assert!(is_meaningful_text_query("北京城"));
+    assert!(is_meaningful_text_query("北京"));
+    assert!(is_meaningful_text_query("京"));
+}
+
+#[test]
+#[ignore = "qualification: repeated CJK currently fails the meaningful-query filter"]
+fn repeated_cjk_query_is_meaningful() {
+    assert!(is_meaningful_text_query("人人"));
+}

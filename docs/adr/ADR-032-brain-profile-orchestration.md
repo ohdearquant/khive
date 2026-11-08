@@ -1026,14 +1026,28 @@ is returned.
 
 #### Binding workflow
 
-A typical "train and serve per subagent per project" sequence:
+The `namespace` parameter on `brain.bind`, `brain.unbind`, `brain.bindings`, and
+`brain.resolve` selects the profile catalog these calls read or write. When supplied,
+that same namespace is the binding match context. When omitted, the call uses the
+caller's default catalog (the request identity's namespace when one is attached,
+otherwise the runtime's default namespace, `local` unless configured) and the wildcard
+match context `*`: `brain.bind` stores the binding with namespace `*`, so it matches
+every namespace context within that catalog; `brain.resolve` matches only bindings
+stored with `*`; `brain.bindings` and `brain.unbind` apply no namespace filter, so they
+match bindings of every namespace in that catalog, subject to their other filters.
+`brain.unbind` returns `removed_by_namespace`, an object mapping each removed binding's namespace to its count (empty when none match), alongside the unchanged `removed` and `unbound` totals.
+Profile IDs are unique within each catalog. Bindings resolve only in the selected
+catalog; cross-catalog resolution is outside this workflow and needs a separate ADR.
+
+A typical "train and serve per subagent per project" sequence for a profile already
+created in `agent:docs`:
 
 ```
 1. Define profile shape  (Fold + Objective + Selector + state type)
-2. brain.backtest(profile_id=candidate, event_filter=...)
+2. brain.backtest(profile_id=candidate, namespace="agent:docs", event_filter=...)
      → derives state by replaying events through the Fold
      → persists snapshot
-3. brain.activate(profile_id=candidate)
+3. brain.activate(profile_id=candidate, namespace="agent:docs")
      → lifecycle changes to active; no live update loop is started (ADR-104)
 4. brain.bind(profile_id=candidate,
               actor="implementer-α",

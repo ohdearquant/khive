@@ -37,6 +37,7 @@ mod commit_history;
 mod commit_ingest;
 mod github_ingest;
 mod github_records;
+mod project_annotation_census;
 
 use github_ingest::*;
 
@@ -320,6 +321,18 @@ pub struct IngestReport {
     pub commits_skipped_existing: u64,
     pub issues_ingested: u64,
     pub issues_skipped_existing: u64,
+    /// Missing live project annotations among at most 1000 inspected issue/PR
+    /// notes. A partial census counts the inspected notes, which are the
+    /// lowest note IDs; null means unavailable.
+    pub missing_project_annotation_count: Option<u64>,
+    /// Up to 20 missing-link note IDs from the inspected prefix, sorted only
+    /// for display. This sample may be capped even when the census is complete.
+    pub missing_project_annotation_note_ids: Vec<String>,
+    /// Whether the census covered all live issue/PR notes for this project in
+    /// the caller's namespace. False also covers an unavailable census.
+    pub project_annotation_census_complete: bool,
+    /// Notes classified in the census snapshot, at most 1000; zero if unavailable.
+    pub project_annotation_notes_scanned: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
     /// `Some(false)` when the source-bound `gh repo view` probe ran but could
@@ -1030,6 +1043,7 @@ async fn run_ingest_inner(
     // stays a truthful completeness signal across daemon restarts — see
     // `IngestReport::commits_total_in_db` (issue #1045).
     report.commits_total_in_db = count_commit_notes_for_project(runtime, token, project_id).await?;
+    project_annotation_census::append_report(runtime, token, project_id, &mut report).await;
 
     Ok(report)
 }

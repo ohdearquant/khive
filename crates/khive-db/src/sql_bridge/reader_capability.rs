@@ -473,6 +473,51 @@ pub(super) fn execute_query_page_interruptibly(
     }
 }
 
+pub(super) fn execute_query_consume_interruptibly(
+    scope: &crate::read_cancellation::InterruptibleReadScope,
+    conn: &rusqlite::Connection,
+    statement: &SqlStatement,
+    consumer: Box<dyn khive_storage::SqlRowConsumer>,
+    operation: &'static str,
+    rollback_interrupted_transaction: bool,
+    interruptible: bool,
+) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlRowConsumer>> {
+    let stmt = prepare_bound_statement(conn, statement)
+        .map_err(|error| map_rusqlite_err(error, operation))?;
+    if !statement_is_cancellable_read(&stmt, &statement.sql) {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Sql,
+            operation: operation.into(),
+            message: "row consumption requires a read-only statement, without transaction control"
+                .into(),
+        });
+    }
+    if interruptible {
+        scope.run_with_interrupted_cleanup(
+            conn,
+            move || {
+                super::query_execution::execute_prepared_query_consume(
+                    stmt,
+                    consumer,
+                    || scope.ensure_active(),
+                    operation,
+                )
+            },
+            || {
+                rollback_interrupted_read_transaction(
+                    conn,
+                    operation,
+                    rollback_interrupted_transaction,
+                )
+            },
+        )
+    } else {
+        // Preserve completion for a read inside an admitted writer transaction.
+        scope.mark_write_committed()?;
+        super::query_execution::execute_prepared_query_consume(stmt, consumer, || Ok(()), operation)
+    }
+}
+
 fn rollback_interrupted_read_transaction(
     conn: &rusqlite::Connection,
     operation: &'static str,

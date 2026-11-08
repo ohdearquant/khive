@@ -22,7 +22,7 @@ The 2026-07-21 live-corpus golden-suite sweep did distinguish the strategies. Th
 
 `ann_overfetch_max_rounds` controls namespace-aware ANN widening. Round one requests `max(candidate_limit * 4, candidate_limit + 32)` and each later round doubles the fetch window, bounded only by the round count and corpus exhaustion, until enough visible candidates survive. `Some(1)` disables widening. When absent, `ANN_OVERFETCH_MAX_ROUNDS` supplies a process-wide value, defaulting to three. A separate post-hydration re-gather loop in recall quadruples its candidate limit per pass, capped by the server-wide maximum; that loop is not governed by this setting.
 
-`ann_ready_timeout_ms` bounds a cold-miss call to `ensure_ann_for_model` before that model degrades to FTS-only. It falls back to `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`, default 8,000 ms. The bound exists because recall and boot warming share the same model single-flight lock; without a timeout, a recall arriving during a from-scratch warm could wait for the full build, observed above 300 seconds in issue #836.
+`ann_ready_timeout_ms` bounds the receiver wait for a detached writable cold-miss Warm attempt, including queued admission. It falls back to `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`, default 8,000 ms. Expiry drops only the receiver; tracked admission/build/supervisor work can continue for later requests. Expiry and received not-ready outcomes select the existing degraded FTS/bounded fresh-tail path. The bound avoids waiting for the full build behind the shared model single-flight lock; see issue #836.
 
 `recall_deadline_ms` bounds the complete pipeline and defaults to 30,000 ms through `KHIVE_MEMORY_RECALL_DEADLINE_MS`. Per-request validation and operator fallback behavior are described in `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
@@ -55,7 +55,22 @@ The hint names a profile, a result boost (default `1.3`), and a posterior thresh
 
 ## Score breakdowns
 
-`ScoreBreakdown` reports raw relevance, raw and decayed salience, temporal recency, weighted contributions, total score, the profile weight projection, the optional per-entity posterior mean, and the terms that make up the returned `rank_score`.
+`ScoreBreakdown` reports the relevance the hit was ranked with, the fused score it came from, the factors of the ranking composite, raw and decayed salience, temporal recency, the additive weighted contributions, the profile weight projection, the optional per-entity posterior mean, and the terms that make up the returned `rank_score`.
+
+`relevance` is the value the ranking composite received: the fused score after the calibrated normalization (never above 0.82), reported without further scaling. `fused_score` is the fused score before that normalization.
+
+`composite` reports the factors of the multiplicative composite that ranks the hit, each the 32-bit value used:
+
+```text
+relevance_term = weights.relevance * relevance
+temporal_boost = 1 + weights.temporal * recency
+salience_boost = 1 + weights.salience * salience
+adjustment_factor = net multiplier of the configured adjustments and the final clamp to [0, 1]
+```
+
+With no `reranker_weights` configured, `relevance_term * temporal_boost * salience_boost * adjustment_factor` equals `pre_entity_score`. When `reranker_weights` is configured, `pre_entity_score` is the reranker output and `composite` still describes the default composite. `adjustment_factor` is `null` when the first three factors do not multiply to a positive number: the adjustments then act on zero or less, and no multiplier describes the score they leave. `composite` is absent from `memory.recall_score`, which scores additively, and from a hit whose composite arithmetic produced a non-finite value and fell back to a zero score.
+
+`temporal` and `salience_decayed` are the half-life recency and the decayed salience that the weighted reranker reads, and `weighted` splits the `RecallConfig` weights additively over `relevance`, the amplified `salience_decayed` and `temporal`. That additive composite is the one `memory.recall_score` scores with. Without `reranker_weights` a recall ranks by `composite`, so in such a recall the three `weighted` contributions do not sum to `pre_entity_score`.
 
 A served profile scores with the configured default weights. `weights_served` is always `"default"`. `profile_component` is a diagnostic: the ratio of the hit's score under the weights the profile's posteriors project to, to its score under the default weights. It is reported for the breakdown only and never enters `rank_score`. It is `1.0` when no profile served the request or the default score is effectively zero.
 
@@ -69,4 +84,4 @@ rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty
 
 `entity_posterior_mean` reports the serving profile's per-entity Beta posterior mean for the hit's UUID. It is absent when no profile served the request or no posterior exists beyond the uninformative prior. The value also feeds the bounded rank-score multiplier `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` (ADR-104 §3). `None` and a mean of `0.5` are neutral; other means adjust `rank_score` by up to ±15% relative to the same candidate under a profile without a posterior for it. The scoring context is documented in `crates/khive-pack-memory/docs/api/scoring.md`.
 
-`total()` sums the three weighted contributions. Profile and entity components describe later multiplicative effects and are not added to that sum.
+`total()` sums the three weighted contributions, which a recall does not rank by (see above). Profile and entity components describe later multiplicative effects and are not added to that sum.

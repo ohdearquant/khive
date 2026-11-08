@@ -97,3 +97,5 @@ include!("acceptance_tests/adr_entity_type_tests.rs");
 include!("acceptance_tests/commit_metadata_masking_tests.rs");
 
 include!("acceptance_tests/pull_request_metadata_tests.rs");
+
+include!("acceptance_tests/project_annotation_census_tests.rs");

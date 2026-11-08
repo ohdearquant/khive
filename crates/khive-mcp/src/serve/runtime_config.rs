@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
+    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, Namespace, OpenedDiagnosticBackend,
     OutboundEmailPolicy, OutputFormat, RuntimeConfig, StorageBackend,
 };
 
@@ -438,9 +438,10 @@ pub struct RuntimeConfigInputs<'a> {
     ///
     /// Distinct from `namespace_explicit`: `kkernel exec` and `kkernel reindex`
     /// set `namespace_explicit: true` unconditionally (their `--namespace` arg
-    /// has no `Option` to distinguish "typed" from "default"), but they have no
-    /// `--actor` flag and must NOT suppress the project/db actor-id tiers when
-    /// their namespace happens to resolve to `"local"`. Only `kkernel mcp`
+    /// has no `Option` to distinguish "typed" from "default") and must NOT
+    /// suppress the project/db actor-id tiers when their namespace resolves to
+    /// `"local"`. Exec's optional actor pin is applied after those tiers. Only
+    /// `kkernel mcp`
     /// (`build_server`, via `resolve_cli_namespace`) sets this to a value that
     /// can suppress those tiers — everyone else passes `false`.
     pub actor_explicit: bool,
@@ -468,12 +469,41 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     Ok(config)
 }
 
+/// Ownership declared by the selected configuration, before actor overrides.
+#[must_use = "finalize configured ownership after selecting the final actor"]
+pub struct ConfiguredActorOwnership {
+    declaring_actor: Option<String>,
+    namespaces: Vec<Namespace>,
+}
+
+impl ConfiguredActorOwnership {
+    /// Apply this declaration once, only to its final declaring actor.
+    pub fn finalize(self, config: &mut RuntimeConfig) {
+        let matches = self
+            .declaring_actor
+            .as_deref()
+            .is_some_and(|actor| config.actor_id.as_deref() == Some(actor));
+        config.owned_namespaces = if matches { self.namespaces } else { Vec::new() };
+    }
+}
+
 /// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
 /// same construction boundary. Server boot paths thread this value through
 /// consistency validation and registry construction without re-reading HOME.
 pub fn resolve_runtime_config_with_db_anchor(
     inputs: RuntimeConfigInputs<'_>,
 ) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let (mut config, db_anchor, ownership) = resolve_runtime_config_with_actor_ownership(inputs)?;
+    ownership.finalize(&mut config);
+    Ok((config, db_anchor))
+}
+
+/// Resolve config and actor tiers while deferring ownership finalization.
+/// The returned config has no ownership grants until the declaration is finalized
+/// after any remaining actor override and expectation checks.
+pub fn resolve_runtime_config_with_actor_ownership(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>, ConfiguredActorOwnership)> {
     let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
     let db_path = db_anchor.clone();
 
@@ -543,6 +573,12 @@ pub fn resolve_runtime_config_with_db_anchor(
         )?
     };
 
+    let mut resolved = resolved;
+    let ownership = ConfiguredActorOwnership {
+        declaring_actor: resolved.actor_id.clone(),
+        namespaces: std::mem::take(&mut resolved.owned_namespaces),
+    };
+
     // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
     // lowest), ratified 2026-07-05:
     //
@@ -560,7 +596,8 @@ pub fn resolve_runtime_config_with_db_anchor(
     //      closes). `kkernel exec`/`reindex` force
     //      `namespace_explicit: true` for unrelated reasons (no `Option` on
     //      their `--namespace` arg) but always pass `actor_explicit: false`,
-    //      so they keep falling through to tiers 2-3 exactly as before.
+    //      so they keep falling through to tiers 2-3 exactly as before. Exec's
+    //      optional actor pin is applied after those lookups.
     //   2. Project/cwd-anchored config `[actor].id`, resolved INDEPENDENTLY of
     //      the database-anchored config load above (`resolve_project_actor_id`).
     //      Commit 10d9c92c (#651) anchored tier-3 `.khive/config.toml` discovery
@@ -582,7 +619,6 @@ pub fn resolve_runtime_config_with_db_anchor(
     // behavior; tiers 2-4 never touch it, per ADR-007 Rev 4 Rule 0).
     let resolved = {
         let mut resolved = resolved;
-        let configured_actor = resolved.actor_id.clone();
         let ns = resolved.default_namespace.as_str().to_string();
         if inputs.namespace_explicit && ns != "local" {
             // An explicit non-"local" namespace (CLI `--actor`/`--namespace`,
@@ -599,19 +635,13 @@ pub fn resolve_runtime_config_with_db_anchor(
             // "local" also looks like "unset". Gated on `actor_explicit`
             // (not the broader `namespace_explicit`) so `kkernel exec`/
             // `reindex` — which force `namespace_explicit: true` for
-            // unrelated reasons and have no `--actor` flag — keep falling
-            // through exactly as before.
+            // unrelated reasons, keep falling through exactly as before.
+            // Exec's optional actor pin is a separate late tier.
             resolved.actor_id = None;
         } else {
             let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
                 .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
             resolved.actor_id = project_actor.or(resolved.actor_id);
-        }
-        // `[actor] owned_namespaces` was declared for the configured actor
-        // (ADR-021 Delta 1). A pin to any other actor, including anonymous,
-        // carries none of it.
-        if resolved.actor_id != configured_actor {
-            resolved.owned_namespaces.clear();
         }
         resolved
     };
@@ -641,7 +671,7 @@ pub fn resolve_runtime_config_with_db_anchor(
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok((apply_env_brain_profile(resolved), db_anchor))
+    Ok((apply_env_brain_profile(resolved), db_anchor, ownership))
 }
 
 /// Upgrade a resolved config's event plane from direct (embedded) mode to

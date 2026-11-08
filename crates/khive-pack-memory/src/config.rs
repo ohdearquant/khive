@@ -95,9 +95,10 @@ pub struct RecallConfig {
     /// Pass `Some(1)` to disable widening entirely.
     pub ann_overfetch_max_rounds: Option<usize>,
 
-    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model` call
-    /// on the recall path before degrading that model's contribution to
-    /// FTS-only (#836). When `None`, falls back to the
+    /// Bounded receiver wait (milliseconds) for detached writable cold-miss
+    /// Warm work, including queued admission. Expiry drops only the receiver;
+    /// tracked work can continue. Not-ready results use degraded FTS/bounded
+    /// fresh-tail recall (#836). When `None`, falls back to the
     /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
     /// `handlers::common::ann_ready_timeout_ms`).
     ///
@@ -485,16 +486,33 @@ impl DecayModel {
 /// Per-component score contributions for a single recall result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
-    /// Raw RRF fusion score (before weighting).
+    /// The relevance the ranking composite received for this hit: the fused score after the
+    /// calibrated normalization, with no further scaling. `memory.recall_score` reports its
+    /// input after the configured fusion strategy's normalization instead.
     pub relevance: f64,
+    /// The fused score before the normalization that produced `relevance`.
+    #[serde(default)]
+    pub fused_score: f64,
     /// Raw salience from the note (before decay).
     pub salience_raw: f64,
-    /// Salience after applying the decay model.
+    /// Salience after applying the decay model. Feeds the weighted reranker and
+    /// `weighted.salience_contribution`, not the ranking composite.
     pub salience_decayed: f64,
     /// Temporal recency score (half-life decay, independent of note's own decay_factor).
+    /// Feeds the weighted reranker and `weighted.temporal_contribution`, not the ranking
+    /// composite, which uses `temporal_boost`.
     pub temporal: f64,
-    /// Weighted contributions summing to the total score.
+    /// Additive split of the `RecallConfig` weights over `relevance`, the amplified
+    /// `salience_decayed` and `temporal`: the composite `memory.recall_score` scores with. A
+    /// recall without `reranker_weights` ranks by the multiplicative composite in `composite`
+    /// instead, so in a recall these do not sum to `pre_entity_score`.
     pub weighted: WeightedContributions,
+    /// The factors of the multiplicative composite a recall ranks by when no `reranker_weights`
+    /// are configured; with them, `pre_entity_score` is the reranker output and these describe
+    /// the default composite. Absent from `memory.recall_score`, which scores additively, and
+    /// absent when the composite arithmetic fell back to a zero score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite: Option<CompositeFactors>,
     /// This hit's composite under the weights the serving profile's posteriors
     /// project to, divided by its composite under the configured default weights.
     /// Reported for the breakdown only: the hit is scored with the default weights
@@ -542,7 +560,8 @@ fn neutral_factor() -> f32 {
 }
 
 impl ScoreBreakdown {
-    /// Total composite score.
+    /// Sum of the three additive contributions in `weighted`. A recall does not rank by this
+    /// sum; see `composite`.
     pub fn total(&self) -> f64 {
         self.weighted.relevance_contribution
             + self.weighted.salience_contribution
@@ -550,12 +569,30 @@ impl ScoreBreakdown {
     }
 }
 
-/// The three weighted components that make up the final score.
+/// The three additive components of the `RecallConfig` composite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightedContributions {
     pub relevance_contribution: f64,
     pub salience_contribution: f64,
     pub temporal_contribution: f64,
+}
+
+/// The factors of the default multiplicative composite. All four are the 32-bit values used, and
+/// with no `reranker_weights` configured
+/// `relevance_term * temporal_boost * salience_boost * adjustment_factor` is the hit's
+/// `pre_entity_score`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeFactors {
+    /// `weights.relevance × relevance`.
+    pub relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub salience_boost: f32,
+    /// Net multiplier of the configured score adjustments and the final clamp to `[0, 1]`.
+    /// `None` when the product of the other three is not a positive finite number: the
+    /// adjustments then act on zero or less, and no multiplier describes the score they leave.
+    pub adjustment_factor: Option<f32>,
 }
 
 // ── English-only embedding models ─────────────────────────────────────────────

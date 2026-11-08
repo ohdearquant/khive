@@ -294,6 +294,16 @@ pub struct DeclarationWriter {
     attempt: u64,
 }
 
+impl Drop for DeclarationWriter {
+    fn drop(&mut self) {
+        // A duplicate can keep the open file description alive after this File
+        // closes. Release logical ownership only for the captured incarnation.
+        if process::same_incarnation(&self.incarnation, process::capture()).is_ok() {
+            let _ = fs4::FileExt::unlock(&self.claim);
+        }
+    }
+}
+
 impl DeclarationWriter {
     pub fn claim(location: RecordLocation) -> Result<Self, ClaimError> {
         let incarnation = process::capture()?;
@@ -547,3 +557,7 @@ impl Faults {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "claim_drop_tests.rs"]
+mod claim_drop_tests;

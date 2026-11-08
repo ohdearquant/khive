@@ -821,7 +821,7 @@ the edge's mutation history.
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors. Without an explicit `limit` the response is the bare array of hits it has always been. An explicit `limit` returns a page instead: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
+Immediate graph neighbors. For an anchor that is not a memory row, a call without an explicit `limit` returns a bare array of hits. A call anchored on a memory row always returns the object shape, `{"neighbors": [...], "next_after": null, "hidden_incoming_edges": {"total": n, "by_relation": {"<relation>": n}}}` when no `limit` is given; `hidden_incoming_edges` counts the incoming memory edges stored in namespaces the caller cannot read and discloses no endpoint id, namespace or content. `by_relation` lists each relation of the request's filter, or with no filter each relation whose count is above zero; the count is 0 for direction `outgoing`. An explicit `limit` returns a page instead, with `hidden_incoming_edges` added for a memory anchor: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
@@ -1599,7 +1599,7 @@ Create a memory note with salience and decay.
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
 
 `properties` is a JSON object of at most 32 keys. A key is 1-64 characters, a lowercase ASCII letter first,
-then lowercase letters, digits or `_`; `memory_type`, `tags` and `attribution` are reserved. A value is a
+then lowercase letters, digits or `_`; `memory_type` and `tags` have their own parameters, `attribution` is written by the runtime, and `supersedes` is written by `memory.apply_batch`; use `link(relation="supersedes")` to add a supersedes edge. A value is a
 string, a finite number, a boolean or an array of strings. The serialized object is at most 8192 bytes. An
 object that breaks a rule is refused with an invalid-input error naming the key and the rule, never
 truncated.
@@ -1665,7 +1665,14 @@ term (bounded to 0.85 to 1.15) when a profile serves the request, and by the ser
 the `local` namespace. Under a profile with a factor, `local` rows' `rank_score` is scaled by it; rows of every other
 namespace are not. `score` stays the absolute relevance in [0, 1] and is taken before the factor.
 
-With `include_breakdown=true` each hit's `breakdown` reports `weights_served` (always `"default"`: a served profile
+With `include_breakdown=true` each hit's `breakdown` reports `relevance` (the value the ranking composite received,
+after the calibrated normalization and with no further scaling), `fused_score` (the fused score before that
+normalization) and `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`, the
+factors of the multiplicative composite that ranks the hit; with no `reranker_weights` their product is
+`pre_entity_score`, and `adjustment_factor` is `null` when the other three do not multiply to a positive number). The
+additive `weighted` contributions and the `temporal` and `salience_decayed` values are not the ranking composite:
+without `reranker_weights` a recall ranks by `composite`. The breakdown also reports `weights_served` (always
+`"default"`: a served profile
 scores with the configured default weights), `profile_component` (a diagnostic: the hit's composite under the weights
 the serving profile's posteriors project to, divided by its composite under the default weights; it never enters
 `rank_score`), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when none applies) and
@@ -1678,7 +1685,9 @@ stage did not run; the text and vector searches run concurrently, so the stages 
 not add up), `retrieval_rounds`, and `rounds[]` with each round's
 `candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
 and stage times. An array response becomes `{results, timings}`; an object
-response keeps its fields and gains `timings`.
+response keeps its fields and gains `timings`. `hidden_incoming_us` measures the
+post-ranking hidden incoming count, including graph access and the awaited query;
+it is `null` when the step is skipped and remains numeric when the count is zero.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1732,6 +1741,9 @@ one and a `supersedes` edge, creates a memory, skips a row, or lists it as a del
 before anything is written; a refused row carries a reason and never stops the others. Writes go through the
 `memory.remember` path in the caller's own namespace, keyed `<batch>:<old id>:<part>` (or `<batch>:create:<part>`),
 so re-running a chunk writes only what is missing. An anonymous caller is refused.
+Within a call, identical `supersede` payloads apart from `part` preserve all existing keyed replays or, if
+none exist, the earliest new row, and refuse other new rows with `duplicate-payload`, the matched row's
+zero-based index, and its part.
 
 | Param     | Type   | Required | Notes                                                                                                                                                                                                                                   |
 | --------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

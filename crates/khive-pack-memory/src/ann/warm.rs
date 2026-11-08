@@ -372,6 +372,7 @@ pub(super) async fn refresh_rotated_segment(
 ///
 /// The actual attempt emits one best-effort `ann_warm` phase span. See
 /// `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
+#[cfg(test)]
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -544,6 +545,7 @@ pub(super) async fn emit_ann_warm_phase_event<P: serde::Serialize>(
 }
 
 /// Restore or rebuild after the caller has established its generation floor.
+#[cfg(test)]
 pub(super) async fn ensure_ann_for_model_inner(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -821,61 +823,27 @@ pub(super) async fn load_and_build_from_vector_store_with_context<C: AnnBuildCon
     let sql = rt.sql();
     let mut reader = sql.reader().await?;
 
-    let rows = reader
-        .query_all(memory_corpus().corpus_scan(&table_name, model, "memory_ann_corpus_scan"))
-        .await?;
+    let corpus = corpus_consumer::scan(
+        &mut *reader,
+        memory_corpus().corpus_scan(&table_name, model, "memory_ann_corpus_scan"),
+        dims,
+    )
+    .await?;
 
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let scan_watermark = rows
-        .first()
-        .and_then(|row| match row.get("log_s") {
-            Some(SqlValue::Integer(n)) => u64::try_from(*n).ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
-    let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
-    let mut namespace_set: HashSet<String> = HashSet::new();
-
-    for row in &rows {
-        let id_str = match row.get("subject_id") {
-            Some(SqlValue::Text(s)) => s.as_str(),
-            _ => continue,
-        };
-        let uuid = match Uuid::parse_str(id_str) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let bytes = match row.get("embedding") {
-            Some(SqlValue::Blob(b)) => b.as_slice(),
-            _ => continue,
-        };
-        if bytes.len() != dims * 4 {
-            continue;
-        }
-        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
-            continue;
-        };
-        if let Some(SqlValue::Text(ns)) = row.get("namespace") {
-            namespace_set.insert(ns.clone());
-        }
-        id_map.push(uuid);
-        flat.extend_from_slice(&vec);
-    }
-
-    if id_map.is_empty() {
+    if corpus.ids.is_empty() {
         return Ok(None);
     }
 
     // Same admitted lease/tracker lives in the actual controlled CPU closure.
-    let mut built = context.build(flat, dims, id_map, namespace_set).await?;
-    built.set_applied_seq(scan_watermark);
+    let mut built = context
+        .build(corpus.flat, dims, corpus.ids, corpus.namespaces)
+        .await?;
+    built.set_applied_seq(corpus.watermark);
     Ok(Some(built))
 }
+
+#[path = "corpus_consumer.rs"]
+mod corpus_consumer;
 
 // ── ADR-079 Amendment 1: segments, registry, classifier (global scope) ────────
 

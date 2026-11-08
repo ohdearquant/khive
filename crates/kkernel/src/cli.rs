@@ -105,6 +105,9 @@ enum Command {
     /// Promote registered legacy entity subtypes and remove redundant kind echoes.
     EntityTypeBackfill(crate::entity_type_backfill::EntityTypeBackfillArgs),
 
+    /// Preview or apply source-namespace repair for live memory-to-memory edges.
+    MemoryEdgeNamespaceMove(crate::memory_edge_namespace_move::MemoryEdgeNamespaceMoveArgs),
+
     /// Execute a verb DSL expression (same syntax as MCP `request` tool).
     Exec(exec::ExecArgs),
 
@@ -473,6 +476,9 @@ pub async fn cli_main() -> Result<()> {
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::EntityTypeBackfill(args) => {
             crate::entity_type_backfill::run_entity_type_backfill(args).await
+        }
+        Command::MemoryEdgeNamespaceMove(args) => {
+            crate::memory_edge_namespace_move::run_memory_edge_namespace_move(args).await
         }
         Command::Exec(e) => {
             let result = exec::run_exec(e).await;

@@ -24,11 +24,12 @@ impl AnnBridge {
         self.index.set_last_applied_seq(Some(seq));
     }
 
-    /// Ordinal lookup for only the subjects in a coalesced tail. Scan the
-    /// id-map once, but allocate and hash at most one entry per tail subject
+    /// Ordinal lookup for only the subjects in a coalesced tail. Walk the
+    /// id-map newest first, allocating at most one entry per tail subject
     /// instead of rebuilding a corpus-sized reverse map for a short replay.
-    /// Highest ordinal wins for a repeated uuid: inserts append, so the
-    /// latest slot is the live one; earlier slots are tombstoned.
+    /// The first live match is the highest live ordinal for a repeated UUID.
+    /// Stop once every distinct requested subject has a live match; missing
+    /// subjects still require scanning the whole id-map.
     ///
     /// A tombstoned ordinal has no owner (ADR-079 Amendment 1 id-map
     /// ownership rule) — `id_map` entries for already-tombstoned slots are
@@ -40,12 +41,31 @@ impl AnnBridge {
         subjects: impl IntoIterator<Item = Uuid>,
     ) -> HashMap<Uuid, u32> {
         let wanted: Vec<Uuid> = subjects.into_iter().collect();
+        #[cfg(test)]
+        REVERSE_MAP_FOR_SCANNED_ENTRIES.with(|scanned| scanned.set(0));
+        if wanted.is_empty() {
+            return HashMap::new();
+        }
         // One/few-row tails are common: comparing UUID bytes is cheaper
         // than hashing every id-map entry while scanning the corpus.
         let wanted_set = (wanted.len() > 4).then(|| wanted.iter().copied().collect::<HashSet<_>>());
+        let distinct_wanted = match &wanted_set {
+            Some(set) => set.len(),
+            None => {
+                let mut distinct = 0;
+                for (position, uuid) in wanted.iter().enumerate() {
+                    if !wanted[..position].contains(uuid) {
+                        distinct += 1;
+                    }
+                }
+                distinct
+            }
+        };
         let mut reverse: HashMap<Uuid, u32> =
             HashMap::with_capacity(wanted.len().min(self.index.live_count()));
-        for (ordinal, uuid) in self.id_map.iter().enumerate() {
+        for (ordinal, uuid) in self.id_map.iter().enumerate().rev() {
+            #[cfg(test)]
+            REVERSE_MAP_FOR_SCANNED_ENTRIES.with(|scanned| scanned.set(scanned.get() + 1));
             let in_tail = match &wanted_set {
                 Some(set) => set.contains(uuid),
                 None => wanted.contains(uuid),
@@ -53,9 +73,17 @@ impl AnnBridge {
             if !in_tail || self.index.is_tombstoned(ordinal as u32) {
                 continue;
             }
-            reverse.insert(*uuid, ordinal as u32);
+            reverse.entry(*uuid).or_insert(ordinal as u32);
+            if reverse.len() == distinct_wanted {
+                break;
+            }
         }
         reverse
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reverse_map_for_scanned_entries() -> usize {
+        REVERSE_MAP_FOR_SCANNED_ENTRIES.with(std::cell::Cell::get)
     }
 
     /// Apply one subject's coalesced final state (ADR-079 Amendment 1):
@@ -212,3 +240,8 @@ impl AnnBridge {
 }
 
 pub(super) const BRIDGE_LOCK_MESSAGE_PREFIX: &str = "ANN bridge";
+
+#[cfg(test)]
+std::thread_local! {
+    static REVERSE_MAP_FOR_SCANNED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

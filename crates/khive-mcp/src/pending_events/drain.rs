@@ -866,6 +866,11 @@ pub(super) async fn run_pending_events_on_with_lease(
                     },
                     lease,
                     dsl,
+                    if event_type == "remind" {
+                        super::dispatch::NamespaceInjection::DefaultPath
+                    } else {
+                        super::dispatch::NamespaceInjection::EventNamespace
+                    },
                     dispatch_actor,
                     server,
                     verbose,

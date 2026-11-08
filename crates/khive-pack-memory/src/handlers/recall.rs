@@ -20,19 +20,20 @@ use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 use khive_types::{Details, KhiveError};
 
-use crate::config::{RecallConfig, ScoreBreakdown};
+use crate::config::{CompositeFactors, RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, contains_cjk, extract_entity_candidates, normalize_min_score,
-    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput, ScoringConfig,
+    calculate_score, calculate_score_factors, contains_cjk, extract_entity_candidates,
+    normalize_min_score, normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    ScoringConfig,
 };
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_for_query, make_pipeline, note_has_any_tag, note_matches_tags, plog,
-    plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
-    RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings, TextSnippetPolicy,
-    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    compute_score_for_recall, deser, fuse_for_query, make_pipeline, note_has_any_tag,
+    note_matches_tags, plog, plog_n, recall_candidate_count, to_json, validate_memory_type,
+    RecallCandidateParams, RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings,
+    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
@@ -405,6 +406,8 @@ impl MemoryPack {
         let mut cfg = p.effective_config(self.active_config());
         super::common::apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())?;
         cfg.validate()?;
+        // Used on both the empty and non-empty completion paths.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         let effective_min_score: f32 = {
             let raw = if let Some(floor) = p.score_floor {
@@ -499,17 +502,21 @@ impl MemoryPack {
         // A served profile scores with the configured default weights. The weights its
         // posteriors project to are computed only to report each hit's `profile_component`
         // in the breakdown; they never enter `rank_score`.
-        let projected_weights = profile_state.as_ref().and_then(|state| {
-            serde_json::from_value::<RecallConfig>(self.project_config(state))
-                .ok()
-                .map(|projected| {
-                    let mut weights = scoring_cfg.weights.clone();
-                    weights.relevance = projected.relevance_weight as f32;
-                    weights.salience = projected.salience_weight as f32;
-                    weights.temporal = projected.temporal_weight as f32;
-                    weights
-                })
-        });
+        let projected_weights = if is_verbose {
+            profile_state.as_ref().and_then(|state| {
+                serde_json::from_value::<RecallConfig>(self.project_config(state))
+                    .ok()
+                    .map(|projected| {
+                        let mut weights = scoring_cfg.weights.clone();
+                        weights.relevance = projected.relevance_weight as f32;
+                        weights.salience = projected.salience_weight as f32;
+                        weights.temporal = projected.temporal_weight as f32;
+                        weights
+                    })
+            })
+        } else {
+            None
+        };
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -678,10 +685,11 @@ impl MemoryPack {
             }
         }
         let candidate_limit = current_candidate_limit;
-        let timings_report: Option<Value> = include_timings.then(|| {
+        let mut timings_report: Option<Value> = include_timings.then(|| {
             let mut report = recall_stage_timings.stage_report();
             report["retrieval_rounds"] = json!(round_reports.len());
             report["rounds"] = Value::Array(round_reports);
+            report["hidden_incoming_us"] = Value::Null;
             report
         });
 
@@ -748,9 +756,6 @@ impl MemoryPack {
             query_trimmed,
             p.embedding_model.as_deref(),
         )?;
-        // Needed on both the empty and non-empty completion paths.
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
-
         if prof {
             if let Some(ref t) = t_stage {
                 plog_n(call_id, "fusion", t.elapsed().as_micros(), fused.len());
@@ -944,7 +949,8 @@ impl MemoryPack {
                 relevance_score: norm_relevance,
                 entity_names: &entity_names,
             };
-            let rank_score = calculate_score(&score_input, &scoring_cfg);
+            let score_factors = calculate_score_factors(&score_input, &scoring_cfg);
+            let rank_score = score_factors.score;
 
             // Reported for the breakdown only: this hit's composite under the projected weights
             // divided by its composite under the default weights, which `rank_score` used.
@@ -979,7 +985,7 @@ impl MemoryPack {
 
             let age_days_f64 =
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
-            let (_, mut breakdown) = compute_score(
+            let (_, mut breakdown) = compute_score_for_recall(
                 &cfg,
                 &recall_pipeline,
                 norm_relevance as f64,
@@ -987,6 +993,14 @@ impl MemoryPack {
                 decay_factor,
                 age_days_f64,
             );
+            breakdown.fused_score = hit.score.to_f64();
+            // A composite whose arithmetic fell back to a zero score has no factors to report.
+            breakdown.composite = score_factors.complete.then(|| CompositeFactors {
+                relevance_term: score_factors.relevance_term,
+                temporal_boost: score_factors.temporal_boost,
+                salience_boost: score_factors.salience_boost,
+                adjustment_factor: score_factors.adjustment_factor(),
+            });
             breakdown.profile_component = profile_component;
             breakdown.entity_posterior_mean = entity_posterior_mean;
 
@@ -1019,7 +1033,6 @@ impl MemoryPack {
                 1.0
             };
             let final_score = unscaled_score * candidate_local_factor;
-            breakdown.namespace = note.namespace.clone();
             breakdown.pre_entity_score = pre_entity_term_score;
             breakdown.entity_term = entity_term;
             breakdown.local_factor = candidate_local_factor;
@@ -1098,10 +1111,13 @@ impl MemoryPack {
                 {
                     if let Ok(uid) = target_str.parse::<Uuid>() {
                         superseded_by_prop.insert(uid);
-                    } else {
-                        let prefix = target_str.to_lowercase();
+                    } else if target_str.len() >= 8
+                        && target_str
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+                    {
                         for sn2 in &ranked {
-                            if sn2.id.as_hyphenated().to_string().starts_with(&prefix) {
+                            if sn2.id.as_hyphenated().to_string().starts_with(target_str) {
                                 superseded_by_prop.insert(sn2.id);
                                 break;
                             }
@@ -1113,24 +1129,27 @@ impl MemoryPack {
             let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
-                let graph = self.runtime.graph(token)?;
-                // One batched read for every candidate; the first element of each
-                // returned pair is the requested candidate that has an incoming
-                // `supersedes` edge.
-                superseded_by_edge = graph
-                    .batch_neighbors(
-                        &candidate_ids,
-                        NeighborQuery {
-                            direction: Direction::In,
-                            relations: Some(vec![EdgeRelation::Supersedes]),
-                            limit: Some(1),
-                            min_weight: None,
-                        },
-                    )
-                    .await?
-                    .into_iter()
-                    .map(|(candidate_id, _)| candidate_id)
-                    .collect();
+                for namespace in token.visible_namespaces() {
+                    // `graph` routes by the token's primary namespace. This token is
+                    // scoped to one namespace already present in the caller's read set.
+                    let namespace_token = token.with_namespace(namespace.clone());
+                    let graph = self.runtime.graph(&namespace_token)?;
+                    superseded_by_edge.extend(
+                        graph
+                            .batch_neighbors(
+                                &candidate_ids,
+                                NeighborQuery {
+                                    direction: Direction::In,
+                                    relations: Some(vec![EdgeRelation::Supersedes]),
+                                    limit: Some(1),
+                                    min_weight: None,
+                                },
+                            )
+                            .await?
+                            .into_iter()
+                            .map(|(candidate_id, _)| candidate_id),
+                    );
+                }
                 khive_storage::ensure_request_read_active("memory.recall")?;
             }
 
@@ -1172,6 +1191,36 @@ impl MemoryPack {
             ranked.truncate(cut);
         }
         let budget_capped = ranked.len() < pre_budget_count;
+        let hidden_target_ids: Vec<String> = ranked.iter().map(|hit| hit.id.to_string()).collect();
+        let hidden_supersedes: std::collections::HashMap<String, u64> =
+            if hidden_target_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let namespaces: Vec<String> = effective_token
+                    .visible_namespaces()
+                    .iter()
+                    .map(|namespace| namespace.as_str().to_string())
+                    .collect();
+                let relations = vec!["supersedes".to_string()];
+                let hidden_started = include_timings.then(Instant::now);
+                let counts = self
+                    .runtime
+                    .graph(&effective_token)?
+                    .count_hidden_incoming_memory_edges(
+                        &hidden_target_ids,
+                        Some(&relations),
+                        &namespaces,
+                    )
+                    .await?;
+                if let (Some(report), Some(started)) = (timings_report.as_mut(), hidden_started) {
+                    report["hidden_incoming_us"] =
+                        json!(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+                }
+                counts
+                    .into_iter()
+                    .map(|(target_id, _, count)| (target_id, count))
+                    .collect()
+            };
 
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
@@ -1227,6 +1276,10 @@ impl MemoryPack {
                     };
                 let (hit_properties, hit_tags) =
                     hit_properties_and_tags(sn.note.properties.as_ref());
+                let hidden_count = hidden_supersedes
+                    .get(&sn.id.to_string())
+                    .copied()
+                    .unwrap_or(0);
                 let mut result = json!({
                     "id": sn.id.to_string(),
                     "full_id": sn.id.to_string(),
@@ -1241,12 +1294,19 @@ impl MemoryPack {
                     "namespace": sn.note.namespace,
                     "tags": hit_tags,
                     "properties": hit_properties,
+                    "hidden_incoming_edges": {
+                        "total": hidden_count,
+                        "by_relation": {"supersedes": hidden_count},
+                    },
                 });
                 if let Some(source) = source_ids.get(&sn.id) {
                     result["source_id"] = json!(source);
                 }
                 if is_verbose {
-                    result["breakdown"] = json!(sn.breakdown);
+                    let mut breakdown = sn.breakdown;
+                    breakdown.namespace = sn.note.namespace.clone();
+                    breakdown.weights_served = "default".to_string();
+                    result["breakdown"] = json!(breakdown);
                 }
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.
