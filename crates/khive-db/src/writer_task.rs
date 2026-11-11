@@ -1492,7 +1492,12 @@ async fn run_writer_task(
                 conn.volume_lease = if request.is_checkpoint_bypass() {
                     None
                 } else {
-                    match blocking_admission.acquire() {
+                    let class = if request.needs_vacuum_headroom() {
+                        crate::disk_guard::LeaseClass::Maintenance
+                    } else {
+                        crate::disk_guard::LeaseClass::WriterTask
+                    };
+                    match blocking_admission.acquire(class) {
                         Ok(lease) => lease,
                         Err(error) => {
                             request.reply_error(error.into_storage_error(

@@ -232,6 +232,8 @@ impl VolumeIdentity {
                         _held: HeldLease {
                             file: Some(file),
                             process: Some(process),
+                            class: None,
+                            granted: Instant::now(),
                         },
                         _thread_bound: PhantomData,
                     });
@@ -540,6 +542,9 @@ fn acquire_process_slot(
 
 #[cfg(all(test, any(unix, windows)))]
 mod fifo_tests;
+mod lease_hold;
+
+pub(crate) use lease_hold::{effective_class, lease_class_scope, lease_hold_snapshot, LeaseClass};
 
 /// A volume lease bound to the thread that took it. Re-entry detection keys
 /// on that thread, so the lease must not move: it is `!Send`, which makes
@@ -574,6 +579,8 @@ impl VolumeLease {
             _held: HeldLease {
                 file: None,
                 process: None,
+                class: None,
+                granted: Instant::now(),
             },
             _thread_bound: PhantomData,
         }
@@ -586,13 +593,24 @@ impl VolumeLease {
 pub(crate) static SKIP_VOLUME_LEASE_FOR_MEASUREMENT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+impl VolumeLease {
+    /// Names what this lease was taken for; its hold time is recorded under
+    /// that class when it drops. A lease never classified records nothing.
+    pub(crate) fn classify(&mut self, class: LeaseClass) {
+        self._held.class = Some(class);
+    }
+}
+
 struct HeldLease {
     file: Option<File>,
     process: Option<ProcessSlot>,
+    class: Option<LeaseClass>,
+    granted: Instant,
 }
 
 impl Drop for HeldLease {
     fn drop(&mut self) {
+        let held = self.granted.elapsed();
         // The advisory lock goes first, then the in-process slot, so a
         // waiter woken by the slot finds the file lock already free.
         if let Some(file) = self.file.take() {
@@ -605,6 +623,10 @@ impl Drop for HeldLease {
             drop(file);
         }
         self.process.take();
+        // Recorded after release, so the record never lengthens the hold.
+        if let Some(class) = self.class {
+            lease_hold::record(class, held);
+        }
     }
 }
 

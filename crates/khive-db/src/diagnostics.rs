@@ -86,7 +86,7 @@ use serde::Serialize;
 use crate::checkpoint;
 use crate::pool::{ConnectionPool, WalCeilingSource};
 
-pub use disk_guard::DiskGuardDiagnostics;
+pub use disk_guard::{DiskGuardDiagnostics, LeaseHoldDiagnostics};
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///

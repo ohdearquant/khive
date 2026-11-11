@@ -62,7 +62,7 @@ pub(crate) struct Snapshot {
 }
 
 #[derive(Debug, Default)]
-struct Histogram {
+pub(crate) struct Histogram {
     buckets: [u64; 18],
     overflow_count: u64,
     count: u64,
@@ -70,7 +70,7 @@ struct Histogram {
 }
 
 impl Histogram {
-    fn record(&mut self, elapsed: Duration) -> Result<(), Unavailable> {
+    pub(crate) fn record(&mut self, elapsed: Duration) -> Result<(), Unavailable> {
         let count = self
             .count
             .checked_add(1)
@@ -93,7 +93,7 @@ impl Histogram {
         Ok(())
     }
 
-    fn snapshot(&self) -> Result<HistogramSnapshot, Unavailable> {
+    pub(crate) fn snapshot(&self) -> Result<HistogramSnapshot, Unavailable> {
         let total: u128 = self
             .buckets
             .iter()
