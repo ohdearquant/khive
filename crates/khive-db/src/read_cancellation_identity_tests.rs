@@ -28,6 +28,16 @@ fn long_read(conn: &ProgressConn) -> StorageResult<i64> {
         .map_err(|error| StorageError::driver(StorageCapability::Sql, "long_read", error))
 }
 
+/// Run `long_read` and record whether SQLite itself interrupted the statement.
+///
+/// The scope maps a read that completes after a stop request to a timeout as well, so
+/// the scope's result alone cannot show that the statement was stopped.
+fn interrupted_long_read(conn: &ProgressConn, interrupted: &mut bool) -> StorageResult<i64> {
+    let result = long_read(conn);
+    *interrupted = matches!(&result, Err(error) if storage_error_is_sqlite_interrupt(error));
+    result
+}
+
 #[test]
 fn a_cancel_stops_the_registered_read_and_not_a_write_on_another_connection() {
     let read_conn = connection();
@@ -37,11 +47,16 @@ fn a_cancel_stops_the_registered_read_and_not_a_write_on_another_connection() {
         .unwrap();
     let (control, scope) = scope("identity");
     let mut write = None;
+    let mut interrupted = false;
     let read = scope.run(&read_conn, || {
         control.cancel(STOP_REQUEST);
         write = Some(write_conn.execute(LONG_WRITE, []));
-        long_read(&read_conn)
+        interrupted_long_read(&read_conn, &mut interrupted)
     });
+    assert!(
+        interrupted,
+        "SQLite interrupted the registered read's statement"
+    );
     assert_eq!(
         write.expect("the write ran").expect("the write completes"),
         ROWS as usize,
@@ -60,10 +75,15 @@ fn a_cancel_during_a_read_stops_it() {
     // The cancel lands while the read is registered and before its statement starts, so only
     // the progress handler can stop it: an interrupt with no statement running is cleared when
     // the next statement starts.
+    let mut interrupted = false;
     let read = scope.run(&conn, || {
         control.cancel(STOP_REQUEST);
-        long_read(&conn)
+        interrupted_long_read(&conn, &mut interrupted)
     });
+    assert!(
+        interrupted,
+        "SQLite interrupted the cancelled read's statement"
+    );
     assert!(
         matches!(read, Err(StorageError::Timeout { .. })),
         "the cancelled read stops: {read:?}"
@@ -119,16 +139,21 @@ async fn an_unwinding_read_whose_clear_fails_quarantines() {
 fn a_cancel_during_a_traversal_inside_a_read_scope_stops_it() {
     let conn = connection();
     let (control, scope) = scope("traversal_inside_read");
+    let mut interrupted = false;
     let read = scope.run(&conn, || {
         with_traversal_stop(
             &conn,
             || false,
             || {
                 control.cancel(STOP_REQUEST);
-                long_read(&conn)
+                interrupted_long_read(&conn, &mut interrupted)
             },
         )
     });
+    assert!(
+        interrupted,
+        "SQLite interrupted the traversal's statement on the enclosing read's cancel"
+    );
     assert!(
         matches!(read, Err(StorageError::Timeout { .. })),
         "the enclosing read's cancel stops the traversal's statement: {read:?}"
@@ -139,14 +164,19 @@ fn a_cancel_during_a_traversal_inside_a_read_scope_stops_it() {
 fn a_cancel_after_a_traversal_returns_still_stops_the_enclosing_read() {
     let conn = connection();
     let (control, scope) = scope("after_traversal");
+    let mut interrupted = false;
     let read = scope.run(&conn, || {
         assert_eq!(
             with_traversal_stop(&conn, || false, || long_read(&conn))?,
             ROWS
         );
         control.cancel(STOP_REQUEST);
-        long_read(&conn)
+        interrupted_long_read(&conn, &mut interrupted)
     });
+    assert!(
+        interrupted,
+        "SQLite interrupted the read's statement after the traversal returned"
+    );
     assert!(
         matches!(read, Err(StorageError::Timeout { .. })),
         "the read registration survives the traversal: {read:?}"
