@@ -79,10 +79,9 @@ pub use server_build::{
     MaintenanceTopologyRefusal,
 };
 
-#[cfg(test)]
-pub(crate) use server_build::is_strict_actor_mode;
-
-pub(crate) use server_build::{canonical_path_no_side_effects, should_warn_unattributed};
+pub(crate) use server_build::{
+    canonical_path_no_side_effects, is_strict_actor_mode, should_warn_unattributed,
+};
 
 use server_build::{
     build_server_from_prepared, canonical_backend_path, prepare_server_boot,

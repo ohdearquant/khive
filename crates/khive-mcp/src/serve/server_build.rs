@@ -84,6 +84,11 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
 ///   scheduled events
 ///
+/// A daemon serves each request frame under the frame's actor rather than its
+/// own, so its dispatch adapter (`crate::daemon::dispatch`) applies the same
+/// policy to every frame's actor through
+/// `KhiveMcpServer::strict_mode_refuses_actor`.
+///
 /// **Pure-introspection registry construction is intentionally EXEMPT**
 /// (`build_registry` in `crates/kkernel/src/pack_introspect.rs`,
 /// `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`) because it never
