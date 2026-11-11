@@ -34,6 +34,14 @@ ignore = [
     # patched range (>= 1.0.10) cannot match a 0.26 version. Remove this entry
     # when ureq 2 leaves the tree or the 1.x lock drops below 1.0.10.
     { id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports the patched webpki-roots 1.0.10 roots" },
+    # rmcp 2.2: both advisories sit behind features this workspace does not
+    # enable. The resolved rmcp feature set (`cargo tree -e features -i rmcp
+    # --workspace --all-features`) is base64, client, default, macros, server,
+    # transport-async-rw, transport-child-process and transport-io. Remove both
+    # entries when rmcp moves to 3.9 or later, or when `auth` or any
+    # `transport-streamable-http-client-*` feature is enabled.
+    { id = "RUSTSEC-2026-0457", reason = "OAuth client metadata fetch; the rmcp auth feature is not enabled" },
+    { id = "RUSTSEC-2026-0462", reason = "Streamable HTTP client body buffering; no transport-streamable-http-client feature is enabled" },
 ]
 
 [licenses]
