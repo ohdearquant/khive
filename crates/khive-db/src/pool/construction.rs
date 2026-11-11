@@ -232,7 +232,8 @@ impl ConnectionPool {
         {
             match write_admission.check() {
                 Ok(()) => {
-                    initialization_lease = write_admission.acquire()?;
+                    initialization_lease =
+                        write_admission.acquire(crate::disk_guard::LeaseClass::Bootstrap)?;
                     match initialize_database_id_with_admission(&mut writer, Some(&write_admission))
                     {
                         Ok(id) => Some(id),

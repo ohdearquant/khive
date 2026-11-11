@@ -218,8 +218,13 @@ impl WriteAdmission {
     /// The caller must retain the returned guard through settlement. A request
     /// from a thread that already holds this volume's lease fails at once as
     /// re-entry, naming both call sites, instead of waiting out the deadline.
+    /// `class` names what the lease is for; a [`crate::disk_guard::lease_class_scope`]
+    /// on this thread overrides it.
     #[track_caller]
-    pub(crate) fn acquire(&self) -> Result<Option<VolumeLease>, SqliteError> {
+    pub(crate) fn acquire(
+        &self,
+        class: crate::disk_guard::LeaseClass,
+    ) -> Result<Option<VolumeLease>, SqliteError> {
         self.ensure_settled()?;
         let Some(identity) = self.expected_volume.as_ref() else {
             return Ok(None);
@@ -230,7 +235,8 @@ impl WriteAdmission {
             self.verify_current_volume()?;
             return Ok(Some(VolumeLease::unheld_for_measurement()));
         }
-        let lease = match identity.acquire(self.guard_deadline, self.volume_lock_dir.as_deref()) {
+        let mut lease = match identity.acquire(self.guard_deadline, self.volume_lock_dir.as_deref())
+        {
             Ok(lease) => lease,
             Err(LeaseRefusal::TimedOut(error)) => {
                 self.record_lease_timeout(&error);
@@ -239,6 +245,7 @@ impl WriteAdmission {
             Err(refusal) => return Err(refusal.into()),
         };
         self.verify_current_volume()?;
+        lease.classify(crate::disk_guard::effective_class(class));
         Ok(Some(lease))
     }
 
@@ -768,7 +775,11 @@ impl crate::migrations::MigrationTransactions for PooledMigrationTransactions<'_
         &mut self,
         operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
     ) -> Result<T, SqliteError> {
-        let mut writer = self.pool.writer()?;
+        let mut writer = {
+            let _class =
+                crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
+            self.pool.writer()?
+        };
         let result = writer.conn_mut().with_mut(operation);
         if writer.guard.is_autocommit() {
             return result;

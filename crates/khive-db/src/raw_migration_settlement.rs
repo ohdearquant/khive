@@ -28,7 +28,7 @@ impl<'conn> RawMigrationWriteUnit<'conn> {
             .unwrap_or_else(|| "in-memory".to_string());
         let mut replacement = Connection::open_in_memory()?;
         replacement.authorizer(Some(|_: AuthContext<'_>| Authorization::Deny))?;
-        let volume_lease = admission.acquire()?;
+        let volume_lease = admission.acquire(crate::disk_guard::LeaseClass::Migration)?;
         Ok(Self {
             conn,
             replacement: Some(replacement),
