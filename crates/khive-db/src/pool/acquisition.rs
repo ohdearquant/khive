@@ -281,7 +281,8 @@ impl ConnectionPool {
         let volume_lease = if checkpoint_bypass {
             None
         } else {
-            self.write_admission.acquire()?
+            self.write_admission
+                .acquire(crate::disk_guard::LeaseClass::Pooled)?
         };
         let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
             self.writer_acquisition_counters
@@ -345,7 +346,9 @@ impl ConnectionPool {
         if should_stop() {
             return Ok(None);
         }
-        let volume_lease = self.write_admission.acquire()?;
+        let volume_lease = self
+            .write_admission
+            .acquire(crate::disk_guard::LeaseClass::Pooled)?;
         let started = Instant::now();
         loop {
             if should_stop() {

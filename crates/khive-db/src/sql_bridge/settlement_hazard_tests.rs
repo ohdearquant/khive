@@ -116,7 +116,7 @@ async fn standalone_begin_keeps_the_volume_lease_until_autocommit() {
     let second = tokio::task::spawn_blocking(move || {
         other
             .write_admission()
-            .acquire()
+            .acquire(crate::disk_guard::LeaseClass::Standalone)
             .map(|lease| lease.is_some())
     })
     .await
@@ -461,7 +461,7 @@ async fn standalone_script_left_in_a_transaction_is_rolled_back_before_the_lease
     let second = tokio::task::spawn_blocking(move || {
         other
             .write_admission()
-            .acquire()
+            .acquire(crate::disk_guard::LeaseClass::Standalone)
             .map(|lease| lease.is_some())
     })
     .await
