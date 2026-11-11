@@ -643,6 +643,15 @@ pub fn resolve_runtime_config_with_actor_ownership(
                 .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
             resolved.actor_id = project_actor.or(resolved.actor_id);
         }
+        // Strict attributed-actor mode is read from the project config on every
+        // branch above, including an explicit actor or namespace: a project
+        // that asks for it keeps it whatever identity the caller supplies.
+        resolved.require_attributed_actor |=
+            khive_runtime::resolve_project_requires_attributed_actor(
+                inputs.config,
+                db_path_for_config.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
         resolved
     };
 

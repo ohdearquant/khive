@@ -482,6 +482,11 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Strict attributed-actor mode requested by configuration: `[actor]
+    /// require_attributed = true` in the database-anchored or the project
+    /// config. The `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag is read
+    /// separately by the enforcing seam; either one turns the refusal on.
+    pub require_attributed_actor: bool,
     /// Resolved `[brain]` policy from the serving process's configuration.
     pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
@@ -641,6 +646,7 @@ impl Default for RuntimeConfig {
             owned_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            require_attributed_actor: false,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             blob: crate::engine_config::BlobSectionConfig {
@@ -985,6 +991,20 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier (the one anchored at `db_path` included), ORed.
+///
+/// The database-anchored load already carries the key into
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
+pub fn resolve_project_requires_attributed_actor(
+    config_path: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> Result<bool, crate::engine_config::ConfigError> {
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path, db_path)
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -1178,6 +1198,8 @@ pub fn runtime_config_from_khive_config(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
+    let require_attributed_actor =
+        khive_cfg.actor.require_attributed || base.require_attributed_actor;
 
     let gate = khive_cfg
         .gate
@@ -1234,6 +1256,7 @@ pub fn runtime_config_from_khive_config(
             owned_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            require_attributed_actor,
             gate,
             brain,
             git_write,
@@ -1275,6 +1298,7 @@ pub fn runtime_config_from_khive_config(
         owned_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        require_attributed_actor,
         gate,
         brain,
         git_write,
