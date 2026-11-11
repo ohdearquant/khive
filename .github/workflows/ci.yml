@@ -962,6 +962,23 @@ jobs:
         run: |
           test "$(cargo-deny --version)" = "cargo-deny 0.19.9"
           cargo deny --manifest-path crates/Cargo.toml --all-features check bans licenses sources advisories
+      # crates/deny.toml ignores RUSTSEC-2026-0457 and RUSTSEC-2026-0462 only
+      # because the rmcp features carrying them are off. This step fails the
+      # moment one of them is enabled, so the ignore cannot outlive its reason.
+      - name: rmcp advisory features stay disabled
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked --manifest-path crates/Cargo.toml -e features -i rmcp --workspace --all-features)
+          features=$(printf '%s\n' "$tree" | grep -o 'rmcp feature "[^"]*"' | sort -u || true)
+          printf '%s\n' "$features"
+          if ! printf '%s\n' "$features" | grep -qx 'rmcp feature "server"'; then
+            echo "::error::could not read the resolved rmcp feature set"
+            exit 1
+          fi
+          if printf '%s\n' "$features" | grep -E '^rmcp feature "(auth|transport-streamable-http-client-reqwest|transport-streamable-http-client-unix-socket)"$'; then
+            echo "::error::an rmcp feature covered by an ignored advisory is enabled; remove the ignore from crates/deny.toml and move rmcp to 3.9 or later"
+            exit 1
+          fi
 
   data-leak-guard:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}JSON/JSONL data-leak guard
