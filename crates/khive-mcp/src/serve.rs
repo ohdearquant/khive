@@ -366,6 +366,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     enforce_strict_actor_mode(
         default_runtime.config().actor_id.as_deref(),
         &default_runtime.config().packs,
+        default_runtime.config().require_attributed_actor,
     )?;
     if should_warn_unattributed(
         default_runtime.config().actor_id.as_deref(),

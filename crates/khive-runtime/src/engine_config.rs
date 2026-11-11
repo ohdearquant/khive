@@ -293,6 +293,7 @@ impl ConfigError {
 /// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
+/// require_attributed = true                       # refuse comm without an actor (optional)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -363,6 +364,18 @@ pub struct ActorConfig {
     /// into an owned namespace and widens no read.
     #[serde(default)]
     pub owned_namespaces: Vec<String>,
+
+    /// Refuse to serve or dispatch while the `comm` pack is loaded and no
+    /// attributed actor is resolved, exactly as `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`
+    /// does. Either one turns the refusal on; neither can turn the other off.
+    /// Every other key comes from the first config file found; this one is ORed
+    /// across the database-anchored file and every existing discovery tier (cwd
+    /// `khive.toml`, cwd `.khive/config.toml`, `~/.khive/config.toml`), so a
+    /// project file without it cannot shadow a home file that sets it. An
+    /// explicit `--config`/`KHIVE_CONFIG` file is hermetic and is the only one
+    /// read. Valid without `id`. Defaults to `false`.
+    #[serde(default)]
+    pub require_attributed: bool,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -1825,6 +1838,48 @@ impl KhiveConfig {
         }
 
         Ok(None)
+    }
+
+    /// Whether `[actor].require_attributed` is set in the explicit file, or with
+    /// none, in any existing discovery tier, the database-anchored one included.
+    /// A file that fails to load is an error, never a silent `false`.
+    pub fn require_attributed_in_any_tier(
+        path: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        if let Some(p) = path {
+            if !p.exists() {
+                return Err(ConfigError::ExplicitConfigMissing {
+                    path: p.to_path_buf(),
+                });
+            }
+            return Ok(Self::load(Some(p))?.is_some_and(|cfg| cfg.actor.require_attributed));
+        }
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home_root = std::env::var_os("HOME").map(PathBuf::from);
+        Self::require_attributed_in_tiers(&project_root, home_root.as_deref(), db_path)
+    }
+
+    /// Every file the loader's tiers 2-4 may read (`load_with_roots_and_source`), plus the
+    /// cwd `.khive/config.toml`, which tier 3 reads when no database path is given.
+    pub(crate) fn require_attributed_in_tiers(
+        project_root: &Path,
+        home_root: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        let mut files = vec![
+            project_root.join("khive.toml"),
+            Self::project_config_anchor_dir(db_path, project_root).join("config.toml"),
+            project_root.join(".khive/config.toml"),
+        ];
+        files.extend(home_root.map(|home| home.join(".khive/config.toml")));
+        files.dedup();
+        for file in files.iter().filter(|file| file.exists()) {
+            if Self::load(Some(file))?.is_some_and(|cfg| cfg.actor.require_attributed) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn diagnostic_config_path(path: &Path) -> PathBuf {
