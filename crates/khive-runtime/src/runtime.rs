@@ -277,8 +277,9 @@ impl NamedVectorIdentity {
 
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, BackendIdError, NamespaceToken, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    BackendIdError, NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----

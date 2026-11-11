@@ -1098,6 +1098,116 @@ fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
     );
 }
 
+/// Resolve a seat-shaped config: `seat_toml` in the cwd project config and
+/// `db_toml` (when given) beside a database in a different directory.
+fn resolve_seat_shaped(
+    seat_toml: &str,
+    db_toml: Option<&str>,
+    namespace: &str,
+    namespace_explicit: bool,
+) -> RuntimeConfig {
+    std::env::remove_var("KHIVE_ACTOR");
+    let seat_dir = tempfile::tempdir().expect("seat tempdir");
+    std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+    std::fs::write(seat_dir.path().join(".khive/config.toml"), seat_toml)
+        .expect("write seat config");
+    let db_dir = tempfile::tempdir().expect("db tempdir");
+    let khive_dir = db_dir.path().join(".khive");
+    std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+    if let Some(toml) = db_toml {
+        std::fs::write(khive_dir.join("config.toml"), toml).expect("write db config");
+    }
+    let db_path = khive_dir.join("khive.db");
+    std::fs::write(&db_path, b"").expect("touch db file");
+    let db_str = db_path.to_str().expect("utf8 path").to_string();
+    let _seat_env = SeatEnv::enter(seat_dir.path());
+    resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(&db_str),
+        config: None,
+        namespace: Namespace::parse(namespace).expect("ns"),
+        namespace_explicit,
+        actor_explicit: false,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve seat-shaped config")
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_project_config_reaches_the_resolved_config() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved =
+        resolve_seat_shaped("[actor]\nrequire_attributed = true\n", None, "local", false);
+    assert!(
+        resolved.require_attributed_actor,
+        "a project config that requires an attributed actor must reach the resolved config"
+    );
+    assert_eq!(
+        resolved.actor_id, None,
+        "the knob names no actor of its own"
+    );
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_database_config_survives_a_project_config_without_it() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nid = \"lambda:seat-actor\"\n",
+        Some("[actor]\nrequire_attributed = true\n"),
+        "local",
+        false,
+    );
+    assert!(
+        resolved.require_attributed_actor,
+        "the database-anchored request for strict mode must hold when the project config is silent"
+    );
+    assert_eq!(resolved.actor_id.as_deref(), Some("lambda:seat-actor"));
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_project_config_holds_under_an_explicit_namespace() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nrequire_attributed = true\n",
+        None,
+        "lambda:explicit",
+        true,
+    );
+    assert!(
+        resolved.require_attributed_actor,
+        "an explicit namespace skips the project actor lookup but must not skip strict mode"
+    );
+    assert_eq!(resolved.actor_id.as_deref(), Some("lambda:explicit"));
+}
+
+#[test]
+#[serial]
+fn require_attributed_is_off_when_no_config_sets_it() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nid = \"lambda:seat-actor\"\n",
+        Some("[actor]\nid = \"lambda:db-actor\"\n"),
+        "local",
+        false,
+    );
+    assert!(
+        !resolved.require_attributed_actor,
+        "strict mode stays off unless a config asks for it"
+    );
+}
+
 /// #689 regression: an unset `--db`/`KHIVE_DB` must anchor tier-3
 /// `.khive/config.toml` discovery on the process cwd, not on
 /// `resolve_db_anchor(None)`'s materialized `$HOME/.khive/khive.db`
@@ -7435,7 +7545,7 @@ fn enforce_strict_actor_mode_returns_err_when_strict_and_no_actor() {
     // Strict mode ON + no actor + comm pack = Err.
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7462,7 +7572,7 @@ fn enforce_strict_actor_mode_ok_when_strict_and_actor_configured() {
     // Strict mode ON + proper actor = Ok (comm pack present is irrelevant).
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]));
+    let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7481,7 +7591,7 @@ fn enforce_strict_actor_mode_ok_when_strict_off_and_no_actor() {
     // never fires the guard.
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7499,7 +7609,7 @@ fn enforce_strict_actor_mode_ok_when_strict_on_but_no_comm_pack() {
     // Strict mode ON but comm pack not loaded = Ok (no risk of party-line).
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7508,6 +7618,88 @@ fn enforce_strict_actor_mode_ok_when_strict_on_but_no_comm_pack() {
         result.is_ok(),
         "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
              (no party-line risk even without actor)"
+    );
+}
+
+// --- enforce_strict_actor_mode: `[actor] require_attributed` ---
+
+fn with_strict_env_unset<T>(f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+    std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+    let out = f();
+    if let Some(v) = prev {
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v);
+    }
+    out
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_refuses_without_actor_when_env_is_unset() {
+    let result =
+        with_strict_env_unset(|| enforce_strict_actor_mode(None, &packs(&["kg", "comm"]), true));
+    let msg = result
+        .expect_err("[actor] require_attributed must refuse an unattributed comm caller")
+        .to_string();
+    assert!(
+        msg.contains("[actor] require_attributed = true"),
+        "error message must name the config key; got: {msg}"
+    );
+    assert!(
+        !msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        "error message must not blame an env flag that is unset; got: {msg}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_refuses_the_local_actor() {
+    let result = with_strict_env_unset(|| {
+        enforce_strict_actor_mode(Some("local"), &packs(&["kg", "comm"]), true)
+    });
+    assert!(
+        result.is_err(),
+        "the shared local identity is unattributed and must be refused"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_admits_a_named_actor() {
+    let result = with_strict_env_unset(|| {
+        enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]), true)
+    });
+    assert!(
+        result.is_ok(),
+        "a named actor satisfies strict mode: {result:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_admits_a_registry_without_comm() {
+    let result =
+        with_strict_env_unset(|| enforce_strict_actor_mode(None, &packs(&["kg", "memory"]), true));
+    assert!(
+        result.is_ok(),
+        "strict mode only guards the comm pack: {result:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn env_and_config_together_name_both_sources() {
+    let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+    std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+    let result = enforce_strict_actor_mode(None, &packs(&["comm"]), true);
+    match prev {
+        Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+        None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+    }
+    let msg = result.expect_err("both sources on must refuse").to_string();
+    assert!(
+        msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1") && msg.contains("require_attributed"),
+        "error message must name both sources; got: {msg}"
     );
 }
 

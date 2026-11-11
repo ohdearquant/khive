@@ -2713,3 +2713,121 @@ fn code_map_values_of_the_wrong_type_fail_configuration_load() {
         assert!(error.contains(key), "{error}");
     }
 }
+
+fn write_config(root: &std::path::Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let first = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the first-found file lacks the key"
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap(), "the home file's key is not shadowed");
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_dot_khive_config_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap());
+}
+
+#[test]
+fn require_attributed_is_off_when_no_tier_sets_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:home\"\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(!any.unwrap());
+}
+
+#[test]
+fn an_explicit_config_is_the_only_file_read_for_require_attributed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(
+        dir.path(),
+        "explicit.toml",
+        "[actor]\nid = \"lambda:explicit\"\n",
+    );
+    let explicit = dir.path().join("explicit.toml");
+    assert!(!KhiveConfig::require_attributed_in_any_tier(Some(&explicit), None).unwrap());
+    write_config(
+        dir.path(),
+        "strict.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let strict = dir.path().join("strict.toml");
+    assert!(KhiveConfig::require_attributed_in_any_tier(Some(&strict), None).unwrap());
+}
+
+#[test]
+fn require_attributed_in_a_database_anchored_config_holds_beside_a_cwd_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        db_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let db = db_dir.path().join(".khive/khive.db");
+    let first = KhiveConfig::load_with_roots(project_dir.path(), None, Some(&db))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the cwd khive.toml shadows the database-anchored file"
+    );
+    let any = KhiveConfig::require_attributed_in_tiers(project_dir.path(), None, Some(&db));
+    assert!(
+        any.unwrap(),
+        "the database-anchored file's key is not shadowed"
+    );
+}
