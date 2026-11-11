@@ -931,7 +931,11 @@ async fn run_exec_inline_read_only(
     db_context: ExecDbContext,
     strict: bool,
 ) -> Result<()> {
-    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+    if let Err(error) = enforce_strict_actor_mode(
+        cfg.actor_id.as_deref(),
+        &cfg.packs,
+        cfg.require_attributed_actor,
+    ) {
         return Err(report_invocation_refusal(
             Some(&ops),
             RefusalReason::AnonymousActor,
@@ -1576,7 +1580,11 @@ pub(super) async fn run_exec_inline_with_forward(
     // same tenant-isolation risk as in-process dispatch.  Checking only in the
     // in-process fallback (as was the case before this fix) allowed a strict-mode
     // client to silently forward through a pre-existing anonymous daemon and exit 0.
-    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+    if let Err(error) = enforce_strict_actor_mode(
+        cfg.actor_id.as_deref(),
+        &cfg.packs,
+        cfg.require_attributed_actor,
+    ) {
         return Err(report_invocation_refusal(
             Some(&ops),
             RefusalReason::AnonymousActor,
@@ -1926,7 +1934,11 @@ pub(super) async fn run_exec_ops_file(
     // the round-trip overhead of socket forwarding per chunk). Honors
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
-    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+    if let Err(error) = enforce_strict_actor_mode(
+        cfg.actor_id.as_deref(),
+        &cfg.packs,
+        cfg.require_attributed_actor,
+    ) {
         let tools = validated_tool_names(&mut validated.snapshot)?;
         return Err(report_tools_refusal(
             tools,

@@ -81,6 +81,13 @@ strict = true
 # denies all cross-namespace delivery. Each entry must be a valid namespace.
 # allowed_outbound_namespaces = ["lambda:otherbot"]
 
+# Refuse to serve or dispatch while the comm pack is loaded and no attributed
+# actor resolves (absent, empty or `local`), the same refusal as
+# KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1. Either one turns it on. Honored in this file
+# and in the project's .khive/config.toml; valid without `id`, so a shared home
+# config can require every caller to bring its own identity. Default false.
+# require_attributed = true
+
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
 
 [runtime]
@@ -313,6 +320,7 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                When exactly "1": refuse to start if the comm pack is loaded with
 #                                no actor identity (id None / local), preventing a shared "party-
 #                                line" inbox. Default: off. Only the literal "1" enables it.
+#                                [actor] require_attributed = true requests the same refusal.
 #
 # ── Session transcript mirror (pack `session`, ADR-080) ──────────────────────────
 #   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes/on.

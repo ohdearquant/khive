@@ -293,6 +293,7 @@ impl ConfigError {
 /// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
+/// require_attributed = true                       # refuse comm without an actor (optional)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -363,6 +364,15 @@ pub struct ActorConfig {
     /// into an owned namespace and widens no read.
     #[serde(default)]
     pub owned_namespaces: Vec<String>,
+
+    /// Refuse to serve or dispatch while the `comm` pack is loaded and no
+    /// attributed actor is resolved, exactly as `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`
+    /// does. Either one turns the refusal on; neither can turn the other off.
+    /// Read from the database-anchored config and from the project config, and
+    /// on when either sets it. Valid without `id`, so a shared home config can
+    /// require every caller to bring its own identity. Defaults to `false`.
+    #[serde(default)]
+    pub require_attributed: bool,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.

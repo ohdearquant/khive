@@ -45,12 +45,14 @@ pub(crate) fn should_warn_unattributed(actor_id: Option<&str>, loaded_packs: &[S
     khive_runtime::should_warn_unattributed_actor(actor_id, loaded_packs)
 }
 
-/// Return true when strict actor-attribution mode is active.
+/// Return true when the `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag
+/// requests strict actor-attribution mode.
 ///
-/// Set `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` to opt in. When active, starting the
-/// server with the `comm` pack loaded and no actor identity configured is a fatal
-/// error instead of a warning. Default is OFF to preserve OSS single-actor
-/// behaviour.
+/// When strict mode is active, starting the server with the `comm` pack loaded
+/// and no actor identity configured is a fatal error instead of a warning.
+/// Strict mode is also requested by `[actor] require_attributed = true`
+/// (carried as [`RuntimeConfig::require_attributed_actor`]); either source
+/// turns it on. Default is OFF to preserve OSS single-actor behaviour.
 ///
 /// This closes the #199/#200 misconfiguration window for cloud deployments where
 /// an operator who misses the startup warning would silently expose a party-line
@@ -63,7 +65,8 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 
 /// Enforce the strict-actor mode contract at server construction time.
 ///
-/// When `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`:
+/// When `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` or `config_requires` (the resolved
+/// `[actor] require_attributed`) is true:
 ///   - If `actor_id` is `None`/`"local"` AND `"comm"` is in the pack list →
 ///     return `Err` with a clear message. The server must NOT be constructed.
 ///
@@ -89,13 +92,22 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],
+    config_requires: bool,
 ) -> anyhow::Result<()> {
-    if is_strict_actor_mode() && should_warn_unattributed(actor_id, loaded_packs) {
+    let env_requires = is_strict_actor_mode();
+    if (env_requires || config_requires) && should_warn_unattributed(actor_id, loaded_packs) {
+        let source = match (env_requires, config_requires) {
+            (true, true) => {
+                "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 and [actor] require_attributed = true are set"
+            }
+            (true, false) => "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set",
+            _ => "[actor] require_attributed = true is set",
+        };
         anyhow::bail!(
-            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-             configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
-             starting in strict mode (comm pack requires an attributed actor to \
-             prevent party-line inbox exposure)."
+            "{source} but no actor identity is configured. Set KHIVE_ACTOR, \
+             --actor or [actor] id to this lambda's id before starting in strict \
+             mode (comm pack requires an attributed actor to prevent party-line \
+             inbox exposure)."
         );
     }
     Ok(())
@@ -380,6 +392,7 @@ pub(super) async fn build_server_from_prepared(
         enforce_strict_actor_mode(
             runtime.config().actor_id.as_deref(),
             &runtime.config().packs,
+            runtime.config().require_attributed_actor,
         )?;
         if should_warn_unattributed(
             runtime.config().actor_id.as_deref(),
