@@ -2,6 +2,26 @@
 
 use super::{async_trait, daemon, RequestParams};
 
+/// Refusal for a request frame with no attributed actor (absent, empty or
+/// `local`) on a daemon in strict attributed-actor mode. Nothing was
+/// dispatched, so nothing committed.
+fn anonymous_actor_refusal() -> daemon::DaemonDispatchError {
+    let reason = khive_types::RefusalReason::AnonymousActor.as_str();
+    let message = "strict attributed-actor mode is on for this daemon and the request \
+                   carries no attributed actor; send the request with this caller's actor \
+                   id (KHIVE_ACTOR, --actor or [actor] id)";
+    daemon::DaemonDispatchError::new(
+        message,
+        Some(serde_json::json!({
+            "kind": "permission_denied",
+            "code": "anonymous_actor",
+            "reason": reason,
+            "message": message,
+            "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        })),
+    )
+}
+
 #[async_trait]
 impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
     fn plan(&self, ops: &str) -> String {
@@ -55,6 +75,15 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
                     "message": "bridge.diagnostics is available only on the stdio bridge",
                 })),
             ));
+        }
+        // Strict attributed-actor mode is checked when the server is built and
+        // on the exec client, against their own actor. A daemon serves each
+        // frame under the frame's actor instead, so the same policy is applied
+        // to that actor here, before anything dispatches.
+        if let Some(identity) = identity.as_ref() {
+            if self.strict_mode_refuses_actor(identity.actor_id.as_deref()) {
+                return Err(anonymous_actor_refusal());
+            }
         }
         let params = RequestParams {
             plan: None,

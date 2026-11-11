@@ -365,9 +365,12 @@ pub struct ActorConfig {
     #[serde(default)]
     pub owned_namespaces: Vec<String>,
 
-    /// Refuse to serve or dispatch while the `comm` pack is loaded and no
-    /// attributed actor is resolved, exactly as `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`
-    /// does. Either one turns the refusal on; neither can turn the other off.
+    /// Strict attributed-actor mode while the `comm` pack is loaded, exactly as
+    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`; either one turns it on and neither can
+    /// turn the other off. An actor is unattributed when it is absent, empty or
+    /// `local`. A server refuses to start and `kkernel exec` refuses to run when
+    /// its own actor is unattributed, and a daemon refuses each request whose
+    /// frame carries an unattributed actor, before anything dispatches.
     /// Every other key comes from the first config file found; this one is ORed
     /// across the database-anchored file and every existing discovery tier (cwd
     /// `khive.toml`, cwd `.khive/config.toml`, `~/.khive/config.toml`), so a

@@ -412,6 +412,22 @@ impl KhiveMcpServer {
         self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
     }
 
+    /// Whether strict attributed-actor mode refuses a request made as
+    /// `actor_id`. The policy is the one checked when this server was built
+    /// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` or `[actor] require_attributed`,
+    /// with the default-backend runtime's pack list), applied here to the
+    /// caller's actor instead of this server's own. A server with no retained
+    /// runtime (registry-only construction) has no pack list to check and
+    /// refuses nothing.
+    pub(crate) fn strict_mode_refuses_actor(&self, actor_id: Option<&str>) -> bool {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return false;
+        };
+        let config = runtime.config();
+        (crate::serve::is_strict_actor_mode() || config.require_attributed_actor)
+            && crate::serve::should_warn_unattributed(actor_id, &config.packs)
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
