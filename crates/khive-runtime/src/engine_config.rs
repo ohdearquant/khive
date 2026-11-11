@@ -368,9 +368,12 @@ pub struct ActorConfig {
     /// Refuse to serve or dispatch while the `comm` pack is loaded and no
     /// attributed actor is resolved, exactly as `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`
     /// does. Either one turns the refusal on; neither can turn the other off.
-    /// Read from the database-anchored config and from the project config, and
-    /// on when either sets it. Valid without `id`, so a shared home config can
-    /// require every caller to bring its own identity. Defaults to `false`.
+    /// Every other key comes from the first config file found; this one is ORed
+    /// across the database-anchored file and every existing discovery tier (cwd
+    /// `khive.toml`, cwd `.khive/config.toml`, `~/.khive/config.toml`), so a
+    /// project file without it cannot shadow a home file that sets it. An
+    /// explicit `--config`/`KHIVE_CONFIG` file is hermetic and is the only one
+    /// read. Valid without `id`. Defaults to `false`.
     #[serde(default)]
     pub require_attributed: bool,
 }
@@ -1835,6 +1838,40 @@ impl KhiveConfig {
         }
 
         Ok(None)
+    }
+
+    /// Whether `[actor].require_attributed` is set in the explicit file, or with
+    /// none, in any existing discovery tier. A file that fails to load is an error,
+    /// never a silent `false`.
+    pub fn require_attributed_in_any_tier(path: Option<&Path>) -> Result<bool, ConfigError> {
+        if let Some(p) = path {
+            if !p.exists() {
+                return Err(ConfigError::ExplicitConfigMissing {
+                    path: p.to_path_buf(),
+                });
+            }
+            return Ok(Self::load(Some(p))?.is_some_and(|cfg| cfg.actor.require_attributed));
+        }
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home_root = std::env::var_os("HOME").map(PathBuf::from);
+        Self::require_attributed_in_tiers(&project_root, home_root.as_deref())
+    }
+
+    pub(crate) fn require_attributed_in_tiers(
+        project_root: &Path,
+        home_root: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        let mut files = vec![
+            project_root.join("khive.toml"),
+            project_root.join(".khive/config.toml"),
+        ];
+        files.extend(home_root.map(|home| home.join(".khive/config.toml")));
+        for file in files.iter().filter(|file| file.exists()) {
+            if Self::load(Some(file))?.is_some_and(|cfg| cfg.actor.require_attributed) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn diagnostic_config_path(path: &Path) -> PathBuf {

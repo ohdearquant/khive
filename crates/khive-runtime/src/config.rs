@@ -991,19 +991,17 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
-/// Read `[actor].require_attributed` from the same cwd-anchored project config
-/// [`resolve_project_actor_id`] reads.
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier, ORed.
 ///
 /// The database-anchored load already carries the key into
-/// [`RuntimeConfig::require_attributed_actor`]; this lookup covers a project
-/// config that the database anchor does not reach. Callers OR the two, so a
-/// request for strict mode in either file holds. `Ok(false)` when no project
-/// config exists.
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
 pub fn resolve_project_requires_attributed_actor(
     config_path: Option<&std::path::Path>,
 ) -> Result<bool, crate::engine_config::ConfigError> {
-    let khive_cfg = crate::engine_config::KhiveConfig::load_with_home_fallback(config_path, None)?;
-    Ok(khive_cfg.is_some_and(|cfg| cfg.actor.require_attributed))
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path)
 }
 
 // ---- Embedding model helpers ----
