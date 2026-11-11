@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::StorageBackend;
+use crate::test_hooks::TestHooks;
 use serial_test::serial;
 use std::time::Duration;
 
@@ -110,7 +111,7 @@ async fn external_index_drop_during_walk_stays_typed_without_bfs_restart() {
         before.pooled_acquisitions,
         "mid-walk failure must not re-ensure behind the writer"
     );
-    let external = rusqlite::Connection::open(path).unwrap();
+    let external = crate::test_hooks::registered(rusqlite::Connection::open(path).unwrap());
     let exists: bool = external
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='idx_graph_edges_ns_src_rel')",
@@ -209,7 +210,7 @@ async fn held_repair_fixture(direction: Direction) -> HeldRepairFixture {
         _dir: dir,
         backend,
         graph,
-        external: rusqlite::Connection::open(&path).unwrap(),
+        external: crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap()),
         root,
         child,
         direction,
@@ -479,7 +480,7 @@ impl ReleaseRepairAuthorizer {
         // The callback holds this exact writer. Reacquiring it after release
         // joins its admitted DDL ownership before removing the authorizer.
         let writer = self.pool.try_writer()?;
-        writer.conn().authorizer(
+        writer.conn().test_authorizer(
             None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
         )?;
         Ok(())
@@ -516,7 +517,7 @@ async fn admitted_index_repair_keeps_ddl_ownership_after_traversal_timeout() {
         let writer = fixture.backend.pool().try_writer().unwrap();
         writer
             .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| {
+            .test_authorizer(Some(move |context: AuthContext<'_>| {
                 if matches!(context.action, AuthAction::CreateIndex { index_name, .. } if index_name == index)
                     && !callback_fired.swap(true, Ordering::Relaxed)
                 {

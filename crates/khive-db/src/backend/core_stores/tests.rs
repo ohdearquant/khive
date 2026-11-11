@@ -1,3 +1,4 @@
+use crate::test_hooks::TestHooks;
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -283,7 +284,7 @@ async fn notes_schema_success_does_not_cache_failed_sequence_repair() {
             .execute("DELETE FROM notes_seq WHERE note_id=?1", [id.to_string()])
             .unwrap();
         let fired = denied.clone();
-        writer.conn().authorizer(Some(move |context: AuthContext<'_>| {
+        writer.conn().test_authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Insert { table_name } if table_name == "notes_seq") {
                 fired.store(true, Ordering::Relaxed); Authorization::Deny
             } else { Authorization::Allow }
@@ -313,7 +314,7 @@ async fn notes_schema_success_does_not_cache_failed_sequence_repair() {
         .try_writer()
         .unwrap()
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
     assert_eq!(notes.count_notes("local", None).await.unwrap(), 1);
     assert!(notes.note_sequence(id).await.unwrap().is_some());

@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const CANONICAL: &str = "idx_git_notes_history_canonical_sha";
 const NONCANONICAL: &str = "idx_git_notes_history_noncanonical";
@@ -181,23 +180,13 @@ fn seed_history(runtime: &KhiveRuntime, from: usize, to: usize) {
 }
 
 fn instruction_work(runtime: &KhiveRuntime, sql: &str) -> u64 {
-    let work = Arc::new(AtomicU64::new(0));
-    let counted = Arc::clone(&work);
     let writer = runtime.backend().pool().try_writer().unwrap();
     writer
         .autocommit(|conn| {
-            conn.progress_handler(
-                1,
-                Some(move || {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    false
-                }),
-            )
-            .unwrap();
-            let result: Result<i64, _> = conn.query_row(sql, ["local", "match"], |row| row.get(0));
-            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            let mut statement = conn.prepare(sql)?;
+            let result: Result<i64, _> = statement.query_row(["local", "match"], |row| row.get(0));
             assert_eq!(result.unwrap(), 1);
-            Ok(work.load(Ordering::Relaxed))
+            Ok(statement.get_status(rusqlite::StatementStatus::VmStep) as u64)
         })
         .unwrap()
 }

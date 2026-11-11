@@ -15,7 +15,7 @@ use super::{
 /// transaction is rolled back; a call that succeeded fails with
 /// `InvalidInput`.
 pub(super) fn settle_pooled_call<T>(
-    guard: &crate::pool::PooledAutocommitWriteUnit<'_>,
+    guard: &mut crate::pool::PooledAutocommitWriteUnit<'_>,
     operation: &'static str,
     result: khive_storage::types::StorageResult<T>,
 ) -> khive_storage::types::StorageResult<T> {

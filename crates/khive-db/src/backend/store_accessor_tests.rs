@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_hooks::TestHooks;
 use std::sync::{mpsc, Barrier};
 use std::time::Duration;
 
@@ -158,7 +159,7 @@ fn notes_sequence_repair_retries_after_schema_success() {
         let fired = Arc::clone(&denied);
         writer
             .conn()
-            .authorizer(Some(move |ctx: AuthContext<'_>| {
+            .test_authorizer(Some(move |ctx: AuthContext<'_>| {
                 if matches!(ctx.action, AuthAction::Insert { table_name } if table_name == "notes_seq") {
                     fired.store(true, Ordering::Relaxed);
                     Authorization::Deny
@@ -180,7 +181,7 @@ fn notes_sequence_repair_retries_after_schema_success() {
         let writer = backend.pool.try_writer().unwrap();
         writer
             .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
             .unwrap();
         let missing: i64 = writer
             .conn()
@@ -299,7 +300,8 @@ fn schema_index_dropped_externally_is_repaired_on_backend_reopen() {
         let backend = StorageBackend::sqlite_for_test(&path).unwrap();
         backend.entities().unwrap();
         {
-            let external = rusqlite::Connection::open(&path).unwrap();
+            let external =
+                crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
             external
                 .execute_batch("DROP INDEX idx_entities_namespace")
                 .unwrap();

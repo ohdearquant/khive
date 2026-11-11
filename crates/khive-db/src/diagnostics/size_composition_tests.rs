@@ -242,7 +242,7 @@ fn size_composition_keeps_admission_and_walk_in_one_snapshot() {
 #[test]
 fn size_composition_releases_snapshot_on_every_outcome() {
     let (_directory, pool, _path) = fixture();
-    let conn = pool
+    let mut conn = pool
         .open_standalone_reader(
             crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
         )
@@ -290,7 +290,7 @@ fn size_composition_releases_snapshot_on_every_outcome() {
 #[test]
 fn size_composition_cleanup_failure_cannot_report_success() {
     let (_directory, pool, _path) = fixture();
-    let conn = pool
+    let mut conn = pool
         .open_standalone_reader(
             crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
         )

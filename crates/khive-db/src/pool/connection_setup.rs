@@ -159,7 +159,10 @@ fn read_only_wal_open_target_for_path(path: &Path) -> Result<PathBuf, SqliteErro
 pub(crate) fn open_read_only_snapshot_connection(path: &Path) -> Result<Connection, SqliteError> {
     let (_, physical_path) = mint_db_identity(path)?;
     let target = read_only_wal_open_target_for_path(&physical_path)?;
-    let conn = Connection::open_with_flags(&target, reader_open_flags())?;
+    let conn = crate::pool::register_test_hooks(Connection::open_with_flags(
+        &target,
+        reader_open_flags(),
+    )?)?;
     #[cfg(feature = "namespace-trigram-proto")]
     register_namespace_trigram(&conn)?;
     Ok(conn)

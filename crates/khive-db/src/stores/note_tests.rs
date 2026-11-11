@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use khive_storage::WriterTaskRequestState;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
@@ -998,7 +999,10 @@ async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     };
     {
         let reader = pool.reader().unwrap();
-        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+        reader
+            .conn()
+            .test_authorizer(Some(deny_count_function))
+            .unwrap();
     }
 
     let request = PageRequest {
@@ -1042,7 +1046,7 @@ async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     let reader = pool.reader().unwrap();
     reader
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
 }
 
@@ -2162,7 +2166,7 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
     let result = store
         .with_writer_tx("test_pooled_commit", |conn| {
             conn.execute("INSERT INTO tx_finalize (id) VALUES (1)", [])?;
-            conn.authorizer(Some(deny_commit))?;
+            conn.test_authorizer(Some(deny_commit))?;
             Ok(())
         })
         .await;
@@ -2196,7 +2200,7 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
         .expect("verified rollback must leave the pooled writer usable");
     let conn = writer.conn();
     assert!(conn.is_autocommit());
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+    conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM tx_finalize", [], |row| row.get(0))
@@ -2220,7 +2224,7 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
             "test_pooled_rollback",
             |conn| -> Result<(), rusqlite::Error> {
                 conn.execute("INSERT INTO tx_rollback_fault (id) VALUES (1)", [])?;
-                conn.authorizer(Some(deny_rollback))?;
+                conn.test_authorizer(Some(deny_rollback))?;
                 Err(rusqlite::Error::InvalidQuery)
             },
         )
@@ -2263,7 +2267,7 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
     let result = store
         .with_writer_tx("test_pooled_panic", |conn| -> Result<(), rusqlite::Error> {
             conn.execute("INSERT INTO tx_panic_fault (id) VALUES (1)", [])?;
-            conn.authorizer(Some(deny_rollback))?;
+            conn.test_authorizer(Some(deny_rollback))?;
             panic!("intentional pooled transaction panic");
         })
         .await;

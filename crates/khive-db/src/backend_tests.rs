@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_hooks::TestHooks;
 use khive_storage::types::{EdgeFilter, SqlStatement, SqlValue};
 use khive_storage::{EntityFilter, EventFilter};
 
@@ -891,7 +892,7 @@ async fn failed_backfill_leaves_the_text_table_unproven() {
         .writer()
         .unwrap()
         .conn()
-        .authorizer(Some(|context: AuthContext<'_>| {
+        .test_authorizer(Some(|context: AuthContext<'_>| {
             if matches!(
                 context.action,
                 AuthAction::Insert {
@@ -910,7 +911,7 @@ async fn failed_backfill_leaves_the_text_table_unproven() {
         .writer()
         .unwrap()
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
     refused.expect_err("a refused marker write fails the fetch");
 
@@ -954,17 +955,11 @@ async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
         let work = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&work);
         {
-            let writer = backend.pool().writer().unwrap();
-            writer
-                .conn()
-                .progress_handler(
-                    1,
-                    Some(move || {
-                        counted.fetch_add(1, Ordering::Relaxed);
-                        false
-                    }),
-                )
-                .unwrap();
+            let mut writer = backend.pool().writer().unwrap();
+            writer.conn_mut().test_progress_every(1, move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                false
+            });
         }
 
         // All opens use this private backend's pooled writer. Release
@@ -978,9 +973,8 @@ async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .progress_handler(0, None::<fn() -> bool>)
-            .unwrap();
+            .conn_mut()
+            .test_progress_reset();
         result.expect("repeated text-store opens must succeed");
         (cold, work.load(Ordering::Relaxed) - cold)
     }

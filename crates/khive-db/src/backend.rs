@@ -737,7 +737,9 @@ impl StorageBackend {
         }
         let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
-        crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
+        writer.conn_mut().with_mut(|conn| {
+            crate::migrations::stage_attachment_cutover_with_admission(conn, &admission)
+        })
     }
 
     /// Atomically publish a verified batch of pack-owned attachment roles.
@@ -753,36 +755,36 @@ impl StorageBackend {
             ));
         }
         let mut writer = self.pool.writer()?;
-        let tx = writer
-            .conn_mut()
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let admission = self.pool.write_admission();
-        if let Err(error) = admission.check() {
-            let rollback = tx.rollback();
-            return Err(crate::migrations::capacity_refusal_after_rollback(
-                writer.conn(),
-                rollback,
-                error,
-                "verified attachment publication",
-            ));
-        }
-        for attachment in attachments {
-            attachment
-                .validate()
-                .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-            crate::migrations::apply_generic_verified_attachment(
-                &tx,
-                &attachment.record_uuid.to_string(),
-                attachment.substrate.as_str(),
-                &attachment.role,
-                &attachment.content_ref,
-                attachment.media_type.as_deref(),
-                attachment.size_bytes,
-                attachment.created_at,
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        writer.conn_mut().with_mut(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Err(error) = admission.check() {
+                let rollback = tx.rollback();
+                return Err(crate::migrations::capacity_refusal_after_rollback(
+                    conn,
+                    rollback,
+                    error,
+                    "verified attachment publication",
+                ));
+            }
+            for attachment in attachments {
+                attachment
+                    .validate()
+                    .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+                crate::migrations::apply_generic_verified_attachment(
+                    &tx,
+                    &attachment.record_uuid.to_string(),
+                    attachment.substrate.as_str(),
+                    &attachment.role,
+                    &attachment.content_ref,
+                    attachment.media_type.as_deref(),
+                    attachment.size_bytes,
+                    attachment.created_at,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Atomically swap GC liveness/fences to attachments, remove the legacy
@@ -799,7 +801,9 @@ impl StorageBackend {
         }
         let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
-        crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
+        writer.conn_mut().with_mut(|conn| {
+            crate::migrations::finalize_attachment_cutover_with_admission(conn, &admission)
+        })
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.

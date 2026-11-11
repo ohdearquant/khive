@@ -26,11 +26,7 @@ fn stored_row(pool: &ConnectionPool, id: Uuid) -> BTreeMap<String, SqliteValue> 
         .conn()
         .prepare("SELECT * FROM notes WHERE id = ?1")
         .unwrap();
-    let names: Vec<String> = statement
-        .column_names()
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
     statement
         .query_row([id.to_string()], |row| {
             names

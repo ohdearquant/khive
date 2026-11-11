@@ -5,7 +5,6 @@ use super::*;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Stdio;
-use std::sync::atomic::AtomicU64;
 
 const COMMIT_LOOKUP: &str = include_str!("../../sql/commits_by_sha_select.sql");
 
@@ -67,26 +66,16 @@ fn linear_history(repo: &Path, count: usize) -> Vec<String> {
 }
 
 fn lookup_work(rt: &KhiveRuntime, sha: &str) -> (Vec<String>, u64) {
-    let work = Arc::new(AtomicU64::new(0));
-    let counted = Arc::clone(&work);
     let writer = rt.backend().pool().try_writer().unwrap();
     writer
         .autocommit(|conn| {
             let mut statement = conn.prepare(COMMIT_LOOKUP).unwrap();
-            conn.progress_handler(
-                1,
-                Some(move || {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    false
-                }),
-            )
-            .unwrap();
             let rows = statement
                 .query_map(["local", sha], |row| row.get::<_, String>(0))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>();
-            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
-            Ok((rows.unwrap(), work.load(Ordering::Relaxed)))
+            let work = statement.get_status(rusqlite::StatementStatus::VmStep) as u64;
+            Ok((rows.unwrap(), work))
         })
         .unwrap()
 }

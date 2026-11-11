@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
 
@@ -300,7 +301,8 @@ async fn begin_failure_reply_waits_for_writer_tx_deregistration() {
     let handle = spawn(&pool, 8).expect("writer task spawn");
     // An independent SQLite writer does not hold khive's cooperative
     // volume lease, so this reaches the intended BEGIN-busy branch.
-    let lock_holder = rusqlite::Connection::open(&path).expect("external writer");
+    let lock_holder =
+        crate::test_hooks::registered(rusqlite::Connection::open(&path).expect("external writer"));
     lock_holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("hold database write lock");
@@ -377,7 +379,7 @@ async fn begin_immediate_failure_replies_error_without_running_op() {
 
     let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
 
-    let lock_holder = rusqlite::Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_ran = Arc::new(AtomicBool::new(false));
@@ -485,7 +487,7 @@ async fn transient_begin_contention_clears_within_budget_and_op_runs_once() {
     // A second khive writer would contend on the cooperative volume lease
     // before SQLite. This fixture needs an independent SQLite writer so it
     // exercises the intended BEGIN busy-handler path.
-    let lock_holder = Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_runs = Arc::new(AtomicUsize::new(0));
@@ -751,7 +753,7 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
                     operation: "test_commit_error_insert".into(),
                     message: e.to_string(),
                 })?;
-            conn.authorizer(Some(deny_commit))
+            conn.test_authorizer(Some(deny_commit))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -788,7 +790,7 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
 
     let affected = handle
         .send(|conn| {
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 .map_err(|e| StorageError::Pool {
                     operation: "test_remove_authorizer".into(),
                     message: e.to_string(),
@@ -823,7 +825,8 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
 
 #[test]
 fn top_level_request_returning_with_open_transaction_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
     let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -869,7 +872,8 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
 
 #[test]
 fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let executions = Arc::new(AtomicUsize::new(0));
@@ -884,7 +888,7 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
                     operation: "test_insert_before_commit_failure".into(),
                     message: e.to_string(),
                 })?;
-            conn.authorizer(Some(deny_commit_and_rollback))
+            conn.test_authorizer(Some(deny_commit_and_rollback))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -956,7 +960,7 @@ async fn poisoned_connection_retires_before_queued_top_level_request() {
                             operation: "test_active_insert".into(),
                             message: e.to_string(),
                         })?;
-                    conn.authorizer(Some(deny_commit_and_rollback))
+                    conn.test_authorizer(Some(deny_commit_and_rollback))
                         .map_err(|e| StorageError::Pool {
                             operation: "test_install_authorizer".into(),
                             message: e.to_string(),
@@ -1031,7 +1035,8 @@ async fn poisoned_connection_retires_before_queued_top_level_request() {
 
 #[test]
 fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let executions = Arc::new(AtomicUsize::new(0));
@@ -1040,7 +1045,7 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
     let request = WriteRequest {
         op: Box::new(move |conn| -> Result<(), StorageError> {
             executions_in_op.fetch_add(1, Ordering::SeqCst);
-            conn.authorizer(Some(deny_rollback))
+            conn.test_authorizer(Some(deny_rollback))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -1081,7 +1086,8 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
 
 #[test]
 fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -1472,7 +1478,7 @@ impl TestWriterStageClock for ControlledWriterClock {
 
 #[test]
 fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(Connection::open_in_memory().unwrap());
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1532,7 +1538,7 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
 
 #[test]
 fn wrapped_transaction_synthetic_commit_and_rollback() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(Connection::open_in_memory().unwrap());
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let (result, terminal) = execute_wrapped_transaction(&conn, "test_commit", |conn| {
@@ -1715,7 +1721,7 @@ async fn writer_task_failure_counters_are_acquisition_site_exact() {
 
         let active_result = handle
             .send(|conn| -> Result<(), StorageError> {
-                conn.authorizer(Some(deny_rollback))
+                conn.test_authorizer(Some(deny_rollback))
                     .map_err(|e| StorageError::Pool {
                         operation: "test_install_authorizer".into(),
                         message: e.to_string(),

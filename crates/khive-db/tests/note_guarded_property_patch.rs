@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -719,7 +720,7 @@ async fn queued_terminal_unknown_outcome_is_not_wrapped_or_retried() {
     handle
         .send_top_level(|connection| {
             connection
-                .authorizer(Some(deny_finalization))
+                .test_authorizer(Some(deny_finalization))
                 .map_err(|error| {
                     StorageError::driver(
                         StorageCapability::Sql,

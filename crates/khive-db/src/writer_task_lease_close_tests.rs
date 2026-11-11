@@ -1,5 +1,6 @@
 use super::*;
 use crate::disk_guard::{observe_close_with_lease, VolumeIdentity};
+use crate::test_hooks::TestHooks;
 use std::sync::atomic::Ordering;
 
 #[test]
@@ -8,7 +9,7 @@ fn terminal_and_unwinding_writer_close_before_volume_lease_release() {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("writer-poison.db");
         let locks = fixture.path().join("locks");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::test_hooks::registered(Connection::open(&path).unwrap());
         conn.execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
             .unwrap();
         let identity = VolumeIdentity::resolve(&path).unwrap();
@@ -16,6 +17,8 @@ fn terminal_and_unwinding_writer_close_before_volume_lease_release() {
             crate::pool::WriteAdmission::new(Some(path.clone()), 0, 100, Some(locks.clone()))
                 .unwrap(),
         );
+        let mut conn = conn;
+        crate::test_hooks::register(&mut conn).unwrap();
         let mut owned = BlockingWriterConnection::new(conn, admission);
         owned.volume_lease = Some(
             identity
@@ -27,7 +30,7 @@ fn terminal_and_unwinding_writer_close_before_volume_lease_release() {
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO admission_payload VALUES (1)")
             .unwrap();
         owned
-            .authorizer(Some(
+            .test_authorizer(Some(
                 |context: rusqlite::hooks::AuthContext<'_>| match context.action {
                     rusqlite::hooks::AuthAction::Transaction {
                         operation: rusqlite::hooks::TransactionOperation::Rollback,
@@ -56,7 +59,7 @@ fn terminal_and_unwinding_writer_close_before_volume_lease_release() {
         let _competitor = identity
             .acquire(Duration::from_millis(2000), Some(&locks))
             .unwrap();
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::test_hooks::registered(Connection::open(&path).unwrap());
         conn.busy_timeout(Duration::ZERO).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let rows: i64 = conn

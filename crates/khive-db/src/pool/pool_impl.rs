@@ -640,7 +640,7 @@ impl ConnectionPool {
         // Allocate once per physical reader; checkouts move the same box between
         // the queue and lease without allocating on every borrow/return.
         Ok(Box::new(PooledReader {
-            conn: self.open_reader_connection()?,
+            conn: crate::ProgressConn::new(self.open_reader_connection()?)?,
             opened_at,
             checkouts: 0,
         }))
@@ -1044,7 +1044,7 @@ impl ConnectionPool {
             return;
         }
 
-        close_connection_quietly(conn.conn);
+        close_connection_quietly(conn.conn.into_inner());
         self.replace_discarded_reader_slot();
     }
 
@@ -1054,7 +1054,7 @@ impl ConnectionPool {
     fn enqueue_reader_slot(&self, conn: Box<PooledReader>) {
         if let Err(conn) = self.readers.push(conn) {
             eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
-            close_connection_quietly(conn.conn);
+            close_connection_quietly(conn.conn.into_inner());
         }
     }
 
