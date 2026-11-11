@@ -1,4 +1,5 @@
 use super::*;
+use khive_db::test_hooks::TestHooks;
 
 mod runtime_measurement {
     include!("vamana/runtime_measurement_tests.rs");
@@ -2990,14 +2991,14 @@ async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
         writer
             .autocommit(|conn| {
                 let result = if armed {
-                    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+                    conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
                         AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
                             Authorization::Deny
                         }
                         _ => Authorization::Allow,
                     }))
                 } else {
-                    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 };
                 result.expect("set the transaction tripwire");
                 Ok(())

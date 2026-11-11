@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,7 +50,7 @@ async fn install_fault(runtime: &KhiveRuntime) -> Arc<Fault> {
         .send(move |connection| {
             let inserts = Arc::clone(&hooks);
             connection
-                .update_hook(Some(move |action, _database: &str, table: &str, _rowid| {
+                .test_update_hook(Some(move |action, _database: &str, table: &str, _rowid| {
                     if action == Action::SQLITE_INSERT && table == "events" {
                         inserts.inserted_events.fetch_add(1, Ordering::SeqCst);
                     }
@@ -58,7 +59,7 @@ async fn install_fault(runtime: &KhiveRuntime) -> Arc<Fault> {
                     StorageError::driver(StorageCapability::Sql, "unknown_usage_update_hook", error)
                 })?;
             connection
-                .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                .test_authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
                     if !hooks.armed.load(Ordering::SeqCst) {
                         return Authorization::Allow;
                     }

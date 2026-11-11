@@ -332,7 +332,7 @@ impl WriteAdmission {
 /// [`SqliteError::WriterPoisoned`] before it starts, and the lease is then
 /// released.
 pub struct WriterGuard<'pool> {
-    pub(super) guard: parking_lot::MutexGuard<'pool, Connection>,
+    pub(super) guard: parking_lot::MutexGuard<'pool, ProgressConn>,
     /// The origin (ADR-091 backend-scoped attribution) of the pool this
     /// guard was checked out from, carried so `transaction` can register its
     /// span with the correct origin without holding a `&ConnectionPool`.
@@ -352,11 +352,15 @@ pub(crate) struct PooledAutocommitWriteUnit<'pool> {
 }
 
 impl PooledAutocommitWriteUnit<'_> {
-    pub(crate) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &ProgressConn {
         self.writer.conn()
     }
 
-    pub(crate) fn rollback_or_retire(&self, context: &str) -> Result<(), SqliteError> {
+    pub(crate) fn conn_mut(&mut self) -> &mut ProgressConn {
+        self.writer.conn_mut()
+    }
+
+    pub(crate) fn rollback_or_retire(&mut self, context: &str) -> Result<(), SqliteError> {
         self.writer.rollback_or_retire(context)
     }
 }
@@ -368,8 +372,12 @@ pub(crate) struct PooledTransactionWriteUnit<'pool> {
 }
 
 impl PooledTransactionWriteUnit<'_> {
-    pub(crate) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &ProgressConn {
         self.writer.conn()
+    }
+
+    pub(crate) fn conn_mut(&mut self) -> &mut ProgressConn {
+        self.writer.conn_mut()
     }
 }
 
@@ -429,7 +437,7 @@ impl Drop for StandaloneWriteUnit {
 /// pool.try_checkpoint_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
 /// ```
 pub struct CheckpointGuard<'pool> {
-    pub(super) guard: parking_lot::MutexGuard<'pool, Connection>,
+    pub(super) guard: parking_lot::MutexGuard<'pool, ProgressConn>,
 }
 
 /// SQLite's three-column result from a fixed WAL checkpoint pragma.
@@ -560,9 +568,11 @@ impl<'pool> WriterGuard<'pool> {
     /// Bind the lease already owned by this guard to one autocommit write
     /// unit. The caller must construct the unit immediately before its first
     /// SQLite write, then keep it through the last call in that unit.
-    pub(crate) fn admit_autocommit(self) -> Result<PooledAutocommitWriteUnit<'pool>, SqliteError> {
+    pub(crate) fn admit_autocommit(
+        mut self,
+    ) -> Result<PooledAutocommitWriteUnit<'pool>, SqliteError> {
         if !self.guard.is_autocommit() {
-            self.pool.retire_pooled_writer(&self.guard);
+            self.pool.retire_pooled_writer(&mut self.guard);
             return Err(SqliteError::InvalidData(
                 "pooled autocommit write began on a connection in a transaction".to_string(),
             ));
@@ -585,12 +595,12 @@ impl<'pool> WriterGuard<'pool> {
     }
 
     /// Borrow inside an already owned internal write boundary.
-    pub(crate) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &ProgressConn {
         &self.guard
     }
 
     /// Borrow for the internal migration owner that retains this guard.
-    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+    pub(crate) fn conn_mut(&mut self) -> &mut ProgressConn {
         &mut self.guard
     }
 
@@ -621,7 +631,7 @@ impl<'pool> WriterGuard<'pool> {
         self,
         operation: impl FnOnce(&Connection) -> Result<R, SqliteError>,
     ) -> Result<R, SqliteError> {
-        let unit = self.admit_autocommit()?;
+        let mut unit = self.admit_autocommit()?;
         let result = operation(unit.conn()).map_err(statement_error);
         if unit.conn().is_autocommit() {
             return result;
@@ -662,7 +672,7 @@ impl<'pool> WriterGuard<'pool> {
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
         let mut tx_handle = None;
-        let writer = self;
+        let mut writer = self;
         writer.ensure_logical_write_checkout(
             "checkpoint writer checkout cannot start a logical transaction",
         )?;
@@ -687,7 +697,7 @@ impl<'pool> WriterGuard<'pool> {
                     ));
                 }
                 if !writer.guard.is_autocommit() {
-                    writer.pool.retire_pooled_writer(&writer.guard);
+                    writer.pool.retire_pooled_writer(&mut writer.guard);
                     return Err(SqliteError::WriterSettlementUnknown);
                 }
                 Ok(result)
@@ -713,14 +723,14 @@ impl<'pool> WriterGuard<'pool> {
     }
 
     /// Acquire SQLite's writer slot before sampling logical-write capacity.
-    fn begin_admitted_transaction(&self) -> Result<(), SqliteError> {
+    fn begin_admitted_transaction(&mut self) -> Result<(), SqliteError> {
         if !self.guard.is_autocommit() {
-            self.pool.retire_pooled_writer(&self.guard);
+            self.pool.retire_pooled_writer(&mut self.guard);
             return Err(SqliteError::InheritedWriterTransaction);
         }
         if let Err(error) = self.guard.execute_batch("BEGIN IMMEDIATE") {
             if !self.guard.is_autocommit() {
-                self.pool.retire_pooled_writer(&self.guard);
+                self.pool.retire_pooled_writer(&mut self.guard);
                 return Err(SqliteError::settlement_with_cause(
                     &error,
                     khive_storage::error::SqliteWriteStage::Begin,
@@ -738,9 +748,9 @@ impl<'pool> WriterGuard<'pool> {
         Ok(())
     }
 
-    pub(crate) fn rollback_or_retire(&self, context: &str) -> Result<(), SqliteError> {
+    pub(crate) fn rollback_or_retire(&mut self, context: &str) -> Result<(), SqliteError> {
         if !crate::connection_settlement::rollback_proves_autocommit(&self.guard) {
-            self.pool.retire_pooled_writer(&self.guard);
+            self.pool.retire_pooled_writer(&mut self.guard);
             tracing::error!(context, "pooled writer rollback did not prove autocommit");
             return Err(SqliteError::WriterSettlementUnknown);
         }
@@ -759,7 +769,7 @@ impl crate::migrations::MigrationTransactions for PooledMigrationTransactions<'_
         operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
     ) -> Result<T, SqliteError> {
         let mut writer = self.pool.writer()?;
-        let result = operation(writer.conn_mut());
+        let result = writer.conn_mut().with_mut(operation);
         if writer.guard.is_autocommit() {
             return result;
         }
@@ -782,7 +792,9 @@ impl Drop for WriterGuard<'_> {
             if let Some(replacement) = self.pool.retirement_connection.lock().take() {
                 // The mutex excludes all aliases; settlement precedes lease release.
                 let original = std::mem::replace(&mut *self.guard, replacement);
-                let _ = self.admission.close_retired_connection(original);
+                let _ = self
+                    .admission
+                    .close_retired_connection(original.into_inner());
             }
         }
     }
@@ -882,7 +894,7 @@ impl ConnectionPool {
     pub(crate) fn transaction_write_unit(
         &self,
     ) -> Result<super::PooledTransactionWriteUnit<'_>, SqliteError> {
-        let writer = self.writer()?;
+        let mut writer = self.writer()?;
         writer.begin_admitted_transaction()?;
         Ok(PooledTransactionWriteUnit { writer })
     }
@@ -917,11 +929,10 @@ impl ConnectionPool {
             let (result, _) = execute_wrapped_transaction(unit.conn(), operation, f);
             result
         } else {
-            let unit = self.transaction_write_unit().map_err(map_admission_error)?;
-            let conn = unit.conn();
-            let (result, terminal_state) = execute_wrapped_transaction(conn, operation, f);
+            let mut unit = self.transaction_write_unit().map_err(map_admission_error)?;
+            let (result, terminal_state) = execute_wrapped_transaction(unit.conn(), operation, f);
             if terminal_state.is_some() {
-                self.retire_pooled_writer(conn);
+                self.retire_pooled_writer(unit.conn_mut());
             }
             result
         };

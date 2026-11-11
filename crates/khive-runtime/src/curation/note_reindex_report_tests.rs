@@ -1,6 +1,7 @@
 use super::*;
 use crate::embedder_registry::EmbedderProvider;
 use crate::{NotePatch, RuntimeError};
+use khive_db::test_hooks::TestHooks;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::sync::{
@@ -121,7 +122,7 @@ async fn assert_report(fault: Fault, stage: ReindexModelStage) {
     if matches!(fault, Fault::Store | Fault::Publication) {
         let observed = sql_attempts.clone();
         let writer = runtime.backend().pool().writer().unwrap();
-        writer.autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+        writer.autocommit(|conn| Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
             let deny = match fault {
                 Fault::Store => matches!(context.action, AuthAction::CreateVtable { table_name, .. } if table_name == "vec_broken"),
                 Fault::Publication => matches!(context.action, AuthAction::Insert { table_name } if table_name == "vec_broken"),
@@ -137,7 +138,9 @@ async fn assert_report(fault: Fault, stage: ReindexModelStage) {
     if matches!(fault, Fault::Store | Fault::Publication) {
         let writer = runtime.backend().pool().writer().unwrap();
         writer
-            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+            .autocommit(|conn| {
+                Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?)
+            })
             .unwrap();
         assert!(
             sql_attempts.load(Ordering::SeqCst) > 0,
@@ -780,7 +783,7 @@ async fn public_note_update_reports_real_vector_publication_refusal_after_commit
     {
         let observed = denied.clone();
         let writer = runtime.backend().pool().writer().unwrap();
-        writer.autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+        writer.autocommit(|conn| Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Insert { table_name } if table_name == "vec_broken") {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
@@ -807,7 +810,9 @@ async fn public_note_update_reports_real_vector_publication_refusal_after_commit
     {
         let writer = runtime.backend().pool().writer().unwrap();
         writer
-            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+            .autocommit(|conn| {
+                Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?)
+            })
             .unwrap();
     }
     assert!(

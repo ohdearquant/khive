@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
@@ -604,7 +605,7 @@ fn receipt_cutover_validates_on_first_use_and_skips_the_validator_until_a_failed
         let writer = backend.pool().writer().unwrap();
         writer
             .autocommit(|conn| {
-                Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+                Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                     if matches!(
                         context.action,
                         AuthAction::Read {
@@ -672,7 +673,7 @@ fn receipt_cutover_validates_on_first_use_and_skips_the_validator_until_a_failed
         .pool()
         .writer()
         .unwrap()
-        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+        .autocommit(|conn| Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
 }
 

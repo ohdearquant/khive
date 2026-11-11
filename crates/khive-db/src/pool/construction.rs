@@ -10,6 +10,8 @@ use khive_storage::tx_registry::TxOrigin;
 use khive_storage::CapacityUnavailablePhase;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+
+use crate::ProgressConn;
 use tokio::sync::Semaphore;
 
 use crate::disk_guard_config::{resolve_disk_guard_config, DEFAULT_DISK_GUARD_DEADLINE_MS};
@@ -172,8 +174,8 @@ impl ConnectionPool {
             .flatten();
         #[cfg(any(unix, windows))]
         claimed_file_identity::verify_before_open(&config, identity_before_open)?;
-        let retirement_connection = Connection::open_in_memory()?;
-        retirement_connection.authorizer(Some(deny_retired_writer))?;
+        let mut retirement_connection = ProgressConn::new(Connection::open_in_memory()?)?;
+        retirement_connection.with_mut(|conn| conn.authorizer(Some(deny_retired_writer)))?;
         // Declared first so a failed bootstrap closes SQLite before releasing its lease.
         let mut initialization_lease = None;
         let mut writer = open_writer_connection(
@@ -278,7 +280,7 @@ impl ConnectionPool {
         crate::statement_observer::install(&writer, &statement_observer)?;
 
         let mut pool = Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(ProgressConn::new(writer)?)),
             retirement_connection: Mutex::new(Some(retirement_connection)),
             #[cfg(any(test, feature = "test-support"))]
             statement_observer,

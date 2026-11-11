@@ -851,7 +851,7 @@ async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock()
         .expect("file-backed writer task");
     writer_task
         .send_top_level(|conn| {
-            conn.busy_handler(None)
+            conn.busy_timeout(std::time::Duration::ZERO)
                 .map_err(|error| khive_storage::StorageError::Internal(error.to_string()))
         })
         .await

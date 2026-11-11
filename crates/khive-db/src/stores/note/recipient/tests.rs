@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use crate::stores::note::transport::{SenderAssurance, SenderEnvelope, SenderTransportStore};
+use crate::test_hooks::TestHooks;
 use crate::StorageBackend;
 use khive_storage::{DeleteMode, NoteStore};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -373,7 +374,7 @@ async fn correlation_lookup_uses_reader_before_writer_transaction() {
     pool.writer()
         .unwrap()
         .conn()
-        .authorizer(Some(|context: AuthContext<'_>| {
+        .test_authorizer(Some(|context: AuthContext<'_>| {
             if let AuthAction::Read { table_name, .. } = context.action {
                 if table_name == "notes" && context.accessor.is_none() {
                     return Authorization::Deny;
@@ -388,7 +389,7 @@ async fn correlation_lookup_uses_reader_before_writer_transaction() {
     pool.writer()
         .unwrap()
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
 
     let note = result.unwrap().note.unwrap();

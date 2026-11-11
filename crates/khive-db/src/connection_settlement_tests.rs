@@ -1,4 +1,5 @@
 use crate::disk_guard::VolumeIdentity;
+use crate::test_hooks::TestHooks;
 use crate::{ConnectionPool, DiskGuardEnvironment, PoolConfig, SqliteError};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use rusqlite::Connection;
@@ -10,7 +11,7 @@ fn poison(conn: &Connection, terminal: bool) {
     conn.execute_batch("INSERT INTO admission_payload VALUES (1)")
         .unwrap();
     std::mem::forget(conn.prepare("SELECT 1").unwrap());
-    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+    conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
         AuthAction::Transaction {
             operation: TransactionOperation::Rollback,
         } => Authorization::Deny,
@@ -29,7 +30,7 @@ fn assert_recovered(root: &Path) {
     let _lease = identity
         .acquire(Duration::from_millis(2000), Some(&root.join("locks")))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
+    let conn = crate::test_hooks::registered(Connection::open(&path).unwrap());
     conn.busy_timeout(Duration::ZERO).unwrap();
     conn.execute_batch("BEGIN IMMEDIATE")
         .expect("OWNED_SETTLEMENT_LIVE_REOPEN: old owner must settle before this process exits");
@@ -42,7 +43,7 @@ fn assert_recovered(root: &Path) {
     conn.execute_batch("ROLLBACK").unwrap();
     let second_path = root.join("same-volume.db");
     assert_eq!(identity, VolumeIdentity::resolve(&second_path).unwrap());
-    let second = Connection::open(second_path).unwrap();
+    let second = crate::test_hooks::registered(Connection::open(second_path).unwrap());
     second
         .execute_batch("CREATE TABLE successor (id INTEGER); INSERT INTO successor VALUES (1)")
         .unwrap();
@@ -282,7 +283,8 @@ fn lifetime_unsettled_close_busy_poisons_the_pool_and_releases_the_lease() {
 #[test]
 fn terminal_settlement_failure_is_a_typed_unknown_outcome() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = Connection::open(dir.path().join("terminal.db")).unwrap();
+    let conn =
+        crate::test_hooks::registered(Connection::open(dir.path().join("terminal.db")).unwrap());
     conn.execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
         .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();

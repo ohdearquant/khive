@@ -196,7 +196,7 @@ async fn completed_v21_gc_gate_requires_new_indexes_and_absent_legacy_column() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     assert!(blob_gc_fencing_complete(backend.sql().as_ref())
         .await
@@ -302,7 +302,7 @@ async fn completed_v21_gate_acceptance_matrix_rejects_each_removed_fact_independ
         let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
             writer
                 .conn_mut()
                 .execute_batch(mutation_sql)
@@ -421,7 +421,7 @@ async fn gate_rejects_ledger_ahead_of_binary_latest() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         // Positive control: the untouched fixture passes.
     }
     assert!(
@@ -464,7 +464,7 @@ async fn gate_rejects_incomplete_ledger_behind_v21() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     assert!(
         blob_gc_fencing_complete(backend.sql().as_ref())
@@ -518,7 +518,7 @@ async fn completed_v21_gate_fails_closed_when_marker_read_errors() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         // `ALTER TABLE ... DROP COLUMN` refuses outright here because the
         // table's own compound CHECK constraint still references
         // `completed_at`; rebuild the table without the column instead
@@ -1505,7 +1505,7 @@ async fn transactional_orphan_sweep_refuses_v20_before_root_or_claim_mutation() 
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_v20_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_v20_gc_fixture);
     }
 
     let root = dir.path().join("blobs");
@@ -1597,7 +1597,7 @@ async fn transactional_orphan_sweep_refuses_incomplete_v21_marker_without_mutati
     let abandoned_ref = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute(
@@ -1669,7 +1669,7 @@ async fn both_sweep_apis_refuse_v20_and_incomplete_v21_epochs_in_both_modes() {
         {
             let mut writer = backend.pool().writer().unwrap();
             if incomplete_v21 {
-                prepare_completed_v21_gc_fixture(writer.conn_mut());
+                writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
                 writer
                     .conn_mut()
                     .execute(
@@ -1680,7 +1680,7 @@ async fn both_sweep_apis_refuse_v20_and_incomplete_v21_epochs_in_both_modes() {
                     )
                     .unwrap();
             } else {
-                prepare_v20_gc_fixture(writer.conn_mut());
+                writer.conn_mut().with_mut(prepare_v20_gc_fixture);
             }
         }
 
@@ -1788,7 +1788,7 @@ async fn transactional_orphan_sweep_recheck_refuses_before_root_lock_when_epoch_
     let backend = Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     assert!(blob_gc_fencing_complete(backend.sql().as_ref())
         .await
@@ -1868,7 +1868,7 @@ async fn transactional_orphan_sweep_accepts_completed_v21_attachment_liveness() 
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
 
     let store = FsBlobStore::new(dir.path().join("blobs"), 0)
@@ -1979,7 +1979,7 @@ async fn transactional_orphan_sweep_refuses_an_incomplete_cutover_marker() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute_batch(
@@ -2019,7 +2019,7 @@ async fn transactional_orphan_sweep_refuses_with_incomplete_fencing_triggers() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute_batch("DROP TRIGGER attachments_reject_claimed_blob_update")
@@ -2088,7 +2088,7 @@ async fn transactional_orphan_sweep_refuses_same_named_noop_fencing_triggers() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute_batch(
@@ -2148,7 +2148,7 @@ async fn fence_probe_refuses_id_collision_and_preserves_the_colliding_attachment
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute(
@@ -2206,7 +2206,7 @@ async fn fence_probe_does_not_touch_an_unrelated_retained_entity_sequence() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         // entities_seq rows intentionally survive entity hard deletion, so
         // an id can collide with the ledger alone — no entities row left
         // for the guard to trip on.
@@ -2279,7 +2279,7 @@ async fn blob_gc_evidence_rejects_a_nul_embedded_claim_ref() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute(
@@ -2311,7 +2311,7 @@ async fn blob_gc_evidence_rejects_a_nul_embedded_attachment_ref() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         // The table CHECK now rejects a NUL-embedded ref at admission
         // time; bypass it to simulate a row that reached this state some
         // other way (e.g. a pre-fix legacy row) and prove the validator
@@ -2355,7 +2355,7 @@ async fn fence_probe_refuses_a_digest_restricted_trigger_rewrite() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
 
     let sql = backend.sql();
@@ -2416,7 +2416,7 @@ async fn fence_probe_refuses_a_shape_restricted_trigger_rewrite() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute_batch(
@@ -2490,7 +2490,7 @@ async fn blob_gc_evidence_accepts_valid_refs_in_a_utf16le_database() {
             encoding, "UTF-16le",
             "the fixture database must actually be UTF-16le"
         );
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         // The fixture copies attachments from the (empty) entities table,
         // so seed one valid canonical row into each scanned table — with
         // no rows the probes measure nothing and a broken byte arm would
@@ -2538,7 +2538,7 @@ async fn blob_gc_evidence_rejects_a_nul_embedded_claim_ref_in_a_utf16le_database
             encoding, "UTF-16le",
             "the fixture database must actually be UTF-16le"
         );
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn_mut()
             .execute(
@@ -2566,7 +2566,7 @@ async fn transactional_orphan_sweep_preserves_put_started_after_liveness_mark() 
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = std::sync::Arc::new(
@@ -2621,7 +2621,7 @@ async fn transactional_orphan_sweep_releases_sqlite_writer_before_physical_delet
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = std::sync::Arc::new(
@@ -2718,7 +2718,7 @@ async fn cancelling_sweep_during_delete_keeps_owner_locks_until_blocking_work_fi
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = std::sync::Arc::new(
@@ -2799,7 +2799,7 @@ async fn transactional_orphan_sweep_recovers_stale_claims_fail_closed() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = FsBlobStore::new(root.clone(), 0)
@@ -2863,7 +2863,7 @@ async fn transactional_orphan_sweep_recovers_claims_after_root_relocation() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
 
     let old_root = dir.path().join("old-blobs");
@@ -2927,7 +2927,7 @@ async fn transactional_orphan_sweep_recovers_claims_copied_by_database_restore()
     {
         let source = crate::StorageBackend::sqlite_for_test(&source_path).unwrap();
         let mut writer = source.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
         writer
             .conn()
             .execute(
@@ -2973,7 +2973,7 @@ async fn transactional_orphan_sweep_bounds_each_durable_claim_batch() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = std::sync::Arc::new(
@@ -3029,16 +3029,18 @@ async fn abandoned_claim_recovery_deletes_at_most_one_batch_per_writer_hold() {
     backend.pool().run_migrations().unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        let tx = writer.conn_mut().transaction().unwrap();
-        for index in 0..(BLOB_GC_CLAIM_BATCH_SIZE + 1) {
-            tx.execute(
-                "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+        writer.conn_mut().with_mut(|conn| {
+            let tx = conn.transaction().unwrap();
+            for index in 0..(BLOB_GC_CLAIM_BATCH_SIZE + 1) {
+                tx.execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
                      VALUES ('abandoned-root', ?1, 1)",
-                [format!("{index:064x}")],
-            )
-            .unwrap();
-        }
-        tx.commit().unwrap();
+                    [format!("{index:064x}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        });
     }
 
     let released = release_abandoned_blob_gc_claim_batch(backend.sql().as_ref())
@@ -3062,7 +3064,7 @@ async fn transactional_orphan_sweep_refuses_corrupt_liveness_and_claim_evidence(
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = FsBlobStore::new(root.clone(), 0)
@@ -3151,7 +3153,7 @@ async fn transactional_orphan_sweep_republishes_deduplicated_external_put() {
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = std::sync::Arc::new(
@@ -3216,7 +3218,7 @@ async fn transactional_orphan_sweep_uses_all_attachment_refs_as_live() {
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let store = FsBlobStore::new(dir.path().join("blobs"), 0)
         .unwrap()
@@ -3291,7 +3293,7 @@ async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     // Default (non-zero) grace period -- this test exercises exactly
     // what it exists to protect.
@@ -3372,7 +3374,7 @@ async fn put_republishing_an_aged_orphan_restarts_its_grace_clock_before_the_ref
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let store = FsBlobStore::new(dir.path().join("blobs"), 0)
         .unwrap()
@@ -3461,7 +3463,7 @@ async fn put_dedup_mtime_refresh_has_no_observable_effect_under_zero_grace_perio
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let store = FsBlobStore::new(dir.path().join("blobs"), 0)
         .unwrap()
@@ -3494,7 +3496,7 @@ async fn transactional_orphan_sweep_still_removes_orphans_older_than_the_grace_p
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let store = FsBlobStore::new(dir.path().join("blobs"), 0)
         .unwrap()
@@ -3553,7 +3555,7 @@ async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_s
     let backend = std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
 
     let root = dir.path().join("blobs");
@@ -3653,7 +3655,7 @@ async fn transactional_orphan_sweep_walk_still_finds_a_real_orphan_past_its_grac
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        prepare_completed_v21_gc_fixture(writer.conn_mut());
+        writer.conn_mut().with_mut(prepare_completed_v21_gc_fixture);
     }
     let root = dir.path().join("blobs");
     let store = FsBlobStore::new(root.clone(), 0)

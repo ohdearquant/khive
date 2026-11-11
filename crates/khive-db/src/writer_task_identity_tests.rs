@@ -1,6 +1,7 @@
 use super::*;
 use crate::disk_guard::VolumeIdentity;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,7 +36,7 @@ async fn lifetime_writer_refuses_changed_volume_after_begin_and_recovers() {
         .send(move |conn| {
             conn.execute_batch("CREATE TABLE guarded (id INTEGER PRIMARY KEY)")
                 .unwrap();
-            conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            conn.test_authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
                 if matches!(
                     ctx.action,
                     AuthAction::Transaction {

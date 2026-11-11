@@ -1450,6 +1450,10 @@ async fn run_writer_task(
     write_admission: Arc<crate::pool::WriteAdmission>,
     busy_timeout: Duration,
 ) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Err(error) = crate::test_hooks::adopt(&mut owner.0) {
+        tracing::error!(%error, "writer task: test hook registration failed");
+    }
     while let Some(mut request) = rx.recv().await {
         // The bounded-channel wait ends at this exact dequeue boundary.
         // Sampling inside the blocking closure would misattribute a saturated

@@ -33,14 +33,14 @@ async fn transient_begin_refusal_retries_once_and_restores_timeout() {
         .send_top_level(move |conn| {
             // A successful timeout reduction installs SQLite's normal busy
             // handler for attempt two; only the first refusal is immediate.
-            conn.busy_handler(None)
+            conn.busy_timeout(Duration::ZERO)
                 .map_err(|error| StorageError::Internal(error.to_string()))?;
             count_begin_attempts(conn, begin_attempts_in_setup)
                 .map_err(|error| StorageError::Internal(error.to_string()))
         })
         .await
         .expect("install connection-local contention observers");
-    let lock_holder = Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_runs = Arc::new(AtomicUsize::new(0));
@@ -116,7 +116,7 @@ async fn transient_begin_refusal_retries_once_and_restores_timeout() {
 }
 
 fn count_begin_attempts(conn: &Connection, attempts: Arc<AtomicUsize>) -> rusqlite::Result<()> {
-    conn.authorizer(Some(move |context: AuthContext<'_>| {
+    conn.test_authorizer(Some(move |context: AuthContext<'_>| {
         if matches!(
             context.action,
             AuthAction::Transaction {
@@ -133,11 +133,11 @@ fn count_begin_attempts(conn: &Connection, attempts: Arc<AtomicUsize>) -> rusqli
 fn failed_busy_timeout_reduction_stops_before_a_second_begin() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("writer_task_timeout_update_failure.db"));
-    let conn = crate::pool::open_external_writer_fixture(&pool).unwrap();
+    let mut conn = crate::pool::open_external_writer_fixture(&pool).unwrap();
     let busy_timeout = Duration::from_secs(5);
     // Return BUSY before the budget expires, without manufacturing the
     // BEGIN result. Only the timeout setter below injects a failure.
-    conn.busy_handler(None).unwrap();
+    conn.busy_handler(None::<fn(i32) -> bool>).unwrap();
     let original_timeout: i64 = conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
         .unwrap();
@@ -253,7 +253,7 @@ async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
     );
     assert_eq!(before.writer_task_begin_busy_absorbed, 0);
 
-    let lock_holder = Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = handle
@@ -359,7 +359,7 @@ async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention
     }
 
     let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
-    let lock_holder = Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = handle

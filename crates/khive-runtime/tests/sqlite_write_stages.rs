@@ -1,5 +1,6 @@
 //! Native failures at actual transaction boundaries retain stage and code evidence.
 
+use khive_db::test_hooks::TestHooks;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -110,7 +111,7 @@ fn native_begin_statement_and_commit_failures_reach_the_wire() {
             let handle = queued.then(|| writer_task::spawn(&pool, 8).unwrap());
             let bridge = SqlBridge::new(Arc::clone(&pool), true);
             let mut writer = bridge.writer().await.unwrap();
-            let lock = rusqlite::Connection::open(&path).unwrap();
+            let lock = khive_db::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
             lock.execute_batch("BEGIN IMMEDIATE").unwrap();
             let ran = Arc::new(AtomicBool::new(false));
             let error = if let Some(handle) = &handle {
@@ -253,9 +254,9 @@ fn failed_pooled_settlement_retains_cause_without_claiming_definite_commit_failu
             .transaction(|conn| {
                 conn.execute("INSERT INTO t VALUES (1)", [])?;
                 if commit {
-                    conn.authorizer(Some(deny_commit_and_rollback))?;
+                    conn.test_authorizer(Some(deny_commit_and_rollback))?;
                 } else {
-                    conn.authorizer(Some(deny_rollback))?;
+                    conn.test_authorizer(Some(deny_rollback))?;
                     conn.execute("INSERT INTO t VALUES (1)", [])?;
                 }
                 Ok(())

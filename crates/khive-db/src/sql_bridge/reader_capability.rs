@@ -383,7 +383,7 @@ pub(super) fn admit_reader_capability_sql(
 
 pub(super) fn execute_query_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
-    conn: &rusqlite::Connection,
+    conn: &crate::ProgressConn,
     statement: &SqlStatement,
     operation: &'static str,
     rollback_interrupted_transaction: bool,
@@ -413,7 +413,7 @@ pub(super) fn execute_query_interruptibly(
 
 pub(super) fn execute_query_row_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
-    conn: &rusqlite::Connection,
+    conn: &crate::ProgressConn,
     statement: &SqlStatement,
     operation: &'static str,
     rollback_interrupted_transaction: bool,
@@ -443,7 +443,7 @@ pub(super) fn execute_query_row_interruptibly(
 
 pub(super) fn execute_query_page_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
-    conn: &rusqlite::Connection,
+    conn: &crate::ProgressConn,
     statement: &SqlStatement,
     page: &PageRequest,
     operation: &'static str,
@@ -475,7 +475,7 @@ pub(super) fn execute_query_page_interruptibly(
 
 pub(super) fn execute_query_consume_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
-    conn: &rusqlite::Connection,
+    conn: &crate::ProgressConn,
     statement: &SqlStatement,
     consumer: Box<dyn khive_storage::SqlRowConsumer>,
     operation: &'static str,

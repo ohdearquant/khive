@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use khive_storage::error::StorageError;
 use khive_storage::StorageCapability;
-use rusqlite::Connection;
 
 use crate::error::SqliteError;
+use crate::ProgressConn;
 
 use super::{
     deny_retired_writer, pool_exhausted_error, CheckpointGuard, ConnectionPool, ReaderAdmission,
@@ -435,9 +435,9 @@ impl ConnectionPool {
         Ok(CheckpointGuard { guard })
     }
 
-    pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
+    pub(crate) fn retire_pooled_writer(&self, conn: &mut ProgressConn) {
         self.pooled_writer_retired.store(true, Ordering::Release);
-        if let Err(error) = conn.authorizer(Some(deny_retired_writer)) {
+        if let Err(error) = conn.with_mut(|conn| conn.authorizer(Some(deny_retired_writer))) {
             tracing::error!(target: "khive_db::pool",
                 %error,
                 "failed to install the retired pooled-writer quarantine authorizer"

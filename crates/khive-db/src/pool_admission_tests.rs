@@ -1,6 +1,7 @@
 //! Disk-reserve admission, lease and settlement tests for the pool.
 
 use super::*;
+use crate::test_hooks::TestHooks;
 
 #[test]
 fn file_pool_without_explicit_volume_lock_dir_fails_closed() {
@@ -88,7 +89,7 @@ fn typed_pooled_transaction_probes_after_begin_and_recovers_after_refusal() {
     let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = Arc::clone(&samples);
     pool.set_test_write_admission(100, move |_| {
-        let competing = Connection::open(&path).unwrap();
+        let competing = crate::test_hooks::registered(Connection::open(&path).unwrap());
         competing.busy_timeout(Duration::ZERO).unwrap();
         let error = competing
             .execute_batch("BEGIN IMMEDIATE")
@@ -133,7 +134,7 @@ fn typed_standalone_transaction_probes_after_begin_and_recovers_after_refusal() 
     let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = Arc::clone(&samples);
     pool.set_test_write_admission(100, move |_| {
-        let competing = Connection::open(&path).unwrap();
+        let competing = crate::test_hooks::registered(Connection::open(&path).unwrap());
         competing.busy_timeout(Duration::ZERO).unwrap();
         let error = competing
             .execute_batch("BEGIN IMMEDIATE")
@@ -266,7 +267,7 @@ fn poisoned_pooled_connection_closes_before_its_volume_lease_is_released() {
     );
     let result: Result<(), SqliteError> = guard.transaction(|conn| {
         conn.execute_batch("INSERT INTO admission_payload VALUES (1)")?;
-        conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+        conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Transaction {
                 operation: TransactionOperation::Rollback,
             } => Authorization::Deny,
@@ -288,7 +289,7 @@ fn poisoned_pooled_connection_closes_before_its_volume_lease_is_released() {
     let _competitor = identity
         .acquire(Duration::from_millis(2000), Some(&locks))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
+    let conn = crate::test_hooks::registered(Connection::open(&path).unwrap());
     conn.busy_timeout(Duration::ZERO).unwrap();
     conn.execute_batch("BEGIN IMMEDIATE")
         .expect("same-volume successor sees a closed old transaction");
@@ -416,7 +417,7 @@ fn db_capacity_floor_refuses_pooled_transaction_after_begin() {
     })
     .unwrap();
     pool.set_test_write_admission(100, move |_| {
-        let competing = Connection::open(&path).unwrap();
+        let competing = crate::test_hooks::registered(Connection::open(&path).unwrap());
         competing.busy_timeout(Duration::ZERO).unwrap();
         let error = competing
             .execute_batch("BEGIN IMMEDIATE")

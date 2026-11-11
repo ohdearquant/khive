@@ -2172,6 +2172,7 @@ pub(crate) fn inspect_open_connection_interruptibly(
     // Declared before `conn`, so this witness runs after the connection drops.
     #[cfg(test)]
     let _connection_witness = DiagnosticConnectionDropWitness(scope.diagnostic_graph_probe());
+    let opened = opened.and_then(|conn| crate::ProgressConn::new(conn).map_err(Into::into));
     let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {

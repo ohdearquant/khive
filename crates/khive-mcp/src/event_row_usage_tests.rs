@@ -1,4 +1,5 @@
 //! Real storage writes observed through the production usage-envelope stamper.
+use khive_db::test_hooks::TestHooks;
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -606,7 +607,7 @@ async fn unknown_atomic_write_outcome_omits_usage_from_the_real_envelope() {
     let (pool, _directory) = pool(false, false);
     pool.writer()
         .unwrap()
-        .autocommit(|conn| Ok(conn.authorizer(Some(deny_rollback))?))
+        .autocommit(|conn| Ok(conn.test_authorizer(Some(deny_rollback))?))
         .unwrap();
     let bridge = khive_db::sql_bridge::SqlBridge::new(Arc::clone(&pool), false);
     let statements = khive_db::stores::event::event_insert_statements(&event()).unwrap();

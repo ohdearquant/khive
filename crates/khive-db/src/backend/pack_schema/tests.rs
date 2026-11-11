@@ -333,7 +333,7 @@ fn pack_column_read_only_validation_reports_all_missing_and_incompatible_columns
 fn pack_column_validation_preserves_query_errors() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(PLAN[0]).unwrap();
     conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
         AuthAction::Read {

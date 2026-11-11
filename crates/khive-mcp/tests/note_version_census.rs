@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -1093,7 +1094,7 @@ fn census() -> BTreeMap<(String, String), String> {
 }
 
 fn fixture(kind: &str, properties: &str) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     khive_db::migrations::run_migrations(&mut conn).unwrap();
     conn.execute(
         "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at) \
@@ -1106,7 +1107,7 @@ fn fixture(kind: &str, properties: &str) -> Connection {
 }
 
 fn deleted_fixture(kind: &str, properties: &str) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     khive_db::migrations::run_migrations(&mut conn).unwrap();
     conn.execute(
         "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at,deleted_at) \
@@ -1119,7 +1120,7 @@ fn deleted_fixture(kind: &str, properties: &str) -> Connection {
 }
 
 fn install_authorizer(conn: &Connection) {
-    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+    conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
         AuthAction::Update {
             table_name: "notes",
             column_name: "version",
@@ -1618,7 +1619,7 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         .unwrap();
     assert_eq!(version(&historical), 1);
     for direct in [false, true] {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
         if !direct {
             for migration in khive_db::migrations::MIGRATIONS
                 .iter()

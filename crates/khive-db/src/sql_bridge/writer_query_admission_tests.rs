@@ -1,5 +1,6 @@
 //! Public cached-writer admission and settlement witnesses.
 
+use crate::test_hooks::TestHooks;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -338,7 +339,7 @@ pub(super) fn configure_test_connection(
     }
     if hooks.deny_rollback {
         let terminal = hooks.terminal;
-        conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+        conn.test_authorizer(Some(move |context: AuthContext<'_>| match context.action {
             AuthAction::Transaction {
                 operation: TransactionOperation::Rollback,
             } => {
@@ -807,7 +808,7 @@ async fn cached_unsettled_script_reports_unknown_poisons_pool_and_releases_lease
         let _lease = identity
             .acquire(WATCHDOG, Some(&root.path().join("volume-locks")))
             .unwrap();
-        let conn = rusqlite::Connection::open(path).unwrap();
+        let conn = crate::test_hooks::registered(rusqlite::Connection::open(path).unwrap());
         conn.busy_timeout(Duration::ZERO).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert_eq!(

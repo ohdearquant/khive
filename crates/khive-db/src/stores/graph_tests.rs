@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use khive_storage::types::{
     Direction, EdgeUpsertDisposition, TraversalExecutionBudget, TraversalOptions,
     MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
@@ -378,7 +379,10 @@ async fn edge_pages_run_when_sqlite_count_is_denied() {
 
     {
         let reader = pool.reader().unwrap();
-        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+        reader
+            .conn()
+            .test_authorizer(Some(deny_count_function))
+            .unwrap();
     }
 
     assert!(
@@ -425,7 +429,7 @@ async fn edge_pages_run_when_sqlite_count_is_denied() {
     let reader = pool.reader().unwrap();
     reader
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
 }
 
@@ -3975,7 +3979,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let racer_path = path.clone();
     let (racer_started_tx, racer_started_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let racer = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&racer_path).unwrap();
+        let conn = crate::test_hooks::registered(rusqlite::Connection::open(&racer_path).unwrap());
         conn.busy_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let _ = racer_started_tx.send(());

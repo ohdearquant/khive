@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -146,7 +147,7 @@ fn quoted(identifier: &str) -> String {
 }
 
 fn scope_connection(migrated: bool) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     if migrated {
         khive_db::run_migrations(&mut conn).unwrap();
         let indexes: Vec<(String, String)> = conn
@@ -178,7 +179,7 @@ fn inspect_sql(conn: &Connection, pack: &str, sql: &str, prepare_only: bool) -> 
     let refused = Arc::new(Mutex::new(None));
     let recorded = Arc::clone(&refused);
     let mut created_indexes = BTreeSet::new();
-    conn.authorizer(Some(move |context: AuthContext<'_>| {
+    conn.test_authorizer(Some(move |context: AuthContext<'_>| {
         match context.action {
             AuthAction::CreateIndex { index_name, .. }
             | AuthAction::CreateTempIndex { index_name, .. } => {
@@ -204,7 +205,7 @@ fn inspect_sql(conn: &Connection, pack: &str, sql: &str, prepare_only: bool) -> 
     } else {
         conn.execute_batch(sql)
     };
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+    conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .map_err(|e| e.to_string())?;
     if let Some(reason) = refused.lock().unwrap().take() {
         let exception = if pack == "tool" {

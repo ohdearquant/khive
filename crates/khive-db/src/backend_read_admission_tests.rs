@@ -23,7 +23,7 @@ async fn admitted_store_constructor_finishes_ddl_after_cancellation() {
         let fired = fired.clone();
         writer
             .conn()
-            .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
+            .test_authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
                 fired.store(true, Ordering::SeqCst);
                 sender.send_replace(true);
                 rusqlite::hooks::Authorization::Allow
@@ -38,7 +38,7 @@ async fn admitted_store_constructor_finishes_ddl_after_cancellation() {
     let writer = backend.pool.writer().unwrap();
     writer
         .conn()
-        .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>)
+        .test_authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>)
         .unwrap();
     result.expect("request cancellation must not interrupt admitted constructor DDL");
     assert!(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef};
 use rusqlite::StatementStatus;
 use std::time::Duration;
@@ -76,7 +77,7 @@ fn assert_entity_id_seek(plan: &[String]) {
 
 #[test]
 fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch(ENTITIES_DDL).unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     let filter = EntityFilter {
@@ -150,7 +151,7 @@ fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
 }
 
 fn id_filtered_page_steps(unrelated: usize) -> (Vec<String>, i32) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch(ENTITIES_DDL).unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     conn.execute_batch("BEGIN").unwrap();
@@ -241,7 +242,7 @@ fn content_attachment(record_uuid: Uuid, digest: &str) -> Attachment {
 
 #[test]
 fn case_insensitive_candidate_lookup_uses_one_partial_index_seek_per_candidate() {
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     run_migrations(&mut conn).unwrap();
 
     let filter = EntityFilter {
@@ -673,7 +674,7 @@ async fn test_query_by_kind_and_entity_type() {
 
 #[test]
 fn legacy_entity_type_fallback_seeks_both_type_indexes() {
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     run_migrations(&mut conn).unwrap();
     for filter in [
         EntityFilter {
@@ -2106,7 +2107,7 @@ async fn pooled_entity_read_counts_busy_handler_timeouts() {
     assert!(store.get_entity(Uuid::new_v4()).await.unwrap().is_none());
     assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 0);
 
-    let holder = rusqlite::Connection::open(&path).unwrap();
+    let holder = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let refused = store.get_entity(Uuid::new_v4()).await.unwrap_err();
     assert!(
@@ -2303,7 +2304,7 @@ async fn entity_count_free_page_never_calls_count() {
             pool.reader()
                 .unwrap()
                 .conn()
-                .authorizer(Some(deny_count))
+                .test_authorizer(Some(deny_count))
                 .unwrap();
             let control = store
                 .query_entities(
@@ -2332,7 +2333,7 @@ async fn entity_count_free_page_never_calls_count() {
             pool.reader()
                 .unwrap()
                 .conn()
-                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 .unwrap();
             let restored = store
                 .query_entities("local", filter.clone(), request)

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::ProgressConn;
 use khive_storage::{error::StorageError, StorageCapability};
-use rusqlite::Connection;
 
 use crate::error::SqliteError;
 
@@ -17,7 +17,7 @@ use super::{
 
 #[derive(Debug)]
 pub(super) struct PooledReader {
-    pub(super) conn: Connection,
+    pub(super) conn: ProgressConn,
     pub(super) opened_at: Instant,
     pub(super) checkouts: u64,
 }
@@ -31,7 +31,7 @@ impl PooledReader {
 
 pub(super) enum ReaderLease<'pool> {
     Pooled(Box<PooledReader>),
-    Shared(parking_lot::MutexGuard<'pool, Connection>),
+    Shared(parking_lot::MutexGuard<'pool, ProgressConn>),
 }
 
 /// A value-extraction view of one row from a reader lease.
@@ -121,7 +121,7 @@ impl<'pool> ReaderGuard<'pool> {
     /// contract by calling `mark_dirty` (also crate-private). A raw
     /// `&Connection` is never handed to a caller outside `khive-db` — use
     /// [`Self::query_row`] instead, which admits only read-shaped SQL.
-    pub(crate) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &ProgressConn {
         match self
             .lease
             .as_ref()
@@ -244,13 +244,13 @@ impl<'pool> Drop for ReaderGuard<'pool> {
                 self.pool.return_reader(conn, self.dirty.get())
             }
             ReaderLease::Pooled(conn) => {
-                close_connection_quietly(conn.conn);
+                close_connection_quietly(conn.conn.into_inner());
                 self.pool.replace_discarded_reader_slot();
             }
-            ReaderLease::Shared(guard) if !self.reusable.get() => {
-                self.pool.retire_pooled_writer(&guard);
+            ReaderLease::Shared(mut guard) if !self.reusable.get() => {
+                self.pool.retire_pooled_writer(&mut guard);
             }
-            ReaderLease::Shared(guard) => {
+            ReaderLease::Shared(mut guard) => {
                 // The shared lease IS the pool's writer connection (degraded
                 // `max_readers == 0` mode) — there is no separate reader
                 // connection to close and replace. A dirty return that
@@ -259,7 +259,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
                 // uses, since reuse and replacement are equally unavailable
                 // here.
                 if self.dirty.get() && !restore_shared_reader_state(&guard, &self.pool.config) {
-                    self.pool.retire_pooled_writer(&guard);
+                    self.pool.retire_pooled_writer(&mut guard);
                 }
             }
         }
@@ -291,7 +291,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
 /// be held by the caller across those `.await` points and give the whole
 /// span real, exclusive ownership of the one connection.
 pub(crate) struct SharedReaderTransactionGuard {
-    conn: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Connection>,
+    conn: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ProgressConn>,
     admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: Arc<ConnectionPool>,
     checked_out_at: Instant,
@@ -304,7 +304,7 @@ pub(crate) struct SharedReaderTransactionGuard {
 }
 
 impl SharedReaderTransactionGuard {
-    pub(crate) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &ProgressConn {
         &self.conn
     }
 
@@ -331,7 +331,7 @@ impl Drop for SharedReaderTransactionGuard {
             restored = restore_shared_reader_state(&self.conn, &self.pool.config);
         }
         if !restored {
-            self.pool.retire_pooled_writer(&self.conn);
+            self.pool.retire_pooled_writer(&mut self.conn);
         }
         drop(self.admission_slot.take());
         self.pool

@@ -1,3 +1,4 @@
+use crate::test_hooks::TestHooks;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -240,7 +241,7 @@ async fn invalid_page_bounds_refuse_before_any_table_read() {
         .writer()
         .unwrap()
         .conn()
-        .authorizer(Some(move |context: AuthContext<'_>| {
+        .test_authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Read { .. }) {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
@@ -438,7 +439,7 @@ async fn page_uses_no_count_or_offset_and_does_not_write() {
         .writer()
         .unwrap()
         .conn()
-        .authorizer(Some(move |context: AuthContext<'_>| match context.action {
+        .test_authorizer(Some(move |context: AuthContext<'_>| match context.action {
             AuthAction::Function { function_name }
                 if function_name.eq_ignore_ascii_case("count") =>
             {

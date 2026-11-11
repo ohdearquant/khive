@@ -26,7 +26,7 @@ impl<'conn> RawMigrationWriteUnit<'conn> {
             .volume_identity()?
             .map(|volume| volume.diagnostic_key())
             .unwrap_or_else(|| "in-memory".to_string());
-        let replacement = Connection::open_in_memory()?;
+        let mut replacement = Connection::open_in_memory()?;
         replacement.authorizer(Some(|_: AuthContext<'_>| Authorization::Deny))?;
         let volume_lease = admission.acquire()?;
         Ok(Self {

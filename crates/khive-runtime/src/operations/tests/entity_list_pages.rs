@@ -1,4 +1,5 @@
 use super::*;
+use khive_db::test_hooks::TestHooks;
 
 #[tokio::test]
 async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
@@ -66,8 +67,8 @@ async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
         let writer = runtime.backend().pool().writer().unwrap();
         writer
             .autocommit(|conn| {
-                Ok(
-                    conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+                Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
+                    match context.action {
                         AuthAction::Function { function_name }
                             if function_name.eq_ignore_ascii_case("count") =>
                         {
@@ -75,8 +76,8 @@ async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
                             Authorization::Deny
                         }
                         _ => Authorization::Allow,
-                    }))?,
-                )
+                    }
+                }))?)
             })
             .unwrap();
     }
@@ -140,7 +141,7 @@ async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
         .pool()
         .writer()
         .unwrap()
-        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+        .autocommit(|conn| Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
     assert_eq!(
         store

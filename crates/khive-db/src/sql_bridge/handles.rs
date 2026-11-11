@@ -112,7 +112,8 @@ pub(crate) fn build_standalone_writer(
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(super::StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn)
+                .map_err(|error| map_rusqlite_err(error, "sql_bridge.writer_open"))?,
             _retained_slot: Some(slot),
             read_transaction_slot: None,
         }),

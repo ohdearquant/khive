@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_hooks::TestHooks;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use std::sync::atomic::AtomicU64;
 
@@ -36,7 +37,7 @@ fn fts_backfill_checks_capacity_after_begin_and_rolls_back_without_writes() {
     let began_available = Arc::clone(&available);
     writer
         .conn()
-        .authorizer(Some(move |context: AuthContext<'_>| {
+        .test_authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(
                 context.action,
                 AuthAction::Transaction {
@@ -53,7 +54,7 @@ fn fts_backfill_checks_capacity_after_begin_and_rolls_back_without_writes() {
     let result = ensure_fts_rowid_map_backfilled(writer.conn(), table, &pool.write_admission());
     writer
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
     assert!(
         matches!(result, Err(SqliteError::CapacityFloor { .. })),
@@ -101,7 +102,7 @@ fn schema_failure_retires_the_pooled_connection_before_release() {
         let writer = backend.pool().writer().unwrap();
         writer
             .conn()
-            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            .test_authorizer(Some(|context: AuthContext<'_>| match context.action {
                 AuthAction::Transaction {
                     operation: TransactionOperation::Rollback,
                 } => Authorization::Deny,
@@ -129,7 +130,7 @@ fn schema_failure_retires_the_pooled_connection_before_release() {
         .pool()
         .probe_retired_pooled_writer_for_test()
         .is_err());
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     conn.busy_timeout(std::time::Duration::ZERO).unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let persisted: i64 = conn
