@@ -11,6 +11,7 @@
 //! and a [`crate::ProgressConn`] removes its entry when it gives up the connection.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
 use parking_lot::Mutex;
@@ -26,6 +27,9 @@ pub(crate) struct Slots {
     authorizer: Mutex<Option<AuthorizerDelegate>>,
     progress: Mutex<Option<ProgressDelegate>>,
     update: Mutex<Option<UpdateDelegate>>,
+    // Set while `test_authorizer` checks that the delegating authorizer is still installed.
+    probing: AtomicBool,
+    probed: AtomicBool,
 }
 
 // Weak, so a connection's delegates are dropped with the connection's own hook closures.
@@ -78,6 +82,10 @@ fn install(conn: &mut Connection, slots: Arc<Slots>) -> rusqlite::Result<()> {
     let progress_slots = Arc::clone(&slots);
     conn.progress_handler(1_000, Some(move || progress(&progress_slots)))?;
     conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if slots.probing.load(Ordering::Acquire) {
+            slots.probed.store(true, Ordering::Release);
+            return Authorization::Allow;
+        }
         match slots.authorizer.lock().as_mut() {
             Some(delegate) => delegate(context),
             None => Authorization::Allow,
@@ -115,7 +123,9 @@ pub(crate) fn progress(slots: &Slots) -> bool {
 
 /// Hook installation for tests, through a shared borrow of a registered connection.
 pub trait TestHooks {
-    /// Replaces the test authorizer delegate (`None` removes it).
+    /// Replaces the test authorizer delegate (`None` removes it). Setting one fails when a raw
+    /// `Connection::authorizer` call has replaced the delegating authorizer, which would never
+    /// consult it.
     fn test_authorizer<F>(&self, hook: Option<F>) -> rusqlite::Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static;
@@ -137,8 +147,25 @@ impl TestHooks for Connection {
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
-        *slots(self).authorizer.lock() = hook.map(|hook| Box::new(hook) as AuthorizerDelegate);
+        let slots = slots(self);
+        let setting = hook.is_some();
+        *slots.authorizer.lock() = hook.map(|hook| Box::new(hook) as AuthorizerDelegate);
         self.flush_prepared_statement_cache();
+        if setting {
+            slots.probed.store(false, Ordering::Release);
+            slots.probing.store(true, Ordering::Release);
+            let prepared = self.prepare("SELECT 1").map(drop);
+            slots.probing.store(false, Ordering::Release);
+            prepared?;
+            if !slots.probed.load(Ordering::Acquire) {
+                *slots.authorizer.lock() = None;
+                return Err(rusqlite::Error::UserFunctionError(
+                    "test_authorizer: a raw authorizer replaced the delegating one on this \
+                     connection, so the delegate would never run"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -156,5 +183,37 @@ impl TestHooks for Connection {
     {
         *slots(self).update.lock() = hook.map(|hook| Box::new(hook) as UpdateDelegate);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test_authorizer_delegate_runs_on_a_registered_connection() {
+        let conn = registered(Connection::open_in_memory().unwrap());
+        conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
+            rusqlite::hooks::AuthAction::Select => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT 1").is_err(),
+            "the delegate denies SELECT"
+        );
+        conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(conn.prepare("SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn a_test_authorizer_refuses_after_a_raw_authorizer_replaced_the_delegate() {
+        let mut conn = registered(Connection::open_in_memory().unwrap());
+        conn.authorizer(Some(|_: AuthContext<'_>| Authorization::Allow))
+            .unwrap();
+        let refused = conn.test_authorizer(Some(|_: AuthContext<'_>| Authorization::Deny));
+        assert!(refused.is_err(), "the delegate would never run");
+        assert!(slots(&conn).authorizer.lock().is_none());
     }
 }
