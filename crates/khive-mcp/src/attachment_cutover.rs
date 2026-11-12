@@ -231,108 +231,115 @@ async fn coordinate_attachment_cutover_inner(
     }
 
     let prepared = Arc::clone(&backend);
-    let handle = khive_runtime::spawn_named_tracked_task("attachment_cutover", async move {
-        let sql = backend.sql();
-        #[cfg(test)]
-        test_sync::before_gc_owner(sql.as_ref()).await;
-        let owner = khive_db::stores::blob::acquire_database_gc_owner(sql.as_ref())
-            .await
-            .context("acquire canonical database GC owner for V21")?;
-
-        let (backend, owner, already_complete) = tokio::task::spawn_blocking(move || {
-            // The optimistic check before task creation is not a lock. A
-            // sibling process may complete V21 while this boot waits for the
-            // canonical GC owner, so re-check under ownership before issuing
-            // any SQL that still names the legacy column.
-            if backend.attachment_cutover_status()? == AttachmentCutoverStatus::Complete {
-                return Ok::<_, anyhow::Error>((backend, owner, true));
-            }
-            backend
-                .stage_attachment_cutover(&owner)
-                .context("commit V21 attachment stage 1")?;
-            Ok::<_, anyhow::Error>((backend, owner, false))
-        })
-        .await
-        .context("V21 stage-1 blocking task panicked")??;
-        if already_complete {
-            if let Some(backend_name) = mode.secondary_name() {
-                require_secondary_attachment_empty(backend, backend_name).await?;
-            }
-            return Ok(());
-        }
-
-        let verified = if let Some(backend_name) = mode.secondary_name() {
-            // Revalidate after stage while the same GC owner remains held.
-            // A legacy writer that raced the earlier inventory is now either
-            // visible both as a legacy ref and a staged content attachment,
-            // or will be caught by finalization's exact backfill recheck.
-            require_secondary_attachment_empty(Arc::clone(&backend), backend_name).await?;
-            Vec::new()
-        } else {
+    // The tracked child runs on its own task: every poll of it, and every write it
+    // queues, is migration class. Its blocking hops call cutover methods that scope
+    // themselves.
+    let migration = khive_db::WriteClassContext::migration();
+    let handle = khive_runtime::spawn_named_tracked_task(
+        "attachment_cutover",
+        migration.scope_future(async move {
             let sql = backend.sql();
-            let legacy_model_count = legacy_preference_model_count(sql.as_ref())
+            #[cfg(test)]
+            test_sync::before_gc_owner(sql.as_ref()).await;
+            let owner = khive_db::stores::blob::acquire_database_gc_owner(sql.as_ref())
                 .await
-                .context("count legacy moodboard preference models")?;
-            if legacy_model_count == 0 {
+                .context("acquire canonical database GC owner for V21")?;
+
+            let (backend, owner, already_complete) = tokio::task::spawn_blocking(move || {
+                // The optimistic check before task creation is not a lock. A
+                // sibling process may complete V21 while this boot waits for the
+                // canonical GC owner, so re-check under ownership before issuing
+                // any SQL that still names the legacy column.
+                if backend.attachment_cutover_status()? == AttachmentCutoverStatus::Complete {
+                    return Ok::<_, anyhow::Error>((backend, owner, true));
+                }
+                backend
+                    .stage_attachment_cutover(&owner)
+                    .context("commit V21 attachment stage 1")?;
+                Ok::<_, anyhow::Error>((backend, owner, false))
+            })
+            .await
+            .context("V21 stage-1 blocking task panicked")??;
+            if already_complete {
+                if let Some(backend_name) = mode.secondary_name() {
+                    require_secondary_attachment_empty(backend, backend_name).await?;
+                }
+                return Ok(());
+            }
+
+            let verified = if let Some(backend_name) = mode.secondary_name() {
+                // Revalidate after stage while the same GC owner remains held.
+                // A legacy writer that raced the earlier inventory is now either
+                // visible both as a legacy ref and a staged content attachment,
+                // or will be caught by finalization's exact backfill recheck.
+                require_secondary_attachment_empty(Arc::clone(&backend), backend_name).await?;
                 Vec::new()
             } else {
-                let verifier = verifier.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
+                let sql = backend.sql();
+                let legacy_model_count = legacy_preference_model_count(sql.as_ref())
+                    .await
+                    .context("count legacy moodboard preference models")?;
+                if legacy_model_count == 0 {
+                    Vec::new()
+                } else {
+                    let verifier = verifier.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
                         "V21 found {legacy_model_count} legacy moodboard preference model(s), but \
                          this build has no moodboard support (compiled without the \
                          `pack-moodboard` feature); rebuild with that feature enabled to \
                          migrate them, then retry boot"
                     )
-                })?;
-                let hydrator = hydrator.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
+                    })?;
+                    let hydrator = hydrator.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
                         "V21 found {legacy_model_count} legacy moodboard preference model(s), but \
                          no BlobHydrator is configured; configure [storage.blob] and retry boot"
                     )
-                })?;
-                let verified = verifier
-                    .verify_legacy_preference_attachments(sql.as_ref(), hydrator.as_ref())
-                    .await
-                    .context("verify legacy moodboard bundle/event/FANN evidence")?;
-                if verified.len() as u64 != legacy_model_count {
-                    anyhow::bail!(
-                        "legacy moodboard verification returned {} attachment(s) for \
+                    })?;
+                    let verified = verifier
+                        .verify_legacy_preference_attachments(sql.as_ref(), hydrator.as_ref())
+                        .await
+                        .context("verify legacy moodboard bundle/event/FANN evidence")?;
+                    if verified.len() as u64 != legacy_model_count {
+                        anyhow::bail!(
+                            "legacy moodboard verification returned {} attachment(s) for \
                          {legacy_model_count} recoverable model(s)",
-                        verified.len()
-                    );
+                            verified.len()
+                        );
+                    }
+                    verified
                 }
-                verified
-            }
-        };
+            };
 
-        let created_at = chrono::Utc::now().timestamp_micros();
-        let attachments = verified
-            .into_iter()
-            .map(|verified| Attachment {
-                record_uuid: verified.model_id,
-                substrate: AttachmentSubstrate::Entity,
-                role: FANN_NETWORK_ROLE.to_string(),
-                content_ref: verified.network_content_ref,
-                media_type: Some("application/octet-stream".to_string()),
-                size_bytes: Some(verified.size_bytes),
-                created_at,
+            let created_at = chrono::Utc::now().timestamp_micros();
+            let attachments = verified
+                .into_iter()
+                .map(|verified| Attachment {
+                    record_uuid: verified.model_id,
+                    substrate: AttachmentSubstrate::Entity,
+                    role: FANN_NETWORK_ROLE.to_string(),
+                    content_ref: verified.network_content_ref,
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(verified.size_bytes),
+                    created_at,
+                })
+                .collect::<Vec<_>>();
+
+            tokio::task::spawn_blocking(move || {
+                backend
+                    .apply_verified_attachments(&owner, &attachments)
+                    .context("atomically apply verified pack-owned attachments")?;
+                backend
+                    .finalize_attachment_cutover(&owner)
+                    .context("finalize V21 attachment/GC cutover")?;
+                Ok::<_, anyhow::Error>(())
             })
-            .collect::<Vec<_>>();
+            .await
+            .context("V21 finalization blocking task panicked")??;
 
-        tokio::task::spawn_blocking(move || {
-            backend
-                .apply_verified_attachments(&owner, &attachments)
-                .context("atomically apply verified pack-owned attachments")?;
-            backend
-                .finalize_attachment_cutover(&owner)
-                .context("finalize V21 attachment/GC cutover")?;
             Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("V21 finalization blocking task panicked")??;
-
-        Ok::<_, anyhow::Error>(())
-    });
+        }),
+    );
 
     handle
         .await
@@ -342,7 +349,7 @@ async fn coordinate_attachment_cutover_inner(
     // was just finished here (or by a sibling while this boot waited for the GC
     // owner) is still at V21. Apply the remaining migrations before the runtime
     // is built on it; the GC owner was released when the task above ended.
-    tokio::task::spawn_blocking(move || prepared.prepare_core_schema())
+    tokio::task::spawn_blocking(migration.wrap_blocking(move || prepared.prepare_core_schema()))
         .await
         .context("post-V21 schema preparation task panicked")?
         .context("apply the migrations after the V21 cutover")?;

@@ -149,15 +149,18 @@ impl SqlAttachmentStore {
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
-        tokio::task::spawn_blocking(move || {
-            let guard = pool
-                .autocommit_write_unit()
-                .map_err(|error| map_sqlite_err(error, operation))?;
-            f(guard.conn())
-                .map_err(|error| map_err(error, operation))
-                .map_err(crate::error::statement_failure)
-                .inspect_err(|error| pool.record_direct_writer_error(error))
-        })
+        // The lease is taken on the blocking thread; carry the caller's class to it.
+        tokio::task::spawn_blocking(
+            crate::disk_guard::WriteClassContext::capture().wrap_blocking(move || {
+                let guard = pool
+                    .autocommit_write_unit()
+                    .map_err(|error| map_sqlite_err(error, operation))?;
+                f(guard.conn())
+                    .map_err(|error| map_err(error, operation))
+                    .map_err(crate::error::statement_failure)
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
+            }),
+        )
         .await
         .map_err(|error| StorageError::driver(StorageCapability::Attachments, operation, error))?
     }
@@ -426,3 +429,7 @@ impl AttachmentStore for SqlAttachmentStore {
 #[cfg(test)]
 #[path = "attachment_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "attachment_lease_class_tests.rs"]
+mod lease_class_tests;

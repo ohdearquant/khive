@@ -109,10 +109,13 @@ pub(super) async fn prepare_core_schema_for_boot(
     label: impl Into<String>,
 ) -> anyhow::Result<u32> {
     let label = label.into();
-    tokio::task::spawn_blocking(move || backend.prepare_core_schema())
-        .await
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
+    tokio::task::spawn_blocking(
+        khive_db::WriteClassContext::migration()
+            .wrap_blocking(move || backend.prepare_core_schema()),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
 }
 
 /// Resolve and install blob hydration on an already prepared runtime.
