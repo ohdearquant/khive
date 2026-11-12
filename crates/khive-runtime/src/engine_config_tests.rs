@@ -2877,7 +2877,7 @@ fn a_malformed_shadowed_tier_is_refused_naming_the_file_and_the_file_in_use() {
              error in {}",
             shadowed.display(),
             used.display(),
-            home_dir.path().join(".khive/config.toml").display()
+            shadowed.display()
         ),
         "{text}"
     );
