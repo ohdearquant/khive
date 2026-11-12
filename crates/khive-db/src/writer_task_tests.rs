@@ -1802,6 +1802,21 @@ fn long_holds(class: crate::disk_guard::LeaseClass) -> u64 {
     histogram.buckets[11..].iter().sum::<u64>() + histogram.overflow_count
 }
 
+/// Waits up to five seconds for `long_holds(class)` to reach `at_least` and
+/// returns the last reading. The writer thread sends the reply before it
+/// releases the volume lease, and the hold is recorded at release, so the
+/// awaiting caller can read the histogram before the hold lands.
+async fn long_holds_reaching(class: crate::disk_guard::LeaseClass, at_least: u64) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = long_holds(class);
+        if now >= at_least || std::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 // Every queue entry point records the writer thread's lease under the class
 // the issuer was scoped to, and an unscoped request under the writer task's.
 #[tokio::test]
@@ -1833,14 +1848,14 @@ async fn every_queue_entry_point_records_the_lease_under_the_issuers_class() {
         .await
         .unwrap();
     assert!(
-        long_holds(LeaseClass::Migration) >= before + 4,
+        long_holds_reaching(LeaseClass::Migration, before + 4).await >= before + 4,
         "four 600 ms holds queued under a migration context are recorded as migration"
     );
 
     let before = long_holds(LeaseClass::WriterTask);
     handle.send(hold).await.unwrap();
     assert!(
-        long_holds(LeaseClass::WriterTask) > before,
+        long_holds_reaching(LeaseClass::WriterTask, before + 1).await > before,
         "an unscoped request keeps the writer task's class"
     );
 }
