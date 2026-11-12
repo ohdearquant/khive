@@ -249,7 +249,7 @@ if (!group || group === "--help" || group === "-h") {
   try {
     repoRoot = await getRepoRoot();
   } catch {
-    // Not in a git repo — production resolution (npm subpackage) does not need it.
+    // The override and module-relative build-output lookup do not need a repo root.
   }
   const bin = kkernelPath(repoRoot);
   const proc = new Deno.Command(bin, {
