@@ -25,8 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The workspace moves to rusqlite 0.41.1 (bundled SQLite 3.54.1). Read cancellation is now scoped to
   the connection the read runs on, so a write on another connection of the same thread is never
   interrupted by a read's cancel.
-- `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
-  third argument.
 
 ### Fixed
 
@@ -39,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The content secret gate also decodes escaped string runs that appear as JSON fragments inside prose
   or inside a larger value, so an escaped credential in a fragment is refused. A knowledge-graph
   proposal whose changeset carries an escaped credential is now refused when it is proposed.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig` adds `require_attributed_actor`, and
+  `khive_db::diagnostics::DiskGuardDiagnostics` adds `lease_hold_seconds`, whose type
+  `khive_db::diagnostics::LeaseHoldDiagnostics` is new.
+- `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
+  third argument.
 
 ## [0.18.0] - 2026-11-08
 ### Added
