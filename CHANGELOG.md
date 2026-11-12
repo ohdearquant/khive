@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The content secret gate also decodes escaped string runs that appear as JSON fragments inside prose
   or inside a larger value, so an escaped credential in a fragment is refused. A knowledge-graph
   proposal whose changeset carries an escaped credential is now refused when it is proposed.
+- A config file that is not the file in use, but is read to look for `[actor] require_attributed`,
+  now fails with an error naming that file and the file in use, instead of a bare parse error.
 
 ### Breaking (Rust crates)
 
