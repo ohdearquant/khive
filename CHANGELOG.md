@@ -41,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking (Rust crates)
 
 - Public structs gained fields, so direct struct literals must set them:
-  `khive_runtime::RuntimeConfig` adds `require_attributed_actor`, and
+  `khive_runtime::RuntimeConfig` adds `require_attributed_actor`,
+  `khive_runtime::engine_config::ActorConfig` adds `require_attributed`, and
   `khive_db::diagnostics::DiskGuardDiagnostics` adds `lease_hold_seconds`, whose type
   `khive_db::diagnostics::LeaseHoldDiagnostics` is new.
 - `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
