@@ -983,13 +983,8 @@ async fn failed_backfill_leaves_the_text_table_unproven() {
             .writer_acquisition_snapshot()
             .pooled_acquisitions
     };
-    backend
-        .text("unproven")
-        .unwrap()
-        .upsert_document(warm_text_document("ns"))
-        .await
-        .unwrap();
-
+    // The table's first fetch writes its marker, so the refusal covers that
+    // first fetch.
     backend
         .pool
         .writer()
@@ -1176,8 +1171,18 @@ async fn text_open_after_legacy_seed_backfills_the_map_with_full_parity() {
                     .unwrap();
             }
         }
+        // The first fetch above marked the then-empty table; a store that
+        // predates the map has no marker, so clear it after the raw seed.
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {map}_state WHERE key = 'backfill'"),
+                [],
+            )
+            .unwrap();
         writer.conn().execute_batch("COMMIT").unwrap();
     }
+    backend.forget_proven_text_tables_for_test();
     {
         let writer = backend.pool().writer().unwrap();
         let map_count: i64 = writer
