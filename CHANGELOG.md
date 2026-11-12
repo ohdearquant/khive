@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `khive_db::diagnostics::LeaseHoldDiagnostics` is new.
 - `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
   third argument.
+- `khive_runtime::ConfigError` gains the variant `ShadowedTier`, so an exhaustive match on it must
+  handle the new arm.
 
 ## [0.18.0] - 2026-11-08
 ### Added
