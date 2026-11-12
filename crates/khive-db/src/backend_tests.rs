@@ -811,11 +811,17 @@ async fn warm_text_fetch_does_not_take_the_writer() {
 
     let before = acquisitions();
     backend.text("warm").unwrap();
-    let store = backend.text("warm").unwrap();
     assert_eq!(
         acquisitions() - before,
-        2,
-        "a table with no rows has no marker, so every fetch re-checks it"
+        1,
+        "the first fetch of an empty table proves it and writes its marker"
+    );
+    let before = acquisitions();
+    let store = backend.text("warm").unwrap();
+    assert_eq!(
+        acquisitions(),
+        before,
+        "an empty table's marker is durable, so the next fetch must not take the writer"
     );
 
     store
@@ -824,19 +830,116 @@ async fn warm_text_fetch_does_not_take_the_writer() {
         .unwrap();
     let before = acquisitions();
     backend.text("warm").unwrap();
-    assert_eq!(
-        acquisitions() - before,
-        1,
-        "the first fetch after a row exists writes the marker"
-    );
-
-    let before = acquisitions();
-    backend.text("warm").unwrap();
     backend.text("warm").unwrap();
     assert_eq!(
         acquisitions(),
         before,
-        "a fetch after the marker is durable must not take the writer"
+        "a maintained write keeps the map, so a fetch after it must not take the writer"
+    );
+}
+
+/// The first check of an empty FTS table writes its completion marker, and a
+/// check that finds the marker absent (a restored store) clears map rows no
+/// live row backs before writing it.
+#[test]
+fn an_empty_text_table_gets_its_marker_and_loses_stale_map_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("text_empty_marker.db")).unwrap();
+    let table = "fts_empty_marker";
+    let map = format!("{table}_rowids");
+    let state = format!("{map}_state");
+    let marker = |backend: &StorageBackend| -> bool {
+        backend
+            .pool
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {state} WHERE key = 'backfill' AND value = ?1)"
+                ),
+                rusqlite::params![crate::stores::text::ROWID_MAP_BACKFILL_COMPLETE],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    backend.text("empty_marker").unwrap();
+    assert!(
+        marker(&backend),
+        "an empty table's first check writes the completion marker"
+    );
+
+    {
+        let writer = backend.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
+            .unwrap();
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {map} (namespace, subject_id, rowid) VALUES ('ns', 'gone', 7)"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+    backend.forget_proven_text_tables_for_test();
+    backend.text("empty_marker").unwrap();
+    assert!(
+        marker(&backend),
+        "the marker is rewritten for the still-empty table"
+    );
+    let stale: i64 = backend
+        .pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(&format!("SELECT COUNT(*) FROM {map}"), [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        stale, 0,
+        "a map row with no live FTS row is removed before the marker"
+    );
+}
+
+/// A sparse store is fetched on every sparse search. Once its table and index
+/// are ensured, a fetch for the same model key must take no write unit; a new
+/// model key is ensured once.
+#[test]
+fn warm_sparse_fetch_does_not_take_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("sparse_warm.db")).unwrap();
+    let acquisitions = || {
+        backend
+            .pool
+            .writer_acquisition_snapshot()
+            .pooled_acquisitions
+    };
+
+    let before = acquisitions();
+    backend.sparse_for_namespace("warm_model", "ns").unwrap();
+    assert_eq!(
+        acquisitions() - before,
+        1,
+        "the first fetch ensures the table"
+    );
+    let before = acquisitions();
+    backend.sparse_for_namespace("warm_model", "ns").unwrap();
+    backend.sparse_for_namespace("warm_model", "other").unwrap();
+    assert_eq!(
+        acquisitions(),
+        before,
+        "a fetch for an ensured model key, in any namespace, must not take the writer"
+    );
+    let before = acquisitions();
+    backend.sparse_for_namespace("second_model", "ns").unwrap();
+    assert_eq!(
+        acquisitions() - before,
+        1,
+        "a new model key is ensured once"
     );
 }
 
@@ -880,13 +983,8 @@ async fn failed_backfill_leaves_the_text_table_unproven() {
             .writer_acquisition_snapshot()
             .pooled_acquisitions
     };
-    backend
-        .text("unproven")
-        .unwrap()
-        .upsert_document(warm_text_document("ns"))
-        .await
-        .unwrap();
-
+    // The table's first fetch writes its marker, so the refusal covers that
+    // first fetch.
     backend
         .pool
         .writer()
@@ -1073,8 +1171,18 @@ async fn text_open_after_legacy_seed_backfills_the_map_with_full_parity() {
                     .unwrap();
             }
         }
+        // The first fetch above marked the then-empty table; a store that
+        // predates the map has no marker, so clear it after the raw seed.
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {map}_state WHERE key = 'backfill'"),
+                [],
+            )
+            .unwrap();
         writer.conn().execute_batch("COMMIT").unwrap();
     }
+    backend.forget_proven_text_tables_for_test();
     {
         let writer = backend.pool().writer().unwrap();
         let map_count: i64 = writer
@@ -1140,8 +1248,8 @@ async fn text_open_reconciles_a_partial_map_instead_of_treating_it_as_complete()
     let map = format!("{table}_rowids");
     let state = format!("{map}_state");
 
-    // Establishes the schema (and, since both tables are still empty,
-    // writes a marker for the empty case).
+    // Establishes the schema and, though both tables are still empty, writes
+    // the completion marker.
     let _ = backend.text(table_key).unwrap();
 
     let a = uuid::Uuid::new_v4();
@@ -1193,6 +1301,7 @@ async fn text_open_reconciles_a_partial_map_instead_of_treating_it_as_complete()
         writer.conn().execute_batch("COMMIT").unwrap();
     }
 
+    backend.forget_proven_text_tables_for_test();
     let store = backend.text(table_key).unwrap();
 
     let a_mapped: i64 = {
@@ -1274,6 +1383,7 @@ async fn text_open_removes_a_wrong_key_map_row_before_backfilling_the_right_one(
         writer.conn().execute_batch("COMMIT").unwrap();
     }
 
+    backend.forget_proven_text_tables_for_test();
     let store = backend.text(table_key).unwrap();
 
     let map_rows: Vec<(String, i64)> = {
@@ -1365,6 +1475,7 @@ async fn text_open_sweeps_the_duplicate_that_lost_the_survivor_race() {
         writer.conn().execute_batch("COMMIT").unwrap();
     }
 
+    backend.forget_proven_text_tables_for_test();
     let _ = backend.text(table_key).unwrap();
 
     let writer = backend.pool().writer().unwrap();
@@ -1528,6 +1639,7 @@ async fn text_open_writable_legacy_backfill_excludes_null_key_rows() {
     }
 
     // Must open without erroring against the map's NOT NULL columns.
+    backend.forget_proven_text_tables_for_test();
     let _ = backend.text(table_key).unwrap();
 
     let writer = backend.pool().writer().unwrap();
@@ -1596,6 +1708,7 @@ async fn text_open_writable_legacy_backfill_survivor_is_chosen_by_updated_at_not
         writer.conn().execute_batch("COMMIT").unwrap();
     }
 
+    backend.forget_proven_text_tables_for_test();
     let _ = backend.text(table_key).unwrap();
 
     let writer = backend.pool().writer().unwrap();
@@ -2023,6 +2136,7 @@ fn issue_1029_pool(write_queue_enabled: bool) -> (tempfile::TempDir, StorageBack
         path: Some(path),
         vector_tables_ready: Default::default(),
         text_tables_ready: Default::default(),
+        sparse_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };
@@ -2115,6 +2229,7 @@ async fn issue_1029_two_pools_same_file_write_queue_on() {
         path: Some(path.clone()),
         vector_tables_ready: Default::default(),
         text_tables_ready: Default::default(),
+        sparse_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };
@@ -2125,6 +2240,7 @@ async fn issue_1029_two_pools_same_file_write_queue_on() {
         path: Some(path),
         vector_tables_ready: Default::default(),
         text_tables_ready: Default::default(),
+        sparse_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };

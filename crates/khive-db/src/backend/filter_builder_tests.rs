@@ -43,6 +43,7 @@ fn memory_backend() -> StorageBackend {
         path: None,
         vector_tables_ready: Default::default(),
         text_tables_ready: Default::default(),
+        sparse_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     }

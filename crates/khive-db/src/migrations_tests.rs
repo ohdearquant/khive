@@ -2898,8 +2898,8 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
     let table = format!("fts_{table_key}");
     let map = format!("{table}_rowids");
     let state = format!("{map}_state");
-    // Establishes the schema; the table is empty so the marker is left
-    // deliberately unwritten (see `ensure_fts_rowid_map_backfilled`'s doc).
+    // Establishes the schema and writes the completion marker for the still
+    // empty table (see `ensure_fts_rowid_map_backfilled`'s doc).
     let _ = backend.text(table_key).unwrap();
     {
         let writer = backend.pool().writer().unwrap();
@@ -2908,10 +2908,11 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
         writer
             .conn()
             .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
-            .expect("clear the marker the empty-table open above did not write anyway");
+            .expect("clear the marker the empty-table open above wrote");
         writer.conn().execute_batch("COMMIT").unwrap();
     }
     // Triggers the real runtime reconciliation.
+    backend.forget_proven_text_tables_for_test();
     let _ = backend.text(table_key).unwrap();
 
     let migrated_fts: Vec<(i64, String, String, i64)> = migrated
