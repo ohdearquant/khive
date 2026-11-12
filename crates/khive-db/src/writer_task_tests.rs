@@ -847,6 +847,7 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
         top_level: true,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         admission: None,
     };
@@ -899,6 +900,7 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         admission: None,
     };
@@ -1058,6 +1060,7 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         admission: None,
     };
@@ -1108,6 +1111,7 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         admission: None,
     };
@@ -1506,6 +1510,7 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry,
         admission: None,
     };
@@ -1759,3 +1764,98 @@ async fn writer_task_failure_counters_are_acquisition_site_exact() {
 
 #[path = "writer_task_admission_metrics_tests.rs"]
 mod admission_metrics_tests;
+
+// The lease class of the issuing future reaches the writer thread that takes
+// the volume lease: work scoped as migration on the caller is recorded as
+// migration on the writer task, and unscoped work keeps the site's class.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn writer_task_applies_the_issuers_lease_class_on_the_writer_thread() {
+    use crate::disk_guard::{effective_class, LeaseClass, WriteClassContext};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("writer_task_lease_class.db");
+    let pool = file_pool(&path);
+    let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+    let scoped = WriteClassContext::migration()
+        .scope_future(handle.send(|_conn| Ok(effective_class(LeaseClass::WriterTask))))
+        .await
+        .expect("scoped op should succeed");
+    assert_eq!(scoped, LeaseClass::Migration);
+
+    let unscoped = handle
+        .send(|_conn| Ok(effective_class(LeaseClass::WriterTask)))
+        .await
+        .expect("unscoped op should succeed");
+    assert_eq!(unscoped, LeaseClass::WriterTask);
+}
+
+/// Holds of at least half a second recorded under `class` so far; see
+/// `pool_identity_admission_tests::long_holds`.
+fn long_holds(class: crate::disk_guard::LeaseClass) -> u64 {
+    let holds = crate::disk_guard::lease_hold_snapshot().expect("lease holds available");
+    let (_, histogram) = holds
+        .iter()
+        .find(|(recorded, _)| *recorded == class)
+        .expect("every class is reported");
+    histogram.buckets[11..].iter().sum::<u64>() + histogram.overflow_count
+}
+
+/// Waits up to five seconds for `long_holds(class)` to reach `at_least` and
+/// returns the last reading. The writer thread sends the reply before it
+/// releases the volume lease, and the hold is recorded at release, so the
+/// awaiting caller can read the histogram before the hold lands.
+async fn long_holds_reaching(class: crate::disk_guard::LeaseClass, at_least: u64) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = long_holds(class);
+        if now >= at_least || std::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// Every queue entry point records the writer thread's lease under the class
+// the issuer was scoped to, and an unscoped request under the writer task's.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn every_queue_entry_point_records_the_lease_under_the_issuers_class() {
+    use crate::disk_guard::{LeaseClass, WriteClassContext};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = file_pool(&dir.path().join("writer_task_lease_report.db"));
+    let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+    let hold = |_conn: &rusqlite::Connection| {
+        std::thread::sleep(Duration::from_millis(600));
+        Ok::<(), StorageError>(())
+    };
+
+    let migration = WriteClassContext::migration();
+    let before = long_holds(LeaseClass::Migration);
+    migration.scope_future(handle.send(hold)).await.unwrap();
+    migration
+        .scope_future(handle.send_bounded(hold))
+        .await
+        .unwrap();
+    migration
+        .scope_future(handle.send_top_level(hold))
+        .await
+        .unwrap();
+    migration
+        .scope_future(handle.send_at(hold, "lease_report_test"))
+        .await
+        .unwrap();
+    assert!(
+        long_holds_reaching(LeaseClass::Migration, before + 4).await >= before + 4,
+        "four 600 ms holds queued under a migration context are recorded as migration"
+    );
+
+    let before = long_holds(LeaseClass::WriterTask);
+    handle.send(hold).await.unwrap();
+    assert!(
+        long_holds_reaching(LeaseClass::WriterTask, before + 1).await > before,
+        "an unscoped request keeps the writer task's class"
+    );
+}
