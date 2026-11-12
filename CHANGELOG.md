@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-11
+### Added
+
+- `[actor] require_attributed = true` turns on strict attributed-actor mode, the same as
+  `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`. Unlike other keys it is ORed across every discovery-tier config
+  file, so a project file without it cannot shadow a home config that sets it; an explicit
+  `--config`/`KHIVE_CONFIG` file is the only one read. `RuntimeConfig` gains
+  `require_attributed_actor` and `ActorConfig` gains `require_attributed`.
+- `db_diagnostics` reports `disk_guard.lease_hold_seconds`: how long each volume lease was held, from
+  grant to release, as one process-wide histogram per operation class (`writer_task`, `pooled`,
+  `standalone`, `bootstrap`, `migration`, `maintenance`). `DiskGuardDiagnostics` gains
+  `lease_hold_seconds`.
+
+### Changed
+
+- The workspace moves to rusqlite 0.41.1 (bundled SQLite 3.54.1). Read cancellation is now scoped to
+  the connection the read runs on, so a write on another connection of the same thread is never
+  interrupted by a read's cancel.
+- `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
+  third argument.
+
+### Fixed
+
+- A warm daemon in strict attributed-actor mode refuses each request frame whose actor is absent,
+  empty, whitespace or `local`, before any op in the frame runs, so a batch frame is refused whole.
+  Before, only the server and `kkernel exec` checked their own actor.
+- The content secret gate scans the decoded value of every escaped string literal inside JSON text, so
+  a credential written with one JSON escape is refused. Nested JSON text is decoded up to 8 levels;
+  deeper nesting is refused.
+- The content secret gate also decodes escaped string runs that appear as JSON fragments inside prose
+  or inside a larger value, so an escaped credential in a fragment is refused. A knowledge-graph
+  proposal whose changeset carries an escaped credential is now refused when it is proposed.
+
 ## [0.18.0] - 2026-11-08
 ### Added
 
