@@ -6,10 +6,12 @@
 use std::sync::Arc;
 
 use khive_db::migrations::{AttachmentCutoverStatus, ATTACHMENT_CUTOVER_VERSION};
-use khive_runtime::attachment_cutover::{
-    coordinate_attachment_cutover, create_v20_database_fixture,
-};
+use khive_runtime::attachment_cutover::coordinate_attachment_cutover;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, RuntimeError, StorageBackend};
+
+#[path = "support/v20_fixture.rs"]
+mod v20_fixture;
+use v20_fixture::create_v20_database_fixture;
 
 fn config(db_path: &std::path::Path) -> RuntimeConfig {
     RuntimeConfig {

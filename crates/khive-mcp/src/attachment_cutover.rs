@@ -16,7 +16,10 @@ pub(crate) use khive_runtime::attachment_cutover::{
 };
 
 #[cfg(test)]
-pub(crate) use khive_runtime::attachment_cutover::create_v20_database_fixture;
+#[path = "../../khive-runtime/tests/support/v20_fixture.rs"]
+mod v20_fixture;
+#[cfg(test)]
+pub(crate) use v20_fixture::create_v20_database_fixture;
 
 /// The V21 legacy-moodboard verifier for this build, or `None` when compiled
 /// without the `pack-moodboard` feature.
