@@ -259,6 +259,23 @@ pub enum ConfigError {
         #[source]
         source: Box<ConfigError>,
     },
+
+    /// A discovery-tier file the loader does not use failed to load while it
+    /// was read only for `[actor] require_attributed`, which is ORed across
+    /// every tier. Still a refusal: the key could not be read from the file.
+    #[error(
+        "config file {} is not the file in use (in use: {}); it was read only to look for \
+         `[actor] require_attributed`, which could not be read from it: {source}",
+        path.display(),
+        in_use.as_deref().map_or_else(|| "none".to_string(), |used| used.display().to_string())
+    )]
+    ShadowedTier {
+        path: PathBuf,
+        /// The discovery-tier file the loader uses, if any exists.
+        in_use: Option<PathBuf>,
+        #[source]
+        source: Box<ConfigError>,
+    },
 }
 
 impl ConfigError {
@@ -1875,10 +1892,25 @@ impl KhiveConfig {
             Self::project_config_anchor_dir(db_path, project_root).join("config.toml"),
             project_root.join(".khive/config.toml"),
         ];
-        files.extend(home_root.map(|home| home.join(".khive/config.toml")));
+        let home_file = home_root.map(|home| home.join(".khive/config.toml"));
+        // The file `load_with_roots_and_source` reads: the first existing of tiers 2-4.
+        let in_use = [Some(&files[0]), Some(&files[1]), home_file.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|file| file.exists())
+            .cloned();
+        files.extend(home_file);
         files.dedup();
         for file in files.iter().filter(|file| file.exists()) {
-            if Self::load(Some(file))?.is_some_and(|cfg| cfg.actor.require_attributed) {
+            let loaded = Self::load(Some(file)).map_err(|source| match &in_use {
+                Some(used) if used == file => source,
+                _ => ConfigError::ShadowedTier {
+                    path: Self::diagnostic_config_path(file),
+                    in_use: in_use.as_deref().map(Self::diagnostic_config_path),
+                    source: Box::new(source),
+                },
+            })?;
+            if loaded.is_some_and(|cfg| cfg.actor.require_attributed) {
                 return Ok(true);
             }
         }

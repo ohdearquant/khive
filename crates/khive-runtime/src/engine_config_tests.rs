@@ -2831,3 +2831,123 @@ fn require_attributed_in_a_database_anchored_config_holds_beside_a_cwd_khive_tom
         "the database-anchored file's key is not shadowed"
     );
 }
+
+/// The refusal a shadowed tier's load failure produces, with its display text.
+fn shadowed_tier_refusal(result: Result<bool, ConfigError>) -> (PathBuf, Option<PathBuf>, String) {
+    match result {
+        Err(error @ ConfigError::ShadowedTier { .. }) => {
+            let text = error.to_string();
+            let ConfigError::ShadowedTier { path, in_use, .. } = error else {
+                unreachable!()
+            };
+            (path, in_use, text)
+        }
+        other => panic!("expected a shadowed-tier refusal, got {other:?}"),
+    }
+}
+
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn a_malformed_shadowed_tier_is_refused_naming_the_file_and_the_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(home_dir.path(), ".khive/config.toml", "[actor\n");
+    let shadowed = canonical(&home_dir.path().join(".khive/config.toml"));
+    let used = canonical(&project_dir.path().join("khive.toml"));
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, shadowed);
+    assert_eq!(in_use.as_deref(), Some(used.as_path()));
+    assert_eq!(
+        text.split(": TOML parse error").next().unwrap(),
+        format!(
+            "config file {} is not the file in use (in use: {}); it was read only to look for \
+             `[actor] require_attributed`, which could not be read from it: config TOML parse \
+             error in {}",
+            shadowed.display(),
+            used.display(),
+            shadowed.display()
+        ),
+        "{text}"
+    );
+    assert!(text.contains("invalid table header"), "{text}");
+}
+
+#[test]
+fn a_shadowed_tier_with_an_unknown_key_is_refused_naming_the_key() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\nrequire_attributes = true\n",
+    );
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, canonical(&home_dir.path().join(".khive/config.toml")));
+    assert_eq!(
+        in_use,
+        Some(canonical(&project_dir.path().join("khive.toml")))
+    );
+    assert!(
+        text.contains("was read only to look for `[actor] require_attributed`"),
+        "{text}"
+    );
+    assert!(text.contains("require_attributes"), "{text}");
+}
+
+#[test]
+fn a_malformed_file_in_use_keeps_its_own_parse_error() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), "khive.toml", "[actor\n");
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\n",
+    );
+    let result =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(
+        matches!(&result, Err(ConfigError::Parse { path, .. }) if path.ends_with("khive.toml")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), ".khive/config.toml", "[actor\n");
+    let db = db_dir.path().join(".khive/khive.db");
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        None,
+        Some(&db),
+    ));
+    assert_eq!(
+        path,
+        canonical(&project_dir.path().join(".khive/config.toml"))
+    );
+    assert_eq!(in_use, None);
+    assert!(text.contains("(in use: none)"), "{text}");
+}

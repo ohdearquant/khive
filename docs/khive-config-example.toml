@@ -85,11 +85,15 @@ strict = true
 # KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1; either one turns it on. An actor is
 # unattributed when it is absent, empty or `local`. The server refuses to start
 # and `kkernel exec` refuses to run when its own actor is unattributed, and a
-# daemon refuses each request whose frame carries an unattributed actor. Unlike other keys it
-# is ORed across every config file found (the database's, the cwd khive.toml and
-# .khive/config.toml, and ~/.khive/config.toml), so a project file without it
-# cannot shadow a home config that sets it. An explicit --config/KHIVE_CONFIG file
-# is the only one read. Valid without `id`. Default false.
+# daemon refuses each request frame whose actor is unattributed. The refusal is per
+# frame and comes before any op runs, so a batch frame is refused whole, read ops
+# included. Unlike other keys it is ORed across every config file found (the
+# database's, the cwd khive.toml and .khive/config.toml, and ~/.khive/config.toml),
+# so a project file without it cannot shadow a home config that sets it. Every one of
+# those files is therefore read, and one that fails to load refuses every command,
+# naming the file, the file in use, and the fact that it was read only for this key.
+# An explicit --config/KHIVE_CONFIG file is the only one read. Valid without `id`.
+# Default false.
 # require_attributed = true
 
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
