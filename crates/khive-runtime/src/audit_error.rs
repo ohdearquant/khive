@@ -100,7 +100,8 @@ impl RuntimeError {
             | Self::CircularPackDependency(_)
             | Self::PackRedeclared { .. }
             | Self::VerbCollision { .. }
-            | Self::ReservedEnvelopeParam { .. } => C::Configuration,
+            | Self::ReservedEnvelopeParam { .. }
+            | Self::AttachmentCutoverRequired { .. } => C::Configuration,
             Self::CanonicalUnsupportedOperation { .. }
             | Self::CrossBackendMergeUnsupported { .. } => C::Unsupported,
             Self::PermissionDenied { .. }

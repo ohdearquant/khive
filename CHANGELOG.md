@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
+  `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
+  `legacy_preference_model_count`. An embedding host can bring a pre-V21 database forward without
+  depending on `khive-mcp`. `RuntimeError` gains `AttachmentCutoverRequired`.
+
+### Changed
+
+- `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
+  `RuntimeError::AttachmentCutoverRequired`, whose message names
+  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
+  `khive-mcp` boot.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
+  `RuntimeError` needs an arm for it.
+
 ## [0.19.0] - 2026-11-11
 ### Added
 

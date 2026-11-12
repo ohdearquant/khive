@@ -585,13 +585,10 @@ impl KhiveRuntime {
         // attempting migration DDL.
         let schema_version = backend.prepare_core_schema()?;
         if schema_version < khive_db::migrations::ATTACHMENT_CUTOVER_VERSION {
-            return Err(khive_db::SqliteError::InvalidData(
-                "database requires the host application-assisted V21 attachment cutover; \
-                 start through khive-mcp/kkernel boot instead of constructing KhiveRuntime \
-                 directly"
-                    .into(),
-            )
-            .into());
+            return Err(crate::error::RuntimeError::AttachmentCutoverRequired {
+                schema_version,
+                required_version: khive_db::migrations::ATTACHMENT_CUTOVER_VERSION,
+            });
         }
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;

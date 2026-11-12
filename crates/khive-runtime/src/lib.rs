@@ -16,6 +16,11 @@ pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod attachment_cutover;
+pub use attachment_cutover::{
+    coordinate_attachment_cutover, coordinate_empty_secondary_attachment_cutover,
+    legacy_preference_model_count, require_secondary_attachment_empty,
+};
 pub mod audit_batch;
 pub mod audit_error;
 pub mod backend_handle;
