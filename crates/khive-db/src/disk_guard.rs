@@ -545,6 +545,7 @@ mod fifo_tests;
 mod lease_hold;
 
 pub(crate) use lease_hold::{effective_class, lease_class_scope, lease_hold_snapshot, LeaseClass};
+pub use lease_hold::{ScopedFuture, WriteClassContext};
 
 /// A volume lease bound to the thread that took it. Re-entry detection keys
 /// on that thread, so the lease must not move: it is `!Send`, which makes

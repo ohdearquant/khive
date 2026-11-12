@@ -109,6 +109,7 @@ pub use checkpoint::{
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 pub use disk_guard::harness_scoped_process_leases;
+pub use disk_guard::{ScopedFuture, WriteClassContext};
 pub use disk_guard_config::{
     default_volume_lock_dir, require_volume_lock_dir, resolve_disk_guard_config,
     DiskGuardConfigSource, DiskGuardEnvironment, EffectiveDiskGuardConfig,
