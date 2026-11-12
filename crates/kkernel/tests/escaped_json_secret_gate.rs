@@ -1,5 +1,6 @@
-//! Black-box: JSON text holding a credential with one escaped character is
-//! refused by every write verb that takes free text, like its plain form.
+//! Black-box: JSON text holding a credential with one escaped character, as a
+//! whole field or as a fragment inside prose, is refused by every write verb
+//! that takes free text, like its plain form; benign escaped JSON is stored.
 
 use std::process::{Command, Output};
 
@@ -9,12 +10,16 @@ use tempfile::TempDir;
 
 const PACKS: &str = "kg,memory,gtd,comm";
 
-/// Every loaded pack on the scratch database with no embedding model.
+/// No embedding engine and every loaded pack on the scratch database, so no
+/// write needs model files.
 fn no_embed_config(home: &TempDir) -> std::path::PathBuf {
     let config = home.path().join("khive.toml");
-    let sections: String = PACKS
-        .split(',')
-        .map(|pack| format!("[packs.{pack}]\nbackend = \"main\"\nno_embed = true\n"))
+    let sections: String = std::iter::once("engines = []\n".to_owned())
+        .chain(
+            PACKS
+                .split(',')
+                .map(|pack| format!("[packs.{pack}]\nbackend = \"main\"\nno_embed = true\n")),
+        )
         .collect();
     std::fs::write(&config, sections).expect("write config");
     config
@@ -68,9 +73,8 @@ fn credentials() -> Vec<(&'static str, String, String)> {
 }
 
 /// Each write verb with its free-text field set to `text`.
-fn write_ops(text: &str, entity_id: &str) -> Vec<(&'static str, serde_json::Value)> {
+fn write_ops(text: &str, entity_id: &str, task_id: &str) -> Vec<(&'static str, serde_json::Value)> {
     use serde_json::json;
-    let sentinel = "00000000-0000-0000-0000-000000000000";
     vec![
         (
             "create",
@@ -90,7 +94,7 @@ fn write_ops(text: &str, entity_id: &str) -> Vec<(&'static str, serde_json::Valu
         ),
         (
             "gtd.transition",
-            json!({"tool": "gtd.transition", "args": {"id": sentinel, "status": "active", "note": text}}),
+            json!({"tool": "gtd.transition", "args": {"id": task_id, "status": "active", "note": text}}),
         ),
         (
             "comm.send",
@@ -121,6 +125,20 @@ async fn seed_entity(home: &TempDir, db: &std::path::Path) -> String {
     id
 }
 
+/// A fresh inbox task, so `gtd.transition` has a real target.
+fn assign_task(home: &TempDir, db: &str) -> String {
+    let reply = response(&exec(home, db, r#"gtd.assign(title="target")"#));
+    reply["results"][0]["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("task id: {reply}"))
+        .to_owned()
+}
+
+fn run_op(home: &TempDir, db: &str, op: serde_json::Value) -> serde_json::Value {
+    let ops = serde_json::Value::Array(vec![op]).to_string();
+    response(&exec(home, db, &ops))["results"][0].clone()
+}
+
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn escaped_credentials_in_json_text_are_refused_by_every_write_verb() {
@@ -128,19 +146,56 @@ async fn escaped_credentials_in_json_text_are_refused_by_every_write_verb() {
     let db_path = home.path().join("escaped.sqlite");
     let entity_id = seed_entity(&home, &db_path).await;
     let db = db_path.to_string_lossy().into_owned();
+    let task_id = assign_task(&home, &db);
 
     let mut rows = Vec::new();
     for (name, plain, escaped) in credentials() {
         for (form, credential) in [("plain", &plain), ("escaped", &escaped)] {
-            let text = format!("{{\"v\": \"{credential}\"}}");
-            for (verb, op) in write_ops(&text, &entity_id) {
-                let ops = serde_json::Value::Array(vec![op]).to_string();
-                let reply = response(&exec(&home, &db, &ops));
-                let code = reply["results"][0]["error"]["code"].clone();
-                rows.push(format!("{name}/{form}/{verb}: {code}"));
+            let document = format!("{{\"v\": \"{credential}\"}}");
+            for (wrap, text) in [
+                ("document", document.clone()),
+                ("prose before", format!("config was {document}")),
+                ("prose after", format!("{document} was the config")),
+            ] {
+                for (verb, op) in write_ops(&text, &entity_id, &task_id) {
+                    let code = run_op(&home, &db, op)["error"]["code"].clone();
+                    rows.push(format!("{name}/{form}/{wrap}/{verb}: {code}"));
+                }
             }
         }
     }
     let refused = |row: &String| row.ends_with(": \"secret_detected\"");
     assert!(rows.iter().all(refused), "{rows:#?}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn benign_escaped_json_is_stored_by_every_write_verb() {
+    let home = TempDir::new().unwrap();
+    let db_path = home.path().join("benign.sqlite");
+    let entity_id = seed_entity(&home, &db_path).await;
+    let db = db_path.to_string_lossy().into_owned();
+
+    let document = r#"{"path": "docs\/guide.md", "text": "line one\nline two \u00e9"}"#;
+    let mut rows = Vec::new();
+    for (wrap, text) in [
+        ("document", document.to_owned()),
+        (
+            "prose",
+            format!("config was {document}, see \"C:\\Users\\me\""),
+        ),
+    ] {
+        let task_id = assign_task(&home, &db);
+        for (verb, op) in write_ops(&text, &entity_id, &task_id) {
+            let result = run_op(&home, &db, op);
+            rows.push(format!(
+                "{wrap}/{verb}: ok={} {}",
+                result["ok"], result["error"]
+            ));
+        }
+    }
+    assert!(
+        rows.iter().all(|row| row.contains(": ok=true ")),
+        "{rows:#?}"
+    );
 }

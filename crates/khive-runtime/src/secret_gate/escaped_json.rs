@@ -1,50 +1,43 @@
-//! Decoded views of the escaped string literals inside a JSON document.
+//! Decoded views of the escaped JSON string literals inside a field.
 //!
 //! The detectors read raw text, so a credential written with one JSON escape
 //! (`AKIA...`, `https:\/\/...`) reads as something else until it is
 //! decoded. Only strings that carry an escape are returned: an unescaped
 //! string already reached the detectors byte for byte.
 
-/// Return the decoded value of every string literal in `text` that contains a
-/// backslash escape, when `text` as a whole parses as JSON. Anything else
-/// yields nothing.
+/// Return the decoded value of every JSON string literal in `text` that
+/// contains a backslash escape, whether `text` is a whole JSON document, a
+/// fragment inside prose, or prose with quoted runs.
+///
+/// A candidate literal is the run between two adjacent unescaped quotes, so
+/// every byte is read at most twice and the candidates are fewer than the
+/// quotes. A run decodes only when every escape in it is a valid JSON escape;
+/// prose quotes and paths like `C:\Users` do not, and keep today's verdict.
 pub(super) fn escaped_strings(text: &str) -> Vec<String> {
     if !text.contains('\\') {
         return Vec::new();
     }
-    let trimmed = text.trim_start();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with('"')) {
-        return Vec::new();
-    }
-    if serde_json::from_str::<serde::de::IgnoredAny>(text).is_err() {
-        return Vec::new();
-    }
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut escaped = false;
-        i += 1;
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' {
-                escaped = true;
-                i += 2;
-            } else {
-                i += 1;
+    unescaped_quotes(text.as_bytes())
+        .windows(2)
+        .filter_map(|pair| {
+            let literal = &text[pair[0]..=pair[1]];
+            if !literal.contains('\\') {
+                return None;
             }
+            serde_json::from_str::<String>(literal).ok()
+        })
+        .collect()
+}
+
+/// Byte offsets of the `"` characters not preceded by an odd run of backslashes.
+fn unescaped_quotes(bytes: &[u8]) -> Vec<usize> {
+    let mut quotes = Vec::new();
+    let mut backslashes = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' && backslashes.is_multiple_of(2) {
+            quotes.push(i);
         }
-        let end = (i + 1).min(bytes.len());
-        i = end;
-        if escaped {
-            if let Ok(value) = serde_json::from_str::<String>(&text[start..end]) {
-                decoded.push(value);
-            }
-        }
+        backslashes = if b == b'\\' { backslashes + 1 } else { 0 };
     }
-    decoded
+    quotes
 }

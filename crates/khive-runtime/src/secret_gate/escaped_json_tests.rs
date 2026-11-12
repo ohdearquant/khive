@@ -150,3 +150,37 @@ fn nesting_past_the_decode_depth_is_refused_not_passed() {
     };
     assert_eq!(matched.detector, "nested-escaped-json");
 }
+
+#[test]
+fn an_escaped_credential_in_a_fragment_inside_prose_is_refused() {
+    for (name, _, escaped) in cases() {
+        for content in [
+            format!("config was {}", json_text(&escaped)),
+            format!("{} was the config", json_text(&escaped)),
+            format!("we saw \"{escaped}\" in the log"),
+        ] {
+            assert!(scan(&content).is_none(), "{name}: control: {content}");
+            assert!(check(&content).is_err(), "{name}: {content}");
+        }
+    }
+}
+
+#[test]
+fn prose_quotes_and_backslash_paths_keep_their_verdict() {
+    for content in [
+        r#"she said "hello" and "goodbye" then left"#,
+        r#"open C:\Users\me\docs and "C:\Program Files\app""#,
+        r#"a 5" screen and a "quoted \" phrase" here"#,
+        r#"see "docs\/guide.md" and "line\none""#,
+        r#"a lone \" quote and \\ backslashes"#,
+    ] {
+        assert!(check(content).is_ok(), "{content}");
+    }
+}
+
+#[test]
+fn each_quoted_run_is_decoded_once() {
+    let content = "\"a\\nb\" ".repeat(50_000) + "\"x\\\" ";
+    assert_eq!(super::escaped_json::escaped_strings(&content).len(), 50_000);
+    assert!(check(&content).is_ok());
+}

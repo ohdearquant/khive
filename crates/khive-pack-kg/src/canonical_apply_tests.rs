@@ -300,8 +300,9 @@ async fn canonical_proposal_scans_decoded_delta_values_for_secrets() {
     // delta restores it.
     let escaped = plain.replacen("@fixture.example", "\\u0040fixture.example", 1);
     assert_ne!(escaped, plain);
-    khive_runtime::secret_gate::check_at(&escaped, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&escaped);
+    let decoded = validate_canonical_delta(&registry, &escaped);
+    assert_secret_refusal(&decoded);
     let error = registry
         .dispatch(
             "propose",
@@ -348,8 +349,9 @@ async fn canonical_proposal_scans_values_under_reserved_property_keys() {
         .replace("khive:secret_gate", "khive:\\u0073ecret_gate");
     assert_ne!(escaped, plain);
     assert!(!escaped.contains("secret"));
-    khive_runtime::secret_gate::check_at(&escaped, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&escaped);
+    let decoded = validate_canonical_delta(&registry, &escaped);
+    assert_secret_refusal(&decoded);
     let error = registry
         .dispatch(
             "propose",
@@ -368,7 +370,7 @@ async fn canonical_proposal_scans_values_under_reserved_property_keys() {
 }
 
 /// The value the secret gate refuses once decoded; the tests below hide it with a JSON
-/// escape so the undecoded text passes a scan of the text alone.
+/// escape, which the proposal's text scan decodes per string literal.
 fn escaped_credential_fixture() -> String {
     format!(
         "postgresql://{}:{}@fixture.example/database",
@@ -405,7 +407,37 @@ async fn propose_canonical(
     (result, before, after)
 }
 
-fn assert_repeated_member_refusal(result: &Result<Value, RuntimeError>) {
+/// The proposal's own text scan decodes each escaped string literal in the delta, so it
+/// refuses the escaped text before the delta is decoded as a change-set.
+fn assert_text_scan_refuses(delta: &str) {
+    let result = khive_runtime::secret_gate::check_at(delta, "proposal", "changeset");
+    assert!(
+        matches!(result, Err(RuntimeError::SecretDetected(_))),
+        "{result:?}"
+    );
+}
+
+/// Runs the decoded-delta checks alone, as the apply worker does for a stored proposal,
+/// so they are shown to refuse without the text scan in front of them.
+fn validate_canonical_delta(registry: &VerbRegistry, delta: &str) -> Result<(), RuntimeError> {
+    validate_proposal(
+        &ProposalChangeset::Canonical {
+            schema_version: khive_changeset::CURRENT_SCHEMA_VERSION,
+            delta: delta.to_owned(),
+        },
+        registry,
+    )
+}
+
+fn assert_secret_refusal<T: std::fmt::Debug>(result: &Result<T, RuntimeError>) {
+    let refusal = result.as_ref().err().map(RuntimeError::refusal_source);
+    assert!(
+        matches!(refusal, Some(RuntimeError::SecretDetected(_))),
+        "{result:?}"
+    );
+}
+
+fn assert_repeated_member_refusal<T: std::fmt::Debug>(result: &Result<T, RuntimeError>) {
     let refusal = result.as_ref().err().map(RuntimeError::refusal_source);
     assert!(
         matches!(
@@ -428,10 +460,11 @@ async fn canonical_proposal_refuses_a_repeated_property_that_hides_an_escaped_cr
         .replacen("\"zz_repeat\"", "\"source\"", 1)
         .replacen("@fixture.example", "\\u0040fixture.example", 1);
     assert_eq!(repeated.matches("\"source\"").count(), 2, "{repeated}");
-    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&repeated);
+    let decoded = validate_canonical_delta(&registry, &repeated);
+    assert_repeated_member_refusal(&decoded);
     let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
-    assert_repeated_member_refusal(&result);
+    assert_secret_refusal(&result);
     assert_eq!(
         after, before,
         "a refused proposal writes no ProposalCreated"
@@ -451,10 +484,11 @@ async fn canonical_proposal_refuses_a_repeated_property_that_hides_an_escaped_to
             .replacen("\"ghp_", "\"\\u0067hp_", 1);
     assert_eq!(repeated.matches("\"k\"").count(), 2, "{repeated}");
     assert!(!repeated.contains("ghp_"), "{repeated}");
-    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&repeated);
+    let decoded = validate_canonical_delta(&registry, &repeated);
+    assert_repeated_member_refusal(&decoded);
     let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
-    assert_repeated_member_refusal(&result);
+    assert_secret_refusal(&result);
     assert_eq!(
         after, before,
         "a refused proposal writes no ProposalCreated"
@@ -472,10 +506,11 @@ async fn canonical_proposal_refuses_a_repeated_name_spelled_with_an_escape() {
         .replacen("\"zz_repeat\"", "\"\\u0073ource\"", 1)
         .replacen("@fixture.example", "\\u0040fixture.example", 1);
     assert_eq!(respelled.matches("\"source\"").count(), 1, "{respelled}");
-    khive_runtime::secret_gate::check_at(&respelled, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&respelled);
+    let decoded = validate_canonical_delta(&registry, &respelled);
+    assert_repeated_member_refusal(&decoded);
     let (result, before, after) = propose_canonical(&runtime, &registry, respelled).await;
-    assert_repeated_member_refusal(&result);
+    assert_secret_refusal(&result);
     assert_eq!(
         after, before,
         "a refused proposal writes no ProposalCreated"
@@ -502,10 +537,11 @@ async fn canonical_proposal_refuses_a_repeated_reserved_property_key() {
         "{repeated}"
     );
     assert!(!repeated.contains("secret"), "{repeated}");
-    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
-        .expect("the undecoded text passes a scan of the text alone");
+    assert_text_scan_refuses(&repeated);
+    let decoded = validate_canonical_delta(&registry, &repeated);
+    assert_repeated_member_refusal(&decoded);
     let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
-    assert_repeated_member_refusal(&result);
+    assert_secret_refusal(&result);
     assert_eq!(
         after, before,
         "a refused proposal writes no ProposalCreated"
