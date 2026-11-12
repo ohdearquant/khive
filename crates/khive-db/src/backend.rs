@@ -735,6 +735,8 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
+        // Cutover work is schema work whoever calls it: its leases are migration class.
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
         let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
@@ -754,6 +756,7 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
         let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
@@ -799,6 +802,7 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
         let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
