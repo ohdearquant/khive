@@ -3764,12 +3764,30 @@ async fn redirected_reads_audit_both_allowed_gate_consultations() {
                 .items
                 .iter()
                 .filter(|event| {
-                    event.target_id == Some(kept.id) && event.outcome == EventOutcome::Success
+                    event.target_id == Some(kept.id)
+                        && event.outcome == EventOutcome::Success
+                        && event.payload.get("record_kind").is_none()
                 })
                 .count(),
             1,
             "effective allow audit must name the kept id exactly once"
         );
+        let completed_reads: Vec<_> = events
+            .items
+            .iter()
+            .filter(|event| event.payload.get("record_kind").is_some())
+            .collect();
+        if verb == "get" {
+            assert_eq!(completed_reads.len(), 1, "one resolved get subject audit");
+            assert_eq!(completed_reads[0].target_id, Some(kept.id));
+            assert_eq!(completed_reads[0].outcome, EventOutcome::Success);
+            assert_eq!(completed_reads[0].payload["record_kind"], "concept");
+        } else {
+            assert!(
+                completed_reads.is_empty(),
+                "resolve has no declared subject"
+            );
+        }
     }
 }
 
