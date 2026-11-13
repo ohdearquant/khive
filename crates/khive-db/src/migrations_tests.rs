@@ -5628,6 +5628,13 @@ fn the_v21_deferral_reader_agrees_with_the_chain() {
     assert!(!attachment_cutover_would_defer(&fresh).unwrap());
     assert!(!chain_defers(&mut fresh));
 
+    // Below V10: the entities table exists but has no content_ref column yet, so
+    // there is no legacy reference; the chain adds the column empty at V10.
+    let mut early = open_memory();
+    migrate_through(&mut early, 9);
+    assert!(!attachment_cutover_would_defer(&early).unwrap());
+    assert!(!chain_defers(&mut early));
+
     // Pending at V20 with no legacy reference: the chain completes V21 itself.
     let mut pending = open_memory();
     migrate_through(&mut pending, 20);

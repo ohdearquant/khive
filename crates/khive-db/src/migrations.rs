@@ -969,9 +969,10 @@ fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteEr
 /// `false` for a store already at or past the cutover version, since the chain
 /// never reaches that step again. Below it, the answer is the chain's own
 /// condition evaluated on the store as it is now: the cutover is `Incomplete`,
-/// or an entity still holds a legacy `content_ref`. A store with no `entities`
-/// table yet holds no legacy reference. An impossible marker and ledger pair is
-/// an error, as it is for the chain.
+/// or an entity still holds a legacy `content_ref`. A store whose `entities`
+/// table has no `content_ref` column yet (no table, or a store below V10) holds
+/// no legacy reference. An impossible marker and ledger pair is an error, as it
+/// is for the chain.
 pub fn attachment_cutover_would_defer(conn: &Connection) -> Result<bool, SqliteError> {
     if read_schema_version(conn)? >= ATTACHMENT_CUTOVER_VERSION {
         return Ok(false);
@@ -982,7 +983,7 @@ pub fn attachment_cutover_would_defer(conn: &Connection) -> Result<bool, SqliteE
 /// The V21 deferral condition, shared by the chain and
 /// [`attachment_cutover_would_defer`] so there is one copy of it.
 fn cutover_defers(conn: &Connection, status: AttachmentCutoverStatus) -> Result<bool, SqliteError> {
-    let legacy_refs: i64 = if schema_object_exists(conn, "table", "entities")? {
+    let legacy_refs: i64 = if schema_column_exists(conn, "entities", "content_ref")? {
         conn.query_row(
             "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
             [],
