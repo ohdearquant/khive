@@ -170,7 +170,6 @@ async fn malformed_query_set_reports_path_and_parser_position_without_persisting
         "#,
     );
     let path = malformed.path().display().to_string();
-    let canonical_path = canonical_query_set_path(&malformed);
 
     let error = registry
         .dispatch(
@@ -182,8 +181,8 @@ async fn malformed_query_set_reports_path_and_parser_position_without_persisting
     assert!(matches!(&error, RuntimeError::InvalidInput(_)));
     let message = error.to_string();
     assert!(
-        message.contains(&canonical_path),
-        "error must name {canonical_path}: {message}"
+        message.contains(&path),
+        "error must name the requested path {path}: {message}"
     );
     assert!(
         message.contains("line"),
@@ -192,6 +191,76 @@ async fn malformed_query_set_reports_path_and_parser_position_without_persisting
     assert!(
         message.contains("column"),
         "error must name a column: {message}"
+    );
+    assert_eq!(stats(&registry).await["retrieval_eval_run_count"], 0);
+}
+
+#[tokio::test]
+async fn query_set_parse_errors_report_position_without_file_text() {
+    let runtime = runtime();
+    let registry = registry(&runtime, "local");
+    let cases = [
+        ("CANARY_NAME=canary-5f1e0c2a9b7d4e36\n", Some(1)),
+        ("queries = \"canary-value-in-a-string\"\n", Some(1)),
+        ("[[queries]]\ncanary_key_name = 1\n", None),
+    ];
+    for (contents, line) in cases {
+        let file = query_set(contents);
+        let path = file.path().display().to_string();
+        let error = registry
+            .dispatch(
+                "knowledge.eval_retrieval",
+                json!({"query_set": path.clone()}),
+            )
+            .await
+            .expect_err("a file that is not a query set must fail");
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+        let message = error.to_string();
+        assert!(message.contains(&path), "{message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("canary"),
+            "error must not quote the file: {message}"
+        );
+        assert!(message.contains(" at line "), "{message}");
+        assert!(message.contains(", column "), "{message}");
+        if let Some(line) = line {
+            assert!(
+                message.contains(&format!(" at line {line}, column ")),
+                "{message}"
+            );
+        }
+    }
+    assert_eq!(stats(&registry).await["retrieval_eval_run_count"], 0);
+}
+
+#[tokio::test]
+async fn query_sets_that_cannot_be_opened_share_one_answer() {
+    let runtime = runtime();
+    let registry = registry(&runtime, "local");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("absent.toml");
+    let directory = dir.path().join("a-directory.toml");
+    std::fs::create_dir(&directory).expect("create directory");
+
+    let mut answers = Vec::new();
+    for path in [&missing, &directory] {
+        let path = path.display().to_string();
+        let error = registry
+            .dispatch(
+                "knowledge.eval_retrieval",
+                json!({"query_set": path.clone()}),
+            )
+            .await
+            .expect_err("an unopenable query set must fail");
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)));
+        let message = error.to_string();
+        assert!(message.contains(&path), "{message}");
+        answers.push(message.replace(&path, "<query_set>"));
+    }
+    assert_eq!(answers[0], answers[1], "{answers:?}");
+    assert!(
+        answers[0].ends_with("knowledge.eval_retrieval: cannot open query set <query_set>"),
+        "{answers:?}"
     );
     assert_eq!(stats(&registry).await["retrieval_eval_run_count"], 0);
 }
@@ -252,7 +321,6 @@ async fn eval_subhandler_persists_complete_runs_and_stats_reads_latest() {
         "#,
     );
     let invalid_path = invalid.path().display().to_string();
-    let canonical_invalid_path = canonical_query_set_path(&invalid);
     let error = registry
         .dispatch(
             "knowledge.eval_retrieval",
@@ -263,8 +331,8 @@ async fn eval_subhandler_persists_complete_runs_and_stats_reads_latest() {
     assert!(matches!(&error, RuntimeError::InvalidInput(_)));
     let message = error.to_string();
     assert!(
-        message.contains(&canonical_invalid_path),
-        "error must name {canonical_invalid_path}: {message}"
+        message.contains(&invalid_path),
+        "error must name the requested path {invalid_path}: {message}"
     );
     assert!(
         message.contains("[1]"),
