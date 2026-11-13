@@ -70,11 +70,13 @@ pub(super) fn prepare_email_channel_loops(
         },
     };
     let external = ExternalInboundConfig::from_env(inbound_only || policy.has_external_senders())?;
-    if external.is_some() && runtime.is_none() {
-        anyhow::bail!("external email requires a comm-routed runtime for verified routing and opt-out commits");
-    }
+    // A process that never polls runs no email loop, so it needs no comm-routed runtime: a server
+    // started without the comm pack still boots when the host has external email configured.
     if !prepare_polling {
         return Ok(None);
+    }
+    if external.is_some() && runtime.is_none() {
+        anyhow::bail!("external email requires a comm-routed runtime for verified routing and opt-out commits");
     }
     let email_ch = match EmailChannel::from_env() {
         Ok(channel) => channel,
