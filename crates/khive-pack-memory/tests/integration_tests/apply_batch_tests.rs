@@ -626,6 +626,87 @@ async fn test_apply_batch_duplicate_keys_in_one_call_are_refused() {
 }
 
 #[tokio::test]
+async fn test_apply_batch_creates_need_distinct_parts_and_retry_dedupes() {
+    async fn assert_no_edges(rt: &KhiveRuntime) {
+        let token = rt
+            .authorize(Namespace::parse("alice").expect("namespace parses"))
+            .expect("authorize namespace");
+        let page = rt
+            .graph(&token)
+            .expect("graph store")
+            .query_edges(
+                EdgeFilter::default(),
+                vec![],
+                PageRequest {
+                    limit: 1000,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query all edge relations");
+        assert!(page.items.is_empty(), "create rows must not write edges");
+    }
+
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let notes_before = ab_note_count(&rt, "alice").await;
+    let batch = "create-parts";
+    let rows = vec![
+        json!({
+            "action": "create",
+            "content": "sandpiper spring survey",
+            "properties": {"who": "batch-tester"},
+        }),
+        json!({
+            "action": "create",
+            "content": "sandpiper autumn survey",
+            "properties": {"who": "batch-tester"},
+        }),
+    ];
+    for dry_run in [true, false] {
+        let result = ab_apply(&alice, batch, rows.clone(), dry_run).await;
+        assert_eq!(result["entries"].as_array().unwrap().len(), 2);
+        for index in 0..2 {
+            assert_eq!(result["entries"][index]["part"], 1);
+            assert_eq!(result["entries"][index]["outcome"], "refused");
+            assert_eq!(result["entries"][index]["reason"]["code"], "duplicate-key");
+        }
+        assert_eq!(result["counts"]["refused"], 2);
+        assert_eq!(result["counts"]["written"], 0);
+        assert_eq!(ab_note_count(&rt, "alice").await, notes_before);
+        assert_no_edges(&rt).await;
+    }
+
+    let mut distinct_parts = rows;
+    distinct_parts[0]["part"] = json!(1);
+    distinct_parts[1]["part"] = json!(2);
+    let written = ab_apply(&alice, batch, distinct_parts.clone(), false).await;
+    assert_eq!(written["counts"]["written"], 2);
+    assert_eq!(written["counts"]["refused"], 0);
+    let first = ab_uuid(&written["entries"][0]["new_id"]);
+    let second = ab_uuid(&written["entries"][1]["new_id"]);
+    assert_ne!(first, second);
+    for index in 0..2 {
+        assert_eq!(written["entries"][index]["outcome"], "written");
+    }
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 2);
+    assert_no_edges(&rt).await;
+
+    let retry = ab_apply(&alice, batch, distinct_parts, false).await;
+    assert_eq!(retry["counts"]["deduped"], 2);
+    assert_eq!(retry["counts"]["written"], 0);
+    for index in 0..2 {
+        assert_eq!(retry["entries"][index]["outcome"], "deduped");
+        assert_eq!(
+            retry["entries"][index]["new_id"],
+            written["entries"][index]["new_id"]
+        );
+    }
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 2);
+    assert_no_edges(&rt).await;
+}
+
+#[tokio::test]
 async fn test_apply_batch_skip_and_delete_candidate_write_nothing() {
     let rt = make_runtime();
     let alice = make_registry_with_actor(rt.clone(), "alice");
