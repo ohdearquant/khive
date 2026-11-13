@@ -2403,6 +2403,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
 async fn recall_bound_profile_projects_config_only_for_breakdown() {
+    use khive_brain_core::profile_serving::count_profile_snapshot_decodes;
     use khive_pack_brain::BrainPack;
 
     let tmp = tempfile::Builder::new()
@@ -2491,11 +2492,16 @@ async fn recall_bound_profile_projects_config_only_for_breakdown() {
             "scoring": { "mmr_penalty": 0.0 },
         },
     });
-    let (plain, plain_calls) = crate::tunable::count_project_config_calls_6377(
-        registry.dispatch("memory.recall", params.clone()),
-    )
-    .await;
+    let ((plain, plain_calls), plain_decodes) =
+        count_profile_snapshot_decodes(crate::tunable::count_project_config_calls_6377(
+            registry.dispatch("memory.recall", params.clone()),
+        ))
+        .await;
     let plain = plain.expect("recall without breakdown");
+    assert_eq!(
+        plain_decodes, 1,
+        "one full decode for an actual bound-profile recall"
+    );
     assert_eq!(
         plain_calls, 0,
         "a recall without a breakdown must not project the serving profile"
@@ -2513,18 +2519,23 @@ async fn recall_bound_profile_projects_config_only_for_breakdown() {
 
     let mut request_verbose = params.clone();
     request_verbose["include_breakdown"] = serde_json::json!(true);
-    let mut config_verbose = params;
+    let mut config_verbose = params.clone();
     let _ = config_verbose
         .as_object_mut()
         .expect("recall params object")
         .remove("include_breakdown");
     config_verbose["config"]["include_breakdown"] = serde_json::json!(true);
     for (route, verbose_params) in [("request", request_verbose), ("config", config_verbose)] {
-        let (verbose, verbose_calls) = crate::tunable::count_project_config_calls_6377(
-            registry.dispatch("memory.recall", verbose_params),
-        )
-        .await;
+        let ((verbose, verbose_calls), verbose_decodes) =
+            count_profile_snapshot_decodes(crate::tunable::count_project_config_calls_6377(
+                registry.dispatch("memory.recall", verbose_params),
+            ))
+            .await;
         let verbose = verbose.expect("recall with breakdown");
+        assert_eq!(
+            verbose_decodes, 1,
+            "verbose output must reuse the same full state"
+        );
         assert_eq!(
             verbose_calls, 1,
             "project once for the entire verbose recall via {route}"
@@ -2548,6 +2559,20 @@ async fn recall_bound_profile_projects_config_only_for_breakdown() {
             (profile_component - 1.0).abs() > 1e-6,
             "the breakdown must use the bound profile's skewed posterior: {profile_component}"
         );
+    }
+    let mut explicit = params;
+    explicit["profile_id"] = json!(profile_id);
+    let (explicit, explicit_decodes) =
+        count_profile_snapshot_decodes(registry.dispatch("memory.recall", explicit)).await;
+    let explicit = explicit.expect("explicit profile recall");
+    assert_eq!(
+        explicit_decodes, 1,
+        "explicit selection must also decode once"
+    );
+    assert_eq!(explicit.as_array().unwrap().len(), plain_hits.len());
+    for (bound, explicit) in plain_hits.iter().zip(explicit.as_array().unwrap()) {
+        assert_eq!(explicit["full_id"], bound["full_id"]);
+        assert_eq!(explicit["rank_score"], bound["rank_score"]);
     }
 }
 

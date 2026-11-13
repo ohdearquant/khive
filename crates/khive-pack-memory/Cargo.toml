@@ -39,6 +39,7 @@ lru = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+khive-brain-core = { version = "0.19.0", path = "../khive-brain-core", features = ["test-support"] }
 # Observe the same registry queue in recall batching tests; no fault injection.
 khive-runtime = { version = "0.19.0", path = "../khive-runtime", features = ["test-internals"] }
 khive-db = { version = "0.19.0", path = "../khive-db", features = ["test-support"] }

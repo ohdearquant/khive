@@ -5,6 +5,7 @@ pub mod brain_state;
 pub mod evidence;
 pub mod posterior;
 pub mod profile;
+pub mod profile_serving;
 pub mod query_class;
 pub mod section_state;
 pub mod section_type;

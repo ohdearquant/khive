@@ -1,4 +1,7 @@
 use super::*;
+use khive_brain_core::profile_serving::{
+    decode_profile_snapshot, publish_profile_snapshot, LOCAL_FACTOR_MAX, LOCAL_FACTOR_MIN,
+};
 use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -6,11 +9,6 @@ fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result
         mask_for_redaction_surface(RedactionSurface::GateProbe, &error.to_string()).into_owned()
     })
 }
-
-/// Smallest `local_factor` a profile may carry.
-const LOCAL_FACTOR_MIN: f64 = 0.5;
-/// Largest `local_factor` a profile may carry (1 means no scaling).
-const LOCAL_FACTOR_MAX: f64 = 1.0;
 
 /// Deserializes a field that is present, an explicit `null` included, as
 /// `Some`, so that the handler can tell "absent" from "null".
@@ -550,13 +548,10 @@ impl BrainPack {
 
         // Means of the stored recall posteriors, read from the snapshot the
         // profile record carries; null when there is no readable snapshot.
-        let posterior_means = record
-            .state_snapshot
+        let raw_snapshot = record.state_snapshot.as_ref().unwrap_or(&Value::Null);
+        let snapshot = decode_profile_snapshot(raw_snapshot);
+        let posterior_means = snapshot
             .as_ref()
-            .and_then(|snap| {
-                serde_json::from_value::<khive_brain_core::BalancedRecallSnapshot>(snap.clone())
-                    .ok()
-            })
             .map(|snap| {
                 json!({
                     "relevance": snap.relevance.mean(),
@@ -565,6 +560,7 @@ impl BrainPack {
                 })
             })
             .unwrap_or(Value::Null);
+        publish_profile_snapshot(&profile_id, raw_snapshot, snapshot);
 
         Ok(json!({
             "id": record.id,
@@ -2215,5 +2211,438 @@ mod local_factor_tests {
             "no state snapshot means no posterior means: {profile}"
         );
         assert_eq!(profile["local_factor"].as_f64(), Some(0.8));
+    }
+}
+
+#[cfg(test)]
+mod profile_serving_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use khive_brain_core::profile_serving::{
+        capture_profile_snapshot, count_profile_snapshot_decodes, CapturedSnapshot,
+    };
+    use khive_brain_core::BrainState;
+    use khive_runtime::{PackRuntime, RequestIdentity, VerbRegistryBuilder};
+    use khive_types::{EventKind, EventOutcome};
+    use uuid::Uuid;
+
+    const PROFILE: &str = "stored-recall-profile";
+
+    #[derive(Clone)]
+    enum ProviderMode {
+        Original,
+        Raw(Value),
+        Rewrite(Value),
+        Twice,
+    }
+
+    struct ProfileProvider {
+        brain: BrainPack,
+        mode: Arc<Mutex<ProviderMode>>,
+    }
+
+    impl khive_types::Pack for ProfileProvider {
+        const NAME: &'static str = <BrainPack as khive_types::Pack>::NAME;
+        const NOTE_KINDS: &'static [&'static str] = <BrainPack as khive_types::Pack>::NOTE_KINDS;
+        const ENTITY_KINDS: &'static [&'static str] =
+            <BrainPack as khive_types::Pack>::ENTITY_KINDS;
+        const BRAIN_CONSUMER_KINDS: &'static [&'static str] =
+            <BrainPack as khive_types::Pack>::BRAIN_CONSUMER_KINDS;
+        const HANDLERS: &'static [HandlerDef] = <BrainPack as khive_types::Pack>::HANDLERS;
+        const REQUIRES: &'static [&'static str] = <BrainPack as khive_types::Pack>::REQUIRES;
+    }
+
+    #[async_trait]
+    impl PackRuntime for ProfileProvider {
+        khive_runtime::pack_runtime_metadata!();
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            params: Value,
+            registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            if verb != "brain.profile" {
+                return self.brain.dispatch(verb, params, registry, token).await;
+            }
+            let mode = self.mode.lock().unwrap().clone();
+            if let ProviderMode::Raw(response) = mode {
+                return Ok(response);
+            }
+            let mut response = self
+                .brain
+                .dispatch(verb, params.clone(), registry, token)
+                .await?;
+            match mode {
+                ProviderMode::Rewrite(patch) => {
+                    for (field, value) in patch.as_object().unwrap() {
+                        response[field] = value.clone();
+                    }
+                }
+                ProviderMode::Twice => {
+                    response = self.brain.dispatch(verb, params, registry, token).await?;
+                }
+                _ => {}
+            }
+            Ok(response)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ProfileGate {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl khive_runtime::Gate for ProfileGate {
+        fn check(
+            &self,
+            request: &khive_runtime::GateRequest,
+        ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+            if request.verb == "brain.profile" {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((request.actor.id.clone(), request.namespace.to_string()));
+                if request.actor.id == "blocked-reader" {
+                    return Ok(khive_runtime::GateDecision::deny(
+                        "profile denied by test policy",
+                    ));
+                }
+            }
+            Ok(khive_runtime::GateDecision::allow())
+        }
+    }
+
+    struct Fixture {
+        registry: VerbRegistry,
+        runtime: KhiveRuntime,
+        state: Arc<Mutex<BrainState>>,
+        mode: Arc<Mutex<ProviderMode>>,
+        gate: Arc<ProfileGate>,
+        note: Uuid,
+        _temp: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        async fn new(custom_provider: bool) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+                db_path: Some(temp.path().join("khive.db")),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".into(), "memory".into(), "brain".into()],
+                actor_id: Some("registry-reader".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            let note = runtime
+                .create_note(
+                    &token,
+                    "memory",
+                    None,
+                    "captureprofile evidence",
+                    Some(0.8),
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .id;
+            let brain = BrainPack::new(runtime.clone());
+            let state = brain.state.clone();
+            let mode = Arc::new(Mutex::new(ProviderMode::Original));
+            let gate = Arc::new(ProfileGate::default());
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_actor_id(Some("registry-reader".into()));
+            builder.with_runtime_event_store(&runtime).unwrap();
+            builder.with_gate(gate.clone());
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_memory::MemoryPack::new(runtime.clone()));
+            if custom_provider {
+                builder.register(ProfileProvider {
+                    brain,
+                    mode: mode.clone(),
+                });
+            } else {
+                builder.register(brain);
+            }
+            let registry = builder.build().unwrap();
+            registry
+                .dispatch("brain.profiles", json!({ "namespace": "local" }))
+                .await
+                .unwrap();
+            let mut record = ProfileRecord::new_balanced_recall(ENTITY_CACHE_CAPACITY);
+            record.id = PROFILE.into();
+            record.state_snapshot.as_mut().unwrap()["entity_posteriors"] =
+                json!({ (note.to_string()): { "alpha": 9.0, "beta": 1.0 } });
+            record.state_snapshot.as_mut().unwrap()["entity_posterior_order"] = json!([note]);
+            state
+                .lock()
+                .unwrap()
+                .profiles
+                .insert(PROFILE.into(), record);
+            Self {
+                registry,
+                runtime,
+                state,
+                mode,
+                gate,
+                note,
+                _temp: temp,
+            }
+        }
+
+        fn request(&self) -> Value {
+            json!({
+                "namespace": "local", "profile_id": PROFILE,
+                "query": "captureprofile", "fusion_strategy": "keyword_only",
+                "include_breakdown": true, "limit": 10,
+                "config": { "reranker_weights": { "salience": 1.0 }, "scoring": { "mmr_penalty": 0.0 } }
+            })
+        }
+
+        async fn profile(&self) -> Value {
+            self.registry
+                .dispatch(
+                    "brain.profile",
+                    json!({ "namespace": "local", "profile_id": PROFILE }),
+                )
+                .await
+                .unwrap()
+        }
+
+        fn assert_hit(&self, result: &Value, mean: Option<f64>) {
+            let hits = result.as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{result}");
+            assert_eq!(hits[0]["full_id"], self.note.to_string());
+            assert_eq!(hits[0]["served_by_profile_id"], PROFILE);
+            assert_eq!(hits[0]["breakdown"]["entity_posterior_mean"].as_f64(), mean);
+            let term = hits[0]["breakdown"]["entity_term"].as_f64().unwrap();
+            assert!((term - (1.0 + 0.3 * (mean.unwrap_or(0.5) - 0.5))).abs() < 1e-6);
+            let breakdown = &hits[0]["breakdown"];
+            let expected = breakdown["pre_entity_score"].as_f64().unwrap()
+                * term
+                * breakdown["local_factor"].as_f64().unwrap()
+                - breakdown["duplicate_penalty"].as_f64().unwrap();
+            assert!((hits[0]["rank_score"].as_f64().unwrap() - expected.max(0.0)).abs() < 1e-6);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_tasks, config_ledger)]
+    async fn served_recall_snapshot_decode_6377_stored_valid_missing_null_and_malformed() {
+        let fixture = Fixture::new(false).await;
+        let original = fixture.state.lock().unwrap().profiles[PROFILE]
+            .state_snapshot
+            .clone();
+        let mut malformed = original.clone().unwrap();
+        malformed["entity_posteriors"][fixture.note.to_string()]["alpha"] = json!(-1.0);
+        for (raw, decodes, mean) in [
+            (original, 1, Some(0.9)),
+            (None, 0, None),
+            (Some(Value::Null), 0, None),
+            (Some(malformed), 1, None),
+        ] {
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .profiles
+                .get_mut(PROFILE)
+                .unwrap()
+                .state_snapshot = raw;
+            assert!(!fixture
+                .state
+                .lock()
+                .unwrap()
+                .profile_states
+                .contains_key(PROFILE));
+            let wire = fixture.profile().await;
+            let (captured_wire, capture) =
+                capture_profile_snapshot(PROFILE, "local", fixture.profile()).await;
+            assert_eq!(
+                captured_wire, wire,
+                "capturing must not change brain.profile JSON"
+            );
+            assert!(matches!(
+                capture.into_snapshot(&wire),
+                CapturedSnapshot::Decoded(_)
+            ));
+            assert_eq!(wire["posterior_means"].is_null(), mean.is_none());
+            let (result, calls) = count_profile_snapshot_decodes(
+                fixture
+                    .registry
+                    .dispatch("memory.recall", fixture.request()),
+            )
+            .await;
+            fixture.assert_hit(&result.unwrap(), mean);
+            assert_eq!(calls, decodes, "raw snapshot: {}", wire["state_snapshot"]);
+        }
+        fixture.registry.shutdown_audit_batch().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_tasks, config_ledger)]
+    async fn served_recall_snapshot_decode_6377_custom_provider_and_final_response_binding() {
+        let fixture = Fixture::new(true).await;
+        let response = fixture.profile().await;
+        let mut changed = response["state_snapshot"].clone();
+        changed["entity_posteriors"][fixture.note.to_string()] =
+            json!({ "alpha": 1.0, "beta": 9.0 });
+        let mut raw = response.clone();
+        raw["state_snapshot"] = changed.clone();
+        for (mode, calls, mean) in [
+            (ProviderMode::Raw(raw), 1, 0.1),
+            (
+                ProviderMode::Rewrite(json!({ "state_snapshot": changed })),
+                2,
+                0.1,
+            ),
+            (
+                ProviderMode::Rewrite(json!({ "id": "provider-alias" })),
+                2,
+                0.9,
+            ),
+            (
+                ProviderMode::Rewrite(json!({ "namespace": "provider-namespace" })),
+                2,
+                0.9,
+            ),
+            (ProviderMode::Twice, 3, 0.9),
+            (
+                ProviderMode::Rewrite(json!({ "local_factor": 0.7 })),
+                1,
+                0.9,
+            ),
+        ] {
+            *fixture.mode.lock().unwrap() = mode;
+            let (result, observed) = count_profile_snapshot_decodes(
+                fixture
+                    .registry
+                    .dispatch("memory.recall", fixture.request()),
+            )
+            .await;
+            let result = result.unwrap();
+            fixture.assert_hit(&result, Some(mean));
+            assert_eq!(observed, calls);
+            if let ProviderMode::Rewrite(patch) = &*fixture.mode.lock().unwrap() {
+                if patch.get("local_factor").is_some() {
+                    assert!(
+                        (result[0]["breakdown"]["local_factor"].as_f64().unwrap() - 0.7).abs()
+                            < 1e-6
+                    );
+                }
+            }
+        }
+        *fixture.mode.lock().unwrap() = ProviderMode::Rewrite(json!({ "lifecycle": "archived" }));
+        let error = fixture
+            .registry
+            .dispatch("memory.recall", fixture.request())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        fixture.registry.shutdown_audit_batch().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_tasks, config_ledger)]
+    async fn served_recall_snapshot_decode_6377_preserves_identity_gate_and_audit() {
+        let fixture = Fixture::new(false).await;
+        let identity = |actor: &str| RequestIdentity {
+            namespace: "local".into(),
+            actor_id: Some(actor.into()),
+            ..Default::default()
+        };
+        for (actor, expected_decodes) in [("request-reader", 1), ("blocked-reader", 0)] {
+            let (result, calls) =
+                count_profile_snapshot_decodes(fixture.registry.dispatch_with_identity(
+                    "memory.recall",
+                    fixture.request(),
+                    Some(identity(actor)),
+                ))
+                .await;
+            assert_eq!(calls, expected_decodes);
+            if actor == "blocked-reader" {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("profile denied by test policy"));
+            } else {
+                fixture.assert_hit(&result.unwrap(), Some(0.9));
+            }
+        }
+        fixture
+            .registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "namespace": "local", "actor": "blocked-reader",
+                    "profile_id": PROFILE, "consumer_kind": "recall"
+                }),
+            )
+            .await
+            .unwrap();
+        let mut bound = fixture.request();
+        bound.as_object_mut().unwrap().remove("profile_id");
+        let (bound, calls) =
+            count_profile_snapshot_decodes(fixture.registry.dispatch_with_identity(
+                "memory.recall",
+                bound,
+                Some(identity("blocked-reader")),
+            ))
+            .await;
+        let bound = bound.expect("an unreadable bound profile retains configured-default fallback");
+        assert_eq!(calls, 0);
+        assert_eq!(bound.as_array().unwrap().len(), 1);
+        assert!(bound[0]["served_by_profile_id"].is_null());
+        assert!(bound[0]["breakdown"]["entity_posterior_mean"].is_null());
+        assert_eq!(bound[0]["breakdown"]["entity_term"], json!(1.0));
+        assert_eq!(
+            *fixture.gate.seen.lock().unwrap(),
+            vec![
+                ("request-reader".into(), "local".into()),
+                ("blocked-reader".into(), "local".into()),
+                ("blocked-reader".into(), "local".into()),
+            ]
+        );
+        fixture.registry.shutdown_audit_batch().await.unwrap();
+        let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+        let events = fixture
+            .runtime
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    verbs: vec!["brain.profile".into()],
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 3);
+        for (actor, outcome, count) in [
+            ("request-reader", EventOutcome::Success, 1),
+            ("blocked-reader", EventOutcome::Denied, 2),
+        ] {
+            let stored_actor = format!("actor:{actor}");
+            let matching: Vec<_> = events
+                .items
+                .iter()
+                .filter(|event| event.actor == stored_actor)
+                .collect();
+            assert_eq!(matching.len(), count, "per-call actor audit");
+            for event in matching {
+                assert_eq!(event.namespace, "local");
+                assert_eq!(event.outcome, outcome);
+            }
+        }
     }
 }

@@ -144,18 +144,47 @@ async fn load_brain_profile(
     registry: &VerbRegistry,
     token: &NamespaceToken,
     profile_id: &str,
-) -> Result<Value, RuntimeError> {
-    // Boxed so the recall future holds a pointer rather than the whole
-    // dispatch future, which grows with the runtime.
-    Box::pin(registry.dispatch_with_identity(
-        "brain.profile",
-        json!({
-            "namespace": token.namespace().as_str(),
-            "profile_id": profile_id,
-        }),
-        Some(RequestIdentity::from_token(token)),
-    ))
-    .await
+) -> Result<
+    (
+        Value,
+        khive_brain_core::profile_serving::ProfileSnapshotCapture,
+    ),
+    RuntimeError,
+> {
+    // Capture boxes the dispatch future before constructing its own future.
+    let (response, capture) = khive_brain_core::profile_serving::capture_profile_snapshot(
+        profile_id,
+        token.namespace().as_str(),
+        registry.dispatch_with_identity(
+            "brain.profile",
+            json!({
+                "namespace": token.namespace().as_str(),
+                "profile_id": profile_id,
+            }),
+            Some(RequestIdentity::from_token(token)),
+        ),
+    )
+    .await;
+    response.map(|response| (response, capture))
+}
+
+fn served_profile_state(
+    response: &Value,
+    capture: khive_brain_core::profile_serving::ProfileSnapshotCapture,
+) -> Option<khive_brain_core::BalancedRecallState> {
+    match capture.into_snapshot(response) {
+        khive_brain_core::profile_serving::CapturedSnapshot::Decoded(snapshot) => {
+            snapshot.map(|snapshot| {
+                khive_brain_core::BalancedRecallState::from_snapshot(
+                    snapshot,
+                    super::common::PROFILE_STATE_ENTITY_CAPACITY,
+                )
+            })
+        }
+        khive_brain_core::profile_serving::CapturedSnapshot::Unavailable => {
+            super::common::balanced_recall_state_from_profile_response(response)
+        }
+    }
 }
 
 fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(), RuntimeError> {
@@ -457,15 +486,16 @@ impl MemoryPack {
         let mut local_factor: f32 = 1.0;
         let (served_by_profile_id, serve_attribution): (Option<String>, ServeAttribution) =
             if let Some(ref pid) = p.profile_id {
-                let resp = load_brain_profile(registry, token, pid)
-                    .await
-                    .map_err(|e| {
-                        RuntimeError::InvalidInput(format!(
-                            "profile_id {pid:?} is not a known profile: {e}"
-                        ))
-                    })?;
+                let (resp, capture) =
+                    load_brain_profile(registry, token, pid)
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::InvalidInput(format!(
+                                "profile_id {pid:?} is not a known profile: {e}"
+                            ))
+                        })?;
                 reject_archived_brain_profile(&resp, pid)?;
-                profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
+                profile_state = served_profile_state(&resp, capture);
                 local_factor = super::common::local_factor_from_profile_response(&resp);
                 (Some(pid.clone()), ServeAttribution::Profile)
             } else {
@@ -474,10 +504,9 @@ impl MemoryPack {
                         .await;
                 if let Some(profile_id) = resolved {
                     match load_brain_profile(registry, token, &profile_id).await {
-                        Ok(resp) => {
+                        Ok((resp, capture)) => {
                             reject_archived_brain_profile(&resp, &profile_id)?;
-                            profile_state =
-                                super::common::balanced_recall_state_from_profile_response(&resp);
+                            profile_state = served_profile_state(&resp, capture);
                             local_factor = super::common::local_factor_from_profile_response(&resp);
                             (Some(profile_id), ServeAttribution::Profile)
                         }
