@@ -414,7 +414,7 @@ mod exhaustive_forwarded {
     async fn drive_until(
         phase: &str,
         mut ready: impl FnMut() -> bool,
-        describe: impl Fn() -> String,
+        describe: &impl Fn() -> String,
     ) {
         let frozen = tokio::time::Instant::now();
         let started = std::time::Instant::now();
