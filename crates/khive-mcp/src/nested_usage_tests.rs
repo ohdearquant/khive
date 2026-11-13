@@ -118,6 +118,7 @@ struct Fixture {
 async fn fixture(mode: ProfileMode) -> Fixture {
     let has_brain = !matches!(mode, ProfileMode::AbsentBrain);
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
         brain_profile: matches!(mode, ProfileMode::Explicit).then(|| PROFILE.to_string()),
         packs: if has_brain {
