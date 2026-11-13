@@ -365,6 +365,7 @@ async fn real_inbox_and_gtd_next_survive_admission_deadline_expiry() {
 }
 
 #[test]
+#[serial(config_ledger)]
 fn real_quiet_keeps_strict_failure_under_full_audit_queue() {
     let directory = tempfile::tempdir().unwrap();
     if khive_storage::test_support::run_exact_test_in_child(

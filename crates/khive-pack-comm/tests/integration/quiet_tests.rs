@@ -106,6 +106,7 @@ async fn deadline(registry: &VerbRegistry) -> Value {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn quiet_dispatch_reports_shared_state_and_preserves_it_on_refusal() {
     if isolated() {
         return;
@@ -186,6 +187,7 @@ fn quiet_dispatch_reports_shared_state_and_preserves_it_on_refusal() {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn quiet_health_becomes_null_after_monotonic_expiry() {
     if isolated() {
         return;
@@ -226,6 +228,7 @@ async fn events(runtime: &KhiveRuntime, verb: &str) -> Vec<Event> {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn quiet_success_audit_is_retained_in_reduced_mode() {
     if isolated() {
         return;
@@ -334,6 +337,7 @@ async fn poll_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>)
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn quiet_defers_real_kg_warm_until_expiry() {
     if isolated() {
         return;
@@ -399,6 +403,7 @@ fn quiet_defers_real_kg_warm_until_expiry() {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn quiet_waiting_kg_warm_preserves_foreground_and_domain_shutdown() {
     if isolated() {
         return;

@@ -343,6 +343,14 @@ async fn quiet_checkpoint_fixture(cancel: bool) {
     })
     .unwrap();
     rt.try_register_embedder(QuietCheckpointEmbedder).unwrap();
+    assert_eq!(
+        rt.registered_embedding_model_names(),
+        vec![QUIET_CHECKPOINT_MODEL.to_owned()]
+    );
+    assert_eq!(
+        rt.embedding_models_for_note_kind("memory"),
+        vec![QUIET_CHECKPOINT_MODEL.to_owned()]
+    );
     let _close = CloseOnDrop::new(&rt);
     let token = rt.authorize(Namespace::local()).unwrap();
     let mut expected_ids = HashSet::new();
@@ -357,7 +365,9 @@ async fn quiet_checkpoint_fixture(cancel: bool) {
                 0.01,
                 None,
                 vec![],
-                Some(QUIET_CHECKPOINT_MODEL),
+                // Note-kind policy selects the registered custom provider;
+                // explicit model overrides accept built-in lattice aliases only.
+                None,
             )
             .await
             .unwrap();
@@ -388,7 +398,7 @@ async fn quiet_checkpoint_fixture(cancel: bool) {
             0.01,
             None,
             vec![],
-            Some(QUIET_CHECKPOINT_MODEL),
+            None,
         )
         .await
         .unwrap();
