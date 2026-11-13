@@ -962,6 +962,38 @@ fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteEr
     Ok(())
 }
 
+/// Whether the migration chain would stop at [`ATTACHMENT_CUTOVER_VERSION`] and
+/// leave the store for the host's application-assisted cutover, read without
+/// mutating the connection.
+///
+/// `false` for a store already at or past the cutover version, since the chain
+/// never reaches that step again. Below it, the answer is the chain's own
+/// condition evaluated on the store as it is now: the cutover is `Incomplete`,
+/// or an entity still holds a legacy `content_ref`. A store with no `entities`
+/// table yet holds no legacy reference. An impossible marker and ledger pair is
+/// an error, as it is for the chain.
+pub fn attachment_cutover_would_defer(conn: &Connection) -> Result<bool, SqliteError> {
+    if read_schema_version(conn)? >= ATTACHMENT_CUTOVER_VERSION {
+        return Ok(false);
+    }
+    cutover_defers(conn, attachment_cutover_status(conn)?)
+}
+
+/// The V21 deferral condition, shared by the chain and
+/// [`attachment_cutover_would_defer`] so there is one copy of it.
+fn cutover_defers(conn: &Connection, status: AttachmentCutoverStatus) -> Result<bool, SqliteError> {
+    let legacy_refs: i64 = if schema_object_exists(conn, "table", "entities")? {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok(status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0)
+}
+
 /// Inspect the coordinated V21 state without mutating the connection.
 ///
 /// The marker and migration ledger form one state machine. Impossible pairs
@@ -2112,21 +2144,15 @@ fn apply_versioned_migration(
             version: migration.version,
             error: e.to_string(),
         })?;
-        let legacy_refs: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+        let defers = cutover_defers(&tx, status).map_err(|e| SqliteError::Migration {
+            version: migration.version,
+            error: e.to_string(),
+        })?;
 
         // V21 belongs to the boot coordinator. Ordinary backend open may
         // finish the degenerate zero-ref case atomically, but it must not
         // expose a dual-source interval or eagerly stage a legacy DB.
-        if status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0 {
+        if defers {
             drop(tx);
             return Ok(MigrationStep::Deferred);
         }
