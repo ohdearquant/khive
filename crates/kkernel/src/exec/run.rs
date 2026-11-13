@@ -572,13 +572,7 @@ mod read_only_policy_tests {
             for (verb, ops) in [
                 ("whoami", "whoami()".to_string()),
                 ("get", format!("get(id={})", json!(id))),
-                (
-                    "search",
-                    format!(
-                        "search(query={}, kind=\"concept\", source=\"text\")",
-                        json!(name)
-                    ),
-                ),
+                ("list", "list(kind=\"concept\")".to_string()),
             ] {
                 let output = cwd.join(format!("explicit-{verb}.jsonl"));
                 let invocation = super::ExecArgs::try_parse_from([
@@ -615,13 +609,13 @@ mod read_only_policy_tests {
                         assert_eq!(row["result"]["id"].as_str(), Some(id.as_str()), "{row}");
                         assert_eq!(row["result"]["name"], name, "{row}");
                     }
-                    "search" => {
-                        let hits = row["result"].as_array().expect("search results array");
+                    "list" => {
+                        let hits = row["result"]["items"].as_array().expect("listed items");
                         assert!(
                             hits.iter().any(|hit| {
                                 hit["id"].as_str() == Some(id.as_str()) && hit["name"] == name
                             }),
-                            "search did not return the copied record: {row}"
+                            "list did not return the copied record: {row}"
                         );
                     }
                     _ => unreachable!("closed read fixture cases"),
@@ -635,27 +629,51 @@ mod read_only_policy_tests {
                 );
             }
 
-            let invocation = super::ExecArgs::try_parse_from([
-                "exec",
-                "create(kind=\"concept\", name=\"read-only-copied-store-write-probe\")",
-                "--read-only",
-                "--db",
-                db.to_str().unwrap(),
-                "--config",
-                config.to_str().unwrap(),
-                "--actor",
-                "actor:read-only-policy-test",
-            ])
-            .unwrap();
-            let refusal = super::run_exec(invocation)
-                .await
-                .expect_err("readonly create must refuse before dispatch")
-                .to_string();
-            assert!(
-                refusal.contains("--read-only refuses operation \"create\""),
-                "wrong write refusal: {refusal}"
-            );
-            let write_store_unchanged = before == store_snapshot(&stores);
+            // Search is an assertion with a telemetry write, so the current
+            // read-only contract refuses it as well as declared writes.
+            let mut refused_results = serde_json::Map::new();
+            for (verb, ops) in [
+                (
+                    "search",
+                    format!(
+                        "search(query={}, kind=\"concept\", source=\"text\")",
+                        json!(name)
+                    ),
+                ),
+                (
+                    "create",
+                    "create(kind=\"concept\", name=\"read-only-copied-store-write-probe\")"
+                        .to_string(),
+                ),
+            ] {
+                let invocation = super::ExecArgs::try_parse_from([
+                    "exec",
+                    &ops,
+                    "--read-only",
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--actor",
+                    "actor:read-only-policy-test",
+                ])
+                .unwrap();
+                let refusal = super::run_exec(invocation)
+                    .await
+                    .expect_err("readonly operation must refuse before dispatch")
+                    .to_string();
+                assert!(
+                    refusal.contains(&format!("--read-only refuses operation {verb:?}")),
+                    "wrong {verb} refusal: {refusal}"
+                );
+                refused_results.insert(
+                    verb.to_string(),
+                    json!({
+                        "declaration_refused": true,
+                        "store_tree_unchanged": before == store_snapshot(&stores),
+                    }),
+                );
+            }
             assert!(
                 !cwd.join(".khive/khive.db").exists(),
                 "created HOME default db"
@@ -669,8 +687,7 @@ mod read_only_policy_tests {
                     "explicit_database_actual_record": true,
                     "copied_store_verified": true,
                     "read_results": read_results,
-                    "write_refused": true,
-                    "write_store_tree_unchanged": write_store_unchanged,
+                    "refused_results": refused_results,
                     "home_default_absent": true,
                     "id": id,
                 }),
@@ -688,7 +705,7 @@ mod read_only_policy_tests {
         );
         assert_eq!(receipt["copied_store_verified"], true, "{receipt}");
         assert_eq!(receipt["read_results"].as_object().unwrap().len(), 3);
-        for verb in ["whoami", "get", "search"] {
+        for verb in ["whoami", "get", "list"] {
             assert_eq!(
                 receipt["read_results"][verb]["result_verified"], true,
                 "{receipt}"
@@ -698,8 +715,17 @@ mod read_only_policy_tests {
                 "readonly {verb} changed store bytes: {receipt}"
             );
         }
-        assert_eq!(receipt["write_refused"], true, "{receipt}");
-        assert_eq!(receipt["write_store_tree_unchanged"], true, "{receipt}");
+        assert_eq!(receipt["refused_results"].as_object().unwrap().len(), 2);
+        for verb in ["search", "create"] {
+            assert_eq!(
+                receipt["refused_results"][verb]["declaration_refused"], true,
+                "{receipt}"
+            );
+            assert_eq!(
+                receipt["refused_results"][verb]["store_tree_unchanged"], true,
+                "refused {verb} changed store bytes: {receipt}"
+            );
+        }
         assert_eq!(
             receipt["selected_store_tree_unchanged"], true,
             "readonly store bytes changed: {receipt}"
