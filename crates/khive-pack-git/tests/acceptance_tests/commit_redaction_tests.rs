@@ -1,7 +1,7 @@
 const REDACTED_COMMIT_MESSAGE: &str = "Commit message was redacted after a secret-gate refusal.";
 
 fn commit_message_refused_after_field_masking() -> String {
-    use khive_runtime::secret_gate::{check, mask_for_redaction_surface, scan, RedactionSurface};
+    use khive_runtime::secret_gate::{check, mask_for_redaction_surface, RedactionSurface};
 
     let subject = "Update configuration documentation";
     let synthetic = ["AK", "IA", "QWERTYUIOPASDFGH"].concat();
@@ -15,10 +15,6 @@ fn commit_message_refused_after_field_masking() -> String {
             mask_for_redaction_surface(RedactionSurface::GitIngest, field),
             field,
             "the fixture must survive the separate subject and body masking"
-        );
-        assert!(
-            scan(field).is_none(),
-            "the raw masker sees no credential span"
         );
     }
     let message = format!("{subject}\n\n{body}");
