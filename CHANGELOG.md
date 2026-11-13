@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
   `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
-  `legacy_preference_model_count`. An embedding host can bring a pre-V21 database forward without
+  `legacy_preference_model_count`. An embedding host can bring a V20 database to V21 without
   depending on `khive-mcp`. `RuntimeError` gains `AttachmentCutoverRequired`.
 
 ### Changed

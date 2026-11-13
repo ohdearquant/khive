@@ -53,7 +53,9 @@ let graph = runtime.graph(&token)?; // Arc<dyn khive_storage::GraphStore>
 
 `KhiveRuntime::new` is suitable for fresh, exact-current, and in-memory
 databases. It deliberately refuses a legacy V20 database that needs verified
-application-assisted migration. Official production boot uses the async
+application-assisted migration, with `RuntimeError::AttachmentCutoverRequired`;
+an embedding host runs `khive_runtime::coordinate_attachment_cutover` over that
+database and then constructs the runtime again. Official production boot uses the async
 `khive_mcp::serve::build_single_backend_runtime` or multi-backend builders and
 then `KhiveRuntime::from_prepared_backend`. The infallible `from_backend`
 constructor is a low-level assembly seam whose caller must already have

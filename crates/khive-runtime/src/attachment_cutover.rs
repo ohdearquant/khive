@@ -181,6 +181,11 @@ pub async fn require_secondary_attachment_empty(
 /// [`StorageBackend::prepare_core_schema`] has migrated it forward (to V20, or
 /// through V21 when no legacy reference needs this coordinator).
 ///
+/// `Ok(())` means the V21 cutover is complete, not that the schema is at the
+/// latest version: later migrations are not run here. `KhiveRuntime::new`
+/// applies them; `KhiveRuntime::from_prepared_backend` needs
+/// [`StorageBackend::prepare_core_schema`] called first.
+///
 /// # Inspecting the state without migrating
 ///
 /// [`StorageBackend::attachment_cutover_status`] is public and only reads: it
