@@ -67,11 +67,11 @@ baseline.
   `cleanup_scratch` walks the scratch tree through a TOCTOU-guarded fd and,
   at every recursion depth, checks each directory's identity two ways: its
   `fstat`ed (device, inode) must match the inode `os.scandir()` observed
-  for that name moments earlier (catching a directory swapped in *after*
+  for that name moments earlier (catching a directory swapped in _after_
   this run started walking the tree — same mechanism regardless of nesting
   depth, not just at the top level), and, for `home`/`tmp`, against the
   identity recorded when this run created them. Neither check can see a
-  substitution that already happened *before* this run's own listing of a
+  substitution that already happened _before_ this run's own listing of a
   given directory — e.g. a directory the `kkernel` subprocess itself
   creates during the run (`blobs`, `eval.db.ann`, `.khive`, `.lattice/...`)
   has no creation-time identity recorded for it — only the listing-time
@@ -281,10 +281,14 @@ exactly 0.04 passes) and at most one question may be lost, meaning it is in the 
 candidate's top ten.
 
 The readable namespaces each round process reports must be the bank's read set plus the primary namespace and the bench
-actor's own namespace, which the runtime adds to every actor's visible namespaces; any other set exits 12. The gate does
-not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line),
-when a recall binding resolves for the caller, or when the two arms' caller, primary namespace or readable namespaces
-differ: in each case the no-profile arm would not be the arm its name says. A hit whose attribution is not its arm's
+actor's own namespace, which the runtime adds to every actor's visible namespaces; any other set exits 12. Both arms of
+a bank share one server process and its credentials, so the same caller, primary namespace and readable namespaces hold
+by construction. The arm-scope comparison remains a defensive guard for a future separate-process implementation. Its
+synthetic mismatch self-tests exercise that helper; they do not show that today's shared-process arms can differ.
+
+The gate does not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line)
+or when a recall binding resolves for the caller: in either case the no-profile arm would not be the arm its name says.
+A hit whose attribution is not its arm's
 (`serve_attribution` of `unspecified` with no `served_by_profile_id` for no profile; `profile` and the candidate's id for
 the candidate) stops the run with exit 11. A degraded recall, or a no-profile recall with no hits, voids its round, which
 runs again in fresh processes; a question that voids three runs in a row stops the gate with exit 11 and is named. A
@@ -328,7 +332,7 @@ target) rather than exact equality: on repeated runs against an identical
 scratch corpus and an identical pinned config, a rank-10-boundary tie in the
 `fresh_directive` class occasionally resolves in either of two orderings
 (nDCG@10 differs by up to ~0.0008; Recall@100/TargetRecall@100/MRR@10 are
-unaffected — the retrieved candidate *set* is stable, only its order at an
+unaffected — the retrieved candidate _set_ is stable, only its order at an
 exact score tie flips). This is a pre-existing `memory.recall`
 scoring/fusion tie-break characteristic, not a wall-clock leak — verified by
 running back to back with a fixed epoch and the temporal weight pinned to
