@@ -626,9 +626,186 @@ probably a property on the entity, not an edge.
 
 ## Loaded taxonomy (generated)
 
-> **Placeholder — NOT GENERATED.** Generation from the current binary's default `schema()`
-> response is pending. The live taxonomy check will print the complete replacement block and fail
-> until it is applied. The human-written taxonomy and relation guidance above remain separate.
+Generated from `schema()` with the binary's default pack selection. Custom pack selections
+can change the vocabulary and endpoint rules; inspect `schema()` on that server.
+
+Regenerate with `python3 scripts/generate-taxonomy.py --kkernel <path> --write`.
+
+Contract version: `ca6ed167079e6c59bea475fb910a209974cc2f058dcd3a3575ab0aa97b8efce4`.
+
+Loaded packs: `blob`, `brain`, `code`, `comm`, `exec`, `git`, `gtd`, `kg`, `knowledge`, `memory`, `schedule`, `session`, `tool`, `workspace`.
+
+### Entity kinds (10)
+
+- `artifact`
+- `concept`
+- `dataset`
+- `document`
+- `org`
+- `person`
+- `project`
+- `resource`
+- `service`
+- `workspace`
+
+### Note kinds (16)
+
+- `channel_health`
+- `commit`
+- `decision`
+- `finding`
+- `head`
+- `insight`
+- `issue`
+- `memory`
+- `message`
+- `observation`
+- `pull_request`
+- `question`
+- `reference`
+- `scheduled_event`
+- `session`
+- `task`
+
+### Edge relations (20)
+
+- `annotates`
+- `competes_with`
+- `composed_with`
+- `contains`
+- `depends_on`
+- `derived_from`
+- `enables`
+- `extends`
+- `implements`
+- `instance_of`
+- `introduced_by`
+- `links_to`
+- `located_in`
+- `owns`
+- `part_of`
+- `precedes`
+- `refutes`
+- `supersedes`
+- `supports`
+- `variant_of`
+
+### Endpoint rules (108)
+
+`base` names a base rule; `pack:NAME` names the pack that declares an additional rule.
+`*` is a literal wildcard. An absent entity type (—) imposes no subtype restriction.
+Duplicate declarations are retained.
+
+| Origin           | Source substrate | Source kind | Source entity type | Relation        | Target substrate | Target kind    | Target entity type |
+| ---------------- | ---------------- | ----------- | ------------------ | --------------- | ---------------- | -------------- | ------------------ |
+| `base`           | `entity`         | `*`         | —                  | `instance_of`   | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `depends_on`    | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `depends_on`    | `entity`         | `service`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `derived_from`  | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `derived_from`  | `entity`         | `dataset`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `derived_from`  | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `derived_from`  | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `implements`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `introduced_by` | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `precedes`      | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `refutes`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `supersedes`    | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `supports`      | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `artifact`  | —                  | `variant_of`    | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `competes_with` | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `composed_with` | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `contains`      | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `enables`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `extends`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `introduced_by` | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `introduced_by` | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `introduced_by` | `entity`         | `person`       | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `located_in`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `part_of`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `refutes`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `supersedes`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `supports`      | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `concept`   | —                  | `variant_of`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `dataset`   | —                  | `enables`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `dataset`   | —                  | `precedes`      | `entity`         | `dataset`      | —                  |
+| `base`           | `entity`         | `dataset`   | —                  | `refutes`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `dataset`   | —                  | `supersedes`    | `entity`         | `dataset`      | —                  |
+| `base`           | `entity`         | `dataset`   | —                  | `supports`      | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `document`  | —                  | `depends_on`    | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `document`  | —                  | `derived_from`  | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `document`  | —                  | `introduced_by` | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `document`  | —                  | `introduced_by` | `entity`         | `person`       | —                  |
+| `base`           | `entity`         | `document`  | —                  | `links_to`      | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `document`  | —                  | `precedes`      | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `document`  | —                  | `refutes`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `document`  | —                  | `supersedes`    | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `document`  | —                  | `supports`      | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `org`       | —                  | `competes_with` | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `org`       | —                  | `contains`      | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `org`       | —                  | `contains`      | `entity`         | `service`      | —                  |
+| `base`           | `entity`         | `org`       | —                  | `located_in`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `org`       | —                  | `owns`          | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `person`    | —                  | `owns`          | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `project`   | —                  | `competes_with` | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `composed_with` | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `contains`      | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `project`   | —                  | `contains`      | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `depends_on`    | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `implements`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `introduced_by` | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `project`   | —                  | `part_of`       | `entity`         | `org`          | —                  |
+| `base`           | `entity`         | `project`   | —                  | `part_of`       | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `project`   | —                  | `precedes`      | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `competes_with` | `entity`         | `service`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `depends_on`    | `entity`         | `artifact`     | —                  |
+| `base`           | `entity`         | `service`   | —                  | `depends_on`    | `entity`         | `dataset`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `depends_on`    | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `depends_on`    | `entity`         | `service`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `enables`       | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `implements`    | `entity`         | `concept`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `instance_of`   | `entity`         | `project`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `introduced_by` | `entity`         | `document`     | —                  |
+| `base`           | `entity`         | `service`   | —                  | `precedes`      | `entity`         | `service`      | —                  |
+| `base`           | `entity`         | `service`   | —                  | `supersedes`    | `entity`         | `service`      | —                  |
+| `pack:code`      | `entity`         | `concept`   | `datatype`         | `depends_on`    | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `concept`   | `datatype`         | `depends_on`    | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `datatype`         | `extends`       | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `concept`   | `datatype`         | `implements`    | `entity`         | `concept`      | —                  |
+| `pack:code`      | `entity`         | `concept`   | `datatype`         | `implements`    | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `function`         | `depends_on`    | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `concept`   | `function`         | `depends_on`    | `entity`         | `concept`      | `function`         |
+| `pack:code`      | `entity`         | `concept`   | `function`         | `depends_on`    | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `function`         | `implements`    | `entity`         | `concept`      | —                  |
+| `pack:code`      | `entity`         | `concept`   | `interface`        | `depends_on`    | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `concept`   | `interface`        | `depends_on`    | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `interface`        | `extends`       | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `contains`      | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `contains`      | `entity`         | `concept`      | `function`         |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `contains`      | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `contains`      | `entity`         | `concept`      | `module`           |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `depends_on`    | `entity`         | `concept`      | `module`           |
+| `pack:code`      | `entity`         | `concept`   | `module`           | `implements`    | `entity`         | `concept`      | —                  |
+| `pack:code`      | `entity`         | `project`   | —                  | `contains`      | `entity`         | `concept`      | `datatype`         |
+| `pack:code`      | `entity`         | `project`   | —                  | `contains`      | `entity`         | `concept`      | `function`         |
+| `pack:code`      | `entity`         | `project`   | —                  | `contains`      | `entity`         | `concept`      | `interface`        |
+| `pack:code`      | `entity`         | `project`   | —                  | `contains`      | `entity`         | `concept`      | `module`           |
+| `pack:git`       | `note`           | `commit`    | —                  | `precedes`      | `note`           | `commit`       | —                  |
+| `pack:gtd`       | `note`           | `task`      | —                  | `depends_on`    | `note`           | `task`         | —                  |
+| `pack:kg`        | `entity`         | `org`       | —                  | `contains`      | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `org`       | —                  | `depends_on`    | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `org`       | —                  | `enables`       | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `org`       | —                  | `part_of`       | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `org`       | —                  | `precedes`      | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `person`    | —                  | `instance_of`   | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `person`    | —                  | `instance_of`   | `entity`         | `project`      | —                  |
+| `pack:kg`        | `entity`         | `person`    | —                  | `part_of`       | `entity`         | `org`          | —                  |
+| `pack:kg`        | `entity`         | `person`    | —                  | `part_of`       | `entity`         | `project`      | —                  |
+| `pack:kg`        | `note`           | `decision`  | —                  | `precedes`      | `note`           | `decision`     | —                  |
+| `pack:workspace` | `entity`         | `workspace` | —                  | `contains`      | `note`           | `commit`       | —                  |
+| `pack:workspace` | `entity`         | `workspace` | —                  | `contains`      | `note`           | `issue`        | —                  |
+| `pack:workspace` | `entity`         | `workspace` | —                  | `contains`      | `note`           | `pull_request` | —                  |
+| `pack:workspace` | `entity`         | `workspace` | —                  | `contains`      | `note`           | `session`      | —                  |
+| `pack:workspace` | `entity`         | `workspace` | —                  | `contains`      | `note`           | `task`         | —                  |
 
 <!-- END GENERATED TAXONOMY -->
 
