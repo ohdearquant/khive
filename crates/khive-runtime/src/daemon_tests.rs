@@ -427,22 +427,12 @@ impl DaemonDispatch for MockDispatch {
 fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
     DaemonRequestFrame {
         owned_namespaces: Vec::new(),
-        plan: false,
         ops: String::new(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "local".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     }
 }
 

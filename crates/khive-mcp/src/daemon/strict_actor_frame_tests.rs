@@ -25,23 +25,13 @@ fn comm_server(require_attributed: bool) -> crate::server::KhiveMcpServer {
 
 fn inbox_frame(config_id: &str, actor_id: Option<&str>) -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "comm.inbox(limit=5)".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
         actor_id: actor_id.map(str::to_string),
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: true,
-        request_id: None,
+        ..Default::default()
     }
 }
 

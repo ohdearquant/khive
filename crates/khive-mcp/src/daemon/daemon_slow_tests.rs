@@ -133,23 +133,12 @@ async fn a_daemon_busy_on_a_held_write_lock_answers_daemon_slow_after_write() {
         .expect("hold the store's write lock");
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "create(kind=\"observation\", content=\"written behind a held lock\")".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let never_spawn = || -> std::io::Result<std::process::Child> {
         panic!("a live daemon is on the socket; nothing may be spawned")
