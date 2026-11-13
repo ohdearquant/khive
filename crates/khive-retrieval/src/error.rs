@@ -106,10 +106,6 @@ pub enum RetrievalError {
     /// Reranking operation failed (permanent).
     #[error("rerank error: {0}")]
     Rerank(String),
-    // TODO(port-rerank): khive-inference not ported yet; re-enable when available.
-    // #[cfg(feature = "native-rerank")]
-    // #[error("inference error: {0}")]
-    // Inference(#[from] khive_inference::InferenceError),
 }
 
 impl RetrievalError {

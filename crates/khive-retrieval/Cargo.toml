@@ -24,6 +24,7 @@ khive-fold    = { version = "0.19.0", path = "../khive-fold", optional = true }
 khive-storage = { version = "0.19.0", path = "../khive-storage", optional = true }
 khive-gate    = { version = "0.19.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
+lattice-inference = { workspace = true, optional = true, features = ["bert", "std"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,8 +61,8 @@ persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand", "khive-storage"]
 storage-adapters = ["khive-storage"]
 # Shared candidate execution with the existing request-scoped storage context.
 executor = ["khive-storage"]
-# Native cross-encoder reranking (deferred until khive-inference is ported)
-native-rerank = []
+# Opt-in CPU BERT cross-encoder scoring; inference defaults remain disabled.
+native-rerank = ["dep:lattice-inference"]
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
 embed = []
 # Hidden helpers shared by the packs that keep file-backed ANN checkpoints: the checkpoint
