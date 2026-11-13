@@ -51,6 +51,30 @@ pub(crate) struct HistogramSnapshot {
     pub(crate) p95: P95Bound,
 }
 
+#[cfg(test)]
+impl HistogramSnapshot {
+    fn count_strictly_above(&self, threshold: Duration) -> Option<u64> {
+        let index = BUCKET_MAX_NANOS
+            .iter()
+            .position(|bound| u128::from(*bound) == threshold.as_nanos())?;
+        Some(self.buckets[index + 1..].iter().sum::<u64>() + self.overflow_count)
+    }
+}
+
+/// Lease samples greater than 500 ms; the inclusive bucket ending at 500 ms
+/// also contains shorter holds, so it cannot answer an at-least-500-ms count.
+#[cfg(test)]
+pub(crate) fn long_lease_holds(class: crate::disk_guard::LeaseClass) -> u64 {
+    let holds = crate::disk_guard::lease_hold_snapshot().expect("lease holds available");
+    let (_, histogram) = holds
+        .iter()
+        .find(|(recorded, _)| *recorded == class)
+        .expect("every class is reported");
+    histogram
+        .count_strictly_above(Duration::from_millis(500))
+        .expect("long-hold threshold must be an exact histogram boundary")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) queue_depth: u64,
