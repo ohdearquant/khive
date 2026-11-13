@@ -403,6 +403,16 @@ mod exhaustive_forwarded {
 
     const ACTOR: &str = "actor:budget-reader";
     const ROWS: usize = TRANSPORT_PAGE_ROWS as usize + 1;
+    // Pausing after real setup retains a fractional millisecond. Tokio rounds
+    // deadlines up to a timer tick, so advancing to the exact instant can leave
+    // the sleep pending forever while drive_until deliberately holds time still.
+    const TIMER_TICK: Duration = Duration::from_millis(1);
+
+    async fn advance_past_timer(at: tokio::time::Instant) {
+        let wake_at = at + TIMER_TICK;
+        tokio::time::advance(wake_at - tokio::time::Instant::now()).await;
+        assert_eq!(tokio::time::Instant::now(), wake_at);
+    }
 
     struct Peer(tokio::task::JoinHandle<()>);
     impl Drop for Peer {
@@ -624,8 +634,9 @@ mod exhaustive_forwarded {
             "actual exhaustive page must start: {}",
             describe()
         );
+        let started = original.async_at() - Duration::from_secs(budget_seconds);
         let first_step = delays[0].min(budget_seconds).min(30);
-        tokio::time::advance(Duration::from_secs(first_step)).await;
+        advance_past_timer(started + Duration::from_secs(first_step)).await;
         if delays[0] > first_step && budget_seconds > first_step {
             for _ in 0..64 {
                 tokio::task::yield_now().await;
@@ -634,10 +645,7 @@ mod exhaustive_forwarded {
                 !call.is_finished(),
                 "long-budget exhaustive page stopped at 30s"
             );
-            tokio::time::advance(Duration::from_secs(
-                delays[0].min(budget_seconds) - first_step,
-            ))
-            .await;
+            advance_past_timer(started + Duration::from_secs(delays[0].min(budget_seconds))).await;
         }
         if budget_seconds > delays[0] {
             drive_until(
@@ -652,10 +660,10 @@ mod exhaustive_forwarded {
                 "the first full page must not end the aggregate: {}",
                 describe()
             );
-            tokio::time::advance(Duration::from_secs(
-                delays[1].min(budget_seconds - delays[0]),
-            ))
-            .await;
+            // Keep expiry tied to the original deadline; the first page's
+            // timer tick must not renew or extend the remaining allowance.
+            let response_at = tokio::time::Instant::now() + Duration::from_secs(delays[1]);
+            advance_past_timer(response_at.min(original.async_at())).await;
         }
         drive_until(
             "call completion",
@@ -680,7 +688,10 @@ mod exhaustive_forwarded {
         let _ = (&mut peer.0).await;
         if succeeds {
             let value = result.expect("complete exhaustive aggregate");
-            assert_eq!(elapsed, Duration::from_secs(delays.iter().sum()));
+            assert_eq!(
+                elapsed,
+                Duration::from_secs(delays.iter().sum()) + TIMER_TICK * 2
+            );
             assert_eq!(value["total"], ROWS);
             assert_eq!(value["window_event_total"], ROWS);
             assert_eq!(value["truncated"], false);
@@ -698,7 +709,7 @@ mod exhaustive_forwarded {
             );
             assert_eq!(*cursors.lock().unwrap(), vec![Some(1_000_000), Some(103)]);
         } else {
-            assert_eq!(elapsed, Duration::from_secs(budget_seconds));
+            assert_eq!(elapsed, Duration::from_secs(budget_seconds) + TIMER_TICK);
             assert!(
                 matches!(&result, Err(RuntimeError::Storage(StorageError::Timeout { operation }))
                 if operation.contains("query_events") && operation.contains(&format!("operator read budget {operator_seconds}s"))),

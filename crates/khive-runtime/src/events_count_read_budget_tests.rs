@@ -1285,20 +1285,18 @@ async fn query_events_read_budget_client_expiry_settles_sqlite_and_recovers_same
     let client = EventsSplitClient::new(socket).unwrap();
     let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
     tokio::time::pause();
-    let mut call = tokio::spawn(scope_request_read_deadline_at(
-        RequestReadDeadline::after(Duration::from_secs(2)),
-        async move {
-            ForwardingEventStore::new("local", client)
-                .query_events(
-                    EventFilter::default(),
-                    PageRequest {
-                        offset: 0,
-                        limit: 1,
-                    },
-                )
-                .await
-        },
-    ));
+    let deadline = RequestReadDeadline::after(Duration::from_secs(2));
+    let mut call = tokio::spawn(scope_request_read_deadline_at(deadline, async move {
+        ForwardingEventStore::new("local", client)
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+    }));
     drive_until(|| accept.is_finished()).await;
     let (cleanup, receiver) = tokio::sync::watch::channel(false);
     let task = serve_query_with_cleanup(&fixture, accept.await.unwrap(), receiver);
@@ -1316,8 +1314,15 @@ async fn query_events_read_budget_client_expiry_settles_sqlite_and_recovers_same
         && store.started.load(Ordering::SeqCst) == 1
         && fixture.frame_budget.available_permits()
             == MAX_INFLIGHT_REQUEST_BYTES - serde_json::to_vec(&query_request()).unwrap().len();
-    tokio::time::advance(Duration::from_secs(2)).await;
-    yield_ready_tasks().await;
+    // Setup ran on a live clock. Cross Tokio's rounded-up millisecond tick,
+    // then hold time fixed while the real client observes its original deadline.
+    let expiry_tick = deadline.async_at() + Duration::from_millis(1);
+    tokio::time::advance(expiry_tick - tokio::time::Instant::now()).await;
+    let completion_until = std::time::Instant::now() + Duration::from_secs(5);
+    while !call.is_finished() && std::time::Instant::now() < completion_until {
+        tokio::task::yield_now().await;
+    }
+    let observed_expiry_tick = tokio::time::Instant::now();
     let result = if call.is_finished() {
         Some((&mut call).await.unwrap())
     } else {
@@ -1343,9 +1348,13 @@ async fn query_events_read_budget_client_expiry_settles_sqlite_and_recovers_same
     let stopped = fixture.progress.load(Ordering::SeqCst) == progress;
     cleanup_query_peer(task, cleanup, &fixture).await;
     assert_framed_query_page(&fixture).await;
+    assert_eq!(
+        observed_expiry_tick, expiry_tick,
+        "client completion must not advance beyond the original deadline's timer tick"
+    );
     assert!(
         matches!(&result, Some(Err(StorageError::Timeout { operation })) if operation.contains("query_events") && operation.contains("operator read budget")),
-        "{result:?}"
+        "client must expire at its original deadline plus one timer tick: {result:?}"
     );
     assert!(
         setup_valid && settled && returned && stopped,
