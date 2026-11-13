@@ -50,7 +50,7 @@ async fn runtime_refuses_v20_then_public_coordinator_unblocks_it() {
     );
 
     // 2. The public coordinator completes the cutover.
-    let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
+    let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
     coordinate_attachment_cutover(Arc::clone(&backend), None, None)
         .await
         .expect("non-model legacy content needs no BlobHydrator");

@@ -170,10 +170,29 @@ pub async fn require_secondary_attachment_empty(
 /// phases receive ownership of the guard, so caller cancellation cannot release
 /// it while native work is still running.
 ///
-/// This is the public entry point an embedding host calls to bring a
-/// pre-V21 database forward. `KhiveRuntime::new` refuses such a database with
-/// [`RuntimeError::AttachmentCutoverRequired`]; run this function over the same
-/// database first, then construct the runtime.
+/// This is the public entry point an embedding host calls to bring a V20
+/// database to V21. `KhiveRuntime::new` migrates a writable database to V20
+/// and, when V21 is left to this coordinator, refuses it with
+/// [`RuntimeError::AttachmentCutoverRequired`]; run this function over the
+/// same database, then construct the runtime again.
+///
+/// The cutover stages only from V20. A file below V20 opened directly with a
+/// backend constructor is refused here until
+/// [`StorageBackend::prepare_core_schema`] has migrated it forward (to V20, or
+/// through V21 when no legacy reference needs this coordinator).
+///
+/// `Ok(())` means the V21 cutover is complete. Whether the later migrations
+/// ran depends on the state at entry. When the cutover was already complete,
+/// this returns at once and runs nothing, so the schema can still be behind the
+/// latest version. Otherwise, once the cutover is finished here (or by a
+/// sibling while this call waited for the GC owner), it applies the remaining
+/// migrations before returning. `KhiveRuntime::new` applies them in either
+/// case; `KhiveRuntime::from_prepared_backend` needs
+/// [`StorageBackend::prepare_core_schema`] called first.
+///
+/// A database that holds legacy moodboard preference models needs both a
+/// `verifier` and a `hydrator`; with either one `None`, the call fails closed
+/// and the cutover stays resumable.
 ///
 /// # Inspecting the state without migrating
 ///
@@ -192,7 +211,8 @@ pub async fn require_secondary_attachment_empty(
 ///
 /// # Errors
 ///
-/// Returns an error when the status cannot be read, when legacy evidence
+/// Returns an error when the status cannot be read, when the database is below
+/// V20 and has not been prepared, when legacy evidence
 /// requires a hydrator that was not configured, or when staging, application or
 /// finalization fails. A failed run leaves the cutover durably resumable.
 pub async fn coordinate_attachment_cutover(
