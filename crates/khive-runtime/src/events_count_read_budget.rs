@@ -40,12 +40,20 @@ impl CountReadBudget {
         &self,
         future: impl Future<Output = StorageResult<T>>,
     ) -> StorageResult<T> {
+        self.scope_operation("events count", future).await
+    }
+
+    pub(super) async fn scope_operation<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = StorageResult<T>>,
+    ) -> StorageResult<T> {
         khive_storage::scope_request_read_deadline_at(self.deadline, async {
-            khive_storage::ensure_request_read_active("events count")
+            khive_storage::ensure_request_read_active(operation)
                 .map_err(|error| self.attribute(error))?;
             let result = future.await;
             if result.is_ok() {
-                khive_storage::ensure_request_read_active("events count")
+                khive_storage::ensure_request_read_active(operation)
                     .map_err(|error| self.attribute(error))?;
             }
             result

@@ -80,6 +80,7 @@ struct Peer {
     _dir: tempfile::TempDir,
     client: Arc<EventsSplitClient>,
     received: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -90,6 +91,8 @@ impl Peer {
         let listener = UnixListener::bind(&socket).unwrap();
         let received = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&received);
+        let closed = Arc::new(AtomicBool::new(false));
+        let saw_close = Arc::clone(&closed);
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let bytes = read_frame(&mut stream).await.unwrap();
@@ -102,6 +105,26 @@ impl Peer {
                     counts: BTreeMap::from([("fixture".into(), 7)]),
                 },
                 EventsRequest::GetEvent { .. } => EventsResponse::Event { event: None },
+                EventsRequest::QueryEvents {
+                    namespace,
+                    filter,
+                    page,
+                    ..
+                } => {
+                    assert_eq!(namespace, "local");
+                    assert_eq!(
+                        serde_json::to_value(filter).unwrap(),
+                        serde_json::to_value(query_filter()).unwrap()
+                    );
+                    assert_eq!(page.offset, 0);
+                    assert_eq!(page.limit, 1);
+                    EventsResponse::Pageful {
+                        page: Page {
+                            items: vec![QueryStore::fixture_event()],
+                            total: Some(1),
+                        },
+                    }
+                }
                 other => panic!("unexpected fixture request: {other:?}"),
             };
             if wire["op"].as_str().unwrap().starts_with("count_") {
@@ -112,14 +135,25 @@ impl Peer {
             assert!(!wire.as_object().unwrap().keys().any(|key| {
                 key.contains("deadline") || key.contains("clock") || key.contains("remaining")
             }));
+            let response_at = tokio::time::Instant::now() + Duration::from_secs(seconds);
+            let delay = tokio::time::sleep_until(response_at);
             observed.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            use tokio::io::AsyncReadExt;
+            tokio::select! {
+                _ = delay => {}
+                closed = stream.read_u8() => {
+                    assert!(closed.is_err(), "one request per connection");
+                    saw_close.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
             let _ = write_frame(&mut stream, &serde_json::to_vec(&response).unwrap()).await;
         });
         Self {
             client: EventsSplitClient::new(socket).unwrap(),
             _dir: dir,
             received,
+            closed,
             task,
         }
     }
@@ -134,7 +168,7 @@ struct CountStore {
     work: CountWork,
     started: AtomicUsize,
     finished: AtomicBool,
-    deadlines: Mutex<Vec<Option<tokio::time::Instant>>>,
+    deadlines: Mutex<Vec<Option<RequestReadDeadline>>>,
 }
 
 impl CountStore {
@@ -148,15 +182,16 @@ impl CountStore {
     }
 
     async fn run_count(&self) -> StorageResult<u64> {
+        self.run_read("fixture.events.count").await
+    }
+
+    async fn run_read(&self, operation: &'static str) -> StorageResult<u64> {
         let deadline = capture_request_read_context().deadline();
-        self.deadlines
-            .lock()
-            .unwrap()
-            .push(deadline.map(RequestReadDeadline::async_at));
+        self.deadlines.lock().unwrap().push(deadline);
         self.started.fetch_add(1, Ordering::SeqCst);
         let result = match &self.work {
             CountWork::Delay(seconds) => {
-                khive_storage::await_request_read_phase("fixture.events.count", async {
+                khive_storage::await_request_read_phase(operation, async {
                     tokio::time::sleep(Duration::from_secs(*seconds)).await;
                     7
                 })
@@ -201,7 +236,11 @@ impl EventStore for CountStore {
         Err(Self::unsupported())
     }
     async fn query_events(&self, _: EventFilter, _: PageRequest) -> StorageResult<Page<Event>> {
-        Err(Self::unsupported())
+        self.run_read("fixture.events.query_events").await?;
+        Ok(Page {
+            items: vec![QueryStore::fixture_event()],
+            total: Some(1),
+        })
     }
     async fn count_events(&self, _: EventFilter) -> StorageResult<u64> {
         self.run_count().await
@@ -215,6 +254,158 @@ impl EventStore for CountStore {
             .await
             .map(|value| BTreeMap::from([("fixture".into(), value)]))
     }
+}
+
+fn query_filter() -> EventFilter {
+    EventFilter {
+        actors: vec!["cursor-reader".into()],
+        kinds: vec![khive_types::EventKind::Audit],
+        after: Some(49),
+        before: Some(151),
+        ..Default::default()
+    }
+}
+
+async fn query(store: &dyn EventStore) -> StorageResult<Page<Event>> {
+    store
+        .query_events(
+            query_filter(),
+            PageRequest {
+                offset: 0,
+                limit: 1,
+            },
+        )
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_events_read_budget_crosses_ten_seconds_with_original_page_shape() {
+    let peer = Peer::delayed(11);
+    let store = ForwardingEventStore::new("local", Arc::clone(&peer.client));
+    let task = tokio::spawn(async move { query(&store).await });
+    drive_until(|| peer.received.load(Ordering::SeqCst)).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    yield_ready_tasks().await;
+    assert!(
+        !task.is_finished(),
+        "query_events retained the fixed timeout"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    drive_until(|| task.is_finished()).await;
+    let page = task.await.unwrap().unwrap();
+    assert_eq!(page.total, Some(1));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, Uuid::from_u128(1));
+    assert_eq!(page.items[0].created_at, 100);
+    assert_eq!(page.items[0].actor, "cursor-reader");
+    peer.task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_events_read_budget_earlier_deadline_and_cancellation_close_socket() {
+    for cancel in [false, true] {
+        let peer = Peer::delayed(11);
+        let store = ForwardingEventStore::new("local", Arc::clone(&peer.client));
+        let (cancellation, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(scope_request_read_deadline_at(
+            RequestReadDeadline::after(Duration::from_secs(5)),
+            khive_storage::scope_request_read_cancellation(
+                receiver,
+                async move { query(&store).await },
+            ),
+        ));
+        drive_until(|| peer.received.load(Ordering::SeqCst)).await;
+        tokio::time::advance(Duration::from_secs(if cancel { 1 } else { 5 })).await;
+        if cancel {
+            cancellation.send(true).unwrap();
+        }
+        drive_until(|| task.is_finished() && peer.closed.load(Ordering::SeqCst)).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, StorageError::Timeout { operation }
+            if operation.contains("query_events") && operation.contains("operator read budget 30s")
+                && operation.matches("operator read budget").count() == 1),
+            "{error:?}"
+        );
+        peer.task.await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_events_read_budget_split_legacy_and_lane_never_renew() {
+    for remote in [false, true] {
+        for lane_seconds in [9, 11] {
+            let legacy = CountStore::new(CountWork::Delay(20));
+            let local_lane = CountStore::new(CountWork::Delay(lane_seconds));
+            let peer = remote.then(|| Peer::delayed(lane_seconds));
+            let lane: Arc<dyn EventStore> = match &peer {
+                Some(peer) => {
+                    Arc::new(ForwardingEventStore::new("local", Arc::clone(&peer.client)))
+                }
+                None => local_lane.clone(),
+            };
+            let split = SplitEventStore::new(legacy.clone(), lane);
+            let started = tokio::time::Instant::now();
+            // No enclosing scope: the split store must establish one for both sources.
+            let task = tokio::spawn(async move { query(&split).await });
+            drive_until(|| legacy.started.load(Ordering::SeqCst) == 1).await;
+            let original = legacy.deadlines.lock().unwrap()[0].expect("split read deadline");
+            assert_eq!(original.async_at(), started + Duration::from_secs(30));
+            tokio::time::advance(Duration::from_secs(20)).await;
+            drive_until(|| {
+                peer.as_ref().map_or_else(
+                    || local_lane.started.load(Ordering::SeqCst) == 1,
+                    |peer| peer.received.load(Ordering::SeqCst),
+                )
+            })
+            .await;
+            if !remote {
+                let lane_deadline = local_lane.deadlines.lock().unwrap()[0].unwrap();
+                assert_eq!(lane_deadline.async_at(), original.async_at());
+                assert_eq!(lane_deadline.blocking_at(), original.blocking_at());
+            }
+            tokio::time::advance(Duration::from_secs(lane_seconds.min(10))).await;
+            drive_until(|| task.is_finished()).await;
+            let result = task.await.unwrap();
+            if lane_seconds == 9 {
+                let page = result.unwrap();
+                assert_eq!(page.total, Some(2));
+                assert_eq!(page.items.len(), 1);
+                assert_eq!(page.items[0].id, Uuid::from_u128(1));
+            } else {
+                assert!(
+                    matches!(result, Err(StorageError::Timeout { .. })),
+                    "{result:?}"
+                );
+            }
+            if let Some(peer) = peer {
+                drive_until(|| peer.task.is_finished()).await;
+                peer.task.await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_events_read_budget_legacy_refusal_prevents_lane_start() {
+    let legacy = CountStore::new(CountWork::Delay(20));
+    let lane = CountStore::new(CountWork::Delay(0));
+    let split = SplitEventStore::new(legacy.clone(), lane.clone());
+    let task = tokio::spawn(scope_request_read_deadline_at(
+        RequestReadDeadline::after(Duration::from_secs(1)),
+        async move { query(&split).await },
+    ));
+    drive_until(|| legacy.started.load(Ordering::SeqCst) == 1).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    drive_until(|| task.is_finished()).await;
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&error, StorageError::Timeout { operation }
+        if operation.starts_with("fixture.events.query_events (operator read budget 30s")
+            && operation.matches("operator read budget").count() == 1),
+        "{error:?}"
+    );
+    assert_eq!(lane.started.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -292,7 +483,13 @@ async fn split_legacy_twenty_then_lane_nine_or_eleven_never_renews() {
             tokio::time::advance(Duration::from_secs(20)).await;
             drive_until(|| peer.received.load(Ordering::SeqCst)).await;
             assert_eq!(
-                *legacy.deadlines.lock().unwrap(),
+                legacy
+                    .deadlines
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|deadline| deadline.map(RequestReadDeadline::async_at))
+                    .collect::<Vec<_>>(),
                 vec![Some(original.async_at())]
             );
             tokio::time::advance(Duration::from_secs(lane_seconds.min(10))).await;
@@ -651,6 +848,7 @@ async fn original_client_expiry_closes_socket_then_awaits_actual_sqlite_settleme
 enum QueryWork {
     Fast,
     Slow,
+    Delay(u64),
 }
 
 struct QueryStore {
@@ -679,11 +877,22 @@ impl QueryStore {
     }
 
     async fn read_fixture_sql(&self, label: &'static str) -> StorageResult<()> {
+        assert!(
+            capture_request_read_context().deadline().is_none(),
+            "the query receiver must not mint a deadline"
+        );
         self.started.fetch_add(1, Ordering::SeqCst);
         let result = async {
+            if let QueryWork::Delay(seconds) = self.work {
+                khive_storage::await_request_read_phase(
+                    label,
+                    tokio::time::sleep(Duration::from_secs(seconds)),
+                )
+                .await?;
+            }
             let mut reader = self.sql.reader().await?;
             let sql = match self.work {
-                QueryWork::Fast => "SELECT COUNT(*) FROM count_fixture",
+                QueryWork::Fast | QueryWork::Delay(_) => "SELECT COUNT(*) FROM count_fixture",
                 // Finite real SQLite work, interrupted through the owned read context.
                 QueryWork::Slow => "SELECT COUNT(*) FROM events CROSS JOIN count_fixture d",
             };
@@ -1058,4 +1267,172 @@ async fn query_event_page_disconnect_settles_sqlite_and_recovers_same_pool() {
             && admission_returned_before_cleanup && frame_returned_before_cleanup,
         "query_event_page_peer_disconnect_settled_resources_before_cleanup: settled={settled_before_cleanup} reader={reader_returned_before_cleanup} admission={admission_returned_before_cleanup} frame={frame_returned_before_cleanup}"
     );
+}
+
+#[tokio::test]
+async fn query_events_read_budget_client_expiry_settles_sqlite_and_recovers_same_pool() {
+    let fixture = Arc::new(SqlFixture::new());
+    assert_framed_query_page(&fixture).await;
+    let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Slow);
+    fixture
+        .stores
+        .lock()
+        .unwrap()
+        .insert("local".into(), store.clone());
+    fixture.progress.store(0, Ordering::SeqCst);
+    let socket = fixture._dir.path().join("query-expiry.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let client = EventsSplitClient::new(socket).unwrap();
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    tokio::time::pause();
+    let mut call = tokio::spawn(scope_request_read_deadline_at(
+        RequestReadDeadline::after(Duration::from_secs(2)),
+        async move {
+            ForwardingEventStore::new("local", client)
+                .query_events(
+                    EventFilter::default(),
+                    PageRequest {
+                        offset: 0,
+                        limit: 1,
+                    },
+                )
+                .await
+        },
+    ));
+    drive_until(|| accept.is_finished()).await;
+    let (cleanup, receiver) = tokio::sync::watch::channel(false);
+    let task = serve_query_with_cleanup(&fixture, accept.await.unwrap(), receiver);
+    let observed_until = std::time::Instant::now() + Duration::from_secs(2);
+    while fixture.progress.load(Ordering::SeqCst) == 0
+        && !task.is_finished()
+        && std::time::Instant::now() < observed_until
+    {
+        tokio::task::yield_now().await;
+    }
+    let active = fixture.pool.reader_acquisition_snapshot();
+    let setup_valid = fixture.progress.load(Ordering::SeqCst) > 0
+        && !task.is_finished()
+        && active.active_pooled_checkouts == 1
+        && store.started.load(Ordering::SeqCst) == 1
+        && fixture.frame_budget.available_permits()
+            == MAX_INFLIGHT_REQUEST_BYTES - serde_json::to_vec(&query_request()).unwrap().len();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    yield_ready_tasks().await;
+    let result = if call.is_finished() {
+        Some((&mut call).await.unwrap())
+    } else {
+        // A regressed client bound must fail without leaving hostile SQLite work behind.
+        call.abort();
+        let _ = (&mut call).await;
+        None
+    };
+    tokio::time::resume();
+    let until = tokio::time::Instant::now()
+        + khive_db::sqlite_interrupt_grace_from_env()
+        + Duration::from_secs(2);
+    while !task.is_finished() && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let settled = task.is_finished() && store.finished.load(Ordering::SeqCst);
+    let before = fixture.pool.reader_acquisition_snapshot();
+    let returned = before.active_pooled_checkouts == 0
+        && before.available_reader_admission_slots == 1
+        && fixture.frame_budget.available_permits() == MAX_INFLIGHT_REQUEST_BYTES;
+    let progress = fixture.progress.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let stopped = fixture.progress.load(Ordering::SeqCst) == progress;
+    cleanup_query_peer(task, cleanup, &fixture).await;
+    assert_framed_query_page(&fixture).await;
+    assert!(
+        matches!(&result, Some(Err(StorageError::Timeout { operation })) if operation.contains("query_events") && operation.contains("operator read budget")),
+        "{result:?}"
+    );
+    assert!(
+        setup_valid && settled && returned && stopped,
+        "expiry must settle SQL and return reader/frame permits before independent cleanup"
+    );
+}
+
+#[tokio::test]
+async fn query_events_read_budget_900s_receiver_has_no_independent_deadline() {
+    const NAME: &str = "events_split::count_read_budget_tests::query_events_read_budget_900s_receiver_has_no_independent_deadline";
+    const CHILD: &str = "KHIVE_EVENTS_QUERY_900S_CHILD";
+    if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("completed");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, NAME)
+            .env("KHIVE_REQUEST_READ_TIMEOUT_SECS", "900")
+            .env("KHIVE_EVENTS_QUERY_900S_DONE", &marker)
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                assert_eq!(std::fs::read_to_string(marker).unwrap(), NAME);
+                return;
+            }
+            if std::time::Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("900s receiver fixture wall deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(
+        khive_storage::request_read_timeout_from_env(),
+        Duration::from_secs(900)
+    );
+    let fixture = Arc::new(SqlFixture::new());
+    let store = QueryStore::new(Arc::clone(&fixture.sql), QueryWork::Delay(40));
+    fixture
+        .stores
+        .lock()
+        .unwrap()
+        .insert("local".into(), store.clone());
+    let socket = fixture._dir.path().join("query-900.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let client = EventsSplitClient::new(socket).unwrap();
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    tokio::time::pause();
+    let call = tokio::spawn(async move {
+        ForwardingEventStore::new("local", client)
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+    });
+    drive_until(|| accept.is_finished()).await;
+    let (cleanup, receiver) = tokio::sync::watch::channel(false);
+    let task = serve_query_with_cleanup(&fixture, accept.await.unwrap(), receiver);
+    drive_until(|| store.started.load(Ordering::SeqCst) == 1).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    yield_ready_tasks().await;
+    let pending_after_thirty = !call.is_finished() && !store.finished.load(Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    // SQL is real but bounded; resume so its blocking worker gets the ordinary cleanup grace.
+    tokio::time::resume();
+    let result = tokio::time::timeout(Duration::from_secs(2), call).await;
+    cleanup_query_peer(task, cleanup, &fixture).await;
+    assert!(
+        pending_after_thirty,
+        "receiver introduced an independent 30s timer"
+    );
+    let page = result.unwrap().unwrap().unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, Uuid::from_u128(1));
+    assert!(store.finished.load(Ordering::SeqCst));
+    assert_query_resources_returned(&fixture);
+    std::fs::write(
+        std::env::var_os("KHIVE_EVENTS_QUERY_900S_DONE").unwrap(),
+        NAME,
+    )
+    .unwrap();
 }
