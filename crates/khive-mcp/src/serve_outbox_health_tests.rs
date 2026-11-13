@@ -242,7 +242,6 @@ async fn set_retry(
         .await
         .unwrap()
         .unwrap();
-    note.created_at = created.timestamp_micros();
     let props = note.properties.as_mut().unwrap();
     props["next_attempt_at"] = json!(next.to_rfc3339());
     props["delivery_attempts"] = json!(attempts);
@@ -253,6 +252,37 @@ async fn set_retry(
         .upsert_note(note)
         .await
         .unwrap();
+
+    // Upserts preserve the original creation time. Age this fixture row
+    // explicitly while leaving retry-property/index updates on the real path.
+    let changed = runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET created_at = ?1 WHERE id = ?2 AND namespace = ?3".into(),
+            params: vec![
+                SqlValue::Integer(created.timestamp_micros()),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(token.namespace().as_str().into()),
+            ],
+            label: Some("outbox_backlog_age_fixture".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(
+        runtime
+            .notes(token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        created.timestamp_micros()
+    );
 }
 
 async fn note_state(runtime: &KhiveRuntime) -> Value {
