@@ -24,23 +24,16 @@ async fn request(
     ops: String,
 ) -> Vec<Value> {
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
         ops,
         presentation: Some("verbose".into()),
-        presentation_per_op: None,
         namespace: "local".into(),
         actor_id: actor.map(str::to_owned),
-        process_ref: None,
         visible_namespaces: visible.iter().map(|ns| (*ns).to_owned()).collect(),
         config_id: config_id.to_owned(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        plan: false,
         format: Some("json".into()),
-        format_per_op: None,
         from_wire: true,
-        request_id: None,
+        ..Default::default()
     };
     let response = timeout(Duration::from_secs(10), exchange(socket, &frame))
         .await

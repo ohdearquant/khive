@@ -147,23 +147,13 @@ async fn start_embedding_daemon(
 
 fn embedding_request_frame(ops: &str, config_id: String) -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: ops.to_owned(),
         presentation: Some("verbose".to_string()),
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id,
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: true,
-        request_id: None,
+        ..Default::default()
     }
 }
 
@@ -384,23 +374,13 @@ mod handover {
 
     fn request(ops: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
-            owned_namespaces: Vec::new(),
-            plan: false,
             ops: ops.to_owned(),
-            presentation: None,
-            presentation_per_op: None,
             namespace: NS.to_owned(),
-            actor_id: None,
-            process_ref: None,
-            visible_namespaces: Vec::new(),
             config_id: CFG.to_owned(),
             protocol_version: PROTOCOL_VERSION,
-            probe_only: false,
-            metrics_only: false,
-            format: None,
-            format_per_op: None,
             from_wire: true,
             request_id: Some(17),
+            ..Default::default()
         }
     }
 
@@ -1717,23 +1697,12 @@ async fn forward_or_spawn_returns_none_when_no_daemon_set() {
     std::env::set_var("KHIVE_NO_DAEMON", "1");
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: "test".to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let out = forward_or_spawn(&frame).await;
     assert!(out.is_none());
@@ -1763,23 +1732,12 @@ async fn forward_or_spawn_returns_none_when_no_daemon_set() {
 
 fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     }
 }
 
@@ -2954,23 +2912,13 @@ async fn daemon_round_trip_dispatches_and_enforces_config_id() {
 
     // (a) valid same-namespace, same-config op
     let req = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
         presentation: Some("verbose".to_string()),
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let resp = exchange(&sock, &req).await;
     assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
@@ -3029,23 +2977,12 @@ async fn daemon_round_trip_dispatches_and_enforces_config_id() {
     // the frame's OWN namespace ("other") over the same shared warm
     // registry, instead of setting `namespace_mismatch`.
     let other = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "other".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let resp_other = exchange(&sock, &other).await;
     assert!(
@@ -3069,23 +3006,12 @@ async fn daemon_round_trip_dispatches_and_enforces_config_id() {
     // config_id reject stays hard under ADR-096 Fork 1 — only the
     // namespace reject was softened.
     let mismatched_config = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let resp_cfg = exchange(&sock, &mismatched_config).await;
     assert!(
@@ -3097,23 +3023,12 @@ async fn daemon_round_trip_dispatches_and_enforces_config_id() {
 
     // (d) version mismatch → explicit error, NOT namespace/config mismatch
     let wrong_version = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: 0,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let resp_ver = exchange(&sock, &wrong_version).await;
     assert!(
@@ -3210,23 +3125,12 @@ async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
     drop(ready);
 
     let request = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: revoked_config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let response = exchange(&sock, &request).await;
 
@@ -3304,64 +3208,37 @@ async fn daemon_serves_per_request_identity_over_one_warm_registry() {
     drop(_ready);
 
     let alice_frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "comm.send(to=\"bob\", content=\"hello from alice\") | comm.thread(id=$prev.full_id)"
             .to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "alpha".to_string(),
         actor_id: Some("alice".to_string()),
         process_ref: Some("worker/alice:17".to_string()),
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let bob_frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "comm.send(to=\"alice\", content=\"hello from bob\") | comm.thread(id=$prev.full_id)"
             .to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "beta".to_string(),
         actor_id: Some("bob".to_string()),
         process_ref: Some("worker/bob:29".to_string()),
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let charlie_frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "comm.send(to=\"alice\", content=\"hello from charlie\") | comm.thread(id=$prev.full_id)"
             .to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "gamma".to_string(),
         actor_id: Some("charlie".to_string()),
         process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let resp_alice = exchange(&sock, &alice_frame).await;
@@ -3496,23 +3373,15 @@ async fn daemon_config_id_ignores_actor_folded_visibility_but_frame_visibility_i
     drop(_ready);
 
     let frame = |ops: &str, actor: &str, visible: &[Namespace]| DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: ops.to_string(),
         presentation: Some("verbose".to_string()),
-        presentation_per_op: None,
         namespace: "local".to_string(),
         actor_id: Some(actor.to_string()),
-        process_ref: None,
         visible_namespaces: visible.iter().map(|ns| ns.as_str().to_string()).collect(),
         config_id: id_a.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let seed_a = exchange(
@@ -3665,23 +3534,12 @@ async fn daemon_round_trip_honors_from_wire_for_subhandlers() {
     drop(_ready);
 
     let frame = |from_wire: bool| DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "brain.state()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "braintest".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.clone(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire,
-        request_id: None,
+        ..Default::default()
     };
 
     // (a) from_wire=true → daemon applies the wire visibility gate:
@@ -3835,23 +3693,12 @@ async fn forward_or_spawn_rejects_old_daemon_and_returns_protocol_mismatch_error
     let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -3946,23 +3793,12 @@ async fn forward_or_spawn_behind_a_newer_daemon_returns_the_error_and_arms_reexe
     ));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -4066,23 +3902,12 @@ async fn try_forward_inner_returns_response_lost_when_daemon_closes_without_resp
     let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     // Call try_forward_inner directly to assert the discriminant.
@@ -4186,23 +4011,12 @@ async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
              outright before the timeout can be observed"
     );
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: big_ops,
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let started = std::time::Instant::now();
@@ -4314,23 +4128,12 @@ async fn try_forward_inner_read_timeout_after_full_write_returns_response_timeou
     let fake_handle = tokio::spawn(serve_read_then_never_answer(listener));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let started = std::time::Instant::now();
@@ -4417,23 +4220,13 @@ async fn try_forward_inner_normal_response_within_ceiling_still_succeeds() {
     let fake_handle = tokio::spawn(serve_one_ok_response(listener, config_id.to_string()));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
         request_id: Some(555),
+        ..Default::default()
     };
 
     let outcome =
@@ -4939,23 +4732,12 @@ async fn oversized_daemon_response_sends_error_frame_not_kills_daemon() {
         .expect("daemon pid must be a u32");
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -5164,23 +4946,13 @@ async fn recovery_path_dispatches_real_request_exactly_once() {
 
     // Now forward the real request exactly once — the call site's single forward.
     let real_frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let fwd = try_forward_inner(&real_frame).await;
     assert!(
@@ -5536,23 +5308,12 @@ async fn parallel_no_socket_recovery_converges_to_one_usable_daemon() {
 
     drop(connect_when_ready(&sock).await);
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
     let response = exchange(&sock, &frame).await;
     assert!(
@@ -5693,23 +5454,12 @@ async fn parallel_parse_failure_is_terminal_and_never_recovers() {
     });
 
     let frame = std::sync::Arc::new(DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: CFG.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     });
     let mut clients = tokio::task::JoinSet::new();
     for _ in 0..CLIENTS {
@@ -5939,23 +5689,12 @@ async fn dispatch_error_propagates_as_non_empty_client_message() {
     drop(_ready);
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -6053,23 +5792,12 @@ async fn current_client_rejects_warm_v3_daemon_before_accepting_result() {
     let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let outcome = try_forward_inner(&frame).await;
@@ -6122,23 +5850,12 @@ async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
     let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let outcome = try_forward_inner(&frame).await;
@@ -6226,23 +5943,12 @@ async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
     });
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -6337,23 +6043,13 @@ async fn forward_or_spawn_dispatches_real_frame_exactly_once_end_to_end() {
     });
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -6445,23 +6141,13 @@ async fn forward_or_spawn_dispatches_real_frame_exactly_once_on_success() {
     });
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = forward_or_spawn(&frame).await;
@@ -6581,23 +6267,12 @@ async fn forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback() {
     });
 
     let frame = DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     };
 
     let started = std::time::Instant::now();

@@ -68,9 +68,7 @@ fn creator_identity() -> RequestIdentity {
         namespace: "local".to_string(),
         actor_id: Some(CREATOR.to_string()),
         process_ref: khive_runtime::process_ref_from_env(),
-        visible_namespaces: Vec::new(),
-        owned_namespaces: Vec::new(),
-        request_id: None,
+        ..Default::default()
     }
 }
 
