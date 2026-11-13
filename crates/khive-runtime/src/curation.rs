@@ -44,9 +44,11 @@ mod note_curation;
 mod note_merge;
 mod note_merge_guard;
 pub(crate) mod note_reindex;
+mod outbound_health;
 mod outbound_messages;
 
 pub use note_merge_guard::{GuardedNoteMerge, MergeAssertion, NoteMergeGuard};
+pub use outbound_health::OutboundHealthSummary;
 
 /// Restrict an outbox scan before its SQL page bound is applied. A held row
 /// for another or unconfigured channel must not consume a channel's page.
