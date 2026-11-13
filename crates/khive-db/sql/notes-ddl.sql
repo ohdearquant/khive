@@ -90,6 +90,11 @@ CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_type_direction
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
 
+-- Forced comm reads need the migration 052 indexes on direct stores and repair.
+CREATE INDEX IF NOT EXISTS idx_comm_message_thread ON notes(namespace, kind, json_extract(properties, '$.thread_id'), created_at DESC) WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor ON notes(namespace, kind, json_extract(properties, '$.to_actor'), json_extract(properties, '$.direction'), json_extract(properties, '$.read'), created_at DESC) WHERE deleted_at IS NULL;
+
 -- Hot property-path indexes for GTD task listing (status/assignee) -- see
 -- sql/027-notes-hot-property-indexes.sql for the full rationale, the note
 -- that each key expression must match its `FilterOp`'s compiled SQL

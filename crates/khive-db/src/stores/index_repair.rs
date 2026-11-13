@@ -15,8 +15,8 @@ pub(crate) enum IndexReadKind {
     Notes,
 }
 
-/// An index a typed read names with `INDEXED BY`: its name, the store schema
-/// that creates it, and the read that forces it.
+/// An index a store or pack read names with `INDEXED BY`: its name, the store
+/// schema that creates it, and the typed read route allowed to repair it.
 pub(crate) struct ForcedIndex {
     pub(crate) name: &'static str,
     pub(crate) kind: StoreSchemaKind,
@@ -25,7 +25,7 @@ pub(crate) struct ForcedIndex {
 
 /// Every forced index. The serving barrier checks each one before readiness,
 /// and a read repairs only the ones it forces.
-pub(crate) const FORCED_INDEXES: [ForcedIndex; 7] = [
+pub(crate) const FORCED_INDEXES: [ForcedIndex; 9] = [
     ForcedIndex {
         name: "idx_graph_edges_ns_src_rel",
         kind: StoreSchemaKind::Graph,
@@ -58,6 +58,16 @@ pub(crate) const FORCED_INDEXES: [ForcedIndex; 7] = [
     },
     ForcedIndex {
         name: "idx_notes_unread_probe_recipient_type_direction",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Notes,
+    },
+    ForcedIndex {
+        name: "idx_comm_message_thread",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Notes,
+    },
+    ForcedIndex {
+        name: "idx_comm_message_to_actor",
         kind: StoreSchemaKind::Notes,
         read: IndexReadKind::Notes,
     },
