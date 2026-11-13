@@ -4,6 +4,12 @@ impl EmailChannel {
     /// Build from environment variables. Fails if any required env var is absent.
     pub fn from_env() -> Result<Self, ChannelError> {
         let config = EmailChannelConfig::from_env()?;
+        if config.trust_exchange_internal {
+            warn!(
+                "KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL is enabled. {}",
+                crate::config::EXCHANGE_INTERNAL_PRECONDITION
+            );
+        }
 
         let (smtp, imap) = match &config.auth {
             EmailAuth::Basic { password } => {

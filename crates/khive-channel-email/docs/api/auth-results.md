@@ -153,7 +153,13 @@ precondition; diagnostic observations do not prove that a header is authentic.
 
 `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` defaults to `false`. Enable it only when the
 configured mailbox is hosted by Exchange Online and the deployment has confirmed
-Exchange's header firewall behavior for its own mailbox. It applies only when
+that its receiving boundary strips sender-supplied
+`X-MS-Exchange-Organization-AuthAs` headers. Both are operator preconditions: khive
+does not verify the mailbox provider or the boundary's header handling from the
+IMAP host or authentication-results trust anchor. With the option enabled on a
+non-Exchange mailbox, a same-domain message carrying the stamp is still attributed
+to the maintainer when the checks below pass. Such deployments must leave the
+option disabled. It applies only when
 normal authentication evaluation returns `auth-absent`; messages with plain or ARC
 authentication headers follow the existing rules.
 
