@@ -84,6 +84,8 @@ include!("acceptance_tests/cursor_refusal_tests.rs");
 
 include!("acceptance_tests/commit_cursor_failure_tests.rs");
 
+include!("acceptance_tests/commit_redaction_tests.rs");
+
 include!("acceptance_tests/remote_capability_tests.rs");
 
 include!("acceptance_tests/digest_limit_tests.rs");

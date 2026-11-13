@@ -262,7 +262,7 @@ pub struct IngestWriteRefusal {
     pub record_key: String,
     pub detector: String,
     pub masked: String,
-    /// Present only for a GitHub replacement attempt; true after a real UUID returns.
+    /// Present for a redacted replacement attempt; true after a valid create receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted: Option<bool>,
 }
