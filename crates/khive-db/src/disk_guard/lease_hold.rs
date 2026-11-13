@@ -111,14 +111,20 @@ pub(crate) fn effective_class(site: LeaseClass) -> LeaseClass {
 /// loses that scope at the hop; this context carries it. It changes only how a
 /// lease is recorded in the lease-hold report, never whether or when a write is
 /// admitted.
+///
+/// This is a general class carrier: [`Self::capture`] preserves the current
+/// internal class, while the default context installs no override.
+/// [`Self::migration`] is the explicit class selector currently exposed
+/// publicly. Bootstrap leases always retain their bootstrap class, including
+/// under a migration context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteClassContext {
     class: Option<LeaseClass>,
 }
 
 impl WriteClassContext {
-    /// Schema work: every lease taken under this context is recorded as
-    /// migration class.
+    /// Schema work: leases taken under this context are recorded as migration,
+    /// except bootstrap leases, which retain their bootstrap class.
     pub fn migration() -> Self {
         Self {
             class: Some(LeaseClass::Migration),

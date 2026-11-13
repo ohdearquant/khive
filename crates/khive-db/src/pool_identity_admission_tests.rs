@@ -1,4 +1,5 @@
 use super::*;
+use crate::writer_admission_metrics::long_lease_holds;
 use std::sync::atomic::AtomicUsize;
 
 /// A 100 ms lease deadline is only meaningful in the test's own lock
@@ -369,27 +370,18 @@ fn write_unit_volume_checks_read_the_existing_database_without_resolving_its_pat
     assert_eq!(crate::disk_guard::resolves_on_this_thread() - before, 2);
 }
 
-/// Holds of at least half a second recorded under `class` so far. Other tests
-/// record into the same process-wide histograms, but none hold a lease that
-/// long, so a delta here is this test's own lease.
-fn long_holds(class: crate::disk_guard::LeaseClass) -> u64 {
-    let holds = crate::disk_guard::lease_hold_snapshot().expect("lease holds available");
-    let (_, histogram) = holds
-        .iter()
-        .find(|(recorded, _)| *recorded == class)
-        .expect("every class is reported");
-    histogram.buckets[11..].iter().sum::<u64>() + histogram.overflow_count
-}
-
 #[test]
 fn a_held_lease_records_its_hold_under_its_class() {
+    if crate::test_process::run_in_child(|_| {}) {
+        return;
+    }
     use crate::disk_guard::LeaseClass;
     let dir = tempfile::tempdir().unwrap();
     let pool = fixture_pool(
         &dir.path().join("lease-hold.db"),
         &dir.path().join("volume-locks"),
     );
-    let before = long_holds(LeaseClass::Standalone);
+    let before = long_lease_holds(LeaseClass::Standalone);
     let lease = pool
         .write_admission()
         .acquire(LeaseClass::Standalone)
@@ -397,19 +389,23 @@ fn a_held_lease_records_its_hold_under_its_class() {
         .expect("real volume lease");
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(
-        long_holds(LeaseClass::Standalone),
+        long_lease_holds(LeaseClass::Standalone),
         before,
         "a hold is recorded at release, not while held"
     );
     drop(lease);
-    assert!(
-        long_holds(LeaseClass::Standalone) > before,
+    assert_eq!(
+        long_lease_holds(LeaseClass::Standalone),
+        before + 1,
         "a 600 ms standalone hold must be recorded under standalone"
     );
 }
 
 #[test]
 fn a_class_scope_overrides_the_acquisition_site_class() {
+    if crate::test_process::run_in_child(|_| {}) {
+        return;
+    }
     use crate::disk_guard::{effective_class, lease_class_scope, LeaseClass};
     assert_eq!(effective_class(LeaseClass::Pooled), LeaseClass::Pooled);
     let dir = tempfile::tempdir().unwrap();
@@ -417,7 +413,7 @@ fn a_class_scope_overrides_the_acquisition_site_class() {
         &dir.path().join("lease-scope.db"),
         &dir.path().join("volume-locks"),
     );
-    let before = long_holds(LeaseClass::Migration);
+    let before = long_lease_holds(LeaseClass::Migration);
     {
         let _outer = lease_class_scope(LeaseClass::Migration);
         {
@@ -434,8 +430,9 @@ fn a_class_scope_overrides_the_acquisition_site_class() {
         drop(lease);
     }
     assert_eq!(effective_class(LeaseClass::Pooled), LeaseClass::Pooled);
-    assert!(
-        long_holds(LeaseClass::Migration) > before,
+    assert_eq!(
+        long_lease_holds(LeaseClass::Migration),
+        before + 1,
         "a lease taken inside a migration scope is recorded as migration"
     );
 }

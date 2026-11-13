@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use crate::test_hooks::TestHooks;
+use crate::writer_admission_metrics::long_lease_holds;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
 
@@ -1791,25 +1792,14 @@ async fn writer_task_applies_the_issuers_lease_class_on_the_writer_thread() {
     assert_eq!(unscoped, LeaseClass::WriterTask);
 }
 
-/// Holds of at least half a second recorded under `class` so far; see
-/// `pool_identity_admission_tests::long_holds`.
-fn long_holds(class: crate::disk_guard::LeaseClass) -> u64 {
-    let holds = crate::disk_guard::lease_hold_snapshot().expect("lease holds available");
-    let (_, histogram) = holds
-        .iter()
-        .find(|(recorded, _)| *recorded == class)
-        .expect("every class is reported");
-    histogram.buckets[11..].iter().sum::<u64>() + histogram.overflow_count
-}
-
-/// Waits up to five seconds for `long_holds(class)` to reach `at_least` and
+/// Waits up to five seconds for `long_lease_holds(class)` to reach `at_least` and
 /// returns the last reading. The writer thread sends the reply before it
 /// releases the volume lease, and the hold is recorded at release, so the
 /// awaiting caller can read the histogram before the hold lands.
 async fn long_holds_reaching(class: crate::disk_guard::LeaseClass, at_least: u64) -> u64 {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let now = long_holds(class);
+        let now = long_lease_holds(class);
         if now >= at_least || std::time::Instant::now() >= deadline {
             return now;
         }
@@ -1822,6 +1812,9 @@ async fn long_holds_reaching(class: crate::disk_guard::LeaseClass, at_least: u64
 #[tokio::test]
 #[serial(tx_registry)]
 async fn every_queue_entry_point_records_the_lease_under_the_issuers_class() {
+    if crate::test_process::run_in_child(|_| {}) {
+        return;
+    }
     use crate::disk_guard::{LeaseClass, WriteClassContext};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1833,29 +1826,52 @@ async fn every_queue_entry_point_records_the_lease_under_the_issuers_class() {
     };
 
     let migration = WriteClassContext::migration();
-    let before = long_holds(LeaseClass::Migration);
+    let before = long_lease_holds(LeaseClass::Migration);
     migration.scope_future(handle.send(hold)).await.unwrap();
+    assert_eq!(
+        long_holds_reaching(LeaseClass::Migration, before + 1).await,
+        before + 1,
+        "send records its 600 ms hold under the migration context"
+    );
+
+    let before = long_lease_holds(LeaseClass::Migration);
     migration
         .scope_future(handle.send_bounded(hold))
         .await
         .unwrap();
+    assert_eq!(
+        long_holds_reaching(LeaseClass::Migration, before + 1).await,
+        before + 1,
+        "send_bounded records its 600 ms hold under the migration context"
+    );
+
+    let before = long_lease_holds(LeaseClass::Migration);
     migration
         .scope_future(handle.send_top_level(hold))
         .await
         .unwrap();
+    assert_eq!(
+        long_holds_reaching(LeaseClass::Migration, before + 1).await,
+        before + 1,
+        "send_top_level records its 600 ms hold under the migration context"
+    );
+
+    let before = long_lease_holds(LeaseClass::Migration);
     migration
         .scope_future(handle.send_at(hold, "lease_report_test"))
         .await
         .unwrap();
-    assert!(
-        long_holds_reaching(LeaseClass::Migration, before + 4).await >= before + 4,
-        "four 600 ms holds queued under a migration context are recorded as migration"
+    assert_eq!(
+        long_holds_reaching(LeaseClass::Migration, before + 1).await,
+        before + 1,
+        "send_at records its 600 ms hold under the migration context"
     );
 
-    let before = long_holds(LeaseClass::WriterTask);
+    let before = long_lease_holds(LeaseClass::WriterTask);
     handle.send(hold).await.unwrap();
-    assert!(
-        long_holds_reaching(LeaseClass::WriterTask, before + 1).await > before,
+    assert_eq!(
+        long_holds_reaching(LeaseClass::WriterTask, before + 1).await,
+        before + 1,
         "an unscoped request keeps the writer task's class"
     );
 }
