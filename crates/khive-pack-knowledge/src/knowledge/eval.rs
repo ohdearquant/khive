@@ -50,13 +50,40 @@ struct QueryMetrics {
     mrr: f64,
 }
 
+/// One answer for every way a query set can fail to open, so the error does not
+/// say whether the path exists, is a directory, or is unreadable.
+fn cannot_open(path: &Path) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "knowledge.eval_retrieval: cannot open query set {}",
+        path.display()
+    ))
+}
+
+/// The parser's own message can quote the file (a value, a key, the offending
+/// line), so a parse failure is reported by position only.
+fn parse_error(path: &Path, contents: &str, error: &toml::de::Error) -> RuntimeError {
+    let position = error
+        .span()
+        .and_then(|span| contents.get(..span.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |tail| tail.chars().count())
+                + 1;
+            format!(" at line {line}, column {column}")
+        })
+        .unwrap_or_default();
+    RuntimeError::InvalidInput(format!(
+        "knowledge.eval_retrieval: query set {} is not a valid query set{position}",
+        path.display()
+    ))
+}
+
 fn parse_query_set(path: &Path, contents: &str) -> Result<Vec<ValidatedQuery>, RuntimeError> {
-    let parsed: QuerySetFile = toml::from_str(contents).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "knowledge.eval_retrieval: invalid TOML syntax in query set {}: {error}",
-            path.display()
-        ))
-    })?;
+    let parsed: QuerySetFile =
+        toml::from_str(contents).map_err(|error| parse_error(path, contents, &error))?;
     if parsed.queries.is_empty() {
         return Err(RuntimeError::InvalidInput(format!(
             "knowledge.eval_retrieval: query set {} contains no queries",
@@ -144,30 +171,15 @@ impl KnowledgeHandlers {
         }
         let query_set = tokio::fs::canonicalize(&requested_query_set)
             .await
-            .map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: cannot resolve query set {}: {error}",
-                    requested_query_set.display()
-                ))
-            })?;
+            .map_err(|_| cannot_open(&requested_query_set))?;
         let persisted_query_set = query_set
             .to_str()
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: canonical query-set path is not valid UTF-8: {}",
-                    query_set.display()
-                ))
-            })?
+            .ok_or_else(|| cannot_open(&requested_query_set))?
             .to_owned();
         let contents = tokio::fs::read_to_string(&query_set)
             .await
-            .map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: cannot read query set {}: {error}",
-                    query_set.display()
-                ))
-            })?;
-        let queries = parse_query_set(&query_set, &contents)?;
+            .map_err(|_| cannot_open(&requested_query_set))?;
+        let queries = parse_query_set(&requested_query_set, &contents)?;
 
         let mut precision_at_5 = 0.0;
         let mut recall_at_5 = 0.0;
