@@ -1544,6 +1544,9 @@ mod tests {
     #[test]
     #[serial(khive_dotenv)]
     fn an_agent_actor_process_does_not_load_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
         let var = "KHIVE_DOTENV_PROBE_AGENT_SKIP";
         let home = dotenv_home_with(var);
         for actor in ["agent:example", " Agent:Example "] {
@@ -1569,6 +1572,9 @@ mod tests {
     #[test]
     #[serial(khive_dotenv)]
     fn a_process_without_an_agent_actor_loads_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
         for (index, actor) in [None, Some("lambda:example"), Some("agentx:example")]
             .into_iter()
             .enumerate()
@@ -1588,6 +1594,9 @@ mod tests {
     #[test]
     #[serial(khive_dotenv)]
     fn the_load_switch_off_or_unrecognized_skips_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
         for (index, value) in ["0", "false", "OFF", "maybe"].into_iter().enumerate() {
             let var = format!("KHIVE_DOTENV_PROBE_SWITCH_{index}");
             let home = dotenv_home_with(&var);
