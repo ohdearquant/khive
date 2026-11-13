@@ -18,7 +18,7 @@ mod backend_disk_guard;
 
 #[path = "engine_config_embed_batch.rs"]
 mod embed_batch;
-pub use embed_batch::EmbedSectionConfig;
+pub use embed_batch::{EmbedSectionConfig, EntityEmbeddingFields, LegacyEmbedDevice};
 
 #[path = "engine_config_peers.rs"]
 mod peers;
@@ -1437,7 +1437,7 @@ where
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
 /// - `[schema]`: explicit import unknown-entity-kind admission
-/// - `[embed].batch_size`: explicit reindex batch size
+/// - `[embed]`: validated policy, explicit reindex batch size and legacy diagnostics
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
@@ -1458,7 +1458,7 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub schema: SchemaSectionConfig,
 
-    /// Explicit reindex batch size; automatic embedding settings remain separate.
+    /// Validated declarations; automatic and field-selection execution is host-owned.
     #[serde(default, deserialize_with = "embed_batch::deserialize_table")]
     pub embed: EmbedSectionConfig,
 
@@ -1712,6 +1712,11 @@ impl KhiveConfig {
         let (embed, unknown_embed_keys) = embed_batch::parse(&raw, &document, &diagnostic_path)?;
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
+        // Keep the validated original-order embed parse. Detached TOML tables
+        // can reorder unknown keys into the reserved datetime-marker position.
+        if let Some(table) = document.as_table_mut() {
+            table.remove("embed");
+        }
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
