@@ -519,6 +519,13 @@ fn outbox_due_index_backfills_existing_deadlines_and_reopens() {
     let mut conn = Connection::open(&path).unwrap();
     conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
         .unwrap();
+    // Recreate the historical comm catalog after current Notes schema setup.
+    // The outbound due index must still be installed by the migration below.
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_comm_message_thread;
+         DROP INDEX IF EXISTS idx_comm_message_to_actor;",
+    )
+    .unwrap();
     conn.execute_batch(COMM_INDEXES).unwrap();
     for (id, deadline) in [
         (1, "2999-01-01T00:00:00Z"),
