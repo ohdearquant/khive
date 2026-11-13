@@ -142,12 +142,22 @@ async fn commit_redaction_preserves_provenance_and_advances_bounded_cursor() {
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0]["id"], expected["id"]);
     }
-    assert!(incoming_annotating_ids(&registry, project)
+    let annotations = registry
+        .dispatch(
+            "neighbors",
+            json!({
+                "id": note_id, "direction": "outgoing", "relations": ["annotates"],
+            }),
+        )
         .await
-        .contains(note_id));
-    assert!(!incoming_annotating_ids(&registry, issue)
-        .await
-        .contains(note_id));
+        .expect("redacted commit annotations");
+    let annotations = annotations.as_array().expect("neighbor array");
+    assert!(annotations
+        .iter()
+        .any(|target| target["id"].as_str() == Some(project.to_string().as_str())));
+    assert!(annotations
+        .iter()
+        .all(|target| target["id"].as_str() != Some(issue.to_string().as_str())));
     let keyed = registry
         .dispatch(
             "get",
