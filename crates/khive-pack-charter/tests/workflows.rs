@@ -18,6 +18,10 @@ const PR_MERGE: &str = include_str!("fixtures/pr_merge.charter");
 
 const PR: &str = "acme/widgets#7";
 
+mod refused_values_tests {
+    include!("workflows_tests/refused_values.rs");
+}
+
 struct Fixture {
     runtime: KhiveRuntime,
     registry: VerbRegistry,
