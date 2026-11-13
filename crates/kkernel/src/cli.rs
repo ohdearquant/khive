@@ -429,8 +429,9 @@ enum BackendCommand {
 /// is not an error.
 ///
 /// The file is skipped entirely for an agent process (`KHIVE_ACTOR` or
-/// `KHIVE_NAMESPACE` in the process environment, or an `--actor` or
-/// `--namespace` argument, names an `agent:` actor) and when
+/// `KHIVE_NAMESPACE` in the process environment, or any `--actor` or
+/// `--namespace` argument, including one after `--` such as a supervisor's
+/// daemon arguments, names an `agent:` actor) and when
 /// `KHIVE_LOAD_DOTENV` is off or unrecognized. This runs before argument
 /// parsing and config discovery, so an agent identity that arrives only
 /// through a config file cannot decide it; such launches set
@@ -442,40 +443,48 @@ fn load_khive_dotenv() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let env_actor = std::env::var_os("KHIVE_ACTOR");
     let env_namespace = std::env::var_os("KHIVE_NAMESPACE");
-    let argv_actor = argv_flag(&args, "--actor");
-    let argv_namespace = argv_flag(&args, "--namespace");
+    let argv_actors = argv_flag_values(&args, "--actor");
+    let argv_namespaces = argv_flag_values(&args, "--namespace");
+    let mut identities = vec![
+        ("KHIVE_ACTOR", env_actor.as_deref()),
+        ("KHIVE_NAMESPACE", env_namespace.as_deref()),
+    ];
+    identities.extend(argv_actors.iter().map(|v| ("--actor", Some(v.as_os_str()))));
+    identities.extend(
+        argv_namespaces
+            .iter()
+            .map(|v| ("--namespace", Some(v.as_os_str()))),
+    );
     load_khive_dotenv_from(
         std::path::Path::new(&home),
-        &[
-            ("KHIVE_ACTOR", env_actor.as_deref()),
-            ("KHIVE_NAMESPACE", env_namespace.as_deref()),
-            ("--actor", argv_actor.as_deref()),
-            ("--namespace", argv_namespace.as_deref()),
-        ],
+        &identities,
         std::env::var_os("KHIVE_LOAD_DOTENV").as_deref(),
     );
 }
 
-/// The value of the first `FLAG VALUE` or `FLAG=VALUE` argument before `--`.
-fn argv_flag(args: &[std::ffi::OsString], flag: &str) -> Option<std::ffi::OsString> {
+/// Every `FLAG VALUE` or `FLAG=VALUE` value in `args`, including those after
+/// `--`, where a supervisor receives the daemon's own arguments. A `FLAG=`
+/// argument that is not valid UTF-8 is returned whole so it is refused as
+/// unreadable rather than ignored.
+fn argv_flag_values(args: &[std::ffi::OsString], flag: &str) -> Vec<std::ffi::OsString> {
+    let prefix = format!("{flag}=");
+    let mut values = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if arg == "--" {
-            return None;
-        }
         if arg == flag {
-            return args.next().cloned();
-        }
-        if let Some(value) = arg
-            .to_str()
-            .and_then(|text| text.strip_prefix(flag))
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            return Some(value.into());
+            values.extend(args.next().cloned());
+        } else if let Some(text) = arg.to_str() {
+            if let Some(value) = text.strip_prefix(&prefix) {
+                values.push(value.into());
+            }
+        } else if arg.to_string_lossy().starts_with(&prefix) {
+            values.push(arg.clone());
         }
     }
-    None
+    values
 }
+
+const AGENT_ACTOR_PREFIX: &str = "agent:";
 
 /// `identities` pairs each place an actor can be named with its value, if any.
 fn load_khive_dotenv_from(
@@ -509,8 +518,8 @@ fn khive_dotenv_actor_skip(source: &str, actor: &std::ffi::OsStr) -> Option<Stri
         Some(actor)
             if actor
                 .trim_start()
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("agent:")) =>
+                .get(..AGENT_ACTOR_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AGENT_ACTOR_PREFIX)) =>
         {
             Some(format!("{source} {} is an agent actor", actor.trim()))
         }
@@ -1645,46 +1654,104 @@ mod tests {
         std::env::remove_var(var);
         std::env::set_var("KHIVE_NAMESPACE", "agent:example");
         load_khive_dotenv();
-        assert_eq!(
-            std::env::var_os(var),
-            None,
-            "KHIVE_NAMESPACE agent:example loaded the file"
-        );
+        let agent = std::env::var_os(var);
         std::env::set_var("KHIVE_NAMESPACE", "lambda:example");
         load_khive_dotenv();
+        let non_agent = std::env::var(var);
+        // The isolated child must leave its HOME empty.
+        std::fs::remove_dir_all(home.join(".khive")).unwrap();
+        assert_eq!(agent, None, "KHIVE_NAMESPACE agent:example loaded the file");
         assert_eq!(
-            std::env::var(var).as_deref(),
+            non_agent.as_deref(),
             Ok("from-file"),
             "a non-agent namespace did not load the file"
         );
     }
 
     #[test]
-    fn the_actor_argument_is_read_in_both_spellings_before_any_separator() {
+    fn every_actor_argument_is_read_in_both_spellings_including_after_a_separator() {
         let parse_flag = |args: &[&str], flag: &str| {
             let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
-            argv_flag(&args, flag).map(|value| value.to_string_lossy().into_owned())
+            argv_flag_values(&args, flag)
+                .into_iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
         };
         let parse = |args: &[&str]| parse_flag(args, "--actor");
         assert_eq!(
-            parse_flag(&["mcp", "--namespace", "agent:n"], "--namespace").as_deref(),
-            Some("agent:n")
+            parse_flag(&["mcp", "--namespace", "agent:n"], "--namespace"),
+            ["agent:n"]
         );
         assert_eq!(
-            parse_flag(&["mcp", "--namespace=agent:m"], "--namespace").as_deref(),
-            Some("agent:m")
+            parse_flag(&["mcp", "--namespace=agent:m"], "--namespace"),
+            ["agent:m"]
+        );
+        assert_eq!(parse(&["mcp", "--actor", "agent:a"]), ["agent:a"]);
+        assert_eq!(parse(&["exec", "--actor=agent:b", "stats()"]), ["agent:b"]);
+        assert_eq!(
+            parse(&[
+                "supervisor",
+                "launch",
+                "--label",
+                "d",
+                "--",
+                "--actor",
+                "agent:c"
+            ]),
+            ["agent:c"]
         );
         assert_eq!(
-            parse(&["mcp", "--actor", "agent:a"]).as_deref(),
-            Some("agent:a")
+            parse(&["mcp", "--actor", "lambda:x", "--", "--actor=agent:y"]),
+            ["lambda:x", "agent:y"]
         );
+        assert!(parse(&["exec", "--actor-x", "agent:d"]).is_empty());
+        assert!(parse(&["exec", "--actor"]).is_empty());
+        assert!(parse(&["mcp"]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_equals_spelling_is_kept_whole() {
+        use std::os::unix::ffi::OsStringExt;
+        let arg = std::ffi::OsString::from_vec(b"--actor=agent:\xff".to_vec());
+        let values = argv_flag_values(&["mcp".into(), arg.clone()], "--actor");
+        assert_eq!(values, [arg]);
+        assert!(khive_dotenv_actor_skip("--actor", &values[0]).is_some());
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn a_supervised_agent_daemon_argument_keeps_the_file_out_of_the_supervisor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let var = "KHIVE_DOTENV_PROBE_SUPERVISOR";
+        let home = dotenv_home_with(var);
+        let args: Vec<std::ffi::OsString> = [
+            "supervisor",
+            "launch",
+            "--label",
+            "agent-daemon",
+            "--restart-interval-secs",
+            "5",
+            "--",
+            "--actor",
+            "agent:example",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+        let actors = argv_flag_values(&args, "--actor");
+        let identities: Vec<_> = actors
+            .iter()
+            .map(|v| ("--actor", Some(v.as_os_str())))
+            .collect();
+        load_khive_dotenv_from(home.path(), &identities, None);
         assert_eq!(
-            parse(&["exec", "--actor=agent:b", "stats()"]).as_deref(),
-            Some("agent:b")
+            std::env::var_os(var),
+            None,
+            "the supervisor loaded the file its agent daemon would inherit"
         );
-        assert_eq!(parse(&["exec", "--", "--actor", "agent:c"]), None);
-        assert_eq!(parse(&["exec", "--actor-x", "agent:d"]), None);
-        assert_eq!(parse(&["mcp"]), None);
     }
 
     #[test]

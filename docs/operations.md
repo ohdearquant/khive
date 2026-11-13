@@ -95,8 +95,9 @@ effect of listing backends.
 - **`~/.khive/.env`**: loaded once at process start via `dotenvy` before argument parsing
   (`load_khive_dotenv` in `crates/kkernel/src/cli.rs`). Real environment variables always win over
   the file; a missing file is not an error. The file is not loaded at all when `KHIVE_ACTOR` or
-  `KHIVE_NAMESPACE` in the process environment, or an `--actor` or `--namespace` argument, names an
-  `agent:` actor (any case, leading whitespace ignored), or when `KHIVE_LOAD_DOTENV` is `0`,
+  `KHIVE_NAMESPACE` in the process environment, or any `--actor` or `--namespace` argument
+  (including one after `--`, such as the daemon arguments of `kkernel supervisor launch`, so the
+  supervisor never holds the values its daemon would inherit), names an `agent:` actor (any case, leading whitespace ignored), or when `KHIVE_LOAD_DOTENV` is `0`,
   `false`, `no`, `off` or an unrecognized value (an empty value counts as unset); when the file
   exists, startup prints one line naming the reason. The check runs before config discovery, so an
   agent identity set only in a config file does not trigger it: such a launch sets
