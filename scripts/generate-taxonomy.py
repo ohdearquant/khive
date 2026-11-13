@@ -131,7 +131,7 @@ def table(headers, rows):
 def render_schema(schema):
     schema = schema_result(schema)
     lines = [
-        "## Loaded taxonomy",
+        "## Loaded taxonomy (generated)",
         "",
         "Generated from `schema()` with the binary's default pack selection. Custom pack selections",
         "can change the vocabulary and endpoint rules; inspect `schema()` on that server.",

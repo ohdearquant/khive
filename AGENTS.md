@@ -523,19 +523,7 @@ the next tier. `kkernel exec` honors all four tiers, including the TOML tier on 
 Use `create(kind="entity", entity_kind="concept", ...)` for entities.
 Use `create(kind="note", note_kind="observation", ...)` for notes.
 
-`concept` is the default. Use `properties` for finer distinctions (`type: "paper"`,
-`domain: "attention"`, `status: "implemented"`).
-
-`observation` is the default. Notes can annotate entities via `create(kind="note",
-annotates=[entity_id], ...)`.
-
 ---
-
-<!-- BEGIN GENERATED TAXONOMY -->
-
-> **Placeholder — NOT GENERATED.** The taxonomy below preserves the existing human-written
-> documentation. Generation from the current binary's default `schema()` response is pending;
-> the live taxonomy check will print the complete replacement block and fail until it is applied.
 
 ## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
 
@@ -551,6 +539,9 @@ annotates=[entity_id], ...)`.
 | `service`  | APIs, hosted endpoints, SaaS products                                      |
 | `resource` | Actionable content agents consume: atoms, domains, skills, tools, runbooks |
 
+`concept` is the default. Use `properties` for finer distinctions (`type: "paper"`,
+`domain: "attention"`, `status: "implemented"`).
+
 ---
 
 ## The 5 note kinds (closed set — [ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
@@ -562,6 +553,9 @@ annotates=[entity_id], ...)`.
 | `question`    | An open inquiry or research direction         |
 | `decision`    | A committed choice with rationale             |
 | `reference`   | An external pointer with context (paper, URL) |
+
+`observation` is the default. Notes can annotate entities via `create(kind="note",
+annotates=[entity_id], ...)`.
 
 ---
 
@@ -622,11 +616,21 @@ When you `link` nodes, use ONLY these relations:
   confidence; stake size belongs in conventional metadata (`pct`, `class`, `as_of`,
   `valid_from`, or `by_class` for multiple classes). Ownership is not transitive.
 
-<!-- END GENERATED TAXONOMY -->
-
 **Why closed**: a sparse ontology stays queryable. Ad-hoc relations (`uses`, `related_to`,
 `loaded_by`) fragment the graph and make traversal useless. If your relationship doesn't fit, it's
 probably a property on the entity, not an edge.
+
+---
+
+<!-- BEGIN GENERATED TAXONOMY -->
+
+## Loaded taxonomy (generated)
+
+> **Placeholder — NOT GENERATED.** Generation from the current binary's default `schema()`
+> response is pending. The live taxonomy check will print the complete replacement block and fail
+> until it is applied. The human-written taxonomy and relation guidance above remain separate.
+
+<!-- END GENERATED TAXONOMY -->
 
 ---
 
