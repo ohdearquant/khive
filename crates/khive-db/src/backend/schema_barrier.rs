@@ -1,7 +1,11 @@
 //! Store schema work a serving process runs before it reports ready (ADR-154 Amendment 3).
 
-use super::*;
+use std::sync::atomic::Ordering;
+
+use super::{StorageBackend, StoreSchemaKind};
+use crate::error::SqliteError;
 use crate::stores::index_repair::FORCED_INDEXES;
+use crate::stores::note;
 
 const MAPPED_TEXT_TABLES: &str = include_str!("../../sql/mapped-text-tables.sql");
 const FORCED_INDEX_EXISTS: &str = include_str!("../../sql/forced-index-exists.sql");
