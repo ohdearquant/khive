@@ -914,6 +914,70 @@ async fn test_apply_batch_admits_an_old_row_in_an_owned_namespace() {
 }
 
 #[tokio::test]
+async fn test_apply_batch_writes_owned_namespace_successor_and_dedupes() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let old = ab_seed(&archive, "osprey migration tally archived original").await;
+    let alice = ab_registry_owning(rt.clone(), "alice", &["alice:archive"]);
+    let old_before = alice
+        .dispatch("get", json!({"id": old.to_string()}))
+        .await
+        .expect("get archived row");
+    let notes_before = ab_note_count(&rt, "alice").await;
+    let archive_notes_before = ab_note_count(&rt, "alice:archive").await;
+    let rows = vec![ab_supersede(old, "osprey migration tally revised")];
+
+    let result = ab_apply(&alice, "owned-write", rows.clone(), false).await;
+    assert_eq!(result["entries"][0]["outcome"], "written");
+    assert_eq!(result["entries"][0]["old_namespace"], "alice:archive");
+    assert_eq!(result["counts"]["written"], 1);
+    let new_id = ab_uuid(&result["entries"][0]["new_id"]);
+    assert_ne!(new_id, old);
+    let new_row = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get successor row");
+    assert_eq!(new_row["namespace"], "alice");
+    assert_eq!(new_row["content"], "osprey migration tally revised");
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 1);
+    assert_eq!(
+        ab_note_count(&rt, "alice:archive").await,
+        archive_notes_before,
+        "the successor is not written into the owned namespace"
+    );
+    let edges = ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].source_id, new_id);
+    assert_eq!(edges[0].target_id, old);
+    let edge_id = Uuid::from(edges[0].id);
+
+    let replay = ab_apply(&alice, "owned-write", rows, false).await;
+    assert_eq!(replay["entries"][0]["outcome"], "deduped");
+    assert_eq!(ab_uuid(&replay["entries"][0]["new_id"]), new_id);
+    assert_eq!(replay["counts"]["deduped"], 1);
+    assert_eq!(replay["counts"]["written"], 0);
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 1);
+    assert_eq!(
+        ab_note_count(&rt, "alice:archive").await,
+        archive_notes_before
+    );
+    let replay_edges =
+        ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(replay_edges.len(), 1);
+    assert_eq!(Uuid::from(replay_edges[0].id), edge_id);
+    let old_after = alice
+        .dispatch("get", json!({"id": old.to_string()}))
+        .await
+        .expect("get archived row after write and replay");
+    assert_eq!(old_after, old_before, "the archived row remains unchanged");
+    let replay_row = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get successor after replay");
+    assert_eq!(replay_row, new_row, "replay leaves the successor unchanged");
+}
+
+#[tokio::test]
 async fn test_apply_batch_refuses_an_owned_namespace_row_when_the_list_is_empty() {
     let rt = make_runtime();
     let archive = make_registry_with_actor(rt.clone(), "alice:archive");
