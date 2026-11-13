@@ -399,7 +399,8 @@ fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition
         | RuntimeError::AmbiguousId { .. }
         | RuntimeError::CrossNamespaceWrite { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::DeadlineExceeded { .. }) => {
+        | RuntimeError::DeadlineExceeded { .. }
+        | RuntimeError::AttachmentCutoverRequired { .. }) => {
             if let Some(capacity) = sqlite_capacity_failure(&other) {
                 let mut value = capacity.into_value(other.to_string());
                 if let Some(context) = other.writer_task_failure_context() {

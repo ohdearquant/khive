@@ -939,6 +939,28 @@ pub enum RuntimeError {
         budget_ms: u64,
         elapsed_ms: u64,
     },
+
+    /// The database schema is below the V21 attachment cutover, so a runtime
+    /// cannot be constructed over it yet.
+    ///
+    /// Bring the database forward with
+    /// [`coordinate_attachment_cutover`](crate::coordinate_attachment_cutover)
+    /// (or
+    /// [`coordinate_empty_secondary_attachment_cutover`](crate::coordinate_empty_secondary_attachment_cutover)
+    /// for a secondary store) and construct the runtime afterwards. The cutover
+    /// state can be read beforehand, without migrating past V21, through
+    /// `StorageBackend::attachment_cutover_status`.
+    #[error(
+        "database is at schema V{schema_version} and requires the V{required_version} attachment \
+         cutover; run khive_runtime::coordinate_attachment_cutover before constructing \
+         KhiveRuntime"
+    )]
+    AttachmentCutoverRequired {
+        /// Schema version the database reports.
+        schema_version: u32,
+        /// First schema version that includes the attachment cutover.
+        required_version: u32,
+    },
 }
 
 // Compatibility bridge for concrete backend callers while ADR-071's raw-SQL
@@ -1141,6 +1163,7 @@ impl RuntimeError {
             Self::WriteBudgetExceeded { .. } => "WriteBudgetExceeded",
             Self::SecretDetected(_) => "SecretDetected",
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
+            Self::AttachmentCutoverRequired { .. } => "AttachmentCutoverRequired",
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
             Self::RefusedWithEvents { context } => context.source.variant_name(),
