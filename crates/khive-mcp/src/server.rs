@@ -788,3 +788,7 @@ mod numeric_env_tests;
 #[cfg(test)]
 #[path = "audit_success_rows_usage_tests.rs"]
 mod audit_success_rows_usage_tests;
+
+#[cfg(test)]
+#[path = "nested_usage_tests.rs"]
+mod nested_usage_tests;
