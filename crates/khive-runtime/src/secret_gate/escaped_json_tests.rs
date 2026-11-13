@@ -166,6 +166,42 @@ fn an_escaped_credential_in_a_fragment_inside_prose_is_refused() {
 }
 
 #[test]
+fn escaped_credentials_after_stray_prose_backslashes_are_refused() {
+    for (name, plain, escaped) in cases() {
+        let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+            panic!("{name}: plain credential control must refuse");
+        };
+        for content in [
+            format!(r#"we saw \"{escaped}" in the log"#),
+            format!(r#"we saw \\"{escaped}" in the log"#),
+            format!(r#"we saw \\\"{escaped}" in the log"#),
+            format!(r#"she said "hello" then \"{escaped}" in the log"#),
+            format!(r#"an earlier \"C:\Users\docs then \"{escaped}" in the log"#),
+            format!(r#"an earlier \"\uD800 then \"{escaped}" in the log"#),
+            format!(r#"we saw \"{escaped} and \"quoted\" text" in the log"#),
+            format!(r#"we saw \"quoted\" text and {escaped}" in the log"#),
+        ] {
+            assert!(scan(&content).is_none(), "{name}: raw control: {content}");
+            let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+                panic!("{name}: escaped credential must refuse: {content}");
+            };
+            assert_eq!(actual.detector, expected.detector, "{name}: {content}");
+        }
+    }
+}
+
+#[test]
+fn a_stray_prose_backslash_does_not_make_invalid_json_escapes_decodable() {
+    for (name, _, escaped) in cases() {
+        for suffix in [r"\q", r"\uD800", r"\uDC00", "\n"] {
+            let content = format!(r#"we saw \"{escaped}{suffix}" in the log"#);
+            assert!(scan(&content).is_none(), "{name}: raw control: {content}");
+            assert!(check(&content).is_ok(), "{name}: {content}");
+        }
+    }
+}
+
+#[test]
 fn prose_quotes_and_backslash_paths_keep_their_verdict() {
     for content in [
         r#"she said "hello" and "goodbye" then left"#,
@@ -173,6 +209,9 @@ fn prose_quotes_and_backslash_paths_keep_their_verdict() {
         r#"a 5" screen and a "quoted \" phrase" here"#,
         r#"see "docs\/guide.md" and "line\none""#,
         r#"a lone \" quote and \\ backslashes"#,
+        r#"we saw \"docs\/guide.md" in the log"#,
+        r#"an earlier \"bad\q then \"line\none" in the log"#,
+        r#"we saw \"music \uD834\uDD1E and \"quoted\" text" in the log"#,
     ] {
         assert!(check(content).is_ok(), "{content}");
     }
@@ -183,4 +222,19 @@ fn each_quoted_run_is_decoded_once() {
     let content = "\"a\\nb\" ".repeat(50_000) + "\"x\\\" ";
     assert_eq!(super::escaped_json::escaped_strings(&content).len(), 50_000);
     assert!(check(&content).is_ok());
+}
+
+#[test]
+fn many_malformed_prose_quotes_do_not_hide_a_later_escaped_credential() {
+    let (_, plain, escaped) = cases().remove(0);
+    let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+        panic!("plain credential control must refuse");
+    };
+    let prefix = r#"\"bad\q "#.repeat(50_000);
+    let content = format!("{prefix}\\\"{escaped}\"");
+    assert!(scan(&content).is_none(), "raw control");
+    let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+        panic!("escaped credential must refuse");
+    };
+    assert_eq!(actual.detector, expected.detector);
 }
