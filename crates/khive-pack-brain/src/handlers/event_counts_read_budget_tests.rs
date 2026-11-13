@@ -411,14 +411,31 @@ mod exhaustive_forwarded {
         }
     }
 
-    async fn drive_until(mut ready: impl FnMut() -> bool) {
-        for _ in 0..32_768 {
+    async fn drive_until(
+        phase: &str,
+        mut ready: impl FnMut() -> bool,
+        describe: impl Fn() -> String,
+    ) {
+        let frozen = tokio::time::Instant::now();
+        let started = std::time::Instant::now();
+        loop {
+            assert_eq!(
+                tokio::time::Instant::now(),
+                frozen,
+                "virtual time advanced waiting for {phase}: {}",
+                describe()
+            );
             if ready() {
                 return;
             }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "exhaustive IPC fixture did not reach {phase} within 5s wall time: {}",
+                describe()
+            );
+            // Allow real SQLite workers and IPC to progress without advancing timers.
             tokio::task::yield_now().await;
         }
-        panic!("exhaustive IPC fixture did not reach its observed phase");
     }
 
     fn check_filter(namespace: &str, filter: &EventFilter) {
@@ -584,14 +601,28 @@ mod exhaustive_forwarded {
                     .await
             },
         ));
-        drive_until(|| {
-            pages.load(Ordering::SeqCst) == 1 || call.is_finished() || peer.0.is_finished()
-        })
+        let describe = || {
+            format!(
+                "delays={delays:?}, caller={budget_seconds}s, operator={operator_seconds}s, \
+                 pages={}, call_finished={}, peer_finished={}, virtual_elapsed={:?}",
+                pages.load(Ordering::SeqCst),
+                call.is_finished(),
+                peer.0.is_finished(),
+                tokio::time::Instant::now()
+                    .duration_since(original.async_at() - Duration::from_secs(budget_seconds))
+            )
+        };
+        drive_until(
+            "first page",
+            || pages.load(Ordering::SeqCst) == 1 || call.is_finished() || peer.0.is_finished(),
+            &describe,
+        )
         .await;
         assert_eq!(
             pages.load(Ordering::SeqCst),
             1,
-            "actual exhaustive page must start"
+            "actual exhaustive page must start: {}",
+            describe()
         );
         let first_step = delays[0].min(budget_seconds).min(30);
         tokio::time::advance(Duration::from_secs(first_step)).await;
@@ -609,24 +640,33 @@ mod exhaustive_forwarded {
             .await;
         }
         if budget_seconds > delays[0] {
-            drive_until(|| {
-                pages.load(Ordering::SeqCst) == 2 || call.is_finished() || peer.0.is_finished()
-            })
+            drive_until(
+                "second page",
+                || pages.load(Ordering::SeqCst) == 2 || call.is_finished() || peer.0.is_finished(),
+                &describe,
+            )
             .await;
             assert_eq!(
                 pages.load(Ordering::SeqCst),
                 2,
-                "the first full page must not end the aggregate"
+                "the first full page must not end the aggregate: {}",
+                describe()
             );
             tokio::time::advance(Duration::from_secs(
                 delays[1].min(budget_seconds - delays[0]),
             ))
             .await;
         }
-        drive_until(|| call.is_finished() || peer.0.is_finished()).await;
+        drive_until(
+            "call completion",
+            || call.is_finished() || peer.0.is_finished(),
+            &describe,
+        )
+        .await;
         assert!(
             !peer.0.is_finished(),
-            "framed peer failed its protocol assertions"
+            "framed peer failed its protocol assertions: {}",
+            describe()
         );
         let result = call.await.unwrap();
         let elapsed = tokio::time::Instant::now()
