@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::events_prune::{
-    self, ApplyOptions, KeyCount, PruneError, PruneTarget, EXPENDABLE_VERBS, HORIZON_SECONDS,
+    self,
+    test_support::{append_batch, apply_at_after_selection},
+    ApplyOptions, KeyCount, PruneError, PruneTarget, EXPENDABLE_VERBS, HORIZON_SECONDS,
 };
 
 const EVENTS_DDL: &str = include_str!("../sql/events-ddl.sql");
@@ -668,16 +670,13 @@ fn an_interrupted_apply_resumes_to_the_same_removed_set() {
     let next: Vec<String> = (2..4)
         .map(|i| format!("00000000-0000-4000-8000-00000000000{}", 6 - i))
         .collect();
-    let ledger = options.state_dir.join("expended-ids.ndjson");
-    let intent = json!({
-        "type": "intent",
-        "digest": plan_parts.digest,
-        "batch": 2,
-        "ids": next.iter().map(|id| json!({"id": id, "verb": "comm.probe", "namespace": "local", "created_at": 0})).collect::<Vec<_>>()
-    });
-    let mut text = std::fs::read_to_string(&ledger).unwrap();
-    text.push_str(&format!("{intent}\n"));
-    std::fs::write(&ledger, text).unwrap();
+    append_batch(
+        &options.state_dir,
+        &plan_parts,
+        &next.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+    )
+    .expect("record the killed batch intent");
     for id in &next {
         parts
             .conn()
@@ -719,19 +718,68 @@ fn a_row_an_edge_names_after_selection_survives_its_batch() {
     assert!(fixture.ids().contains(&b));
 }
 
-fn append_ledger(state_dir: &Path, lines: &[Value]) {
-    let path = state_dir.join("expended-ids.ndjson");
-    let mut text = std::fs::read_to_string(&path).expect("ledger");
-    for line in lines {
-        text.push_str(&format!("{line}\n"));
+#[test]
+fn a_real_skip_then_interruption_resumes_with_the_authorized_digest() {
+    let fixture = Fixture::new();
+    for i in 0..4 {
+        fixture.generic("comm.probe", OLD_US - i);
     }
-    std::fs::write(&path, text).expect("write ledger");
-}
+    let plan = plan(&fixture);
+    assert_eq!(plan.candidates, 4);
+    let kept = plan.selected[0].id.hyphenated().to_string();
+    let gone = plan.selected[1].id.hyphenated().to_string();
+    let receipt = fixture.backup(&plan, "backup.db");
+    let mut options = fixture.options(&plan.digest, receipt, "state");
+    options.max_batches = Some(1);
 
-fn ledger_ids(ids: &[&String]) -> Vec<Value> {
-    ids.iter()
-        .map(|id| json!({"id": id, "verb": "comm.probe", "namespace": "local", "created_at": 0}))
-        .collect()
+    let error = apply_at_after_selection(
+        &fixture.target(),
+        &options,
+        RUN_STARTED_US + 1,
+        |selected| {
+            assert_eq!(selected.selected, plan.selected);
+            assert_eq!(selected.digest, plan.digest);
+            fixture.edge(&kept, &Uuid::new_v4().to_string(), false);
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, PruneError::Interrupted(_)), "{error}");
+    assert_eq!(error.exit_code(), 7);
+    let present = fixture.ids();
+    assert_eq!(present.len(), 3);
+    assert!(present.contains(&kept));
+    assert!(!present.contains(&gone));
+
+    let ledger = std::fs::read_to_string(options.state_dir.join("expended-ids.ndjson"))
+        .expect("real batch ledger");
+    let lines: Vec<Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ledger line"))
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["type"], "intent");
+    assert_eq!(lines[0]["digest"], plan.digest);
+    let batched: BTreeSet<String> = lines[0]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(batched, [kept.clone(), gone.clone()].into_iter().collect());
+    assert_eq!(lines[1]["type"], "commit");
+    assert_eq!(lines[1]["digest"], plan.digest);
+    assert_eq!(lines[1]["batch"], lines[0]["batch"]);
+    assert_eq!(lines[1]["removed"], json!([gone]));
+    assert_eq!(lines[1]["skipped"], json!([[kept, "edge_referenced"]]));
+
+    options.max_batches = None;
+    let report = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2)
+        .expect("resume after a real skipped row");
+    assert_eq!(report.reconciled, 0, "the first batch committed its skip");
+    assert_eq!(report.batches, 1);
+    assert_eq!(report.removed, 2);
+    assert_eq!(report.removed_total, 3);
+    assert_eq!(fixture.ids(), [kept].into_iter().collect());
 }
 
 /// Four candidates, one committed batch of two, then an interruption. Returns the fixture, the options and the two
@@ -766,14 +814,16 @@ fn a_resume_after_a_skipped_row_keeps_the_authorized_digest() {
         .conn()
         .execute("DELETE FROM events WHERE id = ?1", [gone])
         .unwrap();
-    append_ledger(
+    append_batch(
         &options.state_dir,
-        &[
-            json!({"type": "intent", "digest": plan.digest, "batch": 2, "ids": ledger_ids(&[gone, kept])}),
-            json!({"type": "commit", "digest": plan.digest, "batch": 2, "removed": [gone],
-                   "skipped": [[kept, "edge_referenced"]], "at_us": 0}),
-        ],
-    );
+        &plan,
+        &[gone, kept],
+        Some((
+            vec![gone.clone()],
+            vec![(kept.clone(), "edge_referenced".into())],
+        )),
+    )
+    .expect("record the skipped batch");
 
     let report = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2)
         .expect("a resume after a skip continues");
@@ -790,12 +840,8 @@ fn a_resume_after_a_killed_batch_whose_row_gained_an_edge_keeps_the_authorized_d
     let (fixture, options, plan, left) = interrupted_after_one_batch();
     let (still, named) = (&left[0], &left[1]);
     // A batch was killed before its delete committed, and an edge named one of its rows before the next start.
-    append_ledger(
-        &options.state_dir,
-        &[
-            json!({"type": "intent", "digest": plan.digest, "batch": 2, "ids": ledger_ids(&[still, named])}),
-        ],
-    );
+    append_batch(&options.state_dir, &plan, &[still, named], None)
+        .expect("record the killed batch intent");
     fixture.edge(named, &Uuid::new_v4().to_string(), false);
 
     let report = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 2)
@@ -818,6 +864,12 @@ fn a_resume_refuses_when_a_new_row_joins_the_selection() {
         "{error}"
     );
     assert_eq!(error.exit_code(), 4);
+    if let PruneError::DigestMismatch { detail, .. } = &error {
+        assert_eq!(
+            detail,
+            "5 distinct ids in the union of current selection and earlier removed/batched ids"
+        );
+    }
     assert_eq!(fixture.ids(), before);
 }
 
