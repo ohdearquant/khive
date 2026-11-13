@@ -427,15 +427,70 @@ enum BackendCommand {
 /// reach the daemon however it is spawned. Real environment variables win over
 /// the file (dotenvy does not override what is already set), and a missing file
 /// is not an error.
+///
+/// The file is skipped entirely for an agent process (`KHIVE_ACTOR` in the
+/// process environment starts with `agent:`) and for any process started with
+/// `KHIVE_LOAD_DOTENV=0`. This runs before argument parsing and actor
+/// resolution, so only the process environment can decide it.
 fn load_khive_dotenv() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let path = std::path::Path::new(&home).join(".khive/.env");
+    load_khive_dotenv_from(
+        std::path::Path::new(&home),
+        std::env::var_os("KHIVE_ACTOR").as_deref(),
+        std::env::var_os("KHIVE_LOAD_DOTENV").as_deref(),
+    );
+}
+
+fn load_khive_dotenv_from(
+    home: &std::path::Path,
+    actor: Option<&std::ffi::OsStr>,
+    switch: Option<&std::ffi::OsStr>,
+) {
+    let path = home.join(".khive/.env");
+    if let Some(reason) = khive_dotenv_skip_reason(actor, switch) {
+        eprintln!("kkernel: not loading {}: {reason}", path.display());
+        return;
+    }
     match dotenvy::from_path(&path) {
         Ok(()) => {}
         Err(e) if e.not_found() => {}
         Err(e) => eprintln!("warning: failed to load {}: {e}", path.display()),
+    }
+}
+
+/// Why the per-user dotenv file must not be loaded, or `None` to load it.
+/// Unreadable or unrecognized values skip the file: an agent process that
+/// would otherwise inherit every value in it fails closed.
+fn khive_dotenv_skip_reason(
+    actor: Option<&std::ffi::OsStr>,
+    switch: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    if let Some(actor) = actor {
+        match actor.to_str() {
+            None => return Some("KHIVE_ACTOR is not valid UTF-8".to_string()),
+            Some(actor)
+                if actor
+                    .trim_start()
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("agent:")) =>
+            {
+                return Some(format!("KHIVE_ACTOR {} is an agent actor", actor.trim()));
+            }
+            Some(_) => {}
+        }
+    }
+    let switch = switch?;
+    match switch.to_str().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "" | "1" | "true" | "yes" | "on") => None,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => {
+            Some("KHIVE_LOAD_DOTENV is off".to_string())
+        }
+        _ => Some(format!(
+            "KHIVE_LOAD_DOTENV has unrecognized value {:?}; expected 0 or 1",
+            switch.to_string_lossy()
+        )),
     }
 }
 
@@ -1473,6 +1528,86 @@ mod tests {
     use clap::CommandFactory;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    fn dotenv_home_with(var: &str) -> TempDir {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".khive")).unwrap();
+        std::fs::write(
+            home.path().join(".khive/.env"),
+            format!("{var}=from-file\n"),
+        )
+        .unwrap();
+        std::env::remove_var(var);
+        home
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn an_agent_actor_process_does_not_load_the_dotenv_file() {
+        let var = "KHIVE_DOTENV_PROBE_AGENT_SKIP";
+        let home = dotenv_home_with(var);
+        for actor in ["agent:example", " Agent:Example "] {
+            load_khive_dotenv_from(home.path(), Some(std::ffi::OsStr::new(actor)), None);
+            assert_eq!(
+                std::env::var_os(var),
+                None,
+                "actor {actor:?} loaded the file"
+            );
+        }
+        load_khive_dotenv_from(
+            home.path(),
+            Some(std::ffi::OsStr::new("agent:example")),
+            Some(std::ffi::OsStr::new("1")),
+        );
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "the switch overrode an agent actor"
+        );
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn a_process_without_an_agent_actor_loads_the_dotenv_file() {
+        for (index, actor) in [None, Some("lambda:example"), Some("agentx:example")]
+            .into_iter()
+            .enumerate()
+        {
+            let var = format!("KHIVE_DOTENV_PROBE_LOADS_{index}");
+            let home = dotenv_home_with(&var);
+            load_khive_dotenv_from(home.path(), actor.map(std::ffi::OsStr::new), None);
+            assert_eq!(
+                std::env::var(&var).as_deref(),
+                Ok("from-file"),
+                "actor {actor:?} did not load the file"
+            );
+            std::env::remove_var(&var);
+        }
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn the_load_switch_off_or_unrecognized_skips_the_dotenv_file() {
+        for (index, value) in ["0", "false", "OFF", "maybe"].into_iter().enumerate() {
+            let var = format!("KHIVE_DOTENV_PROBE_SWITCH_{index}");
+            let home = dotenv_home_with(&var);
+            load_khive_dotenv_from(
+                home.path(),
+                Some(std::ffi::OsStr::new("lambda:example")),
+                Some(std::ffi::OsStr::new(value)),
+            );
+            assert_eq!(
+                std::env::var_os(&var),
+                None,
+                "switch {value:?} loaded the file"
+            );
+        }
+        let var = "KHIVE_DOTENV_PROBE_SWITCH_ON";
+        let home = dotenv_home_with(var);
+        load_khive_dotenv_from(home.path(), None, Some(std::ffi::OsStr::new("1")));
+        assert_eq!(std::env::var(var).as_deref(), Ok("from-file"));
+        std::env::remove_var(var);
+    }
 
     fn write_empty_config(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("empty-khive.toml");

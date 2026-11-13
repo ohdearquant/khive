@@ -93,8 +93,12 @@ effect of listing backends.
   `reindex`/`mcp` do. `kg export`/`import`/`status`/`fetch` take `--namespace` directly with no
   config-file fallback at all.
 - **`~/.khive/.env`**: loaded once at process start via `dotenvy` before argument parsing
-  (`main.rs:198-215`). Real environment variables always win over the file; a missing file is not
-  an error.
+  (`load_khive_dotenv` in `crates/kkernel/src/cli.rs`). Real environment variables always win over
+  the file; a missing file is not an error. The file is not loaded at all when `KHIVE_ACTOR` in the
+  process environment starts with `agent:`, or when `KHIVE_LOAD_DOTENV` is `0`, `false`, `no`, `off`
+  or an unrecognized value; startup prints one line naming the reason. This keeps the values out of
+  an agent server's environment only: a process that can read the file still gets them, so an
+  agent's filesystem sandbox must deny that path.
 
 ---
 
