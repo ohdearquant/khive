@@ -50,7 +50,26 @@ serialize on a sibling lock; errors before the final rename leave the previous d
 intact. `run_sync_remote(repo_root, &RemoteConfig, repin)` fetches a remote KG
 archive (sparse, depth-1 clone), verifies its content hash against `RemoteConfig::pin`
 when set, and populates `.khive/kg/remotes/<name>/` with a `meta.json` recording the
-resolved commit and hash.
+resolved commit, hash and snapshot coverage. The sync report, including `kkernel kg fetch`
+JSON output, reports the same coverage.
+
+Read a cached snapshot's recorded identity:
+
+```rust
+use std::path::Path;
+use khive_vcs::sync::{read_remote_snapshot_identity, RemoteName};
+
+fn inspect_snapshot(repo_root: &Path) -> anyhow::Result<()> {
+    let name = RemoteName::parse("upstream")?;
+    let identity = read_remote_snapshot_identity(repo_root, &name)?;
+    println!("{}: {:?}", identity.content_hash, identity.coverage);
+    Ok(())
+}
+```
+
+The reader preserves the recorded hash and defaults missing legacy coverage to
+`KG_V1_COVERAGE`. It reports the stored claim; it does not rehash the cache or verify
+that its files satisfy that claim. Malformed hashes or explicit coverage are refused.
 
 ## Semantics
 
@@ -63,6 +82,10 @@ resolved commit and hash.
   `dirty` flag; uncommitted changes are computed fresh via a DB-vs-NDJSON diff, not cached.
 - `KG_V1_COVERAGE` records that v1 snapshots cover entities and edges only; notes are
   excluded pending a note pack that defines versioned export/import/redaction/merge.
+- `SnapshotIdentity` pairs that coverage with the content hash in remote-cache metadata.
+  Equal content hashes with different coverage claims have distinct identity metadata.
+  Coverage does not change v1 hashes or pins. Remote fetch always records v1 coverage;
+  reading a claim that includes notes does not enable note import.
 
 ## Where this sits
 

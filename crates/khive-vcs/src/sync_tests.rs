@@ -1248,11 +1248,15 @@ fn sample_entity(id: &str, name: &str) -> NdjsonEntity {
 }
 
 fn sample_meta(tag: &str) -> MetaJson {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(tag.as_bytes());
     MetaJson {
         fetched_at: "2026-01-01T00:00:00Z".to_string(),
         git_ref: "main".to_string(),
         commit_sha: "deadbeef".to_string(),
-        content_hash: format!("sha256:{tag}"),
+        identity: SnapshotIdentity {
+            content_hash: SnapshotId::from_hash(&hex::encode(digest)).unwrap(),
+            coverage: KG_V1_COVERAGE,
+        },
     }
 }
 
@@ -1283,7 +1287,10 @@ fn assert_cache_is_old_generation(cache_dir: &Path) {
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
             .unwrap();
-    assert_eq!(meta["content_hash"], "sha256:old");
+    assert_eq!(
+        meta["content_hash"],
+        sample_meta("old").identity.content_hash.as_str()
+    );
 }
 
 #[test]
@@ -1541,7 +1548,10 @@ fn remote_cache_publish_success_exposes_complete_new_cache() {
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
             .unwrap();
-    assert_eq!(meta["content_hash"], "sha256:new");
+    assert_eq!(
+        meta["content_hash"],
+        sample_meta("new").identity.content_hash.as_str()
+    );
 }
 
 #[test]
@@ -1660,6 +1670,12 @@ async fn run_sync_remote_fetches_and_verifies_hash_match() {
         "content_hash must match the pin"
     );
     assert!(!report.repinned, "repin was not requested");
+    assert_eq!(report.coverage, KG_V1_COVERAGE);
+    let report_json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        report_json["coverage"],
+        serde_json::json!({"entities": true, "edges": true, "notes": false})
+    );
 
     // Cache files must exist.
     let cache = repo_dir.path().join(".khive/kg/remotes/upstream");
@@ -1679,6 +1695,10 @@ async fn run_sync_remote_fetches_and_verifies_hash_match() {
     // meta.json must be valid JSON with the expected fields.
     let meta_bytes = std::fs::read(cache.join("meta.json")).unwrap();
     let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+    assert_eq!(meta["coverage"], report_json["coverage"]);
+    let identity = read_remote_snapshot_identity(repo_dir.path(), &remote.name).unwrap();
+    assert_eq!(identity.content_hash, expected_pin);
+    assert_eq!(identity.coverage, KG_V1_COVERAGE);
     assert_eq!(
         meta["content_hash"].as_str().unwrap(),
         expected_pin.as_str(),
