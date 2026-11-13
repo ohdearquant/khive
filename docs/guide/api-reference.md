@@ -627,6 +627,8 @@ Hybrid FTS + vector search with RRF fusion.
 | `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
 | `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
 | `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
+| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                       |
+| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                     |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -639,6 +641,20 @@ contradiction is rejected. Entity-only fields on a note search and note-only
 fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
+
+Creation-time bounds apply to both entities and notes, independently of `order_by`,
+and combine with kind, tags and entity-type filters. Omitted or null bounds are
+unrestricted. Offset spellings are compared as instants, retaining nanosecond input
+precision against stored microsecond timestamps; more than nine fractional digits
+is refused rather than rounded. Equal endpoints include a record at that instant.
+
+Time filtering reads metadata for the returned candidate window (`limit × 50`,
+capped at 500 per backend), before ordering and the final limit. Coordinated
+search combines those backend windows, so its merged window can exceed 500.
+Filtering can return fewer hits even
+when other matching records exist outside that window. It is not an exhaustive
+time-range scan and does not use the larger runtime window available to property
+and tag pushdown. These bounds are carried through coordinated search too.
 
 In multi-backend mode a backend failure with surviving hits yields those hits
 with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
