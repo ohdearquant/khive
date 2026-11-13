@@ -181,10 +181,18 @@ pub async fn require_secondary_attachment_empty(
 /// [`StorageBackend::prepare_core_schema`] has migrated it forward (to V20, or
 /// through V21 when no legacy reference needs this coordinator).
 ///
-/// `Ok(())` means the V21 cutover is complete, not that the schema is at the
-/// latest version: later migrations are not run here. `KhiveRuntime::new`
-/// applies them; `KhiveRuntime::from_prepared_backend` needs
+/// `Ok(())` means the V21 cutover is complete. Whether the later migrations
+/// ran depends on the state at entry. When the cutover was already complete,
+/// this returns at once and runs nothing, so the schema can still be behind the
+/// latest version. Otherwise, once the cutover is finished here (or by a
+/// sibling while this call waited for the GC owner), it applies the remaining
+/// migrations before returning. `KhiveRuntime::new` applies them in either
+/// case; `KhiveRuntime::from_prepared_backend` needs
 /// [`StorageBackend::prepare_core_schema`] called first.
+///
+/// A database that holds legacy moodboard preference models needs both a
+/// `verifier` and a `hydrator`; with either one `None`, the call fails closed
+/// and the cutover stays resumable.
 ///
 /// # Inspecting the state without migrating
 ///

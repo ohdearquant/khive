@@ -55,7 +55,9 @@ let graph = runtime.graph(&token)?; // Arc<dyn khive_storage::GraphStore>
 databases. It deliberately refuses a legacy V20 database that needs verified
 application-assisted migration, with `RuntimeError::AttachmentCutoverRequired`;
 an embedding host runs `khive_runtime::coordinate_attachment_cutover` over that
-database and then constructs the runtime again. Official production boot uses the async
+database and then constructs the runtime again. When the database holds legacy
+moodboard preference models, that call needs a legacy-preference verifier and a
+blob hydrator; without them it fails closed and the cutover stays resumable. Official production boot uses the async
 `khive_mcp::serve::build_single_backend_runtime` or multi-backend builders and
 then `KhiveRuntime::from_prepared_backend`. The infallible `from_backend`
 constructor is a low-level assembly seam whose caller must already have
