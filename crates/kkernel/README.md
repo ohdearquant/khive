@@ -119,8 +119,9 @@ Resolution precedence for the default namespace: `--actor` > `--namespace` (lega
 `[actor] id` in a `khive.toml` config file > `"local"`. Config file search order when
 `--config` is not given: `./khive.toml`, `./.khive/config.toml`, `~/.khive/config.toml`.
 `~/.khive/.env` is loaded into the process environment at startup if present (real env vars
-take precedence). It is skipped when `KHIVE_ACTOR` in the process environment names an agent
-actor (`agent:` prefix) or when `KHIVE_LOAD_DOTENV=0`; startup prints one line saying why.
+take precedence). It is skipped when `KHIVE_ACTOR` or an `--actor` argument names an agent actor
+(`agent:` prefix), or when `KHIVE_LOAD_DOTENV` is `0`, `false`, `no`, `off` or an unrecognized
+value; when the file exists, startup prints one line saying why.
 
 | Environment variable              | Effect                                                        |
 | --------------------------------- | ------------------------------------------------------------- |
