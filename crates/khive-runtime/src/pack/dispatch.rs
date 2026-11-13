@@ -14,11 +14,10 @@ use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
 use super::{
-    append_audit_event_best_effort, build_audit_storage_event, fold_audit_obligation,
-    identifier_resolution_help, link_audit_success_from_result, masked_audit_event,
-    persist_git_digest_receipt, resolution_mode_contract, resolve_explicit_namespace,
-    GitDigestReceiptOutcome, InterceptedDispatchResult, RequestIdentity, VerbRegistry,
-    VerifiedActor,
+    append_audit_event_best_effort, fold_audit_obligation, identifier_resolution_help,
+    link_audit_success_from_result, masked_audit_event, persist_git_digest_receipt,
+    resolution_mode_contract, resolve_explicit_namespace, GitDigestReceiptOutcome,
+    InterceptedDispatchResult, RequestIdentity, VerbRegistry, VerifiedActor,
 };
 
 impl VerbRegistry {
@@ -301,7 +300,7 @@ impl VerbRegistry {
                 if let GateDecision::Deny { reason } = decision {
                     let receipt = match &self.event_store {
                         Some(store) => {
-                            let event = build_audit_storage_event(
+                            let event = self.build_dispatch_audit_event(
                                 &gate_req,
                                 &audit,
                                 EventOutcome::Denied,
@@ -445,38 +444,42 @@ impl VerbRegistry {
                         .with_payload_schema_version(2)
                         .with_duration_us(duration_us)
                     }
-                    None => build_audit_storage_event(
-                        gate_req,
-                        &audit,
-                        EventOutcome::Success,
-                        Some(resource),
-                    )
-                    .with_duration_us(duration_us),
+                    None => self
+                        .build_dispatch_audit_event(
+                            gate_req,
+                            &audit,
+                            EventOutcome::Success,
+                            Some(resource),
+                        )
+                        .with_duration_us(duration_us),
                 }
             }
-            Ok(value) => build_audit_storage_event(
-                gate_req,
-                &audit,
-                EventOutcome::Success,
-                Some(success_row.resource(crate::cost_unit::resource_payload(
-                    verb,
-                    &gate_req.args,
-                    value,
-                    || 0,
-                    request_id,
-                ))),
-            )
-            .with_duration_us(duration_us),
-            Err(_) => build_audit_storage_event(
-                gate_req,
-                &audit,
-                EventOutcome::Error,
-                Some(crate::cost_unit::base_resource_payload(request_id)),
-            )
-            .with_duration_us(duration_us),
+            Ok(value) => self
+                .build_dispatch_audit_event(
+                    gate_req,
+                    &audit,
+                    EventOutcome::Success,
+                    Some(success_row.resource(crate::cost_unit::resource_payload(
+                        verb,
+                        &gate_req.args,
+                        value,
+                        || 0,
+                        request_id,
+                    ))),
+                )
+                .with_duration_us(duration_us),
+            Err(_) => self
+                .build_dispatch_audit_event(
+                    gate_req,
+                    &audit,
+                    EventOutcome::Error,
+                    Some(crate::cost_unit::base_resource_payload(request_id)),
+                )
+                .with_duration_us(duration_us),
         };
         match result {
             Ok(value) => {
+                self.enrich_audit_subject_success(&mut event, verb, value);
                 enrich_stream_truncate_success(&mut event, gate_req, value);
                 enrich_search_success(&mut event, gate_req, value, search_arms);
             }
@@ -626,7 +629,7 @@ impl VerbRegistry {
             reason: error.wire_reason().to_string(),
         };
         if let Some(store) = &self.event_store {
-            let mut event = build_audit_storage_event(
+            let mut event = self.build_dispatch_audit_event(
                 gate_req,
                 &audit,
                 EventOutcome::Error,
@@ -813,7 +816,7 @@ impl VerbRegistry {
                             // `resource.cost_unit` is scoped to a successful
                             // dispatch by Amendment 1. `base_resource_payload()`
                             // carries `work_class` alone, no `cost_unit` key.
-                            let storage_event = build_audit_storage_event(
+                            let storage_event = self.build_dispatch_audit_event(
                                 &gate_req,
                                 &audit,
                                 EventOutcome::Denied,
@@ -1108,13 +1111,14 @@ impl VerbRegistry {
                                             "link audit v2 enrichment parse failed; \
                                              falling back to v1 audit shape"
                                         );
-                                        let storage_event = build_audit_storage_event(
-                                            &gate_req,
-                                            &audit,
-                                            EventOutcome::Success,
-                                            Some(resource),
-                                        )
-                                        .with_duration_us(dispatch_us);
+                                        let storage_event = self
+                                            .build_dispatch_audit_event(
+                                                &gate_req,
+                                                &audit,
+                                                EventOutcome::Success,
+                                                Some(resource),
+                                            )
+                                            .with_duration_us(dispatch_us);
                                         append_audit_event_best_effort(
                                             self.audit_batch.as_ref(),
                                             store,
@@ -1173,10 +1177,17 @@ impl VerbRegistry {
                                 } else {
                                     crate::audit_batch::AuditProducer::DispatchFailed
                                 };
-                                let mut storage_event =
-                                    build_audit_storage_event(&gate_req, &audit, outcome, resource)
-                                        .with_duration_us(dispatch_us);
+                                let mut storage_event = self
+                                    .build_dispatch_audit_event(
+                                        &gate_req, &audit, outcome, resource,
+                                    )
+                                    .with_duration_us(dispatch_us);
                                 if let Ok(value) = &result {
+                                    self.enrich_audit_subject_success(
+                                        &mut storage_event,
+                                        verb,
+                                        value,
+                                    );
                                     enrich_stream_truncate_success(
                                         &mut storage_event,
                                         &gate_req,
@@ -1331,7 +1342,7 @@ impl VerbRegistry {
                 // not `Success`. `work_class` is still stamped (ADR-103
                 // Decision (a)); `resource.cost_unit` is omitted, matching
                 // every other errored-dispatch row.
-                let mut storage_event = build_audit_storage_event(
+                let mut storage_event = self.build_dispatch_audit_event(
                     &gate_req,
                     &audit,
                     EventOutcome::Error,

@@ -1,8 +1,7 @@
-#[cfg(doc)]
-use super::VerbRegistry;
 use super::{
     json_type_name, Arc, AuditEvent, AuditObligationFailure, Event, EventKind, EventOutcome,
     EventStore, GateDecision, GateRequest, Namespace, RuntimeError, SubstrateKind, Value,
+    VerbRegistry,
 };
 
 /// Audit target in the submitted args; only `link` also accepts `target` for `target_id`.
@@ -110,6 +109,61 @@ pub(super) fn build_audit_storage_event(
         );
     }
     storage_event
+}
+
+impl VerbRegistry {
+    fn audit_subject_arg(&self, verb: &str) -> Option<&'static str> {
+        if self.is_verb_disabled(verb) {
+            return None;
+        }
+        self.packs
+            .iter()
+            .find(|pack| pack.handlers().iter().any(|handler| handler.name == verb))
+            .and_then(|pack| pack.audit_subject_arg(verb))
+    }
+
+    pub(super) fn build_dispatch_audit_event(
+        &self,
+        gate_req: &GateRequest,
+        audit: &AuditEvent,
+        outcome: EventOutcome,
+        resource: Option<Value>,
+    ) -> Event {
+        let mut event = build_audit_storage_event(gate_req, audit, outcome, resource);
+        if let Some(id) = self
+            .audit_subject_arg(&gate_req.verb)
+            .and_then(|arg| gate_req.args.get(arg))
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+        {
+            event.target_id = Some(id);
+        }
+        event
+    }
+
+    pub(super) fn enrich_audit_subject_success(
+        &self,
+        event: &mut Event,
+        verb: &str,
+        result: &Value,
+    ) {
+        if event.outcome != EventOutcome::Success || self.audit_subject_arg(verb).is_none() {
+            return;
+        }
+        let (Some(id), Some(kind)) = (
+            result
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse::<uuid::Uuid>().ok()),
+            result.get("kind").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        event.target_id = Some(id);
+        if let Value::Object(ref mut payload) = event.payload {
+            payload.insert("record_kind".into(), Value::from(kind));
+        }
+    }
 }
 
 /// Add one closed failure token; never copy error text or stamp success rows.

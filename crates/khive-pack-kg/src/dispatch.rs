@@ -158,6 +158,10 @@ async fn run_kg_embedder_warm(
 impl PackRuntime for KgPack {
     khive_runtime::pack_runtime_metadata!();
 
+    fn audit_subject_arg(&self, verb: &str) -> Option<&'static str> {
+        (verb == "get").then_some("id")
+    }
+
     async fn dispatch_search_intercepted(
         &self,
         params: serde_json::Value,
