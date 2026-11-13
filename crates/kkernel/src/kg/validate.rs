@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use khive_rule_evaluator::{edge_source_id, edge_target_id, record_prefix};
+use khive_rule_evaluator::{edge_source_id, edge_target_id, record_prefix, NdjsonSource};
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use khive_storage::EdgeRelation;
@@ -306,9 +306,13 @@ fn check_required_input_files(
     notes_path: &Path,
 ) -> RuleResult {
     let mut violations = Vec::new();
-    for path in [entities_path, edges_path] {
+    for (path, source) in [
+        (entities_path, NdjsonSource::Entities),
+        (edges_path, NdjsonSource::Edges),
+    ] {
         if let Err(error) = std::fs::read_to_string(path) {
             violations.push(Violation {
+                source: Some(source),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -328,6 +332,7 @@ fn check_required_input_files(
         Ok(_) => {
             if let Err(error) = std::fs::read_to_string(notes_path) {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Notes),
                     entity_id: None,
                     entity_name: None,
                     entity_kind: None,
@@ -343,6 +348,7 @@ fn check_required_input_files(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => violations.push(Violation {
+            source: Some(NdjsonSource::Notes),
             entity_id: None,
             entity_name: None,
             entity_kind: None,
@@ -364,8 +370,22 @@ fn check_required_input_files(
     }
 }
 
-fn schema_violation(file: &str, line_no: usize, message: impl std::fmt::Display) -> Violation {
+fn ndjson_file_name(source: NdjsonSource) -> &'static str {
+    match source {
+        NdjsonSource::Entities => "entities.ndjson",
+        NdjsonSource::Edges => "edges.ndjson",
+        NdjsonSource::Notes => "notes.ndjson",
+    }
+}
+
+fn schema_violation(
+    source: NdjsonSource,
+    line_no: usize,
+    message: impl std::fmt::Display,
+) -> Violation {
+    let file = ndjson_file_name(source);
     Violation {
+        source: Some(source),
         entity_id: None,
         entity_name: None,
         entity_kind: None,
@@ -403,7 +423,7 @@ fn check_schema_compliance(
                         .collect();
                     if !missing.is_empty() {
                         violations.push(schema_violation(
-                            "entities.ndjson",
+                            NdjsonSource::Entities,
                             line_no,
                             format!("missing required field(s): {}", missing.join(", ")),
                         ));
@@ -411,7 +431,7 @@ fn check_schema_compliance(
                 }
                 Err(e) => {
                     violations.push(schema_violation(
-                        "entities.ndjson",
+                        NdjsonSource::Entities,
                         line_no,
                         format!("invalid JSON: {e}"),
                     ));
@@ -440,7 +460,7 @@ fn check_schema_compliance(
                     }
                     if !missing.is_empty() {
                         violations.push(schema_violation(
-                            "edges.ndjson",
+                            NdjsonSource::Edges,
                             line_no,
                             format!("missing required field(s): {}", missing.join(", ")),
                         ));
@@ -448,7 +468,7 @@ fn check_schema_compliance(
                 }
                 Err(e) => {
                     violations.push(schema_violation(
-                        "edges.ndjson",
+                        NdjsonSource::Edges,
                         line_no,
                         format!("invalid JSON: {e}"),
                     ));
@@ -474,7 +494,7 @@ fn check_schema_compliance(
                             .collect();
                         if !missing.is_empty() {
                             violations.push(schema_violation(
-                                "notes.ndjson",
+                                NdjsonSource::Notes,
                                 line_no,
                                 format!("missing required field(s): {}", missing.join(", ")),
                             ));
@@ -482,7 +502,7 @@ fn check_schema_compliance(
                     }
                     Err(e) => {
                         violations.push(schema_violation(
-                            "notes.ndjson",
+                            NdjsonSource::Notes,
                             line_no,
                             format!("invalid JSON: {e}"),
                         ));
@@ -503,6 +523,7 @@ fn check_schema_compliance(
 fn check_valid_kinds(
     records_path: &Path,
     valid_kinds: &HashSet<String>,
+    source: NdjsonSource,
     rule_id: &str,
     kind_label: &str,
 ) -> RuleResult {
@@ -529,6 +550,7 @@ fn check_valid_kinds(
                             name.as_deref(),
                         );
                         violations.push(Violation {
+                            source: Some(source),
                             entity_id: if id.is_empty() { None } else { Some(id) },
                             entity_name: name,
                             entity_kind: Some(kind_str.to_string()),
@@ -563,6 +585,7 @@ pub(super) fn check_valid_entity_kinds(
     check_valid_kinds(
         entities_path,
         valid_kinds,
+        NdjsonSource::Entities,
         "valid-entity-kinds",
         "entity_kind",
     )
@@ -576,7 +599,13 @@ pub(super) fn check_valid_note_kinds(
     notes_path: &Path,
     valid_kinds: &HashSet<String>,
 ) -> RuleResult {
-    check_valid_kinds(notes_path, valid_kinds, "valid-note-kinds", "note_kind")
+    check_valid_kinds(
+        notes_path,
+        valid_kinds,
+        NdjsonSource::Notes,
+        "valid-note-kinds",
+        "note_kind",
+    )
 }
 
 fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
@@ -613,6 +642,7 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
                             format!("[{id_display}] ")
                         };
                         violations.push(Violation {
+                            source: Some(NdjsonSource::Edges),
                             entity_id: if edge_id.is_empty() {
                                 None
                             } else {
@@ -652,6 +682,7 @@ fn check_no_duplicate_uuids(entities_path: &Path) -> RuleResult {
                 if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
                     if !seen.insert(id.to_string()) {
                         violations.push(Violation {
+                            source: Some(NdjsonSource::Entities),
                             entity_id: Some(id.to_string()),
                             entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
                             entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_string),
@@ -691,6 +722,7 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
         sorted.sort();
         if ids != sorted {
             violations.push(Violation {
+                source: Some(NdjsonSource::Entities),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -719,6 +751,7 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
         sorted.sort();
         if keys != sorted {
             violations.push(Violation {
+                source: Some(NdjsonSource::Edges),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -788,6 +821,7 @@ fn check_referential_integrity(
                     if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
+                                source: Some(NdjsonSource::Edges),
                                 entity_id: Some(id.to_string()),
                                 entity_name: None,
                                 entity_kind: None,
