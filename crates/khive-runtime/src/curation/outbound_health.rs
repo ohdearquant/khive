@@ -192,10 +192,13 @@ mod tests {
         seed(&runtime, "local", legacy).await;
         let mut due = pending();
         due["next_attempt_at"] = json!("1990-01-01T00:00:00Z");
-        seed(&runtime, "local", due).await;
+        let due_id = seed(&runtime, "local", due).await.id;
         let mut invalid_deadline = pending();
-        invalid_deadline["next_attempt_at"] = json!("2035-01-01 00:00:00Z");
-        seed(&runtime, "local", invalid_deadline).await;
+        let relaxed_only_deadline = "2035-01-01T00:00:00+0000";
+        assert!(DateTime::parse_from_rfc3339(relaxed_only_deadline).is_err());
+        assert!(relaxed_only_deadline.parse::<DateTime<Utc>>().is_ok());
+        invalid_deadline["next_attempt_at"] = json!(relaxed_only_deadline);
+        let invalid_deadline_id = seed(&runtime, "local", invalid_deadline).await.id;
         let mut nullable = pending();
         nullable["delivered_at"] = Value::Null;
         nullable["delivery_hold"] = Value::Null;
@@ -257,6 +260,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(due.len(), 2);
+        assert_eq!(
+            due.iter()
+                .map(|note| note.id)
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([due_id, invalid_deadline_id]),
+            "delivery must include the overdue and malformed-deadline rows only"
+        );
         assert!(runtime
             .outbound_health_for_channel(&token, "email", "sender@example.com", true)
             .await
