@@ -9,11 +9,59 @@ use crate::backend::{StoreSchemaGate, StoreSchemaKind};
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexReadKind {
     Graph,
     Notes,
 }
+
+/// An index a typed read names with `INDEXED BY`: its name, the store schema
+/// that creates it, and the read that forces it.
+pub(crate) struct ForcedIndex {
+    pub(crate) name: &'static str,
+    pub(crate) kind: StoreSchemaKind,
+    read: IndexReadKind,
+}
+
+/// Every forced index. The serving barrier checks each one before readiness,
+/// and a read repairs only the ones it forces.
+pub(crate) const FORCED_INDEXES: [ForcedIndex; 7] = [
+    ForcedIndex {
+        name: "idx_graph_edges_ns_src_rel",
+        kind: StoreSchemaKind::Graph,
+        read: IndexReadKind::Graph,
+    },
+    ForcedIndex {
+        name: "idx_graph_edges_ns_tgt_rel",
+        kind: StoreSchemaKind::Graph,
+        read: IndexReadKind::Graph,
+    },
+    ForcedIndex {
+        name: "idx_graph_edges_unique_triple",
+        kind: StoreSchemaKind::Graph,
+        read: IndexReadKind::Graph,
+    },
+    ForcedIndex {
+        name: "idx_notes_created",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Graph,
+    },
+    ForcedIndex {
+        name: "idx_notes_message_recipient_direction",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Notes,
+    },
+    ForcedIndex {
+        name: "idx_notes_unread_probe_recipient_direction",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Notes,
+    },
+    ForcedIndex {
+        name: "idx_notes_unread_probe_recipient_type_direction",
+        kind: StoreSchemaKind::Notes,
+        read: IndexReadKind::Notes,
+    },
+];
 
 #[derive(Clone, Copy)]
 struct OwnedIndex {
@@ -62,28 +110,14 @@ impl IndexRepairContext {
             rusqlite::Error::SqlInputError { msg, .. } => msg.as_str(),
             _ => return None,
         };
-        let kind = match (self.read_kind, message) {
-            (
-                IndexReadKind::Graph,
-                "no such index: idx_graph_edges_ns_src_rel"
-                | "no such index: idx_graph_edges_ns_tgt_rel"
-                | "no such index: idx_graph_edges_unique_triple",
-            ) => StoreSchemaKind::Graph,
-            (IndexReadKind::Graph, "no such index: idx_notes_created")
-            | (
-                IndexReadKind::Notes,
-                "no such index: idx_notes_message_recipient_direction"
-                | "no such index: idx_notes_unread_probe_recipient_direction"
-                | "no such index: idx_notes_unread_probe_recipient_type_direction",
-            ) => StoreSchemaKind::Notes,
-            _ => return None,
-        };
-        let ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> = match kind {
-            StoreSchemaKind::Graph => super::graph::ensure_graph_schema,
-            StoreSchemaKind::Notes => super::note::ensure_notes_schema,
-            _ => unreachable!("only graph and notes own droppable forced indexes"),
-        };
-        Some(OwnedIndex { kind, ensure })
+        let name = message.strip_prefix("no such index: ")?;
+        let index = FORCED_INDEXES
+            .iter()
+            .find(|index| index.name == name && index.read == self.read_kind)?;
+        Some(OwnedIndex {
+            kind: index.kind,
+            ensure: index.kind.initializer(),
+        })
     }
 
     async fn repair(

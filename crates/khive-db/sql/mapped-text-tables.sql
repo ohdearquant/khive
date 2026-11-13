@@ -1,0 +1,1 @@
+SELECT substr(t.name, 5) FROM sqlite_master t WHERE t.type = 'table' AND t.name LIKE 'fts\_%' ESCAPE '\' AND t.sql LIKE 'CREATE VIRTUAL TABLE%' AND EXISTS (SELECT 1 FROM sqlite_master m WHERE m.type = 'table' AND m.name = t.name || '_rowids') ORDER BY t.name

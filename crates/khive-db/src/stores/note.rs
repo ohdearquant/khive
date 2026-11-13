@@ -2990,9 +2990,10 @@ pub(crate) fn ensure_notes_schema(conn: &rusqlite::Connection) -> Result<(), rus
 /// (khive #827). Scans `notes` in full, so callers MUST gate this to
 /// run at most once per backend/pool rather than on every store acquisition
 /// (khive #827) -- see
-/// `StorageBackend::notes_for_namespace`.
-pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(NOTES_SEQ_REPAIR_DDL)
+/// `StorageBackend::notes_for_namespace`. Returns the number of `notes_seq`
+/// rows it inserted.
+pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute(NOTES_SEQ_REPAIR_DDL, [])
 }
 
 #[cfg(test)]

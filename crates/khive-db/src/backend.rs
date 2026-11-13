@@ -23,6 +23,8 @@ mod core_stores;
 mod memory_visibility;
 mod pack_schema;
 mod policy_open;
+mod schema_barrier;
+pub use schema_barrier::ForcedIndexCheck;
 
 #[cfg(test)]
 #[path = "backend/filter_builder_tests.rs"]
@@ -230,7 +232,7 @@ fn validate_vector_table_columns(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreSchemaKind {
     Entities,
     Graph,
@@ -240,7 +242,7 @@ pub(crate) enum StoreSchemaKind {
 }
 
 impl StoreSchemaKind {
-    fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    pub(crate) fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
         match self {
             Self::Entities => entity::ensure_entities_schema,
             Self::Graph => graph::ensure_graph_schema,
@@ -954,10 +956,7 @@ impl StorageBackend {
             // so this load-then-run-then-store is race-free: no other caller on
             // this pool can observe or advance `notes_seq_repair_runs` while we
             // hold the writer guard (khive #827).
-            if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
-                note::repair_notes_seq(writer.conn())?;
-                self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
-            }
+            self.repair_notes_seq_with_writer(writer.conn())?;
         }
 
         Ok(Arc::new(
@@ -1588,6 +1587,10 @@ mod store_accessor_tests;
 #[cfg(test)]
 #[path = "backend/store_accessor_index_tests.rs"]
 mod store_accessor_index_tests;
+
+#[cfg(test)]
+#[path = "backend/schema_barrier_tests.rs"]
+mod schema_barrier_tests;
 
 #[cfg(test)]
 #[path = "backend_tests.rs"]
