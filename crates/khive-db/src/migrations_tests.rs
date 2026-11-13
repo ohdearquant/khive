@@ -5604,3 +5604,84 @@ fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
 #[cfg(test)]
 #[path = "migrations/memory_visibility_tests.rs"]
 mod memory_visibility_tests;
+
+/// Runs the chain on `conn` and reports whether it stopped below the cutover.
+fn chain_defers(conn: &mut Connection) -> bool {
+    run_migrations(conn).unwrap() < ATTACHMENT_CUTOVER_VERSION
+}
+
+fn insert_legacy_content_ref(conn: &Connection) {
+    let content = khive_storage::blob::ContentRef::from_hex("c".repeat(64)).unwrap();
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, entity_type, name, tags, created_at, updated_at, deleted_at, content_ref) \
+         VALUES ('legacy', 'local', 'document', NULL, 'legacy', '[]', 1, 1, NULL, ?1)",
+        [content.as_str()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_v21_deferral_reader_agrees_with_the_chain() {
+    // A fresh store: no entities table, so no legacy reference; the chain completes V21.
+    let mut fresh = open_memory();
+    assert!(!attachment_cutover_would_defer(&fresh).unwrap());
+    assert!(!chain_defers(&mut fresh));
+
+    // Below V10: the entities table exists but has no content_ref column yet, so
+    // there is no legacy reference; the chain adds the column empty at V10.
+    let mut early = open_memory();
+    migrate_through(&mut early, 9);
+    assert!(!attachment_cutover_would_defer(&early).unwrap());
+    assert!(!chain_defers(&mut early));
+
+    // Pending at V20 with no legacy reference: the chain completes V21 itself.
+    let mut pending = open_memory();
+    migrate_through(&mut pending, 20);
+    assert!(!attachment_cutover_would_defer(&pending).unwrap());
+    assert!(!chain_defers(&mut pending));
+
+    // Pending at V20 with a legacy reference: the chain stops for the host.
+    let mut legacy = open_memory();
+    migrate_through(&mut legacy, 20);
+    insert_legacy_content_ref(&legacy);
+    assert!(attachment_cutover_would_defer(&legacy).unwrap());
+    assert!(chain_defers(&mut legacy));
+    assert_eq!(
+        attachment_cutover_status(&legacy).unwrap(),
+        AttachmentCutoverStatus::Pending
+    );
+
+    // Staged but not finalized: incomplete, and the chain still stops.
+    stage_attachment_cutover(&mut legacy).unwrap();
+    assert_eq!(
+        attachment_cutover_status(&legacy).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+    assert!(attachment_cutover_would_defer(&legacy).unwrap());
+    assert!(chain_defers(&mut legacy));
+
+    // Finalized: past the cutover, so the chain never reaches that step again.
+    let mut complete = open_memory();
+    migrate_through(&mut complete, 20);
+    finalize_after_stage(&mut complete);
+    assert!(read_schema_version(&complete).unwrap() >= ATTACHMENT_CUTOVER_VERSION);
+    assert!(!attachment_cutover_would_defer(&complete).unwrap());
+    assert!(!chain_defers(&mut complete));
+}
+
+fn finalize_after_stage(conn: &mut Connection) {
+    stage_attachment_cutover(conn).unwrap();
+    finalize_attachment_cutover(conn).unwrap();
+}
+
+#[test]
+fn the_v21_deferral_reader_does_not_write() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    insert_legacy_content_ref(&conn);
+    let changes_before = conn.total_changes();
+    assert!(attachment_cutover_would_defer(&conn).unwrap());
+    assert_eq!(conn.total_changes(), changes_before);
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+}
