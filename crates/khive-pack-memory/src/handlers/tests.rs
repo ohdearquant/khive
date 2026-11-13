@@ -1441,7 +1441,13 @@ fn request_naming_weighted_keeps_the_configured_weights() {
 
 #[test]
 fn local_factor_is_read_from_the_profile_response_as_an_f32() {
-    for stored in [0.5_f64, 0.7, 1.0] {
+    for stored in [
+        0.5_f64,
+        f64::from_bits(0.5_f64.to_bits() + 1),
+        0.7,
+        f64::from_bits(1.0_f64.to_bits() - 1),
+        1.0,
+    ] {
         let resp = serde_json::json!({ "local_factor": stored });
         assert_eq!(local_factor_from_profile_response(&resp), stored as f32);
     }
@@ -1455,6 +1461,8 @@ fn local_factor_is_one_when_the_profile_response_has_no_usable_value() {
         serde_json::json!({}),
         serde_json::json!({ "local_factor": null }),
         serde_json::json!({ "local_factor": "0.7" }),
+        serde_json::json!({ "local_factor": f64::from_bits(0.5_f64.to_bits() - 1) }),
+        serde_json::json!({ "local_factor": f64::from_bits(1.0_f64.to_bits() + 1) }),
         serde_json::json!({ "local_factor": 0.49 }),
         serde_json::json!({ "local_factor": 1.01 }),
         serde_json::json!({ "local_factor": -0.7 }),

@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use khive_brain_core::{LOCAL_FACTOR_MAX, LOCAL_FACTOR_MIN};
 use khive_fusion::FusionStrategy;
 use khive_retrieval::hybrid::{
     combine_best_ranked_evidence, fuse_labelled_scored, HitLabel, HybridConfig,
@@ -414,7 +415,9 @@ pub(super) fn balanced_recall_state_from_profile_response(
 pub(super) fn local_factor_from_profile_response(resp: &Value) -> f32 {
     resp.get("local_factor")
         .and_then(Value::as_f64)
-        .filter(|factor| factor.is_finite() && (0.5..=1.0).contains(factor))
+        .filter(|factor| {
+            factor.is_finite() && (LOCAL_FACTOR_MIN..=LOCAL_FACTOR_MAX).contains(factor)
+        })
         .map_or(1.0, |factor| factor as f32)
 }
 
