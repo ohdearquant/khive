@@ -263,6 +263,15 @@ def main():
             f"pack_counts must sum to total: {verbs_result['pack_counts']} vs "
             f"{verbs_result['total']}"
         )
+        assert verbs_result["pack_counts"].get("comm") == 16, (
+            f"expected 16 public comm verbs: {verbs_result['pack_counts']}"
+        )
+        quiet_verbs = [v for v in verbs_result["verbs"] if v["verb"] == "comm.quiet"]
+        assert len(quiet_verbs) == 1, (
+            f"comm.quiet must appear exactly once: {quiet_verbs}"
+        )
+        assert quiet_verbs[0]["pack"] == "comm", quiet_verbs[0]
+        assert quiet_verbs[0]["category"] == "Directive", quiet_verbs[0]
         documented_count_errors = validate_documented_counts(
             Path(__file__).resolve().parent.parent,
             verbs_result,
@@ -283,7 +292,7 @@ def main():
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 162 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 163 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -330,10 +339,11 @@ def main():
         # hydrates the selected roles; gtd contributes gtd.counts, one assignee's
         # task counts by status without task bodies; memory contributes
         # memory.apply_batch, checked and resumable memory rewrites (ADR-021).
+        # comm.quiet requests bounded cooperative background deferral (ADR-103).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 162, (
-            f"expected 162 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 163, (
+            f"expected 163 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -364,6 +374,7 @@ def main():
             f"hydrates the selected roles; "
             f"gtd contributes gtd.counts; "
             f"memory contributes memory.apply_batch; "
+            f"comm.quiet is bounded cooperative background deferral; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

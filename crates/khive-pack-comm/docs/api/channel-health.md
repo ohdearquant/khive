@@ -328,3 +328,40 @@ available. These readings cover only the executing process, not its descendants;
 when nothing is in flight. Raw observations only, per the same "no computed
 healthy bool" rule as the rest of this verb — attributing severity to a given
 CPU/RSS number is the caller's judgment, not this verb's.
+
+## `comm.quiet` — bounded background deferral
+
+`comm.quiet(ttl_secs=30)` requests a cooperative quiet window in the executing
+process and returns `{quiet_until: "<RFC3339 UTC deadline>"}`. The required
+`ttl_secs` parameter must be an integer from 1 through 300. Canonical dispatch
+normalizes whole-valued JSON numbers such as `1.0` to integers before validation;
+fractional values such as `1.5` are refused. Missing, null,
+non-integer, zero, negative, excessive and unknown parameters refuse before
+changing quiet state. Ordinary caller Gate policy applies; this control change
+is classified as `Write` and retains normal dispatch audit behavior.
+
+Concurrent or repeated requests keep the later of the current monotonic deadline
+and `now + ttl_secs`. A shorter request cannot shorten another caller's window.
+There is no revoke operation; a requester that stops renewing cannot leave quiet
+active permanently. A live requester may extend it with further valid requests.
+`comm.health.resource.quiet_until` is always present: it is the UTC deadline of
+the winning request while active and null as soon as the monotonic deadline
+expires. Wall-clock adjustments do not change expiry.
+
+The deadline is shared across runtime instances and namespaces in this process.
+Normal forwarding applies it in the daemon; an in-process composition applies
+it in that process. It is not persisted and does not coordinate other daemons.
+The handler does not acquire a background-work permit or a database writer for
+the deadline itself. Configured ordinary audit may write, and an audit failure
+after handler execution does not roll back the deadline; an error response alone
+is therefore not proof that the request had no effect.
+
+Warm and maintenance supervisors wait before entering a new producer. KG and
+Knowledge background embedding also wait immediately before inference, and
+Knowledge snapshot warming waits before its warm attempt while retaining its
+single-flight claim. Waits respond to cancellation or daemon shutdown and
+recheck renewals. An already-running memory attempt may finish while retaining
+its existing model guard. Foreground requests, finalization, channel delivery,
+session ingestion and mmap freshness watchers continue. In-flight SQL,
+inference and blocking ANN builds are not suspended; quiet is not a guarantee
+of zero CPU activity or a host-wide contention lock.

@@ -61,7 +61,7 @@ const CHANNEL_SLUG_PARAM: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 21] = [
     HandlerDef {
         name: "comm.suppression_add",
         description: "Add a suppression entry for an email address, exact domain, or recipient key. Address values are normalized with the shared email recipient normalizer; domain values are ASCII-lowercased and match that domain only.",
@@ -810,6 +810,26 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         ],
     },
     HandlerDef {
+        name: "comm.quiet",
+        description: "Defer opted-in background warm and maintenance work in this process. \
+                      Requires integer ttl_secs in 1..=300. Repeated requests retain the later \
+                      deadline; a shorter request cannot shorten an active interval. Returns \
+                      quiet_until, the effective UTC deadline also reported by comm.health. \
+                      Expiry uses a monotonic clock. This cooperative, non-durable request \
+                      applies across namespaces in this process, not other processes. It does \
+                      not interrupt in-flight work or delay foreground dispatch, finalization, \
+                      shutdown, channel polling, or freshness watchers.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Directive,
+        params: &[ParamDef {
+            name: "ttl_secs",
+            param_type: "integer",
+            required: true,
+            description: "Quiet duration in seconds, from 1 through 300 inclusive. Renewals retain the later deadline.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
+    },
+    HandlerDef {
         name: "comm.health",
         // MAINTENANCE, deliberately kept out of the description: the surface and its
         // namespace resolution are specified in khive #606, #877, #917, #1383 and #1472,
@@ -851,7 +871,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                        non-local `namespace=` scope returns that namespace's rows once an \
                        authorized per-tenant writer has run. Without a heartbeat it may still \
                        return quarantine-only channel evidence while the local poll loop is \
-                       actively heartbeating under \"local\".",
+                       actively heartbeating under \"local\". The process-level resource object \
+                       always includes quiet_until: the active comm.quiet UTC deadline, or null \
+                       after monotonic expiry or when no quiet request is active.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
