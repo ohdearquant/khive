@@ -96,6 +96,59 @@ fn a_cancel_during_a_read_stops_it() {
 }
 
 #[test]
+fn nested_read_registration_is_refused_without_disarming_the_outer_read() {
+    for same_connection in [false, true] {
+        let outer_conn = connection();
+        let other_conn = connection();
+        let inner_conn = if same_connection {
+            &outer_conn
+        } else {
+            &other_conn
+        };
+        let (outer_control, outer_scope) = scope("outer_read");
+        let (_, inner_scope) = scope("inner_read");
+        let mut inner_ran = false;
+        let mut interrupted = false;
+        let read = outer_scope.run(&outer_conn, || {
+            let nested = inner_scope.run(inner_conn, || {
+                inner_ran = true;
+                Ok(())
+            });
+            assert!(
+                matches!(nested, Err(StorageError::Internal(_))),
+                "nested registration must fail before its read starts: {nested:?}"
+            );
+            outer_control.cancel(STOP_REQUEST);
+            interrupted_long_read(&outer_conn, &mut interrupted)
+        });
+        assert!(
+            !inner_ran,
+            "a refused registration must not execute its closure"
+        );
+        assert!(interrupted, "SQLite must still interrupt the outer read");
+        assert!(
+            matches!(read, Err(StorageError::Timeout { .. })),
+            "{read:?}"
+        );
+        assert_eq!(
+            inner_scope
+                .run(inner_conn, || long_read(inner_conn))
+                .unwrap(),
+            ROWS,
+            "the refused scope remains usable after the outer guard clears"
+        );
+        let (_, next_scope) = scope("after_nested_read");
+        assert_eq!(
+            next_scope
+                .run(&outer_conn, || long_read(&outer_conn))
+                .unwrap(),
+            ROWS,
+            "the outer connection remains reusable after both guards clear"
+        );
+    }
+}
+
+#[test]
 fn an_unwinding_read_clears_its_registration() {
     let conn = connection();
     let (control, scope) = scope("unwind");

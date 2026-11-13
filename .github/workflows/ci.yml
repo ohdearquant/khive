@@ -975,7 +975,7 @@ jobs:
             echo "::error::could not read the resolved rmcp feature set"
             exit 1
           fi
-          if printf '%s\n' "$features" | grep -E '^rmcp feature "(auth|transport-streamable-http-client-reqwest|transport-streamable-http-client-unix-socket)"$'; then
+          if printf '%s\n' "$features" | grep -E '^rmcp feature "(auth|transport-streamable-http-client-[^"]*)"$'; then
             echo "::error::an rmcp feature covered by an ignored advisory is enabled; remove the ignore from crates/deny.toml and move rmcp to 3.9 or later"
             exit 1
           fi

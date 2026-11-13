@@ -52,8 +52,9 @@ impl ProgressConn {
         self.id
     }
 
-    /// Whether the handler is known to be installed. A failed re-install leaves the connection
-    /// unarmed, and a read scope then refuses it.
+    /// Whether the handler is known to be installed. Once a re-install fails, this returns
+    /// false permanently for this connection, even after a later successful re-install,
+    /// and every subsequent read scope refuses it.
     pub(crate) fn armed(&self) -> bool {
         !self.unarmed.load(Ordering::Acquire)
     }
