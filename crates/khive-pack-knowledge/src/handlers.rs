@@ -382,14 +382,13 @@ async fn load_profile_type_weights(
     token: &NamespaceToken,
 ) -> Option<HashMap<String, f32>> {
     let namespace = token.namespace().as_str();
-    let result = registry
-        .dispatch_with_identity(
-            "brain.profile",
-            json!({ "profile_id": profile_id, "namespace": namespace }),
-            Some(RequestIdentity::from_token(token)),
-        )
-        .await
-        .ok()?;
+    let result = khive_runtime::usage::scope_child(registry.dispatch_with_identity(
+        "brain.profile",
+        json!({ "profile_id": profile_id, "namespace": namespace }),
+        Some(RequestIdentity::from_token(token)),
+    ))
+    .await
+    .ok()?;
     let sections = result.get("section_posteriors")?.as_object()?;
     let weights: HashMap<String, f32> = sections
         .iter()
