@@ -428,9 +428,10 @@ enum BackendCommand {
 /// the file (dotenvy does not override what is already set), and a missing file
 /// is not an error.
 ///
-/// The file is skipped entirely for an agent process (`KHIVE_ACTOR` in the
-/// process environment, or an `--actor` argument, starts with `agent:`) and
-/// when `KHIVE_LOAD_DOTENV` is off or unrecognized. This runs before argument
+/// The file is skipped entirely for an agent process (`KHIVE_ACTOR` or
+/// `KHIVE_NAMESPACE` in the process environment, or an `--actor` or
+/// `--namespace` argument, names an `agent:` actor) and when
+/// `KHIVE_LOAD_DOTENV` is off or unrecognized. This runs before argument
 /// parsing and config discovery, so an agent identity that arrives only
 /// through a config file cannot decide it; such launches set
 /// `KHIVE_LOAD_DOTENV=0`.
@@ -438,41 +439,54 @@ fn load_khive_dotenv() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let argv_actor = argv_actor(std::env::args_os().skip(1));
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let env_actor = std::env::var_os("KHIVE_ACTOR");
+    let env_namespace = std::env::var_os("KHIVE_NAMESPACE");
+    let argv_actor = argv_flag(&args, "--actor");
+    let argv_namespace = argv_flag(&args, "--namespace");
     load_khive_dotenv_from(
         std::path::Path::new(&home),
-        std::env::var_os("KHIVE_ACTOR").as_deref(),
-        argv_actor.as_deref(),
+        &[
+            ("KHIVE_ACTOR", env_actor.as_deref()),
+            ("KHIVE_NAMESPACE", env_namespace.as_deref()),
+            ("--actor", argv_actor.as_deref()),
+            ("--namespace", argv_namespace.as_deref()),
+        ],
         std::env::var_os("KHIVE_LOAD_DOTENV").as_deref(),
     );
 }
 
-/// The value of the first `--actor VALUE` or `--actor=VALUE` argument.
-fn argv_actor(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<std::ffi::OsString> {
+/// The value of the first `FLAG VALUE` or `FLAG=VALUE` argument before `--`.
+fn argv_flag(args: &[std::ffi::OsString], flag: &str) -> Option<std::ffi::OsString> {
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--" {
             return None;
         }
-        if arg == "--actor" {
-            return args.next();
+        if arg == flag {
+            return args.next().cloned();
         }
-        if let Some(value) = arg.to_str().and_then(|text| text.strip_prefix("--actor=")) {
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|text| text.strip_prefix(flag))
+            .and_then(|rest| rest.strip_prefix('='))
+        {
             return Some(value.into());
         }
     }
     None
 }
 
+/// `identities` pairs each place an actor can be named with its value, if any.
 fn load_khive_dotenv_from(
     home: &std::path::Path,
-    env_actor: Option<&std::ffi::OsStr>,
-    argv_actor: Option<&std::ffi::OsStr>,
+    identities: &[(&str, Option<&std::ffi::OsStr>)],
     switch: Option<&std::ffi::OsStr>,
 ) {
     let path = home.join(".khive/.env");
-    let reason = [("KHIVE_ACTOR", env_actor), ("--actor", argv_actor)]
-        .into_iter()
-        .find_map(|(source, actor)| khive_dotenv_actor_skip(source, actor?))
+    let reason = identities
+        .iter()
+        .find_map(|(source, actor)| khive_dotenv_actor_skip(source, (*actor)?))
         .or_else(|| khive_dotenv_switch_skip(switch?));
     if let Some(reason) = reason {
         if path.exists() {
@@ -1575,17 +1589,22 @@ mod tests {
         let var = "KHIVE_DOTENV_PROBE_AGENT_SKIP";
         let home = dotenv_home_with(var);
         for actor in ["agent:example", " Agent:Example "] {
-            load_khive_dotenv_from(home.path(), Some(std::ffi::OsStr::new(actor)), None, None);
-            assert_eq!(
-                std::env::var_os(var),
-                None,
-                "actor {actor:?} loaded the file"
-            );
+            for source in ["KHIVE_ACTOR", "KHIVE_NAMESPACE", "--actor", "--namespace"] {
+                load_khive_dotenv_from(
+                    home.path(),
+                    &[(source, Some(std::ffi::OsStr::new(actor)))],
+                    None,
+                );
+                assert_eq!(
+                    std::env::var_os(var),
+                    None,
+                    "{source} {actor:?} loaded the file"
+                );
+            }
         }
         load_khive_dotenv_from(
             home.path(),
-            Some(std::ffi::OsStr::new("agent:example")),
-            None,
+            &[("KHIVE_ACTOR", Some(std::ffi::OsStr::new("agent:example")))],
             Some(std::ffi::OsStr::new("1")),
         );
         assert_eq!(
@@ -1593,30 +1612,68 @@ mod tests {
             None,
             "the switch overrode an agent actor"
         );
-        for (env_actor, argv_actor) in [
+        for (env_actor, argv_namespace) in [
             (None, "agent:example"),
             (Some("lambda:example"), "agent:example"),
         ] {
             load_khive_dotenv_from(
                 home.path(),
-                env_actor.map(std::ffi::OsStr::new),
-                Some(std::ffi::OsStr::new(argv_actor)),
+                &[
+                    ("KHIVE_ACTOR", env_actor.map(std::ffi::OsStr::new)),
+                    ("--namespace", Some(std::ffi::OsStr::new(argv_namespace))),
+                ],
                 None,
             );
             assert_eq!(
                 std::env::var_os(var),
                 None,
-                "--actor {argv_actor:?} with KHIVE_ACTOR {env_actor:?} loaded the file"
+                "--namespace {argv_namespace:?} with KHIVE_ACTOR {env_actor:?} loaded the file"
             );
         }
     }
 
     #[test]
+    #[serial(khive_dotenv)]
+    fn the_startup_loader_reads_the_namespace_alias_from_the_environment() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let var = "KHIVE_DOTENV_PROBE_STARTUP_NAMESPACE";
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        std::fs::create_dir_all(home.join(".khive")).unwrap();
+        std::fs::write(home.join(".khive/.env"), format!("{var}=from-file\n")).unwrap();
+        std::env::remove_var(var);
+        std::env::set_var("KHIVE_NAMESPACE", "agent:example");
+        load_khive_dotenv();
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "KHIVE_NAMESPACE agent:example loaded the file"
+        );
+        std::env::set_var("KHIVE_NAMESPACE", "lambda:example");
+        load_khive_dotenv();
+        assert_eq!(
+            std::env::var(var).as_deref(),
+            Ok("from-file"),
+            "a non-agent namespace did not load the file"
+        );
+    }
+
+    #[test]
     fn the_actor_argument_is_read_in_both_spellings_before_any_separator() {
-        let parse = |args: &[&str]| {
-            argv_actor(args.iter().map(std::ffi::OsString::from))
-                .map(|value| value.to_string_lossy().into_owned())
+        let parse_flag = |args: &[&str], flag: &str| {
+            let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+            argv_flag(&args, flag).map(|value| value.to_string_lossy().into_owned())
         };
+        let parse = |args: &[&str]| parse_flag(args, "--actor");
+        assert_eq!(
+            parse_flag(&["mcp", "--namespace", "agent:n"], "--namespace").as_deref(),
+            Some("agent:n")
+        );
+        assert_eq!(
+            parse_flag(&["mcp", "--namespace=agent:m"], "--namespace").as_deref(),
+            Some("agent:m")
+        );
         assert_eq!(
             parse(&["mcp", "--actor", "agent:a"]).as_deref(),
             Some("agent:a")
@@ -1642,7 +1699,14 @@ mod tests {
         {
             let var = format!("KHIVE_DOTENV_PROBE_LOADS_{index}");
             let home = dotenv_home_with(&var);
-            load_khive_dotenv_from(home.path(), actor.map(std::ffi::OsStr::new), None, None);
+            load_khive_dotenv_from(
+                home.path(),
+                &[
+                    ("KHIVE_ACTOR", actor.map(std::ffi::OsStr::new)),
+                    ("KHIVE_NAMESPACE", actor.map(std::ffi::OsStr::new)),
+                ],
+                None,
+            );
             assert_eq!(
                 std::env::var(&var).as_deref(),
                 Ok("from-file"),
@@ -1663,8 +1727,7 @@ mod tests {
             let home = dotenv_home_with(&var);
             load_khive_dotenv_from(
                 home.path(),
-                Some(std::ffi::OsStr::new("lambda:example")),
-                None,
+                &[("KHIVE_ACTOR", Some(std::ffi::OsStr::new("lambda:example")))],
                 Some(std::ffi::OsStr::new(value)),
             );
             assert_eq!(
@@ -1676,7 +1739,7 @@ mod tests {
         for (index, value) in ["1", ""].into_iter().enumerate() {
             let var = format!("KHIVE_DOTENV_PROBE_SWITCH_ON_{index}");
             let home = dotenv_home_with(&var);
-            load_khive_dotenv_from(home.path(), None, None, Some(std::ffi::OsStr::new(value)));
+            load_khive_dotenv_from(home.path(), &[], Some(std::ffi::OsStr::new(value)));
             assert_eq!(
                 std::env::var(&var).as_deref(),
                 Ok("from-file"),
