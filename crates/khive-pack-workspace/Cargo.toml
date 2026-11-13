@@ -23,6 +23,7 @@ globset = "0.4"
 [dev-dependencies]
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+khive-db = { version = "0.19.0", path = "../khive-db" }
 khive-pack-kg = { version = "0.19.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.19.0", path = "../khive-pack-gtd" }
 khive-pack-git = { version = "0.19.0", path = "../khive-pack-git" }

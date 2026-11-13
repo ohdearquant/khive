@@ -1,3 +1,4 @@
+use khive_db::migrations::MIGRATIONS;
 use khive_runtime::{RuntimeConfig, StorageBackend};
 use serde_json::{json, Value};
 
@@ -104,8 +105,11 @@ async fn assert_cursor_shape(runtime: &KhiveRuntime) {
 }
 
 #[tokio::test]
-async fn historical_v64_store_upgrade_preserves_rows_and_installs_cursor() {
+async fn previous_schema_store_upgrade_preserves_rows_and_installs_cursor() {
     bounded(async {
+        let (latest, predecessors) = MIGRATIONS.split_last().expect("core migrations exist");
+        let previous = predecessors.last().expect("a predecessor migration exists");
+        let stop_marker = format!("workspace-cursor-stop-v{}", latest.version);
         let tree = MirrorTree::new();
         let db_path = tree.0.join("historical.db");
         let lock_dir = tree.0.join("locks");
@@ -140,40 +144,43 @@ async fn historical_v64_store_upgrade_preserves_rows_and_installs_cursor() {
                 .await
                 .unwrap();
             writer
-                .execute_script(
-                    "CREATE TRIGGER cursor_fixture_stop_v65 \
-                     BEFORE INSERT ON _schema_migrations WHEN NEW.version = 65 \
-                     BEGIN SELECT RAISE(ABORT, 'workspace-cursor-stop-v65'); END;"
-                        .into(),
-                )
+                .execute_script(format!(
+                    "CREATE TRIGGER cursor_fixture_stop_latest \
+                     BEFORE INSERT ON _schema_migrations WHEN NEW.version = {} \
+                     BEGIN SELECT RAISE(ABORT, '{stop_marker}'); END;",
+                    latest.version
+                ))
                 .await
                 .unwrap();
             drop(writer);
 
-            // Build the real V64 prefix, including Rust migration steps, with the
-            // current runner. This is not a database produced by an older binary.
+            // Build every migration except the newest with the current runner,
+            // including Rust steps. This is not an older binary's database.
             let error = backend
                 .prepare_core_schema()
-                .expect_err("stop before V65 commits");
+                .expect_err("stop before the newest migration commits");
             assert_eq!(
                 error.to_string(),
-                "migration v65 failed: workspace-cursor-stop-v65"
+                format!("migration v{} failed: {stop_marker}", latest.version)
             );
-            assert_eq!(backend.schema_version().unwrap(), 64);
+            assert_eq!(backend.schema_version().unwrap(), previous.version);
             let prior = ledger(&backend).await;
             assert_eq!(
-                prior.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-                (1..=64).collect::<Vec<i64>>()
+                prior
+                    .iter()
+                    .map(|entry| (entry.0, entry.1.as_str()))
+                    .collect::<Vec<_>>(),
+                predecessors
+                    .iter()
+                    .map(|migration| (i64::from(migration.version), migration.name))
+                    .collect::<Vec<_>>()
             );
-            assert!(prior.iter().all(|entry| !entry.1.is_empty() && entry.2 > 0));
-            // Graph accessors can ensure this index without advancing the ledger.
-            // Keep setup on raw SQL until both predecessor premises are checked.
-            assert!(!has_object(&backend, "index", "idx_graph_edges_target_relation").await);
+            assert!(prior.iter().all(|entry| entry.2 > 0));
             assert!(!has_object(&backend, "table", "workspace_mirror_cursor").await);
 
             let mut writer = backend.sql().writer().await.unwrap();
             writer
-                .execute_script("DROP TRIGGER cursor_fixture_stop_v65;".into())
+                .execute_script("DROP TRIGGER cursor_fixture_stop_latest;".into())
                 .await
                 .unwrap();
             writer
@@ -214,22 +221,18 @@ async fn historical_v64_store_upgrade_preserves_rows_and_installs_cursor() {
                 volume_lock_dir: Some(lock_dir.clone()),
                 ..RuntimeConfig::no_embeddings()
             })
-            .expect("normal writable runtime upgrades the V64 store");
-            assert_eq!(runtime.backend().schema_version().unwrap(), 65);
+            .expect("normal writable runtime upgrades the predecessor store");
+            assert_eq!(runtime.backend().schema_version().unwrap(), latest.version);
             let upgraded = ledger(runtime.backend()).await;
-            assert_eq!(upgraded.len(), 65);
-            assert_eq!(&upgraded[..64], predecessor_ledger.as_slice());
-            assert_eq!(upgraded[64].0, 65);
-            assert_eq!(upgraded[64].1, "graph_edges_target_relation_index");
-            assert!(upgraded[64].2 > 0);
-            assert!(
-                has_object(
-                    runtime.backend(),
-                    "index",
-                    "idx_graph_edges_target_relation"
-                )
-                .await
+            assert_eq!(upgraded.len(), MIGRATIONS.len());
+            assert_eq!(
+                &upgraded[..predecessors.len()],
+                predecessor_ledger.as_slice()
             );
+            let last = upgraded.last().unwrap();
+            assert_eq!(last.0, i64::from(latest.version));
+            assert_eq!(last.1, latest.name);
+            assert!(last.2 > 0);
             assert_eq!(entity_snapshot(runtime.backend()).await, expected_entity);
             assert!(!has_object(runtime.backend(), "table", "workspace_mirror_cursor").await);
 
