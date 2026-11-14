@@ -22,6 +22,9 @@ use super::{
 /// [`kill_and_respawn`].
 pub(super) const BOOT_FENCE_PROBE_TIMEOUT_MS: u64 = 500;
 
+/// Configuration refused before daemon recovery or request dispatch.
+const DAEMON_LAUNCH_PREFLIGHT_REASON: &str = "daemon_launch_preflight";
+
 /// Outcome of waiting for a concurrent cold-boot (migrations + pack schema
 /// plans / FTS DDL) to finish, then re-checking daemon liveness once quiescent.
 enum BootFenceOutcome {
@@ -387,7 +390,7 @@ where
             return Some(Err(McpError::invalid_params(
                 format!("{error:#}"),
                 Some(serde_json::json!({
-                    "reason": "daemon_launch_preflight",
+                    "reason": DAEMON_LAUNCH_PREFLIGHT_REASON,
                     "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
                 })),
             )));
