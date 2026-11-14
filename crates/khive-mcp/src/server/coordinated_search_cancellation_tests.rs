@@ -29,6 +29,7 @@ use crate::tools::request::RequestParams;
 enum Outcome {
     Answer,
     CancelThenAnswer,
+    DeadlineThenAnswer,
     Timeout {
         cancel: bool,
         proof: bool,
@@ -45,12 +46,34 @@ struct ProbeCoordinator {
 }
 
 impl ProbeCoordinator {
-    fn finish(&self) -> Result<(), RuntimeError> {
+    async fn finish(&self) -> Result<(), RuntimeError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.outcome {
             Outcome::Answer => Ok(()),
             Outcome::CancelThenAnswer => {
                 self.cancellation.send(true).expect("request receiver");
+                Ok(())
+            }
+            Outcome::DeadlineThenAnswer => {
+                let context = khive_storage::capture_request_read_context();
+                assert_eq!(
+                    context.stop_reason(),
+                    None,
+                    "coordinator entered before expiry"
+                );
+                let deadline = context.deadline().expect("caller installed a deadline");
+                assert!(!*self.cancellation.borrow(), "no explicit cancellation");
+                // Cross the deadline after the populated result was obtained. A
+                // small tick avoids depending on the timer's exact boundary.
+                tokio::time::sleep_until(deadline.async_at() + Duration::from_millis(2)).await;
+                assert!(
+                    !*self.cancellation.borrow(),
+                    "deadline does not cancel the watch"
+                );
+                assert_eq!(
+                    context.stop_reason(),
+                    Some(khive_storage::RequestReadStopReason::Deadline)
+                );
                 Ok(())
             }
             Outcome::Timeout {
@@ -132,7 +155,7 @@ impl CoordinatorService for ProbeCoordinator {
             .inner
             .fan_out_search_scoped(request, token, args, extra_visible)
             .await?;
-        self.finish()?;
+        self.finish().await?;
         Ok(result)
     }
 
@@ -147,7 +170,7 @@ impl CoordinatorService for ProbeCoordinator {
             .inner
             .fan_out_note_search_scoped_with_count(request, token, args, extra_visible)
             .await?;
-        self.finish()?;
+        self.finish().await?;
         Ok(result)
     }
 
@@ -344,6 +367,65 @@ async fn coordinated_request_stop_is_not_committed_and_retryable() {
             }
             cancelled.close().await;
         }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn coordinated_request_deadline_is_not_committed_and_retryable() {
+    for kind in ["entity", "note"] {
+        let expired = fixture(Outcome::DeadlineThenAnswer, false);
+        let deadline = khive_storage::RequestReadDeadline::after(Duration::from_secs(1));
+        let entry = khive_storage::scope_request_read_deadline_at(deadline, async {
+            let entry = expired.entry(kind).await;
+            let context = khive_storage::capture_request_read_context();
+            assert_eq!(context.deadline().unwrap().async_at(), deadline.async_at());
+            assert_eq!(
+                context.stop_reason(),
+                Some(khive_storage::RequestReadStopReason::Deadline)
+            );
+            assert!(
+                matches!(
+                    khive_storage::ensure_request_read_active("search"),
+                    Err(StorageError::Timeout { operation }) if operation.as_ref() == "search"
+                ),
+                "retryability does not renew the original request"
+            );
+            entry
+        })
+        .await;
+        assert!(
+            !*expired.receiver.borrow(),
+            "the cancellation watch stayed false"
+        );
+        assert!(
+            expired.receiver.has_changed().is_ok(),
+            "the sender stayed alive"
+        );
+        assert_eq!(entry["ok"], false, "{entry}");
+        assert!(
+            entry.get("result").is_none(),
+            "no expired result page: {entry}"
+        );
+        assert_eq!(entry["domain_disposition"], "not_committed");
+        assert_eq!(entry["error"]["domain_disposition"], "not_committed");
+        assert_eq!(entry["error"]["kind"], "runtime_error");
+        assert_eq!(entry["error"]["retryable"], true);
+        assert_eq!(
+            entry["error"]["message"],
+            RuntimeError::Storage(StorageError::Timeout {
+                operation: "search".into(),
+            })
+            .to_string()
+        );
+        expired.close().await;
+
+        // A fresh request gets its own budget; the expired request above did not.
+        let retry = fixture(Outcome::Answer, false);
+        let entry = retry.entry(kind).await;
+        assert_eq!(entry["ok"], true, "{entry}");
+        assert_eq!(entry["result"].as_array().expect("nonempty retry").len(), 1);
+        retry.close().await;
     }
 }
 

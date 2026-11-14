@@ -433,9 +433,10 @@ pub(super) async fn dispatch_via_coordinator_inner(
 }
 
 fn coordinated_search_failure(tool: &str, error: khive_runtime::DispatchError) -> DispatchFailure {
-    // A stopped read with an explicit no-write proof is safe to retry. A
-    // coincident cancellation must not reclassify another error or an audit
-    // failure after the search already returned its canonical result.
+    // Cancellation or an expired request deadline, with an explicit no-write
+    // proof, permits a new request with a fresh budget; it does not renew this
+    // request's deadline. A coincident stop must not reclassify another error or
+    // an audit failure after the search already returned its canonical result.
     let proven_request_stop = error.disposition() == DomainDisposition::NotCommitted
         && error.source().batch_write_disposition() == Some(DomainDisposition::NotCommitted)
         && khive_storage::request_read_is_cancelled()
