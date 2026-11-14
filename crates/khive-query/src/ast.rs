@@ -14,12 +14,16 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
-/// A parsed query: pattern, predicates, projections, row offset, and optional row limit.
+/// A parsed query: pattern, predicates, projections, ordering, offset, and optional limit.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
     pub where_clause: WhereExpr,
     pub return_items: Vec<ReturnItem>,
+    /// Caller ordering followed by the compiler's deterministic tie order.
+    ///
+    /// An empty vector preserves the existing identity/traversal order.
+    pub order_by: Vec<OrderItem>,
     /// Number of deterministically ordered matches to skip before returning rows.
     ///
     /// GQL supplies this through `SKIP`; SPARQL currently always sets it to zero.
@@ -159,13 +163,35 @@ pub enum EdgeDirection {
     Both,
 }
 
-/// A field or JSON-property path referenced by a WHERE condition.
+/// A field or JSON path referenced by a WHERE condition or ORDER BY term.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyRef {
     /// A dedicated field on the bound substrate, such as `name` or `created_at`.
     Field(String),
     /// A path below the bound record's JSON `properties` object.
     JsonPath(Vec<String>),
+    /// A path below a canonical edge's JSON `metadata` object.
+    MetadataPath(Vec<String>),
+}
+
+/// One validated field or JSON path in GQL's `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderItem {
+    /// Binding whose value supplies this ordering term.
+    pub variable: String,
+    /// Dedicated scalar field or nonempty explicit JSON path.
+    pub property: PropertyRef,
+    /// Ascending or descending SQLite value order, without coercion.
+    pub direction: OrderDirection,
+}
+
+/// Direction of a caller-supplied ordering term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDirection {
+    /// Ascending order, with null values first.
+    Asc,
+    /// Descending order, with null values last.
+    Desc,
 }
 
 /// A predicate in the WHERE clause: `variable.field op value` or

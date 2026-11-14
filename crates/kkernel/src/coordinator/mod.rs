@@ -14,6 +14,54 @@ pub use locator::LocatorCache;
 pub use registry::{BackendEntry, BackendRegistrationError, BackendRegistry};
 pub use service::SubstrateCoordinatorService;
 
+fn ensure_search_active() -> khive_runtime::RuntimeResult<()> {
+    khive_storage::ensure_request_read_active("search")
+        .map_err(|error| khive_runtime::RuntimeError::from(error).before_requested_write())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SearchMetadataPhase {
+    Finalize,
+    Hydrate,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SearchMetadataRead {
+    pub(super) phase: SearchMetadataPhase,
+    pub(super) substrate: khive_pack_kg::handlers::SearchSubstrate,
+    pub(super) id: uuid::Uuid,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SEARCH_METADATA_OBSERVER: std::sync::Arc<dyn Fn(SearchMetadataRead) + Send + Sync>;
+}
+
+#[cfg(test)]
+pub(super) async fn scope_search_metadata_observer<F: std::future::Future>(
+    observer: std::sync::Arc<dyn Fn(SearchMetadataRead) + Send + Sync>,
+    future: F,
+) -> F::Output {
+    SEARCH_METADATA_OBSERVER.scope(observer, future).await
+}
+
+#[cfg(test)]
+fn notify_search_metadata_read(
+    phase: SearchMetadataPhase,
+    substrate: khive_pack_kg::handlers::SearchSubstrate,
+    id: uuid::Uuid,
+) {
+    let _ = SEARCH_METADATA_OBSERVER.try_with(|observe| {
+        observe(SearchMetadataRead {
+            phase,
+            substrate,
+            id,
+        });
+    });
+}
+
 #[cfg(test)]
 mod fusion_label_tests;
 #[cfg(test)]
@@ -25,3 +73,6 @@ mod tests;
 
 #[cfg(test)]
 mod search_audit_tests;
+
+#[cfg(test)]
+mod search_cancellation_tests;
