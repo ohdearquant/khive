@@ -550,8 +550,10 @@ mod tests {
                 props.as_object_mut().unwrap().remove("channel_slug");
             }
             note.properties = Some(props);
+            // Seed retained transport metadata through the privileged fixture store.
             runtime
-                .notes(&token)
+                .backend()
+                .notes_for_namespace(token.namespace().as_str())
                 .unwrap()
                 .upsert_note(note)
                 .await
