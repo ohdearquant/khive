@@ -28,6 +28,66 @@ units or replacement dates. The separate read-only
 changes these status filters nor claims the historical timestamp units. There
 is no `gtd.stats` verb.
 
+## `gtd.tasks` page continuation (#6549)
+
+`gtd.tasks` defaults to 50 tasks per page and clamps a supplied limit to 1–200.
+It applies the complete task filter and namespace visibility before pagination,
+in stable `created_at DESC, id ASC` order. The page query requests one additional
+matching row, at most 201 rows, without computing a total.
+
+When that extra row exists, the result is an object with `tasks` containing only
+the requested page and `has_more: true`. An incomplete page that previously
+returned a bare array now returns this object. Callers that index the result as
+an array must read `tasks` for an incomplete page. The extra row is removed
+before dependency diagnostics, so it is neither returned nor annotated.
+
+When there is no extra row, the existing response shape is preserved: an
+ordinary complete page is an array, including an exactly full final page; a
+complete empty page is `[]` unless the existing excluded-status explanation
+applies. A requested limit above 200 still produces an object with `tasks`,
+`requested_limit`, `effective_limit`, and `limit_clamped: true`, even when no
+further task exists. If both conditions apply, the object also has
+`has_more: true`. A clamped limit does not by itself establish continuation.
+No `has_more: false` field is added to an exhausted page.
+
+Continue with the same filters and `offset` increased by the number of returned
+tasks. For example, a default page of 50 out of 51 matching tasks has
+`has_more: true`; the next call with `offset=50` returns the remaining task as a
+complete array. An exactly full page of 50 out of 50 remains an array. There is
+no new cursor or total-count field.
+
+Consumers must accept either a bare array or an object's `tasks` array.
+Continue when `has_more` is true; the presence of an object or a full page
+alone does not establish continuation. An older short-page loop remains
+valid only if it accepts both shapes and compares the row count with the
+effective clamped limit, not the requested limit. It can require an extra
+empty request after an exactly full final page.
+
+For a known nonempty object page, a chained read can select
+`$prev.tasks[0].id`; a nonempty bare array uses `$prev[0].id`. When the shape
+or presence of a row is unknown, inspect the page before issuing a separate
+call with the chosen identifier. Indexing an object directly with `$prev[0]`
+produces a `substitution_error` with reason `path_wrong_type`; see the
+[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-proposed-2026-11-13-disclose-task-page-continuation-6549).
+
+Continuation describes matching live task rows, including blocked or broken
+tasks. Dependency diagnostics annotate these rows; they do not remove tasks
+from the page. The separate `filter_excluded` probe checks for an excluded
+status at offset zero under the same other predicates when the default page is
+empty. It remains an existence explanation, not a continuation signal or total.
+
+The lookahead and returned rows come from one page-query snapshot. Dependency
+diagnostics use subsequent reads, and successive offset pages do not share a
+snapshot: concurrent inserts or deletions can shift page boundaries. One extra
+returned row does not bound the work needed to evaluate filters or an offset.
+JSON and table formats preserve the continuation marker.
+
+This continuation contract does not apply to `gtd.next`. That verb selects
+at most its effective limit by priority and truncates further candidates
+without a `has_more` marker. Its limit-clamp report is not a completeness
+signal. Use paged `gtd.tasks` for inventory, with its different ordering and
+dependency diagnostics.
+
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 
 Fetches every `task` note matching `property_filters` in a single bounded
@@ -141,10 +201,12 @@ excluded-status probe clones the same complete filter and changes only status,
 so unrelated terminal tasks cannot produce an exclusion hint. No caller-defined
 SQL or JSON path is accepted.
 
-No filters preserves the current behavior: default limit 50, limits clamped to
-1–200, stable `created_at DESC, id ASC` order, ordinary array responses, and the
-existing special empty `tasks`/`filter_excluded` object only when a matching
-excluded task exists. Dependency diagnostics and timestamps are unchanged.
+Omitting these filters preserves the default limit of 50, limits clamped to
+1–200, and stable `created_at DESC, id ASC` order. The
+[page-continuation contract](#gtdtasks-page-continuation-6549) applies to filtered
+and unfiltered pages. The existing empty `tasks`/`filter_excluded` explanation
+still requires a matching excluded task. Dependency diagnostics and timestamps
+are unchanged.
 
 ## Duplicate judgments
 

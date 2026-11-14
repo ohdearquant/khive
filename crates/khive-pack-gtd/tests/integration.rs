@@ -2986,13 +2986,15 @@ async fn tasks_pagination_returns_disjoint_pages() {
         .await
         .unwrap();
 
-    let ids1: HashSet<&str> = page1
+    assert_eq!(page1["has_more"], true);
+    assert_eq!(page2["has_more"], true);
+    let ids1: HashSet<&str> = page1["tasks"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["full_id"].as_str().unwrap())
         .collect();
-    let ids2: HashSet<&str> = page2
+    let ids2: HashSet<&str> = page2["tasks"]
         .as_array()
         .unwrap()
         .iter()

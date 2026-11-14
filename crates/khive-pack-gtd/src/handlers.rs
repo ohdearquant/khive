@@ -1464,11 +1464,6 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
-        // #744 → #2679: see the identical rationale in `handle_next` above — the
-        // bare-array shape stays byte-identical when unclamped; wrapping happens
-        // only when `requested_limit > limit` fires below (checked at every
-        // return site, including the `filter_excluded` object wrap further
-        // down, which already switches shape for an unrelated reason).
         let requested_limit = p.limit.unwrap_or(50);
         let limit = requested_limit.clamp(1, 200);
         let limit_clamped = requested_limit > limit;
@@ -1615,20 +1610,24 @@ impl GtdPack {
             ..Default::default()
         }
         .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
-        let page = self
+        let mut page = self
             .runtime()
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit,
+                    limit: limit + 1,
                     offset: offset.into(),
                 },
             )
             .await
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
+        let has_more = page.items.len() > limit as usize;
+        // The lookahead only witnesses continuation; it is not part of the
+        // caller's page and must not incur dependency diagnostics.
+        page.items.truncate(limit as usize);
         let diagnostics =
             crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
         let result: Vec<Value> = page
@@ -1685,9 +1684,14 @@ impl GtdPack {
                 return Ok(response);
             }
         }
-        if limit_clamped {
+        if limit_clamped || has_more {
             let mut response = json!({ "tasks": result });
-            insert_limit_report(&mut response, requested_limit, limit);
+            if has_more {
+                response["has_more"] = json!(true);
+            }
+            if limit_clamped {
+                insert_limit_report(&mut response, requested_limit, limit);
+            }
             Ok(response)
         } else {
             Ok(Value::Array(result))

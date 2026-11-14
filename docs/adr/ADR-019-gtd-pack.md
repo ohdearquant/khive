@@ -1049,3 +1049,95 @@ This amendment is the named non-CRUD exception in
 Its writer scope is the GTD repair entry in ADR-091 Amendment 20: prepare
 all evidence, provenance and bindings before admission, then execute only the
 guarded UPDATE and audit INSERT with bounded result bookkeeping.
+
+## Amendment 8 (proposed, 2026-11-13): disclose task-page continuation (#6549)
+
+**Status: proposed; awaiting contract approval.** This amendment changes the
+response of an incomplete `gtd.tasks` page. It does not change the status of
+proposed Amendment 3 or alter task lifecycle, visibility, filter, dependency,
+ordering, or timestamp policy.
+
+`gtd.tasks` keeps its default limit of 50, effective limit of 1–200, and existing
+offset. It requests `effective_limit + 1` rows through the existing count-free
+query with the complete task filter and namespace scope. The result order
+remains `created_at DESC, id ASC`. If the query returns more than the effective
+limit, the handler records that another matching row exists and truncates to
+the limit before computing dependency diagnostics.
+
+An incomplete page returns an object with `tasks` containing the retained page
+and `has_more: true`. When the requested limit is above 200, the same object
+retains `requested_limit`, `effective_limit`, and `limit_clamped: true`. These
+signals are independent: a requested limit can be clamped even when the page
+contains every matching task. A requested zero still selects one row without
+the upper-limit clamp report.
+
+An exhausted page keeps its existing shape: an ordinary complete or empty
+array, a limit-clamp object, or the existing `filter_excluded`/`hint` object.
+An exactly full final page is exhausted, so equality between the returned row
+count and the limit does not establish continuation. No false-valued
+`has_more` field is introduced. JSON and table rendering must retain the true
+marker when it is present.
+
+This deliberately changes incomplete responses that previously were bare
+arrays into objects. Consumers must accept both the bare array and the
+object's `tasks` array. `has_more: true` is the continuation signal; an
+object alone is not, because exhausted clamp and excluded-status responses
+are also objects. A legacy short-page loop remains valid only if it unwraps
+both shapes and compares the row count with the effective limit (1–200),
+not the requested limit. Such a loop may make an extra empty request after
+an exactly full final page. It does not migrate every response to an object,
+and it adds neither a cursor protocol nor an exact total.
+
+For a known nonempty object page, a chain selects `$prev.tasks[0].id`:
+
+```text
+gtd.tasks(limit=1) | get(id=$prev.tasks[0].id)
+```
+
+This example requires an object response, such as when at least two tasks
+match. A nonempty exhausted bare array instead requires `$prev[0].id`.
+There is no single index path for both shapes: when the shape or presence
+of a row is unknown, read the page first, inspect it, then pass the selected
+identifier in a separate call.
+
+Applying `get(id=$prev[0])` to an object containing `tasks` produces
+`kind: "substitution_error"`, `reason: "path_wrong_type"`. The exact message,
+assembled from the current source rather than a runtime transcript, is:
+
+```text
+argument "id": $prev[0]: $prev is a object, not an array, so "[0]" cannot be applied to it. $prev resolves only against the immediately preceding op's result — a non-adjacent dependency cannot be expressed inside one chain; split into separate calls and carry the value across yourself.
+```
+
+The lookup begins with an empty argument path at
+[`types.rs:141–143`](../../crates/khive-request/src/types.rs#L141-L143),
+classifies the object/index mismatch at
+[`types.rs:188–217`](../../crates/khive-request/src/types.rs#L188-L217),
+and formats it at
+[`types.rs:310–348`](../../crates/khive-request/src/types.rs#L310-L348).
+The MCP wrapper supplies the argument name, reason and suffix at
+[`dispatch_helpers.rs:612–640`](../../crates/khive-mcp/src/server/dispatch_helpers.rs#L612-L640).
+It does not unwrap `tasks` automatically or list available object fields for
+this wrong-type failure. `$prev[0].id` fails at the same index segment, with
+that full attempted path in the message.
+
+Callers advance the existing offset by the number of returned tasks and keep
+the same filters. The extra row and the retained rows are observed in the same
+page-query snapshot; separate offset calls do not share a snapshot, so
+concurrent inserts or deletions can shift later pages. Dependency diagnostics
+use subsequent reads and annotate matching rows, including blocked and broken
+tasks, without excluding them. The lookahead row receives no diagnostics.
+
+The empty-default-page `filter_excluded` probe remains a separate offset-zero
+existence check under the same other predicates with an excluded-status
+predicate. It is neither a continuation measurement nor a count. No query in
+this amendment computes a total, and no read changes stored task data. The
+extra returned row is bounded to one; the query's filter and offset work is
+not given a new constant-work guarantee.
+
+`gtd.next` is outside this amendment's scope. Its existing priority selection
+truncates at the effective limit without a `has_more` signal
+([`handlers.rs:1358–1374`](../../crates/khive-pack-gtd/src/handlers.rs#L1358-L1374));
+its clamp metadata only reports a requested limit above 200. A full
+`gtd.next` result is not evidence that all actionable candidates were returned.
+Use paged `gtd.tasks` for a task inventory, retaining its different ordering
+and dependency-diagnostic semantics.

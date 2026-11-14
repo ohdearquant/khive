@@ -535,7 +535,15 @@ async fn reverse_filter_preserves_explicit_status_pagination_and_namespace_visib
             )
             .await
             .unwrap();
-        assert_eq!(page[0]["full_id"], all[offset]["full_id"]);
+        let rows = if offset < 2 {
+            assert_eq!(page["has_more"], true);
+            page["tasks"].as_array().expect("continued duplicate page")
+        } else {
+            page.as_array()
+                .expect("complete duplicate page stays an array")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["full_id"], all[offset]["full_id"]);
     }
     let explicit = fixture
         .dispatch("gtd.tasks", json!({"duplicate_of":kept,"status":"done"}))
