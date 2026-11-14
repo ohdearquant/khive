@@ -90,6 +90,143 @@ async fn vector_blob(rt: &KhiveRuntime, id: Uuid) -> Vec<u8> {
     }
 }
 
+#[tokio::test]
+async fn claimed_entity_reindex_preserves_newer_vector_publication() {
+    let (rt, token, before) = fixture().await;
+    let original_vector = vector_blob(&rt, before.id).await;
+    let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+    let stale = super::super::race_seam::BEFORE_ENTITY_VECTOR_PUBLISH.scope(
+        Arc::clone(&barriers),
+        rt.reindex_claimed_entity(&token, &before),
+    );
+    let newer = async {
+        barriers.0.wait().await;
+        let (entity, report) = rt
+            .update_entity_with_index_report(
+                &token,
+                before.id,
+                EntityPatch {
+                    description: Some(Some("a longer, newly published description".into())),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.indexing.status, "complete");
+        assert!(report.indexing.unfinished.is_empty());
+        assert!(pending(&rt, entity.id).await.is_none());
+        let vector = vector_blob(&rt, entity.id).await;
+        assert_ne!(
+            vector, original_vector,
+            "the two descriptions must produce distinct vectors"
+        );
+        let log = claimed_vector_state(&rt, entity.id).await;
+        barriers.1.wait().await;
+        (entity, vector, log)
+    };
+    let (stale, (winner, vector, log)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(stale, newer)
+        })
+        .await
+        .expect("both publication barriers and the intervening update complete");
+    assert_eq!(vector_blob(&rt, winner.id).await, vector);
+    assert_eq!(claimed_vector_state(&rt, winner.id).await, log);
+    assert_eq!(rt.get_entity(&token, winner.id).await.unwrap(), winner);
+    assert!(pending(&rt, winner.id).await.is_none());
+    let error = stale.expect_err("the captured vector cannot replace the newer revision");
+    assert!(
+        error.to_string().contains(&winner.id.to_string()),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("changed concurrently"),
+        "{error}"
+    );
+    let document = rt
+        .text(&token)
+        .unwrap()
+        .get_document("local", winner.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        document.body,
+        super::super::entity_fts_document(&winner).body
+    );
+    rt.reindex_claimed_entity(&token, &winner).await.unwrap();
+    assert_eq!(vector_blob(&rt, winner.id).await, vector);
+    assert_eq!(rt.get_entity(&token, winner.id).await.unwrap(), winner);
+    assert!(pending(&rt, winner.id).await.is_none());
+}
+
+async fn claimed_vector_state(rt: &KhiveRuntime, id: Uuid) -> serde_json::Value {
+    let mut reader = rt.sql().reader().await.unwrap();
+    let log = reader
+        .query_all(SqlStatement::new(
+            "SELECT * FROM ann_write_log WHERE subject_id=?1 ORDER BY seq",
+            vec![SqlValue::Text(id.to_string())],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !log.is_empty(),
+        "actual vector publication must have an ANN record"
+    );
+    let provenance = reader
+        .query_all(SqlStatement::new(
+            "SELECT * FROM vector_provenance WHERE subject_id=?1 ORDER BY model_key",
+            vec![SqlValue::Text(id.to_string())],
+        ))
+        .await
+        .unwrap();
+    serde_json::json!({"ann":log, "provenance":provenance})
+}
+
+#[tokio::test]
+async fn claimed_entity_vector_failure_preserves_row_and_allows_retry() {
+    let rt = KhiveRuntime::memory().unwrap();
+    let namespace =
+        crate::Namespace::parse(&format!("claimed-vector-{}", Uuid::new_v4().as_simple())).unwrap();
+    let token = rt.authorize(namespace).unwrap();
+    rt.register_embedder(Provider);
+    let entity = Entity::new(token.namespace().as_str(), "concept", "retry indexed claim");
+    rt.entities(&token)
+        .unwrap()
+        .upsert_entity(entity.clone())
+        .await
+        .unwrap();
+    let _fault = crate::operations::arm_vector_fail_scoped(token.namespace().as_str());
+    let error = rt
+        .reindex_claimed_entity(&token, &entity)
+        .await
+        .expect_err("vector fault refuses the claim repair");
+    assert!(
+        error.to_string().contains("injected vector failure"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&entity.id.to_string()),
+        "{error}"
+    );
+    assert_eq!(rt.get_entity(&token, entity.id).await.unwrap(), entity);
+    assert!(rt
+        .text(&token)
+        .unwrap()
+        .get_document(token.namespace().as_str(), entity.id)
+        .await
+        .unwrap()
+        .is_some());
+    rt.reindex_claimed_entity(&token, &entity).await.unwrap();
+    assert_eq!(
+        vector_blob(&rt, entity.id).await,
+        khive_storage::encode_f32_native(&[entity.name.len() as f32; 4])
+    );
+    assert_eq!(rt.get_entity(&token, entity.id).await.unwrap(), entity);
+    assert!(pending(&rt, entity.id).await.is_none());
+}
+
 fn change(name: &str) -> EntityPatch {
     EntityPatch {
         name: Some(name.into()),

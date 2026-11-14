@@ -951,7 +951,7 @@ impl KhiveRuntime {
 
     // ---- Internal helpers ----
 
-    async fn apply_entity_index_revision(
+    pub(crate) async fn apply_entity_index_revision(
         &self,
         entity: &Entity,
         statements: Vec<SqlStatement>,
