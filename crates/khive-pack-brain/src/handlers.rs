@@ -266,7 +266,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to read and the binding namespace context. If omitted, uses the caller's default catalog and matches only bindings with namespace \"*\"; profile fallback still applies when none match.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -558,7 +558,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to write and the binding namespace to match. If omitted, stores a \"*\" binding in the caller's default catalog, matching every namespace context within that catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -637,7 +637,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to read and the binding namespace filter. If omitted, reads the caller's default catalog without filtering binding namespaces; other filters still apply.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
