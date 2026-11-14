@@ -12,6 +12,10 @@ use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 use super::*;
 use crate::pack::WorkspacePack;
 
+mod schema_tests {
+    include!("tests/schema_tests.rs");
+}
+
 async fn bounded(test: impl Future<Output = ()>) {
     tokio::time::timeout(Duration::from_secs(10), test)
         .await
