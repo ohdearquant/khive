@@ -1,11 +1,15 @@
 //! Keyed note pagination is distinct from the ordinary insertion-sequence walk.
 
+use std::collections::HashSet;
+
 use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError};
 use khive_storage::note::{
-    FilterOp, NoteFilter, NoteKeyCursor, NoteStatusSelector, PropertyFilter,
+    FilterOp, Note, NoteFilter, NoteKeyCursor, NoteStatusSelector, PropertyFilter,
 };
-use khive_storage::{PageRequest, SqlValue};
+use khive_storage::{Direction, NeighborQuery, PageRequest, SqlValue};
+use khive_types::EdgeRelation;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::common::{
     normalize_entity_timestamps, parse_note_content, remap_note_status, to_json, ListParams,
@@ -73,6 +77,44 @@ pub(super) fn note_filter(p: &ListParams, kind: Option<&str>) -> Result<NoteFilt
         ..Default::default()
     }
     .with_default_note_status(NoteStatusSelector::Active))
+}
+
+pub(super) async fn superseded_note_ids(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    p: &ListParams,
+    notes: &[Note],
+) -> Result<HashSet<Uuid>, RuntimeError> {
+    let mut superseded = HashSet::new();
+    if !p.exclude_superseded {
+        return Ok(superseded);
+    }
+    khive_storage::ensure_request_read_active("list")?;
+    let ids: Vec<Uuid> = notes.iter().map(|note| note.id).collect();
+    if !ids.is_empty() {
+        for namespace in token.visible_namespaces() {
+            khive_storage::ensure_request_read_active("list")?;
+            let namespace_token = token.with_namespace(namespace.clone());
+            superseded.extend(
+                runtime
+                    .graph(&namespace_token)?
+                    .batch_neighbors(
+                        &ids,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|(candidate_id, _)| candidate_id),
+            );
+        }
+    }
+    khive_storage::ensure_request_read_active("list")?;
+    Ok(superseded)
 }
 
 fn encode_cursor(cursor: &NoteKeyCursor) -> Result<String, RuntimeError> {
@@ -171,6 +213,7 @@ pub(super) async fn list_keyed_notes(
                 },
             )
             .await?;
+        let superseded = superseded_note_ids(runtime, token, p, &page).await?;
         if page.is_empty() {
             break false;
         }
@@ -179,7 +222,7 @@ pub(super) async fn list_keyed_notes(
             if view.permits_message_note(token, &note) {
                 last_scanned = Some(NoteKeyCursor::from(&note));
             }
-            if note_matches_list_filters(&note, p, token, view) {
+            if !superseded.contains(&note.id) && note_matches_list_filters(&note, p, token, view) {
                 if skip > 0 {
                     skip -= 1;
                 } else {
