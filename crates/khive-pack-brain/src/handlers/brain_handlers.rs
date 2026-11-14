@@ -532,18 +532,34 @@ impl BrainPack {
             .bindings
             .iter()
             .filter(|binding| {
-                binding.profile_id == profile_id
-                    && (binding.actor == "*"
-                        || Self::check_read_actor(token, &binding.actor).is_ok())
-                    && state
-                        .resolve_with_match(
-                            Some(&binding.actor),
-                            Some(&binding.namespace),
-                            &binding.consumer_kind,
-                        )
+                let namespace = token.namespace().as_str();
+                if binding.profile_id != profile_id
+                    || (binding.actor != "*"
+                        && Self::check_read_actor(token, &binding.actor).is_err())
+                    || (binding.namespace != "*" && binding.namespace != namespace)
+                {
+                    return false;
+                }
+                // Anonymous consumers are a real context for wildcard actors.
+                // Named actors only add more-specific candidates, so querying
+                // the current named caller alone could hide a usable wildcard.
+                let actor = (binding.actor != "*").then_some(binding.actor.as_str());
+                [
+                    ConsumerKind::Recall,
+                    ConsumerKind::KnowledgeCompose,
+                    ConsumerKind::Rerank,
+                ]
+                .into_iter()
+                .filter(|kind| {
+                    binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
+                })
+                .any(|kind| {
+                    state
+                        .resolve_with_match(actor, Some(namespace), kind.as_str())
                         .is_some_and(|(resolved, _, matched_binding)| {
                             matched_binding && resolved.id == profile_id
                         })
+                })
             })
             .map(|binding| {
                 json!({

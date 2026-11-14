@@ -787,3 +787,313 @@ async fn profile_binding_status_preserves_wildcard_selectors() {
         true
     );
 }
+
+struct BindingStatusConsumers;
+
+impl khive_types::Pack for BindingStatusConsumers {
+    const NAME: &'static str = "binding-status-consumers";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &[
+        khive_brain_core::ConsumerKind::Recall.as_str(),
+        khive_brain_core::ConsumerKind::KnowledgeCompose.as_str(),
+        khive_brain_core::ConsumerKind::Rerank.as_str(),
+    ];
+    const HANDLERS: &'static [HandlerDef] = &[];
+}
+
+#[async_trait::async_trait]
+impl PackRuntime for BindingStatusConsumers {
+    khive_runtime::pack_runtime_metadata!();
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!("no handler for {verb}")))
+    }
+}
+
+fn binding_status_consumer_registry() -> khive_runtime::VerbRegistry {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BindingStatusConsumers);
+    let registry = builder.build().unwrap();
+    assert_eq!(registry.all_brain_consumer_kinds().len(), 3);
+    registry
+}
+
+const STATUS_CONSUMER_KINDS: [khive_brain_core::ConsumerKind; 3] = [
+    khive_brain_core::ConsumerKind::Recall,
+    khive_brain_core::ConsumerKind::KnowledgeCompose,
+    khive_brain_core::ConsumerKind::Rerank,
+];
+
+async fn bind_status_selector(
+    pack: &BrainPack,
+    registry: &khive_runtime::VerbRegistry,
+    token: &NamespaceToken,
+    profile_id: &str,
+    actor: &str,
+    namespace: &str,
+    consumer_kind: &str,
+) {
+    let bound = pack
+        .dispatch(
+            "brain.bind",
+            json!({"profile_id":profile_id, "actor":actor, "namespace":namespace, "consumer_kind":consumer_kind}),
+            registry,
+            token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound["bound"], true);
+}
+
+async fn resolve_status_consumer(
+    pack: &BrainPack,
+    registry: &khive_runtime::VerbRegistry,
+    token: &NamespaceToken,
+    kind: khive_brain_core::ConsumerKind,
+) -> Value {
+    pack.dispatch(
+        "brain.resolve",
+        json!({"actor":token.actor().binding_id(), "namespace":token.namespace().as_str(), "consumer_kind":kind.as_str()}),
+        registry,
+        token,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_omits_fully_shadowed_wildcard_kind() {
+    let (pack, rt) = make_pack();
+    let registry = binding_status_consumer_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = "fully-shadowed-kind";
+    let winner = "all-kind-winner";
+    for profile_id in [id, winner] {
+        create_profile_for_binding_status(&pack, &registry, &token, profile_id).await;
+    }
+    bind_status_selector(&pack, &registry, &token, id, "brain-test", "local", "*").await;
+    for kind in STATUS_CONSUMER_KINDS {
+        bind_status_selector(
+            &pack,
+            &registry,
+            &token,
+            winner,
+            "brain-test",
+            "local",
+            kind.as_str(),
+        )
+        .await;
+        let resolved = resolve_status_consumer(&pack, &registry, &token, kind).await;
+        assert_eq!(resolved["resolved_profile_id"], winner);
+        assert_eq!(resolved["matched_binding"], true);
+    }
+    let before = serde_json::to_value(pack.snapshot()).unwrap();
+    let profile = read_profile_binding_status(&pack, &registry, &token, id).await;
+    assert_eq!(profile["lifecycle"], "inactive");
+    assert_eq!(profile["resolving_bindings"], json!([]));
+    assert_eq!(
+        profile["serving_through_visible_binding_while_inactive"],
+        false
+    );
+    assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_retains_partially_shadowed_wildcard_kind() {
+    let (pack, rt) = make_pack();
+    let registry = binding_status_consumer_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = "partially-shadowed-kind";
+    let winner = "two-kind-winner";
+    for profile_id in [id, winner] {
+        create_profile_for_binding_status(&pack, &registry, &token, profile_id).await;
+    }
+    bind_status_selector(&pack, &registry, &token, id, "brain-test", "local", "*").await;
+    for kind in &STATUS_CONSUMER_KINDS[..2] {
+        bind_status_selector(
+            &pack,
+            &registry,
+            &token,
+            winner,
+            "brain-test",
+            "local",
+            kind.as_str(),
+        )
+        .await;
+    }
+    for kind in STATUS_CONSUMER_KINDS {
+        let resolved = resolve_status_consumer(&pack, &registry, &token, kind).await;
+        assert_eq!(
+            resolved["resolved_profile_id"],
+            if kind == khive_brain_core::ConsumerKind::Rerank {
+                id
+            } else {
+                winner
+            }
+        );
+        assert_eq!(resolved["matched_binding"], true);
+    }
+    let before = serde_json::to_value(pack.snapshot()).unwrap();
+    let profile = read_profile_binding_status(&pack, &registry, &token, id).await;
+    assert_eq!(profile["lifecycle"], "inactive");
+    assert_eq!(
+        profile["resolving_bindings"],
+        json!([{"actor":"brain-test", "namespace":"local", "consumer_kind":"*"}])
+    );
+    assert_eq!(
+        profile["serving_through_visible_binding_while_inactive"],
+        true
+    );
+    assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_omits_foreign_namespace_selector() {
+    let (pack, rt) = make_pack();
+    let registry = binding_status_consumer_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = "foreign-namespace-selector";
+    create_profile_for_binding_status(&pack, &registry, &token, id).await;
+    bind_status_selector(
+        &pack,
+        &registry,
+        &token,
+        id,
+        "brain-test",
+        "another-catalog",
+        "recall",
+    )
+    .await;
+    let stored = pack
+        .dispatch(
+            "brain.bindings",
+            json!({"profile_id":id}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored["namespace"], "local");
+    assert_eq!(stored["count"], 1);
+    assert_eq!(stored["bindings"][0]["namespace"], "another-catalog");
+    let resolved = resolve_status_consumer(
+        &pack,
+        &registry,
+        &token,
+        khive_brain_core::ConsumerKind::Recall,
+    )
+    .await;
+    assert_ne!(resolved["resolved_profile_id"], id);
+    assert_eq!(resolved["matched_binding"], false);
+    let before = serde_json::to_value(pack.snapshot()).unwrap();
+    let profile = read_profile_binding_status(&pack, &registry, &token, id).await;
+    assert_eq!(profile["namespace"], "local");
+    assert_eq!(profile["lifecycle"], "inactive");
+    assert_eq!(profile["resolving_bindings"], json!([]));
+    assert_eq!(
+        profile["serving_through_visible_binding_while_inactive"],
+        false
+    );
+    assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_keeps_wildcard_actor_when_caller_is_shadowed() {
+    let (pack, rt) = make_pack();
+    let registry = binding_status_consumer_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = "anonymous-wildcard-winner";
+    let winner = "named-actor-winner";
+    for profile_id in [id, winner] {
+        create_profile_for_binding_status(&pack, &registry, &token, profile_id).await;
+    }
+    bind_status_selector(&pack, &registry, &token, id, "*", "local", "*").await;
+    for kind in STATUS_CONSUMER_KINDS {
+        bind_status_selector(
+            &pack,
+            &registry,
+            &token,
+            winner,
+            "brain-test",
+            "local",
+            kind.as_str(),
+        )
+        .await;
+        let resolved = resolve_status_consumer(&pack, &registry, &token, kind).await;
+        assert_eq!(resolved["resolved_profile_id"], winner);
+        assert_eq!(resolved["matched_binding"], true);
+    }
+    let (_, anonymous_rt) = make_anonymous_pack();
+    let anonymous = anonymous_rt.authorize(Namespace::local()).unwrap();
+    assert_eq!(anonymous.actor().binding_id(), None);
+    for kind in STATUS_CONSUMER_KINDS {
+        let resolved = resolve_status_consumer(&pack, &registry, &anonymous, kind).await;
+        assert_eq!(resolved["resolved_profile_id"], id);
+        assert_eq!(resolved["matched_binding"], true);
+    }
+    let before = serde_json::to_value(pack.snapshot()).unwrap();
+    let profile = read_profile_binding_status(&pack, &registry, &token, id).await;
+    assert_eq!(profile["lifecycle"], "inactive");
+    assert_eq!(
+        profile["resolving_bindings"],
+        json!([{"actor":"*", "namespace":"local", "consumer_kind":"*"}])
+    );
+    assert_eq!(
+        profile["serving_through_visible_binding_while_inactive"],
+        true
+    );
+    assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_omits_shadowed_wildcard_namespace() {
+    let (pack, rt) = make_pack();
+    let registry = binding_status_consumer_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = "shadowed-namespace";
+    let winner = "concrete-namespace-winner";
+    for profile_id in [id, winner] {
+        create_profile_for_binding_status(&pack, &registry, &token, profile_id).await;
+    }
+    bind_status_selector(&pack, &registry, &token, id, "brain-test", "*", "recall").await;
+    bind_status_selector(
+        &pack,
+        &registry,
+        &token,
+        winner,
+        "brain-test",
+        "local",
+        "recall",
+    )
+    .await;
+    let resolved = resolve_status_consumer(
+        &pack,
+        &registry,
+        &token,
+        khive_brain_core::ConsumerKind::Recall,
+    )
+    .await;
+    assert_eq!(resolved["resolved_profile_id"], winner);
+    assert_eq!(resolved["matched_binding"], true);
+    let before = serde_json::to_value(pack.snapshot()).unwrap();
+    let profile = read_profile_binding_status(&pack, &registry, &token, id).await;
+    assert_eq!(profile["lifecycle"], "inactive");
+    assert_eq!(profile["resolving_bindings"], json!([]));
+    assert_eq!(
+        profile["serving_through_visible_binding_while_inactive"],
+        false
+    );
+    assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}

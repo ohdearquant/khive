@@ -1901,6 +1901,16 @@ posterior (`null` when the profile has no state snapshot), and `local_factor`, t
 was created (`null` means no factor, the same as 1). A served profile scores with the configured default weights, so
 `posterior_means` is a diagnostic of what the posteriors project to, not what recall serves.
 
+`resolving_bindings` lists wildcard or actor-visible binding selectors that select this profile
+for a concrete `recall`, `knowledge_compose` or `rerank` consumer in the response's `namespace`
+catalog. A wildcard actor is checked with the anonymous consumer context, so the list can include
+a binding that serves other callers even when the current named caller has a more specific binding.
+Foreign-namespace selectors are excluded, as are selectors for which every matching concrete
+consumer selects a different profile.
+`serving_through_visible_binding_while_inactive` is true exactly when lifecycle is `inactive`
+and this list is nonempty; false makes no claim about hidden bindings. Active versus inactive
+lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless.
+
 ```
 request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 ```
@@ -1926,8 +1936,10 @@ require visibility. There is no `all_actors` resolution mode.
 
 ### `brain.activate` — Commissive
 
-Move a profile to Active. This is a lifecycle transition; serving reads profile state
-per request and no background update loop is started.
+Move a profile to Active for the unbound fallback. A bound, non-archived profile serves regardless
+of active versus inactive lifecycle. Serving reads profile state per request and no background
+update loop is started. Inspect `brain.profile`'s `resolving_bindings` and
+`serving_through_visible_binding_while_inactive` for visible binding status.
 
 | Param        | Type   | Required | Notes                |
 | ------------ | ------ | -------- | -------------------- |
@@ -1939,7 +1951,10 @@ request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
 
 ### `brain.deactivate` — Commissive
 
-Move a profile to Inactive (lifecycle transition; retain state).
+Move a profile to Inactive while retaining state. Active versus inactive lifecycle governs only
+the unbound fallback; deactivation does not remove bindings or stop a bound, non-archived profile
+from serving. `brain.profile` reports `resolving_bindings` and
+`serving_through_visible_binding_while_inactive` for visible binding status.
 
 | Param        | Type   | Required | Notes                  |
 | ------------ | ------ | -------- | ---------------------- |
