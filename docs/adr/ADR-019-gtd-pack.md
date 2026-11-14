@@ -800,9 +800,9 @@ timestamp diagnostics. Amendment 4 permits an evidence census; Amendment 7
 specifies an explicit, caller-reviewed repair path. That exception does not
 authorize inferred conversions or read-time repair.
 
-## Amendment 3 (proposed, 2026-09-14): additive task-query filters (#2678)
+## Amendment 3 (2026-09-14): additive task-query filters (#2678)
 
-**Status: proposed; awaiting contract approval.** This amendment extends the
+**Status**: Accepted 2026-11-14. This amendment extends the
 `gtd.tasks` input contract. It does not change the accepted response shapes,
 status defaults, ordering, limit handling, dependency diagnostics, or timestamps.
 
@@ -1050,11 +1050,11 @@ Its writer scope is the GTD repair entry in ADR-091 Amendment 20: prepare
 all evidence, provenance and bindings before admission, then execute only the
 guarded UPDATE and audit INSERT with bounded result bookkeeping.
 
-## Amendment 8 (proposed, 2026-11-13): disclose task-page continuation (#6549)
+## Amendment 8 (2026-11-13): disclose task-page continuation (#6549)
 
-**Status: proposed; awaiting contract approval.** This amendment changes the
+**Status**: Accepted 2026-11-14. This amendment changes the
 response of an incomplete `gtd.tasks` page. It does not change the status of
-proposed Amendment 3 or alter task lifecycle, visibility, filter, dependency,
+Amendment 3 or alter task lifecycle, visibility, filter, dependency,
 ordering, or timestamp policy.
 
 `gtd.tasks` keeps its default limit of 50, effective limit of 1–200, and existing
