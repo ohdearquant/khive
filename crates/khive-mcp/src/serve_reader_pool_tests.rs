@@ -291,6 +291,8 @@ async fn mcp_boot_retains_config_for_declared_backends() {
 #[cfg(unix)]
 #[tokio::test]
 async fn mcp_boot_retains_discovered_config_for_declared_backends() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     const CHILD_ROOT: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_ROOT";
     const CHILD_TOKEN: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_TOKEN";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
@@ -338,6 +340,14 @@ async fn mcp_boot_retains_discovered_config_for_declared_backends() {
         assert!(!cwd.join("khive.toml").exists());
         let config_dir = root.join(".khive");
         assert_eq!(config_dir.canonicalize().unwrap(), config_dir);
+        for path in [&root, &cwd, &home, &tmp, &config_dir] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0,
+                "discovery fixture directory must be private: {}",
+                path.display()
+            );
+        }
         let db = config_dir.join("khive.db");
         let cfg = config_dir.join("config.toml");
         assert_eq!(cfg.canonicalize().unwrap(), cfg);
@@ -370,16 +380,18 @@ async fn mcp_boot_retains_discovered_config_for_declared_backends() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let cwd = root.join("cwd");
     let home = root.join("home");
     let tmp = root.join("tmp");
     let config_dir = root.join(".khive");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::create_dir_all(&config_dir).unwrap();
+    for path in [&cwd, &home, &tmp, &config_dir] {
+        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
     let token_file = tempfile::Builder::new()
         .prefix("khive-child-")
         .tempfile_in(&root)
