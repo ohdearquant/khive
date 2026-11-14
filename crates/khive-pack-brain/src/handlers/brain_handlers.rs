@@ -45,6 +45,21 @@ fn parse_local_factor(raw: Option<&Value>) -> Result<Option<f64>, RuntimeError> 
 
 // ── BrainPack handler impl ────────────────────────────────────────────────────
 
+pub(super) fn parse_event_kind(raw: &str) -> Result<khive_types::EventKind, RuntimeError> {
+    raw.parse::<khive_types::EventKind>().map_err(|mut error| {
+        // EventKind normalizes case before constructing its error. Inspect the
+        // original operand so that case-sensitive credentials remain detectable.
+        let masked = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
+        if masked.as_ref() != raw {
+            error.value = masked.into_owned();
+        }
+        let message = format!("invalid `kind`: {error}");
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &message).into_owned(),
+        )
+    })
+}
+
 impl BrainPack {
     // ── brain.state ───────────────────────────────────────────────────────
 
@@ -358,13 +373,7 @@ impl BrainPack {
             None => Utc::now().timestamp_micros(),
         };
 
-        let kind_filter = match p.kind.as_deref() {
-            Some(k) => Some(
-                k.parse::<khive_types::EventKind>()
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid `kind`: {e}")))?,
-            ),
-            None => None,
-        };
+        let kind_filter = p.kind.as_deref().map(parse_event_kind).transpose()?;
 
         // The event plane is read through a store scoped to exactly one
         // namespace (`Runtime::events` opens `token.namespace()` and the SQL
