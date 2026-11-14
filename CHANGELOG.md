@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when more
+  matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)` that
+  works on a short queue fails with `substitution_error` once the queue passes the limit: read the
+  object's `tasks`, or read the page first and pass the id in a separate call.
 - `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
   `RuntimeError::AttachmentCutoverRequired`, whose message names
   `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
