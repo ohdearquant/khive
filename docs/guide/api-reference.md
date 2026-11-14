@@ -509,6 +509,15 @@ full record with `get(id=...)` (or `list`) when you need more than what they ret
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
 
+Besides the substrate totals, the response breaks them down. `entities_by_type` is an array of
+`{"entity_type", "count"}` rows, one per stored `entity_type` label across entity kinds, and its
+counts sum to `entities`. The first row is always the untyped bucket: entities whose
+`entity_type` is null, with count zero when there are none. In Agent presentation that row carries
+only `count`, because null fields are dropped. A backend without grouped entity reporting omits
+`entities_by_type`, and the omission does not mean zero; see
+[KG stats](../../crates/khive-pack-kg/docs/api/stats.md). `edges_by_relation` maps each edge
+relation to its count.
+
 The response carries a `count_scope` object stating what the counts range over:
 `{"namespaces": "caller_visible", "rows": "live_only"}` — counts cover the namespaces visible to
 the caller and exclude soft-deleted rows.
