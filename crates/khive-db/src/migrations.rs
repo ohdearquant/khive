@@ -424,9 +424,12 @@ const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
-    let migration_error = |error: rusqlite::Error| SqliteError::Migration {
-        version: 58,
-        error: format!("proposals_open.archived_at migration failed: {error}"),
+    let migration_error = |error: rusqlite::Error| {
+        SqliteError::migration_with_cause(
+            58,
+            format!("proposals_open.archived_at migration failed: {error}"),
+            error,
+        )
     };
     let column = tx
         .query_row(
@@ -455,10 +458,10 @@ fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), Sqlite
         {
             Ok(())
         }
-        Some(_) => Err(SqliteError::Migration {
-            version: 58,
-            error: "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key".into(),
-        }),
+        Some(_) => Err(SqliteError::migration_message(
+            58,
+            "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key",
+        )),
     }
 }
 
@@ -2067,10 +2070,7 @@ fn apply_versioned_migration(
     }
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     if let Err(error) = admission.check() {
         let rollback = tx.rollback();
         return Err(capacity_refusal_after_rollback(
@@ -2086,10 +2086,7 @@ fn apply_versioned_migration(
     // its DDL again would fail; fast-forward past everything it applied.
     let sibling_version: u32 = tx
         .query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0))
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     #[cfg(test)]
     if instrumented_first_begin {
         use std::sync::atomic::Ordering::SeqCst;
@@ -2132,23 +2129,17 @@ fn apply_versioned_migration(
     }
 
     if migration.version == 46 {
-        memory_visibility::capture_pre_v46(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        memory_visibility::capture_pre_v46(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
         #[cfg(test)]
         memory_visibility::test_state::stop_at(memory_visibility::test_state::Stop::AfterCapture)?;
     }
 
     if migration.version == ATTACHMENT_CUTOVER_VERSION {
-        let status = attachment_cutover_status(&tx).map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-        let defers = cutover_defers(&tx, status).map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        let status = attachment_cutover_status(&tx)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        let defers = cutover_defers(&tx, status)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
 
         // V21 belongs to the boot coordinator. Ordinary backend open may
         // finish the degenerate zero-ref case atomically, but it must not
@@ -2158,67 +2149,43 @@ fn apply_versioned_migration(
             return Ok(MigrationStep::Deferred);
         }
         if status != AttachmentCutoverStatus::Pending {
-            return Err(SqliteError::Migration {
-                version: migration.version,
-                error: format!("unexpected attachment cutover state {status:?}"),
-            });
+            return Err(SqliteError::migration_message(
+                migration.version,
+                format!("unexpected attachment cutover state {status:?}"),
+            ));
         }
 
         let now = chrono::Utc::now().timestamp_micros();
-        stage_attachment_cutover_on_connection(&tx, now).map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-        finalize_attachment_cutover_on_connection(&tx, now).map_err(|e| {
-            SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            }
-        })?;
+        stage_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        finalize_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
     } else if migration.version == 36 {
         // The events store DDL may already have added these columns.
-        crate::stores::event::ensure_operation_attribution_columns(&tx).map_err(|error| {
-            SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            }
-        })?;
+        crate::stores::event::ensure_operation_attribution_columns(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 44 {
-        migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        migrate_outbound_due_key(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 48 {
-        migrate_acknowledgement_journal(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        migrate_acknowledgement_journal(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 58 {
         migrate_proposal_archive(&tx)?;
     } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
         tx.execute_batch(migration.up)
-            .map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?;
-        session_identity_migration::apply(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+        session_identity_migration::apply(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else {
         tx.execute_batch(migration.up)
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
     }
 
     let visibility_counts = if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
         Some(
-            memory_visibility::cutover_counts(&tx).map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?,
+            memory_visibility::cutover_counts(&tx)
+                .map_err(|error| SqliteError::migration(migration.version, error))?,
         )
     } else {
         None
@@ -2235,10 +2202,7 @@ fn apply_versioned_migration(
             "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
              UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
         )
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     }
 
     let now = chrono::Utc::now().timestamp_micros();
@@ -2247,10 +2211,7 @@ fn apply_versioned_migration(
          ON CONFLICT(version) DO NOTHING",
         rusqlite::params![migration.version, migration.name, now],
     )
-    .map_err(|e| SqliteError::Migration {
-        version: migration.version,
-        error: e.to_string(),
-    })?;
+    .map_err(|e| SqliteError::migration(migration.version, e))?;
 
     #[cfg(test)]
     if instrumented_first_begin {
@@ -2263,10 +2224,8 @@ fn apply_versioned_migration(
             memory_visibility::test_state::Stop::BeforeCutoverCommit,
         )?;
     }
-    tx.commit().map_err(|e| SqliteError::Migration {
-        version: migration.version,
-        error: e.to_string(),
-    })?;
+    tx.commit()
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     if let Some(counts) = visibility_counts {
         memory_visibility::log_counts(&counts, conn.path().unwrap_or(":memory:"));
     }
