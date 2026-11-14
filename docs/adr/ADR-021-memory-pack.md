@@ -1009,7 +1009,8 @@ carrying no owned namespaces.
 
 ### Delta 2: supersedes reads cover the namespaces the reader can see (2026-11-03)
 
-**Status**: Proposed 2026-11-03. Changes how recall's supersedes suppression (Decision 7) reads, and the reserved
+**Status**: Accepted 2026-11-14 (Proposed 2026-11-03), implemented by #6390. Changes how recall's supersedes
+suppression (Decision 7) reads, and the reserved
 `properties` keys of the 2026-11-01 amendment.
 
 **Problem.** Decision 7 says recall drops any candidate with an incoming `supersedes` edge the reader can see, but the
@@ -1143,8 +1144,10 @@ read by the checks in rule 2 below. It still grants no write into an owned names
 declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
 and travels as Delta 1 rule 2 says. No verb sets or changes it.
 
-**Instruction served.** Every memory write is made in its writer's own actor namespace, so a write in one namespace
-does not change what is recalled from another namespace unless the old-row rule admits it.
+**Basis.** The 2026-11-01 amendment (Decision 1) writes every memory with no `namespace` argument to its writer's
+actor namespace, and Decision 5 with Delta 1 bounds which other namespaces' rows a batch may supersede. This delta
+applies that bound to every other way a supersede is written, so a write in one namespace does not change what is
+recalled from another unless the bound admits it.
 
 **Problem.** Decision 5, as Delta 1 states it, decides which old rows `memory.apply_batch` may supersede: a row in the
 caller's namespace, a row in the shared `local` namespace, or a row in a namespace the caller lists in
@@ -1166,9 +1169,17 @@ affected, because the edge or property sits outside its visible set.
 
 1. **The rule.** A write that would make recall treat a memory row as superseded is checked against Decision 5's rule
    (Delta 1). The superseded row's stored namespace must be one of:
-   - the request's write namespace, which is the one the gate checked;
+   - the namespace the supersede is written in (below);
    - the shared `local` namespace;
    - a namespace in the caller's `owned_namespaces`.
+
+   The namespace the supersede is written in is, for `link`, the request's write namespace, the one the gate checked:
+   the explicit `namespace` argument when the call carries one, and otherwise the registry's write namespace, which
+   ADR-007 Rule 0 sets to `local` (Delta 3, Problem). For a change-set link op it is the op's own `namespace` field; for
+   `restore` it is the edge's stored namespace; for the property it is the namespace of the row that carries the
+   property. So a `link` with no `namespace` argument can supersede only rows in `local` (or an owned namespace), and a
+   caller superseding a row in its own actor namespace passes `namespace=<that namespace>`, which Delta 3 already
+   requires when the source is a memory row in that namespace.
 
    Anything else is refused before anything is written. The refusal names the row's namespace only when the caller can
    read it, the same split as Delta 3 rule 1, and it never redirects the write.
@@ -1180,7 +1191,8 @@ affected, because the edge or property sits outside its visible set.
 
    For the property, the value must be a complete UUID naming a live memory row, and that row is checked by rule 1.
    Any other value is refused, naming `memory.apply_batch` and `link(relation="supersedes")`. A patch that leaves the
-   stored value unchanged is not checked.
+   stored value unchanged is not checked. A patch that removes the key or sets it to null is admitted and not checked:
+   it can only stop a row from being hidden.
 3. **What it is.** This is a rule of the write that supersedes a memory row, the same kind of rule as
    `memory.apply_batch`'s. It is not an access control. Under ADR-007 Rule 9, `link(target_id)` resolves its id without
    a namespace check. This delta extends the second of the two write-effect comparisons that ADR-007 permits (Rule 8
@@ -1190,8 +1202,11 @@ affected, because the edge or property sits outside its visible set.
    whether a record can be read, and the gate still decides the request.
 4. **Stored rows.** Edges and properties already stored are not moved, changed or deleted. A dry run lists each live
    `supersedes` edge whose target is a memory row in a namespace that rule 1 would refuse for the edge's stored
-   namespace. It prints edge id, edge namespace, source namespace and target namespace, and writes nothing. The owner
-   of a listed target decides whether that supersede was meant, and removes the edge if it was not.
+   namespace. It prints edge id, edge namespace, source namespace and target namespace. It also lists each live memory
+   row whose stored `properties.supersedes` names a memory row that Delta 2 rule 3 honors and that rule 1 would refuse
+   for the carrying row's namespace, because recall keeps honoring those too. It prints row id, row namespace and
+   target namespace. It writes nothing. The owner of a listed target decides whether that supersede was meant, and
+   removes the edge or clears the property if it was not.
 
 **Consequences.**
 
@@ -1222,14 +1237,18 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
 **Validation.** Tests on today's code must fail for each subject, with its control in the same test:
 
 - `link` of a `supersedes` edge from a caller's memory onto a memory row in another, not owned, namespace is refused,
-  with no edge stored. Control: the same link between two of the caller's own rows succeeds.
+  with no edge stored. Control: the same link between two of the caller's own rows, with `namespace=<own>`, succeeds.
 - The same `link` from a non-memory note in the caller's namespace is refused. Control: the same note superseding one
-  of the caller's own memory rows succeeds.
+  of the caller's own memory rows with `namespace=<own>` succeeds. With no `namespace` argument the same control is
+  refused, because the write namespace is then `local`.
 - `apply_changeset` refuses the same link op at preparation. Control: an op linking the caller's own two rows
   prepares.
 - `update` setting `properties.supersedes` to another namespace's memory row is refused, and that row stays in a
   two-namespace reader's recall. Control: the same update naming the caller's own row hides that row.
+- `update` removing `properties.supersedes`, and one setting it to null, are admitted on a row whose stored value names
+  a row in another namespace, and the named row returns to recall.
 - Targets in `local` and in an owned namespace are admitted on each path, as `memory.apply_batch` admits them.
 - The refusal names the target namespace only when the caller can read it.
 - `restore` of a soft-deleted `supersedes` edge onto a refused target is refused, and the edge stays soft-deleted.
-- The dry run lists a fixture's cross-namespace supersede edges and leaves the store byte-identical.
+- The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows, and
+  leaves the store byte-identical.
