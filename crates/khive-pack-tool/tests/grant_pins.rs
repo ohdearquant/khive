@@ -414,7 +414,6 @@ async fn bootstrap_marks_legacy_null_pins_without_binding_them() {
 #[tokio::test]
 async fn re_registration_updates_definition_and_invalidates_only_mismatched_grants() {
     for (field, value) in [
-        ("source", json!("mcp:changed")),
         ("side_effect", json!("egress")),
         ("trust", json!("external")),
         ("schema", json!({"type":"object", "required":["changed"]})),
@@ -430,7 +429,7 @@ async fn re_registration_updates_definition_and_invalidates_only_mismatched_gran
         )
         .await;
 
-        let metadata = f.call("tool.register", json!({"name":"same", "description":"corrected description", "kind":"skill", "tags":["new tag"], "capabilities":["new capability"]})).await;
+        let metadata = f.call("tool.register", json!({"name":"same", "description":"corrected description", "kind":"tool", "tags":["new tag"], "capabilities":["new capability"]})).await;
         assert_eq!(metadata["updated"], true);
         assert_eq!(f.check("same").await["source"], "grant");
         assert_eq!(
@@ -445,6 +444,44 @@ async fn re_registration_updates_definition_and_invalidates_only_mismatched_gran
             .unwrap()
             .iter()
             .any(|capability| capability["name"] == "new capability"));
+
+        let frozen = f.entity(&first["full_id"]).await;
+        let token = f.rt.authorize(Namespace::local()).unwrap();
+        let events = f.rt.events(&token).unwrap();
+        let filter = khive_storage::EventFilter {
+            target_id: Some(frozen.id),
+            kinds: vec![khive_types::EventKind::ToolRegistrationChanged],
+            ..Default::default()
+        };
+        let count = events.count_events(filter.clone()).await.unwrap();
+        assert_eq!(count, 0);
+        for fields in [
+            json!({"source":"mcp:changed"}),
+            json!({"kind":"skill"}),
+            json!({"source":"exec:/fixture/other", "kind":"plugin"}),
+        ] {
+            let mut params = fields;
+            params["name"] = json!("same");
+            params["capabilities"] = json!(["must-not-link"]);
+            let error = f
+                .registry
+                .dispatch("tool.register", params)
+                .await
+                .expect_err("source and kind cannot retarget an existing grant");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains("new name"), "{error}");
+            assert_eq!(
+                serde_json::to_value(f.entity(&first["full_id"]).await).unwrap(),
+                serde_json::to_value(&frozen).unwrap()
+            );
+            assert_eq!(f.row(&id).await, grant);
+            assert_eq!(f.check("same").await["grant_id"], id);
+            assert_eq!(
+                f.call("tool.describe", json!({"tool":"same"})).await["tool"]["capabilities"],
+                described["tool"]["capabilities"]
+            );
+            assert_eq!(events.count_events(filter.clone()).await.unwrap(), count);
+        }
 
         let mut patch = json!({"name":"same"});
         patch[field] = value.clone();
@@ -633,12 +670,13 @@ async fn register_and_ingest_keep_same_named_tools_and_links_in_their_own_namesp
             .call_for(
                 &b,
                 "tool.register",
-                json!({"name":"same-tool", "source":"mcp:changed", "capabilities":["b second capability"]}),
+                json!({"name":"same-tool", "description":"updated b description", "schema":{"type":"object"}, "capabilities":["b second capability"]}),
             )
             .await;
         assert_eq!(again_b["created"], false);
         assert_eq!(again_b["tool"]["full_id"], registered_b["tool"]["full_id"]);
-        assert_eq!(again_b["tool"]["source"], "mcp:changed");
+        assert_eq!(again_b["tool"]["source"], "mcp:b");
+        assert_eq!(again_b["tool"]["description"], "updated b description");
         assert_eq!(again_b["updated"], true);
         let tool_b = f
             .call_for(
@@ -648,6 +686,7 @@ async fn register_and_ingest_keep_same_named_tools_and_links_in_their_own_namesp
             )
             .await["tool"]
             .clone();
+        assert_eq!(tool_b["schema"], json!({"type":"object"}));
         let capabilities_b = tool_b["capabilities"].as_array().unwrap();
         assert_eq!(capabilities_b.len(), 2);
         for name in ["b capability", "b second capability"] {

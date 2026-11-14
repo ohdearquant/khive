@@ -86,8 +86,8 @@ async fn register_updates_supplied_fields_and_preserves_identity() {
         .call(
             "tool.register",
             json!({
-                "name": "ECHO", "kind": "skill", "description": "replacement searchable nebula",
-                "schema": replacement, "source": "mcp:replacement", "side_effect": "egress",
+                "name": "ECHO", "kind": "tool", "description": "replacement searchable nebula",
+                "schema": replacement, "source": "mcp:example", "side_effect": "egress",
                 "trust": "marketplace", "tags": ["extra", "extra"],
             }),
         )
@@ -106,19 +106,16 @@ async fn register_updates_supplied_fields_and_preserves_identity() {
         after.properties.as_ref().unwrap()["extension"],
         json!({"retained": true})
     );
-    assert_eq!(after.entity_type.as_deref(), Some("skill"));
+    assert_eq!(after.entity_type.as_deref(), Some("tool"));
     assert_eq!(
         after.description.as_deref(),
         Some("replacement searchable nebula")
     );
     assert_eq!(after.properties.as_ref().unwrap()["schema"], replacement);
-    assert_eq!(
-        after.properties.as_ref().unwrap()["source"],
-        "mcp:replacement"
-    );
+    assert_eq!(after.properties.as_ref().unwrap()["source"], "mcp:example");
     assert_eq!(after.properties.as_ref().unwrap()["side_effect"], "egress");
     assert_eq!(after.properties.as_ref().unwrap()["trust"], "marketplace");
-    assert_eq!(after.tags, ["tool-registry", "extra", "skill"]);
+    assert_eq!(after.tags, ["tool-registry", "tool", "extra"]);
     assert_eq!(after.version, before.version + 1);
     assert!(after.updated_at > before.updated_at);
     assert_ne!(
@@ -266,7 +263,7 @@ async fn register_updates_only_its_own_named_registration_and_leaves_ingest_unch
         foreign_description["capabilities"]
     );
     let before = f.row(&a["tool"]["full_id"]).await;
-    let ingest = f.call("tool.ingest", json!({"namespace": "a", "source": "mcp", "server": "ignored", "tools": [{"name": "shared", "description": "not an update", "inputSchema": {"different": true}, "side_effect": "read"}]})).await;
+    let ingest = f.call("tool.ingest", json!({"namespace": "a", "source": "mcp", "server": "a", "tools": [{"name": "shared", "description": "not an update", "inputSchema": {"different": true}, "side_effect": "read"}]})).await;
     assert_eq!(ingest["registered"], 0);
     assert_eq!(ingest["existing"], 1);
     assert_eq!(
@@ -455,11 +452,10 @@ async fn register_digest_input_change_appends_one_registration_changed_event() {
     assert_eq!(created.items[0].actor, "actor:registrar-a");
 
     for fields in [
-        json!({"source": "mcp:replacement"}),
         json!({"side_effect": "egress"}),
         json!({"trust": "marketplace"}),
         json!({"schema": {"type": "object", "properties": {"query": {"type": "string"}}}}),
-        json!({"source": "mcp:combined", "side_effect": "irreversible", "trust": "external", "schema": {}}),
+        json!({"side_effect": "irreversible", "trust": "external", "schema": {}}),
     ] {
         let before = f.row(id).await;
         let prior = f.registration_events(original.id).await;
@@ -508,9 +504,9 @@ async fn register_digest_input_change_appends_one_registration_changed_event() {
     let events = f.registration_events(original.id).await;
     for fields in [
         json!({"description": "metadata-only searchable description"}),
-        json!({"kind": "skill", "tags": ["metadata-tag"]}),
+        json!({"kind": "tool", "tags": ["metadata-tag"]}),
         json!({"capabilities": ["new-capability"]}),
-        json!({"source": "mcp:combined", "side_effect": "irreversible", "trust": "external", "schema": {}}),
+        json!({"source": "mcp:original", "side_effect": "irreversible", "trust": "external", "schema": {}}),
         json!({"source": null, "side_effect": null, "trust": null, "schema": null}),
         json!({}),
     ] {
@@ -575,7 +571,7 @@ async fn registration_change_rejects_credential_actor_before_writing() {
     )
     .is_err());
     let error = f.registry.dispatch_with_identity(
-        "tool.register", json!({"name": "credential-actor", "source": "mcp:refused", "capabilities": ["must-not-link"]}),
+        "tool.register", json!({"name": "credential-actor", "schema": {"marker": "accepted"}, "capabilities": ["must-not-link"]}),
         Some(registration_identity(&secret)),
     ).await.expect_err("credential-bearing actor must refuse before correction");
     assert!(
@@ -590,7 +586,7 @@ async fn registration_change_rejects_credential_actor_before_writing() {
     );
     f.register_as(
         "safe",
-        json!({"name": "credential-actor", "source": "mcp:accepted"}),
+        json!({"name": "credential-actor", "schema": {"marker": "accepted"}}),
     )
     .await;
     assert_eq!(f.registration_events(original.id).await.len(), 1);
@@ -636,7 +632,7 @@ async fn registration_change_event_failure_rolls_back_and_retry_appends_once() {
         "CREATE TRIGGER fail_registration_change BEFORE INSERT ON events
          WHEN NEW.kind = 'tool_registration_changed' AND NEW.target_id = '{}'
          BEGIN
-           SELECT CASE WHEN (SELECT json_extract(properties, '$.source') FROM entities WHERE id = '{}') = 'mcp:refused'
+           SELECT CASE WHEN (SELECT json_extract(properties, '$.schema.marker') FROM entities WHERE id = '{}') = 'replacement'
              THEN RAISE(ABORT, 'registration_event_after_replacement')
              ELSE RAISE(ABORT, 'registration_event_before_replacement') END;
          END;", original.id, original.id
@@ -653,7 +649,7 @@ async fn registration_change_event_failure_rolls_back_and_retry_appends_once() {
         .dispatch_with_identity(
             "tool.register",
             json!({
-                "name": "rollback", "source": "mcp:refused", "capabilities": ["must-not-link"]
+                "name": "rollback", "schema": {"marker": "replacement"}, "capabilities": ["must-not-link"]
             }),
             Some(registration_identity("registrar")),
         )
@@ -683,11 +679,14 @@ async fn registration_change_event_failure_rolls_back_and_retry_appends_once() {
     let retry = f
         .register_as(
             "registrar",
-            json!({"name": "rollback", "source": "mcp:refused"}),
+            json!({"name": "rollback", "schema": {"marker": "replacement"}}),
         )
         .await;
     assert_outcome(&retry, false, true, false);
-    assert_eq!(f.row(id).await.properties.unwrap()["source"], "mcp:refused");
+    assert_eq!(
+        f.row(id).await.properties.unwrap()["schema"],
+        json!({"marker": "replacement"})
+    );
     assert_eq!(f.registration_events(original.id).await.len(), 1);
 }
 
@@ -787,6 +786,23 @@ async fn required_registration_event_uses_token_attribution_and_skips_noop() {
 
 impl Fixture {
     async fn populate_registration_authorization(&self, name: &str) {
+        let default = self
+            .call(
+                "tool.check",
+                json!({"actor": "agent:default", "tool": name}),
+            )
+            .await;
+        assert_eq!(default["source"], "default");
+        self.call(
+            "tool.policy",
+            json!({"actor": "agent:policy", "tool": name, "decision": "allow"}),
+        )
+        .await;
+        let policy = self
+            .call("tool.check", json!({"actor": "agent:policy", "tool": name}))
+            .await;
+        assert_eq!(policy["source"], "policy");
+        assert_eq!(policy["decision"], "allow");
         self.call(
             "tool.policy",
             json!({"actor": "agent:requester", "tool": name, "decision": "deny"}),
@@ -826,22 +842,33 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn register_correction_refuses_source_or_kind_change_on_declared_rows() {
+async fn register_correction_refuses_source_or_kind_change_on_existing_rows() {
     let program = json!({"version": 1, "fixed_args": ["--version"], "extra_args": "none"});
     let digest = "a".repeat(64);
-    for declarations in [
-        json!({"network": "outbound"}),
-        json!({"executable_digest": digest}),
-        json!({"program": program}),
-        json!({"network": "outbound", "executable_digest": digest}),
-        json!({"program": program, "executable_digest": digest}),
+    for (source, declarations) in [
+        ("exec:/fixture/original", json!({})),
+        ("mcp:original", json!({})),
+        ("exec:/fixture/original", json!({"network": "outbound"})),
+        (
+            "exec:/fixture/original",
+            json!({"executable_digest": digest}),
+        ),
+        ("exec:/fixture/original", json!({"program": program})),
+        (
+            "exec:/fixture/original",
+            json!({"network": "outbound", "executable_digest": digest}),
+        ),
+        (
+            "exec:/fixture/original",
+            json!({"program": program, "executable_digest": digest}),
+        ),
     ] {
         let f = Fixture::new();
         let first = f
             .register_as(
                 "original-registrar",
                 json!({
-                    "name": "declared", "source": "exec:/fixture/original", "kind": "tool",
+                    "name": "frozen", "source": source, "kind": "tool",
                     "side_effect": "read", "trust": "first_party", "capabilities": ["retained"]
                 }),
             )
@@ -862,82 +889,103 @@ async fn register_correction_refuses_source_or_kind_change_on_declared_rows() {
         for (key, value) in declarations.as_object().unwrap() {
             assert_eq!(&stored.properties.as_ref().unwrap()[key], value);
         }
-        f.populate_registration_authorization("declared").await;
-
-        let equal = f
-            .register_as(
-                "different-registrar",
-                json!({
-                    "name": "declared", "source": "exec:/fixture/original", "kind": "tool"
-                }),
+        let default = f
+            .call(
+                "tool.check",
+                json!({"actor": "agent:default", "tool": "frozen"}),
             )
             .await;
-        assert_outcome(&equal, false, false, true);
+        assert_eq!(default["decision"], "allow");
+        assert_eq!(default["source"], "default");
+
+        // No policy or grant is needed for an established name to require protection.
+        let unreferenced = f.registration_state().await;
+        assert!(unreferenced["tool_policy"].as_array().unwrap().is_empty());
+        assert!(unreferenced["tool_grants"].as_array().unwrap().is_empty());
+        let error = f.registry.dispatch_with_identity(
+            "tool.register", json!({"name": "frozen", "source": "exec:/fixture/other", "capabilities": ["must-not-link"]}),
+            Some(registration_identity("different-registrar")),
+        ).await.expect_err("source changes refuse without policy or grant references");
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::InvalidInput(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("source"), "{error}");
+        assert!(error.to_string().contains("new name"), "{error}");
+        assert_eq!(f.registration_state().await, unreferenced);
+
+        f.populate_registration_authorization("frozen").await;
+        let before_replays = f.registration_state().await;
+        for fields in [
+            json!({"source": source, "kind": "tool"}),
+            json!({"source": null, "kind": null}),
+            json!({}),
+        ] {
+            let mut params = fields;
+            params["name"] = json!("frozen");
+            let equal = f.register_as("different-registrar", params).await;
+            assert_outcome(&equal, false, false, true);
+            assert_eq!(f.registration_state().await, before_replays);
+        }
         let metadata = f
             .register_as(
                 "different-registrar",
                 json!({
-                    "name": "declared", "description": "metadata remains correctable"
+                    "name": "frozen", "description": "metadata remains correctable"
                 }),
             )
             .await;
         assert_outcome(&metadata, false, true, false);
-        let before = f.registration_state().await;
         let original = serde_json::to_value(f.row(id).await).unwrap();
+        let capabilities = f.describe("frozen").await["capabilities"].clone();
+        assert_eq!(capabilities.as_array().unwrap().len(), 1);
         assert!(f.registration_events(stored.id).await.is_empty());
-        for (field, value) in [
-            ("source", json!("mcp:replacement")),
-            ("source", json!("exec:/fixture/other")),
-            ("kind", json!("skill")),
-        ] {
-            let mut params = json!({"name": "declared", "capabilities": ["must-not-link"]});
-            params[field] = value;
-            let error = f
-                .registry
-                .dispatch_with_identity(
-                    "tool.register",
-                    params,
-                    Some(registration_identity("different-registrar")),
-                )
-                .await
-                .expect_err("stored declarations constrain corrections even when omitted");
-            let khive_runtime::RuntimeError::InvalidInput(reason) = error else {
-                panic!("expected InvalidInput, got {error:?}");
-            };
-            assert!(reason.contains(field), "{reason}");
-            for key in declarations.as_object().unwrap().keys() {
-                assert!(reason.contains(key), "{reason}");
+        for actor in ["original-registrar", "different-registrar"] {
+            for (fields, changed) in [
+                (json!({"source": "mcp:replacement"}), "source"),
+                (json!({"source": "exec:/fixture/other"}), "source"),
+                (json!({"kind": "skill"}), "kind"),
+                (
+                    json!({"source": "exec:/fixture/other", "kind": "plugin"}),
+                    "source and kind",
+                ),
+            ] {
+                // A preceding tool.check may append its own decision receipt.
+                let before = f.registration_state().await;
+                let mut params = fields;
+                params["name"] = json!("frozen");
+                params["description"] = json!("must not replace metadata");
+                params["schema"] = json!({"must_not_replace": true});
+                params["tags"] = json!(["must-not-add"]);
+                params["capabilities"] = json!(["must-not-link"]);
+                let error = f
+                    .registry
+                    .dispatch_with_identity(
+                        "tool.register",
+                        params,
+                        Some(registration_identity(actor)),
+                    )
+                    .await
+                    .expect_err("all existing rows keep their source and kind");
+                let khive_runtime::RuntimeError::InvalidInput(reason) = error else {
+                    panic!("expected InvalidInput, got {error:?}");
+                };
+                assert_eq!(reason, format!(
+                    "cannot change {changed} on an existing registration; register a different source or kind under a new name"
+                ));
+                assert_eq!(serde_json::to_value(f.row(id).await).unwrap(), original);
+                assert_eq!(f.registration_state().await, before);
+                assert_eq!(f.describe("frozen").await["capabilities"], capabilities);
+                assert!(f.registration_events(stored.id).await.is_empty());
+                let check = f
+                    .call(
+                        "tool.check",
+                        json!({"actor": "agent:requester", "tool": "frozen"}),
+                    )
+                    .await;
+                assert_eq!(check["source"], "grant");
+                assert_eq!(check["decision"], "allow");
             }
-            assert_eq!(serde_json::to_value(f.row(id).await).unwrap(), original);
-            assert_eq!(f.registration_state().await, before);
-            assert!(f.registration_events(stored.id).await.is_empty());
-        }
-    }
-
-    let f = Fixture::new();
-    let first = f
-        .register_as(
-            "original-registrar",
-            json!({
-                "name": "undeclared", "source": "exec:/fixture/original", "kind": "tool"
-            }),
-        )
-        .await;
-    for (field, value) in [
-        ("source", json!("mcp:replacement")),
-        ("source", json!("exec:/fixture/other")),
-        ("kind", json!("skill")),
-    ] {
-        let mut params = json!({"name": "undeclared"});
-        params[field] = value.clone();
-        let response = f.register_as("different-registrar", params).await;
-        assert_outcome(&response, false, true, false);
-        assert_eq!(response["tool"]["full_id"], first["tool"]["full_id"]);
-        let row = f.row(&first["tool"]["full_id"]).await;
-        if field == "kind" {
-            assert_eq!(row.entity_type.as_deref(), value.as_str());
-        } else {
-            assert_eq!(row.properties.as_ref().unwrap()[field], value);
         }
     }
 }
@@ -1019,5 +1067,230 @@ async fn register_correction_refuses_loosening() {
                 "digest_after": RegistryPin::from_entity(&after).unwrap().definition_digest(),
             })
         );
+    }
+}
+
+#[tokio::test]
+async fn register_correction_applies_conservative_unknown_policy_floors() {
+    // Legacy values are deliberately seeded through the trusted store, not public registration.
+    let legacy_states = [
+        ("absent", None),
+        ("null", Some(Value::Null)),
+        ("non-string", Some(json!(true))),
+        ("non-string", Some(json!(17))),
+        ("non-string", Some(json!(["legacy-value-do-not-echo"]))),
+        (
+            "non-string",
+            Some(json!({"legacy": "legacy-value-do-not-echo"})),
+        ),
+        ("unrecognized", Some(json!("legacy-value-do-not-echo"))),
+    ];
+    for (field, refused, admitted, remedy) in [
+        (
+            "side_effect",
+            &["read"][..],
+            &["write", "egress", "irreversible"][..],
+            "use write, egress or irreversible",
+        ),
+        (
+            "trust",
+            &["first_party", "marketplace"][..],
+            &["external"][..],
+            "use external",
+        ),
+    ] {
+        for (classification, legacy) in &legacy_states {
+            let f = Fixture::new();
+            let first = f
+                .register_as(
+                    "original-registrar",
+                    json!({
+                        "name": "legacy-policy", "source": "mcp:original", "kind": "tool",
+                        "side_effect": "read", "trust": "first_party", "capabilities": ["retained"]
+                    }),
+                )
+                .await;
+            let id = &first["tool"]["full_id"];
+            let token = f.runtime.authorize(Namespace::local()).unwrap();
+            let mut seeded = f.row(id).await;
+            let properties = seeded.properties.as_mut().unwrap().as_object_mut().unwrap();
+            if let Some(value) = legacy {
+                properties.insert(field.into(), value.clone());
+            } else {
+                properties.remove(field);
+            }
+            f.runtime
+                .entities(&token)
+                .unwrap()
+                .upsert_entity(seeded)
+                .await
+                .unwrap();
+            let stored = f.row(id).await;
+            assert_eq!(
+                stored.properties.as_ref().unwrap().get(field),
+                legacy.as_ref()
+            );
+            f.populate_registration_authorization("legacy-policy").await;
+            let before_preservation = f.registration_state().await;
+            let mut explicit_null = json!({});
+            explicit_null[field] = Value::Null;
+            for mut params in [json!({}), explicit_null] {
+                params["name"] = json!("legacy-policy");
+                let replay = f.register_as("different-registrar", params).await;
+                assert_outcome(&replay, false, false, true);
+                assert_eq!(f.registration_state().await, before_preservation);
+            }
+            let metadata = f.register_as("different-registrar", json!({
+                "name": "legacy-policy", "description": "unrelated metadata remains correctable"
+            })).await;
+            assert_outcome(&metadata, false, true, false);
+            let after_metadata = f.row(id).await;
+            assert_eq!(after_metadata.properties, stored.properties);
+            assert_eq!(
+                after_metadata.description.as_deref(),
+                Some("unrelated metadata remains correctable")
+            );
+            assert!(f.registration_events(stored.id).await.is_empty());
+            assert_eq!(
+                f.describe("legacy-policy").await["properties"],
+                stored.properties.as_ref().unwrap().clone()
+            );
+
+            let before_refusal = f.registration_state().await;
+            let row_before_refusal = serde_json::to_value(&after_metadata).unwrap();
+            let capabilities = f.describe("legacy-policy").await["capabilities"].clone();
+            assert_eq!(capabilities.as_array().unwrap().len(), 1);
+            for passed in refused {
+                let mut params = json!({
+                    "name": "legacy-policy", "description": "must-not-change", "schema": {"must_not_change": true},
+                    "tags": ["must-not-add"], "capabilities": ["must-not-link"]
+                });
+                params[field] = json!(passed);
+                let error = f
+                    .registry
+                    .dispatch_with_identity(
+                        "tool.register",
+                        params,
+                        Some(registration_identity("different-registrar")),
+                    )
+                    .await
+                    .expect_err("unknown stored policy values have conservative floors");
+                let khive_runtime::RuntimeError::InvalidInput(reason) = error else {
+                    panic!("expected InvalidInput, got {error:?}");
+                };
+                assert_eq!(
+                    reason,
+                    format!(
+                    "cannot set {field} to {passed:?}: stored {field} is {classification}; {remedy}"
+                )
+                );
+                assert!(!reason.contains("legacy-value-do-not-echo"), "{reason}");
+                assert_eq!(
+                    serde_json::to_value(f.row(id).await).unwrap(),
+                    row_before_refusal
+                );
+                assert_eq!(f.registration_state().await, before_refusal);
+                assert_eq!(
+                    f.describe("legacy-policy").await["capabilities"],
+                    capabilities
+                );
+                assert!(f.registration_events(stored.id).await.is_empty());
+            }
+
+            for passed in admitted {
+                // Each admitted value starts from the same legacy class, not a prior tightening.
+                let mut seeded = f.row(id).await;
+                let properties = seeded.properties.as_mut().unwrap().as_object_mut().unwrap();
+                if let Some(value) = legacy {
+                    properties.insert(field.into(), value.clone());
+                } else {
+                    properties.remove(field);
+                }
+                f.runtime
+                    .entities(&token)
+                    .unwrap()
+                    .upsert_entity(seeded)
+                    .await
+                    .unwrap();
+                let before = f.row(id).await;
+                assert_eq!(
+                    before.properties.as_ref().unwrap().get(field),
+                    legacy.as_ref()
+                );
+                let prior_events = f.registration_events(stored.id).await;
+                let prior_state = f.registration_state().await;
+                let check = f
+                    .call(
+                        "tool.check",
+                        json!({"actor": "agent:requester", "tool": "legacy-policy"}),
+                    )
+                    .await;
+                assert_eq!(check["source"], "grant");
+                let mut params = json!({"name": "legacy-policy"});
+                params[field] = json!(passed);
+                let response = f.register_as("different-registrar", params).await;
+                assert_outcome(&response, false, true, false);
+                let after = f.row(id).await;
+                let mut expected = before.clone();
+                expected.properties.as_mut().unwrap()[field] = json!(passed);
+                expected.version += 1;
+                expected.updated_at = after.updated_at;
+                assert!(after.updated_at > before.updated_at);
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                let described = f.describe("legacy-policy").await;
+                assert_eq!(described[field], json!(passed));
+                assert_eq!(
+                    described["properties"],
+                    after.properties.as_ref().unwrap().clone()
+                );
+                assert_eq!(described["capabilities"], capabilities);
+                let after_state = f.registration_state().await;
+                for table in ["graph_edges", "tool_policy", "tool_grants"] {
+                    assert_eq!(after_state[table], prior_state[table], "{table}");
+                }
+                let events = f.registration_events(stored.id).await;
+                assert_eq!(events.len(), prior_events.len() + 1);
+                for prior in &prior_events {
+                    assert!(events.contains(prior));
+                }
+                let added: Vec<_> = events
+                    .iter()
+                    .filter(|event| !prior_events.iter().any(|prior| prior.id == event.id))
+                    .collect();
+                assert_eq!(added.len(), 1);
+                let event = added[0];
+                let before_pin = RegistryPin::from_entity(&before).unwrap();
+                let after_pin = RegistryPin::from_entity(&after).unwrap();
+                assert_ne!(
+                    before_pin.definition_digest(),
+                    after_pin.definition_digest()
+                );
+                assert_eq!(event.kind, khive_types::EventKind::ToolRegistrationChanged);
+                assert_eq!(event.namespace, "local");
+                assert_eq!(event.verb, "tool.register");
+                assert_eq!(event.actor, "actor:different-registrar");
+                assert_eq!(event.substrate, khive_types::SubstrateKind::Event);
+                assert_eq!(event.outcome, khive_types::EventOutcome::Success);
+                assert_eq!(event.target_id, Some(stored.id));
+                assert_eq!(
+                    event.payload,
+                    json!({
+                        "actor": event.actor, "id": stored.id.to_string(),
+                        "digest_before": before_pin.definition_digest(), "digest_after": after_pin.definition_digest(),
+                    })
+                );
+                let check = f
+                    .call(
+                        "tool.check",
+                        json!({"actor": "agent:requester", "tool": "legacy-policy"}),
+                    )
+                    .await;
+                assert_eq!(check["source"], "policy");
+                assert_eq!(check["decision"], "deny");
+            }
+        }
     }
 }

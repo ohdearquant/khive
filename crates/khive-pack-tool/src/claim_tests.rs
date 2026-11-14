@@ -197,7 +197,7 @@ async fn concurrent_register_claim_loser_applies_its_supplied_definition() {
             register(
                 &rt,
                 &token,
-                json!({"name":"shared update", "source":"mcp:left"}),
+                json!({"name":"shared update", "source":"mcp:shared", "schema":{"side":"left"}}),
             ),
         ),
     );
@@ -208,7 +208,7 @@ async fn concurrent_register_claim_loser_applies_its_supplied_definition() {
             register(
                 &rt,
                 &token,
-                json!({"name":"SHARED UPDATE", "source":"mcp:right"}),
+                json!({"name":"SHARED UPDATE", "source":"mcp:shared", "schema":{"side":"right"}}),
             ),
         ),
     );
@@ -221,17 +221,18 @@ async fn concurrent_register_claim_loser_applies_its_supplied_definition() {
     let right = right.unwrap();
     assert_ne!(left["created"], right["created"]);
     assert_eq!(left["tool"]["full_id"], right["tool"]["full_id"]);
-    let (winner, loser, source) = if left["created"] == true {
-        (&left, &right, "mcp:right")
+    let (winner, loser, schema) = if left["created"] == true {
+        (&left, &right, json!({"side":"right"}))
     } else {
-        (&right, &left, "mcp:left")
+        (&right, &left, json!({"side":"left"}))
     };
     assert_eq!(winner["updated"], false);
     assert_eq!(loser["updated"], true);
     assert_eq!(loser["unchanged"], false);
     let id = loser["tool"]["full_id"].as_str().unwrap().parse().unwrap();
     let row = rt.get_entity(&token, id).await.unwrap();
-    assert_eq!(row.properties.as_ref().unwrap()["source"], source);
+    assert_eq!(row.properties.as_ref().unwrap()["source"], "mcp:shared");
+    assert_eq!(row.properties.as_ref().unwrap()["schema"], schema);
     assert_eq!(row.name, winner["tool"]["name"].as_str().unwrap());
     assert_eq!(
         rt.count_entities_tagged(&token, Some(REGISTRY_ENTITY_KIND), Some(REGISTRY_TAG))

@@ -504,37 +504,55 @@ fn validate_registration_correction(
         .entity_type
         .as_ref()
         .is_some_and(|kind| kind != &existing.entity_type);
-    let declarations: Vec<_> = ["network", "executable_digest", "program"]
-        .into_iter()
-        .filter(|key| corrected.get(*key).is_some())
-        .collect();
-    if (source_changed || kind_changed) && !declarations.is_empty() {
+    if source_changed || kind_changed {
         let changed = match (source_changed, kind_changed) {
             (true, true) => "source and kind",
             (true, false) => "source",
             _ => "kind",
         };
         return Err(RuntimeError::InvalidInput(format!(
-            "cannot change {changed} on a registration carrying stored properties: {}",
-            declarations.join(", ")
+            "cannot change {changed} on an existing registration; register a different source or kind under a new name"
         )));
     }
     for (field, order) in [("side_effect", SIDE_EFFECTS), ("trust", TRUST_ORIGINS)] {
-        let Some(previous) = stored(field).and_then(Value::as_str) else {
+        let Some(passed) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(field))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
-        let Some(passed) = corrected.get(field).and_then(Value::as_str) else {
-            continue;
-        };
+        let previous = stored(field);
         if let (Some(before), Some(after)) = (
-            order.iter().position(|value| *value == previous),
+            previous
+                .and_then(Value::as_str)
+                .and_then(|previous| order.iter().position(|value| *value == previous)),
             order.iter().position(|value| *value == passed),
         ) {
             if after < before {
+                let previous = order[before];
                 return Err(RuntimeError::InvalidInput(format!(
                     "cannot loosen {field}: stored {previous:?}, passed {passed:?}"
                 )));
             }
+        } else if (field == "side_effect" && passed == "read")
+            || (field == "trust" && passed != "external")
+        {
+            let state = match previous {
+                None => "absent",
+                Some(Value::Null) => "null",
+                Some(Value::String(_)) => "unrecognized",
+                Some(_) => "non-string",
+            };
+            let remedy = if field == "side_effect" {
+                "use write, egress or irreversible"
+            } else {
+                "use external"
+            };
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot set {field} to {passed:?}: stored {field} is {state}; {remedy}"
+            )));
         }
     }
     Ok(())
