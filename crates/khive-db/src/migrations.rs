@@ -421,6 +421,7 @@ const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
 const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
 const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
 const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
+const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
@@ -870,6 +871,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 65,
         name: "graph_edges_target_relation_index",
         up: V65_UP,
+    },
+    VersionedMigration {
+        version: 66,
+        name: "comm_undelivered_due_index",
+        up: V66_UP,
     },
 ];
 
