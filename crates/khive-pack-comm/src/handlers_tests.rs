@@ -1237,6 +1237,73 @@ async fn handle_heartbeat_does_not_false_conflict_when_snapshot_is_ahead_of_wall
     );
 }
 
+/// A soft-deleted heartbeat still holds the channel's deterministic id. The next
+/// report must replace it with a live row instead of failing with a conflict on
+/// every attempt, and must not carry the deleted row's counters forward.
+#[tokio::test]
+async fn heartbeat_after_soft_delete_writes_a_fresh_live_row() {
+    let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let token = runtime
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .expect("authorize");
+    let failure = json!({
+        "channel_kind": "email",
+        "channel_slug": "deleted@example.com",
+        "outcome": "failure",
+        "error_class": "timeout",
+        "error_message": "boom",
+    });
+
+    for _ in 0..2 {
+        super::handle_heartbeat(&runtime, &token, failure.clone())
+            .await
+            .expect("seed heartbeat");
+    }
+
+    let store = runtime.notes(&token).expect("note store");
+    let id = super::heartbeat_note_id("local", "email", "deleted@example.com");
+    let seeded = store
+        .get_note(id)
+        .await
+        .unwrap()
+        .expect("seeded heartbeat row");
+    assert_eq!(
+        seeded.properties.as_ref().expect("properties")["consecutive_failures"],
+        json!(2)
+    );
+    assert!(store
+        .delete_note(id, khive_storage::types::DeleteMode::Soft)
+        .await
+        .expect("soft delete"));
+    let tombstone = store
+        .get_note_including_deleted(id)
+        .await
+        .unwrap()
+        .expect("soft-deleted row is kept");
+    assert!(tombstone.deleted_at.is_some());
+    assert!(store.get_note(id).await.unwrap().is_none());
+
+    for expected_failures in 1..=2 {
+        let result = super::handle_heartbeat(&runtime, &token, failure.clone()).await;
+        assert!(
+            result.is_ok(),
+            "a heartbeat after a soft delete must persist: {result:?}"
+        );
+        let live = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("the heartbeat is live again");
+        assert_eq!(live.deleted_at, None);
+        assert!(live.updated_at > tombstone.updated_at);
+        assert_eq!(
+            live.properties.as_ref().expect("properties")["consecutive_failures"],
+            json!(expected_failures),
+            "counting restarts from the first report after the delete: {live:?}"
+        );
+    }
+}
+
 #[test]
 fn channel_stalled_uses_strict_three_interval_threshold() {
     let props = json!({
