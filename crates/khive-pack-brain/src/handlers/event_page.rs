@@ -5,9 +5,11 @@ use khive_runtime::{
     micros_to_iso, page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest,
     EventReadPageResult, NamespaceToken, RuntimeError, RuntimeResult,
 };
-use khive_types::{EventKind, HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
+#[cfg(test)]
+use khive_types::EventKind;
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-use super::parse_rfc3339_micros;
+use super::{brain_handlers::parse_event_kind, parse_rfc3339_micros};
 use crate::event_read_scope::event_actor_read_scope;
 use crate::BrainPack;
 
@@ -145,9 +147,7 @@ impl BrainPack {
             .transpose()?;
         let mut kinds = Vec::new();
         for raw in p.kind.into_iter().chain(p.kinds.into_iter().flatten()) {
-            let kind = raw
-                .parse::<EventKind>()
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid `kind`: {e}")))?;
+            let kind = parse_event_kind(&raw)?;
             if !kinds.contains(&kind) {
                 kinds.push(kind);
             }
