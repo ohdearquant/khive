@@ -794,11 +794,7 @@ impl khive_types::Pack for BindingStatusConsumers {
     const NAME: &'static str = "binding-status-consumers";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &[
-        khive_brain_core::ConsumerKind::Recall.as_str(),
-        khive_brain_core::ConsumerKind::KnowledgeCompose.as_str(),
-        khive_brain_core::ConsumerKind::Rerank.as_str(),
-    ];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] = khive_brain_core::ConsumerKind::NAMES;
     const HANDLERS: &'static [HandlerDef] = &[];
 }
 
@@ -821,15 +817,15 @@ fn binding_status_consumer_registry() -> khive_runtime::VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(BindingStatusConsumers);
     let registry = builder.build().unwrap();
-    assert_eq!(registry.all_brain_consumer_kinds().len(), 3);
+    assert_eq!(
+        registry.all_brain_consumer_kinds().len(),
+        khive_brain_core::ConsumerKind::ALL.len()
+    );
     registry
 }
 
-const STATUS_CONSUMER_KINDS: [khive_brain_core::ConsumerKind; 3] = [
-    khive_brain_core::ConsumerKind::Recall,
-    khive_brain_core::ConsumerKind::KnowledgeCompose,
-    khive_brain_core::ConsumerKind::Rerank,
-];
+const STATUS_CONSUMER_KINDS: [khive_brain_core::ConsumerKind;
+    khive_brain_core::ConsumerKind::ALL.len()] = khive_brain_core::ConsumerKind::ALL;
 
 async fn bind_status_selector(
     pack: &BrainPack,
@@ -934,10 +930,10 @@ async fn profile_binding_status_retains_partially_shadowed_wildcard_kind() {
         let resolved = resolve_status_consumer(&pack, &registry, &token, kind).await;
         assert_eq!(
             resolved["resolved_profile_id"],
-            if kind == khive_brain_core::ConsumerKind::Rerank {
-                id
-            } else {
+            if STATUS_CONSUMER_KINDS[..2].contains(&kind) {
                 winner
+            } else {
+                id
             }
         );
         assert_eq!(resolved["matched_binding"], true);
@@ -1096,4 +1092,192 @@ async fn profile_binding_status_omits_shadowed_wildcard_namespace() {
         false
     );
     assert_eq!(serde_json::to_value(pack.snapshot()).unwrap(), before);
+}
+
+#[test]
+fn consumer_kind_enumeration_round_trips_exact_wire_names() {
+    use khive_brain_core::ConsumerKind;
+
+    let mut seen = std::collections::HashSet::new();
+    for (kind, &name) in ConsumerKind::ALL.into_iter().zip(ConsumerKind::NAMES) {
+        assert!(seen.insert(name), "duplicate consumer wire name: {name}");
+        assert_eq!(kind.as_str(), name);
+        assert_eq!(kind.to_string(), name);
+        assert_eq!(name.parse::<ConsumerKind>().unwrap(), kind);
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+        assert_eq!(
+            serde_json::from_value::<ConsumerKind>(json!(name)).unwrap(),
+            kind
+        );
+    }
+    assert_eq!(seen.len(), ConsumerKind::ALL.len());
+    for invalid in ["Recall", "knowledge-compose", "rerank ", "*", ""] {
+        assert_eq!(
+            invalid.parse::<ConsumerKind>().unwrap_err(),
+            format!("unknown ConsumerKind: {invalid:?}")
+        );
+        assert!(serde_json::from_value::<ConsumerKind>(json!(invalid)).is_err());
+    }
+}
+
+fn enum_binding_status_registry(
+    pack: BrainPack,
+    runtime: &KhiveRuntime,
+) -> khive_runtime::VerbRegistry {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(runtime.config().actor_id.clone());
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(BindingStatusConsumers);
+    builder.register(pack);
+    let registry = builder.build().unwrap();
+    let mut registered = registry.all_brain_consumer_kinds();
+    registered.sort_unstable();
+    let mut expected = khive_brain_core::ConsumerKind::NAMES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(registered, expected);
+    registry
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_dispatch_covers_every_consumer_kind() {
+    for (index, kind) in khive_brain_core::ConsumerKind::ALL.into_iter().enumerate() {
+        let (pack, runtime) = make_pack();
+        let state = pack.state.clone();
+        let registry = enum_binding_status_registry(pack, &runtime);
+        let id = format!("concrete-{index}");
+        registry
+            .dispatch(
+                "brain.create_profile",
+                json!({"name":id, "consumer_kind":kind.as_str()}),
+            )
+            .await
+            .unwrap();
+        let binding =
+            json!({"actor":"brain-test", "namespace":"local", "consumer_kind":kind.as_str()});
+        let bound = registry.dispatch(
+            "brain.bind",
+            json!({"profile_id":id, "actor":"brain-test", "namespace":"local", "consumer_kind":kind.as_str()}),
+        ).await.unwrap();
+        assert_eq!(bound["bound"], true);
+        let before = serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap();
+        let resolved = registry
+            .dispatch(
+                "brain.resolve",
+                json!({"actor":"brain-test", "namespace":"local", "consumer_kind":kind.as_str()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved["resolved_profile_id"], id);
+        assert_eq!(resolved["matched_binding"], true);
+        let profile = registry
+            .dispatch("brain.profile", json!({"profile_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(profile["lifecycle"], "inactive");
+        assert_eq!(
+            profile["resolving_bindings"],
+            json!([binding]),
+            "consumer {kind}"
+        );
+        assert_eq!(
+            profile["serving_through_visible_binding_while_inactive"], true,
+            "consumer {kind}"
+        );
+        assert_eq!(
+            serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn profile_binding_status_dispatch_covers_each_sole_wildcard_consumer() {
+    for survivor in khive_brain_core::ConsumerKind::ALL {
+        let (pack, runtime) = make_pack();
+        let state = pack.state.clone();
+        let registry = enum_binding_status_registry(pack, &runtime);
+        let id = "wildcard-candidate";
+        let winner = "specific-winner";
+        for profile_id in [id, winner] {
+            registry
+                .dispatch(
+                    "brain.create_profile",
+                    json!({"name":profile_id, "consumer_kind":survivor.as_str()}),
+                )
+                .await
+                .unwrap();
+        }
+        let bound = registry.dispatch(
+            "brain.bind",
+            json!({"profile_id":id, "actor":"brain-test", "namespace":"local", "consumer_kind":"*"}),
+        ).await.unwrap();
+        assert_eq!(bound["bound"], true);
+        for kind in khive_brain_core::ConsumerKind::ALL {
+            if kind != survivor {
+                let bound = registry.dispatch(
+                    "brain.bind",
+                    json!({"profile_id":winner, "actor":"brain-test", "namespace":"local", "consumer_kind":kind.as_str()}),
+                ).await.unwrap();
+                assert_eq!(bound["bound"], true);
+            }
+        }
+        let before = serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap();
+        for kind in khive_brain_core::ConsumerKind::ALL {
+            let resolved = registry.dispatch(
+                "brain.resolve",
+                json!({"actor":"brain-test", "namespace":"local", "consumer_kind":kind.as_str()}),
+            ).await.unwrap();
+            assert_eq!(
+                resolved["resolved_profile_id"],
+                if kind == survivor { id } else { winner }
+            );
+            assert_eq!(resolved["matched_binding"], true);
+        }
+        let profile = registry
+            .dispatch("brain.profile", json!({"profile_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(profile["lifecycle"], "inactive");
+        assert_eq!(
+            profile["resolving_bindings"],
+            json!([{"actor":"brain-test", "namespace":"local", "consumer_kind":"*"}]),
+            "sole consumer {survivor}"
+        );
+        assert_eq!(
+            profile["serving_through_visible_binding_while_inactive"], true,
+            "sole consumer {survivor}"
+        );
+        assert_eq!(
+            serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap(),
+            before
+        );
+
+        let bound = registry.dispatch(
+            "brain.bind",
+            json!({"profile_id":winner, "actor":"brain-test", "namespace":"local", "consumer_kind":survivor.as_str()}),
+        ).await.unwrap();
+        assert_eq!(bound["bound"], true);
+        let before = serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap();
+        let resolved = registry.dispatch(
+            "brain.resolve",
+            json!({"actor":"brain-test", "namespace":"local", "consumer_kind":survivor.as_str()}),
+        ).await.unwrap();
+        assert_eq!(resolved["resolved_profile_id"], winner);
+        assert_eq!(resolved["matched_binding"], true);
+        let profile = registry
+            .dispatch("brain.profile", json!({"profile_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(profile["resolving_bindings"], json!([]));
+        assert_eq!(
+            profile["serving_through_visible_binding_while_inactive"],
+            false
+        );
+        assert_eq!(
+            serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap(),
+            before
+        );
+    }
 }

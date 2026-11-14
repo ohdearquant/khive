@@ -553,22 +553,18 @@ impl BrainPack {
                 // Named actors only add more-specific candidates, so querying
                 // the current named caller alone could hide a usable wildcard.
                 let actor = (binding.actor != "*").then_some(binding.actor.as_str());
-                [
-                    ConsumerKind::Recall,
-                    ConsumerKind::KnowledgeCompose,
-                    ConsumerKind::Rerank,
-                ]
-                .into_iter()
-                .filter(|kind| {
-                    binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
-                })
-                .any(|kind| {
-                    state
-                        .resolve_with_match(actor, Some(namespace), kind.as_str())
-                        .is_some_and(|(resolved, _, matched_binding)| {
-                            matched_binding && resolved.id == profile_id
-                        })
-                })
+                ConsumerKind::ALL
+                    .into_iter()
+                    .filter(|kind| {
+                        binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
+                    })
+                    .any(|kind| {
+                        state
+                            .resolve_with_match(actor, Some(namespace), kind.as_str())
+                            .is_some_and(|(resolved, _, matched_binding)| {
+                                matched_binding && resolved.id == profile_id
+                            })
+                    })
             })
             .map(|binding| {
                 json!({
