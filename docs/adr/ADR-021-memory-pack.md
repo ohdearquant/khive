@@ -1051,6 +1051,11 @@ hiding their targets.
 `supersedes` edges, and every other edge between two memory rows, are written, and what an edge read reports when it
 leaves edges out.
 
+The endpoint/count qualification of rule 2, its consequences and known limit below,
+and the memory-list option in the 2026-11-13 amendment are **Proposed**, pending contract
+acceptance. The accepted placement rule and the earlier proposed refusal-text change
+retain their existing status.
+
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
 `supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
 kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. ADR-007 Rev 6 Rule 0's scope
@@ -1078,15 +1083,24 @@ and 4 now name the placement rule below beside `restore`'s ownership comparison.
    wrong namespace. This is a placement rule and grants nothing: who may write a namespace stays the gate's decision on
    the request (ADR-007 Rev 8 Rule 9). It refuses no read; the only by-id effect it changes is where an edge between
    memory rows may be written or revived, recorded as an ADR-007 Rule 9 qualification.
-2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
-   can see. For the row whose edges the read lists (recall: each returned row; `neighbors`: the anchor row), and for each
+2. **Reads report filtering.** For a live memory anchor, `neighbors` omits soft-deleted neighboring endpoints.
+   Recall's supersedes read, when `enable_supersedes_suppression` is enabled,
+   and the opt-in memory-list filter below, instead act on each live incoming `supersedes` edge in the request's visible
+   namespaces even when its source row is soft-deleted. They do not require live endpoints for this structural test.
+   For the row whose edges the existing read lists (recall: each returned row; `neighbors`: the anchor row), and for each
    relation, the response also carries the number of edges between memory rows that arrive at that row and that the
-   read leaves out because they are stored in a namespace outside that set. Each such edge is one the reader would
-   have been given if it could see that namespace, so an edge with a soft-deleted endpoint, which no read returns,
-   is not counted. The field is present on every filtered read, with `0` when nothing was left out, so a missing field
-   means the producer is broken, never that nothing was hidden. Under rule 1 an edge is stored in its source row's
-   namespace, so after the move in rule 3 the counted edges are exactly those from rows outside the reader's
-   namespaces, and a reader already sees every outgoing edge of a row it can see; the edges this count covers are
+   live-endpoint read leaves out because they are stored in a namespace outside that set. Each counted edge is one
+   `neighbors` would return if the reader could see that namespace. The count excludes edges with a soft-deleted
+   endpoint. Consequently a live `supersedes` edge whose source is soft-deleted in a hidden namespace contributes zero,
+   although that edge would suppress its target in recall with suppression enabled or the opt-in list if its namespace
+   became visible. This is
+   a completeness gap for structural suppression; the count does not enumerate every hidden edge that could affect it.
+   The field remains present on each returned recall row and the memory-anchor `neighbors` response, with `0` when no qualifying hidden edge
+   was counted. A missing field means the producer is broken; zero is not proof that no hidden structural supersession
+   exists. The new list filter does not add a hidden-count field. Under rule 1 an edge is stored in its source row's
+   namespace, so after the move in rule 3 the counted edges come from live rows outside the reader's
+   namespaces. Namespace visibility alone does not hide outgoing edges of a visible row; endpoint filters still apply.
+   The edges this count covers are
    the incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
    withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
    The field is `hidden_incoming_edges`, shaped `{"total": n, "by_relation": {"<relation>": n}}`; `total` is always
@@ -1110,13 +1124,16 @@ and 4 now name the placement rule below beside `restore`'s ownership comparison.
    preflight before its first write and moves only the edges still misplaced. Other writers are stopped while it runs. The move has a dry run
    that prints per-namespace edge counts before and after and writes nothing; the applying run prints the same counts.
 
-**Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
-chain is either whole or reported as partial with a count. `link` gains one read of its source record when both
+**Consequences.** For live endpoints, a reader who can see a row sees that row's outgoing edges between memory rows,
+and hidden incoming edges are reported with a count. A chain containing a soft-deleted endpoint is outside that count's
+completeness guarantee, even though its live edges can still affect structural supersession.
+`link` gains one read of its source record when both
 endpoints are memory rows. Edges from a memory row to a non-memory record, and edges between non-memory records, keep
 their current rule.
 
-**Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
-arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
+**Known limit.** A reader who can see the target row but not the source row learns how many live incoming edges of each
+relation connect live memory endpoints outside its visible namespace set, never which source rows, source namespaces,
+or their content. Learning the identity of the
 superseding row remains a follow-up, not solved here. A refused write names the source row's namespace only when the
 caller can already read that namespace, so rule 1 discloses no namespace that rule 2 withholds. The refusal still tells
 a caller holding a row's id that the row exists, that it is a memory row (the rule applies only when both endpoints are
@@ -1125,12 +1142,63 @@ read. Rule 1 does not stop the namespace being learned another way: by-id `get` 
 included, without a visibility check. That read is the remaining namespace disclosure, and closing it is a separate
 decision. One further disclosure follows from the design: the count covers only edges whose endpoints are live, so it
 falls when a hidden source row is soft-deleted, which shows a reader that a row it cannot see was deleted.
+This deletion disclosure remains unchanged by #6547. It does not imply that structural suppression lifted:
+the live edge still suppresses when its namespace is visible and structural suppression is enabled. Reconciling the count's completeness with that
+live-edge behavior is the separate follow-up **Reconcile hidden_incoming_edges completeness with live supersedes
+edges from deleted sources** (#6559). #6547 does not change the count query.
 
 **Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
 the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
 written; the same refusal, for `link`, an `apply_changeset` link op and `restore`, naming the source row's namespace
 when the caller can read it and carrying no namespace other than the request's when it cannot; `restore` of a soft-deleted edge between memory rows whose namespace differs from its source row's refused
-with the edge left soft-deleted; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
-edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+with the edge left soft-deleted; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the live incoming memory-to-memory
+edges with live endpoints in namespaces it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
-run leaving all six in the source row's namespace.
+run leaving all six in the source row's namespace. The count comparisons cover live endpoints; a soft-deleted hidden
+source remains excluded from the count as pinned by `test_hidden_incoming_edges_exclude_nonmemory_and_deleted_endpoints`.
+
+### Amendment: opt-in structural memory-list filtering (2026-11-13)
+
+**Status**: Proposed, pending contract acceptance. Implements the list-filter alternative in #6547 and qualifies
+Delta 3 rule 2's endpoint/completeness description above. No code merge precedes that acceptance.
+
+**Decision.** `list(kind="memory", exclude_superseded=true)` and
+`list(kind="note", note_kind="memory", exclude_superseded=true)` omit a memory with a live incoming `supersedes`
+edge in any namespace visible to the request. The option is a strict boolean, defaults to false, and is refused
+when supplied on any other kind, including an unqualified note list. Omission or false retains existing behavior.
+The predicate uses the runtime selected for memory reads and the request's original visible namespace set, including
+for keyed listing, whose note population retains its existing primary-namespace scope. A successor need not match the
+list's tags, be on its page, or be among recall candidates. Outgoing edges, other relations, soft-deleted edges and
+edges in hidden namespaces do not trigger this filter. The filter neither follows chains to select a winner nor
+interprets the legacy `properties.supersedes` path that recall additionally supports.
+
+The filter ignores a stored `properties.supersedes` value, which recall honors when the row carrying it is also a
+candidate (Delta 2 rule 3), so a row hidden from recall only by that property is still listed under
+`exclude_superseded=true`; `memory_list_keeps_legacy_property_target_that_recall_suppresses` pins this.
+
+A `supersedes` edge is the writer's judgment that the older row is stale; deleting the newer row is a judgment
+about that newer row alone. The live edge therefore continues to suppress the older row after its source is
+soft-deleted. Removing that edge lifts its suppression; restoring the newer row changes nothing because suppression
+never lifted. If another visible live incoming edge remains, that edge still suppresses the older row.
+
+Filtering is a read projection before matching-row offset, limit, lookahead and continuation selection. It changes
+neither stored status nor notes, metadata, timestamps or edges. `get` and default lists retain their existing results;
+there is no new `superseded_by` field or hidden-source identity disclosure. The existing hidden-edge count is unchanged,
+with the gap and separate follow-up above; no count completeness claim is added to list.
+
+All filtered pagination paths scan at most 10,000 raw rows in batches of at most 200. An exhausted scan budget yields
+`scan_incomplete: true` and `has_more: true`, even if the result is empty. Insertion and keyed cursor modes return the
+last permitted scanned boundary so the caller can continue past excluded rows. Offset mode rescans from the beginning;
+an incomplete offset page is not proof of exhaustion and does not guarantee forward progress. Use a cursor walk to
+continue beyond a scan ceiling. A nonzero requested limit need not produce a full page; no total or cross-page/edge-read
+snapshot is promised. Existing caps and zero-limit/cursor rules remain. Cancellation and graph-read failures refuse
+the operation rather than reporting an unfiltered or apparently complete page.
+
+**Validation.** The code commit supplies `memory_list_and_recall_keep_deleted_superseder_suppression`, exercising
+both list and recall before and after soft-deleting the superseder, then restoring it without lifting suppression;
+and `memory_list_and_recall_return_after_supersedes_edge_removed`, proving that removing the edge makes the older
+row eligible for both list and recall again. These use actual records, links and dispatch, with matching recall
+candidates and unchanged stored-row checks. Additional regressions cover default/false and get preservation,
+incoming-relation scope, namespace visibility, the memory backend, filtering before pagination across more than
+one batch, insertion/keyed/offset continuation at the scan ceiling, strict scope/type refusals, cancellation,
+graph-read failures and presentation metadata. These are required tests, not a claim that native validation has run.
