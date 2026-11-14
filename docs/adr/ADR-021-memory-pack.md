@@ -1190,21 +1190,33 @@ affected, because the edge or property sits outside its visible set.
    read it, the same split as Delta 3 rule 1, and it never redirects the write.
 2. **Which writes.** The rule applies to these writes, whatever kind of row the source is:
    - `link` with `relation="supersedes"` onto a memory row;
-   - a `link` op with that relation in `apply_changeset`, at preparation;
+   - a `link` op with that relation in a change-set, at preparation, whether it arrives through `apply_changeset` or
+     through an approved `propose` (ADR-046), which applies through the same preparation;
    - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace;
-   - `update`, and a note update in `apply_changeset`, when the patch sets `properties.supersedes` on a memory row;
+   - `update`, and a note update in a change-set, when the patch sets `properties.supersedes` on a memory row;
    - `restore` of a soft-deleted memory row whose stored `properties.supersedes` is a value Delta 2 rule 3 honors,
      checked against the restored row's namespace. A refused restore leaves the row soft-deleted. A stored value
      recall does not honor is not checked, because restoring it hides nothing.
 
-   For the property, the value must be a complete UUID naming a live memory row, and that row is checked by rule 1.
-   Any other value is refused, naming `memory.apply_batch` and `link(relation="supersedes")`. A patch that leaves the
-   stored value unchanged is not checked. A patch that removes the key or sets it to null is admitted and not checked:
-   it can only stop a row from being hidden.
+   On `update` and on a change-set note update, a new value must be a complete UUID naming a live memory row, and that
+   row is checked by rule 1. Any other new value is refused, naming `memory.apply_batch` and
+   `link(relation="supersedes")`. A patch that leaves the stored value unchanged is not checked. A patch that removes
+   the key or sets it to null is admitted and not checked: it can only stop a row from being hidden.
 
-   `merge` is out of scope. A note merge (ADR-039) requires both notes to be in the caller's namespace (ADR-007
-   Rule 5; `ensure_namespace` on both notes in the runtime's note merge), so the `supersedes` edges it moves onto the survivor and the properties it carries over stay in that one
-   namespace, and rule 1's outcome for them does not change.
+   On `restore`, the stored value is not rewritten and is checked as recall would honor it. A complete UUID names one
+   row, checked by rule 1 if it is a live memory row. An id prefix (Delta 2 rule 3) can hide any live memory row whose
+   id starts with it, because recall hides the first ranked candidate that matches. The restore therefore resolves the
+   prefix to every live memory row whose id starts with it and checks each by rule 1; one refused row refuses the
+   restore. A prefix that matches no live memory row is admitted, because it hides nothing at that moment.
+
+   `merge` is not checked, because it cannot change what rule 1 decides. A note merge (ADR-039) requires both notes to
+   be in the caller's namespace (ADR-007 Rule 5; `ensure_namespace` on both notes in the runtime's note merge). It
+   moves every edge incident to the merged-away note onto the survivor, in whatever namespace each edge is stored, and
+   keeps each edge's stored namespace; any properties it carries over land on the survivor. For each moved
+   `supersedes` edge and carried property, the supersede's own namespace is unchanged and the superseded row's
+   namespace is unchanged (both notes are in the caller's namespace), so rule 1 gives the same answer after the merge
+   as before. A supersede stored before this delta that rule 1 would refuse is therefore carried onto the survivor as
+   stored; rule 4's dry run lists it before the merge and after it.
 3. **What it is.** This is a rule of the write that supersedes a memory row, the same kind of rule as
    `memory.apply_batch`'s. It is not an access control. Under ADR-007 Rule 9, `link(target_id)` resolves its id without
    a namespace check. This delta extends the second of the two write-effect comparisons that ADR-007 permits (Rule 8
@@ -1216,13 +1228,15 @@ affected, because the edge or property sits outside its visible set.
    one rule: rule 1 with no `owned_namespaces` list. A supersede is listed when its target is a memory row whose
    namespace is neither the supersede's own namespace nor `local`. For an edge, the supersede's namespace is the edge's
    stored namespace. For a property, it is the namespace of the live memory row that carries `properties.supersedes`,
-   and only a value Delta 2 rule 3 honors is considered, because recall honors exactly those. A target in `local` is
+   and only a value Delta 2 rule 3 honors is considered, because recall honors exactly those. The targets of an id
+   prefix are every live memory row whose id starts with it, each considered on its own, as on `restore`. A target in `local` is
    not listed. A target in an owned namespace is listed, and the output says that a supersede a Delta 1 caller wrote
    into a declared owned namespace appears in the list too.
 
    The dry run scans only edges and carrier rows stored in namespaces the caller can read. For each listed edge it
-   prints the edge id, the edge namespace, the source namespace and the target namespace; for each listed property it
-   prints the carrier row id, the carrier namespace and the target namespace. A source or target namespace the caller
+   prints the edge id, the edge namespace, the source namespace and the target namespace; for each listed property
+   target it prints the carrier row id, the carrier namespace, the stored value and the target namespace, so a prefix
+   carrier with two listed targets prints two lines. A source or target namespace the caller
    cannot read is printed as `unreadable`, never by name, the same split as Delta 3 rule 1 and rule 1 above give
    refusals. The supersede is still listed, because the owner of the readable namespace that stores it can remove it.
 
@@ -1230,7 +1244,7 @@ affected, because the edge or property sits outside its visible set.
    examines, whether or not it is listed, so a page can list nothing and still return a cursor. One call's cost is
    bounded by the page, and a full pass grows with the number of live memory rows and `supersedes` edges in the
    readable namespaces. It writes nothing.
-   A soft-deleted carrier row is not listed: recall does not read it, and its restore is checked by rule 1. Whether a
+   A soft-deleted carrier row is not listed: recall does not read it, and its restore is one of the writes rule 2 lists. Whether a
    listed supersede was meant is the target owner's question. Removing the edge or clearing the property is done by a
    caller who can read the namespace that stores it; when that is not the target's owner, the owner is asked.
 
@@ -1282,8 +1296,18 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
   row stays soft-deleted and the named row stays in a two-namespace reader's recall. Control: restoring a carrier
   whose value names a row in its own namespace succeeds and hides that row; a carrier whose value recall does not
   honor restores unchecked.
-- The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows, and
-  leaves the store byte-identical. It does not list a supersede whose target is in `local`, and it lists one whose
+- `restore` of a soft-deleted carrier whose stored value is an 8-character id prefix matching a memory row in a
+  refused namespace is refused and the row stays soft-deleted, even when the prefix also matches a row in the
+  carrier's own namespace. Control: a prefix that matches only rows in the carrier's own namespace restores; a prefix
+  that matches no live memory row restores.
+- `update` setting `properties.supersedes` to an id prefix is refused, even when the prefix matches only the caller's
+  own rows.
+- A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
+  approved proposal is applied, and no edge is stored. Control: the same op between the caller's own rows applies.
+- A note merge whose merged-away note is the target of a `supersedes` edge stored in another namespace leaves that
+  edge, with its stored namespace, on the survivor; the dry run lists it before and after the merge.
+- The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows,
+  including one line per refused target of a prefix carrier, and leaves the store byte-identical. It does not list a supersede whose target is in `local`, and it lists one whose
   target is in an owned namespace.
 - A fixture edge stored in a readable namespace whose target row is in a namespace the caller cannot read is listed
   with target namespace `unreadable`, and the unreadable namespace's name appears nowhere in the output.
