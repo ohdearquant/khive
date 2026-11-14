@@ -25,6 +25,9 @@ use crate::vocab::{
 };
 use crate::RegistryPin;
 
+mod unregister;
+pub(crate) use unregister::unregister;
+
 #[cfg(test)]
 tokio::task_local! {
     static BEFORE_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
