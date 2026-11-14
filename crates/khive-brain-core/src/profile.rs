@@ -12,6 +12,11 @@ use crate::brain_signal::{is_recall_positive, BrainSignal};
 use crate::posterior::{BetaPosterior, EntityPosteriors};
 use crate::signal::{FeedbackEventKind, FeedbackSignal};
 
+/// Smallest `local_factor` a profile may carry.
+pub const LOCAL_FACTOR_MIN: f64 = 0.5;
+/// Largest `local_factor` a profile may carry (1 means no scaling).
+pub const LOCAL_FACTOR_MAX: f64 = 1.0;
+
 /// Lifecycle states for a registered profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

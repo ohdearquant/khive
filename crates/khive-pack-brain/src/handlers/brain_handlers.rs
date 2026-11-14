@@ -1,4 +1,5 @@
 use super::*;
+use khive_brain_core::{LOCAL_FACTOR_MAX, LOCAL_FACTOR_MIN};
 use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -6,11 +7,6 @@ fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result
         mask_for_redaction_surface(RedactionSurface::GateProbe, &error.to_string()).into_owned()
     })
 }
-
-/// Smallest `local_factor` a profile may carry.
-const LOCAL_FACTOR_MIN: f64 = 0.5;
-/// Largest `local_factor` a profile may carry (1 means no scaling).
-const LOCAL_FACTOR_MAX: f64 = 1.0;
 
 /// Deserializes a field that is present, an explicit `null` included, as
 /// `Some`, so that the handler can tell "absent" from "null".
@@ -2125,7 +2121,13 @@ mod local_factor_tests {
 
     #[test]
     fn local_factor_inside_the_range_is_stored_as_given() {
-        for value in [0.5_f64, 0.7, 1.0] {
+        for value in [
+            0.5_f64,
+            f64::from_bits(0.5_f64.to_bits() + 1),
+            0.7,
+            f64::from_bits(1.0_f64.to_bits() - 1),
+            1.0,
+        ] {
             let parsed = parse_local_factor(Some(&json!(value)));
             assert!(
                 matches!(parsed, Ok(Some(stored)) if stored == value),
@@ -2142,6 +2144,8 @@ mod local_factor_tests {
     #[test]
     fn local_factor_outside_the_range_is_refused_and_the_range_is_named() {
         for raw in [
+            json!(f64::from_bits(0.5_f64.to_bits() - 1)),
+            json!(f64::from_bits(1.0_f64.to_bits() + 1)),
             json!(0.49),
             json!(1.01),
             json!(0.0),
