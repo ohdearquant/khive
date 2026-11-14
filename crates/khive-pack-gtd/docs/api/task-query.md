@@ -171,10 +171,9 @@ The query path batches live blocker reads and probes only unresolved ids for a
 soft-deleted row. A hard-deleted blocker therefore classifies as `missing`,
 while a tombstone classifies as `soft_deleted` without resurrecting it.
 
-## Proposed additive `gtd.tasks` filters (#2678)
+## Additive `gtd.tasks` filters (#2678)
 
-This section implements the proposed ADR-019 Amendment 3; its contract approval
-is pending. `gtd.tasks` additionally accepts:
+This section implements ADR-019 Amendment 3. `gtd.tasks` additionally accepts:
 
 - `tags`: array of strings, using SQLite `NOCASE` tag membership (ASCII
   case-insensitive, not general Unicode case folding). Missing, null, or empty
