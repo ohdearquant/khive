@@ -400,14 +400,15 @@ pub(crate) async fn list_policies(
     rows.iter().map(PolicyRow::from_row).collect()
 }
 
-/// SQL for `pattern_matches(<col>, ?<param>)`: the pattern stored in `col`
-/// against the bound value.
+/// Match a trusted pattern expression against the bound value. Tool callers
+/// pass `lower(tool)` and ASCII-folded bytes; actor callers retain exact bytes.
 ///
 /// It compares bytes, because `pattern_matches` does and SQLite's text
 /// functions do not: `LIKE` and `length()` read a TEXT value only up to its
 /// first NUL. A stored `a\0b*` then does not end in `*` and never matches
-/// `a\0bcd`, and tool names are not NUL-free. For a `deny` policy that miss is
-/// fail-open. Every comparison therefore runs on `CAST(.. AS BLOB)`, where
+/// `a\0bcd`, and tool names are not NUL-free. SQLite's built-in `lower()` uses
+/// the complete byte length, so ASCII folding retains the suffix after NUL.
+/// Every comparison therefore runs on `CAST(.. AS BLOB)`, where
 /// `length()` counts bytes and `substr(x, -1)` is the last byte, and `X'2A'` is
 /// `*`. A lone `*` gets its own arm: `substr` of a zero-length blob is NULL,
 /// not an empty blob, so the prefix arm cannot match an empty value, and
@@ -451,7 +452,7 @@ pub(crate) async fn select_deciding_policy(
     tool: &str,
 ) -> Result<Option<PolicyRow>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
-    let tool_match = pattern_match_sql("tool", 3);
+    let tool_match = pattern_match_sql("lower(tool)", 3);
     let rank = |col: &str| {
         format!(
             "CASE WHEN CAST({col} AS BLOB) = X'2A' THEN 0 \
@@ -497,7 +498,7 @@ pub(crate) async fn select_deciding_policy(
             params: vec![
                 SqlValue::Text(ns.to_string()),
                 SqlValue::Text(actor.to_string()),
-                SqlValue::Text(tool.to_string()),
+                SqlValue::Blob(tool.to_ascii_lowercase().into_bytes()),
             ],
             label: Some("tool_policy_decide".into()),
         })
@@ -579,11 +580,11 @@ async fn select_grant_on(
     selector: GrantSelector<'_>,
 ) -> Result<Option<(GrantRow, bool)>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
-    let tool_match = pattern_match_sql("tool", 3);
+    let tool_match = pattern_match_sql("lower(tool)", 3);
     let mut params = vec![
         SqlValue::Text(ns.to_string()),
         SqlValue::Text(actor.to_string()),
-        SqlValue::Text(tool.to_string()),
+        SqlValue::Blob(tool.to_ascii_lowercase().into_bytes()),
         SqlValue::Integer(now),
     ];
     let pinned = match registration {
