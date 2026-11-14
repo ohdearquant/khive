@@ -298,10 +298,45 @@ emitting either field value. Its ordered vocabulary follows the production finge
 fallback decision still use the original full fingerprints.
 
 The `khive_strict_daemon_fallback` marker on a strict-fallback rejection's
-`McpError` (#947) lets `request()` in `server.rs` distinguish "the daemon was
-never reached and strict mode rejected the fallback" from every other
+`McpError` (#947) lets `request()` in `server.rs` distinguish a refusal before
+operation dispatch with local fallback rejected by strict mode from every other
 daemon-forward `McpError` (protocol mismatch, oversized frame, ambiguous
 post-write outcome), which stay RPC-level errors.
+
+## Configuration mismatch diagnostics (#6542)
+
+After a pack or engine configuration change, a running daemon can reject a
+request because it still serves the old configuration. In strict mode, the
+forwarding error and the final MCP failed-operation envelope retain
+`reason=config_mismatch` and identify the daemon's reported PID when available.
+The message instructs the operator to stop or restart that daemon, through its
+supervisor if managed, and then retry.
+
+The receiver supplies a numeric `daemon_pid` in the existing configuration
+mismatch `error_detail` object. The client accepts only a positive integer that
+fits in a u32. Missing or malformed metadata is reported as PID unavailable;
+an older daemon may not send the field. The client does not infer a PID from
+its own process or a PID file. The optional JSON member does not change the
+protocol version, and older clients can ignore it.
+
+The PID is explicitly described as **reported**. It is diagnostic information,
+not kernel-authenticated ownership evidence. Use the supervising service to
+restart a managed daemon; for a manually managed process, establish ownership
+before stopping it. The configuration-refusal path itself performs no process
+signal, socket/PID-file removal, or restart.
+
+The final MCP message is constructed from local static text and the validated
+numeric PID. Arbitrary peer error text, configuration field values and paths
+are not copied into it. Single and parallel requests keep their failed-operation
+entries with `not_committed`; a chain keeps its first failure and aborted tail.
+Summary counts, status, strict-fallback markers and other refusal reasons retain
+their existing behavior.
+
+Explicit `KHIVE_DAEMON_STRICT=0` retains the existing local fallback for
+configuration mismatch, including missing or incompatible served-configuration
+echoes. Strict-mode refusal still records the existing fallback reason exactly
+once, and explicit non-strict mode does not add a strict violation. This remedy
+does not change the compatibility decision or authorize a new recovery attempt.
 
 ## Bridge executable replacement
 
@@ -347,13 +382,14 @@ regardless of which task drives it.
 
 ## `forward_or_spawn` — the `None` contract (#644)
 
-Returns `None` only when nothing was ever written to the daemon and local
-dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
-definitively absent/refused (`NoSocket`). A connect error that does not prove
-absence (`Unreachable`) returns `Some(Err)` immediately because the client
-cannot know whether a healthy daemon is serving other processes. It never
-returns `None` after the real frame has been written — `Some(Ok)`/`Some(Err)`
-both mean the caller must not dispatch locally.
+`None` asks the bridge to dispatch locally. It covers explicit daemon opt-out
+(`KHIVE_NO_DAEMON`), a definitively absent/refused socket (`NoSocket`), and the
+existing compatibility fallbacks permitted in non-strict mode. Those
+compatibility decisions occur after reading the daemon's response; they are
+distinct from an unknown transport outcome after a write. A connect error that
+does not prove absence (`Unreachable`) returns `Some(Err)` immediately because
+the client cannot know whether a healthy daemon is serving other processes.
+`Some(Ok)` and `Some(Err)` both prevent local dispatch.
 Under strict mode, the `NoSocket` case becomes `Some(Err(..))`
 instead (see `fallback_or_reject`) — `KHIVE_NO_DAEMON` itself is unaffected,
 since it is the caller's explicit, unconditional opt-out (nothing is ever

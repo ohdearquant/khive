@@ -7,6 +7,7 @@ use khive_runtime::daemon::{
 use rmcp::ErrorData as McpError;
 use tokio::net::UnixStream;
 
+use super::fallback::{config_mismatch_fallback_or_reject, daemon_reported_pid};
 use super::{
     fallback_or_reject, process_is_alive, supervised_daemon_error, FallbackReason,
     RECOVERER_LOCK_TIMEOUT_MS,
@@ -708,11 +709,11 @@ pub(super) fn map_response(
         );
     }
     if resp.config_mismatch {
-        return fallback_or_reject(
-            FallbackReason::ConfigMismatch,
+        return config_mismatch_fallback_or_reject(
             expected_config_id,
             resp.served_config_id.as_deref(),
             namespace_client,
+            daemon_reported_pid(resp.error_detail.as_ref()),
         );
     }
     // Fail closed: only trust a result the daemon positively confirms it served
@@ -721,11 +722,11 @@ pub(super) fn map_response(
     if !resp.served_config_id.as_deref().is_some_and(|served| {
         khive_runtime::daemon::config_ids_compatible(expected_config_id, served)
     }) {
-        return fallback_or_reject(
-            FallbackReason::ConfigMismatch,
+        return config_mismatch_fallback_or_reject(
             expected_config_id,
             resp.served_config_id.as_deref(),
             namespace_client,
+            daemon_reported_pid(resp.error_detail.as_ref()),
         );
     }
     if resp.ok {
