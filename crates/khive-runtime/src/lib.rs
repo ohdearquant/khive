@@ -64,6 +64,8 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
 pub mod graph_lint;
 pub mod input_schema;
@@ -216,6 +218,8 @@ pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
