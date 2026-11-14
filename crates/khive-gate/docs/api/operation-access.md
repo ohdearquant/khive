@@ -86,6 +86,10 @@ reader connection and store nothing. `charter.publish`, `charter.vocabulary`, `c
 stores a definition, a run, an observation or a state change. `charter.claim` stays `Write`
 even where claims are not yet admitted and it refuses without writing.
 
+Revision `domain-effects-v26` classifies `tool.unregister` as `Write`: it
+soft-deletes a tool registration, retires matching local policies and revokes
+matching local grants. Idempotent retirement remains subject to write admission.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |

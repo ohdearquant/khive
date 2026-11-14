@@ -980,13 +980,14 @@ async fn unregister_refuses_carried_reserved_properties() {
             .unwrap()
             .insert(key.into(), json!({"legacy":true}));
         f.write(
-            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            "UPDATE entities SET properties = ?1, version = version + 1 WHERE id = ?2",
             vec![
                 SqlValue::Text(serde_json::to_string(&legacy.properties).unwrap()),
                 SqlValue::Text(target.to_string()),
             ],
         )
         .await;
+        legacy.version += 1;
         let stored = f.entity("local", target).await;
         assert!(stored.deleted_at.is_none());
         assert_eq!(
