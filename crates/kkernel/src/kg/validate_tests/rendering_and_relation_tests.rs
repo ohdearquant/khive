@@ -202,6 +202,158 @@ fn render_fix_report(run: &ValidationRun, args: &ValidateArgs) -> (String, Strin
 }
 
 #[test]
+fn github_annotations_locate_malformed_records_without_ids() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    let files = ["entities.ndjson", "edges.ndjson", "notes.ndjson"];
+    for file in files {
+        std::fs::write(kg_dir.join(file), "{\n").unwrap();
+    }
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(annotations.lines().count(), 3, "{annotations}");
+    for file in files {
+        assert!(
+            annotations.lines().any(|line| line.starts_with(&format!(
+                "::error file=.khive/kg/{file}::{file} line 1: invalid JSON:"
+            ))),
+            "{annotations}"
+        );
+    }
+}
+
+#[test]
+fn github_annotations_use_evaluated_inputs_instead_of_record_ids_or_messages() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    std::fs::write(
+        kg_dir.join("entities.ndjson"),
+        concat!(
+            "{\"id\":\"entity-source\",\"kind\":\"concept\",\"name\":\"Source\",\"description\":\"present\"}\n",
+            "{\"id\":\"shared\",\"kind\":\"concept\",\"name\":\"Target\",\"properties\":{\"year\":9999}}\n"
+        ),
+    )
+    .unwrap();
+    write_edges_canonical(&kg_dir, &[("entity-source", "shared", "annotates")]);
+    std::fs::write(
+        kg_dir.join("notes.ndjson"),
+        "{\"id\":\"shared\",\"kind\":\"reference\",\"content\":\"Citation\",\"properties\":{\"year\":9999}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        kg_dir.join("rules.toml"),
+        r#"
+[[rules]]
+id = "entity-description"
+severity = "error"
+kind = "entity"
+require_field = "description"
+message = "notes.ndjson is mentioned by an entity"
+
+[[rules]]
+id = "edge-caption"
+severity = "warning"
+kind = "edge"
+require_field = "caption"
+message = "entities.ndjson is mentioned by an edge"
+
+[edge_endpoint_types]
+enabled = true
+severity = "error"
+
+[citation_date_lint]
+enabled = true
+severity = "warning"
+"#,
+    )
+    .unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.no_rules = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(annotations.lines().count(), 5, "{annotations}");
+    assert!(annotations.contains(
+        "::error file=.khive/kg/entities.ndjson::notes.ndjson is mentioned by an entity\n"
+    ));
+    assert!(annotations.contains(
+        "::warning file=.khive/kg/edges.ndjson::entities.ndjson is mentioned by an edge\n"
+    ));
+    let endpoint = &run
+        .report
+        .rules
+        .iter()
+        .find(|rule| rule.id == "edge-endpoint-types")
+        .unwrap()
+        .violations[0];
+    assert_eq!(endpoint.entity_id.as_deref(), Some("entity-source"));
+    assert!(annotations
+        .lines()
+        .any(|line| line == format!("::error file=.khive/kg/edges.ndjson::{}", endpoint.message)));
+    let citations: Vec<_> = annotations
+        .lines()
+        .filter(|line| line.contains("property \"year\""))
+        .collect();
+    assert_eq!(citations.len(), 2, "{annotations}");
+    for file in ["entities.ndjson", "notes.ndjson"] {
+        assert!(citations
+            .iter()
+            .any(|line| line.starts_with(&format!("::warning file=.khive/kg/{file}::"))));
+    }
+
+    args.format = OutputFormat::Json;
+    let (json, _) = render_fix_report(&run, &args);
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for rule in report["rules"].as_array().unwrap() {
+        for violation in rule["violations"].as_array().unwrap() {
+            assert_eq!(violation.as_object().unwrap().len(), 7);
+            assert!(violation.get("source").is_none());
+        }
+    }
+}
+
+#[test]
+fn github_annotations_keep_unbound_findings_and_empty_notice() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    write_entities(&kg_dir, &[]);
+    write_edges(&kg_dir, &[]);
+    std::fs::write(
+        kg_dir.join("rules.toml"),
+        r#"
+[[rules]]
+id = "bad-severity"
+severity = "erorr"
+kind = "entity"
+require_field = "description"
+message = "unused"
+"#,
+    )
+    .unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.no_rules = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        annotations,
+        concat!(
+            "::notice ::Empty graph: no entity, edge, or note records read\n",
+            "::error ::Rule \"bad-severity\": invalid severity \"erorr\"; ",
+            "must be \"error\", \"warning\", or \"info\"\n"
+        )
+    );
+}
+
+#[test]
 fn validate_fix_reports_moved_entities_and_post_fix_status() {
     let tmp = TempDir::new().unwrap();
     let kg_dir = make_kg_dir(&tmp);
@@ -422,7 +574,7 @@ fn validate_without_fix_preserves_files_strict_status_and_report_formats() {
     let (annotations, stderr) = render_fix_report(&run, &args);
     assert_eq!(
         annotations,
-        "::warning ::entities.ndjson is not sorted by UUID; run `kkernel kg validate --fix`\n"
+        "::warning file=.khive/kg/entities.ndjson::entities.ndjson is not sorted by UUID; run `kkernel kg validate --fix`\n"
     );
     assert!(stderr.is_empty());
     args.strict = true;
@@ -570,6 +722,7 @@ fn pairing_rule(id: &str, severity: &'static str, passed: bool, fixable: bool) -
             Vec::new()
         } else {
             vec![Violation {
+                source: None,
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
