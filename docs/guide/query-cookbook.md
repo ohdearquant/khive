@@ -131,12 +131,10 @@ but carries no meaning such as recency. Both omissions are deliberate; see
 [ADR-008](../adr/ADR-008-query-layer-separation.md#why-bounded-skip-instead-of-an-opaque-cursor-or-aggregates)
 for the reasoning. Use these instead:
 
-| You want                         | Use                                                                                                                                                                                                        |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The newest records about a topic | `search(kind="note", query="...", order_by="created_at")`, or `order_by="updated_at"`. Results sort newest first within the bounded candidate window, so this ranks recent matches but is not a full sort. |
-| How many entities of a type      | No verb returns this count today. Page `list(kind="entity", entity_type="...", after="")` until `next_after` is null and count the rows.                                                                   |
-
-`stats()` reports totals per substrate (entities, edges, notes) only, not per kind or type.
+| You want                         | Use                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The newest records about a topic | `search(kind="note", query="...", order_by="created_at")`, or `order_by="updated_at"`. Results sort newest first within the bounded candidate window, so this ranks recent matches but is not a full sort.                                                                                                                                                                                                      |
+| How many entities of a type      | `stats()` returns `entities_by_type`: one row per stored `entity_type` across entity kinds, counted over caller-visible namespaces and live rows (its `count_scope`). The first row counts entities with no type; in Agent presentation it carries only `count`, because null fields are dropped. For a count under other filters, such as kind or tags, page `list(..., after="")` until `next_after` is null. |
 
 ## Verified GQL idioms
 
