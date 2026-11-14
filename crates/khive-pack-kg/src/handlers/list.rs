@@ -39,6 +39,7 @@ fn validate_list_filter_scope(
             "note_kind" | "note_status" | "key_prefix" | "after_key" | "created_after"
             | "updated_after" | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read"
             | "delivered" => (matches!(spec, KindSpec::Note { .. }), "note lists"),
+            "exclude_superseded" => (matches!(spec, KindSpec::Note { .. }), "memory note lists"),
             "created_by_actor" => (
                 matches!(spec, KindSpec::Note { .. }),
                 "scheduled_event note lists",
@@ -508,6 +509,7 @@ impl KgPack {
         // become accepted on an unrelated substrate or note kind.
         let has_schedule_filters =
             params.get("status").is_some() || params.get("created_by_actor").is_some();
+        let has_supersession_filter = params.get("exclude_superseded").is_some();
         let original_params = params.clone();
         let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
@@ -661,6 +663,12 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                if has_supersession_filter && kind_filter.as_deref() != Some("memory") {
+                    return Err(RuntimeError::InvalidInput(
+                        "list: exclude_superseded requires kind=memory or kind=note with note_kind=memory"
+                            .into(),
+                    ));
+                }
                 let message_filters = supplied_fields
                     .iter()
                     .any(|field| MESSAGE_FILTER_FIELDS.contains(&field.as_str()));
@@ -725,7 +733,7 @@ impl KgPack {
                 // row-level filter keeps the store's own offset and cursor. The
                 // capped scan below would stop at MAX_SCAN_TOTAL and leave rows
                 // past it unreachable by offset.
-                let has_note_filter = message_filters;
+                let has_note_filter = message_filters || p.exclude_superseded;
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
@@ -751,6 +759,9 @@ impl KgPack {
                                     scan_limit,
                                 )
                                 .await?;
+                            let superseded =
+                                super::note_list::superseded_note_ids(runtime, token, &p, &page)
+                                    .await?;
                             if page.is_empty() {
                                 break false;
                             }
@@ -759,7 +770,9 @@ impl KgPack {
                                 if mailbox_view.permits_message_note(token, &note) {
                                     last_scanned = Some(note.id);
                                 }
-                                if note_matches_list_filters(&note, &p, token, &mailbox_view) {
+                                if !superseded.contains(&note.id)
+                                    && note_matches_list_filters(&note, &p, token, &mailbox_view)
+                                {
                                     collected.push(note);
                                     if collected.len() >= target {
                                         break;
@@ -853,12 +866,17 @@ impl KgPack {
                         let page = runtime
                             .list_notes_filtered(token, filter.clone(), remaining_scan, db_offset)
                             .await?;
+                        let superseded =
+                            super::note_list::superseded_note_ids(runtime, token, &p, &page)
+                                .await?;
                         let fetched = page.len() as u32;
                         for note in page {
                             if note.deleted_at.is_some() {
                                 continue;
                             }
-                            if note_matches_list_filters(&note, &p, token, &mailbox_view) {
+                            if !superseded.contains(&note.id)
+                                && note_matches_list_filters(&note, &p, token, &mailbox_view)
+                            {
                                 collected.push(note);
                                 if collected.len() >= target_after_skip {
                                     break;
@@ -886,6 +904,7 @@ impl KgPack {
                 // is not.
                 let has_more = if has_note_filter {
                     notes.len() > offset as usize + limit as usize
+                        || (p.exclude_superseded && scan_incomplete)
                 } else {
                     notes.len() > limit as usize
                 };
