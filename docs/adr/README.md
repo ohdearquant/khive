@@ -335,6 +335,8 @@ Amendments whose own status reads accepted, independently of the record's header
 - [ADR-200 Amendment 6](ADR-200-external-email-policy.md#amendment-6-2026-10-23----quarantine-records-are-readable-only-by-the-maintainer) (2026-10-23): accepted 2026-10-23; quarantine records are admitted only into the maintainer's mailbox view, in every form of the mailbox partition (#5424).
 - [ADR-201 Amendment 1](ADR-201-brain-module-boundaries.md#amendment-1-2026-10-23----implementation-base-and-packaging) (2026-10-23): accepted 2026-10-23; the implementation base is the current tree, the packaging is approved on measured size floors, and the grouped-count follow-up is already done (#4510, #4554).
 - [ADR-205 Amendment 3](ADR-205-dependency-scoped-pull-request-ci.md#amendment-3-pushes-to-main-are-never-scoped-and-d3a-is-withdrawn-2026-10-27) (2026-10-27): accepted 2026-10-27; D3a is withdrawn: no push to `main` is scoped to a closure (each runs the full suite, or the documentation lane when only Markdown changed since its tested base), D8 loses the mechanical-range escape clause and D9 the mechanical-range condition; runs other than pull requests keep recording their scope.
+- [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-2026-09-14-additive-task-query-filters-2678) (2026-09-14): accepted 2026-11-14; additive task-query filters (#2678).
+- [ADR-019 Amendment 8](ADR-019-gtd-pack.md#amendment-8-2026-11-13-disclose-task-page-continuation-6549) (2026-11-13): accepted 2026-11-14; disclose incomplete task pages with `tasks` and `has_more`, preserving exhausted-page shapes (#6549).
 
 ## Proposed amendments
 
@@ -348,8 +350,6 @@ Amendments to accepted records:
 - [ADR-031 Amendment 5](ADR-031-multi-engine-retrieval.md#amendment-5-2026-10-08-ordered-peer-engines-and-explicit-retrieval-strategies) (2026-10-08): proposed ordered peer `[[engines]]`, a per-query retrieval strategy that is always resolved and disclosed, weighted reciprocal rank fusion, and a shared executor in khive-retrieval.
 - [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
-- [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
-- [ADR-019 Amendment 8](ADR-019-gtd-pack.md#amendment-8-proposed-2026-11-13-disclose-task-page-continuation-6549) (2026-11-13): disclose incomplete task pages with `tasks` and `has_more`, preserving exhausted-page shapes (#6549).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14) (2026-09-14): resolve fallback-limit disclosure.
 - [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
