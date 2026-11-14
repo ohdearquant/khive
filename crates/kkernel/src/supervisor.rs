@@ -66,11 +66,6 @@ mod unix {
         probe_supervisor_socket, request_supervisor_handover, supervisor_effective_uid,
         supervisor_pid_is_alive, SupervisorSocketProbe,
     };
-    use khive_mcp::serve::{
-        config_discovery_db_anchor, reject_conflicting_db_override_with_source,
-        resolve_runtime_config_with_db_anchor, RuntimeConfigInputs,
-    };
-    use khive_runtime::KhiveConfig;
 
     use super::LaunchArgs;
 
@@ -203,35 +198,10 @@ mod unix {
     }
 
     fn resolve_configuration(args: &khive_mcp::args::Args) -> Result<()> {
-        let discovery_anchor = config_discovery_db_anchor(args.db.as_deref());
-        let loaded = KhiveConfig::load_with_home_fallback_and_source(
-            args.config.as_deref(),
-            discovery_anchor.as_deref(),
-        )?;
-        if let Some((config, source)) = &loaded {
-            reject_conflicting_db_override_with_source(
-                args.db.as_deref(),
-                &config.backends,
-                Some(source),
-            )?;
-        }
-        let (explicit, namespace) =
-            khive_mcp::args::resolve_cli_namespace(args).map_err(anyhow::Error::msg)?;
-        let (resolved, _) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
-            db: args.db.as_deref(),
-            config: args.config.as_deref(),
-            namespace,
-            namespace_explicit: explicit,
-            actor_explicit: explicit,
-            no_embed: args.no_embed,
-            packs: (!args.pack.is_empty()).then(|| args.pack.clone()),
-            brain_profile: args.brain_profile.clone(),
-        })?;
-        khive_runtime::PackRegistry::validate_pack_selection(&resolved.packs)?;
         // Resolution itself opens no database, migration, model, transport,
         // or incumbent-daemon probe. The launcher's separate own-job probe
         // may already have run while holding the marker lock.
-        Ok(())
+        khive_mcp::serve::preflight_daemon_configuration(args)
     }
 
     pub(super) async fn launch(args: LaunchArgs, log: &str, marker: &Path) -> Result<()> {

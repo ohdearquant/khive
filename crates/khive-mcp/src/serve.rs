@@ -117,7 +117,8 @@ mod runtime_hooks;
 use disk_policy::{open_backend, open_backend_with_wal_ceiling};
 #[cfg(unix)]
 pub use events_socket_preflight::{
-    preflight_events_socket_for_boot, prepare_preflighted_daemon_store_plan,
+    preflight_daemon_configuration, preflight_events_socket_for_boot,
+    prepare_preflighted_daemon_store_plan,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
