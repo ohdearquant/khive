@@ -55,13 +55,13 @@ This API does not add cross-backend query federation.
 
 `scopes` supplies namespace filters. An empty vector means cross-namespace; otherwise every applicable table is filtered with bound parameters. Query text cannot supply this value.
 
-`max_limit` is the effective per-call page size supplied by the runtime after applying its hard cap. The payload bound is the lesser of an explicit query `LIMIT` and `max_limit`, subject to checked `usize`-to-`i64` conversion. Query-verb callers normally set this through `page_size`; its public range is 1 through 10,000 rows.
+`max_limit` is the effective per-call page size supplied by the runtime after applying its hard cap. An explicit query `LIMIT` is a total bound across pages: the remaining allowance is `max(LIMIT - SKIP, 0)`, and the payload bound is the lesser of that allowance and `max_limit`, subject to checked `usize`-to-`i64` conversion. Without an explicit limit, the payload bound is `max_limit`. Query-verb callers normally set this through `page_size`; its public range is 1 through 10,000 rows.
 
 `GqlQuery.offset` is emitted as a bound SQL `OFFSET`. It must fit SQLite's signed integer range. A negative GQL `SKIP` is rejected by the parser, and a hand-built or platform-sized value above `i64::MAX` is rejected before execution.
 
 ## Truncation sentinel
 
-When an explicit `LIMIT` is at or below `max_limit`, the caller's limit is terminal and the compiler fetches exactly that number. When there is no explicit limit or it exceeds the page size, SQL fetches `max_limit + 1` rows and sets `CompiledQuery.truncation_check`.
+When the remaining explicit allowance `max(LIMIT - SKIP, 0)` is at or below `max_limit`, the caller's limit is terminal and the compiler fetches at most that allowance, without a sentinel. When there is no explicit limit or the remaining allowance exceeds the page size, SQL fetches `max_limit + 1` rows and sets `CompiledQuery.truncation_check`. For example, `SKIP 90 LIMIT 100` with page size 50 fetches at most ten rows and no sentinel.
 
 The execution site removes the sentinel and truncates to `TruncationCheck.max_limit`. `requested_limit` retains the caller's explicit value for diagnostics. Inspecting the extra row avoids both false warnings when a large limit matches few rows and silent truncation when an unbounded query matches more than the page size (issue #777). For GQL, a sentinel produces `has_more: true`, retains `truncated: true` for compatibility, and returns `next_offset = current offset + emitted rows`; terminal pages omit `next_offset`.
 
@@ -69,7 +69,9 @@ The execution site removes the sentinel and truncates to `TruncationCheck.max_li
 
 All scope values, relation filters, property values, depths, and limits are bound parameters. Integer values remain `INTEGER`, finite decimals remain `REAL`, booleans use integer `0`/`1`, and text equality uses `COLLATE NOCASE`. Non-finite floats in hand-built ASTs return `InvalidInput`.
 
-Inline property equality continues to map arbitrary keys through `json_extract`. In `WHERE`, dedicated fields such as `name` or `content` map directly to columns, while only explicit `properties.<path>` references map to `json_extract(alias.properties, '$.path')`. Unknown direct fields and the bare `properties` container are rejected; the same resolver is used by fixed- and variable-length compilation. Event predicates require a known event column, and edge predicates accept only `relation` and `weight`; neither accepts JSON-property paths. `entity_type` always uses its dedicated column. For `LIKE`-family operations, literal `%`, `_`, and `\` are escaped before compiler-supplied wildcards are added.
+Inline property equality continues to map arbitrary keys through `json_extract`. In `WHERE`, dedicated fields map directly to columns. Explicit node `properties.<path>` references extract from properties; canonical edge `metadata.<path>` references extract from metadata. Metadata paths and comparison values are bound parameters; existing node-property predicates retain their validated path literals. Unknown direct fields and bare containers are rejected; the same substrate-aware resolver is used by fixed- and variable-length compilation. Event predicates require a known event column. Existing direct edge predicates accept `relation` and `weight`, and edge JSON predicates require the metadata root, never properties. The `entity_type` field always uses its dedicated column. Literal wildcard characters are escaped before compiler-supplied `LIKE` wildcards are added.
+
+`RETURN e.metadata` reads the stored JSON text or SQL null without reserialization. Missing and JSON-null extracted leaves both become SQL null. Integers, floats and booleans retain their SQLite scalar representations; extracting metadata does not coerce every value to text. Metadata access on nodes or synthetic observation edges is rejected before SQL generation.
 
 Node kind labels `entity`, `note`, `event`, and `edge` select a substrate in the primary-node union; granular values such as `concept`, `task`, or comm's pack-registered `message` filter the stored `kind`. No stored row is expected to have the literal granular kind `entity` (issue #849).
 
@@ -84,7 +86,15 @@ not a query field. Runtime-supplied namespace scopes still apply to every union 
 
 Canonical edges bind through `graph_edges`, while endpoint nodes bind through a union of entities, notes, events, and graph edges. This substrate-agnostic source is necessary because relations such as `annotates` can target several substrates and epistemic relations can connect notes (issue #467).
 
-The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and resolves WHERE predicates and RETURN projections against the bound variable's substrate. Fixed-length results are ordered by every bound node and edge identity before applying `LIMIT`/`OFFSET`; substrate discriminators precede UUIDs so equal IDs in different union members remain distinct, and synthetic observations use their `(event_id, role, position)` primary key.
+The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and resolves WHERE predicates and RETURN projections against the bound variable's substrate. Fixed-length results append every bound node and edge identity after any requested ordering terms, before applying `LIMIT`/`OFFSET`; substrate discriminators precede UUIDs so equal IDs in different union members remain distinct, and synthetic observations use their `(event_id, role, position)` primary key.
+
+## Caller ordering and continuation
+
+`ORDER BY` resolves validated scalar fields or named node-properties/canonical-edge-metadata paths. It emits no extra result columns. Bare containers and namespace fields are rejected; direction is a typed `Asc` or `Desc`, never caller-supplied SQL. Queries using neither metadata nor ordering retain unchanged SQL and parameters.
+
+Sort values are not cast: ascending SQLite order is null, numeric, BINARY-collated text, then blob; descending reverses this value order. JSON array/object leaves remain JSON text. Predicate equality can still use NOCASE collation, so matching text case-insensitively does not imply case-insensitive sorting. Each requested direction applies only to its term; the existing identity tie suffix retains its direction.
+
+All visibility and deletion predicates apply before ordering and the page sentinel. The runtime's effective limit preserves a query-text `LIMIT` as a total across `SKIP` pages. To continue, retain the query and order terms, replace `SKIP` with `next_offset`, and keep the page size. Repeated reads of unchanged data are stable; concurrent changes can shift an offset page.
 
 ## Synthetic observation edges
 
@@ -103,14 +113,18 @@ Synthetic edges must be outbound and fixed-length. Mixing synthetic and canonica
 
 Variable-length compilation currently accepts exactly one `start -[*N..M]-> end` pattern. Mixed fixed/variable chains, trailing elements, and synthetic edges return `Unsupported`.
 
-The recursive seed starts at depth one. The CTE binds maximum and minimum depth as parameters, records visited IDs in a path string to prevent cycles, filters deleted and out-of-scope intermediate nodes, and accumulates edge weight. Because the final projection uses `DISTINCT`, results order first by depth and descending total weight, then by every projected output alias. That tuple is total over the rows that survive `DISTINCT` and avoids choosing an arbitrary hidden path as the representative for a collapsed row.
+The recursive seed starts at depth one. The CTE binds maximum and minimum depth as parameters, records visited IDs in a path string to prevent cycles, filters deleted and out-of-scope intermediate nodes, and accumulates edge weight. Because the final projection uses `DISTINCT`, its deterministic tie order is depth and descending total weight, then every projected output alias. That tuple is total over the rows that survive `DISTINCT` and avoids choosing an arbitrary hidden path as the representative for a collapsed row.
+
+Requested order terms precede that tuple only if derivable from the actual returned projections. A returned JSON container permits ordering by a path within it; an unreturned field does not. Whole-edge projections omit metadata, and whole-node projections do not implicitly return description. Non-derivable terms return `Unsupported` containing `variable-length ORDER BY must be derived from RETURN projections`. The compiler does not add hidden fields to the DISTINCT projection to make an otherwise ambiguous order legal.
+
+Canonical edge metadata describes the final traversed edge. The CTE declaration, seed and step carry `via_metadata` only when RETURN, WHERE or ORDER BY needs it; old queries retain their exact CTE SQL and parameters. Final-edge metadata predicates run after traversal, alongside end-node predicates, so an earlier edge's metadata cannot incorrectly prune the path.
 
 The end-node union is always joined because end filters apply even when the end variable is not projected. A start-node join is emitted only when its columns are returned.
 
-`OR` within one endpoint is preserved. An `OR` spanning start and end endpoints is rejected because routing its halves to separate CTE phases would silently change it into `AND`; cross-endpoint `AND` remains supported.
+`OR` within one phase is preserved, including a final-edge metadata predicate combined with an end-node predicate. An `OR` spanning start-node and final-row phases is rejected because routing its halves to separate CTE phases would silently change it into `AND`; cross-phase `AND` remains supported.
 
 ## Projection columns and failure modes
 
-Whole-variable projections expand to the allowed columns for their substrate. Property projections are checked against node, event, observation-target, or edge whitelists; unknown columns return `QueryError::Compile`. Only `relation` and `weight` are valid edge properties in query predicates.
+Whole-variable projections expand to the allowed columns for their substrate. Property projections are checked against node, event, observation-target, or edge whitelists; unknown columns return `QueryError::Compile`. Fixed-length `RETURN e` retains `id`, `source_id`, `target_id`, `relation`, and `weight`; recursive `RETURN e` retains the final edge's `id`, `relation`, and `weight`. Metadata requires explicit `RETURN e.metadata`. Edge predicates accept direct `relation`/`weight` or explicit metadata paths. Synthetic observation edges reject metadata projection, predicates and ordering.
 
 Common unsupported cases include repeated variables, zero-hop paths, mixed fixed/variable chains, SPARQL `*`, variable-length synthetic edges, and `OR` spanning both variable-length endpoints. Limits or depths that cannot fit the SQL parameter type return `InvalidInput` rather than wrapping.
