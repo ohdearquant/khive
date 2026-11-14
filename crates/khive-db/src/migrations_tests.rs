@@ -16,6 +16,8 @@ mod comm_legacy_quarantine;
 mod edge_governance_invalidation;
 #[path = "migrations_tests/edge_governance_schema_tests.rs"]
 mod edge_governance_schema;
+#[path = "migrations_tests/error_cause.rs"]
+mod error_cause;
 #[path = "migrations_tests/node_confirmed_pins.rs"]
 mod node_confirmed_pins;
 #[path = "migrations_tests/page_accounting.rs"]
