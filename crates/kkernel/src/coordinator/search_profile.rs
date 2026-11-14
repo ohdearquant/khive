@@ -25,18 +25,11 @@
 //! - `hydrate`: record reads that attach kind, name and timestamps to hits.
 //! - `search`: the whole coordinated search.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use khive_runtime::{NoteSearchHit, SearchHit};
+use khive_runtime::{KhiveRuntime, NoteSearchHit, SearchHit};
 
 use super::dispatch::{BackendSearchFailureKind, BackendSearchResult};
-
-static CALL_ID: AtomicU64 = AtomicU64::new(0);
-
-tokio::task_local! {
-    static CALL: u64;
-}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -65,14 +58,17 @@ pub(super) async fn profiled<F: std::future::Future>(search: F) -> F::Output {
 }
 
 async fn scoped<F: std::future::Future>(on: bool, search: F) -> F::Output {
-    if !on || CALL.try_with(|_| ()).is_ok() {
+    if !on || KhiveRuntime::search_profile_call_id().is_some() {
         return search.await;
     }
-    let call = CALL_ID.fetch_add(1, Ordering::Relaxed) + 1;
-    let started = tokio::time::Instant::now();
-    let output = CALL.scope(call, search).await;
-    emit(&line(call, "search", started.elapsed(), &[]));
-    output
+    KhiveRuntime::search_profile_scope(true, async {
+        let call = KhiveRuntime::search_profile_call_id().expect("profile scope has a call id");
+        let started = tokio::time::Instant::now();
+        let output = search.await;
+        emit(&line(call, "search", started.elapsed(), &[]));
+        output
+    })
+    .await
 }
 
 /// Start a stage timer: the current instant while profiling is on, else `None`
@@ -147,7 +143,7 @@ pub(super) fn backend_deadline(
     snapshot: &khive_storage::request_context::SearchPhaseSnapshot,
 ) {
     emit_if_on(|| {
-        let call = CALL.try_with(|call| *call).unwrap_or(0);
+        let call = KhiveRuntime::search_profile_call_id().unwrap_or(0);
         record(
             call,
             "backend_deadline",
@@ -176,7 +172,7 @@ fn emit_if_on(build: impl FnOnce() -> String) {
 }
 
 fn write(stage: &str, elapsed: Duration, fields: &[(&str, serde_json::Value)]) {
-    let call = CALL.try_with(|call| *call).unwrap_or(0);
+    let call = KhiveRuntime::search_profile_call_id().unwrap_or(0);
     emit(&line(call, stage, elapsed, fields));
 }
 
@@ -266,7 +262,7 @@ mod tests {
     }
 
     fn current() -> Option<u64> {
-        CALL.try_with(|call| *call).ok()
+        KhiveRuntime::search_profile_call_id()
     }
 
     // `enabled` records the switch in the config ledger the first time it runs.
@@ -296,11 +292,39 @@ mod tests {
         let second = scoped(true, async { current() }).await;
         assert!(first.is_some_and(|id| id > 0), "{first:?}");
         assert!(second.is_some() && second != first, "{first:?} {second:?}");
-        let nested = CALL.scope(41, scoped(true, async { current() })).await;
-        assert_eq!(nested, Some(41));
+        let (outer, nested) = KhiveRuntime::search_profile_scope(true, async {
+            let outer = current();
+            let nested = scoped(true, async { current() }).await;
+            (outer, nested)
+        })
+        .await;
+        assert!(outer.is_some_and(|id| id > 0), "{outer:?}");
+        assert_eq!(nested, outer);
         assert_eq!(current(), None);
         // switched off, a search runs outside any call
         assert_eq!(scoped(false, async { current() }).await, None);
+    }
+
+    #[tokio::test]
+    async fn spawned_worker_inherits_the_coordinator_call() {
+        let (outer, worker) = scoped(true, async {
+            let outer = current();
+            let worker = tokio::spawn(KhiveRuntime::search_profile_inherit(async {
+                KhiveRuntime::search_profile_call_id()
+            }))
+            .await
+            .expect("worker completed");
+            (outer, worker)
+        })
+        .await;
+        assert!(outer.is_some_and(|id| id > 0));
+        assert_eq!(worker, outer);
+        let outside = tokio::spawn(KhiveRuntime::search_profile_inherit(async {
+            KhiveRuntime::search_profile_call_id()
+        }))
+        .await
+        .expect("unscoped worker completed");
+        assert_eq!(outside, None);
     }
 
     #[tokio::test]
