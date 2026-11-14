@@ -427,6 +427,13 @@ Invalid JSON under `parse_content=true` returns `invalid_input`, naming the note
 refusal. One invalid returned note refuses its list operation. Both verbs reject
 unknown fields by name; older servers without `parse_content` explicitly reject that parameter.
 
+Entity and note offset pages are ordered newest first by `created_at`. Entities
+that share a `created_at` follow `id` descending, notes `id` ascending, so
+`list(kind="entity", entity_type="...", limit=1)` returns the newest entity of a
+type. A note listing by `key_prefix` has its own order and is not covered here.
+Cursor mode does not follow this order: it walks the insertion sequence, oldest
+first, as described below.
+
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
 server-side cap binds. Advance `offset` by `items.length`, not by either limit field;
