@@ -190,13 +190,18 @@ fn escaped_credentials_after_stray_prose_backslashes_are_refused() {
     }
 }
 
+/// Pins the decoder only: a run holding an invalid escape yields no decoded view. Whether the gate
+/// should still refuse the escaped credential in such a run is tracked in #6554.
 #[test]
 fn a_stray_prose_backslash_does_not_make_invalid_json_escapes_decodable() {
     for (name, _, escaped) in cases() {
         for suffix in [r"\q", r"\uD800", r"\uDC00", "\n"] {
             let content = format!(r#"we saw \"{escaped}{suffix}" in the log"#);
             assert!(scan(&content).is_none(), "{name}: raw control: {content}");
-            assert!(check(&content).is_ok(), "{name}: {content}");
+            assert!(
+                super::escaped_json::escaped_strings(&content).is_empty(),
+                "{name}: {content}"
+            );
         }
     }
 }
