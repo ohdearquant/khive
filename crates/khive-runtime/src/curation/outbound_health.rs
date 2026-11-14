@@ -444,4 +444,410 @@ mod tests {
         assert_eq!((observed.undelivered_rows, observed.backoff_rows), (1, 1));
         assert_eq!(observed.max_backoff_delivery_attempts, Some(9));
     }
+
+    fn backlog_rows(runtime: &KhiveRuntime) -> Vec<Vec<rusqlite::types::Value>> {
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit_sqlite(|conn| {
+                conn.prepare("SELECT * FROM notes ORDER BY id")?
+                    .query_map([], |row| {
+                        (0..row.as_ref().column_count())
+                            .map(|i| row.get(i))
+                            .collect()
+                    })?
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    fn measure_backlog(
+        runtime: &KhiveRuntime,
+        legacy: bool,
+    ) -> (Vec<rusqlite::types::Value>, i32, Vec<String>) {
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit_sqlite(|conn| {
+                let sql = crate::sql!("outbound_channel_health_summary");
+                let legacy = i64::from(legacy);
+                let params = rusqlite::params![
+                    "local",
+                    "email:",
+                    "sender@example.com",
+                    legacy,
+                    "2030-01-01T00:00:00.000000999Z"
+                ];
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                    .query_map(params, |row| row.get(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut statement = conn.prepare(sql)?;
+                let mut result = statement.query(params)?;
+                let row = result.next()?.expect("aggregate row");
+                let values = (0..6)
+                    .map(|i| row.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(result.next()?.is_none(), "exactly one aggregate row");
+                drop(result);
+                Ok((
+                    values,
+                    statement.get_status(rusqlite::StatementStatus::VmStep),
+                    plan,
+                ))
+            })
+            .unwrap()
+    }
+
+    async fn file_backlog_fixture(
+        history: usize,
+    ) -> (tempfile::TempDir, KhiveRuntime, NamespaceToken) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.db");
+        let backend = std::sync::Arc::new(
+            crate::StorageBackend::sqlite_for_test_with_journal_mode_in(
+                &path,
+                true,
+                std::time::Duration::from_secs(5),
+                dir.path().join("locks"),
+            )
+            .unwrap(),
+        );
+        backend.prepare_core_schema().unwrap();
+        let runtime = KhiveRuntime::from_backend(
+            backend,
+            crate::RuntimeConfig {
+                db_path: Some(path),
+                ..crate::RuntimeConfig::no_embeddings()
+            },
+        );
+        runtime.install_pack_owned_note_kinds(vec!["message".into()]);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        for i in 0..25 {
+            let mut note = Note::new("local", "message", "retained pending message");
+            note.id = uuid::Uuid::from_u128(i + 1);
+            note.created_at = at("2020-01-01T00:00:00Z").timestamp_micros()
+                + i64::try_from(i / 2).unwrap() * 1_000_000;
+            note.updated_at = note.created_at;
+            let mut props = pending();
+            props["next_attempt_at"] = json!(if i < 3 || (15..17).contains(&i) {
+                "1990-01-01T00:00:00Z"
+            } else {
+                "2999-01-01T00:00:00Z"
+            });
+            props["delivery_attempts"] = json!(if i == 14 {
+                u64::MAX - 1
+            } else if i == 24 {
+                u64::MAX
+            } else {
+                9
+            });
+            if i >= 15 {
+                props.as_object_mut().unwrap().remove("channel_slug");
+            }
+            note.properties = Some(props);
+            // Seed retained transport metadata through the privileged fixture store.
+            runtime
+                .backend()
+                .notes_for_namespace(token.namespace().as_str())
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+        }
+        runtime.backend().pool().writer().unwrap().transaction(|conn| {
+            {
+                let mut insert = conn.prepare(
+                    "INSERT INTO notes(id,namespace,kind,content,properties,created_at,updated_at)
+                     VALUES (?1,'local','message','retained history',?2,1,1)",
+                )?;
+                for i in 0..history {
+                    insert.execute(rusqlite::params![
+                        format!("10000000-0000-4000-8000-{i:012}"),
+                        json!({"direction":"outbound","to_actor":"email:recipient@example.com",
+                            "channel_slug":"sender@example.com"}).to_string(),
+                    ])?;
+                }
+                for i in 0..1000 {
+                    for (prefix, direction) in [("20000000", "outbound"), ("30000000", "inbound")] {
+                        insert.execute(rusqlite::params![
+                            format!("{prefix}-0000-4000-8000-{i:012}"),
+                            json!({"direction":direction,"to_actor":"other:recipient"}).to_string(),
+                        ])?;
+                    }
+                }
+            }
+            assert_eq!(conn.execute(
+                "UPDATE notes SET properties=json_set(properties,'$.delivered_at','2020-01-01T00:00:00Z')
+                 WHERE id >= '10000000' AND id < '20000000'", [],
+            )?, history);
+            let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            assert_eq!(mode, "wal");
+            Ok(())
+        }).unwrap();
+        (dir, runtime, token)
+    }
+
+    #[tokio::test]
+    async fn outbound_backlog_work_is_independent_of_delivered_history() {
+        use rusqlite::types::Value as SqliteValue;
+        let (_small_dir, small, small_token) = file_backlog_fixture(1000).await;
+        let (_large_dir, large, large_token) = file_backlog_fixture(10_000).await;
+        for stage in ["fresh", "analyzed"] {
+            if stage == "analyzed" {
+                for runtime in [&small, &large] {
+                    runtime
+                        .backend()
+                        .pool()
+                        .writer()
+                        .unwrap()
+                        .autocommit_sqlite(|conn| conn.execute_batch("ANALYZE"))
+                        .unwrap();
+                }
+            }
+            let small_before = backlog_rows(&small);
+            let large_before = backlog_rows(&large);
+            assert_eq!(small_before.len(), 3025);
+            assert_eq!(large_before.len(), 12_025);
+            for legacy in [false, true] {
+                let maximum = if legacy { u64::MAX } else { u64::MAX - 1 };
+                let expected = OutboundHealthSummary {
+                    observed_at: at("2030-01-01T00:00:00Z"),
+                    undelivered_rows: if legacy { 25 } else { 15 },
+                    backoff_rows: if legacy { 20 } else { 12 },
+                    oldest_undelivered_created_at: Some(at("2020-01-01T00:00:00Z")),
+                    oldest_backoff_created_at: Some(at("2020-01-01T00:00:01Z")),
+                    earliest_backoff_next_attempt_at: Some(at("2999-01-01T00:00:00Z")),
+                    max_backoff_delivery_attempts: Some(maximum),
+                };
+                let expected_row = vec![
+                    SqliteValue::Integer(i64::try_from(expected.undelivered_rows).unwrap()),
+                    SqliteValue::Integer(i64::try_from(expected.backoff_rows).unwrap()),
+                    SqliteValue::Integer(
+                        expected
+                            .oldest_undelivered_created_at
+                            .unwrap()
+                            .timestamp_micros(),
+                    ),
+                    SqliteValue::Integer(
+                        expected
+                            .oldest_backoff_created_at
+                            .unwrap()
+                            .timestamp_micros(),
+                    ),
+                    SqliteValue::Text(format!("{maximum:020}")),
+                    SqliteValue::Text("2999-01-01T00:00:00Z".into()),
+                ];
+                let (small_row, small_steps, small_plan) = measure_backlog(&small, legacy);
+                let (large_row, large_steps, large_plan) = measure_backlog(&large, legacy);
+                assert_eq!(small_row, expected_row, "{stage}, legacy={legacy}");
+                assert_eq!(large_row, expected_row);
+                for plan in [&small_plan, &large_plan] {
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.contains("idx_comm_message_outbound_due")
+                                && line
+                                    .contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?")),
+                        "{stage}, legacy={legacy}: aggregate lost the bucket seek: {plan:?}"
+                    );
+                }
+                assert!(large_steps <= small_steps + 128,
+                    "{stage}, legacy={legacy}: delivered history added aggregate work: {small_steps} -> {large_steps}");
+                for (runtime, token) in [(&small, &small_token), (&large, &large_token)] {
+                    assert_eq!(summary(runtime, token, legacy).await, expected);
+                    let expected_ids: Vec<_> = if legacy {
+                        vec![17, 16, 3, 1, 2]
+                    } else {
+                        vec![3, 1, 2]
+                    }
+                    .into_iter()
+                    .map(uuid::Uuid::from_u128)
+                    .collect();
+                    let due = runtime
+                        .list_undelivered_outbound_messages_for_channel(
+                            token,
+                            "email:",
+                            "sender@example.com",
+                            legacy,
+                            200,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        due.iter().map(|note| note.id).collect::<Vec<_>>(),
+                        expected_ids
+                    );
+                }
+            }
+            assert_eq!(backlog_rows(&small), small_before);
+            assert_eq!(backlog_rows(&large), large_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_delivery_and_raw_marker_changes_preserve_index_membership() {
+        let (runtime, token) = fixture();
+        let mut props = pending();
+        props["next_attempt_at"] = json!("1990-01-01T00:00:00Z");
+        let note = seed(&runtime, "local", props.clone()).await;
+        let control = seed(&runtime, "local", pending()).await;
+        let original = backlog_rows(&runtime);
+        let before = summary(&runtime, &token, false).await;
+        assert_eq!((before.undelivered_rows, before.backoff_rows), (2, 1));
+        let due = runtime
+            .list_undelivered_outbound_messages_for_channel(
+                &token,
+                "email:",
+                "sender@example.com",
+                false,
+                200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(due.iter().map(|row| row.id).collect::<Vec<_>>(), [note.id]);
+        assert_eq!(backlog_rows(&runtime), original);
+        let delivered = runtime
+            .mark_outbound_message_delivered(
+                &token,
+                note.id,
+                "2020-01-02T00:00:00Z".into(),
+                Some("transport-id".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap(),
+            Some(delivered.clone())
+        );
+        assert_eq!((delivered.id, &delivered.content), (note.id, &note.content));
+        assert_eq!(
+            delivered.properties.as_ref().unwrap()["delivery"],
+            json!("delivered")
+        );
+        assert_eq!(
+            delivered.properties.as_ref().unwrap()["delivered_at"],
+            json!("2020-01-02T00:00:00Z")
+        );
+        assert!(delivered
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("next_attempt_at")
+            .is_none());
+        let stamped = backlog_rows(&runtime);
+        assert_eq!(stamped.len(), original.len());
+        assert_eq!(summary(&runtime, &token, false).await.undelivered_rows, 1);
+        assert!(runtime
+            .list_undelivered_outbound_messages_for_channel(
+                &token,
+                "email:",
+                "sender@example.com",
+                false,
+                200,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(backlog_rows(&runtime), stamped);
+        for marker in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("2020-01-01T00:00:00Z")),
+            Some(json!("invalid")),
+            Some(json!(0)),
+            Some(json!(42)),
+            Some(json!(false)),
+            Some(json!(true)),
+            Some(json!([])),
+            Some(json!({})),
+            None,
+            Some(Value::Null),
+        ] {
+            let eligible = marker.as_ref().is_none_or(Value::is_null);
+            let mut edited = props.clone();
+            if let Some(value) = marker {
+                edited["delivered_at"] = value;
+            }
+            runtime
+                .backend()
+                .pool()
+                .writer()
+                .unwrap()
+                .autocommit_sqlite(|conn| {
+                    conn.execute(
+                        "UPDATE notes SET properties=?1 WHERE id=?2",
+                        rusqlite::params![edited.to_string(), note.id.to_string()],
+                    )
+                })
+                .unwrap();
+            let baseline = backlog_rows(&runtime);
+            let observed = summary(&runtime, &token, false).await;
+            assert_eq!(
+                (observed.undelivered_rows, observed.backoff_rows),
+                (if eligible { 2 } else { 1 }, 1),
+                "properties={edited}"
+            );
+            let due = runtime
+                .list_undelivered_outbound_messages_for_channel(
+                    &token,
+                    "email:",
+                    "sender@example.com",
+                    false,
+                    200,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                due.iter().map(|row| row.id).collect::<Vec<_>>(),
+                if eligible { vec![note.id] } else { vec![] },
+                "properties={edited}"
+            );
+            assert_eq!(backlog_rows(&runtime), baseline);
+        }
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit_sqlite(|conn| {
+                conn.execute(
+                    "UPDATE notes SET properties=NULL WHERE id=?1",
+                    [note.id.to_string()],
+                )
+            })
+            .unwrap();
+        let baseline = backlog_rows(&runtime);
+        assert_eq!(summary(&runtime, &token, false).await.undelivered_rows, 1);
+        assert!(runtime
+            .list_undelivered_outbound_messages_for_channel(
+                &token,
+                "email:",
+                "sender@example.com",
+                false,
+                200,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(control.id)
+                .await
+                .unwrap(),
+            Some(control)
+        );
+        assert_eq!(backlog_rows(&runtime), baseline);
+    }
 }
