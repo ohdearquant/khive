@@ -247,7 +247,7 @@ async fn concurrent_registration_updates_refuse_a_stale_snapshot_before_linking(
     let initial = register(
         &rt,
         &token,
-        json!({"name":"guarded", "source":"mcp:original"}),
+        json!({"name":"guarded", "source":"mcp:original", "trust":"first_party"}),
     )
     .await
     .unwrap();
@@ -294,7 +294,7 @@ async fn concurrent_registration_updates_refuse_a_stale_snapshot_before_linking(
         let result = register(
             &rt,
             &token,
-            json!({"name":"guarded", "trust":"first_party", "capabilities":["right capability"]}),
+            json!({"name":"guarded", "trust":"marketplace", "capabilities":["right capability"]}),
         )
         .await;
         resume.notify_one();
@@ -317,7 +317,7 @@ async fn concurrent_registration_updates_refuse_a_stale_snapshot_before_linking(
     assert_eq!(after.version, before.version + 1);
     assert_eq!(after.properties.as_ref().unwrap()["source"], "mcp:original");
     assert_eq!(after.description, before.description);
-    assert_eq!(after.properties.as_ref().unwrap()["trust"], "first_party");
+    assert_eq!(after.properties.as_ref().unwrap()["trust"], "marketplace");
     assert_eq!(
         requests(&rt, &token, json!({})).await.unwrap(),
         grants_before
@@ -341,7 +341,7 @@ async fn concurrent_registration_updates_refuse_a_stale_snapshot_before_linking(
     assert_eq!(retry["updated"], true);
     let retried = rt.get_entity(&token, id).await.unwrap();
     assert_eq!(retried.description.as_deref(), Some("left"));
-    assert_eq!(retried.properties.as_ref().unwrap()["trust"], "first_party");
+    assert_eq!(retried.properties.as_ref().unwrap()["trust"], "marketplace");
     assert_eq!(capabilities_of(&rt, &token, id).await.unwrap().len(), 2);
     assert_eq!(
         requests(&rt, &token, json!({})).await.unwrap(),

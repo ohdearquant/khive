@@ -57,7 +57,7 @@ async fn register_updates_supplied_fields_and_preserves_identity() {
     let first = f
         .call(
             "tool.register",
-            json!({"name": "Echo", "source": "mcp:example"}),
+            json!({"name": "Echo", "source": "mcp:example", "trust": "first_party"}),
         )
         .await;
     assert_outcome(&first, true, false, false);
@@ -221,7 +221,7 @@ async fn register_updates_only_its_own_named_registration_and_leaves_ingest_unch
     let a = f
         .call(
             "tool.register",
-            json!({"name": "shared", "namespace": "a", "source": "mcp:a"}),
+            json!({"name": "shared", "namespace": "a", "source": "mcp:a", "side_effect": "read"}),
         )
         .await;
     let b = f.call("tool.register", json!({"name": "SHARED", "namespace": "b", "source": "mcp:b", "capabilities": ["b capability"]})).await;
@@ -459,7 +459,7 @@ async fn register_digest_input_change_appends_one_registration_changed_event() {
         json!({"side_effect": "egress"}),
         json!({"trust": "marketplace"}),
         json!({"schema": {"type": "object", "properties": {"query": {"type": "string"}}}}),
-        json!({"source": "mcp:combined", "side_effect": "write", "trust": "first_party", "schema": {}}),
+        json!({"source": "mcp:combined", "side_effect": "irreversible", "trust": "external", "schema": {}}),
     ] {
         let before = f.row(id).await;
         let prior = f.registration_events(original.id).await;
@@ -510,7 +510,7 @@ async fn register_digest_input_change_appends_one_registration_changed_event() {
         json!({"description": "metadata-only searchable description"}),
         json!({"kind": "skill", "tags": ["metadata-tag"]}),
         json!({"capabilities": ["new-capability"]}),
-        json!({"source": "mcp:combined", "side_effect": "write", "trust": "first_party", "schema": {}}),
+        json!({"source": "mcp:combined", "side_effect": "irreversible", "trust": "external", "schema": {}}),
         json!({"source": null, "side_effect": null, "trust": null, "schema": null}),
         json!({}),
     ] {
@@ -783,4 +783,241 @@ async fn required_registration_event_uses_token_attribution_and_skips_noop() {
         serde_json::to_value(&updated).unwrap()
     );
     assert_eq!(f.registration_events(original.id).await, events);
+}
+
+impl Fixture {
+    async fn populate_registration_authorization(&self, name: &str) {
+        self.call(
+            "tool.policy",
+            json!({"actor": "agent:requester", "tool": name, "decision": "deny"}),
+        )
+        .await;
+        let request = self
+            .call(
+                "tool.request",
+                json!({"actor": "agent:requester", "tool": name}),
+            )
+            .await;
+        self.call("tool.grant", json!({"id": request["request_id"]}))
+            .await;
+        let check = self
+            .call(
+                "tool.check",
+                json!({"actor": "agent:requester", "tool": name}),
+            )
+            .await;
+        assert_eq!(check["source"], "grant");
+        for table in [
+            "entities",
+            "graph_edges",
+            "events",
+            "tool_policy",
+            "tool_grants",
+        ] {
+            assert!(
+                !self.registration_state().await[table]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "populated {table}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn register_correction_refuses_source_or_kind_change_on_declared_rows() {
+    let program = json!({"version": 1, "fixed_args": ["--version"], "extra_args": "none"});
+    let digest = "a".repeat(64);
+    for declarations in [
+        json!({"network": "outbound"}),
+        json!({"executable_digest": digest}),
+        json!({"program": program}),
+        json!({"network": "outbound", "executable_digest": digest}),
+        json!({"program": program, "executable_digest": digest}),
+    ] {
+        let f = Fixture::new();
+        let first = f
+            .register_as(
+                "original-registrar",
+                json!({
+                    "name": "declared", "source": "exec:/fixture/original", "kind": "tool",
+                    "side_effect": "read", "trust": "first_party", "capabilities": ["retained"]
+                }),
+            )
+            .await;
+        let id = &first["tool"]["full_id"];
+        let token = f.runtime.authorize(Namespace::local()).unwrap();
+        let mut seeded = f.row(id).await;
+        for (key, value) in declarations.as_object().unwrap() {
+            seeded.properties.as_mut().unwrap()[key] = value.clone();
+        }
+        f.runtime
+            .entities(&token)
+            .unwrap()
+            .upsert_entity(seeded)
+            .await
+            .unwrap();
+        let stored = f.row(id).await;
+        for (key, value) in declarations.as_object().unwrap() {
+            assert_eq!(&stored.properties.as_ref().unwrap()[key], value);
+        }
+        f.populate_registration_authorization("declared").await;
+
+        let equal = f
+            .register_as(
+                "different-registrar",
+                json!({
+                    "name": "declared", "source": "exec:/fixture/original", "kind": "tool"
+                }),
+            )
+            .await;
+        assert_outcome(&equal, false, false, true);
+        let metadata = f
+            .register_as(
+                "different-registrar",
+                json!({
+                    "name": "declared", "description": "metadata remains correctable"
+                }),
+            )
+            .await;
+        assert_outcome(&metadata, false, true, false);
+        let before = f.registration_state().await;
+        let original = serde_json::to_value(f.row(id).await).unwrap();
+        assert!(f.registration_events(stored.id).await.is_empty());
+        for (field, value) in [
+            ("source", json!("mcp:replacement")),
+            ("source", json!("exec:/fixture/other")),
+            ("kind", json!("skill")),
+        ] {
+            let mut params = json!({"name": "declared", "capabilities": ["must-not-link"]});
+            params[field] = value;
+            let error = f
+                .registry
+                .dispatch_with_identity(
+                    "tool.register",
+                    params,
+                    Some(registration_identity("different-registrar")),
+                )
+                .await
+                .expect_err("stored declarations constrain corrections even when omitted");
+            let khive_runtime::RuntimeError::InvalidInput(reason) = error else {
+                panic!("expected InvalidInput, got {error:?}");
+            };
+            assert!(reason.contains(field), "{reason}");
+            for key in declarations.as_object().unwrap().keys() {
+                assert!(reason.contains(key), "{reason}");
+            }
+            assert_eq!(serde_json::to_value(f.row(id).await).unwrap(), original);
+            assert_eq!(f.registration_state().await, before);
+            assert!(f.registration_events(stored.id).await.is_empty());
+        }
+    }
+
+    let f = Fixture::new();
+    let first = f
+        .register_as(
+            "original-registrar",
+            json!({
+                "name": "undeclared", "source": "exec:/fixture/original", "kind": "tool"
+            }),
+        )
+        .await;
+    for (field, value) in [
+        ("source", json!("mcp:replacement")),
+        ("source", json!("exec:/fixture/other")),
+        ("kind", json!("skill")),
+    ] {
+        let mut params = json!({"name": "undeclared"});
+        params[field] = value.clone();
+        let response = f.register_as("different-registrar", params).await;
+        assert_outcome(&response, false, true, false);
+        assert_eq!(response["tool"]["full_id"], first["tool"]["full_id"]);
+        let row = f.row(&first["tool"]["full_id"]).await;
+        if field == "kind" {
+            assert_eq!(row.entity_type.as_deref(), value.as_str());
+        } else {
+            assert_eq!(row.properties.as_ref().unwrap()[field], value);
+        }
+    }
+}
+
+#[tokio::test]
+async fn register_correction_refuses_loosening() {
+    // Literal contract order keeps the oracle independent of the production arrays.
+    for (field, order) in [
+        (
+            "side_effect",
+            &["read", "write", "egress", "irreversible"][..],
+        ),
+        ("trust", &["first_party", "marketplace", "external"][..]),
+    ] {
+        for (stored_index, stored) in order.iter().enumerate().skip(1) {
+            for passed in &order[..stored_index] {
+                let f = Fixture::new();
+                let mut definition = json!({
+                    "name": "monotonic", "source": "mcp:original",
+                    "side_effect": "read", "trust": "first_party", "capabilities": ["retained"]
+                });
+                definition[field] = json!(stored);
+                let first = f.register_as("original-registrar", definition).await;
+                let id = &first["tool"]["full_id"];
+                let original = f.row(id).await;
+                f.populate_registration_authorization("monotonic").await;
+                let before = f.registration_state().await;
+                assert!(f.registration_events(original.id).await.is_empty());
+                let mut params = json!({"name": "monotonic", "capabilities": ["must-not-link"]});
+                params[field] = json!(passed);
+                let error = f
+                    .registry
+                    .dispatch_with_identity(
+                        "tool.register",
+                        params,
+                        Some(registration_identity("different-registrar")),
+                    )
+                    .await
+                    .expect_err("another actor cannot loosen the stored registration");
+                let khive_runtime::RuntimeError::InvalidInput(reason) = error else {
+                    panic!("expected InvalidInput, got {error:?}");
+                };
+                assert_eq!(
+                    reason,
+                    format!("cannot loosen {field}: stored {stored:?}, passed {passed:?}")
+                );
+                assert_eq!(
+                    serde_json::to_value(f.row(id).await).unwrap(),
+                    serde_json::to_value(&original).unwrap()
+                );
+                assert_eq!(f.registration_state().await, before);
+                assert!(f.registration_events(original.id).await.is_empty());
+            }
+        }
+
+        let f = Fixture::new();
+        let first = f.register_as("original-registrar", json!({
+            "name": "tightening", "source": "mcp:original", "side_effect": "read", "trust": "first_party"
+        })).await;
+        let id = &first["tool"]["full_id"];
+        let before = f.row(id).await;
+        let mut params = json!({"name": "tightening"});
+        params[field] = json!(order.last().unwrap());
+        let response = f.register_as("different-registrar", params).await;
+        assert_outcome(&response, false, true, false);
+        let after = f.row(id).await;
+        assert_eq!(
+            after.properties.as_ref().unwrap()[field],
+            json!(order.last().unwrap())
+        );
+        let events = f.registration_events(before.id).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "actor:different-registrar");
+        assert_eq!(
+            events[0].payload,
+            json!({
+                "actor": "actor:different-registrar", "id": before.id.to_string(),
+                "digest_before": RegistryPin::from_entity(&before).unwrap().definition_digest(),
+                "digest_after": RegistryPin::from_entity(&after).unwrap().definition_digest(),
+            })
+        );
+    }
 }

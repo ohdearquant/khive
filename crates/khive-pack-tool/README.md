@@ -19,14 +19,15 @@ These three flags describe the **registry entity row**. An unchanged row can
 still gain capability links or have its search index repaired. A successful
 creation returns `created:true`, `updated:false`, `unchanged:false`.
 
-| Field                            | Existing-name behavior                                                            |
-| -------------------------------- | --------------------------------------------------------------------------------- |
-| `kind`                           | Replace the subtype and its kind tag; retain other tags.                          |
-| `description`                    | Replace the description and update its search indexes.                            |
-| `schema`                         | Replace the entire object, including nested members; `{}` stores an empty object. |
-| `source`, `side_effect`, `trust` | Replace the supplied value.                                                       |
-| `tags`                           | Add extra tags without removing existing extra tags.                              |
-| `capabilities`                   | Create missing capability concepts and add missing `implements` links.            |
+| Field                  | Existing-name behavior                                                            |
+| ---------------------- | --------------------------------------------------------------------------------- |
+| `kind`                 | Replace the subtype and its kind tag; retain other tags.                          |
+| `description`          | Replace the description and update its search indexes.                            |
+| `schema`               | Replace the entire object, including nested members; `{}` stores an empty object. |
+| `source`               | Replace the supplied value, subject to stored declarations below.                 |
+| `side_effect`, `trust` | Replace only with the same or a later value in the orders below.                  |
+| `tags`                 | Add extra tags without removing existing extra tags.                              |
+| `capabilities`         | Create missing capability concepts and add missing `implements` links.            |
 
 Omitted and `null` optional fields preserve existing values. Empty tag and
 capability arrays remove nothing. The `tool`, `write` and `external` defaults
@@ -37,12 +38,27 @@ refuse the update or index repair; retry with the current definition. Index
 repair checks the live row revision before each text or vector publication, so
 a stale retry cannot overwrite indexes from a newer registration.
 
+If stored properties carry `network`, `executable_digest` or `program`, changing
+`source` or `kind` refuses, including changing one `exec:` path to another. The
+refusal names the stored declaration keys. Omitting those properties does not
+remove their restriction; an unchanged source or kind and unrelated metadata
+corrections remain allowed.
+
+Corrections cannot move `side_effect` earlier in `read`, `write`, `egress`,
+`irreversible`, or `trust` earlier in `first_party`, `marketplace`, `external`.
+This applies to every caller, including an actor other than the original
+registrar. A refusal names the field, stored value and passed value, preserves
+the row, and appends no `tool_registration_changed` event.
+
 Grants pin the registry UUID and a canonical digest of `source`, `side_effect`,
 `trust` and `schema`. Changing one of those inputs makes a grant for the old
 definition stop matching. The grant row is retained, and policy or the default
 decision can still allow the tool. Metadata and capability edits do not change
-that digest. Restoring the original four inputs can make its original grant
-match again; registration is not permanent grant revocation.
+that digest. Restoring original `source` or `schema` values can make an original
+grant match again when the source change is permitted. A `side_effect` or `trust`
+restoration must obey the same monotonic order; restoring a looser definition
+refuses and leaves its old grant inactive. Registration is not permanent grant
+revocation.
 
 `tool.ingest` retains its create-or-return behavior for existing names. Use
 `tool.register` to correct a stored definition. Retired registry names still

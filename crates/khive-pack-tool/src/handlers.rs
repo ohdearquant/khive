@@ -478,6 +478,68 @@ fn registration_changed_event(
     Ok(Some(event.with_payload(json!(payload))))
 }
 
+fn validate_registration_correction(
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<(), RuntimeError> {
+    let mut corrected = existing
+        .properties
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(Value::Object(properties)) = &patch.properties {
+        for (key, value) in properties {
+            corrected.insert(key.clone(), value.clone());
+        }
+    }
+    let stored = |key| {
+        existing
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+    };
+    let source_changed = corrected.get("source") != stored("source");
+    let kind_changed = patch
+        .entity_type
+        .as_ref()
+        .is_some_and(|kind| kind != &existing.entity_type);
+    let declarations: Vec<_> = ["network", "executable_digest", "program"]
+        .into_iter()
+        .filter(|key| corrected.get(*key).is_some())
+        .collect();
+    if (source_changed || kind_changed) && !declarations.is_empty() {
+        let changed = match (source_changed, kind_changed) {
+            (true, true) => "source and kind",
+            (true, false) => "source",
+            _ => "kind",
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "cannot change {changed} on a registration carrying stored properties: {}",
+            declarations.join(", ")
+        )));
+    }
+    for (field, order) in [("side_effect", SIDE_EFFECTS), ("trust", TRUST_ORIGINS)] {
+        let Some(previous) = stored(field).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(passed) = corrected.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if let (Some(before), Some(after)) = (
+            order.iter().position(|value| *value == previous),
+            order.iter().position(|value| *value == passed),
+        ) {
+            if after < before {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cannot loosen {field}: stored {previous:?}, passed {passed:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn registration_patch(existing: &Entity, spec: &RegisterSpec, supplied: &Value) -> EntityPatch {
     let present = |field| supplied.get(field).is_some_and(|value| !value.is_null());
     let mut patch = EntityPatch::default();
@@ -628,6 +690,7 @@ async fn register_with_updates(
                 || patch.properties.is_some()
                 || patch.tags.is_some()
             {
+                validate_registration_correction(&entity, &patch)?;
                 let required_event = registration_changed_event(token, &entity, &patch)?;
                 #[cfg(test)]
                 if let Ok((ready, resume)) = BEFORE_REGISTRATION_UPDATE.try_with(Clone::clone) {

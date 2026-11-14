@@ -415,7 +415,7 @@ async fn bootstrap_marks_legacy_null_pins_without_binding_them() {
 async fn re_registration_updates_definition_and_invalidates_only_mismatched_grants() {
     for (field, value) in [
         ("source", json!("mcp:changed")),
-        ("side_effect", json!("read")),
+        ("side_effect", json!("egress")),
         ("trust", json!("external")),
         ("schema", json!({"type":"object", "required":["changed"]})),
     ] {
@@ -480,9 +480,36 @@ async fn re_registration_updates_definition_and_invalidates_only_mismatched_gran
         assert_eq!(f.check("same").await["grant_id"], replacement_id);
         let mut restore = json!({"name":"same"});
         restore[field] = original.properties.as_ref().unwrap()[field].clone();
-        f.call("tool.register", restore).await;
-        assert_eq!(f.check("same").await["grant_id"], id);
+        if matches!(field, "side_effect" | "trust") {
+            let before = f.entity(&first["full_id"]).await;
+            let token = f.rt.authorize(Namespace::local()).unwrap();
+            let events = f.rt.events(&token).unwrap();
+            let filter = khive_storage::EventFilter {
+                target_id: Some(before.id),
+                kinds: vec![khive_types::EventKind::ToolRegistrationChanged],
+                ..Default::default()
+            };
+            let count = events.count_events(filter.clone()).await.unwrap();
+            let error = f
+                .registry
+                .dispatch("tool.register", restore)
+                .await
+                .expect_err("restoring a looser side effect or more trusted origin refuses");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
+            assert_eq!(
+                serde_json::to_value(f.entity(&first["full_id"]).await).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(events.count_events(filter).await.unwrap(), count);
+            assert_eq!(f.check("same").await["grant_id"], replacement_id);
+            assert_ne!(f.check("same").await["grant_id"], id);
+        } else {
+            f.call("tool.register", restore).await;
+            assert_eq!(f.check("same").await["grant_id"], id);
+        }
         assert_eq!(f.row(&id).await, grant);
+        assert_eq!(f.row(&replacement_id).await, replacement);
     }
 }
 
