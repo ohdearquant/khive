@@ -379,7 +379,13 @@ where
         if let Err(error) = preflight() {
             // Nothing was sent. Preserve the configuration refusal instead
             // of waiting for a child that cannot bind its events socket.
-            return Some(Err(McpError::invalid_params(format!("{error:#}"), None)));
+            return Some(Err(McpError::invalid_params(
+                format!("{error:#}"),
+                Some(serde_json::json!({
+                    "reason": "daemon_launch_preflight",
+                    "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+                })),
+            )));
         }
     }
     let mut initial_supervisor_marker: Option<SupervisorMarker> = None;
