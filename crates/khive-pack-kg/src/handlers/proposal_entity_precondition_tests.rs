@@ -523,7 +523,8 @@ async fn propose_supersede_entity_preserves_merged_operand_redirects() {
         for depth in [0, 2] {
             let old = f.entity("Old before merge", "local").await;
             let new = f.entity("New before merge", "local").await;
-            let kept = f.entity("Kept merge target", "local").await;
+            let consumed_name = if old_operand { &old.name } else { &new.name };
+            let kept = f.entity(&format!("{consumed_name} kept"), "local").await;
             let consumed = if old_operand { old.id } else { new.id };
             f.call(
                 "merge",

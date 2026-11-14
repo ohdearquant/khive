@@ -2202,7 +2202,8 @@ mod supersede_liveness {
                     let proposal = f.propose(&supersede(f.old, f.new, nested)).await;
                     let invalid = if old_operand { f.old } else { f.new };
                     let detail = if merged {
-                        let kept = f.entity("Kept merge target", "local").await;
+                        let kept_name = if old_operand { "Old kept" } else { "New kept" };
+                        let kept = f.entity(kept_name, "local").await;
                         f.call("merge", json!({"into_id": kept, "from_id": invalid}))
                             .await;
                         let tombstone = f
