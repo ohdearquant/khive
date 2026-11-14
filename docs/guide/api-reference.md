@@ -3187,6 +3187,19 @@ resolving or auto-creating the repo-anchor
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 ```
 
+The verb reads only the sources the config's `[git_digest]` section names. A local path is
+resolved, symlinks included, and must lie under a resolved `local_roots` entry; a remote must
+name the same repository as a `remotes` entry once the trailing `/` and `.git` are removed and
+the host is lowercased. Both lists are empty by default, which refuses every source. Every
+source outside the lists gives one message, `source ... is not a configured git.digest source`,
+and that check runs before the path is read.
+
+```toml
+[git_digest]
+local_roots = ["/srv/repos"]
+remotes = ["https://github.com/org/repo"]
+```
+
 The result includes `writes_refused`, a per-call count of record writes blocked by the
 secret gate, and `write_refusals`, one safe structured diagnostic per refusal. Each
 diagnostic names the attempted `verb`, the provenance `record_kind` and natural

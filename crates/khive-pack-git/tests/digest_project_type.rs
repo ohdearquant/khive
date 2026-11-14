@@ -14,6 +14,10 @@ fn registry() -> VerbRegistry {
         wal_ceiling_env_raw: None,
         actor_id: None,
         brain_profile: None,
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: vec!["https://example.invalid/strict-project/repo".to_string()],
+        },
         ..RuntimeConfig::default()
     })
     .unwrap();

@@ -382,6 +382,11 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
         default_namespace: Namespace::local(),
         packs: packs.clone(),
         actor_id: None,
+        // The dedicated server reads only the repository this build was given.
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![source.repo.clone()],
+            remotes: Vec::new(),
+        },
         ..RuntimeConfig::no_embeddings()
     })
     .map_err(|error| anyhow::anyhow!(error))

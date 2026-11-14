@@ -705,6 +705,26 @@ pub struct KnowledgeSectionConfig {
     pub import_roots: Vec<std::path::PathBuf>,
 }
 
+/// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
+/// lists refuse every source of that kind.
+///
+/// ```toml
+/// [git_digest]
+/// local_roots = ["/srv/repos"]
+/// remotes = ["https://github.com/example/repo"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitDigestSectionConfig {
+    /// Absolute directories a local source may resolve under, symlinks included.
+    #[serde(default)]
+    pub local_roots: Vec<std::path::PathBuf>,
+    /// `https://` repositories a remote source may name, compared after the
+    /// trailing `/` and `.git` are removed and the host is lowercased.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
 impl KnowledgeSectionConfig {
     /// The configured roots that resolve to existing directories, resolved. A root
     /// that does not resolve admits nothing.
@@ -1470,9 +1490,10 @@ where
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
 /// - `[knowledge]`: directories `knowledge.import` may read
+/// - `[git_digest]`: sources `git.digest` may read
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]` and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]` and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1579,6 +1600,10 @@ pub struct KhiveConfig {
     /// Knowledge-pack policy: the directories `knowledge.import` may read.
     #[serde(default)]
     pub knowledge: KnowledgeSectionConfig,
+
+    /// The local roots and remote repositories `git.digest` may read.
+    #[serde(default)]
+    pub git_digest: GitDigestSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
@@ -2016,6 +2041,28 @@ impl KhiveConfig {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "knowledge.import_roots".to_owned(),
                 reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .git_digest
+            .local_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.local_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !remote.starts_with("https://"))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!("{remote:?} is not an https:// URL"),
             });
         }
 

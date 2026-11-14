@@ -2974,3 +2974,34 @@ fn knowledge_import_roots_parse_closed_and_absolute() {
         "{error}"
     );
 }
+
+#[test]
+fn git_digest_sources_parse_closed_and_checked() {
+    let parsed: KhiveConfig = toml::from_str(
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/a\"]\n",
+    )
+    .unwrap();
+    parsed
+        .validate()
+        .expect("absolute roots and https remotes validate");
+    assert_eq!(
+        parsed.git_digest.local_roots,
+        vec![PathBuf::from("/srv/repos")]
+    );
+    assert!(KhiveConfig::default().git_digest == GitDigestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[git_digest]\nroots = []\n").is_err());
+
+    let relative: KhiveConfig =
+        toml::from_str("[git_digest]\nlocal_roots = [\"repos\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("git_digest.local_roots"),
+        "{error}"
+    );
+
+    let ssh: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
+    let error = ssh.validate().expect_err("a non-https remote is refused");
+    assert!(error.to_string().contains("git_digest.remotes"), "{error}");
+}

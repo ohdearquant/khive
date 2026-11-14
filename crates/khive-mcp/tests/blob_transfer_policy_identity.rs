@@ -154,3 +154,27 @@ fn knowledge_import_roots_distinguish_daemon_identity_without_changing_the_empty
         "different roots cannot share a warm daemon"
     );
 }
+
+#[test]
+#[serial_test::serial(blob_transfer_environment)]
+fn git_digest_sources_distinguish_daemon_identity_without_changing_the_empty_identity() {
+    let _environment = TransferEnvironment::unset();
+    let base = base_config();
+    let empty = runtime_config_from_khive_config(&KhiveConfig::default(), base.clone());
+    let local: KhiveConfig = toml::from_str("[git_digest]\nlocal_roots = [\"/srv/a\"]\n").unwrap();
+    let remote: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"https://example.com/a\"]\n").unwrap();
+    let empty_id = compute_config_id(&empty, None);
+    assert_eq!(empty_id, transfer_disabled_identity(&empty));
+    let local_id = compute_config_id(
+        &runtime_config_from_khive_config(&local, base.clone()),
+        None,
+    );
+    let remote_id = compute_config_id(&runtime_config_from_khive_config(&remote, base), None);
+    assert!(local_id.starts_with(&format!("{empty_id};git_digest_sources=")));
+    assert!(remote_id.starts_with(&format!("{empty_id};git_digest_sources=")));
+    assert_ne!(
+        local_id, remote_id,
+        "different sources cannot share a warm daemon"
+    );
+}

@@ -593,13 +593,24 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         hasher.update(serde_json::to_vec(&config.knowledge.import_roots).expect("paths serialize"));
         format!(";knowledge_import_roots={:x}", hasher.finalize())
     };
+    let git_digest_sources = if config.git_digest == Default::default() {
+        String::new()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(b"khive.git-digest-sources.v1");
+        hasher.update(
+            serde_json::to_vec(&(&config.git_digest.local_roots, &config.git_digest.remotes))
+                .expect("sources serialize"),
+        );
+        format!(";git_digest_sources={:x}", hasher.finalize())
+    };
     let disk_guard = disk_guard_policy_fingerprint(config, khive_cfg, storage_read_only);
     // Operator policy applies with implicit main as well as declared backends.
     let disabled_verbs = khive_cfg
         .map(disabled_verb_policy_suffix)
         .unwrap_or_default();
     format!(
-        "{base}{topology}{blob_file_transfers}{knowledge_import_roots}{disk_guard}{disabled_verbs}"
+        "{base}{topology}{blob_file_transfers}{knowledge_import_roots}{git_digest_sources}{disk_guard}{disabled_verbs}"
     )
 }
 

@@ -285,6 +285,10 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
                 .collect(),
             ..Default::default()
         },
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: Vec::new(),
+        },
         ..RuntimeConfig::no_embeddings()
     })
     .expect("memory runtime");

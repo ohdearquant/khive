@@ -177,8 +177,8 @@ pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
     BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig,
-    ResolvedWalCeiling, StorageSectionConfig,
+    GitDigestSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+    KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
