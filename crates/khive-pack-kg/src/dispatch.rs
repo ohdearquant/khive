@@ -73,7 +73,12 @@ async fn run_kg_embedder_warm(
         // Preserve the ordinary timing boundary after the start append returns.
         let phase_start = std::time::Instant::now();
         let cpu_start = khive_runtime::process_resource_usage();
-        let result = job.run_body(runtime.embed("khive warmup")).await;
+        let result = job
+            .run_body(async {
+                khive_runtime::resource_admission::wait_until_not_quiet().await;
+                runtime.embed("khive warmup").await
+            })
+            .await;
         (phase_start, cpu_start, result)
     } else {
         tracing::warn!(

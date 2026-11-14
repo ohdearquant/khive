@@ -6,19 +6,27 @@ delivery confirmation, and channel polling observability.
 
 ## Verbs
 
-| Verb             | What it does                                                                                                                                                  |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`      | Send a message, optionally threaded                                                                                                                           |
-| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
-| `comm.transport_status` | Read the sender-local transport state for an outbound UUID |
-| `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
-| `comm.read`      | Fetch one or up to 500 inbound messages and mark them read; `body=false` returns only the prior acknowledgement shape                                         |
-| `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
-| `comm.unread`    | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                          |
-| `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
-| `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
-| `comm.health`    | Read a bounded heartbeat-first channel snapshot, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                    |
-| `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
+| Verb                    | What it does                                                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`             | Send a message, optionally threaded                                                                                                                           |
+| `comm.delivered`        | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
+| `comm.transport_status` | Read the sender-local transport state for an outbound UUID                                                                                                    |
+| `comm.inbox`            | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
+| `comm.read`             | Fetch one or up to 500 inbound messages and mark them read; `body=false` returns only the prior acknowledgement shape                                         |
+| `comm.mark_read`        | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
+| `comm.unread`           | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                          |
+| `comm.reply`            | Reply to a message, preserving thread linkage                                                                                                                 |
+| `comm.thread`           | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.health`           | Read a bounded heartbeat-first channel snapshot, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                    |
+| `comm.probe`            | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
+| `comm.quiet`            | Request a bounded process-wide quiet window for cooperative background warm and maintenance work                                                              |
+
+`comm.quiet(ttl_secs=30)` returns `{quiet_until: "<RFC3339 UTC>"}`. Requests
+combine by the later monotonic deadline, so a shorter request cannot shorten an
+active window. `comm.health.resource.quiet_until` is always present and becomes
+null on expiry. This is process-wide cooperative deferral; in-flight work,
+foreground requests, finalization and shutdown continue. See the
+[channel health and quiet reference](docs/api/channel-health.md#commquiet--bounded-background-deferral).
 
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message

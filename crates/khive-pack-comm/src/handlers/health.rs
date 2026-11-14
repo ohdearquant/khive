@@ -396,6 +396,8 @@ fn resource_value(
         "rss_bytes": current,
         "max_rss_bytes": usage.map(|u| u.max_rss_bytes),
         "active_phases": phases,
+        "quiet_until": khive_runtime::resource_admission::quiet_until()
+            .map(|until| until.to_rfc3339()),
     })
 }
 

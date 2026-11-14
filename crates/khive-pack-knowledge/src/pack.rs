@@ -143,7 +143,10 @@ async fn run_knowledge_embedder_warm(
         let phase_start = std::time::Instant::now();
         let cpu_start = khive_runtime::process_resource_usage();
         let result = job
-            .run_body(runtime.embed("__khive_knowledge_warm__"))
+            .run_body(async {
+                khive_runtime::resource_admission::wait_until_not_quiet().await;
+                runtime.embed("__khive_knowledge_warm__").await
+            })
             .await;
         (phase_start, cpu_start, result)
     } else {

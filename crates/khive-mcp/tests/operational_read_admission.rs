@@ -364,6 +364,112 @@ async fn real_inbox_and_gtd_next_survive_admission_deadline_expiry() {
     occupant.abort();
 }
 
+#[test]
+#[serial(config_ledger)]
+fn real_quiet_keeps_strict_failure_under_full_audit_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    if khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_MCP_QUIET_ADMISSION_CHILD",
+        false,
+        |command| {
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("KHIVE_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(directory.path())
+                .env("HOME", directory.path())
+                .env("LATTICE_MODEL_CACHE", directory.path().join("models"))
+                .env("KHIVE_BLOB_ROOT", directory.path().join("blobs"))
+                .env("KHIVE_VOLUME_LOCK_DIR", directory.path().join("locks"));
+        },
+    ) {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let (seed, registry, outbound_id, _) = seeded_registry(
+                    AuditBatchConfig {
+                        max_pending_rows: NonZeroUsize::new(1).unwrap(),
+                        ..AuditBatchConfig::default()
+                    },
+                    Arc::new(MemoryEventStore::default()),
+                )
+                .await;
+                let before = seed.dispatch("comm.health", json!({})).await.unwrap();
+                assert!(before["resource"]["quiet_until"].is_null());
+                let (batch, occupant) = occupy_generation(&registry).await;
+                let filler_batch = Arc::clone(&batch);
+                let filler = tokio::spawn(async move {
+                    filler_batch
+                        .submit(PreparedAuditRow {
+                            event: audit_event("acceptance.quiet_filler"),
+                            producer: AuditProducer::ConfigLocked,
+                        })
+                        .await
+                });
+                wait_until(Duration::from_secs(5), || {
+                    batch.test_snapshot().pending_rows == 1
+                })
+                .await;
+
+                let error = registry
+                    .dispatch_with_disposition("comm.quiet", json!({"ttl_secs": 30}), None)
+                    .await
+                    .expect_err("process control must not degrade into an operational read");
+                let (error, disposition) = error.into_parts();
+                assert_eq!(disposition, khive_runtime::DomainDisposition::Committed);
+                let khive_runtime::RuntimeError::AuditObligation {
+                    failure,
+                    domain_result,
+                } = error
+                else {
+                    panic!("expected the typed post-dispatch audit failure, got {error:?}");
+                };
+                assert_eq!(failure.verb, "comm.quiet");
+                assert_eq!(
+                    failure.reason,
+                    khive_runtime::AuditObligationReason::Terminal(
+                        AuditTerminalReason::QueueAdmissionExhausted
+                    )
+                );
+                assert!(domain_result["quiet_until"].is_string());
+                // The handler ran before audit admission; this error is not rollback.
+                let after = seed.dispatch("comm.health", json!({})).await.unwrap();
+                assert_eq!(
+                    after["resource"]["quiet_until"],
+                    domain_result["quiet_until"]
+                );
+
+                for (verb, params) in [
+                    ("comm.health", json!({})),
+                    ("comm.probe", json!({"actor": "local"})),
+                ] {
+                    let before_refused = audit_admission_refused_obligation_count();
+                    let result = registry
+                        .dispatch_with_disposition(verb, params, None)
+                        .await
+                        .unwrap();
+                    assert_normal_read_shape(verb, &result, &outbound_id);
+                    assert_eq!(
+                        audit_admission_refused_obligation_count(),
+                        before_refused + 1
+                    );
+                }
+                assert_eq!(batch.test_snapshot().pending_rows, 1);
+                occupant.abort();
+                filler.abort();
+            })
+            .await
+            .expect("isolated quiet audit fixture must settle within its watchdog");
+        });
+}
+
 #[tokio::test]
 #[serial]
 #[serial(config_ledger)]

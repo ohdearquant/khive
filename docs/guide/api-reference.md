@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 6     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 16    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -2140,7 +2140,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 15 verbs
+## `comm` pack — 16 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2419,11 +2419,41 @@ permanently purges it. There is deliberately no automatic "release as trusted" p
 Generic message `create`/`update` mutations cannot set `channel_kind`, `channel_slug`, or
 `quarantined`; those transport-owned fields are established only by `comm.ingest`.
 
+The process-level `resource.quiet_until` is always present: the active quiet
+window's RFC3339 UTC deadline, or null after monotonic expiry. It is shared
+across namespaces in the executing process.
+
 No parameters.
 
 ```
 request(ops="comm.health()")
 ```
+
+### `comm.quiet` — Directive
+
+Request a process-wide cooperative quiet window for background warm and
+maintenance work. Ordinary caller write policy applies.
+
+| Param      | Type    | Required | Notes                                                                                 |
+| ---------- | ------- | -------- | ------------------------------------------------------------------------------------- |
+| `ttl_secs` | integer | yes      | 1 through 300, inclusive. Invalid or unknown parameters refuse before changing state. |
+
+```
+request(ops="comm.quiet(ttl_secs=30)")
+```
+
+Canonical dispatch applies its normal integer normalization: a whole-valued
+JSON number such as `1.0` is accepted; `1.5` is refused.
+
+Returns `{quiet_until: "<RFC3339 UTC deadline>"}`. Renewals keep the later
+monotonic deadline; shorter requests cannot revoke an active window.
+`comm.health.resource.quiet_until` is always present and becomes null on expiry.
+The deadline spans namespaces in the executing process, is not durable and does
+not coordinate other daemons. It is checked at background supervisor entry,
+before KG/Knowledge background embedding and before Knowledge snapshot warming.
+Foreground work, in-flight work, finalization, shutdown and channel delivery
+continue. Normal audit failure after handler execution does not roll back the
+deadline. See the [full quiet contract](../../crates/khive-pack-comm/docs/api/channel-health.md#commquiet--bounded-background-deferral).
 
 ### `comm.suppression_add` — Commissive
 

@@ -80,6 +80,7 @@ struct Probe {
     calls: AtomicUsize,
     dropped: AtomicBool,
     inputs: Mutex<Vec<String>>,
+    quiet_at_entry: Mutex<Vec<bool>>,
 }
 impl Probe {
     fn new() -> Arc<Self> {
@@ -89,6 +90,7 @@ impl Probe {
             calls: AtomicUsize::new(0),
             dropped: AtomicBool::new(false),
             inputs: Mutex::new(vec![]),
+            quiet_at_entry: Mutex::new(vec![]),
         })
     }
 }
@@ -139,6 +141,11 @@ impl EmbeddingService for Service {
         _: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
         let _drop = CallDrop(self.probe.clone());
+        self.probe
+            .quiet_at_entry
+            .lock()
+            .unwrap()
+            .push(khive_runtime::resource_admission::quiet_until().is_some());
         self.probe.calls.fetch_add(1, Ordering::SeqCst);
         self.probe.inputs.lock().unwrap().extend_from_slice(texts);
         self.probe.entered.notify_one();
@@ -375,4 +382,139 @@ async fn read_only_configured_knowledge_warm_never_enters_the_writer_plane() {
         "actual configured warm phase emission must preserve read-only early return"
     );
     assert_eq!(*probe.inputs.lock().unwrap(), ["__khive_knowledge_warm__"]);
+}
+
+fn quiet_stage_child() -> bool {
+    let mut fixture = None;
+    khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_QUIET_STAGE_CHILD",
+        false,
+        |command| {
+            let mut builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir().unwrap();
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("KHIVE_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .env("HOME", directory.path())
+                .env("KHIVE_TEST_HARNESS", "1");
+            fixture = Some(directory);
+        },
+    )
+}
+
+async fn quiet_after_start(cancel: bool) {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::Action;
+
+    let wall = WallClock::new();
+    wall.wait(async {
+        let (runtime, probe) = configured(true, false);
+        let _close = CloseOnDrop(runtime.background_domain().control());
+        let requested = Arc::new(AtomicBool::new(false));
+        let requested_hook = requested.clone();
+        // Request quiet from the actual first phase INSERT, after the common
+        // supervisor-entry check. This makes the pre-embed checkpoint essential.
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit(move |connection| {
+                connection
+                    .test_update_hook(Some(move |action, _: &str, table: &str, _| {
+                        if matches!(action, Action::SQLITE_INSERT)
+                            && table == "events"
+                            && !requested_hook.swap(true, Ordering::SeqCst)
+                        {
+                            assert_eq!(khive_runtime::resource_admission::quiet_until(), None);
+                            khive_runtime::resource_admission::request_quiet(if cancel {
+                                300
+                            } else {
+                                1
+                            })
+                            .unwrap();
+                        }
+                    }))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let pack = KnowledgePack::new_with_index_role(runtime.clone(), false);
+        let warm = tokio::spawn(async move { pack.warm().await });
+        while phases(&wall, &runtime).await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requested.load(Ordering::SeqCst),
+            "actual phase insert established quiet"
+        );
+        let started = phases(&wall, &runtime).await;
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].kind, EventKind::PhaseStarted);
+        if cancel {
+            assert_eq!(
+                probe.calls.load(Ordering::SeqCst),
+                0,
+                "quiet arrived between phase start and inference"
+            );
+            runtime
+                .background_domain()
+                .control()
+                .close(Instant::now() + Duration::from_secs(2));
+            terminal(&wall, &runtime, EventKind::PhaseCancelled).await;
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                khive_runtime::resource_admission::quiet_until().is_some(),
+                "terminal finalization does not wait for quiet expiry"
+            );
+        } else {
+            entered(&wall, &probe).await;
+            assert_eq!(
+                *probe.quiet_at_entry.lock().unwrap(),
+                [false],
+                "actual provider entry must follow quiet expiry"
+            );
+            probe.release.notify_one();
+            terminal(&wall, &runtime, EventKind::PhaseCompleted).await;
+        }
+        warm.await.unwrap();
+        runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit(|connection| {
+                connection
+                    .test_update_hook(None::<fn(Action, &str, &str, i64)>)
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        stop(&wall, &runtime).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn quiet_after_phase_start_defers_actual_embedder_entry() {
+    if quiet_stage_child() {
+        return;
+    }
+    quiet_after_start(false).await;
+}
+
+#[tokio::test]
+async fn quiet_after_phase_start_cancels_without_delaying_terminal_event() {
+    if quiet_stage_child() {
+        return;
+    }
+    quiet_after_start(true).await;
 }

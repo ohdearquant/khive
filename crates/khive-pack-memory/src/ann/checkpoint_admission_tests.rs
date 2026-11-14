@@ -273,3 +273,263 @@ fn checkpoint_unsuccessful_dispositions_survive_claim_release() {
         drop(CheckpointClaim::take(&ann, &key).expect("timed-out attempt releases claim"));
     });
 }
+
+fn quiet_checkpoint_child() -> bool {
+    let mut fixture = None;
+    khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_QUIET_CHECKPOINT_CHILD",
+        false,
+        |command| {
+            let mut builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir().unwrap();
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("KHIVE_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .env("HOME", directory.path())
+                .env("KHIVE_TEST_HARNESS", "1");
+            fixture = Some(directory);
+        },
+    )
+}
+
+const QUIET_CHECKPOINT_MODEL: &str = "quiet-checkpoint-model";
+struct QuietCheckpointEmbedder;
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for QuietCheckpointEmbedder {
+    fn name(&self) -> &str {
+        QUIET_CHECKPOINT_MODEL
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+        Ok(Arc::new(QuietCheckpointEmbedder))
+    }
+}
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for QuietCheckpointEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|text| vec![1.0, text.len() as f32])
+            .collect())
+    }
+    fn supports_model(&self, _: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "quiet-checkpoint-fixture"
+    }
+}
+
+async fn quiet_checkpoint_fixture(cancel: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(directory.path().join("checkpoint.db")),
+        volume_lock_dir: Some(directory.path().join("locks")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    rt.try_register_embedder(QuietCheckpointEmbedder).unwrap();
+    assert_eq!(
+        rt.registered_embedding_model_names(),
+        vec![QUIET_CHECKPOINT_MODEL.to_owned()]
+    );
+    assert_eq!(
+        rt.embedding_models_for_note_kind("memory"),
+        vec![QUIET_CHECKPOINT_MODEL.to_owned()]
+    );
+    let _close = CloseOnDrop::new(&rt);
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let mut expected_ids = HashSet::new();
+    for content in ["first quiet checkpoint note", "second distinct note"] {
+        let note = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                content,
+                Some(0.8),
+                0.01,
+                None,
+                vec![],
+                // Note-kind policy selects the registered custom provider;
+                // explicit model overrides accept built-in lattice aliases only.
+                None,
+            )
+            .await
+            .unwrap();
+        expected_ids.insert(note.id);
+    }
+    let ann = new_shared_for_role(true);
+    assert_eq!(
+        ensure_ann_for_model(&rt, &token, &ann, QUIET_CHECKPOINT_MODEL)
+            .await
+            .unwrap(),
+        AnnEnsureStatus::Built { vectors: 2 }
+    );
+    let watermark_before = read_own_watermark(&rt, QUIET_CHECKPOINT_MODEL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        watermark_before > 0,
+        "production ensure durably protects the seeded corpus"
+    );
+    let third = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "third new checkpoint tail note",
+            Some(0.8),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    expected_ids.insert(third.id);
+    let key = AnnKey::new(QUIET_CHECKPOINT_MODEL);
+    let old = Instant::now() - Duration::from_secs(301);
+    {
+        let mut indexes = ann.indexes.write().await;
+        let bridge = indexes.get_mut(&key).unwrap();
+        bridge.dirty_ops = 1;
+        bridge.last_checkpoint = old;
+    }
+    ann.checkpoint_policy.write().unwrap().interval = Duration::from_secs(300);
+    let events = rt.events(&token).unwrap();
+    let filter = khive_storage::EventFilter {
+        verbs: vec!["memory.ann_warm".into()],
+        ..Default::default()
+    };
+    let page = khive_storage::PageRequest {
+        limit: 100,
+        offset: 0,
+    };
+    let before: HashSet<_> = events
+        .query_events(filter.clone(), page.clone())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let timer = CheckpointTimer {
+        claim: CheckpointClaim::take(&ann, &key).unwrap(),
+        delay: Duration::ZERO,
+        checkpoint: old,
+    };
+    let shutdown = CancellationToken::new();
+    let tracking = TrackedJob::register("quiet_checkpoint_fixture");
+    let quiet_deadline =
+        khive_runtime::resource_admission::request_quiet(if cancel { 300 } else { 1 }).unwrap();
+    let mut attempt = Box::pin(run_timer_tracked(&rt, timer, shutdown.clone(), &tracking));
+    if cancel {
+        queued(attempt.as_mut()).await;
+        assert!(ann.checkpoint_timers.lock().unwrap().contains(&key));
+        shutdown.cancel();
+        assert!(attempt.await.is_none());
+        while !ann.checkpoint_timers.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert!(khive_runtime::resource_admission::quiet_until().is_some());
+        assert_eq!(
+            read_own_watermark(&rt, QUIET_CHECKPOINT_MODEL)
+                .await
+                .unwrap(),
+            Some(watermark_before)
+        );
+        assert_eq!(ann.indexes.read().await.get(&key).unwrap().dirty_ops, 1);
+    } else {
+        assert!(attempt.await.is_none());
+        assert_eq!(khive_runtime::resource_admission::quiet_until(), None);
+        assert!(
+            read_own_watermark(&rt, QUIET_CHECKPOINT_MODEL)
+                .await
+                .unwrap()
+                .unwrap()
+                > watermark_before,
+            "actual checkpoint advances durable protection over the new vector"
+        );
+        let indexes = ann.indexes.read().await;
+        let bridge = indexes
+            .get(&key)
+            .expect("checkpoint retains populated bridge");
+        assert_eq!(
+            bridge.dirty_ops, 0,
+            "successful checkpoint clears dirtiness"
+        );
+        assert!(bridge.last_checkpoint > old);
+        assert_eq!(
+            bridge.id_map.iter().copied().collect::<HashSet<_>>(),
+            expected_ids
+        );
+    }
+    let rows: Vec<_> = events
+        .query_events(filter, page)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|row| !before.contains(&row.id))
+        .collect();
+    if cancel {
+        assert!(
+            rows.is_empty(),
+            "cancelled pre-entry timer invents no phase pair"
+        );
+    } else {
+        assert_eq!(rows.len(), 2);
+        let started = rows
+            .iter()
+            .find(|row| row.kind == khive_types::EventKind::PhaseStarted)
+            .unwrap();
+        assert!(
+            started.created_at >= quiet_deadline.timestamp_micros(),
+            "actual phase-entry timestamp, not observer scheduling, proves deferral"
+        );
+        let completed = rows
+            .iter()
+            .find(|row| row.kind == khive_types::EventKind::PhaseCompleted)
+            .unwrap();
+        assert!(matches!(
+            completed.payload["path"].as_str(),
+            Some("full_build" | "incremental_in_place" | "incremental_checkpoint")
+        ));
+    }
+    assert!(ann.checkpoint_timers.lock().unwrap().is_empty());
+    drop(
+        CheckpointClaim::take(&ann, &key).expect("quiet attempt releases its single-flight claim"),
+    );
+}
+
+#[tokio::test]
+async fn quiet_defers_real_checkpoint_then_resumes() {
+    if quiet_checkpoint_child() {
+        return;
+    }
+    WallClock::new().wait(quiet_checkpoint_fixture(false)).await;
+}
+
+#[tokio::test]
+async fn quiet_checkpoint_shutdown_releases_claim_without_phase() {
+    if quiet_checkpoint_child() {
+        return;
+    }
+    WallClock::new().wait(quiet_checkpoint_fixture(true)).await;
+}

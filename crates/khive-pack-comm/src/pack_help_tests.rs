@@ -9,6 +9,23 @@ fn find_handler(name: &str) -> &'static HandlerDef {
 }
 
 #[test]
+fn quiet_is_a_public_directive_with_required_integer_ttl() {
+    let handler = find_handler("comm.quiet");
+    assert_eq!(handler.visibility, Visibility::Verb);
+    assert_eq!(handler.category, VerbCategory::Directive);
+    assert_eq!(handler.params.len(), 1);
+    let ttl = &handler.params[0];
+    assert_eq!(ttl.name, "ttl_secs");
+    assert_eq!(ttl.param_type, "integer");
+    assert!(ttl.required);
+    assert!(handler.description.contains("1..=300"));
+    assert!(handler.description.contains("monotonic"));
+    assert!(find_handler("comm.health")
+        .description
+        .contains("quiet_until"));
+}
+
+#[test]
 fn send_has_required_to_and_content() {
     let h = find_handler("comm.send");
     assert!(!h.params.is_empty(), "send must have non-empty params");
