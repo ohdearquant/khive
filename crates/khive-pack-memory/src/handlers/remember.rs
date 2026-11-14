@@ -60,12 +60,15 @@ const MAX_PROPERTIES_BYTES: usize = 8192;
 /// `attribution` is written by the runtime, and `supersedes` is written by
 /// `memory.apply_batch` (recall hides the row it names).
 const RESERVED_PROPERTY_KEYS: [(&str, &str); 4] = [
-    ("memory_type", "memory_type has its own parameter"),
-    ("tags", "tags has its own parameter"),
-    ("attribution", "attribution is written by the runtime"),
+    ("memory_type", "use the top-level memory_type parameter"),
+    ("tags", "use the top-level tags parameter"),
+    (
+        "attribution",
+        "omit attribution; the runtime sets it for anonymous callers",
+    ),
     (
         "supersedes",
-        "supersedes is written by memory.apply_batch; use link(relation=\"supersedes\") to add a supersedes edge",
+        "use a memory.apply_batch row with action=\"supersede\", or link(relation=\"supersedes\") from the new memory to the old memory",
     ),
 ];
 
