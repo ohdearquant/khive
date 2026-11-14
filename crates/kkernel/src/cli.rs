@@ -1632,6 +1632,7 @@ mod tests {
             namespace: None,
             no_embed: true,
             pack: Vec::new(),
+            catalog_verbosity: khive_mcp::args::CatalogVerbosity::Full,
             config: Some(config_path.clone()),
             daemon: false,
             lifetime: None,
