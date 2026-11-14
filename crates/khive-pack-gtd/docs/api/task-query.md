@@ -56,6 +56,20 @@ tasks. For example, a default page of 50 out of 51 matching tasks has
 complete array. An exactly full page of 50 out of 50 remains an array. There is
 no new cursor or total-count field.
 
+Consumers must accept either a bare array or an object's `tasks` array.
+Continue when `has_more` is true; the presence of an object or a full page
+alone does not establish continuation. An older short-page loop remains
+valid only if it accepts both shapes and compares the row count with the
+effective clamped limit, not the requested limit. It can require an extra
+empty request after an exactly full final page.
+
+For a known nonempty object page, a chained read can select
+`$prev.tasks[0].id`; a nonempty bare array uses `$prev[0].id`. When the shape
+or presence of a row is unknown, inspect the page before issuing a separate
+call with the chosen identifier. Indexing an object directly with `$prev[0]`
+produces a `substitution_error` with reason `path_wrong_type`; see the
+[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-proposed-2026-11-13-disclose-task-page-continuation-6549).
+
 Continuation describes matching live task rows, including blocked or broken
 tasks. Dependency diagnostics annotate these rows; they do not remove tasks
 from the page. The separate `filter_excluded` probe checks for an excluded
@@ -67,6 +81,12 @@ diagnostics use subsequent reads, and successive offset pages do not share a
 snapshot: concurrent inserts or deletions can shift page boundaries. One extra
 returned row does not bound the work needed to evaluate filters or an offset.
 JSON and table formats preserve the continuation marker.
+
+This continuation contract does not apply to `gtd.next`. That verb selects
+at most its effective limit by priority and truncates further candidates
+without a `has_more` marker. Its limit-clamp report is not a completeness
+signal. Use paged `gtd.tasks` for inventory, with its different ordering and
+dependency diagnostics.
 
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 
