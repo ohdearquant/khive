@@ -1049,3 +1049,50 @@ This amendment is the named non-CRUD exception in
 Its writer scope is the GTD repair entry in ADR-091 Amendment 20: prepare
 all evidence, provenance and bindings before admission, then execute only the
 guarded UPDATE and audit INSERT with bounded result bookkeeping.
+
+## Amendment 8 (proposed, 2026-11-13): disclose task-page continuation (#6549)
+
+**Status: proposed; awaiting contract approval.** This amendment changes the
+response of an incomplete `gtd.tasks` page. It does not change the status of
+proposed Amendment 3 or alter task lifecycle, visibility, filter, dependency,
+ordering, or timestamp policy.
+
+`gtd.tasks` keeps its default limit of 50, effective limit of 1–200, and existing
+offset. It requests `effective_limit + 1` rows through the existing count-free
+query with the complete task filter and namespace scope. The result order
+remains `created_at DESC, id ASC`. If the query returns more than the effective
+limit, the handler records that another matching row exists and truncates to
+the limit before computing dependency diagnostics.
+
+An incomplete page returns an object with `tasks` containing the retained page
+and `has_more: true`. When the requested limit is above 200, the same object
+retains `requested_limit`, `effective_limit`, and `limit_clamped: true`. These
+signals are independent: a requested limit can be clamped even when the page
+contains every matching task. A requested zero still selects one row without
+the upper-limit clamp report.
+
+An exhausted page keeps its existing shape: an ordinary complete or empty
+array, a limit-clamp object, or the existing `filter_excluded`/`hint` object.
+An exactly full final page is exhausted, so equality between the returned row
+count and the limit does not establish continuation. No false-valued
+`has_more` field is introduced. JSON and table rendering must retain the true
+marker when it is present.
+
+This deliberately changes incomplete responses that previously were bare
+arrays into objects. Callers using array-index result paths must select
+`tasks` for an incomplete page. It does not migrate every response to an
+object, and it adds neither a cursor protocol nor an exact total.
+
+Callers advance the existing offset by the number of returned tasks and keep
+the same filters. The extra row and the retained rows are observed in the same
+page-query snapshot; separate offset calls do not share a snapshot, so
+concurrent inserts or deletions can shift later pages. Dependency diagnostics
+use subsequent reads and annotate matching rows, including blocked and broken
+tasks, without excluding them. The lookahead row receives no diagnostics.
+
+The empty-default-page `filter_excluded` probe remains a separate offset-zero
+existence check under the same other predicates with an excluded-status
+predicate. It is neither a continuation measurement nor a count. No query in
+this amendment computes a total, and no read changes stored task data. The
+extra returned row is bounded to one; the query's filter and offset work is
+not given a new constant-work guarantee.
