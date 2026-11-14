@@ -594,6 +594,83 @@ fn apply_without_a_backup_refuses_before_any_write() {
     assert_eq!(fixture.ids(), before);
 }
 
+/// The same file named relative to the process's working directory, so resolving it depends on where the
+/// process runs, as a path given on the command line would.
+fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("working directory");
+    let absolute = std::fs::canonicalize(path).expect("canonical path");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(absolute.strip_prefix("/").expect("absolute path"));
+    assert!(relative.is_relative());
+    relative
+}
+
+#[test]
+fn a_backup_taken_through_a_relative_path_records_the_absolute_source() {
+    let fixture = Fixture::new();
+    fixture.insert(
+        &Uuid::new_v4().to_string(),
+        "audit",
+        "whoami",
+        OLD_US,
+        &envelope("whoami", "allow").to_string(),
+        false,
+    );
+    let plan = plan(&fixture);
+    let target = PruneTarget {
+        events_db: relative_to_cwd(&fixture.events),
+        edge_dbs: vec![fixture.main.clone()],
+    };
+    let dest = fixture.root.join("relative-backup.db");
+    let receipt = events_prune::backup(&target, &plan, &dest).expect("backup");
+    assert!(receipt.source.is_absolute(), "{}", receipt.source.display());
+    assert_eq!(
+        receipt.source,
+        std::fs::canonicalize(&fixture.events).unwrap()
+    );
+}
+
+#[test]
+fn a_receipt_with_a_relative_source_refuses_before_any_apply_mutation() {
+    let fixture = Fixture::new();
+    for verb in ["comm.inbox", "whoami"] {
+        fixture.insert(
+            &Uuid::new_v4().to_string(),
+            "audit",
+            verb,
+            OLD_US,
+            &envelope(verb, "allow").to_string(),
+            false,
+        );
+    }
+    let plan = plan(&fixture);
+    let receipt_file = fixture.backup(&plan, "backup.db");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&receipt_file).unwrap()).unwrap();
+    // A receipt written before sources were recorded absolute: the path still resolves to this very store
+    // from the test's working directory, so only the relative form itself can refuse it.
+    stored["source"] = json!(relative_to_cwd(&fixture.events));
+    std::fs::write(&receipt_file, serde_json::to_vec(&stored).unwrap()).unwrap();
+    fixture.checkpoint();
+    let before = (
+        std::fs::read(&fixture.events).unwrap(),
+        fixture.rows_except(&BTreeSet::new()),
+    );
+    let options = fixture.options(&plan.digest, receipt_file, "relative-state");
+    let error = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 1)
+        .expect_err("a relative receipt source must refuse");
+    assert!(matches!(error, PruneError::NoBackup(_)), "{error}");
+    assert!(error.to_string().contains("relative path"), "{error}");
+    assert!(
+        !options.state_dir.exists(),
+        "refusal must not create apply state"
+    );
+    assert_eq!(std::fs::read(&fixture.events).unwrap(), before.0);
+    assert_eq!(fixture.rows_except(&BTreeSet::new()), before.1);
+}
+
 #[test]
 fn a_backup_of_another_store_refuses_before_any_apply_mutation() {
     let source = Fixture::new();

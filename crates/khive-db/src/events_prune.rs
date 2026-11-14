@@ -796,11 +796,13 @@ pub fn backup(target: &PruneTarget, plan: &Plan, dest: &Path) -> Result<BackupRe
             "rows by kind differ: source {counted:?}, copy {copied:?}"
         )));
     }
+    // Record where the copied store resolves now, so a receipt names the same file wherever apply runs.
+    let source_path = fs::canonicalize(&target.events_db)?;
     let receipt = BackupReceipt {
         classifier: CLASSIFIER.to_string(),
         digest: plan.digest.clone(),
         cutoff_us: plan.cutoff_us,
-        source: target.events_db.clone(),
+        source: source_path,
         backup_path: dest.to_path_buf(),
         bytes: fs::metadata(dest)?.len(),
         sha256: sha256_file(dest)?,
@@ -993,6 +995,14 @@ pub fn apply_at(
         return Err(PruneError::NoBackup(
             "the backup receipt is dated after this run's start".into(),
         ));
+    }
+    if !receipt.source.is_absolute() {
+        return Err(PruneError::NoBackup(format!(
+            "backup receipt source {} is a relative path, which would resolve against this run's \
+             working directory; take a new backup of prune target {}",
+            receipt.source.display(),
+            target.events_db.display()
+        )));
     }
     let source = fs::canonicalize(&receipt.source).map_err(|error| {
         PruneError::NoBackup(format!(
