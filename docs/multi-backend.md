@@ -101,9 +101,7 @@ display_name = "khive app node"     # advisory; not used by the runtime
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 [[engines]]
-name = "default"
-model = "all-minilm-l6-v2"
-default = true
+name = "all-minilm-l6-v2"
 
 # ── Backends ───────────────────────────────────────────────────────────────────
 # Every [[backends]] entry declares one SQLite file (or in-memory db for testing).
@@ -139,6 +137,14 @@ backend = "records"
 # All built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm,
 # session, git, code) are left unlisted and therefore default to "main".
 ```
+
+`[[engines]]` names the embedding provider directly. Its supported fields are
+`name`, `weight` (defaults to `1.0`; other weights are currently refused), and
+optional `dims`, which checks the provider's dimensionality. Entries retain
+declaration order, and the first serves single-engine compatibility APIs; there
+is no canonical `default` flag. See the
+[configuration example](khive-config-example.toml) for multiple engines and
+legacy-input conversion.
 
 Fields on `[[backends]]`:
 
