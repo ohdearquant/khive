@@ -273,9 +273,8 @@ is qualified the same way ([ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-e
 `link` resolves both ids unscoped, then compares the source row's stored namespace with the request's
 write namespace and refuses a mismatch, and `restore` of such an edge compares the edge's stored
 namespace with its source row's. Under the proposed [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14), the same comparison also
-covers the memory row a `supersedes` write names: `link`, a change-set link op, `restore` of such an edge and an
-`update` that sets `properties.supersedes` compare that row's stored namespace with the write namespace under the
-batch old-row rule. The comparison applies only when the named row is a memory row and the relation is `supersedes`;
+covers the memory row a `supersedes` write names, for the writes Delta 4 rule 2 lists: each compares that row's stored
+namespace with the write namespace under the batch old-row rule. The comparison applies only when the named row is a memory row and the relation is `supersedes`;
 the id is still resolved without a namespace check, and every other `link(target_id)` keeps the unscoped contract. These comparisons decide where an edge may be written, never who
 may reach a record; the gate still decides the request. And the contract has narrower siblings on other verbs:
 several parameters declare prefix-scoped-to-primary resolution instead, `neighbors(node_id)` among
@@ -695,7 +694,8 @@ What Rev 4 does NOT change:
   NOT widened by `visible_namespaces`: `list(namespace="ns-beta")` returns only `ns-beta`,
   never `ns-beta ∪ local ∪ visible_namespaces`. This preserves the ability to read a single
   named set precisely.
-- By-ID ops (Rule 2). get, update, delete, merge by UUID remain namespace-agnostic.
+- By-ID ops (Rule 2). get, update, delete, merge by UUID remain namespace-agnostic in how they resolve an id;
+  merge also keeps its same-namespace guard (Rule 5).
 - The Gate (Rule 4). Authorization remains a single seam. `visible_namespaces` is a
   configuration convenience, not an authorization mechanism. A TenantGate continues to
   mint the read-visibility set from the authenticated identity, independent of this config

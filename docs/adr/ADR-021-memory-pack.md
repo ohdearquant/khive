@@ -24,10 +24,14 @@ adds `memory.apply_batch`, and its
 declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 **Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
 the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
-`memory.remember` reserves the `supersedes` property (#6386; proposed).
+`memory.remember` reserves the `supersedes` property (#6386; accepted 2026-11-14, #6390).
 **Amended**: 2026-11-04, [Delta 3](#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04) of
 the batch-apply amendment: an edge between two memory rows is written in the source row's namespace by every verb,
-and edge reads report how many such edges they left out (#6380; proposed).
+and edge reads report how many such edges they left out (#6380; accepted 2026-11-05, except the amendment to rule
+1's refusal text, which is proposed).
+**Amended**: 2026-11-14, [Delta 4](#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) of
+the batch-apply amendment: every writer of a `supersedes` edge or property applies the old-row namespace rule
+(#6607; proposed).
 
 ## Context
 
@@ -351,8 +355,9 @@ per-actor-episodic plus shared-semantic model. The prior contract stamped both m
 This is attribution plus view-layer visibility, not storage isolation:
 
 - The store performs no `record.namespace == caller_namespace` check (ADR-007 Rule 2). By-ID ops
-  on a memory note (`get`, `update`, `delete`, `merge` by UUID) are namespace-agnostic regardless
-  of which actor wrote the memory. `delete(id=<memory_uuid>)` (§6) works across actors.
+  on a memory note (`get`, `update`, `delete` by UUID) are namespace-agnostic regardless
+  of which actor wrote the memory. `merge` resolves its ids the same way but keeps its same-namespace guard
+  (ADR-007 Rule 5): both notes must be in the caller's namespace. `delete(id=<memory_uuid>)` (§6) works across actors.
 - Recall reads operate over the caller's read visible-set,
   `{local} ∪ {actor.id} ∪ {actor.visible_namespaces}` (ADR-007 Rule 3b). An actor's own episodic
   memories are visible to its default recall because the set always includes `{actor.id}`. Another
@@ -1140,7 +1145,7 @@ run leaving all six in the source row's namespace.
 
 **Status**: Proposed 2026-11-14. Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
 Recall and Delta 2 are unchanged. It amends Delta 1 rule 4 in one respect: the `owned_namespaces` declaration is also
-read by the checks in rule 2 below. It still grants no write into an owned namespace and widens no read. Who sets the
+read by rule 1 below. It still grants no write into an owned namespace and widens no read. Who sets the
 declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
 and travels as Delta 1 rule 2 says. No verb sets or changes it.
 
@@ -1193,6 +1198,10 @@ affected, because the edge or property sits outside its visible set.
    Any other value is refused, naming `memory.apply_batch` and `link(relation="supersedes")`. A patch that leaves the
    stored value unchanged is not checked. A patch that removes the key or sets it to null is admitted and not checked:
    it can only stop a row from being hidden.
+
+   `merge` is out of scope. A note merge (ADR-039) requires both notes to be in the caller's namespace (ADR-007
+   Rule 5; `ensure_namespace` on both notes in the runtime's note merge), so the `supersedes` edges it moves onto the survivor and the properties it carries over stay in that one
+   namespace, and rule 1's outcome for them does not change.
 3. **What it is.** This is a rule of the write that supersedes a memory row, the same kind of rule as
    `memory.apply_batch`'s. It is not an access control. Under ADR-007 Rule 9, `link(target_id)` resolves its id without
    a namespace check. This delta extends the second of the two write-effect comparisons that ADR-007 permits (Rule 8
@@ -1205,15 +1214,23 @@ affected, because the edge or property sits outside its visible set.
    namespace. It prints edge id, edge namespace, source namespace and target namespace. It also lists each live memory
    row whose stored `properties.supersedes` names a memory row that Delta 2 rule 3 honors and that rule 1 would refuse
    for the carrying row's namespace, because recall keeps honoring those too. It prints row id, row namespace and
-   target namespace. It writes nothing. The owner of a listed target decides whether that supersede was meant, and
+   target namespace. It applies no `owned_namespaces` list: it lists every supersede whose edge namespace, or carrier
+   row namespace, differs from the target row's namespace, and its output says that a supersede a Delta 1 caller wrote
+   into a declared owned namespace appears in the list too. It scans only the namespaces the caller can read and prints
+   no id or namespace outside them, the same bound Delta 2 and Delta 3 state. It reads in id order in pages of at most
+   1,000 rows and returns a cursor, so one call's cost is bounded by the page and a full pass grows with the number of
+   live memory rows. It writes nothing.
+   The owner of a listed target decides whether that supersede was meant, and
    removes the edge or clears the property if it was not.
 
 **Consequences.**
 
-- `link`, the change-set link op and the property path now agree with `memory.apply_batch` on which rows they may
-  supersede.
-- A caller writing from `local` can supersede only rows in `local`, which is what the batch rule already gives that
-  caller.
+- `link`, the change-set link op and the property path now apply `memory.apply_batch`'s old-row rule, with the write
+  namespace in the place of the batch's caller namespace. `memory.apply_batch` takes no `namespace` argument; these
+  verbs do, so a caller that passes `namespace=<V>` may supersede an unowned row in V, which the batch would refuse.
+  Whether the caller may write in V is the gate's decision, and only the gate bounds that case.
+- A caller writing from `local` can supersede only rows in `local` or in a namespace it declares as owned, which is
+  what the batch rule already gives that caller.
 - `link` gains one read of the target row when the relation is `supersedes`.
 - Other relations onto a memory row (`annotates`, `supports`, `refutes`) keep their current rule, because recall reads
   only `supersedes`.
