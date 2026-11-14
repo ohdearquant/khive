@@ -4,10 +4,9 @@
 mod receipt_credentials;
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use khive_db::test_hooks::TestHooks;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
 use khive_runtime::presentation::{present, PresentationMode};
@@ -951,51 +950,147 @@ async fn memory_list_graph_read_errors_fail_closed_without_changing_rows() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn memory_list_observes_cancellation_during_real_sql_work() {
+    use std::time::Duration;
+
     let (runtime, registry) = fixture();
     let notes = seeded_walk(&runtime, 205, 3).await;
     let before = snapshot(&runtime).await;
-    let (cancel, receiver) = tokio::sync::watch::channel(false);
-    let observed = Arc::new(AtomicBool::new(false));
-    {
-        let observed = Arc::clone(&observed);
-        let connection = runtime.backend().pool().reader().unwrap();
-        connection
-            .test_progress_handler(Some(move || {
-                observed.store(true, Ordering::SeqCst);
-                cancel.send_replace(true);
-                // The production cancellation guard, not the fixture, interrupts SQL.
-                false
-            }))
-            .unwrap();
-    }
-    assert!(!observed.load(Ordering::SeqCst));
-    let result = khive_storage::scope_request_read_cancellation(
-        receiver,
-        registry.dispatch("list", filtered()),
+    let pool = runtime.backend().pool();
+    assert_eq!(pool.max_readers(), 0, "fixture uses the shared connection");
+
+    // Preserve the graph rows while making the real adjacency query stay in
+    // SQLite long enough to observe and cancel, even on a fast machine.
+    sql(
+        &runtime,
+        "ALTER TABLE graph_edges RENAME TO cancellation_graph_edges",
     )
     .await;
-    {
-        let connection = runtime.backend().pool().reader().unwrap();
-        connection
-            .test_progress_handler(None::<fn() -> bool>)
-            .unwrap();
-    }
+    sql(
+        &runtime,
+        "CREATE VIEW graph_edges AS SELECT * FROM cancellation_graph_edges \
+         WHERE (WITH RECURSIVE cancellation_work(n) AS (\
+             VALUES(1) UNION ALL SELECT n + 1 FROM cancellation_work WHERE n < 100000000\
+         ) SELECT SUM(n) FROM cancellation_work) > 0",
+    )
+    .await;
+
+    let statements = pool.observe_test_statement_starts(4096).unwrap();
+    assert!(statements.started_statements().unwrap().is_empty());
+    let progress = Arc::new(AtomicUsize::new(0));
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let mut request = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+        let registry = registry.clone();
+        let progress = Arc::clone(&progress);
+        async move {
+            khive_db::scope_test_read_progress(
+                progress,
+                khive_storage::scope_request_read_cancellation(receiver, async move {
+                    let no_deadline = khive_storage::capture_request_read_context()
+                        .deadline()
+                        .is_none();
+                    (no_deadline, registry.dispatch("list", filtered()).await)
+                }),
+            )
+            .await
+        }
+    }));
+
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if request.is_finished() {
+                return Err("list finished before its graph read was observed".to_owned());
+            }
+            let started = statements
+                .started_statements()
+                .map_err(|error| error.to_string())?;
+            if started.iter().any(|statement| {
+                statement.readonly
+                    && statement
+                        .sql
+                        .contains("FROM requested CROSS JOIN graph_edges AS edges")
+            }) {
+                let before_graph_progress = progress.load(Ordering::SeqCst);
+                while progress.load(Ordering::SeqCst) == before_graph_progress {
+                    if request.is_finished() {
+                        return Err("graph read finished before further SQLite progress".to_owned());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let unfinished_at_cancel = !request.is_finished();
+    let already_cancelled = cancel.send_replace(true);
+
+    // Watcher failure and task panic also take the settlement path. Never
+    // restore the table while a query could still be using the view.
+    let (settled, within_bound) =
+        match tokio::time::timeout(Duration::from_secs(5), &mut request).await {
+            Ok(result) => (Some(result), true),
+            Err(_) => {
+                request.abort();
+                (
+                    tokio::time::timeout(Duration::from_secs(5), &mut request)
+                        .await
+                        .ok(),
+                    false,
+                )
+            }
+        };
+    let released = tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.oldest_checkout_age().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(statements);
     assert!(
-        observed.load(Ordering::SeqCst),
-        "request must reach the SQLite progress callback"
+        settled.is_some() && released.is_ok(),
+        "request did not settle and release its reader: settled={settled:?}, released={released:?}"
+    );
+    sql(&runtime, "DROP VIEW graph_edges").await;
+    sql(
+        &runtime,
+        "ALTER TABLE cancellation_graph_edges RENAME TO graph_edges",
+    )
+    .await;
+
+    assert!(matches!(ready, Ok(Ok(()))), "{ready:?}");
+    assert!(
+        unfinished_at_cancel,
+        "graph read finished before cancellation"
+    );
+    assert!(!already_cancelled, "request was already cancelled");
+    assert!(within_bound, "request needed the abort fail-safe");
+    let (no_deadline, result) = settled.unwrap().expect("list task panicked");
+    assert!(
+        no_deadline,
+        "a deadline must not substitute for cancellation"
     );
     assert!(
         matches!(
-            result,
-            Err(RuntimeError::Storage(StorageError::Timeout { .. }))
+            &result,
+            Err(RuntimeError::Storage(StorageError::Timeout { operation }))
+                if operation == "batch_neighbors"
         ),
         "{result:?}"
     );
-    let retry = registry.dispatch("list", filtered()).await.unwrap();
+    let stopped_progress = progress.load(Ordering::SeqCst);
+    let retry = tokio::time::timeout(
+        Duration::from_secs(5),
+        registry.dispatch("list", filtered()),
+    )
+    .await
+    .expect("reader did not recover after cancellation")
+    .unwrap();
     assert_eq!(
         ids(rows(&retry)),
         notes[205..].iter().map(|note| note.id).collect::<Vec<_>>()
     );
+    assert_eq!(progress.load(Ordering::SeqCst), stopped_progress);
     assert_eq!(snapshot(&runtime).await, before);
 }
 
