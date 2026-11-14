@@ -146,7 +146,6 @@ impl OutboxChannels<'_> {
 struct Prepared {
     envelope: ChannelEnvelope,
     external_id: Option<String>,
-    recipient: String,
 }
 
 impl OutboxPolicy<'_> {
@@ -190,7 +189,6 @@ impl OutboxPolicy<'_> {
                 Ok(Some(Prepared {
                     envelope: ChannelEnvelope::new("telegram:bot", to, note.content.clone()),
                     external_id: None,
-                    recipient: to.to_string(),
                 }))
             }
         }
@@ -253,44 +251,35 @@ impl OutboxPolicy<'_> {
     fn delivered(
         &self,
         id: uuid::Uuid,
-        recipient: &str,
+        attempt_count: u64,
         message_id: Option<&str>,
         result: khive_runtime::RuntimeResult<Note>,
     ) {
-        match (self.kind(), result) {
-            ("email", Ok(_)) => {
-                tracing::info!(target: "khive_mcp::serve", note_id = %id, recipient = %recipient, message_id = %message_id.unwrap_or_default(), "outbox loop: delivered")
+        match result {
+            Ok(_) => {
+                // Delivery must remain visible under the daemon's default warn filter.
+                tracing::warn!(target: "khive_mcp::serve", note_id = %id, channel = self.kind(), attempt_count, message_id = ?message_id, "outbox loop: delivered")
             }
-            ("email", Err(error)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, error = %error, "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)")
-            }
-            (_, Ok(_)) => {
-                tracing::info!(target: "khive_mcp::serve", note_id = %id, "telegram outbox loop: delivered")
-            }
-            (_, Err(error)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, error = %error, "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)")
+            Err(error) => {
+                tracing::warn!(target: "khive_mcp::serve", note_id = %id, channel = self.kind(), attempt_count, error = %error, "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)")
             }
         }
     }
     fn failed(
         &self,
         id: uuid::Uuid,
-        recipient: &str,
+        attempt_count: u64,
         error: &khive_channel::ChannelError,
         result: khive_runtime::RuntimeResult<Note>,
     ) {
-        match (self.kind(), result) {
-            ("email", Ok(_)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, recipient = %recipient, error = %error, classification = ?error.delivery_failure_class(), "outbox loop: send failure recorded")
+        // Transport errors can echo recipient addresses. Keep their detail in the
+        // persisted retry state and log only the classification here.
+        match result {
+            Ok(_) => {
+                tracing::warn!(target: "khive_mcp::serve", note_id = %id, channel = self.kind(), attempt_count, classification = ?error.delivery_failure_class(), "outbox loop: send failure recorded")
             }
-            ("email", Err(mark_error)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, recipient = %recipient, error = %error, mark_error = %mark_error, "outbox loop: send failed and retry state could not be recorded")
-            }
-            (_, Ok(_)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, error = %error, classification = ?error.delivery_failure_class(), "telegram outbox loop: send failure recorded")
-            }
-            (_, Err(mark_error)) => {
-                tracing::warn!(target: "khive_mcp::serve", note_id = %id, error = %error, mark_error = %mark_error, "telegram outbox loop: send failed and retry state could not be recorded")
+            Err(mark_error) => {
+                tracing::warn!(target: "khive_mcp::serve", note_id = %id, channel = self.kind(), attempt_count, classification = ?error.delivery_failure_class(), mark_error = %mark_error, "outbox loop: send failed and retry state could not be recorded")
             }
         }
     }
@@ -426,6 +415,12 @@ pub(super) async fn outbox_once(
         let Some(prepared) = policy.prepare(runtime, &token, &note, &mut cycle).await? else {
             continue;
         };
+        // A successful mark clears delivery_attempts, which counts prior failures.
+        let attempt_count = props
+            .get("delivery_attempts")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
         match channel.channel().send(prepared.envelope).await {
             Ok(()) => {
                 let result = runtime
@@ -438,7 +433,7 @@ pub(super) async fn outbox_once(
                     .await;
                 policy.delivered(
                     note.id,
-                    &prepared.recipient,
+                    attempt_count,
                     prepared.external_id.as_deref(),
                     result,
                 );
@@ -459,7 +454,7 @@ pub(super) async fn outbox_once(
                     _ => false,
                 };
                 let result = record_outbound_send_failure(runtime, &token, note.id, &error).await;
-                policy.failed(note.id, &prepared.recipient, &error, result);
+                policy.failed(note.id, attempt_count, &error, result);
                 if rate_limit {
                     return Ok(());
                 }
@@ -860,7 +855,6 @@ async fn prepare_email(
     Ok(Some(Prepared {
         envelope,
         external_id: Some(message_id),
-        recipient: normalized_recipient.expect("configured policy accepted a parsed recipient"),
     }))
 }
 
