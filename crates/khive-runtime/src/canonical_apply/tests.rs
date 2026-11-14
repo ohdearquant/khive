@@ -1471,3 +1471,57 @@ async fn canonical_prepare_refusal_hides_unreadable_memory_source_namespace() {
         .unwrap()
         .is_none());
 }
+
+#[tokio::test]
+async fn canonical_supersedes_onto_foreign_memory_target_refuses_at_preparation() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let alice = Namespace::parse("alice").unwrap();
+    let bob = Namespace::parse("bob").unwrap();
+    let alice_token = rt.authorize(alice.clone()).unwrap();
+    let bob_token = rt.authorize(bob.clone()).unwrap();
+    let token = rt
+        .authorize_with_visibility(alice.clone(), vec![bob.clone()])
+        .unwrap();
+    let source = Note::new("alice", "memory", "alice replacement");
+    let own = Note::new("alice", "memory", "alice earlier");
+    let foreign = Note::new("bob", "memory", "bob original");
+    let (source_id, own_id, foreign_id) = (source.id, own.id, foreign.id);
+    for (tok, note) in [
+        (&alice_token, source),
+        (&alice_token, own),
+        (&bob_token, foreign),
+    ] {
+        rt.notes(tok).unwrap().upsert_note(note).await.unwrap();
+    }
+    let link = |target: Uuid| {
+        changeset(vec![Op::Link(khive_changeset::LinkOp {
+            id: id128(Uuid::new_v4()),
+            namespace: alice.clone(),
+            source: id128(source_id),
+            target: id128(target),
+            relation: khive_types::EdgeRelation::Supersedes,
+            weight: 1.0,
+            properties: Default::default(),
+        })])
+    };
+    prepare_canonical_changeset(rt, &registry(), &token, &link(own_id))
+        .await
+        .expect("control: an own-namespace supersedes link op prepares");
+    let error = prepare_canonical_changeset(rt, &registry(), &token, &link(foreign_id))
+        .await
+        .expect_err("canonical_supersedes_foreign_target_prepared");
+    let RuntimeError::CanonicalAdmission { op_index, source } = error else {
+        panic!("a foreign supersede target must refuse as CanonicalAdmission");
+    };
+    assert_eq!(op_index, 0);
+    let RuntimeError::InvalidInput(message) = *source else {
+        panic!("a foreign supersede target must refuse as InvalidInput");
+    };
+    assert!(
+        message.contains(
+            "apply_changeset: the memory row a supersedes edge names is in namespace bob"
+        ) && message.contains("link operation namespace alice"),
+        "{message}"
+    );
+}

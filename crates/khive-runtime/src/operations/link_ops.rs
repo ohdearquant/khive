@@ -331,9 +331,37 @@ impl KhiveRuntime {
         source: &khive_storage::Note,
         target: &khive_storage::Note,
     ) -> RuntimeResult<()> {
-        if source.kind != "memory" || target.kind != "memory" {
-            return Ok(());
+        if source.kind == "memory" && target.kind == "memory" {
+            Self::ensure_memory_edge_source_namespace(
+                read_scope,
+                operation,
+                write_namespace,
+                endpoints,
+                relation,
+                source,
+                target,
+            )?;
         }
+        Self::ensure_supersede_target_namespace(
+            read_scope,
+            operation,
+            write_namespace,
+            endpoints,
+            relation,
+            source,
+            target,
+        )
+    }
+
+    fn ensure_memory_edge_source_namespace(
+        read_scope: &NamespaceToken,
+        operation: &str,
+        write_namespace: &str,
+        endpoints: (Uuid, Uuid),
+        relation: EdgeRelation,
+        source: &khive_storage::Note,
+        target: &khive_storage::Note,
+    ) -> RuntimeResult<()> {
         let (source_id, target_id) = endpoints;
         // Base symmetric relations are entity-only today. Use the persisted
         // canonical source for the namespace rule, without changing canonicalization.
@@ -376,6 +404,63 @@ impl KhiveRuntime {
             return Err(RuntimeError::InvalidInput(message));
         }
         Ok(())
+    }
+
+    /// Apply `memory.apply_batch`'s old-row namespace rule to a `supersedes`
+    /// edge whose superseded row is a memory note, whatever the source note is
+    /// (ADR-021 Delta 4). The superseded row must sit in the write namespace,
+    /// the shared `local` namespace, or a namespace the caller declared it owns.
+    ///
+    /// This decides only whether the edge is written. Both ids were resolved
+    /// without a namespace check, and no other relation or target is affected.
+    fn ensure_supersede_target_namespace(
+        read_scope: &NamespaceToken,
+        operation: &str,
+        write_namespace: &str,
+        endpoints: (Uuid, Uuid),
+        relation: EdgeRelation,
+        source: &khive_storage::Note,
+        target: &khive_storage::Note,
+    ) -> RuntimeResult<()> {
+        if relation != EdgeRelation::Supersedes {
+            return Ok(());
+        }
+        let (source_id, target_id) = endpoints;
+        let (canonical_source, _) = canonical_edge_endpoints(relation, source_id, target_id);
+        let superseded = if canonical_source == source_id {
+            target
+        } else {
+            source
+        };
+        if superseded.kind != "memory" {
+            return Ok(());
+        }
+        let namespace = superseded.namespace.as_str();
+        if namespace == write_namespace
+            || namespace == crate::Namespace::LOCAL
+            || read_scope.owns(namespace)
+        {
+            return Ok(());
+        }
+        let write_label = match operation {
+            "restore" => "stored edge namespace",
+            "apply_changeset" => "link operation namespace",
+            _ => "write namespace",
+        };
+        let readable = read_scope
+            .visible_namespaces()
+            .iter()
+            .any(|visible| visible.as_str() == namespace);
+        let found = if readable {
+            format!("is in namespace {namespace}")
+        } else {
+            "is in a namespace the caller cannot read".to_string()
+        };
+        Err(RuntimeError::InvalidInput(format!(
+            "{operation}: the memory row a supersedes edge names {found}; a supersede may name \
+             only a memory row in the {write_label} {write_namespace}, in the shared namespace \
+             local, or in a namespace the caller owns, as memory.apply_batch requires"
+        )))
     }
 
     /// Public delegator for cross-backend link validation.

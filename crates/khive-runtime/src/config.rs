@@ -280,8 +280,9 @@ impl NamespaceToken {
     ///
     /// The declaration is the `[actor] owned_namespaces` list carried on the
     /// caller's identity. It is consulted by the `memory.apply_batch` old-row
-    /// namespace check alone: ownership grants no write into the namespace and
-    /// widens no read.
+    /// namespace check and by the same rule on every other writer of a
+    /// `supersedes` edge (ADR-021 Delta 4): ownership grants no write into the
+    /// namespace and widens no read.
     pub fn owns(&self, namespace: &str) -> bool {
         self.owned.iter().any(|owned| owned.as_str() == namespace)
     }

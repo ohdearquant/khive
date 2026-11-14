@@ -350,16 +350,9 @@ async fn explicit_namespace_recall_reads_edges_only_where_it_can_see() {
         )
         .await
         .expect("create non-matching replacement memory");
-    rt.link(
-        &local_token,
-        newer.id,
-        old.id,
-        EdgeRelation::Supersedes,
-        1.0,
-        None,
-    )
-    .await
-    .expect("store supersedes edge in local");
+    // ADR-021 Delta 4 refuses writing this edge through `link` now; an edge
+    // stored before that rule is kept, so the fixture writes it below the check.
+    hidden_incoming_seed_edge(&rt, "local", newer.id, old.id, 1).await;
 
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(vec![visible.clone()]);
