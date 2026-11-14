@@ -123,6 +123,21 @@ are ordered by depth, weight, and their complete projected value tuple. Repeated
 of unchanged data are therefore stable. This is offset paging, not a cross-call database
 snapshot: inserts or deletes that match the query can shift later pages.
 
+## Ordering and counts
+
+GQL has no caller-defined `ORDER BY` and no `count()` or other aggregate. Its row
+order is the compiler's identity order described above, which keeps paging stable
+but carries no meaning such as recency. Both omissions are deliberate; see
+[ADR-008](../adr/ADR-008-query-layer-separation.md#why-bounded-skip-instead-of-an-opaque-cursor-or-aggregates)
+for the reasoning. Use these instead:
+
+| You want                         | Use                                                                                                                                                                                                        |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The newest records about a topic | `search(kind="note", query="...", order_by="created_at")`, or `order_by="updated_at"`. Results sort newest first within the bounded candidate window, so this ranks recent matches but is not a full sort. |
+| How many entities of a type      | No verb returns this count today. Page `list(kind="entity", entity_type="...", after="")` until `next_after` is null and count the rows.                                                                   |
+
+`stats()` reports totals per substrate (entities, edges, notes) only, not per kind or type.
+
 ## Verified GQL idioms
 
 Each row was issued as `query(query="...")` through the `request` tool
@@ -197,6 +212,7 @@ returns rows on the live MCP tool.
   caller-defined ordering exists. GQL uses `SKIP` rather than an `OFFSET`
   keyword; SPARQL `OFFSET` remains unsupported. Orphan-detection and
   edge-density questions cannot be expressed in a single query.
+  [Ordering and counts](#ordering-and-counts) names the verbs to use instead.
 - A repeated node-variable binding is rejected, which blocks cycle and
   self-reachability queries.
 - SPARQL is single-path only; a branched `WHERE` block is rejected.
