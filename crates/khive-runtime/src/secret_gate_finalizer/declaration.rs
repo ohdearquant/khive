@@ -536,7 +536,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "curation.entity.update",
-        site: "khive-runtime/src/curation/entity_curation.rs::KhiveRuntime::persist_prepared_entity_update",
+        site: "khive-runtime/src/curation/entity_curation.rs::KhiveRuntime::persist_prepared_entity_update_with_required_event",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
