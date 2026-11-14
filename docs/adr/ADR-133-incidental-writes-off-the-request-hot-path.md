@@ -1372,7 +1372,7 @@ Test names identify existing coverage or explicitly identify coverage to add.
 
 ## Amendment 12 (2026-11-14): Named handler refusals before domain writes
 
-**Status**: Proposed. This amendment does not change the status of the base ADR or earlier amendments.
+**Status**: Accepted 2026-11-14. This amendment does not change the status of the base ADR or earlier amendments.
 
 **Addresses**: [#6539](https://github.com/ohdearquant/khive/issues/6539).
 
