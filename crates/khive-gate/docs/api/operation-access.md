@@ -290,6 +290,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `tool.requests`                   | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L241)                              |
 | `tool.revoke`                     | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L230)                              |
 | `tool.suggest`                    | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L154)                              |
+| `tool.unregister`                 | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L172)                              |
 | `traverse`                        | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1017)                   |
 | `update`                          | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L495)                    |
 | `verbs`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1473)                   |

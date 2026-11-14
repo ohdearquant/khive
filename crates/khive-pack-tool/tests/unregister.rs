@@ -850,6 +850,7 @@ async fn unregister_reports_committed_cleanup_failure() {
     );
 }
 
+#[derive(Debug)]
 struct RetirementGate {
     deny: AtomicBool,
     seen: Mutex<Vec<GateRequest>>,
