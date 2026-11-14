@@ -162,6 +162,8 @@ Recursive patterns use `DISTINCT`, so they order by depth, weight, and every pro
 alias—a total tuple over the rows that survive projection. This makes pages repeatable while the
 matched graph is unchanged without exposing caller-defined ordering in the query dialect.
 
+See [Amendment 1][A1] for the subsequent caller-defined ordering contract.
+
 The query verb supplies a bounded `page_size` (minimum 1, default 500, hard cap 10,000). Query-text
 `LIMIT` and `page_size` compose as the smaller payload bound. When the server page size binds,
 compilation fetches one sentinel row; runtime removes it and returns `has_more`, compatibility
@@ -268,6 +270,8 @@ would require a separate expression and grouping model. The compiler-owned ident
 deliberately not caller-configurable: it supplies the stable continuation contract without adding
 the much larger `ORDER BY` surface.
 
+See [Amendment 1][A1], which supersedes this ordering deferral.
+
 ## Alternatives Considered
 
 | Alternative                          | Why rejected                                                                                                          |
@@ -280,7 +284,9 @@ the much larger `ORDER BY` surface.
 | Merge khive-query into khive-request | Different grammars, ASTs, and concerns. Coupling creates unnecessary churn.                                           |
 | Opaque result cursor                 | Requires a versioned encoding across fixed and recursive result identities; defer until deep-offset cost is measured. |
 | Aggregation-only completion          | `COUNT` can audit cardinality but cannot retrieve the missing rows and requires a new expression/grouping model.      |
-| Caller-defined `ORDER BY`            | Expands validation and projection semantics; compiler-owned identity order is sufficient for continuation.            |
+| Caller-defined `ORDER BY`            | Expands validation and projection semantics; compiler-owned identity order is sufficient for continuation. [A1]       |
+
+[A1]: #amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14
 
 ## Consequences
 
@@ -389,6 +395,35 @@ uses the same query, ordering and page size with the returned `next_offset`; the
 query `LIMIT` remains the total bound across pages. Offset paging does not provide a
 cross-call snapshot when matching data changes.
 
+### Execution cost and cancellation
+
+Caller-selected JSON metadata sort paths have no dedicated sort index. Producing a page
+can require evaluating and ordering the whole visible match set before `LIMIT` and
+`OFFSET`; deep ordered reads can repeat a full sort per page rather than resume an
+indexed cursor. `CompileOptions.max_limit` defaults to 500 and caps the returned page,
+with at most one extra internal continuation row; it does not cap the matched set or the
+sort's work. The public `query` handler accepts a requested page size up to 10,000. A
+query-text `LIMIT` bounds returned results across pages, not the number of matching rows
+SQLite must examine to order them.
+
+Built-in MCP hosts scope reads to the request deadline and cancellation signal. For a
+query-only request, `KHIVE_REQUEST_READ_TIMEOUT_SECS` defaults to 30 seconds and accepts
+1 through 86,400 seconds; invalid values use the default and larger values are clamped.
+The request policy can extend a batch's allowance for `comm.inbox` waits, and nested
+deadlines retain the earlier bound. Daemon dispatch also installs its configured read
+deadline and cancels reads on peer disconnect or shutdown. These contexts reach
+`query_with_metadata` and `SqlReader::query_all`: both file-backed and in-memory built-in
+SQLite readers register the running read statement's exact connection for interruption,
+with a connection-local progress callback checking cancellation and deadline expiry.
+
+This is cooperative cancellation, not an unconditional execution-time or memory bound.
+Interrupt settlement may extend beyond the request deadline; uncooperative blocking
+work can outlive the settlement bounds and retain its connection after detachment.
+Direct Rust callers of `query_with_metadata` inherit an existing request context but do
+not acquire a deadline from that method. Custom `SqlAccess` implementations must provide
+their own cancellation behavior. The query compiler itself imposes no matched-row,
+sort-work or elapsed-time cap.
+
 ### Recursive final-edge semantics
 
 For a variable-length path, edge metadata describes the final traversed edge. Both CTE
@@ -412,8 +447,11 @@ weight, and projected-value tie order, without adding hidden columns to `DISTINC
 ### Compatibility and acceptance
 
 The shared AST adds `GqlQuery.order_by: Vec<OrderItem>`, typed `OrderDirection::{Asc, Desc}`,
-and `PropertyRef::MetadataPath(Vec<String>)`. Direct Rust AST consumers must initialize
-the new field and accommodate the new variant. SPARQL constructs an empty order list.
+and `PropertyRef::MetadataPath(Vec<String>)`. This breaks direct Rust `GqlQuery` constructors:
+they must initialize the new field, and exhaustive property-reference matches must
+accommodate the new variant. The only known in-tree consumers of `khive-query` are
+`khive-runtime` and `khive-pack-kg`; this does not establish compatibility for external
+Rust consumers. SPARQL constructs an empty order list.
 Compilation validates hand-built AST paths and fields as well as parsed input. No storage
 migration, runtime production change, or new dependency is required.
 
