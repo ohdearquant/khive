@@ -40,17 +40,34 @@ fn brain_resolve_params_has_consumer_kind_required() {
         h.params.iter().any(|p| p.name == "namespace"),
         "brain.resolve must document optional namespace"
     );
-    for verb in ["brain.bind", "brain.bindings", "brain.resolve"] {
+    for (verb, description) in [
+        (
+            "brain.bind",
+            "The profile catalog to write and the binding namespace to match. If omitted, stores a \"*\" binding in the caller's default catalog, matching every namespace context within that catalog.",
+        ),
+        (
+            "brain.bindings",
+            "The profile catalog to read and the binding namespace filter. If omitted, reads the caller's default catalog without filtering binding namespaces; other filters still apply.",
+        ),
+        (
+            "brain.resolve",
+            "The profile catalog to read and the binding namespace context. If omitted, uses the caller's default catalog and matches only bindings with namespace \"*\"; profile fallback still applies when none match.",
+        ),
+    ] {
         let handler = find_handler(verb);
         let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
         assert_eq!(
             namespace.description,
-            "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
-            "{verb} namespace help must describe the catalog"
+            description,
+            "{verb} namespace help must describe the catalog and binding match behavior"
         );
     }
     let unbind = find_handler("brain.unbind");
-    let namespace = unbind.params.iter().find(|p| p.name == "namespace").unwrap();
+    let namespace = unbind
+        .params
+        .iter()
+        .find(|p| p.name == "namespace")
+        .unwrap();
     assert!(namespace.description.contains("every namespace"));
     assert!(namespace.description.contains("default catalog"));
     assert!(unbind.description.contains("removed_by_namespace"));
