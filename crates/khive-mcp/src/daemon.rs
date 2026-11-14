@@ -41,7 +41,10 @@ mod self_heal;
 
 use recovery::*;
 
-pub(crate) use fallback::{bridge_diagnostics_snapshot, FallbackReason, STRICT_FALLBACK_MARKER};
+pub(crate) use fallback::{
+    bridge_diagnostics_snapshot, config_mismatch_remedy, daemon_reported_pid, FallbackReason,
+    STRICT_FALLBACK_MARKER,
+};
 use fallback::{
     fallback_or_reject, is_daemon_strict_mode, opaque_config_id, record_daemon_slow,
     with_rendezvous_admission_snapshot, DaemonSlowPhase,
@@ -170,6 +173,9 @@ mod strict_default_tests;
 
 #[cfg(all(test, unix))]
 mod strict_actor_frame_tests;
+
+#[cfg(all(test, unix))]
+mod config_mismatch_recovery_tests;
 
 #[cfg(all(test, unix))]
 mod daemon_slow_tests;

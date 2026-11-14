@@ -294,6 +294,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                 "kind": "protocol",
                 "code": "config_mismatch",
                 "message": "daemon configuration does not match the request",
+                "daemon_pid": std::process::id(),
                 "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
             })),
             namespace_mismatch: false,
