@@ -206,6 +206,11 @@ pub enum SqliteError {
         version: u32,
         /// Human-readable description of the failure.
         error: String,
+        /// The typed cause, when the failure came from an error value. It keeps
+        /// the native result code and write-stage evidence that `error` renders
+        /// as text.
+        #[source]
+        source: Option<Box<SqliteError>>,
     },
 }
 
@@ -245,6 +250,78 @@ impl SqliteError {
             _ => None,
         }
     }
+    /// A migration failure that keeps its typed cause.
+    ///
+    /// The message is the cause's own display text, read before the cause is
+    /// converted into a `SqliteError`, so it reads exactly as it did when only
+    /// the text was kept. A driver error therefore keeps its bare driver text
+    /// instead of gaining the `sqlite error:` prefix of its wrapped form.
+    pub fn migration(version: u32, cause: impl std::fmt::Display + Into<SqliteError>) -> Self {
+        let error = cause.to_string();
+        Self::Migration {
+            version,
+            error,
+            source: Some(Box::new(cause.into())),
+        }
+    }
+
+    /// A migration failure with a message of its own that still keeps its
+    /// typed cause.
+    pub fn migration_with_cause(
+        version: u32,
+        message: impl Into<String>,
+        cause: impl Into<SqliteError>,
+    ) -> Self {
+        Self::Migration {
+            version,
+            error: message.into(),
+            source: Some(Box::new(cause.into())),
+        }
+    }
+
+    /// A migration failure that has no underlying error value.
+    pub fn migration_message(version: u32, message: impl Into<String>) -> Self {
+        Self::Migration {
+            version,
+            error: message.into(),
+            source: None,
+        }
+    }
+
+    /// The typed cause of a failed migration, when one was kept.
+    pub fn migration_cause(&self) -> Option<&SqliteError> {
+        match self {
+            Self::Migration { source, .. } => source.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The SQLite extended result code behind this error, when it carries one.
+    ///
+    /// Reads only owned shapes (the driver error, the write evidence and a
+    /// migration's kept cause) and never calls into `source()`, for the same
+    /// reason as `native_write_failure`.
+    pub fn native_extended_code(&self) -> Option<i32> {
+        match self {
+            Self::Rusqlite(source) | Self::Write { source, .. } => {
+                Self::driver_extended_code(source)
+            }
+            Self::WriteSettlementUnknown { failure } => Some(failure.extended_code),
+            Self::Migration { source, .. } => source
+                .as_deref()
+                .and_then(|cause| cause.native_extended_code()),
+            _ => None,
+        }
+    }
+
+    fn driver_extended_code(error: &rusqlite::Error) -> Option<i32> {
+        match error {
+            rusqlite::Error::SqliteFailure(code, _)
+            | rusqlite::Error::SqlInputError { error: code, .. } => Some(code.extended_code),
+            _ => None,
+        }
+    }
+
     /// Stable structured stage for an ADR-194 WAL-capacity failure.
     pub fn wal_capacity_stage(&self) -> Option<&'static str> {
         match self {
