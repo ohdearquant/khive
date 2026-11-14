@@ -261,7 +261,8 @@ fn optional_create_kind_alias_for_replay<'a>(
         )),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
         ))),
     }
 }

@@ -147,3 +147,111 @@ async fn schedule_schedule_rejects_create_bulk_over_1000_entries() {
         "sanity: the live KG bulk create handler must reject 1001 entries; got: {kg_err}"
     );
 }
+
+#[tokio::test]
+async fn schedule_create_alias_type_refusals_mask_credentials_without_writes() {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+    use khive_runtime::RuntimeError;
+    use khive_storage::SqlStatement;
+    use serde_json::{json, Value};
+
+    async fn snapshot(runtime: &KhiveRuntime) -> Vec<Value> {
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let mut tables = Vec::new();
+        for table in ["entities", "notes", "graph_edges", "events"] {
+            let mut rows: Vec<_> = reader
+                .query_all(SqlStatement::new(format!("SELECT * FROM {table}"), vec![]))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| serde_json::to_value(row).unwrap())
+                .collect();
+            rows.sort_by_cached_key(Value::to_string);
+            tables.push(json!({"table": table, "rows": rows}));
+        }
+        assert!(!tables[0]["rows"].as_array().unwrap().is_empty());
+        assert!(!tables[1]["rows"].as_array().unwrap().is_empty());
+        tables
+    }
+
+    let (registry, runtime) = build_registry();
+    registry
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Retained replay baseline", "skip_dedup_check": true}),
+        )
+        .await
+        .expect("valid entity baseline");
+    let scheduled = registry
+        .dispatch(
+            "schedule.schedule",
+            json!({
+                "action": "create(kind=\"concept\", entity_kind=\"concept\", note_kind=null, name=\"Accepted replay\")",
+                "at": "2099-06-01T10:00:00Z",
+            }),
+        )
+        .await
+        .expect("valid aliases still schedule an action");
+    assert_eq!(scheduled["status"], "pending");
+    let stored = registry
+        .dispatch("get", json!({"id": scheduled["full_id"]}))
+        .await
+        .expect("actual persisted schedule baseline");
+    assert_eq!(stored["kind"], "scheduled_event");
+    assert_eq!(stored["properties"]["status"], "pending");
+    assert_eq!(
+        stored["content"],
+        "create(kind=\"concept\", entity_kind=\"concept\", note_kind=null, name=\"Accepted replay\")"
+    );
+    let before = snapshot(&runtime).await;
+    let secret = format!("sk-proj-{}", "A".repeat(80));
+
+    for field in ["entity_kind", "note_kind"] {
+        for (value, masked) in [
+            (json!(17), false),
+            (json!({"label": "ordinary"}), false),
+            (json!(["ordinary"]), false),
+            (json!({"credential": secret.clone()}), true),
+            (json!([{"credential": secret.clone()}]), true),
+        ] {
+            let serialized = value.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+            if masked {
+                assert!(serialized.contains(&secret));
+                assert!(
+                    !shown.contains(&secret),
+                    "canonical masker recognizes the fixture"
+                );
+                assert!(shown.contains("***MASKED***"));
+            } else {
+                assert_eq!(shown, serialized, "ordinary JSON diagnostic is retained");
+            }
+            let action =
+                format!("create(kind=\"concept\", {field}={serialized}, name=\"Refused replay\")");
+            let error = registry
+                .dispatch(
+                    "schedule.schedule",
+                    json!({"action": action, "at": "2099-06-01T10:00:00Z"}),
+                )
+                .await
+                .expect_err("wrong alias type must refuse before scheduling");
+            let RuntimeError::InvalidInput(message) = error else {
+                panic!("wrong schedule refusal kind: {error:?}");
+            };
+            assert_eq!(
+                message,
+                format!("create: `{field}` must be a string or null; got {shown}"),
+                "actual alias refusal before generic error projection"
+            );
+            assert!(!message.contains(&secret));
+            if masked {
+                assert!(message.contains("***MASKED***"));
+            }
+            assert_eq!(
+                snapshot(&runtime).await,
+                before,
+                "refusal changed persisted rows"
+            );
+        }
+    }
+}

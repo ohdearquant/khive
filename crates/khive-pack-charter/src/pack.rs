@@ -5,6 +5,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry};
 use khive_storage::note::{FilterOp, PropertyFilter};
 use khive_storage::{
@@ -459,7 +460,8 @@ impl Params {
             Value::Null => Map::new(),
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "{verb}: parameters must be an object, got {other}"
+                    "{verb}: parameters must be an object, got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         };
@@ -490,7 +492,10 @@ impl Params {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
             Some(Value::String(_)) => Err(self.invalid(format!("{name} must not be empty"))),
-            Some(other) => Err(self.invalid(format!("{name} must be a string, got {other}"))),
+            Some(other) => Err(self.invalid(format!(
+                "{name} must be a string, got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
+            ))),
         }
     }
 
@@ -503,7 +508,10 @@ impl Params {
         match self.map.get(name) {
             None | Some(Value::Null) => Ok(Map::new()),
             Some(Value::Object(m)) => Ok(m.clone()),
-            Some(other) => Err(self.invalid(format!("{name} must be an object, got {other}"))),
+            Some(other) => Err(self.invalid(format!(
+                "{name} must be an object, got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
+            ))),
         }
     }
 
@@ -1979,7 +1987,10 @@ impl CharterPack {
             Some(Value::Object(fields)) => fields.clone(),
             None => return Err(params.invalid("descriptor is required")),
             Some(other) => {
-                return Err(params.invalid(format!("descriptor must be an object, got {other}")))
+                return Err(params.invalid(format!(
+                    "descriptor must be an object, got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
+                )))
             }
         };
         if let Some(name) = descriptor.keys().find(|name| {
@@ -2011,9 +2022,10 @@ impl CharterPack {
                     return Err(params.invalid(format!("descriptor.{name} must not be empty")))
                 }
                 Some(other) => {
-                    return Err(
-                        params.invalid(format!("descriptor.{name} must be a string, got {other}"))
-                    )
+                    return Err(params.invalid(format!(
+                        "descriptor.{name} must be a string, got {}",
+                        mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
+                    )))
                 }
                 None => return Err(params.invalid(format!("descriptor.{name} is required"))),
             }
