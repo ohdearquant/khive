@@ -318,6 +318,7 @@ async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
                 target: Id128::from_u128(target.id.as_u128()),
                 relation: khive_types::EdgeRelation::Extends,
                 weight: Some(0.8),
+                metadata: None,
             },
             "link",
         ),
@@ -695,6 +696,7 @@ async fn committed_created_record_resolution_failure_is_not_reverted_or_replayed
             target: Id128::from_u128(target.id.as_u128()),
             relation: khive_types::EdgeRelation::Extends,
             weight: Some(1.0),
+            metadata: None,
         },
     )
     .await;
@@ -875,6 +877,7 @@ async fn apply_worker_applies_add_edge_changeset() {
         target: Id128::from_u128(e2.id.as_u128()),
         relation: khive_types::EdgeRelation::Extends,
         weight: Some(1.0),
+        metadata: None,
     };
 
     // Seed the ProposalCreated event in the event store.
@@ -1195,6 +1198,7 @@ async fn apply_worker_rejects_legacy_multi_step_compound_without_partial_entity_
                 target: Id128::from_u128(Uuid::new_v4().as_u128()),
                 relation: khive_types::EdgeRelation::Extends,
                 weight: Some(1.0),
+                metadata: None,
             },
         ],
     };
@@ -1609,6 +1613,7 @@ async fn budget_some_zero_allows_edge_only_changeset() {
         target: Id128::from_u128(e2.id.as_u128()),
         relation: khive_types::EdgeRelation::Extends,
         weight: Some(1.0),
+        metadata: None,
     };
 
     seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
@@ -1689,6 +1694,7 @@ fn count_new_entries_recursive() {
                 target: Id128::from_u128(1),
                 relation: khive_types::EdgeRelation::Extends,
                 weight: None,
+                metadata: None,
             },
         ],
     };
@@ -1721,4 +1727,444 @@ fn count_new_entries_recursive() {
         ],
     };
     assert_eq!(count_new_entries(&nested), 3, "1 + 2 nested = 3");
+}
+
+struct ProposalMetadataFixture {
+    runtime: KhiveRuntime,
+    token: NamespaceToken,
+    registry: VerbRegistry,
+    source: Uuid,
+    target: Uuid,
+    relation: &'static str,
+}
+
+impl ProposalMetadataFixture {
+    async fn new(source_kind: &str, target_kind: &str, relation: &'static str) -> Self {
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        ensure_schema(&runtime).await;
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some("local".into()));
+        builder.register(crate::KgPack::new(runtime.clone()));
+        let registry = builder.build().unwrap();
+        let source = runtime
+            .create_entity_with_embedding_report(
+                &token,
+                source_kind,
+                None,
+                "MetadataSource",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .0
+            .id;
+        let target = runtime
+            .create_entity_with_embedding_report(
+                &token,
+                target_kind,
+                None,
+                "MetadataTarget",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .0
+            .id;
+        registry
+            .dispatch(
+                "create",
+                serde_json::json!({"kind":"observation", "content":"Unchanged metadata fixture note"}),
+            )
+            .await
+            .unwrap();
+        let fixture = Self {
+            runtime,
+            token,
+            registry,
+            source,
+            target,
+            relation,
+        };
+        fixture.reset_edge().await;
+        fixture
+    }
+
+    fn link_args(&self, metadata: Option<serde_json::Value>) -> serde_json::Value {
+        let mut args = serde_json::json!({
+            "source_id":self.source, "target_id":self.target,
+            "relation":self.relation, "weight":0.25
+        });
+        if let Some(metadata) = metadata {
+            args["metadata"] = metadata;
+        }
+        args
+    }
+
+    async fn reset_edge(&self) {
+        let mut args = self.link_args(Some(
+            serde_json::json!({"fixture":"before", "optional":false}),
+        ));
+        args["weight"] = serde_json::json!(0.75);
+        self.registry.dispatch("link", args).await.unwrap();
+    }
+
+    async fn domain_rows(&self) -> serde_json::Value {
+        let mut reader = self.runtime.sql().reader().await.unwrap();
+        let mut snapshots = Vec::new();
+        for table in ["entities", "notes", "graph_edges"] {
+            let rows = reader
+                .query_all(SqlStatement::new(
+                    format!("SELECT * FROM {table} ORDER BY id"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                !rows.is_empty(),
+                "{table} must have a nonempty refusal baseline"
+            );
+            snapshots.push(serde_json::json!({"table":table, "rows":rows}));
+        }
+        serde_json::json!(snapshots)
+    }
+
+    async fn edge(&self) -> serde_json::Value {
+        let rows = self
+            .runtime
+            .list_edges(
+                &self.token,
+                EdgeListFilter {
+                    source_id: Some(self.source),
+                    target_id: Some(self.target),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the fixture has one natural-key edge");
+        serde_json::to_value(&rows[0]).unwrap()
+    }
+
+    async fn propose(&self, metadata: Option<serde_json::Value>) -> Uuid {
+        let mut changeset = serde_json::json!({
+            "kind":"add_edge", "source":self.source, "target":self.target,
+            "relation":self.relation, "weight":0.25
+        });
+        if let Some(value) = &metadata {
+            changeset["metadata"] = value.clone();
+        }
+        let response = self
+            .registry
+            .dispatch(
+                "propose",
+                serde_json::json!({
+                    "title":"Edge metadata intent", "description":"Preserve supplied edge metadata",
+                    "changeset":changeset
+                }),
+            )
+            .await
+            .unwrap();
+        let id = Uuid::parse_str(response["full_id"].as_str().unwrap()).unwrap();
+        let stored = self
+            .runtime
+            .events(&self.token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalCreated],
+                    payload_proposal_id: Some(id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.items.len(), 1);
+        let intent = &stored.items[0].payload["changeset"];
+        assert_eq!(intent["source"], self.source.to_string());
+        assert_eq!(intent["target"], self.target.to_string());
+        assert_eq!(intent["relation"], self.relation);
+        assert_eq!(intent["weight"], 0.25);
+        assert_eq!(
+            intent.get("metadata"),
+            metadata.as_ref().filter(|value| !value.is_null()),
+            "the immutable proposal event must retain the caller's metadata"
+        );
+        id
+    }
+
+    async fn approve(&self, id: Uuid) -> khive_types::ApplyResult {
+        self.registry
+            .dispatch("review", serde_json::json!({"id":id,"decision":"approve"}))
+            .await
+            .unwrap();
+        let applied = self
+            .runtime
+            .events(&self.token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalApplied],
+                    payload_proposal_id: Some(id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.items.len(),
+            1,
+            "read the actual apply outcome, not review's acknowledgement"
+        );
+        let payload: khive_types::ProposalAppliedPayload =
+            serde_json::from_value(applied.items[0].payload.clone()).unwrap();
+        assert_eq!(payload.proposal_id, Id128::from_u128(id.as_u128()));
+        payload.result
+    }
+
+    async fn assert_success(
+        &self,
+        metadata: Option<serde_json::Value>,
+        expected: serde_json::Value,
+    ) {
+        self.registry
+            .dispatch("link", self.link_args(metadata.clone()))
+            .await
+            .unwrap();
+        let direct = self.edge().await;
+        assert_eq!(
+            direct["metadata"], expected,
+            "direct link is the compatibility control"
+        );
+        self.reset_edge().await;
+        let before = self.edge().await;
+        let id = self.propose(metadata).await;
+        assert_eq!(
+            self.edge().await,
+            before,
+            "proposing must not write the edge"
+        );
+        let result = self.approve(id).await;
+        let edge = self.edge().await;
+        let khive_types::ApplyResult::Success { created_records } = result else {
+            panic!("expected an applied edge, got {result:?}");
+        };
+        assert_eq!(
+            created_records,
+            vec![Id128::from_u128(
+                Uuid::parse_str(edge["id"].as_str().unwrap())
+                    .unwrap()
+                    .as_u128()
+            )]
+        );
+        assert_eq!(
+            edge["id"], before["id"],
+            "existing natural-key identity is retained"
+        );
+        assert_eq!(
+            edge["metadata"], expected,
+            "proposal metadata must reach the persisted edge"
+        );
+        assert_eq!(edge["metadata"], direct["metadata"]);
+        assert_eq!(edge["weight"], direct["weight"]);
+        assert_eq!(edge["weight"], 0.25);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn proposal_add_edge_metadata_round_trips_and_matches_link() {
+    let rich = serde_json::json!({"optional":false, "context":{"values":[1,true,null], "label":"evidence"}});
+    ProposalMetadataFixture::new("concept", "concept", "extends")
+        .await
+        .assert_success(Some(rich.clone()), rich)
+        .await;
+    for kind in [
+        "build",
+        "runtime",
+        "data",
+        "artifact",
+        "tooling",
+        "normative",
+    ] {
+        let explicit =
+            serde_json::json!({"dependency_kind":kind,"optional":true,"purpose":"supplied"});
+        ProposalMetadataFixture::new("project", "project", "depends_on")
+            .await
+            .assert_success(Some(explicit.clone()), explicit)
+            .await;
+    }
+    ProposalMetadataFixture::new("project", "project", "depends_on")
+        .await
+        .assert_success(
+            Some(serde_json::json!({"optional":false,"context":"inferred"})),
+            serde_json::json!({"optional":false,"context":"inferred","dependency_kind":"build"}),
+        )
+        .await;
+    let no_default = serde_json::json!({"optional":true,"context":"no inferred qualifier"});
+    ProposalMetadataFixture::new("service", "project", "depends_on")
+        .await
+        .assert_success(Some(no_default.clone()), no_default)
+        .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn proposal_add_edge_metadata_invalid_values_match_link_without_domain_writes() {
+    let cases = [
+        (
+            "depends_on",
+            serde_json::json!("not an object"),
+            "metadata must be a JSON object",
+        ),
+        (
+            "depends_on",
+            serde_json::json!([]),
+            "metadata must be a JSON object",
+        ),
+        (
+            "depends_on",
+            serde_json::json!(42),
+            "metadata must be a JSON object",
+        ),
+        (
+            "depends_on",
+            serde_json::json!(false),
+            "metadata must be a JSON object",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"optional":null}),
+            "metadata.optional must be a boolean",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"optional":"yes"}),
+            "metadata.optional must be a boolean",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"optional":1}),
+            "metadata.optional must be a boolean",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"dependency_kind":null}),
+            "dependency_kind must be a string",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"dependency_kind":7}),
+            "dependency_kind must be a string",
+        ),
+        (
+            "depends_on",
+            serde_json::json!({"dependency_kind":"unknown"}),
+            "unknown dependency_kind",
+        ),
+        (
+            "extends",
+            serde_json::json!({"dependency_kind":"runtime"}),
+            "dependency_kind is only valid on depends_on",
+        ),
+    ];
+    for (relation, metadata, reason) in cases {
+        let kind = if relation == "depends_on" {
+            "project"
+        } else {
+            "concept"
+        };
+        let fixture = ProposalMetadataFixture::new(kind, kind, relation).await;
+        let before = fixture.domain_rows().await;
+        let direct = fixture
+            .registry
+            .dispatch("link", fixture.link_args(Some(metadata.clone())))
+            .await
+            .expect_err("direct link must refuse invalid metadata");
+        assert!(matches!(&direct, RuntimeError::InvalidInput(_)));
+        assert!(direct.to_string().contains(reason), "{direct}");
+        assert_eq!(fixture.domain_rows().await, before);
+        let id = fixture.propose(Some(metadata)).await;
+        assert_eq!(
+            fixture.domain_rows().await,
+            before,
+            "draft creation must not mutate domain rows"
+        );
+        let result = fixture.approve(id).await;
+        let khive_types::ApplyResult::Failed {
+            error,
+            applied_step_count,
+        } = result
+        else {
+            panic!("invalid metadata must fail at apply before writes, got {result:?}");
+        };
+        assert_eq!(applied_step_count, 0);
+        assert_eq!(
+            error,
+            direct.to_string(),
+            "both routes must use the same metadata validator"
+        );
+        assert_eq!(
+            fixture.domain_rows().await,
+            before,
+            "refused apply must preserve all domain rows"
+        );
+        let projection = ProposalsProjectionWorker::new(fixture.runtime.clone())
+            .get_proposal_row(&fixture.token, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.status, "approved",
+            "retain the existing failed-apply lifecycle"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn proposal_add_edge_metadata_absent_null_and_empty_follow_link() {
+    for metadata in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!({})),
+    ] {
+        let ordinary = metadata
+            .clone()
+            .filter(|value| !value.is_null())
+            .unwrap_or(serde_json::Value::Null);
+        ProposalMetadataFixture::new("concept", "concept", "extends")
+            .await
+            .assert_success(metadata.clone(), ordinary.clone())
+            .await;
+        ProposalMetadataFixture::new("project", "project", "depends_on")
+            .await
+            .assert_success(
+                metadata.clone(),
+                serde_json::json!({"dependency_kind":"build"}),
+            )
+            .await;
+        ProposalMetadataFixture::new("service", "project", "depends_on")
+            .await
+            .assert_success(metadata, ordinary)
+            .await;
+    }
 }
