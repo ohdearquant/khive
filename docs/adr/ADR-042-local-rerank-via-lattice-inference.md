@@ -32,10 +32,27 @@ uses the feature keys `relevance`, `salience`, `temporal`, `text_match`, and
 `vector_match`; when non-empty, that weighted score replaces the default final
 `rank_score`.
 
-Native lattice/cross-encoder rerank, LoRA hook resolution, runtime rerank config,
-latency disable behavior, and memory-path `RerankExecuted` emission are deferred.
-`khive-retrieval` contains a native cross-encoder scaffold and an empty
-`native-rerank` feature only.
+The opt-in `native-rerank` Cargo feature now provides a concrete local BERT
+cross-encoder through pinned `lattice-inference` 0.15.0, a runtime entity-document
+resolver, and `KhiveRuntime::native_cross_encoder_reranker` to compose them. Default
+retrieval and runtime builds do not enable the inference dependency. Native model
+selection in recall, LoRA hook resolution, runtime rerank config, latency disable
+behavior, and memory-path `RerankExecuted` emission remain deferred.
+
+The concrete scorer returns one sigmoid probability in `[0, 1]` per document in
+input order, not raw logits. Although sigmoid is mathematically monotonic, finite
+precision and saturation can introduce ties; strict score ordering is not
+guaranteed. Equal scores retain candidate input order.
+
+The runtime resolver reads live entities by UUID using the existing store's by-ID
+namespace contract. Text is the canonical entity name plus a space and nonempty
+description, or name alone. Missing or deleted entities produce `None`; the
+reranker drops them while keeping retained IDs, documents, and scores aligned.
+The result limit applies after filtering and scoring. An all-missing batch returns
+empty without calling the scorer. Resolver failures and resolver/score length
+mismatches remain errors. Attachment hydration and merged-ID redirects are not
+performed. This drop behavior is distinct from the future caller-level fallback
+in §6; no native recall fallback is enabled by constructing the adapter.
 
 ### What this ADR does
 
@@ -48,7 +65,7 @@ latency disable behavior, and memory-path `RerankExecuted` emission are deferred
 ### What this ADR does NOT do
 
 - Change the shipped ADR-033 weighted feature rerank contract.
-- Claim that `lattice-inference`, LoRA hooks, runtime `rerank_model_id`, or
+- Claim that LoRA hooks, runtime `rerank_model_id`, or
   memory-path `RerankExecuted` emission are currently shipped.
 - Add query paraphrasing or synthesis call sites.
 
@@ -248,9 +265,9 @@ Shipped rerank computes a single weighted score from five feature keys:
 | `text_match`   | Candidate appeared in text results   |
 | `vector_match` | Candidate appeared in vector results |
 
-The generic retrieval `Reranker` trait and native cross-encoder scaffold exist in
-`khive-retrieval`, but native cross-encoder use remains deferred until the inference
-port lands.
+The generic retrieval `Reranker` trait and concrete feature-gated native adapter
+exist in `khive-retrieval`, with runtime entity resolution and composition as
+described above. Integration into the memory rerank pipeline remains deferred.
 
 If a reranker errors, its scores default to `0.0` for that batch — the rest of the
 pipeline proceeds. This preserves the §6 degraded-mode-tolerance contract per
@@ -387,9 +404,9 @@ audit logs without losing recall functionality.
 
 ### Negative
 
-- Adds dependency on `lattice-inference` from `khive-runtime` (was previously only
-  `lattice-embed`). The dependency is opt-in via `rerank_model_id` config but the
-  link is mandatory at compile.
+- Enabling the `native-rerank` Cargo feature adds the native inference dependency
+  through `khive-retrieval`. This dependency is absent from default builds;
+  future runtime model-selection configuration is separate from feature selection.
 - Rerank latency dominates recall when enabled. Operators must pick model + GPU
   configuration that fits the budget.
 - The fallback paths (no model, mismatch, latency) are degraded-mode behaviors that
@@ -421,14 +438,16 @@ audit logs without losing recall functionality.
 ### Crate dependencies
 
 ```toml
-# khive-runtime/Cargo.toml
-lattice-inference = "X"
-lattice-tune      = { version = "X", features = ["inference-hook"] }
+# khive-retrieval/Cargo.toml (workspace pin)
+lattice-inference = { version = "=0.15.0", default-features = false, optional = true, features = ["bert", "std"] }
+
+[features]
+native-rerank = ["dep:lattice-inference"]
 ```
 
-The `inference-hook` feature flag is mandatory at compile because the brain pack
-references `LoraHook` types from lattice-tune unconditionally. Pure-Bayesian
-deployments compile the flag in but never load a LoRA profile.
+The runtime's feature forwards to `khive-retrieval/native-rerank`. LoRA hook
+dependencies and their feature policy remain part of the deferred integration;
+the concrete BERT scorer does not enable or require them.
 
 ### Handler
 
