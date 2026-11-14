@@ -830,7 +830,9 @@ A fixed line before the entries identifies the compact presentation, explains
 first-line summaries and marked shortening at that limit, and directs callers
 to `verb(help=true)` for the full text.
 
-Only the catalog embedded in `tools/list` changes. `verb(help=true)` and `verbs`
+Only the catalog embedded in `tools/list` changes. In compact mode, the rest of
+the request-tool description, including ops syntax, response shape, and bridge
+control note, is emitted in full. `verb(help=true)` and `verbs`
 retain full descriptions; argument definitions, dispatch, pack selection, and mounted
 catalog refresh and refusal behavior remain unchanged. Acceptance exercises
 actual MCP discovery and calls, default/full byte equality, complete compact

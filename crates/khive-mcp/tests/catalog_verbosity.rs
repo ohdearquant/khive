@@ -479,10 +479,45 @@ fn compact_catalog_keeps_exact_callables_full_help_and_dispatch() {
                 descriptor_without_description(full_tool),
                 descriptor_without_description(compact_tool)
             );
+            let full_prefix = description(full_tool).split_once(HEADING).unwrap().0;
+            let compact_prefix = description(compact_tool).split_once(HEADING).unwrap().0;
             assert_eq!(
-                description(full_tool).split_once(HEADING).unwrap().0,
-                description(compact_tool).split_once(HEADING).unwrap().0
+                full_prefix.as_bytes(),
+                compact_prefix.as_bytes(),
+                "compact mode must preserve every byte outside the verb catalog"
             );
+            for (section, expected) in [
+                (
+                    "ops syntax",
+                    r#"ops syntax:
+
+  Single op   : verb(name=value, name=value)
+  Batch       : [verb(...), verb(...)]                 — parallel, max 100
+  Chain       : verb1(...) | verb2(id=$prev.id)        — sequential, $prev
+  JSON form   : [{"tool":"verb","args":{...}}, ...]    — INDEPENDENT ops only"#,
+                ),
+                (
+                    "response shape",
+                    r#"Response shape:
+
+  {
+    "results": [ {"ok": true, "tool": "verb", "result": {...}}, ... ],
+    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N },
+    "status": "success" | "partial"
+  }"#,
+                ),
+                (
+                    "bridge control note",
+                    "Bridge control: `bridge.diagnostics()` reads this stdio bridge's in-memory\n\
+fallback counters without contacting a daemon or store. It must be the only\n\
+operation in the request; `bridge.diagnostics(help=true)` describes its schema.",
+                ),
+            ] {
+                assert!(
+                    compact_prefix.contains(expected),
+                    "compact mode must retain the complete {section}: {compact_prefix}"
+                );
+            }
             assert!(description(compact_tool).len() < description(full_tool).len());
             let rows = compact_rows(description(compact_tool));
             let names = rows.iter().map(|(name, _)| *name).collect::<Vec<_>>();
