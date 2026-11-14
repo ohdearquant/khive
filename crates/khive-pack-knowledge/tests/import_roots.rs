@@ -66,7 +66,7 @@ impl Fixture {
 
 fn markdown(title: &str) -> String {
     format!(
-        "# {title}\n\n{CANARY} This markdown document carries enough meaningful words to satisfy atom content validation for the import root confinement tests."
+        "# {title}\n\n{CANARY} This markdown document carries enough meaningful words to satisfy the atom content validation rule for the import root confinement tests."
     )
 }
 

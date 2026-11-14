@@ -3003,7 +3003,11 @@ fn git_digest_sources_parse_closed_and_checked() {
     let ssh: KhiveConfig =
         toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
     let error = ssh.validate().expect_err("a non-https remote is refused");
-    assert!(error.to_string().contains("git_digest.remotes"), "{error}");
+    assert!(
+        error.to_string().contains("git_digest.remotes")
+            && error.to_string().contains("is not an https:// URL"),
+        "{error}"
+    );
 
     for broad in [
         "https://github.com/ohdearquant",

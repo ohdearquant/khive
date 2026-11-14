@@ -73,10 +73,14 @@ async fn a_source_under_a_root_is_ingested_beside_it() {
         .await
         .expect("a source under a root is ingested");
     let target = allowed.path().join("map.db");
+    std::fs::File::create(&target).expect("pre-create explicit ingest target");
     ingest(&registry, &path_str(&source), Some(&path_str(&target)))
         .await
-        .expect("a missing target under a root is created");
-    assert!(target.exists(), "the map database was written");
+        .expect("an existing target under a root is ingested into");
+    assert!(
+        std::fs::metadata(&target).expect("target metadata").len() > 0,
+        "the map database was written"
+    );
 }
 
 #[tokio::test]
