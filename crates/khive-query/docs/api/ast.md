@@ -4,7 +4,7 @@ The query AST is the shared contract between the GQL and SPARQL parsers, validat
 
 ## `GqlQuery`
 
-`GqlQuery` contains one alternating `MatchPattern`, a `WhereExpr`, ordered `ReturnItem` projections, a non-negative row `offset`, and an optional row limit. GQL `SKIP` populates `offset`; the SPARQL parser leaves it at zero because its `OFFSET` form is not supported. Parsers produce this form; callers that construct it directly must still pass it through `validate` or `compile`, which repeats the structural validation.
+`GqlQuery` contains one alternating `MatchPattern`, a `WhereExpr`, ordered `ReturnItem` projections, `order_by: Vec<OrderItem>`, a non-negative row `offset`, and an optional row limit. GQL `SKIP` populates `offset`; the SPARQL parser leaves it at zero because its `OFFSET` form is not supported. SPARQL also initializes an empty order list. Parsers produce this form; callers that construct it directly must still pass it through `validate` or `compile`, which repeats the structural validation.
 
 ## `MatchPattern` and `PatternElement`
 
@@ -18,7 +18,15 @@ The query AST is the shared contract between the GQL and SPARQL parsers, validat
 
 `WhereExpr` preserves the boolean tree instead of flattening it: `And`, `Or`, a leaf `Condition`, or `True` when the query has no `WHERE` clause. `conditions()` walks leaves depth-first from left to right; `for_each_condition_mut()` provides the same traversal for normalization; `is_true()` detects the identity expression.
 
-A `Condition` binds a variable and `PropertyRef` to a `CompareOp` and `ConditionValue`. `PropertyRef::Field` names a dedicated substrate field, while `PropertyRef::JsonPath` stores the non-empty identifier segments below the JSON `properties` object. The distinction prevents an unknown field from silently becoming a JSON lookup. Operators cover scalar comparisons, `LIKE`, literal `CONTAINS` and `STARTS WITH`, list-valued `IN`, and operand-free `IS NOT NULL`. A `ReturnItem` is either a whole bound variable or one property projection; `variable()` returns the binding name in both cases.
+A `Condition` binds a variable and `PropertyRef` to a `CompareOp` and `ConditionValue`. `PropertyRef::Field` names a dedicated substrate field, `PropertyRef::JsonPath` stores the non-empty identifier segments below JSON `properties`, and `PropertyRef::MetadataPath` stores those below canonical edge `metadata`. These roots are distinct: node metadata and edge properties are unsupported. The distinction prevents an unknown field from silently becoming a JSON lookup. Operators cover scalar comparisons, `LIKE`, literal `CONTAINS` and `STARTS WITH`, list-valued `IN`, and operand-free `IS NOT NULL`. A `ReturnItem` is either a whole bound variable or one property projection; `variable()` returns the binding name in both cases. `RETURN e.metadata` projects the stored container, while the existing whole-edge expansion remains unchanged.
+
+## `OrderItem` and `OrderDirection`
+
+Each `OrderItem` carries `variable: String`, `property: PropertyRef`, and `direction: OrderDirection`. `OrderDirection::{Asc, Desc}` makes direction a closed choice; the GQL parser defaults to `Asc`. Order terms reference supported scalar fields or named paths below node properties or canonical edge metadata. Bare containers, namespace fields, unknown bindings, and invalid path segments are rejected, including in hand-built ASTs.
+
+The compiler adds these terms before its existing deterministic tie order without adding result columns. Recursive queries additionally require each term to be derivable from the actual returned projections so `DISTINCT` cannot hide an ambiguous sort value. Queries using neither metadata nor `ORDER BY` preserve the old SQL and parameter sequence.
+
+Direct Rust consumers must initialize the new `order_by` field and handle the added `MetadataPath` variant when matching `PropertyRef` exhaustively. No serialization contract for the AST is introduced.
 
 ## Numeric and literal values
 
