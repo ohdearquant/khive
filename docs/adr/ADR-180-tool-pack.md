@@ -1042,7 +1042,10 @@ declaration rules unchanged.
    including nested members; `{}` stores an empty object. Omitted and null
    fields preserve stored values. Creation retains its current defaults. Extra
    tags and capability links remain additive; a kind change replaces the kind
-   tag. No removal operation is introduced.
+   tag. No removal operation is introduced. A stored schema or description
+   therefore cannot be cleared: a correction can replace the schema with `{}`,
+   a description must be a nonempty string, and omitting either field or
+   passing null keeps the stored value.
 
 2. **The result distinguishes row outcomes.** Creation returns `created:true`,
    `updated:false`, `unchanged:false`. An existing row correction returns
@@ -1071,6 +1074,23 @@ declaration rules unchanged.
    inputs can make the old grant active again. A nonmatching grant still falls
    through to policy and default; this is not permanent revocation.
 
+   A correction that changes any of the four digest inputs appends exactly one
+   event of kind `tool_registration_changed`, verb `tool.register`, substrate
+   `event`, in the caller's namespace with the authenticated actor. Its typed
+   data is `{actor, id, digest_before, digest_after}`: the authenticated actor,
+   the registry row's UUID, and the Amendment 1 digest computed from the
+   stored and the corrected inputs. It carries no field values. It goes
+   through the same event store as Amendment 6's `tool_check_decided`, and
+   `actor` passes the same ADR-115 credential gate before the correction is
+   applied. The append is part of the guarded replacement: a failed append
+   refuses the correction and leaves the row unchanged. A correction that
+   changes only metadata, tags or capabilities, and an unchanged
+   registration, append none. The generic dispatch `Audit` row for
+   `tool.register` records the call, not which row changed or how its digest
+   moved. The class's ADR-168 retention class is `pinned_while_referenced`; its
+   referent is the registry row and its terminal condition is that row's
+   deletion.
+
 ### Acceptance for Amendment 10
 
 - `register_updates_supplied_fields_and_preserves_identity` adds a schema to an
@@ -1088,6 +1108,12 @@ declaration rules unchanged.
   exercise both the claim-loser path and a competing update. Skipping the
   losing caller's correction or replacing the guarded update with an
   unguarded one must fail the corresponding behavioral assertion.
+- `register_digest_input_change_appends_one_registration_changed_event` corrects
+  each of the four digest inputs on a row another actor registered and reads
+  exactly one `tool_registration_changed` event per correction, carrying the
+  correcting actor, the row id and the two digests, and no field value. A
+  description-only correction and an unchanged registration append none, and a
+  refused correction leaves neither a changed row nor an event.
 - Existing namespace, retired-name and ingest tests retain their contracts;
   `refused_registration_updates_preserve_rows_and_capabilities` checks refusal
   against a populated registration before and after the call.
