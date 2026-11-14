@@ -186,6 +186,39 @@ fleet_readers = []
 # Example granting one aggregate reader instead:
 # fleet_readers = ["service:metrics"]
 
+# ── Embedding settings ─────────────────────────────────────────────────────────
+#
+# Optional [embed] settings are read and validated at config load. Invalid known
+# values refuse the config and stop daemon startup; unknown keys in [embed] and
+# [embed.fields] warn and are ignored. [[engines]] below controls providers.
+#
+# [embed]
+# auto_embed = true
+# Boolean only (default true). Parsed here; automatic suppression is not wired yet.
+# batch_size = 128
+# Positive integer only; zero, negative and non-integer values are refused.
+# Used by kkernel reindex: --batch-size wins, omission defaults to 128, maximum 500.
+#
+# Legacy settings below are validated but ignored: they select no model, vector
+# size or hardware. Prefer [[engines]]; new configs need none of these keys.
+# model = "all-minilm-l6-v2"
+# Nonempty string only (empty or non-string refused); warns when it differs from
+# the default engine name, including when no default engine exists.
+# dimensions = 384
+# Positive integer only (zero, negative or non-integer refused); warns only when
+# it differs from the default engine's declared dims. No declaration: no comparison.
+# device = "cpu"
+# Exactly "metal", "cuda" or "cpu"; any other value or type is refused.
+# Any valid device warns. Applicable reasons share one startup warning;
+# matching model/dimensions values are silent.
+#
+# [embed.fields]
+# include = ["name", "description"]
+# Parsed selectors (default shown); execution of field selection is not wired yet.
+# A non-empty array of strings is required. Blank names, exact duplicates and
+# the literal "kind" are refused; names retain their exact bytes and order.
+# [embed.fields] must be a table. Invalid values refuse config loading.
+
 # ── Embedding engines ──────────────────────────────────────────────────────────
 #
 # The [[engines]] array declares peers in participation order. Built-in aliases

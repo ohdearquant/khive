@@ -371,3 +371,22 @@ fn literal_datetime_marker_after_ordinary_keys_remains_unknown() {
         assert!(!text.contains("private-inner-value"), "{text}");
     }
 }
+
+/// The `[embed]` section every released `kkernel kg init` wrote (v0.2.1 to v0.11.0), verbatim,
+/// still loads: each of its values is valid under the strict rules, so an upgrade refuses none.
+#[test]
+fn the_config_released_initializers_wrote_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("khive.toml");
+    let raw = "[embed]\nmodel = \"mE5-small\"\ndimensions = 384\nauto_embed = true\nbatch_size = 64\n\n[embed.fields]\ninclude = [\"name\", \"description\"]\n";
+    std::fs::write(&path, raw).unwrap();
+    let config = KhiveConfig::load(Some(&path))
+        .unwrap_or_else(|error| panic!("{error}"))
+        .unwrap();
+    assert_eq!(config.embed.model.as_deref(), Some("mE5-small"));
+    assert_eq!(config.embed.dimensions, Some(384));
+    assert_eq!(config.embed.device, None);
+    assert!(config.embed.auto_embed);
+    assert_eq!(config.embed.batch_size, Some(64));
+    assert_eq!(config.embed.fields.include(), &["name", "description"]);
+}
