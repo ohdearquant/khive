@@ -979,6 +979,21 @@ pub fn apply_at(
     options: &ApplyOptions,
     run_started_us: i64,
 ) -> Result<ApplyReport, PruneError> {
+    apply_at_inner(
+        target,
+        options,
+        run_started_us,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn apply_at_inner(
+    target: &PruneTarget,
+    options: &ApplyOptions,
+    run_started_us: i64,
+    #[cfg(test)] after_selection: Option<&dyn Fn(&Plan)>,
+) -> Result<ApplyReport, PruneError> {
     if options.batch_rows == 0 || options.batch_rows > MAX_BATCH_ROWS {
         return Err(PruneError::Invalid(format!(
             "batch rows {} outside 1..={MAX_BATCH_ROWS}",
@@ -1025,9 +1040,9 @@ pub fn apply_at(
             last_batch = last_batch.max(batch);
             match entry {
                 Ledger::Intent { batch, ids, .. } => {
-                    for entry in &ids {
-                        batched_ids.insert(Uuid::parse_str(&entry.id).map_err(|_| {
-                            PruneError::Invalid(format!("ledger id {} is not a UUID", entry.id))
+                    for ledger_id in &ids {
+                        batched_ids.insert(Uuid::parse_str(&ledger_id.id).map_err(|_| {
+                            PruneError::Invalid(format!("ledger id {} is not a UUID", ledger_id.id))
                         })?);
                     }
                     intents.insert(batch, ids);
@@ -1090,16 +1105,26 @@ pub fn apply_at(
             .chain(batched_ids.iter().copied()),
     );
     if recomputed != options.digest {
+        let distinct_ids: HashSet<_> = planned
+            .selected
+            .iter()
+            .map(|candidate| candidate.id)
+            .chain(removed_ids.iter().copied())
+            .chain(batched_ids.iter().copied())
+            .collect();
         return Err(PruneError::DigestMismatch {
             expected: options.digest.clone(),
             actual: recomputed,
             detail: format!(
-                "{} selected now, {} removed and {} batched earlier by this run",
-                planned.selected.len(),
-                removed_ids.len(),
-                batched_ids.len()
+                "{} distinct ids in the union of current selection and earlier removed/batched ids",
+                distinct_ids.len()
             ),
         });
+    }
+
+    #[cfg(test)]
+    if let Some(after_selection) = after_selection {
+        after_selection(&planned);
     }
 
     let (controls_before, candidate_old_before) = key_counts(&conn, options.cutoff_us)?;
@@ -1376,4 +1401,81 @@ pub(crate) fn delete_batch(
         }
     }
     Ok((removed, skipped))
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn apply_at_after_selection(
+        target: &PruneTarget,
+        options: &ApplyOptions,
+        run_started_us: i64,
+        after_selection: impl Fn(&Plan),
+    ) -> Result<ApplyReport, PruneError> {
+        apply_at_inner(target, options, run_started_us, Some(&after_selection))
+    }
+
+    pub(crate) fn append_batch(
+        state_dir: &Path,
+        plan: &Plan,
+        ids: &[&str],
+        outcome: Option<BatchOutcome>,
+    ) -> Result<(), PruneError> {
+        let path = state_dir.join("expended-ids.ndjson");
+        let mut last_batch = 0;
+        for line in BufReader::new(fs::File::open(&path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: Ledger = serde_json::from_str(&line)?;
+            let batch = match entry {
+                Ledger::Intent { batch, .. }
+                | Ledger::Commit { batch, .. }
+                | Ledger::Reconcile { batch, .. } => batch,
+            };
+            last_batch = last_batch.max(batch);
+        }
+        let batch = last_batch + 1;
+        let ids = ids
+            .iter()
+            .map(|id| {
+                let id = Uuid::parse_str(id).expect("fixture id");
+                let candidate = plan
+                    .selected
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .expect("fixture id belongs to the authorized plan");
+                LedgerId {
+                    id: id.hyphenated().to_string(),
+                    verb: EXPENDABLE_VERBS[candidate.verb as usize].to_string(),
+                    namespace: plan.namespaces[candidate.namespace as usize].clone(),
+                    created_at: candidate.created_at,
+                }
+            })
+            .collect();
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        append_line(
+            &mut file,
+            &Ledger::Intent {
+                digest: plan.digest.clone(),
+                batch,
+                ids,
+            },
+        )?;
+        if let Some((removed, skipped)) = outcome {
+            append_line(
+                &mut file,
+                &Ledger::Commit {
+                    digest: plan.digest.clone(),
+                    batch,
+                    removed,
+                    skipped,
+                    at_us: chrono::Utc::now().timestamp_micros(),
+                },
+            )?;
+        }
+        Ok(())
+    }
 }
