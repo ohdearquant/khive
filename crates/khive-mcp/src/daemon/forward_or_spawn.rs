@@ -355,6 +355,44 @@ where
     .await
 }
 
+/// Validate the exact spelling passed to UnixStream::connect. In particular,
+/// a relative primary socket stays relative; adding the cwd changes its limit.
+fn validate_primary_socket_path(socket_path: &std::path::Path) -> Result<(), McpError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: sockaddr_un contains only integer fields and a character array;
+    // zero is valid. This value is used only to inspect the field capacity.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let sun_path_capacity = address.sun_path.len();
+    let path_bytes = socket_path.as_os_str().as_bytes().len();
+    let required_bytes = path_bytes.saturating_add(1);
+    if required_bytes <= sun_path_capacity {
+        return Ok(());
+    }
+
+    let path = format!("{socket_path:?}");
+    Err(McpError::invalid_params(
+        format!(
+            "daemon socket path {path} is too long: {path_bytes} path bytes \
+             ({required_bytes} including NUL) exceed the platform sun_path capacity of \
+             {sun_path_capacity} bytes; configure paired shorter private absolute \
+             KHIVE_SOCKET and KHIVE_PID paths consistently for the daemon and its clients"
+        ),
+        Some(serde_json::json!({
+            "reason": "daemon_socket_path_too_long",
+            "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+            "path": path,
+            "path_bytes": path_bytes,
+            "required_bytes": required_bytes,
+            "sun_path_capacity": sun_path_capacity,
+        })),
+    ))
+}
+
+#[cfg(test)]
+#[path = "primary_socket_path_tests.rs"]
+mod primary_socket_path_tests;
+
 async fn forward_or_spawn_admitted<F, P>(
     frame: &DaemonRequestFrame,
     spawn: &F,
@@ -367,6 +405,10 @@ where
 {
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
+    }
+
+    if let Err(error) = validate_primary_socket_path(&khive_runtime::daemon::socket_path()) {
+        return Some(Err(error));
     }
 
     let request_started = tokio::time::Instant::now();
