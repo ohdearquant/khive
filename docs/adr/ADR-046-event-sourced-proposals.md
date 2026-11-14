@@ -1417,9 +1417,10 @@ Running the legacy steps' prepared plans as one atomic unit is not enough. Two g
 The `Canonical` arm (2026-10-14 amendment, K1-K3) closes both gaps. It applies an ordered
 change-set in one writer transaction, all of it or none. Creates carry caller-minted ids, and a
 link can name a create earlier in the same change-set. A link's `properties` land as the edge's
-metadata. Budgets, secret scans, reserved-property refusal, gate checks on every constituent
-operation, and the refusal shape that names the failing operation index are already defined
-there. This amendment routes the step form onto that path instead of building a second atomic
+metadata. The bound on the operation count and the refusal shape that names the failing
+operation index are set there (K1-K3). The rules a change-set lands under, including secret scans,
+reserved-property handling and the gate check on every constituent operation, are ADR-102's
+2026-10-14 amendment, which the canonical apply runs. This amendment routes the step form onto that path instead of building a second atomic
 apply.
 
 ### C1. Translation at proposal creation
@@ -1453,6 +1454,14 @@ refuses the whole proposal, and no event is appended:
 - An `AddEntity` whose resolved kind is not one of the eight base entity kinds is refused: a canonical
   create's `entity_kind` is that closed set, so a pack-registered kind such as `resource` has no
   slot. A proposal for such an entity stays single-step.
+- An `AddEdge` with relation `supersedes` whose source or target is a note of kind `memory` created
+  by an earlier step of the same compound is refused. That endpoint is not in the local store, which
+  is A1's second shape rejected at `propose`; the earlier step's draft kind is how the endpoint is
+  known to be a memory note. This holds whether the other endpoint is a stored memory note or is
+  also created in the compound.
+- A `SupersedeEntity` step is translated only when `old` and `new` both name stored entities or
+  entities created by earlier steps. One that names a note is refused, so a supersedes link between
+  memory notes cannot leave the A1 route by arriving as `SupersedeEntity`.
 - A governance-bearing step (2026-08-16 amendment, A1) and `ClassifyExistingEdgeGovernance` are
   refused. A3 requires a governance-bearing edge to apply through governed apply, and the canonical
   link path does not provide it, so translation would land the edge ungoverned.
@@ -1492,7 +1501,8 @@ ways the proposer can see:
 
 `EntityDraft` and `NoteDraft` gain an optional `id`, a full UUID. `propose` refuses an id held by
 a live or deleted record, or by an edge or event, and names it. This is a new check:
-proposal validation reads no stored rows today. When the change-set lands, the canonical identity
+changeset validation at `propose` reads no stored rows today (the read of a parent proposal is
+separate). When the change-set lands, the canonical identity
 check runs again, so a record created between proposal and approval refuses the unit, which rolls
 back whole, and the refusal names the operation index. When the
 id is absent, `propose` mints one while translating. The `propose` response gains `created_ids`,
@@ -1528,7 +1538,9 @@ proposal whose payload carries a key these types do not define still loads, revi
 
 ### C5. What this amendment does not change
 
-- The 2026-08-16 amendment's classification reads the steps as submitted, before translation.
+- The 2026-08-16 amendment's classification reads the steps as submitted, before translation,
+  including the store reads A1's definition needs to tell whether an endpoint is a live memory note
+  in the local store.
   A governance-bearing proposal is never translated (C1), so its rules are unaffected.
 - The `Canonical` arm's caller-supplied form, its apply path and its output (`preimage: none` for a
   change-set with only creates and links) are unchanged.
@@ -1550,6 +1562,10 @@ proposal whose payload carries a key these types do not define still loads, revi
 - A compound whose `AddNote` carries `properties.tags` lands the note with those tags.
 - A compound with an `AddEntity` of kind `resource`, and one with a governance-bearing `AddEdge`,
   are refused at `propose`, and no event is appended.
+- A compound whose `AddNote` creates a memory note and whose later `AddEdge` with relation
+  `supersedes` links it to a stored memory note is refused at `propose`, and so is one that links
+  two memory notes the compound creates. A `SupersedeEntity` step naming a memory note in a
+  multi-step compound is refused. No event is appended in any of these cases.
 - An `AddEntity` id held by a live record, and one held by a deleted record, are refused at
   `propose`. An id taken between proposal and approval refuses the apply, and the entity the first
   step would have created does not exist.
