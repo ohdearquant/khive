@@ -13,7 +13,8 @@
 /// a candidate remain content, but an invalid fragment lets the next quote
 /// start a new candidate. Fragment validation and complete candidates each
 /// cover disjoint runs, keeping total work linear. Every escape must still be
-/// valid JSON; paths like `C:\Users` do not decode.
+/// valid JSON; paths like `C:\Users` do not decode. A final unclosed candidate
+/// is decoded only if adding its closing quote makes it a valid JSON string.
 pub(super) fn escaped_strings(text: &str) -> Vec<String> {
     if !text.contains('\\') {
         return Vec::new();
@@ -46,6 +47,15 @@ pub(super) fn escaped_strings(text: &str) -> Vec<String> {
             previous_quote = i;
         }
         backslashes = if b == b'\\' { backslashes + 1 } else { 0 };
+    }
+    // Complete the one remaining candidate once, preserving strict escape
+    // validation. This adds one linear suffix pass, not a retry per quote.
+    let tail = &text[start..];
+    if tail.contains('\\') {
+        let literal = format!("{tail}\"");
+        if let Ok(value) = serde_json::from_str::<String>(&literal) {
+            decoded.push(value);
+        }
     }
     decoded
 }

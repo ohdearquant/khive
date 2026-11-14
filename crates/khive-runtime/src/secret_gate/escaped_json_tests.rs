@@ -190,6 +190,61 @@ fn escaped_credentials_after_stray_prose_backslashes_are_refused() {
     }
 }
 
+#[test]
+fn unclosed_escaped_credentials_are_refused_at_end_of_field() {
+    for (name, plain, escaped) in cases() {
+        let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+            panic!("{name}: plain credential control must refuse");
+        };
+        for content in [
+            format!(r#"she said "hi then \"{escaped} in the log"#),
+            format!(r#"we saw \"{escaped} in the log"#),
+            format!(r#""{escaped}"#),
+        ] {
+            assert!(scan(&content).is_none(), "{name}: raw control: {content}");
+            let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+                panic!("{name}: unclosed escaped credential must refuse: {content}");
+            };
+            assert_eq!(actual.detector, expected.detector, "{name}: {content}");
+            let Err(RuntimeError::SecretDetected(located)) =
+                check_note_fields_at(&content, None, None, "note")
+            else {
+                panic!("{name}: note content must refuse");
+            };
+            assert_eq!(located.detector, expected.detector);
+            assert_eq!(located.location.as_deref(), Some("note.content"));
+        }
+    }
+}
+
+#[test]
+fn benign_unclosed_text_and_invalid_escape_tails_keep_their_verdict() {
+    for content in [
+        r#"she said "hello"#,
+        r#"she said "hello then \"goodbye"#,
+        r#"we saw \"docs\/guide.md"#,
+        r#""line\none and \u00e9"#,
+        r#""a final escaped backslash \\"#,
+    ] {
+        assert!(scan(content).is_none(), "raw control: {content}");
+        assert!(check(content).is_ok(), "{content}");
+    }
+    for content in [
+        r#""C:\Users\docs"#,
+        r#""invalid \q"#,
+        r#""short unicode \u004"#,
+        r#""unpaired surrogate \uD800"#,
+        "\"dangling backslash \\",
+        "\"literal newline\nthen \\n",
+    ] {
+        assert!(
+            super::escaped_json::escaped_strings(content).is_empty(),
+            "{content}"
+        );
+        assert!(check(content).is_ok(), "{content}");
+    }
+}
+
 /// Pins the decoder only: a run holding an invalid escape yields no decoded view. Whether the gate
 /// should still refuse the escaped credential in such a run is tracked in #6554.
 #[test]
@@ -225,8 +280,53 @@ fn prose_quotes_and_backslash_paths_keep_their_verdict() {
 #[test]
 fn each_quoted_run_is_decoded_once() {
     let content = "\"a\\nb\" ".repeat(50_000) + "\"x\\\" ";
-    assert_eq!(super::escaped_json::escaped_strings(&content).len(), 50_000);
+    let decoded = super::escaped_json::escaped_strings(&content);
+    // The final valid unfinished run now contributes its own decoded value.
+    assert_eq!(decoded.len(), 50_001);
+    assert_eq!(decoded.last().map(String::as_str), Some("x\" "));
     assert!(check(&content).is_ok());
+}
+
+#[test]
+fn many_quoted_runs_do_not_hide_an_unclosed_escaped_credential() {
+    let prefix = "\"a\\nb\" ".repeat(50_000) + &r#"\"bad\q "#.repeat(50_000);
+    for (name, plain, escaped) in cases() {
+        let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+            panic!("{name}: plain credential control must refuse");
+        };
+        let content = format!("{prefix}\\\"{escaped}");
+        assert!(scan(&content).is_none(), "{name}: raw control");
+        let decoded = super::escaped_json::escaped_strings(&content);
+        assert_eq!(decoded.len(), 50_001, "{name}: one final candidate");
+        assert_eq!(decoded.last(), Some(&plain));
+        let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+            panic!("{name}: final escaped credential must refuse");
+        };
+        assert_eq!(actual.detector, expected.detector);
+    }
+}
+
+#[test]
+fn many_escaped_quotes_in_one_unclosed_run_are_decoded_once() {
+    let prefix = "\"intro ".to_owned() + &r#"\"quoted\" "#.repeat(50_000);
+    for (name, plain, escaped) in cases() {
+        let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+            panic!("{name}: plain credential control must refuse");
+        };
+        let content = format!("{prefix}{escaped}");
+        assert!(scan(&content).is_none(), "{name}: raw control");
+        let decoded = super::escaped_json::escaped_strings(&content);
+        assert_eq!(
+            decoded.len(),
+            1,
+            "{name}: one candidate across escaped quotes"
+        );
+        assert!(decoded[0].ends_with(&plain));
+        let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+            panic!("{name}: unclosed escaped credential must refuse");
+        };
+        assert_eq!(actual.detector, expected.detector);
+    }
 }
 
 #[test]
