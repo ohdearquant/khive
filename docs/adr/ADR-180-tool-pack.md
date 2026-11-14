@@ -1030,9 +1030,11 @@ new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is i
 ## Amendment 10 (2026-11-14): correcting an existing registration
 
 **Status: Proposed.** Refs #6597. This qualifies the Decision's existing-name
-behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest`, the
-grant pin predicate and the specialized network, executable and program
-declaration rules unchanged.
+behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest` and
+the grant pin predicate unchanged. The network, executable and program
+declaration rules keep their content; item 4 checks them against the corrected
+row as a whole, and the statements of the old existing-name contract are listed
+at the end with what happens to each.
 
 1. **Supplied fields correct the same row.** A public registration resolves the
    name in the request's write namespace. A live existing row keeps its UUID,
@@ -1089,7 +1091,64 @@ declaration rules unchanged.
    `tool.register` records the call, not which row changed or how its digest
    moved. The class's ADR-168 retention class is `pinned_while_referenced`; its
    referent is the registry row and its terminal condition is that row's
-   deletion.
+   deletion. The digests are unkeyed over short inputs; the event lives in the
+   row's namespace, so its readers can already read the row it describes.
+
+4. **The corrected row is validated whole.** Before the guarded replacement,
+   the row that would result (stored fields with the supplied ones applied) is
+   checked against the declaration rules for `network`, `executable_digest` and
+   `program` ([ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations)
+   Decision item 1, [ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+   items 1 and 2, and Amendment 8 of this record), not only the supplied
+   fields. On a row that carries any of those three properties, a correction
+   that changes `source` or `kind` is refused, and the reason names the stored
+   properties. This covers an `exec:` source changed to another `exec:` path:
+   a stored `executable_digest` is bound to the registered binary, and a stored
+   `program` to its interpreter, so a different binary or program is a new
+   registration under a new name, granted again. A passed `network`,
+   `executable_digest` or `program` that differs from the stored value is
+   refused as those amendments already say; this amendment adds none of the
+   three to the correctable fields.
+
+5. **A correction cannot loosen the definition.** `tool.check` resolves by
+   name, so a correction to an existing row changes the default answer every
+   caller of that name receives. A correction that moves `side_effect` to a
+   less strict class, or `trust` to a more trusted origin, is refused, and the
+   reason names the field, the stored value and the passed one. The orders are
+   the Decision's own listings: `side_effect` from `read` (least strict, the
+   only class the default allows) through `write` and `egress` to
+   `irreversible`, and `trust` from `first_party` (most trusted) through
+   `marketplace` to `external`. A looser definition is a new registration under
+   a new name. Moving either field the other way, and every other supplied
+   field, corrects in place as item 1 says. The registry row records no
+   registrant, so no caller is exempt.
+
+### Statements of the old existing-name contract
+
+- ADR-180 Decision, "re-registering an existing name returns the existing object
+  and links any new capabilities without changing its properties": scoped to
+  `tool.ingest` by the pointer under the Decision; `tool.register` follows this
+  amendment.
+- ADR-180 Amendment 5 Context, the same sentence quoted: kept as the record of
+  what Amendment 5 addressed. Its acceptance arms 37, 38 and 41 still hold: the
+  existing row keeps its id and reports `created: false`.
+- ADR-180 Decision acceptance arms 1, 2 and 8: still hold as written. Arm 1's
+  second call returns the same id with `created: false`, and arm 8 is
+  `tool.ingest`.
+- ADR-180 Amendment 8 item 3, "Re-registering an existing name returns the stored
+  row unchanged": rewritten by item 4. A passed `program` that differs is still
+  refused, and a source or kind change on a row carrying `program` is refused.
+- ADR-181 Amendment 13 Decision item 1, "Re-registering an existing name keeps
+  the stored row unchanged": rewritten. A passed `network` follows Amendment 14
+  item 2; the other supplied fields follow items 1, 4 and 5.
+- ADR-181 Amendment 14 item 1, "Re-registering an existing name never changes the
+  stored row", and item 2, "the existing row is returned unchanged as today":
+  rewritten for `tool.register`. The refusal of a differing `network` or
+  `executable_digest` stands, and item 4 adds the refusal of a source or kind
+  change on a row carrying either.
+- The test `re_registration_keeps_the_approved_object_and_definition`, cited by
+  ADR-181 Amendments 13 and 14 as proof of the old contract, is replaced by
+  `re_registration_updates_definition_and_invalidates_only_mismatched_grants`.
 
 ### Acceptance for Amendment 10
 
@@ -1114,6 +1173,17 @@ declaration rules unchanged.
   correcting actor, the row id and the two digests, and no field value. A
   description-only correction and an unchanged registration append none, and a
   refused correction leaves neither a changed row nor an event.
+- `register_correction_refuses_source_or_kind_change_on_declared_rows` stores
+  rows carrying `network` with `executable_digest`, and `program`, and corrects
+  `source` (to a non-`exec:` value and to another `exec:` path) and `kind` on
+  each: every call is refused naming the stored properties, with the row,
+  grants and events unchanged. The same corrections on a row carrying none of
+  them succeed (control). Validating only the supplied fields must fail it.
+- `register_correction_refuses_loosening` moves `side_effect` to each less
+  strict class and `trust` to each more trusted origin on a row another actor
+  registered: each call is refused naming the field, with the row unchanged and
+  no `tool_registration_changed` event. Tightening either field succeeds and
+  appends one event (control). Dropping the order check must fail it.
 - Existing namespace, retired-name and ingest tests retain their contracts;
   `refused_registration_updates_preserve_rows_and_capabilities` checks refusal
   against a populated registration before and after the call.

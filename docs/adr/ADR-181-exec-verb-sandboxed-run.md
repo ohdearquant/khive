@@ -960,6 +960,9 @@ accepted by its driven arms, never by its text.
    re-registration does not reach the row. `tool.describe`, `tool.list` and the register response
    report the stored `network`, so the caller sees what is stored rather than what was asked.
 
+   ADR-180 Amendment 10 (proposed) rewrites the existing-name behavior of `tool.register`: supplied fields
+   correct the row, and a source or kind change on a row carrying `network` is refused.
+
    Which registrations may carry `network` is the hosting deployment's registration policy, not
    exec's. exec enforces the declaration a row carries; it does not decide eligibility, and nothing
    here promises that a deployment's general code runs without network. Whether the host runs
@@ -1356,6 +1359,8 @@ item 8).
 
    An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
    changes the stored row (item 2).
+   ADR-180 Amendment 10 (proposed) rewrites this for `tool.register`: other supplied fields correct the row, and a source
+   or kind change on a row carrying `executable_digest` is refused.
 
 2. **Re-registration refuses a conflicting network declaration.** `tool.register` on a name that already has a row
    validates a passed `network` or `executable_digest` as it would for a new row. When a passed value differs from the
