@@ -172,6 +172,17 @@ async fn failed_real_scan_preserves_success_without_hiding_the_failure() {
     let after = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
     assert_eq!(after["last_success_at"], before["last_success_at"]);
     assert_eq!(after["pending_rows_seen"], before["pending_rows_seen"]);
+    for field in [
+        "backlog_observed_at",
+        "undelivered_rows",
+        "backoff_rows",
+        "oldest_undelivered_created_at",
+        "oldest_backoff_created_at",
+        "earliest_backoff_next_attempt_at",
+        "max_backoff_delivery_attempts",
+    ] {
+        assert_eq!(after[field], before[field], "{field}");
+    }
     assert_eq!(after["last_scan_succeeded"], false);
     assert_eq!(after["consecutive_failures"], 1);
     assert_eq!(after["last_scan_completed_at"], after["last_failure_at"]);
@@ -214,4 +225,268 @@ async fn real_scan_records_the_selected_page_before_failed_delivery() {
     assert!(health["channels"][0]["outbox"]["oldest_pending_age_secs"]
         .as_u64()
         .is_some());
+}
+
+async fn set_retry(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: uuid::Uuid,
+    created: DateTime<Utc>,
+    next: DateTime<Utc>,
+    attempts: u64,
+) {
+    let mut note = runtime
+        .notes(token)
+        .unwrap()
+        .get_note(id)
+        .await
+        .unwrap()
+        .unwrap();
+    let props = note.properties.as_mut().unwrap();
+    props["next_attempt_at"] = json!(next.to_rfc3339());
+    props["delivery_attempts"] = json!(attempts);
+    runtime
+        .backend()
+        .notes_for_namespace(token.namespace().as_str())
+        .unwrap()
+        .upsert_note(note)
+        .await
+        .unwrap();
+
+    // Upserts preserve the original creation time. Age this fixture row
+    // explicitly while leaving retry-property/index updates on the real path.
+    let changed = runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET created_at = ?1 WHERE id = ?2 AND namespace = ?3".into(),
+            params: vec![
+                SqlValue::Integer(created.timestamp_micros()),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(token.namespace().as_str().into()),
+            ],
+            label: Some("outbox_backlog_age_fixture".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(
+        runtime
+            .notes(token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        created.timestamp_micros()
+    );
+}
+
+async fn note_state(runtime: &KhiveRuntime) -> Value {
+    let rows = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_all(SqlStatement {
+            sql: "SELECT * FROM notes ORDER BY id".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    serde_json::to_value(rows).unwrap()
+}
+
+#[tokio::test]
+async fn future_retry_is_visible_through_real_scan_and_read_only_health_for_both_transports() {
+    for kind in ["email", "telegram"] {
+        let (runtime, token) = fixture();
+        let channel = Arc::new(RecordingChannel::new(
+            kind,
+            "sender@example.com",
+            Outcome::Success,
+        ));
+        let mut channels = ChannelRegistry::new();
+        channels.register(channel.clone());
+        let id = seed(&runtime, &token, kind, Some("sender@example.com")).await;
+        let created = Utc::now() - chrono::Duration::hours(10);
+        let next = Utc::now() + chrono::Duration::hours(1);
+        set_retry(&runtime, &token, id, created, next, u64::MAX).await;
+        pass(&runtime, &channels, kind, &mut None).await.unwrap();
+        assert!(channel.sent.lock().unwrap().is_empty());
+        let server =
+            KhiveMcpServer::with_packs(runtime.clone(), &["kg".into(), "comm".into()]).unwrap();
+        let before = note_state(&runtime).await;
+        for _ in 0..3 {
+            let health = server
+                .verb_registry_clone()
+                .dispatch("comm.health", json!({}))
+                .await
+                .unwrap();
+            let outbox = &health["channels"][0]["outbox"];
+            assert_eq!(outbox["pending_rows_seen"], 0);
+            assert!(outbox["oldest_pending_created_at"].is_null());
+            assert_eq!(outbox["undelivered_rows"], 1);
+            assert_eq!(outbox["backoff_rows"], 1);
+            assert_eq!(outbox["max_backoff_delivery_attempts"], u64::MAX);
+            assert_eq!(
+                DateTime::parse_from_rfc3339(
+                    outbox["earliest_backoff_next_attempt_at"].as_str().unwrap()
+                )
+                .unwrap(),
+                next
+            );
+            assert_eq!(
+                DateTime::parse_from_rfc3339(outbox["oldest_backoff_created_at"].as_str().unwrap())
+                    .unwrap()
+                    .timestamp_micros(),
+                created.timestamp_micros()
+            );
+            assert!(outbox["oldest_undelivered_age_secs"].as_u64().unwrap() >= 36000);
+            assert!(outbox["backlog_observed_at"].is_string());
+            assert!(health["channels"][0]["no_success_age_secs"].is_null());
+        }
+        assert_eq!(note_state(&runtime).await, before);
+        // Becoming due changes only the partition; the real delivery loop then sends it.
+        set_retry(
+            &runtime,
+            &token,
+            id,
+            created,
+            Utc::now() - chrono::Duration::seconds(1),
+            7,
+        )
+        .await;
+        pass(&runtime, &channels, kind, &mut None).await.unwrap();
+        let after = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
+        assert_eq!(after["pending_rows_seen"], 1);
+        assert_eq!(after["undelivered_rows"], 1);
+        assert_eq!(after["backoff_rows"], 0);
+        assert!(after["earliest_backoff_next_attempt_at"].is_null());
+        assert!(after["max_backoff_delivery_attempts"].is_null());
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn real_scan_keeps_due_page_capped_while_counting_future_rows() {
+    let (runtime, token) = fixture();
+    for _ in 0..201 {
+        seed(&runtime, &token, "telegram", Some("sender@example.com")).await;
+    }
+    let future = seed(&runtime, &token, "telegram", Some("sender@example.com")).await;
+    set_retry(
+        &runtime,
+        &token,
+        future,
+        Utc::now() - chrono::Duration::days(1),
+        Utc::now() + chrono::Duration::days(1),
+        10,
+    )
+    .await;
+    let channels = channels("telegram", Outcome::Transient);
+    pass(&runtime, &channels, "telegram", &mut None)
+        .await
+        .unwrap();
+    let observed = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
+    assert_eq!(observed["pending_rows_seen"], 200);
+    assert_eq!(observed["pending_rows_limit"], 200);
+    assert_eq!(observed["undelivered_rows"], 202);
+    assert_eq!(observed["backoff_rows"], 1);
+    assert_eq!(observed["max_backoff_delivery_attempts"], 10);
+}
+
+#[tokio::test]
+async fn real_scan_excludes_ambiguous_missing_slugs_from_backlog() {
+    let (runtime, token) = fixture();
+    let mut channels = channels("telegram", Outcome::Success);
+    channels.register(Arc::new(RecordingChannel::new(
+        "telegram",
+        "second@example.com",
+        Outcome::Success,
+    )));
+    for slug in [None, Some("second@example.com"), Some("sender@example.com")] {
+        let id = seed(&runtime, &token, "telegram", slug).await;
+        set_retry(
+            &runtime,
+            &token,
+            id,
+            Utc::now(),
+            Utc::now() + chrono::Duration::days(1),
+            10,
+        )
+        .await;
+    }
+    pass(&runtime, &channels, "telegram", &mut None)
+        .await
+        .unwrap();
+    let observed = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
+    assert_eq!(observed["pending_rows_seen"], 0);
+    assert_eq!(observed["undelivered_rows"], 1);
+    assert_eq!(observed["backoff_rows"], 1);
+}
+
+#[tokio::test]
+async fn backlog_query_failure_keeps_dated_observation_and_does_not_stop_delivery() {
+    let (runtime, token) = fixture();
+    let channel = Arc::new(RecordingChannel::new(
+        "telegram",
+        "sender@example.com",
+        Outcome::Success,
+    ));
+    let mut channels = ChannelRegistry::new();
+    channels.register(channel.clone());
+    let future = seed(&runtime, &token, "telegram", Some("sender@example.com")).await;
+    set_retry(
+        &runtime,
+        &token,
+        future,
+        Utc::now(),
+        Utc::now() + chrono::Duration::days(1),
+        9,
+    )
+    .await;
+    pass(&runtime, &channels, "telegram", &mut None)
+        .await
+        .unwrap();
+    let before = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
+    assert_eq!(before["backoff_rows"], 1);
+    // This future row stays outside the real due page, but its invalid metadata refuses the aggregate.
+    runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET created_at='invalid-timestamp' WHERE id=?1".into(),
+            params: vec![SqlValue::Text(future.to_string())],
+            label: None,
+        })
+        .await
+        .unwrap();
+    seed(&runtime, &token, "telegram", Some("sender@example.com")).await;
+    pass(&runtime, &channels, "telegram", &mut None)
+        .await
+        .unwrap();
+    assert_eq!(channel.sent.lock().unwrap().len(), 1);
+    let after = health_note(&runtime, &token).await.properties.unwrap()["outbox"].clone();
+    assert_eq!(after["last_scan_succeeded"], false);
+    assert_eq!(after["consecutive_failures"], 1);
+    for field in [
+        "last_success_at",
+        "pending_rows_seen",
+        "backlog_observed_at",
+        "undelivered_rows",
+        "backoff_rows",
+        "oldest_undelivered_created_at",
+        "oldest_backoff_created_at",
+        "earliest_backoff_next_attempt_at",
+        "max_backoff_delivery_attempts",
+    ] {
+        assert_eq!(after[field], before[field], "{field}");
+    }
 }
