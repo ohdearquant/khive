@@ -15,7 +15,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub enum DomainDisposition {
     /// The handler returned its canonical success value before a later failure.
     Committed,
-    /// The operation was refused before its handler was invoked.
+    /// No requested domain write committed, established by pre-dispatch refusal
+    /// or an explicit handler/write proof.
     NotCommitted,
     /// The handler failed, so its domain effects are not established here.
     Unknown,
@@ -649,7 +650,8 @@ impl std::error::Error for ResolutionFailureContext {
 }
 
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
-/// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
+/// Callers should match on `InvalidInput` or `RejectedBeforeWrite` for bad arguments,
+/// and `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -698,6 +700,11 @@ pub enum RuntimeError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// A named handler validation phase refused before any requested domain write.
+    /// This evidence belongs to that operation, not an enclosing caller's earlier work.
+    #[error("invalid input: {0}")]
+    RejectedBeforeWrite(String),
 
     #[error("invalid input: {0}")]
     UnknownVerb(String),
@@ -1025,6 +1032,7 @@ impl RuntimeError {
     /// Read only this operation's proof, never a nested earlier action's finality.
     pub fn batch_write_disposition(&self) -> Option<DomainDisposition> {
         match self {
+            Self::RejectedBeforeWrite(_) => Some(DomainDisposition::NotCommitted),
             Self::BatchWrite { context } => Some(context.disposition),
             Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
             _ => None,
@@ -1134,6 +1142,7 @@ impl RuntimeError {
             Self::Query(_) => "Query",
             Self::NotFound(_) => "NotFound",
             Self::InvalidInput(_) => "InvalidInput",
+            Self::RejectedBeforeWrite(_) => "RejectedBeforeWrite",
             Self::UnknownVerb(_) => "UnknownVerb",
             Self::Unconfigured(_) => "Unconfigured",
             Self::UnknownModel(_) => "UnknownModel",
@@ -1431,6 +1440,42 @@ mod batch_write_proof_tests {
         let value = runtime_error_value(source, disposition);
         assert_eq!(value["domain_disposition"], disposition.as_str());
         (disposition, value)
+    }
+
+    #[test]
+    fn rejected_before_write_preserves_enclosing_disposition_and_error_class() {
+        let message = "decoding refused";
+        let (disposition, value) =
+            project_failed(RuntimeError::RejectedBeforeWrite(message.into()));
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["kind"], "runtime_error");
+        assert_eq!(value["message"], format!("invalid input: {message}"));
+        assert_eq!(
+            RuntimeError::RejectedBeforeWrite(message.into()).audit_error_class(),
+            crate::audit_error::AuditErrorClass::InvalidParams
+        );
+        let (ordinary, _) = project_failed(RuntimeError::InvalidInput(message.into()));
+        assert_eq!(ordinary, DomainDisposition::Unknown);
+
+        let enclosing =
+            RuntimeError::RejectedBeforeWrite(message.into()).with_resolution(ResolutionFacts {
+                project_id: Uuid::new_v4(),
+                duplicate_anchor_ids: vec![],
+                slug_backfilled: false,
+                project_created: true,
+                orphaned_project_id: None,
+                orphaned_note_count: 0,
+            });
+        let (disposition, _) = project_failed(enclosing);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        let committed =
+            DispatchError::after_handler(RuntimeError::RejectedBeforeWrite(message.into()), true);
+        assert_eq!(committed.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = committed.into_parts();
+        assert_eq!(
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
+        );
     }
 
     #[test]

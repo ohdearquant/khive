@@ -16,7 +16,7 @@ use crate::ann;
 use crate::MemoryPack;
 
 use super::common::{
-    deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
+    decode_params, deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
 };
 
@@ -224,12 +224,16 @@ impl MemoryPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        self.remember_permitting(token, params, &[]).await
+        let decoded = decode_params(params).map_err(RuntimeError::RejectedBeforeWrite)?;
+        self.remember_decoded_with_properties(token, decoded, &[], None)
+            .await
+            .map(|(response, _)| response)
     }
 
     /// `memory.remember` with the reserved `properties` keys in `permitted`
     /// accepted. `memory.apply_batch` writes its rows through this with
     /// [`BATCH_WRITTEN_PROPERTY_KEYS`]; the verb itself permits none.
+    #[cfg(test)]
     pub(super) async fn remember_permitting(
         &self,
         token: &NamespaceToken,
@@ -244,6 +248,7 @@ impl MemoryPack {
     /// The remember response and, on replay, the held row's properties. Batch
     /// writes compare those properties before reporting a replay as deduped or
     /// asserting an edge.
+    #[cfg(test)]
     pub(super) async fn remember_permitting_with_properties(
         &self,
         token: &NamespaceToken,
@@ -280,6 +285,17 @@ impl MemoryPack {
         write_namespace: Option<&Namespace>,
     ) -> Result<(Value, Option<Value>), RuntimeError> {
         let p: RememberParams = deser(params)?;
+        self.remember_decoded_with_properties(token, p, permitted, write_namespace)
+            .await
+    }
+
+    async fn remember_decoded_with_properties(
+        &self,
+        token: &NamespaceToken,
+        p: RememberParams,
+        permitted: &[&str],
+        write_namespace: Option<&Namespace>,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
         }
@@ -530,3 +546,47 @@ impl MemoryPack {
 #[cfg(test)]
 #[path = "remember_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod rejected_before_write_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn internal_batch_remember_decode_remains_uncertified_after_an_earlier_write() {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            events_split: None,
+            actor_id: Some("actor:batch-decode".into()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let pack = MemoryPack::new_with_index_role(runtime.clone(), false);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let stored = pack
+            .handle_remember(
+                &token,
+                json!({"content":"earlier batch write", "namespace":"local"}),
+            )
+            .await
+            .unwrap();
+        let id = stored["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+        let notes = runtime.notes(&token).unwrap();
+        let before = notes.get_note(id).await.unwrap().unwrap();
+        let error = pack
+            .remember_permitting_with_properties_in_namespace(
+                &token,
+                json!({"content":"refused row", "key":"same", "idempotency_key":"same"}),
+                BATCH_WRITTEN_PROPERTY_KEYS,
+                &Namespace::local(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(notes.get_note(id).await.unwrap().unwrap(), before);
+        assert_eq!(notes.count_notes("local", Some("memory")).await.unwrap(), 1);
+        assert_eq!(error.batch_write_disposition(), None);
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message == "duplicate field `key`")
+        );
+    }
+}

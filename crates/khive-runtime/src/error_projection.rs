@@ -374,6 +374,7 @@ fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition
         other @ (RuntimeError::Storage(_)
         | RuntimeError::Query(_)
         | RuntimeError::InvalidInput(_)
+        | RuntimeError::RejectedBeforeWrite(_)
         | RuntimeError::UnknownVerb(_)
         | RuntimeError::Unconfigured(_)
         | RuntimeError::UnknownModel(_)

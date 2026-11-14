@@ -86,6 +86,7 @@ impl RuntimeError {
             | Self::NamespaceMismatch { .. }
             | Self::RemoteCacheMissing { .. } => C::NotFoundOrNotAddressed,
             Self::InvalidInput(_)
+            | Self::RejectedBeforeWrite(_)
             | Self::UnknownVerb(_)
             | Self::UnknownModel(_)
             | Self::Ambiguous(_)

@@ -1369,3 +1369,52 @@ Test names identify existing coverage or explicitly identify coverage to add.
 | A11-10 | The 70-pair allowlist resolves to the named owners and covers the classified Assertive surface.                                                                       | `admission_degrade_safe_assertive_census_matches_live_pack_sources`, `crates/khive-runtime/src/pack_tests.rs:382-567`; count entries at `crates/khive-runtime/src/pack/registry_access.rs:456-553`.                                                                                                      |
 | A11-11 | Base acceptance 1 compares source-pinned inventories for the same pack population at two revisions.                                                                   | Unexecuted. `scripts/data/writer-census-v1.json:3-133` and `crates/khive-runtime/tests/data/adr133-writer-census.json:3-37` expose the unmatched populations and missing final revision.                                                                                                                 |
 | A11-12 | The amended text retains the 5 s read wait, records Amendment 10 as Accepted, and both invariants name the same obligation departures.                                | D1's release table and Amendment 11, Decisions 1, 2 and 4 in this file; `crates/khive-runtime/src/audit_batch.rs:307`.                                                                                                                                                                                   |
+
+## Amendment 12 (2026-11-14): Named handler refusals before domain writes
+
+**Status**: Proposed. This amendment does not change the status of the base ADR or earlier amendments.
+
+**Addresses**: [#6539](https://github.com/ohdearquant/khive/issues/6539).
+
+### Decision
+
+Amendment 3 permits a handler to certify a named path whose refusal precedes every domain write.
+`RuntimeError::RejectedBeforeWrite` carries that explicit proof. Its `batch_write_disposition()` is
+`NotCommitted`, so a failed handler dispatch and its projected error report `not_committed`.
+The displayed invalid-input message and `runtime_error` wire kind remain unchanged.
+A successful enclosing dispatch still takes precedence and reports `committed`.
+
+Exactly two handler phases adopt this proof:
+
+1. `comm.send`: the default refusal when the resolved recipient equals the sender's non-`local` actor
+   and `self_send` is false. This check precedes attachment import, message sealing and both message writes.
+   An optional thread-root lookup before it is a read. Explicitly allowed self-send retains its behavior.
+2. The public `memory.remember` parameter-decoding boundary: decoding the complete `RememberParams`
+   fails before the remember body, retrieval or any domain write. This includes supplying both `key`
+   and its `idempotency_key` alias. Internal batch-row decoding does not acquire this proof; earlier
+   rows in that enclosing batch may already have written.
+
+These are raise-site claims, not a classification of every `InvalidInput`. Downstream argument,
+property, source, secret-gate and storage failures retain their existing classifications. Other
+ordinary handler failures remain `unknown`; existing typed settlement proofs remain unchanged.
+A child operation's refusal cannot establish that an enclosing operation with earlier writes had no
+side effects. Callers must retain the disposition of the operation they are reporting.
+
+The proof concerns domain effects. It does not suppress independent dispatch audit or observability
+recording and does not promise that those records remain absent.
+
+### Acceptance
+
+- Exercise each adopted phase through the real request dispatch. Assert both the entry and error
+  carry `domain_disposition: "not_committed"`, preserve the diagnostic, and read the domain store
+  after the refusal to prove no row change. Use a nonempty baseline so an unrelated empty store
+  cannot satisfy the assertion.
+- Keep ordinary handler failures at `unknown`, including downstream memory validation, and keep
+  explicit committed/rolled-back write classifications unchanged. Preserve parameter-message masking.
+- Verify the internal memory batch decoder remains uncertified even when the public remember decoder
+  reports a pre-write refusal.
+- In an isolated control, make only the new variant's disposition return `None`. Each adopted-site
+  regression must compile and fail at its disposition assertion. A compiler failure, setup failure,
+  timeout or zero selected tests does not establish this control.
+
+These are verification requirements; this amendment records no executed test or control result.
