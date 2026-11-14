@@ -1191,7 +1191,11 @@ affected, because the edge or property sits outside its visible set.
 2. **Which writes.** The rule applies to these writes, whatever kind of row the source is:
    - `link` with `relation="supersedes"` onto a memory row;
    - a `link` op with that relation in a change-set, at preparation, whether it arrives through `apply_changeset` or
-     through an approved `propose` (ADR-046), which applies through the same preparation;
+     through an approved `propose` (ADR-046), which applies through the same preparation. An approved proposal is
+     checked with an empty `owned_namespaces` list. It is applied under the apply worker's system identity, from which
+     ADR-046 infers no authority, and `owned_namespaces` is a claim carried on a caller's own request, which no stored
+     proposal records. Neither the proposer's list nor the reviewer's applies, so the target must be in the op's own
+     namespace or in `local`;
    - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace. The
      target is looked up among stored memory rows, live or soft-deleted, and checked by rule 1 against its stored
      namespace, for the reason given for `restore` below: a soft-deleted target can become live after the edge is
@@ -1325,6 +1329,9 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
   own rows.
 - A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
   approved proposal is applied, and no edge is stored. Control: the same op between the caller's own rows applies.
+- A link op with `relation="supersedes"` onto a row in namespace `V`, in a proposal whose proposer and reviewer both
+  list `V` in `owned_namespaces`, is refused when the approved proposal is applied, and no edge is stored. Control: the
+  same op through `apply_changeset` by the proposer applies.
 - A note merge whose merged-away note is the target of a `supersedes` edge stored in another namespace leaves that
   edge, with its stored namespace, on the survivor; the dry run lists it before and after the merge.
 - The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows,
