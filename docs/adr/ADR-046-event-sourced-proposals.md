@@ -1419,12 +1419,12 @@ place. If more than one step remains, `propose` translates them into one canonic
 stores that change-set as the proposal's `Canonical` changeset. The steps map to operations as
 follows:
 
-| Step                                                     | Canonical operation                                                                                                           |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `AddEntity { entity }`                                   | `create` of an entity: the draft's `kind` as `entity_kind`, and its `name`, `description`, `properties` and `tags`; id per C2 |
-| `AddNote { note }`                                       | `create` of a note: the draft's `kind` as `note_kind`, and its `content` and `properties`; id per C2                          |
-| `AddEdge { source, target, relation, weight, metadata }` | `link` with a minted id; `weight` as given, or 1.0 when absent (the `link` default); `properties` = `metadata`, or empty      |
-| `SupersedeEntity { old, new }`                           | `link` from `new` to `old` with relation `supersedes`, weight 1.0 and a minted id                                             |
+| Step                                                     | Canonical operation                                                                                                                                                     |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AddEntity { entity }`                                   | `create` of an entity: the draft's `kind`, resolved as the legacy step resolves it, as `entity_kind`, and its `name`, `description`, `properties` and `tags`; id per C2 |
+| `AddNote { note }`                                       | `create` of a note: the draft's `kind` as `note_kind`, its `content`, and its `properties` with `tags` moved into the create's own `tags` field; id per C2              |
+| `AddEdge { source, target, relation, weight, metadata }` | `link` with a minted id; `weight` as given, or 1.0 when absent (the `link` default); `properties` = `metadata`, or empty                                                |
+| `SupersedeEntity { old, new }`                           | `link` from `new` to `old` with relation `supersedes`, weight 1.0 and a minted id                                                                                       |
 
 Every operation's namespace is the proposal's namespace. The envelope's `producer` is the
 proposer's actor id, `staged_at` is the proposal's creation time, and `producer_model_family` is
@@ -1436,6 +1436,12 @@ refuses the whole proposal, and no event is appended:
   `update` operation carries the caller's preimage. The legacy patch has no preimage, and K3 forbids
   inventing one.
 - `MergeEntities` is refused, for the reason K1 gives for canonical merge.
+- An `AddEntity` whose resolved kind is not one of the eight base entity kinds is refused: a canonical
+  create's `entity_kind` is that closed set, so a pack-registered kind such as `resource` has no
+  slot. A proposal for such an entity stays single-step.
+- A governance-bearing step (2026-08-16 amendment, A1) and `ClassifyExistingEdgeGovernance` are
+  refused. A3 requires a governance-bearing edge to apply through governed apply, and the canonical
+  link path does not provide it, so translation would land the edge ungoverned.
 - An `AddNote` whose draft sets `name` is refused: a canonical note create has no name field, and
   adding one changes the ADR-101 change-set model, which this amendment does not do.
 - A draft whose `properties` is present and not a JSON object is refused, because a canonical
@@ -1451,15 +1457,35 @@ every id, field and edge.
 A single remaining step, and every non-`Compound` arm, keeps its current path, with the additions
 in C2 and C3.
 
+A translated step lands under the canonical path's rules, which differ from the legacy step's in
+ways the proposer can see:
+
+- An edge whose `(namespace, source, target, relation)` key is already held by a live or deleted
+  edge refuses the unit. The legacy `AddEdge` updates the existing edge instead.
+- An edge given no metadata stores an empty object, where the legacy step stores none.
+- Edge metadata passes the secret scan and the reserved-property refusal, and links from note
+  sources pass the owning pack's link validation. The legacy `AddEdge` runs neither.
+- The gate checks the change-set and every operation under the applying caller (K2). Applying a
+  legacy step makes no per-operation gate check.
+- Edge endpoint rules are checked when the change-set lands, as for every `Canonical` proposal,
+  not at `propose`. An edge they refuse fails the apply and names its operation index, and the
+  unit rolls back whole.
+- The apply result's `created_records` lists the ids of links, including the link a
+  `SupersedeEntity` step becomes, as it does for every `Canonical` proposal.
+
 ### C2. Caller-given ids on `AddEntity` and `AddNote`
 
 `EntityDraft` and `NoteDraft` gain an optional `id`, a full UUID. `propose` refuses an id held by
-a live or deleted record and names it. The same check runs again when the change-set lands, so a
-record created between proposal and approval refuses the unit, which rolls back whole. When the
+a live or deleted record, or by an edge or event, and names it. This is a new check:
+proposal validation reads no stored rows today. When the change-set lands, the canonical identity
+check runs again, so a record created between proposal and approval refuses the unit, which rolls
+back whole, and the refusal names the operation index. When the
 id is absent, `propose` mints one while translating. The `propose` response gains `created_ids`,
-the ids of the records the proposal will create, in step order, so a caller learns minted ids
-before review. A single-step `AddEntity` or `AddNote` with an id creates the record under that
-id; without one it behaves as today.
+the ids fixed at proposal time, in step order: every create of a translated proposal, and the
+create of a single-step `AddEntity` or `AddNote` given an id. A caller learns minted ids before
+review. A single-step create given an id creates the record under that id, and a taken id refuses
+it at apply instead of updating the record. A single-step create without an id is minted at apply,
+as today, and is not listed.
 
 A step-local reference, such as `"$steps.0.id"`, is rejected as an alternative. Caller-given ids
 already let a later step name an earlier create. A reference language would add a resolution step
@@ -1474,7 +1500,8 @@ In a translated change-set, it becomes the `link` operation's `properties`.
 
 ### C4. Unknown step fields are refused
 
-`EntityDraft`, `NoteDraft` and every changeset arm's fields refuse a field they do not define,
+`EntityDraft`, `NoteDraft`, the `UpdateEntity` patch and every changeset arm's fields refuse a field
+they do not define,
 and the error names it. Without this, a misspelled `id` would get a minted id and a misspelled
 `metadata` an edge without it, each reported as success. This is a behavior change for any
 caller that sends extra keys today, and the implementation pull request lists the callers it
@@ -1482,8 +1509,8 @@ found.
 
 ### C5. What this amendment does not change
 
-- The 2026-08-16 amendment's classification reads the steps as submitted. Translation never changes
-  whether a proposal is governance-bearing.
+- The 2026-08-16 amendment's classification reads the steps as submitted, before translation.
+  A governance-bearing proposal is never translated (C1), so its rules are unaffected.
 - The `Canonical` arm's caller-supplied form, its apply path and its output (`preimage: none` for a
   change-set with only creates and links) are unchanged.
 - `ApplyResult::Failed.applied_step_count` stays 0 for a translated proposal, because the unit
@@ -1495,8 +1522,13 @@ found.
 - A compound of one `AddEntity` with a caller id and two `AddEdge` steps naming it lands in one
   transaction on approval. The stored changeset is `Canonical`, and both edges and the entity exist
   afterwards.
-- The same compound with an edge whose relation the endpoint rules refuse is refused. Nothing it
-  names exists afterwards, and no event is appended.
+- The same compound with an edge whose relation the endpoint rules refuse fails at apply, and
+  the failure names that operation's index. Nothing it names exists afterwards.
+- A compound with an edge whose key an existing edge holds fails at apply. The existing edge is
+  unchanged.
+- A compound whose `AddNote` carries `properties.tags` lands the note with those tags.
+- A compound with an `AddEntity` of kind `resource`, and one with a governance-bearing `AddEdge`,
+  are refused at `propose`, and no event is appended.
 - An `AddEntity` id held by a live record, and one held by a deleted record, are refused at
   `propose`. An id taken between proposal and approval refuses the apply, and the entity the first
   step would have created does not exist.
@@ -1506,6 +1538,8 @@ found.
 - A nested `Compound` flattens in order. A compound that flattens to one step keeps the legacy
   path.
 - An unknown field in a draft or a step is refused by name.
-- `created_ids` in the `propose` response equals the ids the approved proposal creates.
+- `created_ids` in the `propose` response equals the ids the approved translated proposal
+  creates. A single-step `AddEntity` given an id that a live entity holds fails at apply, and the
+  live entity is unchanged.
 - The `propose` help states the compound form, the `id` and `metadata` fields and the
   `canonical` arm.
