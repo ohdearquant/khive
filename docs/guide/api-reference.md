@@ -31,7 +31,7 @@ An always-machine-readable copy of this page is at
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
-| `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `tool`      | 15    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
@@ -3652,7 +3652,7 @@ request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
 
-## `tool` pack — 14 verbs
+## `tool` pack — 15 verbs
 
 Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
 `tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges

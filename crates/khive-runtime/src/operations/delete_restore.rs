@@ -620,6 +620,7 @@ impl KhiveRuntime {
         let mut retired = expected.clone();
         retired.deleted_at = Some(retired_at);
         retired.updated_at = retired_at;
+        crate::secret_gate::reject_reserved_secret_gate_property(retired.properties.as_ref())?;
         let statement = khive_db::stores::entity::entity_replace_if_unchanged_statement(
             &retired,
             expected.updated_at,

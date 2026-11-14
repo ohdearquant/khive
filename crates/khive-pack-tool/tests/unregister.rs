@@ -933,3 +933,118 @@ async fn unregister_catalog_and_write_gate_are_complete() {
     gate.deny.store(false, Ordering::SeqCst);
     assert_retired(&f.call("tool.unregister", args).await, target, 1, 1);
 }
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn unregister_refuses_carried_reserved_properties() {
+    for (key, owner) in [
+        (
+            khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY,
+            "runtime-owned",
+        ),
+        (
+            khive_runtime::secret_gate::RESERVED_WEB_RECEIPT_KEY,
+            "web-pack-owned",
+        ),
+    ] {
+        let f = Fixture::new();
+        let target = id(&f.register("local", "reserved-retirement").await);
+        let survivor = id(&f.register("local", "reserved-survivor").await);
+        f.call(
+            "create",
+            json!({"kind":"observation","content":"retirement refusal history"}),
+        )
+        .await;
+        let policy = f
+            .policy("local", "agent:policy", "reserved-retirement", "ask")
+            .await;
+        f.policy("local", "agent:policy", "reserved-retirement", "deny")
+            .await;
+        let request = f.request("local", "reserved-retirement", REQUESTER).await;
+        f.grant("local", &request).await;
+        assert_ne!(
+            f.row("tool_policy", &policy).await.text("history").unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            f.row("tool_grants", &request).await.text("status").unwrap(),
+            "granted"
+        );
+
+        let mut legacy = f.entity("local", target).await;
+        legacy
+            .properties
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), json!({"legacy":true}));
+        f.write(
+            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            vec![
+                SqlValue::Text(serde_json::to_string(&legacy.properties).unwrap()),
+                SqlValue::Text(target.to_string()),
+            ],
+        )
+        .await;
+        let stored = f.entity("local", target).await;
+        assert!(stored.deleted_at.is_none());
+        assert_eq!(
+            stored.properties.as_ref().unwrap()[key],
+            json!({"legacy":true})
+        );
+        assert_eq!(stored.properties, legacy.properties);
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+        let before = f.snapshot().await;
+        for table in [
+            "entities",
+            "notes",
+            "graph_edges",
+            "tool_policy",
+            "tool_grants",
+        ] {
+            assert!(!before[table].as_array().unwrap().is_empty(), "{table}");
+        }
+        let fts_before = [f.fts_rows(target).await, f.fts_rows(survivor).await];
+        assert!(fts_before
+            .iter()
+            .all(|rows| !rows.as_array().unwrap().is_empty()));
+        let events_before = serde_json::to_value(
+            f.rows("SELECT * FROM events ORDER BY namespace, id", vec![])
+                .await,
+        )
+        .unwrap();
+        assert!(!events_before.as_array().unwrap().is_empty());
+        let error = f.refused("tool.unregister", json!({"tool":target})).await;
+        let expected = format!(
+            "property key `{key}` is {owner} and cannot be created, replaced, merged, or removed by callers"
+        );
+        assert!(
+            matches!(&error, RuntimeError::InvalidInput(message) if message == &expected),
+            "{error:?}"
+        );
+        let after = f.entity("local", target).await;
+        assert!(after.deleted_at.is_none());
+        assert_eq!(after.properties, stored.properties);
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(stored).unwrap()
+        );
+        assert_eq!(f.snapshot().await, before);
+        assert_eq!(
+            [f.fts_rows(target).await, f.fts_rows(survivor).await],
+            fts_before
+        );
+        assert_eq!(
+            serde_json::to_value(
+                f.rows("SELECT * FROM events ORDER BY namespace, id", vec![])
+                    .await,
+            )
+            .unwrap(),
+            events_before
+        );
+    }
+}
