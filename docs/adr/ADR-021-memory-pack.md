@@ -1181,8 +1181,8 @@ affected, because the edge or property sits outside its visible set.
    The namespace the supersede is written in is, for `link`, the request's write namespace, the one the gate checked:
    the explicit `namespace` argument when the call carries one, and otherwise the registry's write namespace, which
    ADR-007 Rule 0 sets to `local` (Delta 3, Problem). For a change-set link op it is the op's own `namespace` field; for
-   `restore` it is the edge's stored namespace; for the property it is the namespace of the row that carries the
-   property. So a `link` with no `namespace` argument can supersede only rows in `local` (or an owned namespace), and a
+   `restore` of an edge it is the edge's stored namespace; for the property, on `update` and on `restore`, it is the
+   namespace of the row that carries the property. So a `link` with no `namespace` argument can supersede only rows in `local` (or an owned namespace), and a
    caller superseding a row in its own actor namespace passes `namespace=<that namespace>`, which Delta 3 already
    requires when the source is a memory row in that namespace.
 
@@ -1192,7 +1192,10 @@ affected, because the edge or property sits outside its visible set.
    - `link` with `relation="supersedes"` onto a memory row;
    - a `link` op with that relation in `apply_changeset`, at preparation;
    - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace;
-   - `update`, and a note update in `apply_changeset`, when the patch sets `properties.supersedes` on a memory row.
+   - `update`, and a note update in `apply_changeset`, when the patch sets `properties.supersedes` on a memory row;
+   - `restore` of a soft-deleted memory row whose stored `properties.supersedes` is a value Delta 2 rule 3 honors,
+     checked against the restored row's namespace. A refused restore leaves the row soft-deleted. A stored value
+     recall does not honor is not checked, because restoring it hides nothing.
 
    For the property, the value must be a complete UUID naming a live memory row, and that row is checked by rule 1.
    Any other value is refused, naming `memory.apply_batch` and `link(relation="supersedes")`. A patch that leaves the
@@ -1227,8 +1230,9 @@ affected, because the edge or property sits outside its visible set.
    examines, whether or not it is listed, so a page can list nothing and still return a cursor. One call's cost is
    bounded by the page, and a full pass grows with the number of live memory rows and `supersedes` edges in the
    readable namespaces. It writes nothing.
-   The owner of a listed target decides whether that supersede was meant, and
-   removes the edge or clears the property if it was not.
+   A soft-deleted carrier row is not listed: recall does not read it, and its restore is checked by rule 1. Whether a
+   listed supersede was meant is the target owner's question. Removing the edge or clearing the property is done by a
+   caller who can read the namespace that stores it; when that is not the target's owner, the owner is asked.
 
 **Consequences.**
 
@@ -1274,6 +1278,10 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
 - Targets in `local` and in an owned namespace are admitted on each path, as `memory.apply_batch` admits them.
 - The refusal names the target namespace only when the caller can read it.
 - `restore` of a soft-deleted `supersedes` edge onto a refused target is refused, and the edge stays soft-deleted.
+- `restore` of a soft-deleted memory row whose stored `properties.supersedes` names a refused target is refused, the
+  row stays soft-deleted and the named row stays in a two-namespace reader's recall. Control: restoring a carrier
+  whose value names a row in its own namespace succeeds and hides that row; a carrier whose value recall does not
+  honor restores unchecked.
 - The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows, and
   leaves the store byte-identical. It does not list a supersede whose target is in `local`, and it lists one whose
   target is in an owned namespace.
