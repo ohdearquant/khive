@@ -1105,8 +1105,9 @@ old existing-name contract are listed at the end with what happens to each.
 
    An admitted correction that changes a digest input appends exactly one
    event of kind `tool_registration_changed`, verb `tool.register`, substrate
-   `event`, in the caller's namespace with the authenticated actor. Its typed
-   data is `{actor, id, digest_before, digest_after}`: the authenticated actor,
+   `event`, with the authenticated actor, in the namespace of the row it
+   changes: the request's write namespace, where item 1 resolves the name.
+   Its typed data is `{actor, id, digest_before, digest_after}`: the authenticated actor,
    the registry row's UUID, and the same full canonical per-row grant-definition
    digest before and after the correction, including any applicable conditional
    declaration inputs. The event does not use a separate four-field digest or
@@ -1119,8 +1120,11 @@ old existing-name contract are listed at the end with what happens to each.
    row for `tool.register` records the call, not which row changed or how its
    digest moved. The class's ADR-168 retention class is `pinned_while_referenced`;
    its referent is the registry row and its terminal condition is that row's
-   deletion. The digests are unkeyed over short inputs; the event lives in the
-   row's namespace, so its readers can already read the row it describes.
+   deletion. The digests are unkeyed over short inputs; because the event lives
+   in the row's namespace, its readers can already read the row it describes.
+   Who may correct a row is decided where creation is decided, by the Gate on
+   `tool.register` in that namespace; an explicit namespace argument behaves as
+   it does for creation.
 
 4. **The corrected row is validated whole and keeps its source and kind.**
    Before the guarded replacement, the row that would result (stored fields
