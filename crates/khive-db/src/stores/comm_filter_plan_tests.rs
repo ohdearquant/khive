@@ -31,7 +31,7 @@ CREATE INDEX idx_comm_message_outbound_recipient
  json_extract(properties, '$.to_actor'), created_at DESC, id ASC)
  WHERE deleted_at IS NULL;";
 
-const OUTBOX_DUE_INDEX: &str = include_str!("../../sql/044-comm-outbound-due-b-index.sql");
+const OUTBOX_DUE_INDEX: &str = include_str!("../../sql/066-comm-undelivered-due-index.sql");
 
 const RECIPIENT_ONLY: &str = "CREATE INDEX idx_candidate_recipient_only
  ON notes(namespace, kind, ifnull(json_extract(properties, '$.to_actor'), ''))
@@ -399,6 +399,208 @@ fn outbox_zero_due_scan_cost_stays_bounded_as_same_channel_future_rows_grow() {
             large_steps <= small_steps + 128,
             "{stage}: future same-channel backlog must not add row-proportional due-scan work: {small_steps} -> {large_steps}"
         );
+    }
+}
+
+fn outbox_row_snapshot(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+    conn.prepare("SELECT * FROM notes ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            (0..row.as_ref().column_count())
+                .map(|i| row.get(i))
+                .collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn history_outbox_filter(legacy: bool) -> NoteFilter {
+    let mut filter = outbox_filter();
+    if !legacy {
+        let slug = filter.property_filters.last_mut().unwrap();
+        assert_eq!(slug.json_path, "$.channel_slug");
+        slug.op = FilterOp::Eq;
+        slug.value = SqlValue::Text("sender".into());
+    }
+    filter
+}
+
+fn delivered_history_fixture(history: usize) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = Connection::open(dir.path().join("outbox.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "cache_size", crate::pool::sqlite_cache_size_pragma())
+        .unwrap();
+    conn.pragma_update(None, "mmap_size", crate::pool::sqlite_mmap_size_pragma())
+        .unwrap();
+    conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
+        .unwrap();
+    register_comm_indexes(&conn);
+    let tx = conn.transaction().unwrap();
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO notes(id,namespace,kind,content,properties,created_at,updated_at,strict_due_key,due_source)
+             VALUES (?1,'default','message','retained message',?2,?3,?3,?4,?5)",
+        ).unwrap();
+        for i in 0..25 {
+            let due = i < 3 || (15..17).contains(&i);
+            let deadline = if due {
+                "1990-01-01T00:00:00Z"
+            } else {
+                "2999-01-01T00:00:00Z"
+            };
+            let mut props = json!({"direction":"outbound", "to_actor":"test:recipient",
+                "next_attempt_at":deadline});
+            if i < 15 {
+                props["channel_slug"] = json!("sender");
+            }
+            insert
+                .execute(rusqlite::params![
+                    format!("00000000-0000-4000-8000-{:012}", i + 1),
+                    props.to_string(),
+                    i64::from(i / 2),
+                    crate::pool::strict_rfc3339_key(deadline),
+                    deadline,
+                ])
+                .unwrap();
+        }
+        for i in 0..history {
+            insert.execute(rusqlite::params![
+                format!("10000000-0000-4000-8000-{i:012}"),
+                json!({"direction":"outbound","to_actor":"test:recipient","channel_slug":"sender"}).to_string(),
+                1000_i64, Option::<Vec<u8>>::None, Option::<String>::None,
+            ]).unwrap();
+        }
+        // Keep other buckets present after ANALYZE, independently of delivered history.
+        for i in 0..1000 {
+            for (prefix, direction) in [("20000000", "outbound"), ("30000000", "inbound")] {
+                insert
+                    .execute(rusqlite::params![
+                        format!("{prefix}-0000-4000-8000-{i:012}"),
+                        json!({"direction":direction,"to_actor":"other:recipient"}).to_string(),
+                        2000_i64,
+                        Option::<Vec<u8>>::None,
+                        Option::<String>::None,
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    assert_eq!(tx.execute(
+        "UPDATE notes SET properties=json_set(properties,'$.delivered_at','2020-01-01T00:00:00Z')
+         WHERE id >= '10000000' AND id < '20000000'", [],
+    ).unwrap(), history);
+    tx.commit().unwrap();
+    (dir, conn)
+}
+
+#[test]
+fn outbox_due_work_is_independent_of_delivered_history() {
+    let (_small_dir, small) = delivered_history_fixture(1000);
+    let (_large_dir, large) = delivered_history_fixture(10_000);
+    for stage in ["fresh", "analyzed"] {
+        if stage == "analyzed" {
+            small.execute_batch("ANALYZE").unwrap();
+            large.execute_batch("ANALYZE").unwrap();
+        }
+        let small_before = outbox_row_snapshot(&small);
+        let large_before = outbox_row_snapshot(&large);
+        assert_eq!(small_before.len(), 3025);
+        assert_eq!(large_before.len(), 12_025);
+        for legacy in [false, true] {
+            let expected: Vec<_> = if legacy { vec![17, 16] } else { vec![3, 1, 2] }
+                .into_iter()
+                .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+                .collect();
+            let filter = history_outbox_filter(legacy);
+            let small_read = measure(&small, &filter);
+            let large_read = measure(&large, &filter);
+            assert_eq!(
+                small_read["ids"],
+                json!(expected),
+                "{stage}, legacy={legacy}"
+            );
+            assert_eq!(large_read["ids"], small_read["ids"]);
+            for read in [&small_read, &large_read] {
+                let plan = read["plan"].to_string();
+                assert!(
+                    plan.contains("idx_comm_message_outbound_due")
+                        && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?")
+                        && plan.contains("<expr><?"),
+                    "{stage}, legacy={legacy}: bucket/deadline seek missing: {plan}"
+                );
+            }
+            let small_steps = small_read["vm_steps"].as_i64().unwrap();
+            let large_steps = large_read["vm_steps"].as_i64().unwrap();
+            assert!(large_steps <= small_steps + 128,
+                "{stage}, legacy={legacy}: delivered history added due-page work: {small_steps} -> {large_steps}");
+        }
+        assert_eq!(outbox_row_snapshot(&small), small_before);
+        assert_eq!(outbox_row_snapshot(&large), large_before);
+    }
+}
+
+#[test]
+fn outbox_due_preserves_delivered_marker_types_and_raw_updates() {
+    for legacy in [false, true] {
+        let conn = future_outbox_fixture(0);
+        let mut props = json!({"direction":"outbound","to_actor":"test:recipient"});
+        if !legacy {
+            props["channel_slug"] = json!("sender");
+        }
+        for (id, created) in [("target", 2), ("control", 1)] {
+            conn.execute(
+                "INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at)
+                 VALUES (?1,'default','message',?2,?3,?3)",
+                rusqlite::params![id, props.to_string(), created],
+            )
+            .unwrap();
+        }
+        let filter = history_outbox_filter(legacy);
+        for marker in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("2020-01-01T00:00:00Z")),
+            Some(json!("invalid")),
+            Some(json!(0)),
+            Some(json!(42)),
+            Some(json!(false)),
+            Some(json!(true)),
+            Some(json!([])),
+            Some(json!({})),
+            None,
+            Some(Value::Null),
+        ] {
+            let eligible = marker.as_ref().is_none_or(Value::is_null);
+            let mut edited = props.clone();
+            if let Some(value) = marker {
+                edited["delivered_at"] = value;
+            }
+            conn.execute(
+                "UPDATE notes SET properties=?1 WHERE id='target'",
+                [edited.to_string()],
+            )
+            .unwrap();
+            let before = outbox_row_snapshot(&conn);
+            let result = measure(&conn, &filter);
+            assert_eq!(
+                result["ids"],
+                if eligible {
+                    json!(["target", "control"])
+                } else {
+                    json!(["control"])
+                },
+                "legacy={legacy}, properties={edited}"
+            );
+            assert_eq!(outbox_row_snapshot(&conn), before);
+        }
+        conn.execute("UPDATE notes SET properties=NULL WHERE id='target'", [])
+            .unwrap();
+        let before = outbox_row_snapshot(&conn);
+        assert_eq!(measure(&conn, &filter)["ids"], json!(["control"]));
+        assert_eq!(outbox_row_snapshot(&conn), before);
     }
 }
 

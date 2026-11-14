@@ -2584,7 +2584,8 @@ no_embed = true
 
         let (_, control_hits, _) = SubstrateCoordinator::single(Arc::clone(no_embed))
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(
             control_hits.is_empty(),
             "text-only handle cannot find a vector-only match"
@@ -2603,7 +2604,8 @@ no_embed = true
         let registry = coordinator_backend_registry(&multi.per_pack_runtimes, &khive_cfg).unwrap();
         let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(outcomes
             .iter()
             .all(|outcome| outcome.error.is_none() && outcome.vector_error.is_none()));
