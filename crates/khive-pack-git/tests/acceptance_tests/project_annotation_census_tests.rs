@@ -611,6 +611,9 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn existing_annotation_warning_reports_unavailable_graph_reads() {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
     if crate::test_process::run_in_child() {
         return;
     }
@@ -626,16 +629,30 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
     assert_eq!(before.0.as_array().unwrap().len(), 2);
     assert_eq!(before.1.as_array().unwrap().len(), 2);
     let (_dir, repo, logs, _path) = annotation_encounter_remote(false, &[1, 2]);
+    // In-memory readers share this writer connection. Refuse only the first
+    // graph read: the per-note check must warn, while the mandatory commit
+    // count and the later census still read the real graph successfully.
+    assert_eq!(runtime.backend().pool().max_readers(), 0);
+    let denied_graph_reads = Arc::new(AtomicUsize::new(0));
+    let denied = Arc::clone(&denied_graph_reads);
     runtime
-        .sql()
+        .backend()
+        .pool()
         .writer()
-        .await
         .unwrap()
-        .execute(SqlStatement::new(
-            "ALTER TABLE graph_edges RENAME TO annotation_unavailable_edges",
-            vec![],
-        ))
-        .await
+        .autocommit_sqlite(|conn| {
+            conn.test_authorizer(Some(move |context: AuthContext<'_>| match context.action {
+                AuthAction::Read { table_name, .. }
+                    if table_name == "graph_edges"
+                        && denied
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok() =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }))
+        })
         .unwrap();
     let outcome = registry
         .dispatch(
@@ -643,18 +660,17 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
             annotation_encounter_params(&repo, project, false, 1),
         )
         .await;
-    // Restore even if the real dispatch failed, before inspecting its result.
+    // Remove the fault even if the real dispatch failed, before inspecting it.
     runtime
-        .sql()
+        .backend()
+        .pool()
         .writer()
-        .await
         .unwrap()
-        .execute(SqlStatement::new(
-            "ALTER TABLE annotation_unavailable_edges RENAME TO graph_edges",
-            vec![],
-        ))
-        .await
+        .autocommit_sqlite(|conn| {
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        })
         .unwrap();
+    assert_eq!(denied_graph_reads.load(Ordering::SeqCst), 1);
     let report = outcome.expect("annotation read failure remains an explicit warning");
     annotation_encounter_state(&report, false, 1, false);
     let warnings = annotation_encounter_warnings(&report);
@@ -671,11 +687,15 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|warning| warning
+        .all(|warning| !warning
             .as_str()
             .unwrap()
             .starts_with("project annotation census unavailable: ")));
-    assert!(report["missing_project_annotation_count"].is_null());
+    assert_eq!(report["commits_total_in_db"], 0);
+    assert_eq!(report["missing_project_annotation_count"], 0);
+    assert_eq!(report["missing_project_annotation_note_ids"], json!([]));
+    assert_eq!(report["project_annotation_notes_scanned"], 2);
+    assert_eq!(report["project_annotation_census_complete"], true);
     annotation_encounter_checkpoint(&runtime, &token, project, false, &[(1, ids[0])]).await;
     annotation_encounter_receipt(&registry, &report).await;
     assert_eq!(annotation_encounter_rows(&runtime).await, before);
