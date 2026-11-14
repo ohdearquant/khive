@@ -367,7 +367,9 @@ impl CallerFixture {
         let socket = events_socket_path_beside(&events_db_path_beside(&main));
         assert_eq!(socket.as_os_str().as_bytes().len(), socket_bytes);
         let config = root.join("khive.toml");
-        let mut body = "[runtime]\npacks = [\"kg\"]\n[packs.kg]\nno_embed = true\n".to_owned();
+        // Both exec and daemon boot resolve this engine list into their identity.
+        let mut body =
+            "engines = []\n[runtime]\npacks = [\"kg\"]\n[packs.kg]\nno_embed = true\n".to_owned();
         if backend_count > 0 {
             body.push_str(&format!(
                 "\n[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = {main:?}\n"
@@ -396,7 +398,6 @@ impl CallerFixture {
             .arg("--config")
             .arg(&self.config)
             .args(["--actor", "actor:events-preflight"])
-            .env("KHIVE_NO_EMBED", "true")
             .env("KHIVE_PACKS", "kg")
             .env("KHIVE_RECOVERER_LOCK", self.root.join("recoverer.lock"))
             .env("KHIVE_SUPERVISOR_MARKER", self.root.join("supervisor"));
