@@ -1203,11 +1203,16 @@ affected, because the edge or property sits outside its visible set.
    `link(relation="supersedes")`. A patch that leaves the stored value unchanged is not checked. A patch that removes
    the key or sets it to null is admitted and not checked: it can only stop a row from being hidden.
 
-   On `restore`, the stored value is not rewritten and is checked as recall would honor it. A complete UUID names one
-   row, checked by rule 1 if it is a live memory row. An id prefix (Delta 2 rule 3) can hide any live memory row whose
-   id starts with it, because recall hides the first ranked candidate that matches. The restore therefore resolves the
-   prefix to every live memory row whose id starts with it and checks each by rule 1; one refused row refuses the
-   restore. A prefix that matches no live memory row is admitted, because it hides nothing at that moment.
+   On `restore`, the stored value is not rewritten and is checked as recall would honor it, now and after any later
+   write. A row the value names can become live after the carrier is restored: by-id `restore` is open to that row's
+   own namespace (ADR-007), and a change-set can store a row under a given id. The check therefore does not depend on
+   whether the named row is live. A complete UUID is looked up among stored memory rows, live or soft-deleted, and the
+   row it names is checked by rule 1 against its stored namespace. An id prefix (Delta 2 rule 3) can hide any memory
+   row whose id starts with it, because recall hides the first ranked candidate that matches. The restore therefore
+   resolves the prefix to every stored memory row, live or soft-deleted, whose id starts with it, and checks each by
+   rule 1. One refused row refuses the restore. A complete UUID that names no stored memory row, and a prefix that
+   matches none, are refused too: the check cannot name the namespace that will hold that id. The refusal says which
+   case applies. A refused restore leaves the carrier soft-deleted with its stored value unchanged.
 
    `merge` is not checked, because it cannot change what rule 1 decides. A note merge (ADR-039) requires both notes to
    be in the caller's namespace (ADR-007 Rule 5; `ensure_namespace` on both notes in the runtime's note merge). It
@@ -1298,8 +1303,13 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
   honor restores unchecked.
 - `restore` of a soft-deleted carrier whose stored value is an 8-character id prefix matching a memory row in a
   refused namespace is refused and the row stays soft-deleted, even when the prefix also matches a row in the
-  carrier's own namespace. Control: a prefix that matches only rows in the carrier's own namespace restores; a prefix
-  that matches no live memory row restores.
+  carrier's own namespace. Control: a prefix that matches only rows in the carrier's own namespace restores.
+- `restore` of a soft-deleted carrier whose stored value is the complete UUID of a soft-deleted memory row in a
+  refused namespace is refused. When that row's owner later restores it, it stays in a two-namespace reader's recall.
+  Control: a carrier naming a soft-deleted row in its own namespace restores.
+- `restore` of a soft-deleted carrier is refused when its stored prefix matches only a soft-deleted row in a refused
+  namespace, when its complete UUID names no stored memory row, and when its prefix matches none. Each refusal names
+  its case, and the carrier stays soft-deleted with its value unchanged.
 - `update` setting `properties.supersedes` to an id prefix is refused, even when the prefix matches only the caller's
   own rows.
 - A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
