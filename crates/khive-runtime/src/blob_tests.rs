@@ -526,6 +526,10 @@ async fn cancelling_while_queued_starts_no_backend_work() {
 #[tokio::test(start_paused = true)]
 #[serial(background_tasks)]
 async fn caller_deadline_drops_only_the_waiter_until_backend_completion() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let (store, first_started, first_release) = HydrationReadStore::blocking_first(b"x".to_vec());
     let hydrator = Arc::new(

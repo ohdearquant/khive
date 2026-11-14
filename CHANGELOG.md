@@ -27,10 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_query::GqlQuery` adds `order_by: Vec<OrderItem>`, so direct Rust constructors must
+  initialize it; exhaustive `PropertyRef` matches must handle the new `MetadataPath` variant.
 - `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
   `RuntimeError` needs an arm for it.
 
 ## [0.19.0] - 2026-11-11
+
 ### Added
 
 - `[actor] require_attributed = true` turns on strict attributed-actor mode, the same as
@@ -76,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle the new arm.
 
 ## [0.18.0] - 2026-11-08
+
 ### Added
 
 - `kkernel exec --read-only` runs inline DSL against an existing file-backed database through a
@@ -240,6 +244,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kkernel::exec::ExecArgs` adds `read_only`.
 
 ## [0.17.0] - 2026-11-04
+
 ### Added
 
 - `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
@@ -304,6 +309,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
   posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
   event to the profile that served it, as the live path does.
+
 ### Fixed
 
 - `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
@@ -338,6 +344,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kkernel::reindex::ReindexArgs` adds `fts_only`.
 
 ## [0.16.0] - 2026-11-01
+
 ### Added
 
 - `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task
