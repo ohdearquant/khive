@@ -315,6 +315,56 @@ fn exchange_internal_anchor_admits_same_domain_maintainer() {
     );
 }
 
+#[tokio::test]
+async fn exchange_internal_precondition_is_not_verified_for_a_non_exchange_mailbox() {
+    let raw = b"From: owner@example.com\r\nSender: owner@example.com\r\n\
+        To: user@example.com\r\nSubject: operator precondition\r\n\
+        X-MS-Exchange-Organization-AuthAs: Internal\r\n\r\nmessage";
+    let email = parse_raw_bytes(1, raw, "imap.non-exchange.example", 4242)
+        .expect("valid same-domain message");
+    assert!(email.authentication_results.is_empty());
+
+    for enabled in [true, false] {
+        let mut config = make_config("owner@example.com");
+        config.imap_host = "imap.non-exchange.example".to_string();
+        config.trust_anchor = TrustAnchor::AuthservId("mx.non-exchange.example".to_string());
+        config.trust_exchange_internal = enabled;
+        let channel = build_channel_from(config, vec![email.clone()]);
+        assert_eq!(
+            channel.evaluate_auth(&email),
+            Err(QuarantineReason::AuthAbsent)
+        );
+        assert_eq!(
+            gate_outcome(&channel, &email, None),
+            if enabled {
+                Ok("maintainer")
+            } else {
+                Err(QuarantineReason::AuthAbsent)
+            }
+        );
+
+        let envelopes = channel.poll(Utc::now()).await.unwrap();
+        assert_eq!(envelopes.len(), 1);
+        if enabled {
+            assert_eq!(envelopes[0].from, "email:owner@example.com");
+            assert!(!envelopes[0].metadata.contains_key("quarantined"));
+        } else {
+            assert_eq!(envelopes[0].from, EMAIL_QUARANTINE_SENDER);
+            assert_eq!(
+                envelopes[0].metadata.get("quarantined").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                envelopes[0]
+                    .metadata
+                    .get("quarantine_reason")
+                    .map(String::as_str),
+                Some("auth-absent")
+            );
+        }
+    }
+}
+
 /// One refusal arm: label, opt-in, From, Sender, raw header block.
 type RefusalArm<'a> = (&'a str, bool, &'a str, Option<&'a str>, &'a [u8]);
 
