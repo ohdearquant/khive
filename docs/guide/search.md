@@ -209,6 +209,39 @@ patterns.
 | Find knowledge atoms with scoring | `knowledge.search(query="...", rerank=true)` |
 | Recall agent memories             | `memory.recall(query="...")`                 |
 
+## Provisioning Qwen3-Embedding-0.6B
+
+The `qwen3-embedding-0.6b` embedding provider loads local model files. Before
+selecting it, download the four files below from Qwen's upstream repository at
+revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3` into a fresh model directory.
+These links pin that revision; the sizes and SHA256 hashes apply to the 0.6B
+model.
+
+| File                                                                                                                                             |         Bytes | SHA256                                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------: | ------------------------------------------------------------------ |
+| [config.json](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/config.json)                     |           727 | `b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9` |
+| [model.safetensors](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/model.safetensors)         | 1,191,586,416 | `0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd` |
+| [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/tokenizer.json)               |    11,423,705 | `def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a` |
+| [tokenizer_config.json](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/tokenizer_config.json) |         9,706 | `253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0` |
+
+The default directory is `$HOME/.lattice/models/qwen3-embedding-0.6b`.
+To use another directory, set `LATTICE_QWEN_MODEL_DIR` to its path in the
+environment of the process loading the model. For daemon-backed requests,
+the daemon must receive that environment before model loading.
+Start with only the four files above: an existing optional
+`inference_config.json` can change loading settings.
+
+In the model directory, verify the downloaded files:
+
+```sh
+shasum -a 256 config.json model.safetensors tokenizer.json tokenizer_config.json
+```
+
+Compare each result with the table before selecting `qwen3-embedding-0.6b`
+in your [engine configuration](../khive-config-example.toml).
+Provisioning and hash verification are manual steps; the loader does not
+download these files or enforce these pinned hashes.
+
 ## Performance notes
 
 - **Cold start**: the first search in a session loads the ANN index and
