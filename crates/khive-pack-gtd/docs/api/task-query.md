@@ -68,7 +68,7 @@ For a known nonempty object page, a chained read can select
 or presence of a row is unknown, inspect the page before issuing a separate
 call with the chosen identifier. Indexing an object directly with `$prev[0]`
 produces a `substitution_error` with reason `path_wrong_type`; see the
-[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-proposed-2026-11-13-disclose-task-page-continuation-6549).
+[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-2026-11-13-disclose-task-page-continuation-6549).
 
 Continuation describes matching live task rows, including blocked or broken
 tasks. Dependency diagnostics annotate these rows; they do not remove tasks
