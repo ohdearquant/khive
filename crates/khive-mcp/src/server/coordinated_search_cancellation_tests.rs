@@ -138,7 +138,7 @@ impl CoordinatorService for ProbeCoordinator {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult {
+    ) -> Result<CoordSearchResult, RuntimeError> {
         self.inner
             .fan_out_search(request, namespace, extra_visible)
             .await
