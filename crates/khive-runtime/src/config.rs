@@ -503,6 +503,8 @@ pub struct RuntimeConfig {
     pub knowledge: crate::engine_config::KnowledgeSectionConfig,
     /// `[git_digest]` policy: the sources `git.digest` may read.
     pub git_digest: crate::engine_config::GitDigestSectionConfig,
+    /// `[code_ingest]` policy: the directories `code.ingest` may use.
+    pub code_ingest: crate::engine_config::CodeIngestSectionConfig,
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
@@ -660,6 +662,7 @@ impl Default for RuntimeConfig {
             },
             knowledge: crate::engine_config::KnowledgeSectionConfig::default(),
             git_digest: crate::engine_config::GitDigestSectionConfig::default(),
+            code_ingest: crate::engine_config::CodeIngestSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
@@ -1227,6 +1230,7 @@ pub fn runtime_config_from_khive_config(
     };
     let knowledge = khive_cfg.knowledge.clone();
     let git_digest = khive_cfg.git_digest.clone();
+    let code_ingest = khive_cfg.code_ingest.clone();
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
@@ -1271,6 +1275,7 @@ pub fn runtime_config_from_khive_config(
             blob,
             knowledge,
             git_digest,
+            code_ingest,
             exec,
             telemetry,
             mounts,
@@ -1315,6 +1320,7 @@ pub fn runtime_config_from_khive_config(
         blob,
         knowledge,
         git_digest,
+        code_ingest,
         exec,
         telemetry,
         mounts,

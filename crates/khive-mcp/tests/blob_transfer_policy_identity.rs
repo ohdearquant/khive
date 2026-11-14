@@ -178,3 +178,25 @@ fn git_digest_sources_distinguish_daemon_identity_without_changing_the_empty_ide
         "different sources cannot share a warm daemon"
     );
 }
+
+#[test]
+fn code_ingest_roots_distinguish_daemon_identity_without_changing_the_empty_identity() {
+    let _environment = TransferEnvironment::unset();
+    let base = base_config();
+    let empty = runtime_config_from_khive_config(&KhiveConfig::default(), base.clone());
+    let first: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/a\"]\n").unwrap();
+    let second: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/b\"]\n").unwrap();
+    let empty_id = compute_config_id(&empty, None);
+    assert_eq!(empty_id, transfer_disabled_identity(&empty));
+    let first_id = compute_config_id(
+        &runtime_config_from_khive_config(&first, base.clone()),
+        None,
+    );
+    let second_id = compute_config_id(&runtime_config_from_khive_config(&second, base), None);
+    assert!(first_id.starts_with(&format!("{empty_id};code_ingest_roots=")));
+    assert!(second_id.starts_with(&format!("{empty_id};code_ingest_roots=")));
+    assert_ne!(
+        first_id, second_id,
+        "different roots cannot share a warm daemon"
+    );
+}

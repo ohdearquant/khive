@@ -725,6 +725,17 @@ pub struct GitDigestSectionConfig {
     pub remotes: Vec<String>,
 }
 
+/// `[code_ingest]` policy: the directories `code.ingest` may read and write a
+/// map database under. Absent or empty refuses every path.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIngestSectionConfig {
+    /// Absolute directories; a source path and an explicit `db` must resolve,
+    /// symlinks included, under one of them.
+    #[serde(default)]
+    pub roots: Vec<std::path::PathBuf>,
+}
+
 impl KnowledgeSectionConfig {
     /// The configured roots that resolve to existing directories, resolved. A root
     /// that does not resolve admits nothing.
@@ -1491,9 +1502,10 @@ where
 /// - `[blob]`: server-local file-transfer opt-in
 /// - `[knowledge]`: directories `knowledge.import` may read
 /// - `[git_digest]`: sources `git.digest` may read
+/// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]` and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]` and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1604,6 +1616,10 @@ pub struct KhiveConfig {
     /// The local roots and remote repositories `git.digest` may read.
     #[serde(default)]
     pub git_digest: GitDigestSectionConfig,
+
+    /// The directories `code.ingest` may read and write a map database under.
+    #[serde(default)]
+    pub code_ingest: CodeIngestSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
@@ -2051,6 +2067,17 @@ impl KhiveConfig {
         {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "git_digest.local_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .code_ingest
+            .roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "code_ingest.roots".to_owned(),
                 reason: format!("{root:?} is not an absolute path"),
             });
         }

@@ -604,13 +604,21 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         );
         format!(";git_digest_sources={:x}", hasher.finalize())
     };
+    let code_ingest_roots = if config.code_ingest.roots.is_empty() {
+        String::new()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(b"khive.code-ingest-roots.v1");
+        hasher.update(serde_json::to_vec(&config.code_ingest.roots).expect("paths serialize"));
+        format!(";code_ingest_roots={:x}", hasher.finalize())
+    };
     let disk_guard = disk_guard_policy_fingerprint(config, khive_cfg, storage_read_only);
     // Operator policy applies with implicit main as well as declared backends.
     let disabled_verbs = khive_cfg
         .map(disabled_verb_policy_suffix)
         .unwrap_or_default();
     format!(
-        "{base}{topology}{blob_file_transfers}{knowledge_import_roots}{git_digest_sources}{disk_guard}{disabled_verbs}"
+        "{base}{topology}{blob_file_transfers}{knowledge_import_roots}{git_digest_sources}{code_ingest_roots}{disk_guard}{disabled_verbs}"
     )
 }
 

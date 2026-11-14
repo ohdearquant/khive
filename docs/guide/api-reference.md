@@ -3406,6 +3406,18 @@ becomes known.
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
+The verb reads and writes only under the roots the config's `[code_ingest]` section names. The
+source `path` is resolved, symlinks included, and must lie under a resolved `roots` entry; an
+explicit `db` must have its nearest existing ancestor directory under one as well. The list is
+empty by default, which refuses every call. A path outside every root and one that cannot be
+resolved give one message, `path ... is not under a configured code.ingest root` (or `db ...`),
+and that check runs before the source is read or the target is created.
+
+```toml
+[code_ingest]
+roots = ["/srv/code"]
+```
+
 The argument object is closed: unknown names are rejected before filesystem or database access.
 The success report's sorted `languages` array describes languages observed by a selected tier,
 rather than echoing the caller's filter. It also includes `fts_indexed`, the number of entity

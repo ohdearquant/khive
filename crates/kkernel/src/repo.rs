@@ -382,10 +382,16 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
         default_namespace: Namespace::local(),
         packs: packs.clone(),
         actor_id: None,
-        // The dedicated server reads only the repository this build was given.
+        // The dedicated server reads only the repository this build was given and
+        // writes only beside its map database.
         git_digest: khive_runtime::GitDigestSectionConfig {
             local_roots: vec![source.repo.clone()],
             remotes: Vec::new(),
+        },
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: std::iter::once(source.repo.clone())
+                .chain(map_db.parent().map(Path::to_path_buf))
+                .collect(),
         },
         ..RuntimeConfig::no_embeddings()
     })

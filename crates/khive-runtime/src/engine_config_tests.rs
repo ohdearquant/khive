@@ -3005,3 +3005,17 @@ fn git_digest_sources_parse_closed_and_checked() {
     let error = ssh.validate().expect_err("a non-https remote is refused");
     assert!(error.to_string().contains("git_digest.remotes"), "{error}");
 }
+
+#[test]
+fn code_ingest_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
+    parsed.validate().expect("absolute roots validate");
+    assert_eq!(parsed.code_ingest.roots, vec![PathBuf::from("/srv/code")]);
+    assert!(KhiveConfig::default().code_ingest == CodeIngestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[code_ingest]\nimport_roots = []\n").is_err());
+
+    let relative: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"code\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(error.to_string().contains("code_ingest.roots"), "{error}");
+}
