@@ -55,7 +55,11 @@ fn brain_resolve_params_has_consumer_kind_required() {
         ),
     ] {
         let handler = find_handler(verb);
-        let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
+        let namespace = handler
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .unwrap();
         assert_eq!(
             namespace.description,
             description,
@@ -143,4 +147,23 @@ fn brain_reset_params_has_optional_profile_id() {
             .any(|p| p.name == "profile_id" && !p.required),
         "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
     );
+}
+
+#[test]
+fn profile_lifecycle_help_explains_binding_resolution() {
+    for verb in ["brain.profile", "brain.activate", "brain.deactivate"] {
+        let description = find_handler(verb).description;
+        assert!(
+            description.contains("lifecycle governs only the unbound fallback"),
+            "{verb}: {description}"
+        );
+        assert!(
+            description.contains("bound, non-archived profile"),
+            "{verb}: {description}"
+        );
+    }
+    let profile = find_handler("brain.profile").description;
+    assert!(profile.contains("resolving_bindings"));
+    assert!(profile.contains("serving_through_visible_binding_while_inactive"));
+    assert!(profile.contains("false makes no claim about hidden bindings"));
 }
