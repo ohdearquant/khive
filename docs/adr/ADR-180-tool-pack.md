@@ -1021,3 +1021,49 @@ The implementation stores `program` in the registry row's existing properties an
 receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
 already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
 new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
+
+## Amendment 12 (2026-11-14): tool policy matching uses the registry's name folding
+
+**Status: Proposed.** This amendment requires sign-off before the dependent implementation merges.
+Amendments 10 and 11 precede this amendment; their registration and retirement rules remain in force.
+
+1. **Tool matching folds ASCII case.** Policy and grant tool patterns use the registry's name fold
+   for both the stored pattern and the queried name. Exact labels, a trailing `*` and a lone `*`
+   retain their existing meanings. Matching compares the complete byte strings after folding,
+   including bytes after an embedded NUL; non-ASCII bytes are unchanged. Actor matching remains
+   byte-exact. The public check and execution preflight use this same rule, as do the by-actor and
+   by-ID grant readers. Grant identity, definition pins, expiry, namespace and status checks do not
+   change.
+2. **Matching does not merge policy rows.** The stored `(namespace, actor, tool)` identity and exact
+   labels used for correction or deletion remain unchanged. Case-distinct rows can both match one
+   tool. The existing specificity sum still ranks them, followed by `deny` over `ask` over `allow`,
+   then `created_at ASC, id ASC`. Each row retains its spelling, ID and history.
+3. **Grant lifetime uses the same fold.** First-registration invalidation and the registration
+   evidence consulted when approving an unpinned grant fold prefixes as well as exact names.
+   Existing namespace, status, null-pin and prior-evidence restrictions remain. Exact-name
+   evidence retains priority over prefix evidence, followed by the existing creation-time and ID
+   order. No evidence is inferred from a registration that is no longer stored as live.
+4. **Existing writable stores replace the trigger atomically.** The existing schema batch drops
+   and recreates the registry-insert trigger, then runs the ordered evidence backfill in the same
+   schema transaction. A later statement failure restores both the former trigger and row values.
+   Repeating a successful schema application preserves the recorded invalidation evidence.
+
+### Acceptance for Amendment 12
+
+1. An actual `tool.check` uses a differently cased policy for a registered tool and reports that
+   policy's decision and ID. Both stored-pattern and queried-name folding are required; actors
+   differing only by case remain distinct.
+2. The actual execution `preflight_policy` resolves the same different-case policy against the
+   registered entity and records the corresponding decision receipt.
+3. A request made before a differently spelled registration is subsequently granted and pins that
+   row's ID and definition. Actual checks and the by-ID grant reader agree that the grant applies.
+4. A different-case prefix matches, while a different suffix does not. NUL-bearing exact and prefix
+   patterns preserve all bytes after NUL, and non-ASCII case pairs remain distinct.
+5. Independently stored case-distinct policies of equal specificity select the stricter decision
+   with the existing final tie order. Exact corrections and deletion retain independent row
+   identity and history.
+6. Registration before or after approval invalidates the same matching unpinned prefix grant.
+   Other namespaces, unrelated prefixes, pinned rows and prior invalidation evidence stay intact.
+7. A store carrying the former trigger upgrades to the new body, backfills exactly the eligible
+   rows and uses the installed trigger for a later registration. A second application is
+   idempotent; a deliberately later statement failure preserves the former body and all row data.
