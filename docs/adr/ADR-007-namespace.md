@@ -229,7 +229,9 @@ The following constraints apply:
    a backend whose isolation is enforced at connection time, not at per-record read time.
    No by-ID namespace check is added anywhere in the shared substrate layer, other than those two
    write-effect comparisons, which compare stored namespaces with each other or with the
-   gate-checked write namespace and never gate a read.
+   gate-checked write namespace and never gate a read. Under the proposed ADR-021 Delta 4 the placement rule also
+   compares a superseded row's stored namespace with the shared `local` namespace and with the caller's declared
+   `owned_namespaces`; that is still a write-effect comparison and still never gates a read.
 
 5. **The local degenerate case of such a pack is a view-layer scope, not a security
    boundary.** When a principal-scoped pack runs against the shared local SQLite backend

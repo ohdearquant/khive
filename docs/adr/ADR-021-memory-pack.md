@@ -985,7 +985,7 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
    `source_ids` rule does not apply to it. The new row is written in the caller's namespace as before, and the old
    row is not changed.
 4. **Scope.** The declaration is read by this check alone. It grants no write into the owned namespace, widens no
-   read, and no other verb consults it.
+   read, and no other verb consults it. (Delta 4, proposed, makes the supersede writes it names read the same list.)
 
 **Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
 machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
@@ -1209,17 +1209,24 @@ affected, because the edge or property sits outside its visible set.
    with each other or with the gate-checked write namespace. It now also compares the superseded row's namespace, and
    for the property path the named row's namespace. It decides only whether that write is refused. It never decides
    whether a record can be read, and the gate still decides the request.
-4. **Stored rows.** Edges and properties already stored are not moved, changed or deleted. A dry run lists each live
-   `supersedes` edge whose target is a memory row in a namespace that rule 1 would refuse for the edge's stored
-   namespace. It prints edge id, edge namespace, source namespace and target namespace. It also lists each live memory
-   row whose stored `properties.supersedes` names a memory row that Delta 2 rule 3 honors and that rule 1 would refuse
-   for the carrying row's namespace, because recall keeps honoring those too. It prints row id, row namespace and
-   target namespace. It applies no `owned_namespaces` list: it lists every supersede whose edge namespace, or carrier
-   row namespace, differs from the target row's namespace, and its output says that a supersede a Delta 1 caller wrote
-   into a declared owned namespace appears in the list too. It scans only the namespaces the caller can read and prints
-   no id or namespace outside them, the same bound Delta 2 and Delta 3 state. It reads in id order in pages of at most
-   1,000 rows and returns a cursor, so one call's cost is bounded by the page and a full pass grows with the number of
-   live memory rows. It writes nothing.
+4. **Stored rows.** Edges and properties already stored are not moved, changed or deleted. A dry run lists them by
+   one rule: rule 1 with no `owned_namespaces` list. A supersede is listed when its target is a memory row whose
+   namespace is neither the supersede's own namespace nor `local`. For an edge, the supersede's namespace is the edge's
+   stored namespace. For a property, it is the namespace of the live memory row that carries `properties.supersedes`,
+   and only a value Delta 2 rule 3 honors is considered, because recall honors exactly those. A target in `local` is
+   not listed. A target in an owned namespace is listed, and the output says that a supersede a Delta 1 caller wrote
+   into a declared owned namespace appears in the list too.
+
+   The dry run scans only edges and carrier rows stored in namespaces the caller can read. For each listed edge it
+   prints the edge id, the edge namespace, the source namespace and the target namespace; for each listed property it
+   prints the carrier row id, the carrier namespace and the target namespace. A source or target namespace the caller
+   cannot read is printed as `unreadable`, never by name, the same split as Delta 3 rule 1 and rule 1 above give
+   refusals. The supersede is still listed, because the owner of the readable namespace that stores it can remove it.
+
+   It reads in id order and returns a cursor. A page is at most 1,000 rows read, counting every edge and memory row it
+   examines, whether or not it is listed, so a page can list nothing and still return a cursor. One call's cost is
+   bounded by the page, and a full pass grows with the number of live memory rows and `supersedes` edges in the
+   readable namespaces. It writes nothing.
    The owner of a listed target decides whether that supersede was meant, and
    removes the edge or clears the property if it was not.
 
@@ -1268,4 +1275,8 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
 - The refusal names the target namespace only when the caller can read it.
 - `restore` of a soft-deleted `supersedes` edge onto a refused target is refused, and the edge stays soft-deleted.
 - The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows, and
-  leaves the store byte-identical.
+  leaves the store byte-identical. It does not list a supersede whose target is in `local`, and it lists one whose
+  target is in an owned namespace.
+- A fixture edge stored in a readable namespace whose target row is in a namespace the caller cannot read is listed
+  with target namespace `unreadable`, and the unreadable namespace's name appears nowhere in the output.
+- A page over a fixture with more than 1,000 rows and no listed supersede returns no rows and a cursor.
