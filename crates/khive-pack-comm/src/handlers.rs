@@ -181,7 +181,8 @@ pub(crate) async fn handle_send_with_route(
              worktree-scoped `.khive/config.toml`, so they are not addressable as distinct \
              principals until each is configured with its own actor identity. If this send is \
              genuinely a note to yourself, resend with `self_send=true`."
-        )));
+        ))
+        .before_requested_write());
     }
 
     // #200: unattributed callers stamp from_actor="local", corrupting reply-thread

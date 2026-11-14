@@ -1369,3 +1369,23 @@ Test names identify existing coverage or explicitly identify coverage to add.
 | A11-10 | The 70-pair allowlist resolves to the named owners and covers the classified Assertive surface.                                                                       | `admission_degrade_safe_assertive_census_matches_live_pack_sources`, `crates/khive-runtime/src/pack_tests.rs:382-567`; count entries at `crates/khive-runtime/src/pack/registry_access.rs:456-553`.                                                                                                      |
 | A11-11 | Base acceptance 1 compares source-pinned inventories for the same pack population at two revisions.                                                                   | Unexecuted. `scripts/data/writer-census-v1.json:3-133` and `crates/khive-runtime/tests/data/adr133-writer-census.json:3-37` expose the unmatched populations and missing final revision.                                                                                                                 |
 | A11-12 | The amended text retains the 5 s read wait, records Amendment 10 as Accepted, and both invariants name the same obligation departures.                                | D1's release table and Amendment 11, Decisions 1, 2 and 4 in this file; `crates/khive-runtime/src/audit_batch.rs:307`.                                                                                                                                                                                   |
+
+## Amendment 12 (2026-11-14): Named handler refusals before domain writes
+
+**Status**: Proposed. This amendment does not change the status of the base ADR or earlier amendments.
+
+**Addresses**: [#6539](https://github.com/ohdearquant/khive/issues/6539).
+
+Use the existing `RuntimeError::before_requested_write()` helper only where refusal provably
+precedes every requested domain write. This amendment adopts it at exactly two handler phases:
+
+1. `comm.send`: the default refusal when the resolved recipient equals the sender's non-`local` actor
+   and `self_send` is false. This check precedes attachment import, message sealing and both message writes.
+   An optional thread-root lookup before it is a read. Explicitly allowed self-send retains its behavior.
+2. The public `memory.remember` parameter-decoding boundary: decoding the complete `RememberParams`
+   fails before the remember body, retrieval or any domain write. This includes supplying both `key`
+   and its `idempotency_key` alias. Internal batch-row decoding does not acquire this proof; earlier
+   rows in that enclosing batch may already have written.
+
+All other ordinary handler failures remain `unknown`; existing typed settlement proofs remain
+unchanged.
