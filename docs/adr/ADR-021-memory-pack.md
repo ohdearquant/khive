@@ -1134,3 +1134,102 @@ with the edge left soft-deleted; a move whose set holds two edges with one desti
 edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
 one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
 run leaving all six in the source row's namespace.
+
+### Delta 4: every writer of a supersede applies the old-row namespace rule (2026-11-14)
+
+**Status**: Proposed 2026-11-14. Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
+Recall and Delta 2 are unchanged. It amends Delta 1 rule 4 in one respect: the `owned_namespaces` declaration is also
+read by the checks in rule 2 below. It still grants no write into an owned namespace and widens no read. Who sets the
+declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
+and travels as Delta 1 rule 2 says. No verb sets or changes it.
+
+**Instruction served.** Every memory write is made in its writer's own actor namespace, so a write in one namespace
+does not change what is recalled from another namespace unless the old-row rule admits it.
+
+**Problem.** Decision 5, as Delta 1 states it, decides which old rows `memory.apply_batch` may supersede: a row in the
+caller's namespace, a row in the shared `local` namespace, or a row in a namespace the caller lists in
+`owned_namespaces`. Any other row is refused as `old-namespace`. The same supersede can be written three other ways,
+and none of them applies that rule:
+
+- `link(relation="supersedes")`. Delta 3 checks only the source row's namespace, and only when both endpoints are memory
+  rows. A source that is not a memory row skips the check entirely.
+- A `link` op in `apply_changeset`, with the same gap at preparation.
+- `update` of a memory row whose `properties` carry `supersedes`. Delta 2 made `memory.remember` refuse that key, but
+  `update` still writes it.
+
+Recall honors each of the three exactly as it honors a batch supersede (Delta 2). A write in one namespace therefore
+hides a row in another namespace that `memory.apply_batch` would have refused to supersede. The hiding applies to
+every reader whose visible set covers both namespaces. A reader scoped to the target row's own namespace is not
+affected, because the edge or property sits outside its visible set.
+
+**Decision.**
+
+1. **The rule.** A write that would make recall treat a memory row as superseded is checked against Decision 5's rule
+   (Delta 1). The superseded row's stored namespace must be one of:
+   - the request's write namespace, which is the one the gate checked;
+   - the shared `local` namespace;
+   - a namespace in the caller's `owned_namespaces`.
+
+   Anything else is refused before anything is written. The refusal names the row's namespace only when the caller can
+   read it, the same split as Delta 3 rule 1, and it never redirects the write.
+2. **Which writes.** The rule applies to these writes, whatever kind of row the source is:
+   - `link` with `relation="supersedes"` onto a memory row;
+   - a `link` op with that relation in `apply_changeset`, at preparation;
+   - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace;
+   - `update`, and a note update in `apply_changeset`, when the patch sets `properties.supersedes` on a memory row.
+
+   For the property, the value must be a complete UUID naming a live memory row, and that row is checked by rule 1.
+   Any other value is refused, naming `memory.apply_batch` and `link(relation="supersedes")`. A patch that leaves the
+   stored value unchanged is not checked.
+3. **What it is.** This is a rule of the write that supersedes a memory row, the same kind of rule as
+   `memory.apply_batch`'s. It is not an access control. Under ADR-007 Rule 9, `link(target_id)` resolves its id without
+   a namespace check. This delta extends the second of the two write-effect comparisons that ADR-007 permits (Rule 8
+   constraint 1, Rule 9's qualifications): the memory-edge placement rule of Delta 3, which compares stored namespaces
+   with each other or with the gate-checked write namespace. It now also compares the superseded row's namespace, and
+   for the property path the named row's namespace. It decides only whether that write is refused. It never decides
+   whether a record can be read, and the gate still decides the request.
+4. **Stored rows.** Edges and properties already stored are not moved, changed or deleted. A dry run lists each live
+   `supersedes` edge whose target is a memory row in a namespace that rule 1 would refuse for the edge's stored
+   namespace. It prints edge id, edge namespace, source namespace and target namespace, and writes nothing. The owner
+   of a listed target decides whether that supersede was meant, and removes the edge if it was not.
+
+**Consequences.**
+
+- `link`, the change-set link op and the property path now agree with `memory.apply_batch` on which rows they may
+  supersede.
+- A caller writing from `local` can supersede only rows in `local`, which is what the batch rule already gives that
+  caller.
+- `link` gains one read of the target row when the relation is `supersedes`.
+- Other relations onto a memory row (`annotates`, `supports`, `refutes`) keep their current rule, because recall reads
+  only `supersedes`.
+- Supersedes written before this delta keep their effect on recall. Their listing is the only change rule 4 makes.
+
+**Known limit.** As in Delta 1, `owned_namespaces` is the caller's own claim, carried with its identity, so this rule
+bounds what these verbs agree to supersede. It protects no row from a caller that holds the row's id and uses
+`update(id)` or `delete(id)` (ADR-007 Rule 2).
+
+**Alternatives considered.**
+
+- _Recall honors a supersede only when its namespace is the target's own or `local`._ Rejected. `owned_namespaces` is
+  configuration carried on the writer's request and is not stored, so recall cannot apply Delta 1, and supersedes that
+  Delta 1 admits would stop hiding their targets. This rule would also make every supersede already stored across
+  namespaces reappear, including ones their owners meant.
+- _A stored ownership record that recall consults._ Not opened: it needs a schema change and its own decision.
+- _Refuse `properties.supersedes` on `update` outright, as `memory.remember` does._ Rejected for this delta: a full-UUID
+  value checked by rule 1 matches the batch rule. Outright refusal could follow in a later delta if a caller needs
+  nothing beyond the edge.
+
+**Validation.** Tests on today's code must fail for each subject, with its control in the same test:
+
+- `link` of a `supersedes` edge from a caller's memory onto a memory row in another, not owned, namespace is refused,
+  with no edge stored. Control: the same link between two of the caller's own rows succeeds.
+- The same `link` from a non-memory note in the caller's namespace is refused. Control: the same note superseding one
+  of the caller's own memory rows succeeds.
+- `apply_changeset` refuses the same link op at preparation. Control: an op linking the caller's own two rows
+  prepares.
+- `update` setting `properties.supersedes` to another namespace's memory row is refused, and that row stays in a
+  two-namespace reader's recall. Control: the same update naming the caller's own row hides that row.
+- Targets in `local` and in an owned namespace are admitted on each path, as `memory.apply_batch` admits them.
+- The refusal names the target namespace only when the caller can read it.
+- `restore` of a soft-deleted `supersedes` edge onto a refused target is refused, and the edge stays soft-deleted.
+- The dry run lists a fixture's cross-namespace supersede edges and leaves the store byte-identical.
