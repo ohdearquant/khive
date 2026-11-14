@@ -172,6 +172,36 @@ impl KgPack {
         )))
     }
 
+    async fn validate_supersede_entity_preconditions(
+        &self,
+        token: &NamespaceToken,
+        changeset: &ProposalChangeset,
+    ) -> Result<(), RuntimeError> {
+        let mut pending = vec![changeset];
+        while let Some(step) = pending.pop() {
+            match step {
+                ProposalChangeset::SupersedeEntity { old, new } => {
+                    for id in [old, new] {
+                        let id = Uuid::from_u128(id.to_u128());
+                        match self.runtime.get_entity(token, id).await {
+                            Ok(_) => {}
+                            Err(RuntimeError::NotFound(_)) => {
+                                return Err(RuntimeError::NotFound(format!(
+                                    "{id} does not name a live entity"
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                // Stack order preserves the submitted order, including nested steps.
+                ProposalChangeset::Compound { steps } => pending.extend(steps.iter().rev()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_propose(
         &self,
         token: &NamespaceToken,
@@ -237,6 +267,8 @@ impl KgPack {
             })?;
         crate::canonical_apply::validate_proposal(&changeset, registry)?;
         reject_reserved_changeset_properties(&changeset)?;
+        self.validate_supersede_entity_preconditions(token, &changeset)
+            .await?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
@@ -672,3 +704,7 @@ mod reservation_tests;
 #[cfg(test)]
 #[path = "proposal_cleanup_tests.rs"]
 mod cleanup_tests;
+
+#[cfg(test)]
+#[path = "proposal_entity_precondition_tests.rs"]
+mod entity_precondition_tests;
