@@ -234,9 +234,9 @@ impl KhiveMcpServer {
                                     "kind": "substitution_error",
                                     "reason": "bare_ref_ambiguous",
                                     "message": format!(
-                                        "argument {name:?}: $prev requires a dotted path \
-                                         (e.g. $prev.0) when the prior result is an array. \
-                                         Use $prev.N to select a specific element."
+                                        "argument {name:?}: $prev requires an array index \
+                                         (e.g. `$prev[0]`) when the prior result is an array. \
+                                         Use `$prev[0].id` to select a field from an element."
                                     ),
                                 }),
                             ));

@@ -264,6 +264,52 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
     Ok(())
 }
 
+#[tokio::test]
+async fn test_bare_prev_array_error_examples_parse_and_resolve() -> anyhow::Result<()> {
+    let client = connect().await?;
+    ok_one(
+        &client,
+        r#"gtd.assign(title="array-prev-example", status="next")"#,
+    )
+    .await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"gtd.tasks(status="next") | gtd.complete(id=$prev)"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    assert_eq!(body["results"][0]["ok"], true, "{body}");
+    assert_eq!(body["results"][1]["ok"], false, "{body}");
+    let previous = &body["results"][0]["result"];
+    assert_eq!(previous.as_array().expect("task array").len(), 1);
+    let error = &body["results"][1]["error"];
+    assert_eq!(error["reason"], "bare_ref_ambiguous");
+    let message = error["message"].as_str().expect("error message");
+    let examples: Vec<_> = message
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| matches!(c, '`' | '.' | ')' | ',')))
+        .filter(|example| example.starts_with("$prev") && *example != "$prev")
+        .collect();
+    assert_eq!(examples.len(), 2, "array and field examples: {message}");
+    assert!(previous[0]["id"].is_string(), "task id: {previous}");
+    for (example, expected) in examples
+        .into_iter()
+        .zip([previous[0].clone(), previous[0]["id"].clone()])
+    {
+        let ops = format!(r#"gtd.tasks(status="next") | gtd.complete(id={example})"#);
+        let parsed = khive_request::parse_request(&ops)
+            .unwrap_or_else(|error| panic!("advertised example {example} must parse: {error}"));
+        let argument = parsed.ops[1].args.get("id").expect("id argument");
+        assert_eq!(argument.resolve_all(previous), Some(expected), "{example}");
+    }
+    Ok(())
+}
+
 /// ADR-016 H3 regression: `$prev.nonexistent_field` error must list the
 /// available top-level fields from the prior result.
 ///
