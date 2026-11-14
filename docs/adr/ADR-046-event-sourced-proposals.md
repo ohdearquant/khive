@@ -888,9 +888,22 @@ left to the plain link path:
   either endpoint is not in the local store. Governance is local-only
   (ADR-159 §2); the same silent-inert trap applies.
 
-All other steps — including `SupersedeEntity` (entity-level supersession) and
-`AddEdge` for any other relation or endpoint pair — are unaffected by this
-amendment and keep the base ADR's review and apply semantics unchanged.
+`SupersedeEntity` is entity-level supersession. At `propose`, both `old` and `new`
+must name live entities, including inside a `Compound` at any nesting depth. An
+operand that does not name a live entity is refused before proposal history is
+written, with a typed `NotFound` error naming the ID and stating that it does not
+name a live entity. The check uses the existing by-ID entity lookup on the selected
+runtime, without adding a namespace restriction.
+
+Once the translation specified by the 2026-11-14 compound amendment is implemented,
+an entity created by an earlier `AddEntity` step also satisfies this precondition.
+A note create, a forward reference or an unknown ID does not. This qualification
+does not itself enable compound translation or change the application of stored
+proposals.
+
+All other steps, including `AddEdge` for any other relation or endpoint pair, are
+unaffected by this amendment and keep the base ADR's review and apply semantics
+unchanged.
 
 ### A2. New changeset arm: `ClassifyExistingEdgeGovernance`
 
