@@ -305,6 +305,7 @@ impl Fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn coordinated_request_stop_is_not_committed_and_retryable() {
     for kind in ["entity", "note"] {
         let control = fixture(Outcome::Answer, false);
@@ -347,6 +348,7 @@ async fn coordinated_request_stop_is_not_committed_and_retryable() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ordinary_coordinator_failures_do_not_acquire_retryability() {
     for outcome in [
         Outcome::Timeout {
@@ -409,6 +411,7 @@ async fn ordinary_coordinator_failures_do_not_acquire_retryability() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn audit_failure_after_search_success_keeps_committed_disposition() {
     for kind in ["entity", "note"] {
         let f = fixture(Outcome::Answer, true);
