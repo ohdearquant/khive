@@ -1021,3 +1021,74 @@ The implementation stores `program` in the registry row's existing properties an
 receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
 already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
 new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
+
+## Amendment 11 (2026-11-14): retiring a tool registration
+
+**Status:** Proposed.
+
+`tool.unregister(tool, namespace)` retires one Tool registry entity in the selected write
+namespace. It accepts the live registry's name, full UUID or unambiguous UUID prefix; the exact
+owning name or full UUID also identifies an already-retired row for retry. A visible foreign
+registration, capability or ordinary project is not a retirement target. Normal namespace
+authorization applies. Generic KG mutation of registry rows remains refused.
+
+The first successful call soft-deletes the entity and advances its version while preserving its
+identity, properties, tags and creation history. Capability concepts and `implements` edges stay
+stored. List, describe and suggest exclude the retired registration through their live-entity
+checks. Retirement neither uninstalls an executable nor creates a universal deny rule.
+
+Authorization rows change in the same transaction as the entity:
+
+| Row                                                                                                                                               | Change                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Live policy in the selected namespace, with a byte-exact stored tool label equal to the registration's canonical name and no `*` anywhere         | Set the existing deletion time and actor, across all actor labels.                    |
+| Non-revoked grant in the selected namespace, pinned to this registry UUID                                                                         | Set status to `revoked` and stamp the decision time, actor and fixed retirement note. |
+| Unpinned grant in the selected namespace, with both pin fields null, a byte-exact non-pattern name, and status `requested`, `granted` or `denied` | Make the same terminal transition to `revoked`.                                       |
+| Every other row                                                                                                                                   | Preserve it unchanged.                                                                |
+
+The last row includes wildcard and prefix policies, case-distinct labels, already-revoked grants,
+other registry UUIDs and every other namespace. A foreign grant pinned to the retired UUID remains
+stored unchanged but is inactive because its registration is no longer live; it is not reported as
+revoked. A foreign same-name registration is an independent identity. Pin, scope, reason, request
+time, expiry and prior invalidation evidence are preserved when a local grant is revoked. A name
+containing a literal `*` does not authorize retirement of a pattern with those same bytes.
+
+The runtime retirement boundary validates the captured entity's namespace, registry kind and tag,
+then applies a version/time/deletion-marker compare-and-set and the two prepared companion UPDATEs
+inside one `atomic_unit`. A stale entity or either failed statement returns the transaction's outer
+error, rolling back all three domains. Clocks, actor labels, serialization, token validation and
+statement preparation precede writer admission. Existing grant decisions still revalidate their
+captured registration inside the applying writer, so a prepared decision cannot bind a registration
+retired before that decision commits.
+
+After confirmed commit, existing entity deletion cleanup attempts FTS removal, vector removal for
+each registered model, and the lifecycle event. Failures are reported as postcommit degradations;
+they do not change the committed retirement into a rollback. The result contains `id`, `full_id`,
+`retired`, `policies_retired`, `grants_revoked` and `post_commit_degradations`. The two counts describe
+rows changed by this transaction, not all rules that might still affect the name.
+
+A recognized tombstone returns `retired:false`, zero counts and no cleanup attempt. In particular,
+it does not change policies or requests created after the original retirement. An unknown target
+refuses. Registration and ingest retain their refusal to revive a retired name. Surviving broad
+policies or later requests can still decide an unregistered name under the ordinary policy rules.
+
+### Acceptance for Amendment 11
+
+1. Actual register, request, grant and unregister calls prove entity retirement, exact local row
+   counts, preserved history, inactive discovery and a surviving searchable registration.
+2. Populated namespace, actor, case, embedded-NUL, wildcard, prefix and registry-ID controls prove
+   the literal selection boundary and unchanged shared authorization rows.
+3. A real foreign pinned grant remains byte-identical while the actual foreign `tool.check` no
+   longer answers from it; a foreign same-name registration remains usable independently.
+4. Existing local unpinned requests and denied/granted rows become terminal, while unrelated and
+   already-revoked rows stay unchanged.
+5. Owned live reference forms work; foreign and nonregistry targets refuse. Tombstone retry leaves
+   newly created policies and requests unchanged, and register/ingest cannot revive the target.
+6. Separate failures in each companion UPDATE roll back the entity and both authorization tables;
+   a healthy retry commits.
+7. A stale captured entity refuses before companion changes. A grant prepared before retirement
+   cannot attach afterward.
+8. An actual FTS cleanup failure leaves the domain retirement committed and reports the cleanup
+   degradation; the healthy path removes the text entry.
+9. The loaded verb catalog, dispatch and write classification agree. Read-only gates and malformed
+   arguments refuse without changing domain rows.
