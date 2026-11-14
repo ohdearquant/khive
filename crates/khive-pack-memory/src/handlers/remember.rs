@@ -224,7 +224,8 @@ impl MemoryPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let decoded = decode_params(params).map_err(RuntimeError::RejectedBeforeWrite)?;
+        let decoded = decode_params(params)
+            .map_err(|message| RuntimeError::InvalidInput(message).before_requested_write())?;
         self.remember_decoded_with_properties(token, decoded, &[], None)
             .await
             .map(|(response, _)| response)

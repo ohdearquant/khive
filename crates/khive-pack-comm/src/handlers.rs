@@ -172,7 +172,7 @@ pub(crate) async fn handle_send_with_route(
     // "local" is exempt (anonymous single-tenant party-line default).
     // See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
     if to_actor == from_actor && to_actor != "local" && !p.self_send {
-        return Err(RuntimeError::RejectedBeforeWrite(format!(
+        return Err(RuntimeError::InvalidInput(format!(
             "send: `to` ({to_actor:?}) resolves to the sender's own actor identity \
              ({from_actor:?}); refusing to silently self-address (issue #820). If you intended \
              to reach a distinct actor (e.g. a sub-agent addressing its parent orchestrator), \
@@ -181,7 +181,8 @@ pub(crate) async fn handle_send_with_route(
              worktree-scoped `.khive/config.toml`, so they are not addressable as distinct \
              principals until each is configured with its own actor identity. If this send is \
              genuinely a note to yourself, resend with `self_send=true`."
-        )));
+        ))
+        .before_requested_write());
     }
 
     // #200: unattributed callers stamp from_actor="local", corrupting reply-thread

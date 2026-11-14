@@ -87,9 +87,8 @@ impl Fixture {
         let before = self.stored().await;
         let error = self.dispatch(verb, params).await.expect_err("must refuse");
         assert_eq!(self.stored().await, before, "{verb}: stored rows changed");
-        match error {
-            RuntimeError::RejectedBeforeWrite(message) if verb == "memory.remember" => message,
-            RuntimeError::InvalidInput(message) if verb != "memory.remember" => message,
+        match error.refusal_source() {
+            RuntimeError::InvalidInput(message) => message.clone(),
             error => panic!("{verb}: changed error type: {error:?}"),
         }
     }
