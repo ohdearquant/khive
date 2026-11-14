@@ -115,6 +115,11 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// Under `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
 /// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller
 /// opt-out, not a fallback).
+/// In both strict and non-strict mode, a `NoSocket` outcome whose daemon
+/// launch preflight refuses the current configuration returns `Some(Err(..))`
+/// with `reason: "daemon_launch_preflight"` and `not_committed`: a daemon
+/// launched from that configuration would exit before binding, so the
+/// refusal is reported at once instead of after the recovery wait.
 ///
 /// This conservative entry point never replays a fully written frame.
 /// The CLI/MCP policy-aware entry points additionally permit one classified
@@ -124,7 +129,10 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// error immediately instead of killing/respawning/retrying or falling back
 /// locally (#644). See `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
-    forward_or_spawn_with(frame, &spawn_daemon).await
+    forward_or_spawn_with_preflight(frame, &spawn_daemon, false, &|| {
+        super::launch::preflight_daemon_launch(None, None, None)
+    })
+    .await
 }
 
 /// Forward a request while preserving an explicit config selection (and an
@@ -132,7 +140,8 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 /// spawn.
 ///
 /// An already-running daemon is still matched exclusively by `config_id`.
-/// `config` and `db` only supply construction inputs for a missing daemon;
+/// If the socket is absent, validate the current launch configuration before
+/// waiting for recovery. `config` and `db` supply construction inputs for that daemon;
 /// without them, `kkernel exec --config <path>` would spawn `kkernel mcp
 /// --daemon` against automatic discovery and immediately disagree with the
 /// request it was spawned to serve, and `kkernel exec --db :memory:` would
@@ -170,7 +179,10 @@ pub(crate) async fn forward_or_spawn_with_replay_policy(
         let exe = std::env::current_exe()?;
         spawn_daemon_with_exe_and_config(&exe, config, db, packs)
     };
-    forward_or_spawn_with_policy(frame, &spawn, replay_read_only).await
+    forward_or_spawn_with_preflight(frame, &spawn, replay_read_only, &|| {
+        super::launch::preflight_daemon_launch(config, db, packs)
+    })
+    .await
 }
 
 /// Forward a request, spawning the daemon if needed, without an explicit
@@ -270,6 +282,7 @@ pub(super) async fn forward_or_spawn_with_exe(
     forward_or_spawn_with(frame, &spawn).await
 }
 
+#[cfg(test)]
 pub(super) async fn forward_or_spawn_with<F>(
     frame: &DaemonRequestFrame,
     spawn: &F,
@@ -311,6 +324,7 @@ pub(super) fn supervisor_discovery_hook(point: SupervisorDiscoveryPoint) {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn forward_or_spawn_with_policy<F>(
     frame: &DaemonRequestFrame,
     spawn: &F,
@@ -319,17 +333,37 @@ pub(super) async fn forward_or_spawn_with_policy<F>(
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
-    with_rendezvous_admission_snapshot(forward_or_spawn_admitted(frame, spawn, replay_read_only))
-        .await
+    forward_or_spawn_with_preflight(frame, spawn, replay_read_only, &|| Ok(())).await
 }
 
-async fn forward_or_spawn_admitted<F>(
+async fn forward_or_spawn_with_preflight<F, P>(
     frame: &DaemonRequestFrame,
     spawn: &F,
     replay_read_only: bool,
+    preflight: &P,
 ) -> Option<Result<String, McpError>>
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
+    P: Fn() -> anyhow::Result<()> + Sync,
+{
+    with_rendezvous_admission_snapshot(forward_or_spawn_admitted(
+        frame,
+        spawn,
+        replay_read_only,
+        preflight,
+    ))
+    .await
+}
+
+async fn forward_or_spawn_admitted<F, P>(
+    frame: &DaemonRequestFrame,
+    spawn: &F,
+    replay_read_only: bool,
+    preflight: &P,
+) -> Option<Result<String, McpError>>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+    P: Fn() -> anyhow::Result<()> + Sync,
 {
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
@@ -346,6 +380,17 @@ where
     if matches!(first, ForwardOutcome::NoSocket) {
         if let Some(split) = khive_runtime::daemon::rendezvous_split() {
             return Some(Err(rendezvous_split_error(&split)));
+        }
+        if let Err(error) = preflight() {
+            // Nothing was sent. Preserve the configuration refusal instead
+            // of waiting for a child that cannot bind its events socket.
+            return Some(Err(McpError::invalid_params(
+                format!("{error:#}"),
+                Some(serde_json::json!({
+                    "reason": "daemon_launch_preflight",
+                    "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+                })),
+            )));
         }
     }
     let mut initial_supervisor_marker: Option<SupervisorMarker> = None;

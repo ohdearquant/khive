@@ -357,7 +357,12 @@ both mean the caller must not dispatch locally.
 Under strict mode, the `NoSocket` case becomes `Some(Err(..))`
 instead (see `fallback_or_reject`) — `KHIVE_NO_DAEMON` itself is unaffected,
 since it is the caller's explicit, unconditional opt-out (nothing is ever
-recorded or counted for it). Once the real frame IS fully written
+recorded or counted for it). In both modes, a `NoSocket` outcome whose daemon
+launch preflight refuses the current configuration (for example an events
+socket path over the platform limit) returns `Some(Err(..))` with `reason`
+`daemon_launch_preflight` and `domain_disposition: "not_committed"`, before any
+recovery wait: a daemon launched from that configuration would exit before
+binding. Once the real frame IS fully written
 (`ResponseTimeout`/`ResponseLost`/`ParseFailure`/`ProtocolMismatch`), this
 returns a hard error immediately instead of killing/respawning/retrying or
 falling back locally. The first three carry `reason` `daemon_slow` (with
