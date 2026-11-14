@@ -520,6 +520,7 @@ async fn tasks_limit_over_cap_clamps_to_200_and_reports_it() {
     assert_eq!(resp["requested_limit"], 500);
     assert_eq!(resp["effective_limit"], 200);
     assert_eq!(resp["limit_clamped"], true);
+    assert_eq!(resp["has_more"], true);
 }
 
 /// The `filter_excluded`/`hint` object wrap (#96) already switches `gtd.tasks` to an
@@ -949,18 +950,15 @@ async fn issue_2678_tags_and_context_filter_before_limit_and_offset() {
         page,
         "stable order and rendering on repeat"
     );
-    assert_eq!(
-        issue_2678_ids(
-            &fixture
-                .dispatch(
-                    "gtd.tasks",
-                    json!({"tags": ["red"], "context_entity_id": alpha, "limit": 1})
-                )
-                .await
-                .unwrap()
-        ),
-        expected[..1]
-    );
+    let first = fixture
+        .dispatch(
+            "gtd.tasks",
+            json!({"tags": ["red"], "context_entity_id": alpha, "limit": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["has_more"], true);
+    assert_eq!(issue_2678_ids(&first["tasks"]), expected[..1]);
     assert_eq!(
         fixture
             .dispatch(
