@@ -1073,8 +1073,11 @@ at the end with what happens to each.
    `schema`. A changed input changes the computed digest and an old grant no
    longer matches; its persisted status and pin are not rewritten. Metadata or
    capability changes leave the digest unchanged. Restoring the four original
-   inputs can make the old grant active again. A nonmatching grant still falls
-   through to policy and default; this is not permanent revocation.
+   inputs can make the old grant active again: for `source` and `schema` in
+   either direction, and for `side_effect` and `trust` only when the restore is
+   the tightening leg, since item 5 refuses the loosening one. A nonmatching
+   grant still falls through to policy and default; this is not permanent
+   revocation.
 
    A correction that changes any of the four digest inputs appends exactly one
    event of kind `tool_registration_changed`, verb `tool.register`, substrate
@@ -1162,6 +1165,9 @@ at the end with what happens to each.
 - `re_registration_updates_definition_and_invalidates_only_mismatched_grants`
   changes each policy input independently through registration and checks the
   real grant consumer, reapproval and restoration of the original definition.
+  `source` and `schema` change and restore in either direction. `side_effect`
+  and `trust` start from a looser stored value, are tightened, and the restore
+  to the looser value is refused by item 5 with the grant left inactive.
 - `concurrent_register_claim_loser_applies_its_supplied_definition` and
   `concurrent_registration_updates_refuse_a_stale_snapshot_before_linking`
   exercise both the claim-loser path and a competing update. Skipping the
