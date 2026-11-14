@@ -385,24 +385,57 @@ impl EventsSplitClient {
         request: &EventsRequest,
         budget: &CountReadBudget,
     ) -> StorageResult<EventsResponse> {
-        budget.scope(async {
-            let payload = serialize_events_request(request)?;
-            let attempt = events_round_trip_attempt(&self.socket_path, &payload);
-            let result = khive_storage::await_request_read_phase("events daemon count round-trip", attempt)
-                .await.map_err(|error| budget.attribute(error))?;
-            let bytes = match result {
-                Ok(bytes) => bytes,
-                Err(("read", error)) => return Err(StorageError::Serialization {
+        budget
+            .scope(self.round_trip_read(request, budget, "events daemon count round-trip"))
+            .await
+    }
+
+    pub(super) async fn round_trip_query(
+        &self,
+        request: &EventsRequest,
+        budget: &CountReadBudget,
+    ) -> StorageResult<EventsResponse> {
+        budget
+            .scope_operation(
+                "query_events",
+                self.round_trip_read(request, budget, "events daemon query_events round-trip"),
+            )
+            .await
+    }
+
+    async fn round_trip_read(
+        &self,
+        request: &EventsRequest,
+        budget: &CountReadBudget,
+        operation: &'static str,
+    ) -> StorageResult<EventsResponse> {
+        let payload = serialize_events_request(request)?;
+        let attempt = events_round_trip_attempt(&self.socket_path, &payload);
+        let result = khive_storage::await_request_read_phase(operation, attempt)
+            .await
+            .map_err(|error| budget.attribute(error))?;
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(("read", error)) => {
+                return Err(StorageError::Serialization {
                     capability: khive_storage::StorageCapability::Events,
-                    message: format!("events daemon closed or broke the response after connection at {}: {error}", self.socket_path.display()),
-                }),
-                Err((stage, error)) => return Err(StorageError::Pool {
-                    operation: "events daemon count round-trip".into(),
-                    message: format!("events daemon {stage} failed at {}: {error}", self.socket_path.display()),
-                }),
-            };
-            deserialize_events_response(&bytes)
-        }).await
+                    message: format!(
+                    "events daemon closed or broke the response after connection at {}: {error}",
+                    self.socket_path.display()
+                ),
+                })
+            }
+            Err((stage, error)) => {
+                return Err(StorageError::Pool {
+                    operation: operation.into(),
+                    message: format!(
+                        "events daemon {stage} failed at {}: {error}",
+                        self.socket_path.display()
+                    ),
+                })
+            }
+        };
+        deserialize_events_response(&bytes)
     }
 }
 

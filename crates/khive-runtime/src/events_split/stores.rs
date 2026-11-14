@@ -150,13 +150,14 @@ impl EventStore for ForwardingEventStore {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>> {
+        let budget = CountReadBudget::capture();
         let request = EventsRequest::QueryEvents {
             protocol_version: EVENTS_PROTOCOL_VERSION,
             namespace: self.namespace.clone(),
             filter,
             page,
         };
-        match self.client.round_trip(&request).await? {
+        match self.client.round_trip_query(&request, &budget).await? {
             EventsResponse::Pageful { page } => Ok(page),
             other => Err(self.unexpected("query_events", other)),
         }
@@ -305,58 +306,64 @@ impl EventStore for SplitEventStore {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>> {
-        // Offset pagination cannot be split across two stores: fetch each
-        // store's prefix covering the requested window, merge in the stores'
-        // shared order (created_at DESC, id DESC), then window in memory.
-        // Cost is O(offset + limit) rows materialized from each store — the
-        // floor for offset semantics over two sources, since the split point
-        // is unknowable without both prefixes. The sort below is a single
-        // merge pass in practice (std's stable sort is adaptive on the
-        // concatenation of two sorted runs). That materialization is why the
-        // window is bounded below: without a bound, one authenticated
-        // request with a pathological offset would make both stores buffer
-        // and sort every matching row. Deep walks page with a `before`
-        // cursor (strict `created_at <` bound in `EventFilter`) at
-        // `offset: 0`, which stays inside the bound at any depth.
-        let window = page.offset.saturating_add(u64::from(page.limit));
-        if window > Self::MAX_MERGED_WINDOW_ROWS {
-            return Err(StorageError::InvalidInput {
-                capability: khive_storage::StorageCapability::Events,
-                operation: "query_events".into(),
-                message: format!(
+        let budget = CountReadBudget::capture();
+        budget
+            .scope_operation("query_events", async {
+                // Offset pagination cannot be split across two stores: fetch each
+                // store's prefix covering the requested window, merge in the stores'
+                // shared order (created_at DESC, id DESC), then window in memory.
+                // Cost is O(offset + limit) rows materialized from each store — the
+                // floor for offset semantics over two sources, since the split point
+                // is unknowable without both prefixes. The sort below is a single
+                // merge pass in practice (std's stable sort is adaptive on the
+                // concatenation of two sorted runs). That materialization is why the
+                // window is bounded below: without a bound, one authenticated
+                // request with a pathological offset would make both stores buffer
+                // and sort every matching row. Deep walks page with a `before`
+                // cursor (strict `created_at <` bound in `EventFilter`) at
+                // `offset: 0`, which stays inside the bound at any depth.
+                let window = page.offset.saturating_add(u64::from(page.limit));
+                if window > Self::MAX_MERGED_WINDOW_ROWS {
+                    return Err(StorageError::InvalidInput {
+                        capability: khive_storage::StorageCapability::Events,
+                        operation: "query_events".into(),
+                        message: format!(
                     "offset+limit ({window}) exceeds the merged event plane's window bound \
                      of {}; page deep windows with a `before` cursor at offset 0, or narrow \
                      the filter",
                     Self::MAX_MERGED_WINDOW_ROWS
                 ),
-            });
-        }
-        let prefix = PageRequest {
-            offset: 0,
-            limit: window.min(u64::from(u32::MAX)) as u32,
-        };
-        let legacy = self
-            .legacy
-            .query_events(filter.clone(), prefix.clone())
-            .await?;
-        let lane = self.lane.query_events(filter, prefix).await?;
-        let total = match (legacy.total, lane.total) {
-            (Some(a), Some(b)) => Some(a + b),
-            _ => None,
-        };
-        let mut items = legacy.items;
-        items.extend(lane.items);
-        items.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        let items = items
-            .into_iter()
-            .skip(page.offset as usize)
-            .take(page.limit as usize)
-            .collect();
-        Ok(Page { items, total })
+                    });
+                }
+                let prefix = PageRequest {
+                    offset: 0,
+                    limit: window.min(u64::from(u32::MAX)) as u32,
+                };
+                let legacy = self
+                    .legacy
+                    .query_events(filter.clone(), prefix.clone())
+                    .await
+                    .map_err(|error| budget.attribute(error))?;
+                let lane = self.lane.query_events(filter, prefix).await?;
+                let total = match (legacy.total, lane.total) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
+                let mut items = legacy.items;
+                items.extend(lane.items);
+                items.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+                let items = items
+                    .into_iter()
+                    .skip(page.offset as usize)
+                    .take(page.limit as usize)
+                    .collect();
+                Ok(Page { items, total })
+            })
+            .await
     }
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {

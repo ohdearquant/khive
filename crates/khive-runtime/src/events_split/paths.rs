@@ -33,7 +33,8 @@ pub const DEFAULT_APPEND_QUEUE_BATCHES: usize = 4096;
 #[cfg(unix)]
 pub const DEFAULT_APPEND_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Timeout for one synchronous round-trip (idempotent appends, reads).
+/// Timeout for one synchronous round-trip (idempotent appends, GetEvent,
+/// QueryEventPage). Counts and QueryEvents use the original request-read budget.
 /// Covers the WHOLE attempt — connect, peer verification, write, read —
 /// because each round-trip owns its connection (no shared lock to wait on
 /// outside the clock).
