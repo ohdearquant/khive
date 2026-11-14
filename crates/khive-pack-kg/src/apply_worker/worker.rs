@@ -620,6 +620,8 @@ impl ProposalApplyWorker {
                     })
                 }
                 ProposalChangeset::SupersedeEntity { old, new } => {
+                    self.validate_supersede_entity_preconditions(token, changeset)
+                        .await?;
                     let old_id = Uuid::from_u128(old.to_u128());
                     let new_id = Uuid::from_u128(new.to_u128());
                     let args = serde_json::json!({
