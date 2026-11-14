@@ -807,3 +807,32 @@ response shape unchanged; every existing test asserting the pre-amendment reject
 unbracketed comma-plus-pipe mix, a dangling separator, or a nested batch continues to hold.
 This amendment adds no cross-unit isolation guarantee, no recursive nesting beyond one level
 of brackets, and no change to any verb's own per-item limits.
+
+## Amendment 3 (2026-11-14): optional compact discovery catalog
+
+**Status: Proposed.** Refs #6604. This qualifies the request tool's discovery
+catalog presentation; it changes no callable verb or request argument.
+
+`kkernel mcp --catalog-verbosity full|compact` selects the presentation for that
+MCP server instance. `full` is the default and preserves the complete request-tool
+description byte-for-byte for the same catalog. Rust callers may select the same
+mode through `KhiveMcpServer::with_catalog_verbosity`; existing constructors use
+`full`. The setting changes neither runtime configuration identity nor daemon
+forwarding, and has no environment-variable or TOML binding.
+
+`compact` retains the exact enabled public callable set required by
+[ADR-023](ADR-023-declarative-pack-format.md), including mounted verbs. It emits
+one sorted row per verb, retaining every contributing pack and an exact
+`verb(help=true)` pointer. Each contribution uses its first nonempty description
+line with normalized whitespace, capped at 160 Unicode scalar values including
+any shortening ellipsis. Empty descriptions use a help-available placeholder.
+A fixed line before the entries identifies the compact presentation, explains
+first-line summaries and marked shortening at that limit, and directs callers
+to `verb(help=true)` for the full text.
+
+Only the catalog embedded in `tools/list` changes. `verb(help=true)` and `verbs`
+retain full descriptions; argument definitions, dispatch, pack selection, and mounted
+catalog refresh and refusal behavior remain unchanged. Acceptance exercises
+actual MCP discovery and calls, default/full byte equality, complete compact
+names and contributors, disclosure and truncation boundaries, full help, both
+parsed single- and multi-backend construction paths, and mounted refresh failure.
