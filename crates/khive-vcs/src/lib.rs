@@ -10,4 +10,4 @@ pub mod sync;
 pub mod types;
 
 pub use error::VcsError;
-pub use types::{SnapshotCoverage, SnapshotId, VcsState, KG_V1_COVERAGE};
+pub use types::{SnapshotCoverage, SnapshotId, SnapshotIdentity, VcsState, KG_V1_COVERAGE};

@@ -111,6 +111,20 @@ pub const KG_V1_COVERAGE: SnapshotCoverage = SnapshotCoverage {
     notes: false,
 };
 
+/// Recorded content identity and the record classes the snapshot claims to cover.
+/// Coverage distinguishes completeness claims without changing the v1 content hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotIdentity {
+    pub content_hash: SnapshotId,
+    /// Metadata written before coverage was recorded describes a v1 snapshot.
+    #[serde(default = "legacy_snapshot_coverage")]
+    pub coverage: SnapshotCoverage,
+}
+
+fn legacy_snapshot_coverage() -> SnapshotCoverage {
+    KG_V1_COVERAGE
+}
+
 // ── VcsState ─────────────────────────────────────────────────────────────────
 
 /// Per-namespace VCS state.
