@@ -230,6 +230,7 @@ fn check_no_duplicate_stage_ids(duplicate_ids: &[String]) -> RuleResult {
     let violations: Vec<Violation> = duplicate_ids
         .iter()
         .map(|id| Violation {
+            source: None,
             entity_id: Some(id.clone()),
             entity_name: None,
             entity_kind: None,
