@@ -18,7 +18,17 @@ use serde_json::{json, Value};
 // ── fixture ───────────────────────────────────────────────────────────────────
 
 fn rt() -> KhiveRuntime {
-    KhiveRuntime::memory().expect("memory runtime")
+    KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        knowledge: khive_runtime::KnowledgeSectionConfig {
+            import_roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime")
 }
 
 struct Fixture {

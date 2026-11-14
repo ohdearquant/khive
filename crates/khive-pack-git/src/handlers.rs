@@ -192,8 +192,8 @@ impl GitPack {
             .get("source")
             .and_then(Value::as_str)
             .ok_or_else(|| RuntimeError::InvalidInput("git.digest requires source".into()))?;
-        let source =
-            parse_source(source_raw).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let source = crate::source::parse_source_syntax(source_raw)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         // Parsed as i64 (not u64) so an out-of-range negative value clamps to
         // MIN_MAX_ITEMS instead of failing `as_u64` and silently falling
@@ -225,6 +225,12 @@ impl GitPack {
                 ))
             }
         };
+
+        crate::source::admit_digest_source(&source, &self.runtime().config().git_digest)
+            .map_err(RuntimeError::InvalidInput)?;
+        if let DigestSource::Local(path) = &source {
+            crate::source::require_git_entry(path).map_err(RuntimeError::InvalidInput)?;
+        }
 
         // Commits need a repository to walk. Issues and pull requests are
         // source-bound `gh` API reads, so a remote API-only request uses a
@@ -892,7 +898,18 @@ mod tests {
     }
 
     async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
-        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            git_digest: khive_runtime::GitDigestSectionConfig {
+                local_roots: vec![std::env::temp_dir()],
+                remotes: vec!["https://127.0.0.1:1/org/repo".to_string()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime");
         let token = rt.authorize(Namespace::local()).expect("authorize local");
         let mut builder = VerbRegistryBuilder::new();
         builder.register(khive_pack_kg::KgPack::new(rt.clone()));

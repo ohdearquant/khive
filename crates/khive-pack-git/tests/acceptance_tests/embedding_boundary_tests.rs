@@ -215,6 +215,10 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: Vec::new(),
+        },
         ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime with a configured default model");

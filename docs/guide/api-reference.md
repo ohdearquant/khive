@@ -2842,6 +2842,17 @@ Validate and ingest atlas markdown file(s) with canonical-frontmatter or stable 
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
 
+The verb reads only under the directories listed in `import_roots` in the `[knowledge]` section of
+the config. The requested path is resolved, symlinks included, and must lie under a resolved root.
+With no roots configured, every path is refused. A path outside every root, or one that cannot be
+resolved, gives one message, `import path is not under a configured import root`, so a refusal says
+nothing about what exists outside the roots.
+
+```toml
+[knowledge]
+import_roots = ["/srv/atlas"]
+```
+
 Leading delimiter-bounded YAML frontmatter is metadata rather than body content. Its agreeing
 `id`/`atlas_id`/`atlas-id` aliases take identity precedence; `name`/`title`, `tags`, nested
 `properties`, and other metadata map into atom fields. Without a canonical ID, directory slugs use
@@ -3176,6 +3187,21 @@ resolving or auto-creating the repo-anchor
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 ```
 
+The verb reads only the sources the config's `[git_digest]` section names. A local path is
+resolved, symlinks included, and must lie under a resolved `local_roots` entry; a remote must
+name the same repository as a `remotes` entry once the trailing `/` and `.git` are removed and
+the host is lowercased. Each `remotes` entry is a full `https://host/owner/repo` URL and admits
+only that repository; configuration validation refuses an owner, a host or a pattern. Both
+lists are empty by default, which refuses every source. Every source outside the lists gives one
+message, `source ... is not a configured git.digest source`,
+and that check runs before the path is read.
+
+```toml
+[git_digest]
+local_roots = ["/srv/repos"]
+remotes = ["https://github.com/org/repo"]
+```
+
 The result includes `writes_refused`, a per-call count of record writes blocked by the
 secret gate, and `write_refusals`, one safe structured diagnostic per refusal. Each
 diagnostic names the attempted `verb`, the provenance `record_kind` and natural
@@ -3380,6 +3406,18 @@ becomes known.
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
+```
+
+The verb reads and writes only under the roots the config's `[code_ingest]` section names. The
+source `path` is resolved, symlinks included, and must lie under a resolved `roots` entry; an
+explicit `db` must have its nearest existing ancestor directory under one as well. The list is
+empty by default, which refuses every call. A path outside every root and one that cannot be
+resolved give one message, `path ... is not under a configured code.ingest root` (or `db ...`),
+and that check runs before the source is read or the target is created.
+
+```toml
+[code_ingest]
+roots = ["/srv/code"]
 ```
 
 The argument object is closed: unknown names are rejected before filesystem or database access.

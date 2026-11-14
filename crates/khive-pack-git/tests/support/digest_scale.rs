@@ -12,6 +12,10 @@ const UNRELATED: usize = 50_000;
 pub(super) async fn file_fixture(path: &Path) -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: Some(path.to_path_buf()),
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: vec!["https://github.com/fixture/repository".to_string()],
+        },
         ..RuntimeConfig::no_embeddings()
     })
     .expect("file-backed runtime");

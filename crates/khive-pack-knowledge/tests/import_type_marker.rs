@@ -12,7 +12,17 @@ const BODY: &str = "This section body carries enough text to clear the minimum s
 
 #[tokio::test]
 async fn import_types_sections_by_marker_and_counts_unknown_markers() {
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        knowledge: khive_runtime::KnowledgeSectionConfig {
+            import_roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));

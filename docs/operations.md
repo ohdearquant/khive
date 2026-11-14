@@ -456,6 +456,9 @@ kkernel exec 'knowledge.import(path="/path/to/atlas-markdown", format="atlas_md"
 kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 
+The path must lie under a directory listed in `import_roots` in the config's `[knowledge]` section;
+with none listed, the verb refuses every path.
+
 See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for
 `import`'s argument shape; that handler lives outside `kkernel` (in the pack crate), not in this
 binary.

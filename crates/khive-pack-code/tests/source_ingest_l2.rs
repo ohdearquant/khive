@@ -64,6 +64,9 @@ fn rt_at(db_path: &Path) -> KhiveRuntime {
         db_path: Some(db_path.to_path_buf()),
         packs: vec![],
         volume_lock_dir: Some(private_volume_lock_dir()),
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
         ..RuntimeConfig::no_embeddings()
     };
     KhiveRuntime::new(config).expect("target runtime opens")
@@ -715,7 +718,17 @@ async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
     write_l2_symbol_fixture(root.path(), "pkg_default");
     let db = root.path().join("default.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt);
 
     let result = dispatch(
@@ -750,7 +763,19 @@ async fn wire_unknown_arguments_are_rejected_before_db_open() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_unknown_arg");
     let db = root.path().join("unknown-arg.db");
-    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let reg = registry(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime"),
+    );
 
     let error = dispatch(
         &reg,
@@ -781,7 +806,19 @@ async fn wire_report_languages_describe_observed_sources() {
     write_l2_symbol_fixture(root.path(), "pkg_observed_language");
     let db = root.path().join("observed-language.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
-    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let reg = registry(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime"),
+    );
 
     let report = dispatch(
         &reg,
@@ -804,7 +841,17 @@ async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
     write_l2_symbol_fixture(root.path(), "pkg_null");
     let db = root.path().join("null.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt);
 
     let result = dispatch(
@@ -855,7 +902,19 @@ async fn wire_empty_tiers_write_no_map_rows() {
     write_l2_symbol_fixture(root.path(), "pkg_wire_empty");
     let db = root.path().join("wire-empty.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
-    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let reg = registry(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime"),
+    );
 
     let result = dispatch(
         &reg,
@@ -885,7 +944,17 @@ async fn wire_empty_tiers_write_no_map_rows() {
 async fn wire_malformed_tiers_rejected_before_db_open() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_malformed");
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt);
 
     for (label, tiers_value) in [
@@ -932,7 +1001,17 @@ async fn wire_duplicate_tiers_canonicalize() {
     std::fs::File::create(&db_dup).expect("pre-create explicit ingest target");
     let db_single = root.path().join("single.db");
     std::fs::File::create(&db_single).expect("pre-create explicit ingest target");
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt);
 
     for (db, tiers) in [
@@ -964,7 +1043,17 @@ async fn wire_duplicate_tiers_canonicalize() {
 async fn wire_tier_order_is_caller_independent() {
     let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_order");
-    let rt = KhiveRuntime::memory().expect("memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt);
 
     let db_a = root.path().join("order_a.db");
@@ -1009,7 +1098,17 @@ async fn default_and_explicit_l1_l1_5_are_report_byte_equivalent() {
 
     let db_wire = root.path().join("bytes_wire.db");
     std::fs::File::create(&db_wire).expect("pre-create explicit ingest target");
-    let rt_wire = KhiveRuntime::memory().expect("memory runtime");
+    let rt_wire = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime");
     let reg = registry(rt_wire);
     let value_wire = dispatch(
         &reg,
