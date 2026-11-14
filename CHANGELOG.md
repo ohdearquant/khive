@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
   `khive-mcp` boot.
 
+### Breaking (configuration)
+
+- Config loading now refuses invalid known embedding settings that were previously accepted with
+  any value; the daemon does not start with these values: `embed.model` as an empty string or a
+  non-string; `embed.dimensions` as zero, a negative value or a non-integer; `embed.device` as
+  anything other than `"metal"`, `"cuda"` or `"cpu"`; `embed.auto_embed` as a non-boolean;
+  `embed.fields` as a non-table; and `embed.fields.include` as anything other than a non-empty
+  array of strings with no blank name, exact duplicate or literal `"kind"`. Valid legacy `model`,
+  `dimensions` and `device` values still select no provider, vector size or hardware:
+  `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
+  default engine's declared dimensions, or any supplied device produces a startup warning;
+  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load.
+
 ### Breaking (Rust crates)
 
 - `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
