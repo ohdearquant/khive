@@ -2842,6 +2842,17 @@ Validate and ingest atlas markdown file(s) with canonical-frontmatter or stable 
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
 
+The verb reads only under the directories listed in `import_roots` in the `[knowledge]` section of
+the config. The requested path is resolved, symlinks included, and must lie under a resolved root.
+With no roots configured, every path is refused. A path outside every root, or one that cannot be
+resolved, gives one message, `import path is not under a configured import root`, so a refusal says
+nothing about what exists outside the roots.
+
+```toml
+[knowledge]
+import_roots = ["/srv/atlas"]
+```
+
 Leading delimiter-bounded YAML frontmatter is metadata rather than body content. Its agreeing
 `id`/`atlas_id`/`atlas-id` aliases take identity precedence; `name`/`title`, `tags`, nested
 `properties`, and other metadata map into atom fields. Without a canonical ID, directory slugs use

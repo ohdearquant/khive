@@ -2951,3 +2951,26 @@ fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use()
     assert_eq!(in_use, None);
     assert!(text.contains("(in use: none)"), "{text}");
 }
+
+#[test]
+fn knowledge_import_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"/srv/atlas\"]\n").unwrap();
+    assert_eq!(
+        parsed.knowledge.import_roots,
+        vec![PathBuf::from("/srv/atlas")]
+    );
+    parsed.validate().expect("an absolute root validates");
+    assert!(KhiveConfig::default().knowledge.import_roots.is_empty());
+
+    let unknown = toml::from_str::<KhiveConfig>("[knowledge]\nimport_root = [\"/srv\"]\n");
+    assert!(unknown.is_err(), "a misspelled key fails to parse");
+
+    let relative: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"atlas\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("knowledge.import_roots"),
+        "{error}"
+    );
+}

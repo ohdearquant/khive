@@ -694,6 +694,29 @@ pub struct BlobSectionConfig {
     pub file_transfers: bool,
 }
 
+/// `[knowledge]` pack policy.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSectionConfig {
+    /// Absolute directories `knowledge.import` may read from. A requested path is
+    /// resolved, symlinks included, before it is compared against the resolved
+    /// roots. Absent or empty refuses every import path.
+    #[serde(default)]
+    pub import_roots: Vec<std::path::PathBuf>,
+}
+
+impl KnowledgeSectionConfig {
+    /// The configured roots that resolve to existing directories, resolved. A root
+    /// that does not resolve admits nothing.
+    pub fn resolved_import_roots(&self) -> Vec<std::path::PathBuf> {
+        self.import_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .filter(|root| root.is_dir())
+            .collect()
+    }
+}
+
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
 /// already covered by `[[backends]]` (ADR-028). Unknown fields are rejected
 /// so an unsupported database selector cannot silently select the default store.
@@ -1446,9 +1469,10 @@ where
 /// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
+/// - `[knowledge]`: directories `knowledge.import` may read
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]` and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1551,6 +1575,10 @@ pub struct KhiveConfig {
     /// Server-local file-transfer opt-in. Other blob verbs are unaffected.
     #[serde(default)]
     pub blob: BlobSectionConfig,
+
+    /// Knowledge-pack policy: the directories `knowledge.import` may read.
+    #[serde(default)]
+    pub knowledge: KnowledgeSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
@@ -1977,6 +2005,18 @@ impl KhiveConfig {
         #[cfg(not(feature = "blob-s3"))]
         if matches!(&self.storage.blob, Some(BlobConfig::S3 { .. })) {
             return Err(ConfigError::BlobS3FeatureDisabled);
+        }
+
+        if let Some(root) = self
+            .knowledge
+            .import_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "knowledge.import_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
         }
 
         let warm = self

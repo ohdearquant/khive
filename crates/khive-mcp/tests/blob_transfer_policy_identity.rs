@@ -130,3 +130,27 @@ fn daemon_identity_uses_the_boot_snapshot_after_the_transfer_environment_changes
     );
     assert_eq!(compute_config_id(&disabled, None), before);
 }
+
+#[test]
+#[serial_test::serial(blob_transfer_environment)]
+fn knowledge_import_roots_distinguish_daemon_identity_without_changing_the_empty_identity() {
+    let _environment = TransferEnvironment::unset();
+    let base = base_config();
+    let empty = runtime_config_from_khive_config(&KhiveConfig::default(), base.clone());
+    let one: KhiveConfig = toml::from_str("[knowledge]\nimport_roots = [\"/srv/a\"]\n").unwrap();
+    let other: KhiveConfig = toml::from_str("[knowledge]\nimport_roots = [\"/srv/b\"]\n").unwrap();
+    let empty_id = compute_config_id(&empty, None);
+    assert_eq!(
+        empty_id,
+        transfer_disabled_identity(&empty),
+        "a host with no import roots keeps its established identity"
+    );
+    let one_id = compute_config_id(&runtime_config_from_khive_config(&one, base.clone()), None);
+    let other_id = compute_config_id(&runtime_config_from_khive_config(&other, base), None);
+    assert!(one_id.starts_with(&format!("{empty_id};knowledge_import_roots=")));
+    assert_ne!(one_id, empty_id);
+    assert_ne!(
+        one_id, other_id,
+        "different roots cannot share a warm daemon"
+    );
+}
