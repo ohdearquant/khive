@@ -1032,22 +1032,25 @@ new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is i
 **Status: Proposed.** Refs #6597. This qualifies the Decision's existing-name
 behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest` and
 the grant pin predicate unchanged. The network, executable and program
-declaration rules keep their content; item 4 checks them against the corrected
-row as a whole, and the statements of the old existing-name contract are listed
-at the end with what happens to each.
+declaration rules keep their content and their governing amendments' status;
+item 4 checks them against the corrected row as a whole. The statements of the
+old existing-name contract are listed at the end with what happens to each.
 
 1. **Supplied fields correct the same row.** A public registration resolves the
    name in the request's write namespace. A live existing row keeps its UUID,
    name spelling, namespace, creation time, `registered_at` and unrelated
-   properties. Nonnull supplied `kind`, `description`, `source`, `side_effect`,
-   `trust` and `schema` replace those fields. Schema replacement is whole-object,
-   including nested members; `{}` stores an empty object. Omitted and null
-   fields preserve stored values. Creation retains its current defaults. Extra
-   tags and capability links remain additive; a kind change replaces the kind
-   tag. No removal operation is introduced. A stored schema or description
-   therefore cannot be cleared: a correction can replace the schema with `{}`,
-   a description must be a nonempty string, and omitting either field or
-   passing null keeps the stored value.
+   properties. Nonnull supplied `description`, `side_effect`, `trust` and
+   `schema` replace those fields, subject to items 4 and 5. On every existing
+   row, a supplied nonnull `source` or `kind` that differs from the stored
+   value is refused; equal values are not changes. A different source or kind
+   is registered under a new name, for the reason in item 4. Schema replacement
+   is whole-object, including nested members; `{}` stores an empty object.
+   Omitted and null fields preserve stored values. Incoming field validation
+   remains in force, and creation retains its current defaults. Extra tags
+   and capability links remain additive. No removal operation is introduced.
+   A stored schema or description therefore cannot be cleared: a correction
+   can replace the schema with `{}`, a description must be a nonempty string,
+   and omitting either field or passing null keeps the stored value.
 
 2. **The result distinguishes row outcomes.** Creation returns `created:true`,
    `updated:false`, `unchanged:false`. An existing row correction returns
@@ -1060,58 +1063,91 @@ at the end with what happens to each.
 3. **Updates retain the registration and grant safeguards.** The same update
    rule applies after a concurrent first-registration claim loses. Existing
    derived-ID uniqueness, legacy-ID selection and tombstone refusals remain.
-   Updates compare the read snapshot and use a guarded replacement; a stale
-   snapshot refuses before adding capability links. Secret checks and kind
-   validation apply to the correction, and changed descriptions are reindexed.
-   Index or event repair after a surviving claim remains repeatable. Each text or
-   vector publication compares the captured entity revision with the live row
-   in the same writer transaction as its index changes. A stale repair refuses
-   with the surviving entity ID and cannot overwrite a newer index. Repair
-   itself does not advance the entity revision.
+   In particular, [Amendment 5](#amendment-5-2026-09-25-uniqueness-by-name-is-held-by-the-store-not-by-a-lookup)
+   item 5 and acceptance arms 39 and 41 keep a soft-deleted registration's
+   ASCII-folded name reserved in its owning namespace, for both derived and
+   legacy minted IDs. Updates compare the read snapshot and use a guarded
+   replacement; a stale snapshot refuses
+   before adding capability links. Secret checks and kind validation apply to
+   the correction, and changed descriptions are reindexed. Index or event
+   repair after a surviving claim remains repeatable. Each text or vector
+   publication compares the captured entity revision with the live row in the
+   same writer transaction as its index changes. A stale repair refuses with
+   the surviving entity ID and cannot overwrite a newer index. Repair itself
+   does not advance the entity revision.
 
-   Amendment 1's digest still covers only `source`, `side_effect`, `trust` and
-   `schema`. A changed input changes the computed digest and an old grant no
-   longer matches; its persisted status and pin are not rewritten. Metadata or
-   capability changes leave the digest unchanged. Restoring the four original
-   inputs can make the old grant active again: for `source` and `schema` in
-   either direction, and for `side_effect` and `trust` only when the restore is
-   the tightening leg, since item 5 refuses the loosening one. A nonmatching
-   grant still falls through to policy and default; this is not permanent
-   revocation.
+   The public base delete surface refuses a tool registry row, including hard
+   deletion of a live row or tombstone; atomic requests and canonical
+   changesets preserve that refusal. A soft-deleted registry name remains
+   reserved under Amendment 5, so registration cannot replace its definition.
+   This amendment introduces no public purge or revival route. This clause
+   covers the public verb surface only. Direct Rust or store maintenance runs
+   with the embedder's trust, outside this public-verb ownership boundary, and
+   must not be described as preserving that reservation after a privileged
+   purge.
 
-   A correction that changes any of the four digest inputs appends exactly one
+   The grant-definition digest includes Amendment 1's `source`, `side_effect`,
+   `trust` and `schema`, plus the conditional declaration inputs specified by
+   ADR-181 Amendments 13 and 14 and Amendment 8 of this record: `network`,
+   `executable_digest` and `program` join the canonical inputs on rows carrying
+   their respective keys. An absent declaration key is omitted, not inserted
+   as null, preserving the original four-input bytes on rows without those
+   keys. These extensions retain their governing amendments' applicability
+   and implementation requirements. A changed input changes the computed
+   digest and an old grant no longer matches; its persisted status and pin are
+   not rewritten. Metadata or capability changes leave the digest unchanged.
+   Restoring an earlier schema can make the old grant active again when all
+   its other pinned inputs match and the grant is otherwise active. Source and
+   kind corrections are refused. Tightening `side_effect` or `trust` cannot be
+   reversed to the earlier, looser value through `tool.register`, because item
+   5 refuses that restore. A nonmatching grant still falls through to policy
+   and default; this is not permanent revocation.
+
+   An admitted correction that changes a digest input appends exactly one
    event of kind `tool_registration_changed`, verb `tool.register`, substrate
    `event`, in the caller's namespace with the authenticated actor. Its typed
    data is `{actor, id, digest_before, digest_after}`: the authenticated actor,
-   the registry row's UUID, and the Amendment 1 digest computed from the
-   stored and the corrected inputs. It carries no field values. It goes
-   through the same event store as Amendment 6's `tool_check_decided`, and
-   `actor` passes the same ADR-115 credential gate before the correction is
-   applied. The append is part of the guarded replacement: a failed append
-   refuses the correction and leaves the row unchanged. A correction that
-   changes only metadata, tags or capabilities, and an unchanged
-   registration, append none. The generic dispatch `Audit` row for
-   `tool.register` records the call, not which row changed or how its digest
-   moved. The class's ADR-168 retention class is `pinned_while_referenced`; its
-   referent is the registry row and its terminal condition is that row's
+   the registry row's UUID, and the same full canonical per-row grant-definition
+   digest before and after the correction, including any applicable conditional
+   declaration inputs. The event does not use a separate four-field digest or
+   carry field values. It goes through the same event store as Amendment 6's
+   `tool_check_decided`, and `actor` passes the same ADR-115 credential gate
+   before the correction is applied. The append is part of the guarded
+   replacement: a failed append refuses the correction and leaves the row
+   unchanged. A correction that changes only metadata, tags or capabilities,
+   and an unchanged registration, append none. The generic dispatch `Audit`
+   row for `tool.register` records the call, not which row changed or how its
+   digest moved. The class's ADR-168 retention class is `pinned_while_referenced`;
+   its referent is the registry row and its terminal condition is that row's
    deletion. The digests are unkeyed over short inputs; the event lives in the
    row's namespace, so its readers can already read the row it describes.
 
-4. **The corrected row is validated whole.** Before the guarded replacement,
-   the row that would result (stored fields with the supplied ones applied) is
-   checked against the declaration rules for `network`, `executable_digest` and
-   `program` ([ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations)
+4. **The corrected row is validated whole and keeps its source and kind.**
+   Before the guarded replacement, the row that would result (stored fields
+   with the supplied ones applied) is checked against the declaration rules
+   for `network`, `executable_digest` and `program`
+   ([ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations)
    Decision item 1, [ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
-   items 1 and 2, and Amendment 8 of this record), not only the supplied
-   fields. On a row that carries any of those three properties, a correction
-   that changes `source` or `kind` is refused, and the reason names the stored
-   properties. This covers an `exec:` source changed to another `exec:` path:
-   a stored `executable_digest` is bound to the registered binary, and a stored
-   `program` to its interpreter, so a different binary or program is a new
-   registration under a new name, granted again. A passed `network`,
-   `executable_digest` or `program` that differs from the stored value is
-   refused as those amendments already say; this amendment adds none of the
-   three to the correctable fields.
+   items 1 and 2, and Amendment 8 of this record), not only the supplied fields.
+   Every existing row refuses a supplied nonnull `source` or `kind` that differs
+   from storage, whether or not the row carries any declaration. This includes
+   plain `exec:` rows, `mcp:` and other non-exec rows, changes between executable
+   paths, and changes into or out of an `exec:` source. The refusal names
+   `source`, `kind` or both and directs the caller to register a different
+   source or kind under a new name. No part of the correction or its capability
+   additions is applied, and no `tool_registration_changed` event is appended.
+
+   `tool.check` can allow a name through the `read` default or a name-keyed
+   policy without a grant. Those allows are not pinned to the definition;
+   only grants are. Changing an established name's source or kind could
+   therefore retarget what other callers already trust even when there are no
+   policy or grant rows. The refusal has no reference-presence exception and
+   applies to every caller. Rows with `network`, `executable_digest` or
+   `program` are included in this same rule: their declarations cannot be
+   carried to a different binary, server or kind. A passed `network`,
+   `executable_digest` or `program` that differs from the stored value is still
+   refused as those amendments say; this amendment adds none of the three to
+   the correctable fields.
 
 5. **A correction cannot loosen the definition.** `tool.check` resolves by
    name, so a correction to an existing row changes the default answer every
@@ -1121,10 +1157,23 @@ at the end with what happens to each.
    the Decision's own listings: `side_effect` from `read` (least strict, the
    only class the default allows) through `write` and `egress` to
    `irreversible`, and `trust` from `first_party` (most trusted) through
-   `marketplace` to `external`. A looser definition is a new registration under
-   a new name. Moving either field the other way, and every other supplied
-   field, corrects in place as item 1 says. The registry row records no
-   registrant, so no caller is exempt.
+   `marketplace` to `external`.
+
+   A changed, supplied nonnull field also has a conservative floor when its
+   stored value is absent, null, non-string or unrecognized. Such a
+   `side_effect` refuses `read` and permits `write`, `egress` or `irreversible`;
+   such a `trust` permits only `external` and refuses `first_party` and
+   `marketplace`. The refusal names the field and a fixed classification of
+   the stored state, without echoing arbitrary legacy content. The trust floor
+   is a correction rule, not a trust-based default decision: the default
+   decision uses `side_effect`. Omitted or null fields and unrelated
+   corrections preserve unknown stored values rather than initialize them;
+   incoming enum validation is unchanged.
+
+   A looser definition is a new registration under a new name. Moving a known
+   field toward the stricter end, and other correctable fields allowed by
+   items 1 and 4, corrects in place. The registry row records no registrant, so
+   no caller is exempt.
 
 ### Statements of the old existing-name contract
 
@@ -1134,21 +1183,23 @@ at the end with what happens to each.
   amendment.
 - ADR-180 Amendment 5 Context, the same sentence quoted: kept as the record of
   what Amendment 5 addressed. Its acceptance arms 37, 38 and 41 still hold: the
-  existing row keeps its id and reports `created: false`.
+  existing row keeps its id and reports `created: false`, while a matching
+  tombstone refuses under item 5 and acceptance arms 39 and 41.
 - ADR-180 Decision acceptance arms 1, 2 and 8: still hold as written. Arm 1's
   second call returns the same id with `created: false`, and arm 8 is
   `tool.ingest`.
 - ADR-180 Amendment 8 item 3, "Re-registering an existing name returns the stored
-  row unchanged": rewritten by item 4. A passed `program` that differs is still
-  refused, and a source or kind change on a row carrying `program` is refused.
+  row unchanged": rewritten by item 4 for correctable fields. A differing
+  `program` remains refused, as does a differing source or kind on every
+  existing row, including one carrying `program`.
 - ADR-181 Amendment 13 Decision item 1, "Re-registering an existing name keeps
   the stored row unchanged": rewritten. A passed `network` follows Amendment 14
   item 2; the other supplied fields follow items 1, 4 and 5.
 - ADR-181 Amendment 14 item 1, "Re-registering an existing name never changes the
   stored row", and item 2, "the existing row is returned unchanged as today":
   rewritten for `tool.register`. The refusal of a differing `network` or
-  `executable_digest` stands, and item 4 adds the refusal of a source or kind
-  change on a row carrying either.
+  `executable_digest` stands. Source and kind are immutable on every existing
+  row, including rows carrying either declaration.
 - The test `re_registration_keeps_the_approved_object_and_definition`, cited by
   ADR-181 Amendments 13 and 14 as proof of the old contract, is replaced by
   `re_registration_updates_definition_and_invalidates_only_mismatched_grants`.
@@ -1160,39 +1211,71 @@ at the end with what happens to each.
   updated row and description through public readers. Omitting the update or
   merging the old nested schema must fail its stored-value assertions.
 - `register_equal_and_omitted_fields_preserve_the_stored_row` pins equal,
-  omitted and null behavior, with additive-tag and capability controls.
-  Applying creation defaults to an existing row must fail this test.
+  omitted and null behavior, including source and kind, with additive-tag and
+  capability controls. Applying creation defaults to an existing row must fail
+  this test.
 - `re_registration_updates_definition_and_invalidates_only_mismatched_grants`
-  changes each policy input independently through registration and checks the
-  real grant consumer, reapproval and restoration of the original definition.
-  `source` and `schema` change and restore in either direction. `side_effect`
-  and `trust` start from a looser stored value, are tightened, and the restore
-  to the looser value is refused by item 5 with the grant left inactive.
+  changes schema, `side_effect` and `trust` independently through registration
+  and checks the real grant consumer and reapproval. Schema changes and
+  restores in either direction. `side_effect` and `trust` start from a looser
+  stored value, are tightened, and their restore to the looser value is refused
+  with the grant left inactive. Source and kind changes are refused with the
+  original row and grant meaning intact.
 - `concurrent_register_claim_loser_applies_its_supplied_definition` and
   `concurrent_registration_updates_refuse_a_stale_snapshot_before_linking`
-  exercise both the claim-loser path and a competing update. Skipping the
-  losing caller's correction or replacing the guarded update with an
-  unguarded one must fail the corresponding behavioral assertion.
+  exercise both the claim-loser path and a competing update using permitted
+  corrections. Skipping the losing caller's correction or replacing the
+  guarded update with an unguarded one must fail the corresponding behavioral
+  assertion.
 - `register_digest_input_change_appends_one_registration_changed_event` corrects
-  each of the four digest inputs on a row another actor registered and reads
+  each admitted digest input on a row another actor registered and reads
   exactly one `tool_registration_changed` event per correction, carrying the
-  correcting actor, the row id and the two digests, and no field value. A
-  description-only correction and an unchanged registration append none, and a
-  refused correction leaves neither a changed row nor an event.
-- `register_correction_refuses_source_or_kind_change_on_declared_rows` stores
-  rows carrying `network` with `executable_digest`, and `program`, and corrects
-  `source` (to a non-`exec:` value and to another `exec:` path) and `kind` on
-  each: every call is refused naming the stored properties, with the row,
-  grants and events unchanged. The same corrections on a row carrying none of
-  them succeed (control). Validating only the supplied fields must fail it.
+  correcting actor, the row id and the full before/after grant-definition
+  digests, and no field value. Conditional declaration inputs follow their
+  governing amendments' acceptance requirements. A description-only correction
+  and an unchanged registration append none, and a refused correction leaves
+  neither a changed row nor a correction event.
+- `register_correction_refuses_source_or_kind_change_on_existing_rows` stores
+  plain `exec:` rows, `mcp:` rows, rows carrying `network` with
+  `executable_digest`, and rows carrying `program`. Source changes to another
+  executable and into or out of `exec:`, kind changes, and both together are
+  refused naming the differing fields and the new-name remedy. The row,
+  capabilities, grants and correction events remain unchanged, including when
+  the call requests new capability links or another actor makes it. Equal,
+  omitted and null source/kind values remain admissible. Restoring the former
+  declaration-only condition must fail the plain-row refusal arm.
 - `register_correction_refuses_loosening` moves `side_effect` to each less
   strict class and `trust` to each more trusted origin on a row another actor
   registered: each call is refused naming the field, with the row unchanged and
   no `tool_registration_changed` event. Tightening either field succeeds and
   appends one event (control). Dropping the order check must fail it.
+- `register_correction_applies_conservative_unknown_policy_floors` covers
+  absent, null, non-string and unrecognized stored values. It refuses `read`
+  for unknown `side_effect` and `first_party`/`marketplace` for unknown `trust`;
+  `write`/`egress`/`irreversible` and `external`, respectively, succeed. Public
+  reads and event queries verify the full stored result, digest and event on
+  success, and unchanged state with no correction event on refusal. Omitting
+  those fields, passing null or correcting unrelated metadata preserves the
+  legacy values. Restoring the absent/non-string skip and the unknown-string
+  skip independently must fail the corresponding refusal assertions.
 - Existing namespace, retired-name and ingest tests retain their contracts;
-  `refused_registration_updates_preserve_rows_and_capabilities` checks refusal
-  against a populated registration before and after the call.
+  Amendment 5 acceptance arms 39 and 41 retain the same-name tombstone
+  refusal for derived and legacy IDs. `refused_registration_updates_preserve_rows_and_capabilities`
+  checks refusal against a populated registration before and after the call.
+- A populated historical registry tombstone followed by `tool.register` of
+  the same name with a different source is refused without changing the row,
+  policies, grants or capability links. Use a legacy minted ID for the control
+  that omits the matching-tombstone refusal, so an independent derived-ID
+  claim refusal cannot mask its effect; it must fail the registration-refusal
+  assertion after the fixture is ready.
+- A live registry row and a registry tombstone, each with a matching policy,
+  reject public hard deletion. A subsequent same-name source replacement is
+  also refused, preserving the original rows, policies, grants and capability
+  links. Exercise ordinary and atomic delete requests; canonical changesets
+  use the same guarded atomic preparer and retain its refusal. Independently
+  removing each public deletion guard must fail its declared refusal
+  assertion. Each control requires a nonzero passing baseline and an actual
+  behavioral failure, not a compilation, setup, timeout or selection failure.
 - `unchanged_registration_cannot_overwrite_newer_search_document` pauses an
   equal registration before repair, completes a newer description update, and
   verifies the actual text document and search results remain current.
