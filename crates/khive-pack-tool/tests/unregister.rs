@@ -273,7 +273,11 @@ async fn unregister_retires_registry_authorization_and_discovery() {
     restored_fields.deleted_at = old.deleted_at;
     restored_fields.updated_at = old.updated_at;
     restored_fields.version = old.version;
-    assert_eq!(restored_fields, old);
+    assert_eq!(restored_fields.properties, old.properties);
+    assert_eq!(
+        serde_json::to_value(restored_fields).unwrap(),
+        serde_json::to_value(&old).unwrap()
+    );
     let policy_after = f.row("tool_policy", &policy).await;
     unchanged_columns(&old_policy, &policy_after, &["deleted_at", "deleted_by"]);
     assert!(policy_after.opt_i64("deleted_at").unwrap().is_some());
@@ -482,7 +486,12 @@ async fn unregister_preserves_foreign_pins_but_makes_them_inactive() {
     assert_eq!(other_check["registered"], true);
     assert_eq!(other_check["grant_id"], other_request);
     assert_eq!(other_check["source"], "grant");
-    assert_eq!(f.entity("independent", other).await, other_entity);
+    let stored = f.entity("independent", other).await;
+    assert_eq!(stored.properties, other_entity.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&other_entity).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -769,7 +778,12 @@ async fn unregister_rejects_stale_registry_snapshot() {
         before,
         "stale registry CAS must not retire either authorization table"
     );
-    assert_eq!(f.entity("local", target).await, current);
+    let stored = f.entity("local", target).await;
+    assert_eq!(stored.properties, current.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&current).unwrap()
+    );
     assert_retired(
         &f.call("tool.unregister", json!({"tool":target})).await,
         target,
