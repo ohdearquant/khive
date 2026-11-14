@@ -42,7 +42,11 @@ fn brain_resolve_params_has_consumer_kind_required() {
     );
     for verb in ["brain.bind", "brain.bindings", "brain.resolve"] {
         let handler = find_handler(verb);
-        let namespace = handler.params.iter().find(|p| p.name == "namespace").unwrap();
+        let namespace = handler
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .unwrap();
         assert_eq!(
             namespace.description,
             "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
@@ -50,7 +54,11 @@ fn brain_resolve_params_has_consumer_kind_required() {
         );
     }
     let unbind = find_handler("brain.unbind");
-    let namespace = unbind.params.iter().find(|p| p.name == "namespace").unwrap();
+    let namespace = unbind
+        .params
+        .iter()
+        .find(|p| p.name == "namespace")
+        .unwrap();
     assert!(namespace.description.contains("every namespace"));
     assert!(namespace.description.contains("default catalog"));
     assert!(unbind.description.contains("removed_by_namespace"));
@@ -126,4 +134,23 @@ fn brain_reset_params_has_optional_profile_id() {
             .any(|p| p.name == "profile_id" && !p.required),
         "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
     );
+}
+
+#[test]
+fn profile_lifecycle_help_explains_binding_resolution() {
+    for verb in ["brain.profile", "brain.activate", "brain.deactivate"] {
+        let description = find_handler(verb).description;
+        assert!(
+            description.contains("lifecycle governs only the unbound fallback"),
+            "{verb}: {description}"
+        );
+        assert!(
+            description.contains("bound, non-archived profile"),
+            "{verb}: {description}"
+        );
+    }
+    let profile = find_handler("brain.profile").description;
+    assert!(profile.contains("resolving_bindings"));
+    assert!(profile.contains("serving_through_visible_binding_while_inactive"));
+    assert!(profile.contains("false makes no claim about hidden bindings"));
 }
