@@ -38,6 +38,9 @@ registered object points at each capability it implements with an `implements` e
 unique per namespace; re-registering an existing name returns the existing object and links any
 new capabilities without changing its properties. `tool.register(name, kind, description, schema, source, side_effect, trust, capabilities, tags)` creates the object; `kind` defaults to `tool`, `side_effect` to `write` and `trust` to `external`.
 
+[Amendment 10](#amendment-10-2026-11-14-correcting-an-existing-registration) qualifies
+the existing-name behavior of `tool.register`; `tool.ingest` keeps the original behavior.
+
 **Discovery.** `tool.suggest(query, limit, kind, actor)` runs two arms and merges them: hybrid
 search over the registry, and hybrid search over capability concepts expanded through their
 `implements` edges to the objects that implement them, scored at nine tenths of the concept hit.
@@ -98,6 +101,8 @@ Re-registration does not update properties; pattern matching is prefix only; the
 best effort and reported in `notified`; capability expansion reads up to fifty implementers per
 concept; the grants table is pack-local until the grants primitive exists. These are listed for the
 audit pass, not hidden.
+
+The re-registration limitation is addressed by Amendment 10 for `tool.register`.
 
 ## Amendment 1 (2026-09-10): a grant resolves on the registry row, not on the name
 
@@ -1021,3 +1026,76 @@ The implementation stores `program` in the registry row's existing properties an
 receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
 already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
 new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
+
+## Amendment 10 (2026-11-14): correcting an existing registration
+
+**Status: Proposed.** Refs #6597. This qualifies the Decision's existing-name
+behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest`, the
+grant pin predicate and the specialized network, executable and program
+declaration rules unchanged.
+
+1. **Supplied fields correct the same row.** A public registration resolves the
+   name in the request's write namespace. A live existing row keeps its UUID,
+   name spelling, namespace, creation time, `registered_at` and unrelated
+   properties. Nonnull supplied `kind`, `description`, `source`, `side_effect`,
+   `trust` and `schema` replace those fields. Schema replacement is whole-object,
+   including nested members; `{}` stores an empty object. Omitted and null
+   fields preserve stored values. Creation retains its current defaults. Extra
+   tags and capability links remain additive; a kind change replaces the kind
+   tag. No removal operation is introduced.
+
+2. **The result distinguishes row outcomes.** Creation returns `created:true`,
+   `updated:false`, `unchanged:false`. An existing row correction returns
+   `created:false`, `updated:true`, `unchanged:false`. An equal row returns
+   `created:false`, `updated:false`, `unchanged:true` without advancing its
+   revision or update timestamp. These flags concern the registry entity only:
+   a call can still add capability links or repair indexes when its row is
+   unchanged. The existing `tool` and `capabilities` fields remain.
+
+3. **Updates retain the registration and grant safeguards.** The same update
+   rule applies after a concurrent first-registration claim loses. Existing
+   derived-ID uniqueness, legacy-ID selection and tombstone refusals remain.
+   Updates compare the read snapshot and use a guarded replacement; a stale
+   snapshot refuses before adding capability links. Secret checks and kind
+   validation apply to the correction, and changed descriptions are reindexed.
+   Index or event repair after a surviving claim remains repeatable. Each text or
+   vector publication compares the captured entity revision with the live row
+   in the same writer transaction as its index changes. A stale repair refuses
+   with the surviving entity ID and cannot overwrite a newer index. Repair
+   itself does not advance the entity revision.
+
+   Amendment 1's digest still covers only `source`, `side_effect`, `trust` and
+   `schema`. A changed input changes the computed digest and an old grant no
+   longer matches; its persisted status and pin are not rewritten. Metadata or
+   capability changes leave the digest unchanged. Restoring the four original
+   inputs can make the old grant active again. A nonmatching grant still falls
+   through to policy and default; this is not permanent revocation.
+
+### Acceptance for Amendment 10
+
+- `register_updates_supplied_fields_and_preserves_identity` adds a schema to an
+  existing registration, replaces nested schema members, and observes the
+  updated row and description through public readers. Omitting the update or
+  merging the old nested schema must fail its stored-value assertions.
+- `register_equal_and_omitted_fields_preserve_the_stored_row` pins equal,
+  omitted and null behavior, with additive-tag and capability controls.
+  Applying creation defaults to an existing row must fail this test.
+- `re_registration_updates_definition_and_invalidates_only_mismatched_grants`
+  changes each policy input independently through registration and checks the
+  real grant consumer, reapproval and restoration of the original definition.
+- `concurrent_register_claim_loser_applies_its_supplied_definition` and
+  `concurrent_registration_updates_refuse_a_stale_snapshot_before_linking`
+  exercise both the claim-loser path and a competing update. Skipping the
+  losing caller's correction or replacing the guarded update with an
+  unguarded one must fail the corresponding behavioral assertion.
+- Existing namespace, retired-name and ingest tests retain their contracts;
+  `refused_registration_updates_preserve_rows_and_capabilities` checks refusal
+  against a populated registration before and after the call.
+- `unchanged_registration_cannot_overwrite_newer_search_document` pauses an
+  equal registration before repair, completes a newer description update, and
+  verifies the actual text document and search results remain current.
+- `claimed_entity_reindex_preserves_newer_vector_publication` pauses a prepared
+  vector, publishes a newer revision, then verifies its vector bytes and ANN
+  log remain unchanged. Removing either publication guard must fail the
+  corresponding index-preservation assertion; the vector control retains its
+  prepublication pause. Existing index-failure/retry behavior remains covered.
