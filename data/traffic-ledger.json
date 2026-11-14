@@ -635,13 +635,91 @@
       "unique_clones": 60,
       "views": 138,
       "unique_views": 94
+    },
+    "2026-10-31": {
+      "clones": 1878,
+      "unique_clones": 74,
+      "views": 19,
+      "unique_views": 1
+    },
+    "2026-11-01": {
+      "clones": 1359,
+      "unique_clones": 98,
+      "views": 57,
+      "unique_views": 1
+    },
+    "2026-11-02": {
+      "clones": 1120,
+      "unique_clones": 116,
+      "views": 6,
+      "unique_views": 2
+    },
+    "2026-11-03": {
+      "clones": 599,
+      "unique_clones": 108,
+      "views": 16,
+      "unique_views": 7
+    },
+    "2026-11-04": {
+      "clones": 1348,
+      "unique_clones": 66,
+      "views": 20,
+      "unique_views": 9
+    },
+    "2026-11-05": {
+      "clones": 835,
+      "unique_clones": 45,
+      "views": 1102,
+      "unique_views": 1096
+    },
+    "2026-11-06": {
+      "clones": 1305,
+      "unique_clones": 111,
+      "views": 60,
+      "unique_views": 8
+    },
+    "2026-11-07": {
+      "clones": 363,
+      "unique_clones": 49,
+      "views": 15,
+      "unique_views": 4
+    },
+    "2026-11-08": {
+      "clones": 454,
+      "unique_clones": 79,
+      "views": 17,
+      "unique_views": 7
+    },
+    "2026-11-09": {
+      "clones": 280,
+      "unique_clones": 97,
+      "views": 5,
+      "unique_views": 5
+    },
+    "2026-11-10": {
+      "clones": 139,
+      "unique_clones": 39,
+      "views": 3,
+      "unique_views": 3
+    },
+    "2026-11-11": {
+      "clones": 1351,
+      "unique_clones": 47,
+      "views": 9,
+      "unique_views": 4
+    },
+    "2026-11-12": {
+      "clones": 596,
+      "unique_clones": 75,
+      "views": 11,
+      "unique_views": 2
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-11-01T05:25:16Z",
-    "clones_14d": 40569,
-    "unique_clones_14d": 2300,
-    "views_14d": 1576,
-    "unique_views_14d": 996
+    "taken_at": "2026-11-14T05:46:06Z",
+    "clones_14d": 12654,
+    "unique_clones_14d": 700,
+    "views_14d": 1478,
+    "unique_views_14d": 1225
   }
 }
