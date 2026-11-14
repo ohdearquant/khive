@@ -133,7 +133,12 @@ async fn claimed_entity_reindex_preserves_newer_vector_publication() {
         .expect("both publication barriers and the intervening update complete");
     assert_eq!(vector_blob(&rt, winner.id).await, vector);
     assert_eq!(claimed_vector_state(&rt, winner.id).await, log);
-    assert_eq!(rt.get_entity(&token, winner.id).await.unwrap(), winner);
+    let stored = rt.get_entity(&token, winner.id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
     assert!(pending(&rt, winner.id).await.is_none());
     let error = stale.expect_err("the captured vector cannot replace the newer revision");
     assert!(
@@ -157,7 +162,12 @@ async fn claimed_entity_reindex_preserves_newer_vector_publication() {
     );
     rt.reindex_claimed_entity(&token, &winner).await.unwrap();
     assert_eq!(vector_blob(&rt, winner.id).await, vector);
-    assert_eq!(rt.get_entity(&token, winner.id).await.unwrap(), winner);
+    let stored = rt.get_entity(&token, winner.id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
     assert!(pending(&rt, winner.id).await.is_none());
 }
 
@@ -210,7 +220,12 @@ async fn claimed_entity_vector_failure_preserves_row_and_allows_retry() {
         error.to_string().contains(&entity.id.to_string()),
         "{error}"
     );
-    assert_eq!(rt.get_entity(&token, entity.id).await.unwrap(), entity);
+    let stored = rt.get_entity(&token, entity.id).await.unwrap();
+    assert_eq!(stored.properties, entity.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&entity).unwrap()
+    );
     assert!(rt
         .text(&token)
         .unwrap()
@@ -223,7 +238,12 @@ async fn claimed_entity_vector_failure_preserves_row_and_allows_retry() {
         vector_blob(&rt, entity.id).await,
         khive_storage::encode_f32_native(&[entity.name.len() as f32; 4])
     );
-    assert_eq!(rt.get_entity(&token, entity.id).await.unwrap(), entity);
+    let stored = rt.get_entity(&token, entity.id).await.unwrap();
+    assert_eq!(stored.properties, entity.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&entity).unwrap()
+    );
     assert!(pending(&rt, entity.id).await.is_none());
 }
 

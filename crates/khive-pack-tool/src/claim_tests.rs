@@ -127,12 +127,22 @@ async fn unchanged_registration_cannot_overwrite_newer_search_document() {
         error.to_string().contains("changed concurrently"),
         "{error}"
     );
-    assert_eq!(rt.get_entity(&token, id).await.unwrap(), winner);
+    let stored = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
     let retry = register(&rt, &token, json!({"name":"indexed tool"}))
         .await
         .unwrap();
     assert_eq!(retry["unchanged"], true);
-    assert_eq!(rt.get_entity(&token, id).await.unwrap(), winner);
+    let stored = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
     assert_eq!(
         serde_json::to_value(
             text.get_document(token.namespace().as_str(), id)
