@@ -48,6 +48,35 @@ proven for session recall once a key is configured and the same `key` is replaye
 | `source_id`    | uuid   | none                             | Entity or note this memory annotates                                      |
 | `key`          | string | none                             | Stable identity for an exact keyed replay                                 |
 
+### Reserved properties
+
+The `properties` object stores caller metadata. These names are reserved; use
+the replacement below instead of placing them inside `properties`.
+
+| Reserved name | Replacement                                                                                                                      |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `memory_type` | use the top-level `memory_type` parameter                                                                                        |
+| `tags`        | use the top-level `tags` parameter                                                                                               |
+| `attribution` | omit `attribution`; the runtime sets it for anonymous callers                                                                    |
+| `supersedes`  | use a `memory.apply_batch` row with `action="supersede"`, or `link(relation="supersedes")` from the new memory to the old memory |
+
+For two existing memory rows, link the new memory to the old memory using the
+new memory's namespace, which the caller must be allowed to write:
+
+```text
+link(
+    source_id="<new_memory_id>",
+    target_id="<old_memory_id>",
+    relation="supersedes",
+    namespace="<new_memory_namespace>"
+)
+```
+
+The old memory stays stored. `memory.apply_batch` can create the replacement and
+its edge together using a `supersede` row; its default `dry_run=true` previews
+the requested writes. See [batch memory rewrites](../adr/ADR-021-memory-pack.md#amendment-batch-apply-for-memory-rewrites-2026-11-02)
+for the row fields and validation rules.
+
 ### Salience calibration
 
 Salience determines how prominently a memory surfaces during recall. Use these

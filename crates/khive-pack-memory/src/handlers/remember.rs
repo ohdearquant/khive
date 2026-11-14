@@ -55,17 +55,20 @@ const MAX_PROPERTY_KEYS: usize = 32;
 const MAX_PROPERTY_KEY_CHARS: usize = 64;
 /// Largest accepted serialized `properties` object, in bytes.
 const MAX_PROPERTIES_BYTES: usize = 8192;
-/// Keys a caller may not set through `properties`, each with the reason its
-/// refusal gives: `memory_type` and `tags` have their own parameters,
-/// `attribution` is written by the runtime, and `supersedes` is written by
-/// `memory.apply_batch` (recall hides the row it names).
+/// Keys a caller may not set through `properties`, each with the replacement
+/// its refusal names. `docs/guide/memory.md` lists the same pairs, and
+/// `memory_guide_reserved_properties_match_handler` keeps the two equal.
+/// `supersedes` is reserved because recall hides the row it names.
 const RESERVED_PROPERTY_KEYS: [(&str, &str); 4] = [
-    ("memory_type", "memory_type has its own parameter"),
-    ("tags", "tags has its own parameter"),
-    ("attribution", "attribution is written by the runtime"),
+    ("memory_type", "use the top-level memory_type parameter"),
+    ("tags", "use the top-level tags parameter"),
+    (
+        "attribution",
+        "omit attribution; the runtime sets it for anonymous callers",
+    ),
     (
         "supersedes",
-        "supersedes is written by memory.apply_batch; use link(relation=\"supersedes\") to add a supersedes edge",
+        "use a memory.apply_batch row with action=\"supersede\", or link(relation=\"supersedes\") from the new memory to the old memory",
     ),
 ];
 
