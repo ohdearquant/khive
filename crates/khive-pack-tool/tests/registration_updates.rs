@@ -348,3 +348,439 @@ async fn existing_legacy_registration_keeps_its_minted_id_when_updated() {
     );
     assert_eq!(f.call("tool.list", json!({})).await["count"], 1);
 }
+
+fn registration_identity(actor: &str) -> khive_runtime::RequestIdentity {
+    khive_runtime::RequestIdentity {
+        namespace: "local".into(),
+        actor_id: Some(actor.into()),
+        visible_namespaces: Vec::new(),
+        owned_namespaces: Vec::new(),
+        process_ref: None,
+        request_id: None,
+    }
+}
+
+impl Fixture {
+    async fn register_as(&self, actor: &str, params: Value) -> Value {
+        self.registry
+            .dispatch_with_identity("tool.register", params, Some(registration_identity(actor)))
+            .await
+            .unwrap()
+    }
+
+    async fn registration_events(&self, id: Uuid) -> Vec<khive_storage::Event> {
+        let token = self.runtime.authorize(Namespace::local()).unwrap();
+        let store = self.runtime.events(&token).unwrap();
+        let filter = khive_storage::EventFilter {
+            target_id: Some(id),
+            kinds: vec![khive_types::EventKind::ToolRegistrationChanged],
+            ..Default::default()
+        };
+        let page = store
+            .query_events(
+                filter.clone(),
+                khive_storage::PageRequest {
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_events(filter).await.unwrap(),
+            page.items.len() as u64
+        );
+        let mut events = page.items;
+        events.sort_by_key(|event| event.id);
+        events
+    }
+
+    async fn registration_state(&self) -> Value {
+        let mut reader = self.runtime.sql().reader().await.unwrap();
+        let mut state = serde_json::Map::new();
+        for table in [
+            "entities",
+            "graph_edges",
+            "events",
+            "tool_policy",
+            "tool_grants",
+        ] {
+            let rows = reader
+                .query_all(khive_storage::SqlStatement::new(
+                    format!("SELECT * FROM {table} ORDER BY id"),
+                    Vec::new(),
+                ))
+                .await
+                .unwrap();
+            state.insert(table.into(), serde_json::to_value(rows).unwrap());
+        }
+        Value::Object(state)
+    }
+}
+
+#[tokio::test]
+async fn register_digest_input_change_appends_one_registration_changed_event() {
+    let f = Fixture::new();
+    let first = f
+        .register_as(
+            "registrar-a",
+            json!({
+                "name": "eventful", "source": "mcp:original", "side_effect": "read",
+                "trust": "first_party", "schema": {"type": "object"}
+            }),
+        )
+        .await;
+    let id = &first["tool"]["full_id"];
+    let original = f.row(id).await;
+    assert!(f.registration_events(original.id).await.is_empty());
+    let token = f.runtime.authorize(Namespace::local()).unwrap();
+    let created = f
+        .runtime
+        .events(&token)
+        .unwrap()
+        .query_events(
+            khive_storage::EventFilter {
+                target_id: Some(original.id),
+                kinds: vec![khive_types::EventKind::EntityCreated],
+                ..Default::default()
+            },
+            khive_storage::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.items.len(), 1);
+    assert_eq!(created.items[0].actor, "actor:registrar-a");
+
+    for fields in [
+        json!({"source": "mcp:replacement"}),
+        json!({"side_effect": "egress"}),
+        json!({"trust": "marketplace"}),
+        json!({"schema": {"type": "object", "properties": {"query": {"type": "string"}}}}),
+        json!({"source": "mcp:combined", "side_effect": "write", "trust": "first_party", "schema": {}}),
+    ] {
+        let before = f.row(id).await;
+        let prior = f.registration_events(original.id).await;
+        let mut params = fields;
+        params["name"] = json!("eventful");
+        let response = f.register_as("registrar-b", params).await;
+        assert_outcome(&response, false, true, false);
+        let after = f.row(id).await;
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.created_at, original.created_at);
+        let events = f.registration_events(original.id).await;
+        assert_eq!(
+            events.len(),
+            prior.len() + 1,
+            "one event per corrected registration"
+        );
+        let added: Vec<_> = events
+            .iter()
+            .filter(|event| !prior.iter().any(|old| old.id == event.id))
+            .collect();
+        assert_eq!(added.len(), 1);
+        let event = added[0];
+        let before_pin = RegistryPin::from_entity(&before).unwrap();
+        let after_pin = RegistryPin::from_entity(&after).unwrap();
+        assert_ne!(
+            before_pin.definition_digest(),
+            after_pin.definition_digest()
+        );
+        assert_eq!(event.namespace, "local");
+        assert_eq!(event.actor, "actor:registrar-b");
+        assert_ne!(event.actor, created.items[0].actor);
+        assert_eq!(event.verb, "tool.register");
+        assert_eq!(event.substrate, khive_types::SubstrateKind::Event);
+        assert_eq!(event.outcome, khive_types::EventOutcome::Success);
+        assert_eq!(event.target_id, Some(original.id));
+        assert_eq!(
+            event.payload,
+            json!({
+                "actor": event.actor, "id": original.id.to_string(),
+                "digest_before": before_pin.definition_digest(),
+                "digest_after": after_pin.definition_digest(),
+            })
+        );
+    }
+
+    let events = f.registration_events(original.id).await;
+    for fields in [
+        json!({"description": "metadata-only searchable description"}),
+        json!({"kind": "skill", "tags": ["metadata-tag"]}),
+        json!({"capabilities": ["new-capability"]}),
+        json!({"source": "mcp:combined", "side_effect": "write", "trust": "first_party", "schema": {}}),
+        json!({"source": null, "side_effect": null, "trust": null, "schema": null}),
+        json!({}),
+    ] {
+        let mut params = fields;
+        params["name"] = json!("eventful");
+        f.register_as("registrar-b", params).await;
+        assert_eq!(f.registration_events(original.id).await, events);
+    }
+    let final_row = f.row(id).await;
+    assert_eq!(
+        final_row.description.as_deref(),
+        Some("metadata-only searchable description")
+    );
+    assert!(final_row.tags.iter().any(|tag| tag == "metadata-tag"));
+    assert_eq!(
+        f.describe("eventful").await["capabilities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let listed = f
+        .call(
+            "list",
+            json!({
+                "kind": "event", "event_kinds": ["tool_registration_changed"],
+                "verb": "tool.register", "limit": 100
+            }),
+        )
+        .await;
+    assert_eq!(listed["has_more"], false);
+    let mut listed_ids: Vec<_> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .collect();
+    listed_ids.sort();
+    assert_eq!(
+        listed_ids,
+        events.iter().map(|event| event.id).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn registration_change_rejects_credential_actor_before_writing() {
+    let f = Fixture::new();
+    let first = f
+        .register_as(
+            "safe",
+            json!({"name": "credential-actor", "source": "mcp:original"}),
+        )
+        .await;
+    let id = &first["tool"]["full_id"];
+    let original = f.row(id).await;
+    let before = f.registration_state().await;
+    let secret = format!("{}{}", ["gh", "p_"].concat(), "A".repeat(36));
+    assert!(khive_runtime::secret_gate::check_at(
+        &format!("actor:{secret}"),
+        "tool.register",
+        "actor"
+    )
+    .is_err());
+    let error = f.registry.dispatch_with_identity(
+        "tool.register", json!({"name": "credential-actor", "source": "mcp:refused", "capabilities": ["must-not-link"]}),
+        Some(registration_identity(&secret)),
+    ).await.expect_err("credential-bearing actor must refuse before correction");
+    assert!(
+        matches!(error, khive_runtime::RuntimeError::SecretDetected(_)),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(&secret));
+    assert_eq!(f.registration_state().await, before);
+    assert_eq!(
+        serde_json::to_value(f.row(id).await).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    f.register_as(
+        "safe",
+        json!({"name": "credential-actor", "source": "mcp:accepted"}),
+    )
+    .await;
+    assert_eq!(f.registration_events(original.id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn registration_change_event_failure_rolls_back_and_retry_appends_once() {
+    let f = Fixture::new();
+    let first = f
+        .register_as(
+            "registrar",
+            json!({
+                "name": "rollback", "source": "mcp:original", "capabilities": ["retained"]
+            }),
+        )
+        .await;
+    let id = &first["tool"]["full_id"];
+    let original = f.row(id).await;
+    f.call(
+        "tool.policy",
+        json!({"actor": "agent:requester", "tool": "rollback", "decision": "deny"}),
+    )
+    .await;
+    f.call(
+        "tool.request",
+        json!({"actor": "agent:requester", "tool": "rollback"}),
+    )
+    .await;
+    let before = f.registration_state().await;
+    for table in [
+        "entities",
+        "graph_edges",
+        "events",
+        "tool_policy",
+        "tool_grants",
+    ] {
+        assert!(
+            !before[table].as_array().unwrap().is_empty(),
+            "populated {table}"
+        );
+    }
+    let trigger = format!(
+        "CREATE TRIGGER fail_registration_change BEFORE INSERT ON events
+         WHEN NEW.kind = 'tool_registration_changed' AND NEW.target_id = '{}'
+         BEGIN
+           SELECT CASE WHEN (SELECT json_extract(properties, '$.source') FROM entities WHERE id = '{}') = 'mcp:refused'
+             THEN RAISE(ABORT, 'registration_event_after_replacement')
+             ELSE RAISE(ABORT, 'registration_event_before_replacement') END;
+         END;", original.id, original.id
+    );
+    f.runtime
+        .backend()
+        .pool_arc()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|connection| connection.execute_batch(&trigger))
+        .unwrap();
+    let refused = f
+        .registry
+        .dispatch_with_identity(
+            "tool.register",
+            json!({
+                "name": "rollback", "source": "mcp:refused", "capabilities": ["must-not-link"]
+            }),
+            Some(registration_identity("registrar")),
+        )
+        .await;
+    f.runtime
+        .backend()
+        .pool_arc()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_registration_change")
+        })
+        .unwrap();
+    let error = refused.expect_err("required event failure must refuse the replacement");
+    assert!(
+        error
+            .to_string()
+            .contains("registration_event_after_replacement"),
+        "{error}"
+    );
+    assert_eq!(f.registration_state().await, before);
+    assert_eq!(
+        serde_json::to_value(f.row(id).await).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert!(f.registration_events(original.id).await.is_empty());
+    let retry = f
+        .register_as(
+            "registrar",
+            json!({"name": "rollback", "source": "mcp:refused"}),
+        )
+        .await;
+    assert_outcome(&retry, false, true, false);
+    assert_eq!(f.row(id).await.properties.unwrap()["source"], "mcp:refused");
+    assert_eq!(f.registration_events(original.id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn required_registration_event_uses_token_attribution_and_skips_noop() {
+    let f = Fixture::new();
+    let first = f
+        .call(
+            "tool.register",
+            json!({"name": "trusted-boundary", "source": "mcp:old"}),
+        )
+        .await;
+    let id = &first["tool"]["full_id"];
+    let original = f.row(id).await;
+    let token = f.runtime.authorize(Namespace::local()).unwrap();
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+    let mut changed = original.clone();
+    changed.properties.as_mut().unwrap()["source"] = json!("mcp:new");
+    let payload = json!({
+        "actor": actor, "id": original.id.to_string(),
+        "digest_before": RegistryPin::from_entity(&original).unwrap().definition_digest(),
+        "digest_after": RegistryPin::from_entity(&changed).unwrap().definition_digest(),
+    });
+    let event = khive_storage::Event::new(
+        "foreign",
+        "tool.register",
+        khive_types::EventKind::ToolRegistrationChanged,
+        khive_types::SubstrateKind::Event,
+        "forged:actor",
+    )
+    .with_target(original.id)
+    .with_payload(payload.clone());
+    let updated = f
+        .runtime
+        .update_entity_if_unchanged_with_required_event(
+            &token,
+            &original,
+            khive_runtime::EntityPatch {
+                properties: Some(json!({"source": "mcp:new"})),
+                ..Default::default()
+            },
+            &[],
+            event.clone(),
+        )
+        .await
+        .unwrap();
+    let events = f.registration_events(original.id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].namespace, "local");
+    assert_eq!(events[0].actor, actor);
+    assert_eq!(events[0].payload, payload);
+    let stale_event = khive_storage::Event::new(
+        "foreign",
+        "tool.register",
+        khive_types::EventKind::ToolRegistrationChanged,
+        khive_types::SubstrateKind::Event,
+        "forged:actor",
+    )
+    .with_target(original.id)
+    .with_payload(payload);
+    f.runtime
+        .update_entity_if_unchanged_with_required_event(
+            &token,
+            &original,
+            khive_runtime::EntityPatch {
+                properties: Some(json!({"source": "mcp:stale"})),
+                ..Default::default()
+            },
+            &[],
+            stale_event,
+        )
+        .await
+        .expect_err("stale replacement cannot append its event");
+    assert_eq!(f.registration_events(original.id).await, events);
+    assert_eq!(f.row(id).await.properties, updated.properties);
+    assert_eq!(
+        serde_json::to_value(f.row(id).await).unwrap(),
+        serde_json::to_value(&updated).unwrap()
+    );
+    let unchanged = f
+        .runtime
+        .update_entity_if_unchanged_with_required_event(
+            &token,
+            &updated,
+            khive_runtime::EntityPatch::default(),
+            &[],
+            event,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&unchanged).unwrap(),
+        serde_json::to_value(&updated).unwrap()
+    );
+    assert_eq!(f.registration_events(original.id).await, events);
+}

@@ -86,7 +86,7 @@ impl EventSink {
     }
 }
 
-/// Discriminant for the 43 typed event variants produced by the verb dispatch path
+/// Discriminant for the 44 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,6 +103,10 @@ pub enum EventKind {
     SearchExecuted,
     /// A tool-use policy decision was computed by tool.check or exec.run.
     ToolCheckDecided,
+    /// A registration correction changed its canonical grant-policy inputs.
+    /// Retention: `pinned_while_referenced`; the payload/target registry row
+    /// is the referent and its deletion is the terminal condition (ADR-180 A10).
+    ToolRegistrationChanged,
     /// A new directed edge was created between two nodes.
     LinkCreated,
     /// A new entity was created.
@@ -182,13 +186,14 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 43 event kind variants in declaration order.
-    pub const ALL: [Self; 43] = [
+    /// All 44 event kind variants in declaration order.
+    pub const ALL: [Self; 44] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
         Self::SearchExecuted,
         Self::ToolCheckDecided,
+        Self::ToolRegistrationChanged,
         Self::LinkCreated,
         Self::EntityCreated,
         Self::EntityUpdated,
@@ -240,6 +245,7 @@ impl EventKind {
             Self::RerankExecuted => EventSink::CallerEventStore,
             Self::SearchExecuted => EventSink::CallerEventStore,
             Self::ToolCheckDecided => EventSink::CallerEventStore,
+            Self::ToolRegistrationChanged => EventSink::CallerEventStore,
             Self::LinkCreated => EventSink::CallerEventStore,
             Self::EntityCreated => EventSink::CallerEventStore,
             Self::EntityUpdated => EventSink::CallerEventStore,
@@ -289,6 +295,7 @@ impl EventKind {
             Self::RerankExecuted => "rerank_executed",
             Self::SearchExecuted => "search_executed",
             Self::ToolCheckDecided => "tool_check_decided",
+            Self::ToolRegistrationChanged => "tool_registration_changed",
             Self::LinkCreated => "link_created",
             Self::EntityCreated => "entity_created",
             Self::EntityUpdated => "entity_updated",
@@ -343,6 +350,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "rerank_executed",
     "search_executed",
     "tool_check_decided",
+    "tool_registration_changed",
     "link_created",
     "entity_created",
     "entity_updated",
@@ -393,6 +401,7 @@ impl core::str::FromStr for EventKind {
             "rerank_executed" => Ok(Self::RerankExecuted),
             "search_executed" => Ok(Self::SearchExecuted),
             "tool_check_decided" => Ok(Self::ToolCheckDecided),
+            "tool_registration_changed" => Ok(Self::ToolRegistrationChanged),
             "link_created" => Ok(Self::LinkCreated),
             "entity_created" => Ok(Self::EntityCreated),
             "entity_updated" => Ok(Self::EntityUpdated),
@@ -471,6 +480,8 @@ pub enum EventPayload {
     RerankExecuted(RerankExecutedPayload),
     /// Structured payload for a tool-use policy decision.
     ToolCheckDecided(ToolCheckDecidedPayload),
+    /// A registration correction without disclosing the changed field values.
+    ToolRegistrationChanged(ToolRegistrationChangedPayload),
     /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
@@ -500,6 +511,21 @@ pub struct ToolCheckDecidedPayload {
     pub id: Option<String>,
     pub scope: Option<String>,
     pub caller_verb: String,
+}
+
+/// A correction to the four policy inputs covered by a tool registration digest.
+/// Values of the corrected fields are deliberately absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ToolRegistrationChangedPayload {
+    /// Authenticated actor stamped into the event row.
+    pub actor: String,
+    /// Canonical full UUID of the registry row.
+    pub id: String,
+    /// Canonical policy-input digest before the correction.
+    pub digest_before: String,
+    /// Canonical policy-input digest after the correction.
+    pub digest_after: String,
 }
 
 /// Implementation that produced a rerank event (ADR-042 Amendment 1).

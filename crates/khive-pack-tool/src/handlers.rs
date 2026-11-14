@@ -436,6 +436,48 @@ struct RegisterSpec {
     tags: Vec<String>,
 }
 
+fn registration_changed_event(
+    token: &NamespaceToken,
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<Option<khive_storage::Event>, RuntimeError> {
+    let before = RegistryPin::from_entity(existing)?;
+    let mut inputs = crate::pin::registry_policy_inputs(existing);
+    for key in ["source", "side_effect", "trust", "schema"] {
+        if let Some(value) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+        {
+            inputs[key] = value.clone();
+        }
+    }
+    let bytes = khive_types::canonical_json_bytes(&inputs)
+        .map_err(|error| RuntimeError::InvalidInput(format!("tool definition: {error}")))?;
+    let after = RegistryPin::from_canonical_bytes(existing.id, bytes);
+    if before.canonical_bytes() == after.canonical_bytes() {
+        return Ok(None);
+    }
+    let event = khive_runtime::EventAttribution::from_token(token).stamp(
+        khive_storage::Event::new(
+            token.namespace().as_str(),
+            "tool.register",
+            khive_types::EventKind::ToolRegistrationChanged,
+            khive_types::SubstrateKind::Event,
+            "",
+        )
+        .with_target(existing.id),
+    );
+    khive_runtime::secret_gate::check_at(&event.actor, "tool.register", "actor")?;
+    let payload = khive_types::ToolRegistrationChangedPayload {
+        actor: event.actor.clone(),
+        id: existing.id.to_string(),
+        digest_before: before.definition_digest().to_string(),
+        digest_after: after.definition_digest().to_string(),
+    };
+    Ok(Some(event.with_payload(json!(payload))))
+}
+
 fn registration_patch(existing: &Entity, spec: &RegisterSpec, supplied: &Value) -> EntityPatch {
     let present = |field| supplied.get(field).is_some_and(|value| !value.is_null());
     let mut patch = EntityPatch::default();
@@ -586,14 +628,28 @@ async fn register_with_updates(
                 || patch.properties.is_some()
                 || patch.tags.is_some()
             {
+                let required_event = registration_changed_event(token, &entity, &patch)?;
                 #[cfg(test)]
                 if let Ok((ready, resume)) = BEFORE_REGISTRATION_UPDATE.try_with(Clone::clone) {
                     ready.wait().await;
                     resume.notified().await;
                 }
-                entity = rt
-                    .update_entity_if_unchanged(token, &entity, patch, &[])
-                    .await?;
+                entity = match required_event {
+                    Some(event) => {
+                        rt.update_entity_if_unchanged_with_required_event(
+                            token,
+                            &entity,
+                            patch,
+                            &[],
+                            event,
+                        )
+                        .await?
+                    }
+                    None => {
+                        rt.update_entity_if_unchanged(token, &entity, patch, &[])
+                            .await?
+                    }
+                };
                 updated = true;
             }
         }
