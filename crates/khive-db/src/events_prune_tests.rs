@@ -768,7 +768,10 @@ fn receipt_source_and_apply_target_accept_canonical_path_aliases() {
         }
         let backup = fixture.root.join("backup.db");
         let receipt = events_prune::backup(&backup_target, &plan, &backup).unwrap();
-        assert_eq!(receipt.source, backup_target.events_db);
+        assert_eq!(
+            receipt.source,
+            backup_target.events_db.canonicalize().unwrap()
+        );
         let report = events_prune::apply_at(
             &apply_target,
             &fixture.options(&plan.digest, events_prune::receipt_path(&backup), "state"),
