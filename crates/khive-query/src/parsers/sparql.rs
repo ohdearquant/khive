@@ -473,6 +473,7 @@ fn triples_to_ast(
     }
 
     Ok(GqlQuery {
+        order_by: Vec::new(),
         pattern: MatchPattern { elements },
         where_clause: where_conditions,
         return_items,
