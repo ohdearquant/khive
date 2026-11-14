@@ -1741,15 +1741,19 @@ one and a `supersedes` edge, creates a memory, skips a row, or lists it as a del
 before anything is written; a refused row carries a reason and never stops the others. Writes go through the
 `memory.remember` path in the caller's own namespace, keyed `<batch>:<old id>:<part>` (or `<batch>:create:<part>`),
 so re-running a chunk writes only what is missing. An anonymous caller is refused.
+Each `create` row without an `id` needs a distinct `part` within the call. An omitted `part`
+defaults to 1, so multiple creates that omit it share `<batch>:create:1`; all rows with that key
+are refused with `duplicate-key`, even when their content differs. Set distinct parts such as
+1 and 2 to create both memories, and keep those parts on an exact retry to dedupe them.
 Within a call, identical `supersede` payloads apart from `part` preserve all existing keyed replays or, if
 none exist, the earliest new row, and refuse other new rows with `duplicate-payload`, the matched row's
 zero-based index, and its part.
 
-| Param     | Type   | Required | Notes                                                                                                                                                                                                                                   |
-| --------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `batch`   | string | yes      | At most 128 characters; stored on every written row as `properties.batch`.                                                                                                                                                              |
-| `rows`    | array  | yes      | 1 to 200 rows `{id?, part?, action, content?, memory_type?, salience?, properties?, tags?}`; `action` is `supersede`, `create`, `skip` or `delete-candidate`, `part` defaults to 1, and salience above 0.4 needs `properties.verified`. |
-| `dry_run` | bool   | no       | Default true: checks every row and reports the plan without writing. Pass false to write.                                                                                                                                               |
+| Param     | Type   | Required | Notes                                                                                                                                                                                                                                                                                                                                              |
+| --------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `batch`   | string | yes      | At most 128 characters; stored on every written row as `properties.batch`.                                                                                                                                                                                                                                                                         |
+| `rows`    | array  | yes      | 1 to 200 rows `{id?, part?, action, content?, memory_type?, salience?, properties?, tags?}`; `action` is `supersede`, `create`, `skip` or `delete-candidate`. Every no-id `create` needs a distinct `part`; omitted parts default to 1, and all rows sharing a key are refused as `duplicate-key`. Salience above 0.4 needs `properties.verified`. |
+| `dry_run` | bool   | no       | Default true: checks every row and reports the plan without writing. Pass false to write.                                                                                                                                                                                                                                                          |
 
 ```
 request(ops="memory.apply_batch(batch=\"rewrite-1\", rows=[{\"action\": \"skip\", \"id\": \"<uuid>\"}])")
