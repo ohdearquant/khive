@@ -1021,3 +1021,100 @@ The implementation stores `program` in the registry row's existing properties an
 receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
 already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
 new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
+
+## Amendment 9 (2026-11-14): `tool.call` runs a registered tool, and an `mcp:` source runs only through a mount
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent implementation merges.** It adds one
+verb, `tool.call`, adds `tool.call` to the `caller_verb` values of Amendment 6's decision event, and adds counted and
+argument-bound grants. It does not change the status of the base ADR or of earlier amendments. Issues #6589, #6590
+and #6606.
+
+### Problem
+
+The pack decides whether an actor may call a tool, and nothing in it runs one. An agent that finds a tool with
+`tool.suggest` leaves the request, calls the tool through its own client, and depends on a separate hook to ask
+`tool.check` first. The decision and the call happen in two places, so a call cannot sit in a `|` chain and nothing
+records that the decision and the call belong together. An approver can grant a time window and nothing narrower,
+for example one call with one set of arguments.
+
+### Decision
+
+1. **`tool.call(tool, args, timeout_s)`** runs one registered tool for the authenticated caller. It takes no `actor`
+   argument: the actor evaluated is always the caller, so there is no second label to compare. `args` is a JSON
+   object and defaults to empty. The verb is commissive.
+2. **Decision first.** The row is resolved by name in the caller's namespace (Amendments 1 and 5), and the decision is
+   computed by the same tool-policy seam as `tool.check`, which appends Amendment 6's `tool_check_decided` event with
+   `caller_verb` `tool.call`. A `deny` or `ask` refuses the call before anything runs. The error carries the decision
+   object `{decision, source, id}`, so the caller can file `tool.request` with it. An unregistered name is refused
+   with `ask` from `default`, as `tool.check` answers it.
+3. **Dispatch by source**, only after an `allow`:
+   - `khive:<pack>`: the verb whose name is the row's name, dispatched through the verb registry under the caller's
+     identity, so the ADR-018 gate checks it too. A row whose name is `tool.call` is refused, so a call cannot
+     dispatch itself.
+   - `mcp:<server>`: the verb `<server>.<tool>` of the deployment's mount named `<server>`, dispatched the same way.
+     A mount is the deployment's executor for an `mcp:` source: an operator-configured, pinned stdio server whose
+     tools are already ordinary verbs. With no mount of that name, the call is refused, and the error names the
+     server and the `mounts` configuration key. A tool missing from the mount's pinned catalog is refused, and the
+     error names the mount.
+   - `exec:<path>`: refused, and the error names `exec.run`. That verb needs a tree and the sandbox, and it already
+     applies this decision.
+   - `skills:<dir>` and any other source: refused, and the error names the source. A skill is instructions, not a
+     callable.
+4. **Result.** The dispatched verb's result is the op's result, unchanged, so the call chains with `|` and `$prev`.
+   `tool.call` adds no truncation. A limit the dispatched path applies, such as a mount's frame bound, refuses the
+   call with that path's own error, which names the limit. `timeout_s` can shorten the mount's configured timeout
+   for this call and cannot extend it. A value above the configured timeout is refused, and the error names both.
+5. **Record.** Each call that reaches dispatch appends one `tool_called` event: `{actor, tool, registry_id, source,
+   decision_source, decision_id, outcome, error_code}`. It carries neither the arguments nor the result. A refusal at
+   step 2 leaves only the decision event.
+
+**Decision line: khive holds no sign-in for an `mcp:` source.** An `mcp:` tool runs only through a
+deployment-configured mount. A mount's credential is the name of an environment variable, resolved in the daemon's
+environment when the mount starts (the existing mount configuration rule refuses an inline value), and it is never a
+value in the store. Rejected: a khive-held sign-in, such as an OAuth or token record per third-party server. That is a
+store of third-party secrets, and the store takes none. Also rejected: a separate executor table keyed by source
+prefix, with its own command or socket protocol (the sketch in #6590). That would be a second way to start and call
+an external tool server beside mounts, without the mount's pinned catalog and digests. A host that already holds the
+connectors' sign-in can serve as a stdio server and be mounted.
+
+6. **Counted grants.** `tool.grant(id, expires_in_s, uses, note)` takes an optional `uses`, a positive integer. Such a
+   grant is active while it has uses left and has not expired. A call allowed by it consumes one use in the writer
+   transaction that holds the grant by id (Amendment 7), before dispatch, so two concurrent calls cannot both spend
+   the last use. A use spent on a dispatch that then fails is not returned. `tool.check` reports `uses_left` for a
+   counted grant and does not consume a use.
+7. **Argument-bound grants.** `tool.request` takes optional `args`. A grant on a request that carried `args` stores
+   their canonical digest, computed by the same function as the grant digest (Amendment 2), and allows only a
+   `tool.call` whose `args` produce the same digest. Any other arguments get the decision the call would have without
+   that grant. `exec.run` does not consult argument-bound grants, because its arguments are an array after the binary
+   and not this object.
+
+### What this amendment does not change
+
+- A mounted verb stays directly callable as `<server>.<tool>`, and that path does not consult tool policy. A
+  deployment that wants policy on every call refuses those verbs at the ADR-018 gate for the actors concerned, and
+  `tool.call` is then their only path.
+- `tool.check`, `tool.request` and `exec.run` keep their responses, apart from `uses_left` in item 6.
+- The default decision still depends only on `side_effect`. A caller that may not write gets `ask` for a `write` tool
+  and `allow` for a `read` tool, exactly as `tool.check` answers it today.
+
+### Acceptance for Amendment 9
+
+1. A registered `read` tool with source `khive:kg` and name `stats` returns the same result through `tool.call` as a
+   direct `stats()` call, and leaves one decision event (`caller_verb` `tool.call`) and one `tool_called` event, with
+   no arguments or result in either.
+2. A `deny` policy on the tool refuses `tool.call`: the error carries `{decision: deny, source: policy, id}`, nothing
+   is dispatched, and no `tool_called` event exists. Control: the same call with the policy removed dispatches.
+3. A `write` tool with no grant is refused with `ask` from `default`. After `tool.request` and `tool.grant` by another
+   actor, the call dispatches.
+4. An `mcp:` row whose server has no mount is refused, and the error names the server and `mounts`. With a mount of
+   that name, whose pinned catalog holds the tool, the call returns the mounted tool's result. A tool outside the
+   pinned catalog is refused, and the error names the mount.
+5. `exec:` and `skills:` rows are refused, and the errors name `exec.run` and the source.
+6. A row named `tool.call` is refused.
+7. `timeout_s` above the mount's timeout is refused, and the error names both values. A value below it ends the call
+   at the shorter bound.
+8. A grant with `uses=1` allows exactly one call. Of two concurrent calls, one dispatches and the other gets the
+   decision without the grant. `tool.check` before and after reports `uses_left` 1 and 0 and consumes nothing.
+9. A grant on a request that carried `args` allows a call with equal arguments, including keys in another order, and
+   gives a call with different arguments the decision without that grant.
+10. Chaining: `tool.call(...) | get(id=$prev.id)` reads a record the called verb returned.
