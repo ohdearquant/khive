@@ -115,6 +115,11 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// Under `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
 /// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller
 /// opt-out, not a fallback).
+/// In both strict and non-strict mode, a `NoSocket` outcome whose daemon
+/// launch preflight refuses the current configuration returns `Some(Err(..))`
+/// with `reason: "daemon_launch_preflight"` and `not_committed`: a daemon
+/// launched from that configuration would exit before binding, so the
+/// refusal is reported at once instead of after the recovery wait.
 ///
 /// This conservative entry point never replays a fully written frame.
 /// The CLI/MCP policy-aware entry points additionally permit one classified
