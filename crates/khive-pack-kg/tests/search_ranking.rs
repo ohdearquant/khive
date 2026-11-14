@@ -268,3 +268,190 @@ async fn ranking_floor_precedes_time_order_limit_for_entities_and_notes() {
         }
     }
 }
+
+async fn seed_created_record(
+    runtime: &KhiveRuntime,
+    substrate: &str,
+    id: u128,
+    created: i64,
+    fields: (&str, Option<&str>, &str),
+) {
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    if substrate == "entity" {
+        let mut entity = Entity::new("local", fields.0, QUERY);
+        entity.id = Uuid::from_u128(id);
+        entity.created_at = created;
+        entity.updated_at = 10_000_000 - created;
+        entity.entity_type = fields.1.map(str::to_owned);
+        entity.tags = vec![fields.2.into()];
+        entity.properties = Some(json!({"bucket":"range"}));
+        runtime
+            .entities(&token)
+            .unwrap()
+            .upsert_entity(entity.clone())
+            .await
+            .unwrap();
+        runtime
+            .text(&token)
+            .unwrap()
+            .upsert_document(entity_fts_document(&entity))
+            .await
+            .unwrap();
+    } else {
+        let mut note = Note::new("local", fields.0, QUERY);
+        note.id = Uuid::from_u128(id);
+        note.created_at = created;
+        note.updated_at = 10_000_000 - created;
+        note.properties = Some(json!({"bucket":"range", "tags":[fields.2]}));
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        runtime
+            .text_for_notes(&token)
+            .unwrap()
+            .upsert_document(note_fts_document(&note))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn created_range_filters_actual_entity_and_note_search_with_other_filters() {
+    for substrate in ["entity", "note"] {
+        let (runtime, registry) = fixture();
+        let kind = if substrate == "entity" {
+            "concept"
+        } else {
+            "observation"
+        };
+        for id in 1..=5 {
+            seed_created_record(
+                &runtime,
+                substrate,
+                id,
+                id as i64 * 1_000_000,
+                (kind, Some("theorem"), "range"),
+            )
+            .await;
+        }
+        seed_created_record(
+            &runtime,
+            substrate,
+            6,
+            3_000_000,
+            (kind, Some("theorem"), "other"),
+        )
+        .await;
+        seed_created_record(
+            &runtime,
+            substrate,
+            7,
+            3_000_000,
+            (
+                if substrate == "entity" {
+                    "document"
+                } else {
+                    "insight"
+                },
+                None,
+                "range",
+            ),
+        )
+        .await;
+        if substrate == "entity" {
+            seed_created_record(
+                &runtime,
+                substrate,
+                8,
+                3_000_000,
+                (kind, Some("algorithm"), "range"),
+            )
+            .await;
+        }
+        for (after, before, expected) in [
+            (None, None, vec![1, 2, 3, 4, 5]),
+            (Some("1970-01-01T00:00:02Z"), None, vec![2, 3, 4, 5]),
+            (None, Some("1970-01-01T00:00:04Z"), vec![1, 2, 3, 4]),
+            (
+                Some("1970-01-01T00:00:02Z"),
+                Some("1970-01-01T00:00:04Z"),
+                vec![2, 3, 4],
+            ),
+            (
+                Some("1970-01-01T01:00:03+01:00"),
+                Some("1969-12-31T19:00:03-05:00"),
+                vec![3],
+            ),
+            (
+                Some("1970-01-01T00:00:03.000000001Z"),
+                Some("1970-01-01T00:00:03.999999999Z"),
+                vec![],
+            ),
+        ] {
+            for order in ["score", "created_at", "updated_at"] {
+                let mut args = json!({"kind":kind, "query":QUERY, "tags":["range"],
+                    "properties":{"bucket":"range"}, "order_by":order,
+                    "created_after":after, "created_before":before});
+                if substrate == "entity" {
+                    args["entity_type"] = json!("theorem");
+                }
+                let mut ids: Vec<_> = hits(&registry, args)
+                    .await
+                    .iter()
+                    .map(|row| {
+                        Uuid::parse_str(row["id"].as_str().unwrap())
+                            .unwrap()
+                            .as_u128()
+                    })
+                    .collect();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "{substrate}, {order}, {after:?}, {before:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn created_range_widens_candidates_and_filters_before_limit() {
+    for kind in ["entity", "note"] {
+        let (runtime, registry) = fixture();
+        let (high, low) = seed_ranked_pair(&runtime, kind).await;
+        let base = json!({"kind":kind, "query":QUERY, "limit":1});
+        let baseline = hits(&registry, base.clone()).await;
+        assert_eq!(baseline[0]["id"], high.to_string());
+        let mut ranged = base.clone();
+        ranged["created_after"] = json!("1970-01-01T00:00:01.000000001Z");
+        let result = hits(&registry, ranged).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["id"], low.to_string());
+        let mut nulls = base;
+        nulls["created_after"] = Value::Null;
+        nulls["created_before"] = Value::Null;
+        assert_eq!(hits(&registry, nulls).await, baseline);
+    }
+}
+
+#[tokio::test]
+async fn created_range_refuses_invalid_or_overprecise_bounds_before_search() {
+    let (_, registry) = fixture();
+    for fields in [
+        json!({"created_after":"invalid"}),
+        json!({"created_before":42}),
+        json!({"created_after":"1970-01-01T00:00:02Z", "created_before":"1970-01-01T00:00:01Z"}),
+        json!({"created_after":"1970-01-01T00:00:01.0000000001Z"}),
+        json!({"created_before":"1970-01-01T00:00:01.0000000000Z"}),
+        json!({"created_after":"1970-01-01T00:00:01.0000000002Z", "created_before":"1970-01-01T00:00:01.0000000001Z"}),
+    ] {
+        let mut args = json!({"kind":"entity", "query":QUERY});
+        args.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let parsed = ValidatedSearchRequest::from_value(args.clone(), &registry).unwrap_err();
+        assert!(matches!(parsed, RuntimeError::InvalidInput(_)));
+        let dispatched = registry.dispatch("search", args).await.unwrap_err();
+        assert_eq!(dispatched.to_string(), parsed.to_string());
+    }
+}
