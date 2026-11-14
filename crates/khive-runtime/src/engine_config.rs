@@ -705,6 +705,25 @@ pub struct KnowledgeSectionConfig {
     pub import_roots: Vec<std::path::PathBuf>,
 }
 
+/// Whether an `https://` remote entry names exactly one repository: a host and at
+/// least an owner and a repository segment, with no empty segment, wildcard, query or
+/// fragment. An entry matches only the repository it names, so an owner-level entry
+/// would admit nothing and a pattern would read as wider than it is; both are refused.
+fn names_one_repository(remote: &str) -> bool {
+    let Some(rest) = remote.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.contains(['*', '?', '#', '[', ']']) {
+        return false;
+    }
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or("");
+    let path: Vec<&str> = segments.collect();
+    !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
+}
+
 /// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
 /// lists refuse every source of that kind.
 ///
@@ -2090,6 +2109,20 @@ impl KhiveConfig {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "git_digest.remotes".to_owned(),
                 reason: format!("{remote:?} is not an https:// URL"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !names_one_repository(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!(
+                    "{remote:?} does not name one repository: an entry is a full https://host/owner/repo URL, \
+                     never an owner, a host or a pattern"
+                ),
             });
         }
 

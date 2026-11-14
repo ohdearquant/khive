@@ -3190,8 +3190,10 @@ request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 The verb reads only the sources the config's `[git_digest]` section names. A local path is
 resolved, symlinks included, and must lie under a resolved `local_roots` entry; a remote must
 name the same repository as a `remotes` entry once the trailing `/` and `.git` are removed and
-the host is lowercased. Both lists are empty by default, which refuses every source. Every
-source outside the lists gives one message, `source ... is not a configured git.digest source`,
+the host is lowercased. Each `remotes` entry is a full `https://host/owner/repo` URL and admits
+only that repository; configuration validation refuses an owner, a host or a pattern. Both
+lists are empty by default, which refuses every source. Every source outside the lists gives one
+message, `source ... is not a configured git.digest source`,
 and that check runs before the path is read.
 
 ```toml

@@ -2978,7 +2978,7 @@ fn knowledge_import_roots_parse_closed_and_absolute() {
 #[test]
 fn git_digest_sources_parse_closed_and_checked() {
     let parsed: KhiveConfig = toml::from_str(
-        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/a\"]\n",
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/org/a\"]\n",
     )
     .unwrap();
     parsed
@@ -3004,6 +3004,38 @@ fn git_digest_sources_parse_closed_and_checked() {
         toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
     let error = ssh.validate().expect_err("a non-https remote is refused");
     assert!(error.to_string().contains("git_digest.remotes"), "{error}");
+
+    for broad in [
+        "https://github.com/ohdearquant",
+        "https://github.com/ohdearquant/",
+        "https://github.com",
+        "https://github.com/ohdearquant/*",
+        "https://github.com/*/khive",
+        "https://github.com//khive",
+        "https://github.com/ohdearquant/khive?all",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{broad:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry naming more or less than one repository is refused");
+        assert!(
+            error.to_string().contains("does not name one repository"),
+            "{broad}: {error}"
+        );
+    }
+    for exact in [
+        "https://github.com/ohdearquant/khive",
+        "https://github.com/ohdearquant/khive.git",
+        "https://github.com/ohdearquant/khive/",
+        "https://gitlab.example/group/subgroup/repo",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{exact:?}]\n")).unwrap();
+        parsed
+            .validate()
+            .unwrap_or_else(|error| panic!("{exact} names one repository: {error}"));
+    }
 }
 
 #[test]
