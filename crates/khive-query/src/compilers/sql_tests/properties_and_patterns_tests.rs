@@ -84,8 +84,13 @@ fn compile_rejects_bare_properties_where_field() {
 
 #[test]
 fn where_json_path_rejects_empty_hand_built_path() {
-    let err = where_property_expression(&PropertyRef::JsonPath(Vec::new()), &VarKind::Node, "n0")
-        .unwrap_err();
+    let err = where_property_expression(
+        &PropertyRef::JsonPath(Vec::new()),
+        &VarKind::Node,
+        "n0",
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, QueryError::Compile(ref msg) if msg.contains("cannot be empty")),
         "got {err:?}"
@@ -98,6 +103,7 @@ fn where_json_path_rejects_injection_shaped_hand_built_segment() {
         &PropertyRef::JsonPath(vec!["severity') OR 1=1 --".into()]),
         &VarKind::Node,
         "n0",
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(
@@ -114,6 +120,7 @@ fn where_json_path_rejects_edge_and_event_bindings() {
             &PropertyRef::JsonPath(vec!["severity".into()]),
             &kind,
             "bound",
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
