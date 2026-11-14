@@ -215,6 +215,16 @@ pub(super) async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
+                project_annotation_census::append_existing_note_warning(
+                    runtime,
+                    token,
+                    project_id,
+                    "pull_request",
+                    masked.number,
+                    existing,
+                    report,
+                )
+                .await;
                 if !cursor_stalled
                     && !checkpoint.acknowledge(
                         masked.number,
@@ -492,6 +502,16 @@ pub(super) async fn ingest_issues(
                 find_by_number(runtime, token, "issue", project_id, masked.number).await?
             {
                 report.issues_skipped_existing += 1;
+                project_annotation_census::append_existing_note_warning(
+                    runtime,
+                    token,
+                    project_id,
+                    "issue",
+                    masked.number,
+                    existing,
+                    report,
+                )
+                .await;
                 if !cursor_stalled
                     && !checkpoint.acknowledge(
                         masked.number,
