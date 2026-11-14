@@ -396,7 +396,7 @@ impl CallerFixture {
             .arg("--config")
             .arg(&self.config)
             .args(["--actor", "actor:events-preflight"])
-            .env("KHIVE_NO_EMBED", "1")
+            .env("KHIVE_NO_EMBED", "true")
             .env("KHIVE_PACKS", "kg")
             .env("KHIVE_RECOVERER_LOCK", self.root.join("recoverer.lock"))
             .env("KHIVE_SUPERVISOR_MARKER", self.root.join("supervisor"));
@@ -437,7 +437,7 @@ async fn public_forwarders_refuse_socket_length_without_recovery_time() {
                 .env_remove("LATTICE_MODEL_CACHE")
                 .env("HOME", directory.path().join("home"))
                 .env("KHIVE_TEST_HARNESS", "1")
-                .env("KHIVE_NO_EMBED", "1")
+                .env("KHIVE_NO_EMBED", "true")
                 .current_dir(directory.path());
             private = Some(directory);
         },
