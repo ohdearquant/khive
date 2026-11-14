@@ -667,11 +667,11 @@ async fn multi_backend_search_forwards_the_complete_validated_filter_contract() 
 
     for (ops, expected_substrate) in [
         (
-            r#"search(kind="concept", query="typed entity", limit=4, entity_kind="concept", entity_type="theorem", properties={"tier":"hot"}, tags=["reviewed"], min_score=0.25)"#,
+            r#"search(kind="concept", query="typed entity", limit=4, entity_kind="concept", entity_type="theorem", properties={"tier":"hot"}, tags=["reviewed"], min_score=0.25, created_after="1970-01-01T00:00:01.000000001Z", created_before="1970-01-01T00:00:02Z")"#,
             SearchSubstrate::Entity,
         ),
         (
-            r#"search(kind="observation", query="typed note", limit=5, note_kind="observation", include_superseded=true, properties={"status":"open"}, tags=["urgent"], min_score=0.5)"#,
+            r#"search(kind="observation", query="typed note", limit=5, note_kind="observation", include_superseded=true, properties={"status":"open"}, tags=["urgent"], min_score=0.5, created_after="1970-01-01T00:00:01.000000001Z", created_before="1970-01-01T00:00:02Z")"#,
             SearchSubstrate::Note,
         ),
     ] {
@@ -696,6 +696,11 @@ async fn multi_backend_search_forwards_the_complete_validated_filter_contract() 
             .clone()
             .expect("coordinator must receive a validated request");
         assert_eq!(captured.substrate(), expected_substrate);
+        assert!(captured.has_created_range());
+        assert!(!captured.matches_created_at(1_000_000));
+        assert!(captured.matches_created_at(1_000_001));
+        assert!(captured.matches_created_at(2_000_000));
+        assert!(!captured.matches_created_at(2_000_001));
         match expected_substrate {
             SearchSubstrate::Entity => {
                 assert_eq!(captured.query(), "typed entity");
@@ -756,6 +761,56 @@ async fn multi_backend_search_rejects_filters_for_the_wrong_substrate() {
                 .contains("only valid when kind resolves"),
             "error must explain the substrate mismatch: {entry}"
         );
+        assert!(!coord
+            .search_called
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn multi_backend_search_created_range_errors_match_handler_and_never_dispatch() {
+    for ops in [
+        r#"search(kind="entity", query="x", created_after="invalid")"#,
+        r#"search(kind="note", query="x", created_before=42)"#,
+        r#"search(kind="entity", query="x", created_after="1970-01-01T00:00:02Z", created_before="1970-01-01T00:00:01Z")"#,
+        r#"search(kind="entity", query="x", created_after="1970-01-01T00:00:01.0000000001Z")"#,
+        r#"search(kind="note", query="x", created_before="1970-01-01T00:00:01.0000000000Z")"#,
+        r#"search(kind="note", query="x", created_after="1970-01-01T00:00:01.0000000002Z", created_before="1970-01-01T00:00:01.0000000001Z")"#,
+    ] {
+        let coord = MockCoordinator::multi_backend();
+        let (registry, _) = make_registry();
+        let handler = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg");
+        let (registry, _) = make_registry();
+        let coordinated = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        let mut errors = Vec::new();
+        for server in [&handler, &coordinated] {
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    plan: None,
+                    ops: ops.into(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("validation remains a per-op failure");
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], false, "{ops}: {entry}");
+            let diagnostic = if ops.contains("created_before=42") {
+                "expected a string"
+            } else {
+                "created_"
+            };
+            assert!(entry["error"].to_string().contains(diagnostic));
+            errors.push(entry["error"].clone());
+        }
+        assert_eq!(errors[0], errors[1], "{ops}");
         assert!(!coord
             .search_called
             .load(std::sync::atomic::Ordering::SeqCst));
