@@ -325,3 +325,108 @@ the much larger `ORDER BY` surface.
   metadata.
 - `crates/khive-pack-kg/src/handlers/graph.rs`: public page-size validation and hard-cap
   enforcement.
+
+## Amendment 1: Edge metadata and bounded GQL ordering (2026-11-14)
+
+**Amendment status**: Proposed
+
+Issue #6594 requires qualified relations to be read in their stored order without fetching
+each edge separately. This amendment supersedes the caller-ordering deferral in Bounded GQL
+result pages, its rationale, and Alternatives Considered. The existing read-only,
+single-database, visibility, depth and page-size boundaries remain in force.
+
+### Metadata references
+
+Canonical edge bindings support `RETURN e.metadata`, projecting the stored JSON text or SQL
+null under `e_metadata`. There is no JSON reserialization or substitution of node properties.
+The existing whole-edge `RETURN e` expansion remains unchanged: fixed-length matches
+return `id`, `source_id`, `target_id`, `relation`, and `weight`; recursive matches return
+the final edge's `id`, `relation`, and `weight`. Metadata requires its explicit projection.
+These are the stored field names; whole fixed-edge output keys use `e_source` and
+`e_target` for the endpoint fields, preserving the existing wire shape.
+
+`WHERE e.metadata.<identifier>[.<identifier>...]` extracts a JSON value from the canonical
+edge's metadata. Every path segment is validated, and the JSON path and comparison values
+are parameters. Existing scalar comparison rules apply: exact integers, finite floats,
+booleans as integers, case-insensitive text equality and LIKE-family predicates, and literal wildcard escaping for
+`CONTAINS` and `STARTS WITH`. Missing and JSON-null leaves yield SQL null. A metadata key
+named `namespace` is ordinary stored data, never a visibility override.
+
+Node metadata, edge properties, bare metadata containers in predicates, unknown fields or
+bindings, and invalid paths fail before SQL execution. Synthetic `observed_as_*` edges do
+not have canonical metadata and reject metadata projection, filtering and ordering. These
+rules do not change their existing observation projections or predicates.
+
+### Ordering grammar and value semantics
+
+GQL gains one optional clause between `RETURN` and `SKIP`/`LIMIT`:
+
+```text
+ORDER BY reference [ASC | DESC] ("," reference [ASC | DESC])*
+reference = variable "." scalar_field
+          | variable ".properties." identifier ("." identifier)*
+          | variable ".metadata." identifier ("." identifier)*
+```
+
+Omitted direction means `ASC`. References must be supported by their bound substrate;
+namespace fields and bare `properties`/`metadata` containers are not order terms. This
+grammar does not admit functions, expressions, aliases, aggregates, SQL fragments, or a
+`NULLS` clause. The new keywords are parsed only in the GQL tail; SPARQL syntax and
+identifiers named `order`, `by`, `asc`, and `desc` retain their existing behavior.
+
+Sort expressions retain SQLite's value types without text casts. Ascending order places
+null before numeric values, then text under BINARY collation, then blobs; descending order
+reverses those groups. JSON booleans become integers, and array/object leaves become JSON
+text through `json_extract`. BINARY text sorting is intentionally distinct from the
+established case-insensitive text predicate semantics.
+
+Requested terms precede the compiler's existing deterministic tie order. Fixed matches
+retain the complete node and edge identity suffix, including substrate discriminators and
+synthetic observation primary keys. Each requested direction affects its term only; it
+does not reverse the identity suffix. Visibility and deletion filters precede sorting,
+sentinel detection, `LIMIT`, and `OFFSET`. Ordering adds no result columns. Continuation
+uses the same query, ordering and page size with the returned `next_offset`; the explicit
+query `LIMIT` remains the total bound across pages. Offset paging does not provide a
+cross-call snapshot when matching data changes.
+
+### Recursive final-edge semantics
+
+For a variable-length path, edge metadata describes the final traversed edge. Both CTE
+arms carry `via_metadata` only when projection, filtering or ordering needs it. A final-edge
+metadata predicate runs after traversal, so metadata on an earlier hop cannot prune a
+path that has a matching final edge. Final-edge and end-node predicates share that phase
+and preserve their boolean grouping. An `OR` crossing start-node and final-row phases
+remains explicitly unsupported; an `AND` can be routed to both phases.
+
+Recursive results retain `DISTINCT`. Each requested sort value must be derivable from the
+actual returned projections, so collapsing identical projected rows cannot leave an
+ambiguous hidden sort value. For example, `RETURN e.metadata ORDER BY e.metadata.order`
+is valid. `RETURN e ORDER BY e.metadata.order` is not: the whole-edge expansion does not
+include metadata. Likewise, a whole-node projection does not implicitly include fields
+absent from its documented expansion. Non-derivable terms return `Unsupported` with
+`variable-length ORDER BY must be derived from RETURN projections`. A returned JSON
+container permits ordering by its named paths. A returned start-node sort value uses the
+start-row join. The requested prefix precedes the existing depth, descending accumulated
+weight, and projected-value tie order, without adding hidden columns to `DISTINCT`.
+
+### Compatibility and acceptance
+
+The shared AST adds `GqlQuery.order_by: Vec<OrderItem>`, typed `OrderDirection::{Asc, Desc}`,
+and `PropertyRef::MetadataPath(Vec<String>)`. Direct Rust AST consumers must initialize
+the new field and accommodate the new variant. SPARQL constructs an empty order list.
+Compilation validates hand-built AST paths and fields as well as parsed input. No storage
+migration, runtime production change, or new dependency is required.
+
+When neither metadata nor ordering is requested, compiled SQL, parameter values and
+indices, and outward result shapes remain unchanged. Conditional CTE metadata carriage
+must preserve both old CTE arms exactly. Acceptance requires actual stored-value and
+canonical query-dispatch tests for raw JSON, mixed scalar types, final-edge predicates,
+ascending/descending order, identity ties, multi-page reconstruction, total limits,
+visibility, unchanged domain state, recursive `DISTINCT`, and typed refusals. Compiler
+tests also cover direct-AST injection attempts, old SQL/parameter compatibility and
+unchanged SPARQL identifiers. Mutation controls must fail observable behavior assertions,
+not merely fail to compile or time out.
+
+Comma-separated `MATCH` patterns remain unsupported under this amendment. Their separate
+design and implementation follow the primary metadata/ordering change; #6594 remains open
+until both parts are delivered.
