@@ -1297,7 +1297,7 @@ old existing-name contract are listed at the end with what happens to each.
 
 ## Amendment 11 (2026-11-14): retiring a tool registration
 
-**Status:** Proposed.
+**Status:** Accepted 2026-11-14 (#6623).
 
 `tool.unregister(tool, namespace)` retires one Tool registry entity in the selected write
 namespace. It accepts the live registry's name, full UUID or unambiguous UUID prefix; the exact
