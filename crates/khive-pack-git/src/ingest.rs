@@ -51,6 +51,10 @@ pub(crate) use commit_history::*;
 #[path = "commit_text_tests.rs"]
 mod commit_text_tests;
 
+/// Content stored when a commit's original fields fail the secret gate.
+pub const REDACTED_COMMIT_MESSAGE: &str =
+    "Commit message was redacted after a secret-gate refusal.";
+
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
 }

@@ -63,9 +63,15 @@ passes retain the conservative
 
 ## Secret-gate refusal accounting
 
-`run_ingest` keeps its established per-record fail-closed/continue behavior: a refused
-`create` does not land and freezes that section's cursor, while clean sibling records are
-still attempted. The result makes that partial outcome mechanically visible through
+`run_ingest` never stores a refused `create` payload. When the refusal is
+`SecretDetected`, it makes one redacted replacement attempt through the same
+gate. A valid replacement receipt allows cursor progress if no earlier record
+stalled the source. Any other unresolved create refusal, or a failed replacement,
+freezes that section's cursor while sibling records are still attempted. Commit
+key conflicts retain their existing reconciliation path: reusing a committed
+winner and completing its missing annotations also permits cursor progress.
+The result makes
+the refusal visible through
 `IngestReport::writes_refused` and `IngestReport::write_refusals`, in addition to the
 human-readable warning. Only `RuntimeError::SecretDetected` increments this counter;
 ordinary validation, storage, and embedding failures remain warnings but are not
@@ -76,6 +82,17 @@ natural key (commit SHA or GitHub number), plus `SecretMatch`'s detector and mas
 excerpt. It never includes the rejected content. Accounting is per ingest call rather
 than process-global daemon telemetry, so a caller can reliably assert
 `writes_refused == 0` even when other digests run concurrently.
+
+A commit replacement uses `REDACTED_COMMIT_MESSAGE` as its content and retains only
+the Git-generated `sha`, `short_sha`, `committed_at`, and `parents` properties.
+It omits `author`, `author_email`, and `changed_paths`: masking alone does not
+guarantee that encoded credentials in those fields will pass the gate. The
+SHA-derived key, project annotations, and parent-edge processing are preserved.
+Issue and pull-request replacements likewise retain their trusted structured
+metadata and replace caller text. The original structured refusal has
+`redacted: false` until a valid replacement receipt is received, then
+`redacted: true`; this is a report field, not a stored note property. A successful
+replacement does not remove or decrement the original refusal.
 
 ## Per-source tri-state and walk exhaustion (issue #1617)
 
@@ -248,7 +265,10 @@ are pruned to the currently fetched page. A cap overflow stops with a stalled
 cursor instead of silently dropping progress. Records acknowledged before an upstream
 edit are still governed by the existing append-only natural-key ingest behavior.
 
-Any per-record failure freezes the saved prefix. Neither later new nor existing
+Any unresolved per-record failure freezes the saved prefix. A successful redacted
+replacement or successful committed-winner reconciliation resolves its create
+refusal for this purpose; a failure that leaves the record unacknowledged does
+not. Neither later new nor existing
 records may advance it or be acknowledged beyond that failure. Publish this stall
 in the report before a fallible checkpoint write. The next pass retries the failed
 record; already-landed later records remain idempotent via natural-key dedupe.
@@ -336,6 +356,9 @@ and go through the typed `GitIngest` permanent mask-only surface backed by the s
 detector `content` already used —
 closing the gap where the commit note `name` (built from the raw subject)
 and its `author`/`author_email` properties skipped masking entirely.
+The create gate still checks the masked result. If it detects a secret, the one
+replacement attempt discards all caller-text properties as well as the original
+message, as described under [Secret-gate refusal accounting](#secret-gate-refusal-accounting).
 
 For `MaskedPrFields`: `number`, `created_at`, `merged_at`, `closed_at`, and
 `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
@@ -410,7 +433,8 @@ allowance are recomputed before every subsequent fetch.
 
 ## `ingest_prs` / `ingest_issues` cursor semantics
 
-`cursor_stalled` mirrors `ingest_commits`: once one record fails to create,
+`cursor_stalled` mirrors `ingest_commits`: once one record remains unwritten after
+its create and any permitted redacted replacement,
 later records in this pass are still attempted (so every failure surfaces
 in this pass's warnings), but `checkpoint.floor` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
@@ -516,12 +540,16 @@ the pair away from the exact path facts that join against ADR-085 modules.
 A merge commit carries one canonical path set: its diff against the first
 parent. Paths that survive the canonical filter are secret-masked, sorted,
 and deduplicated before storage.
-The stored property has exactly three states: `[]` for a genuinely empty
+For commit notes stored without redaction, the property has exactly three states:
+`[]` for a genuinely empty
 commit — and only for one; the canonical remainder array when at least one
 touched path survives the filter; and an omitted `changed_paths` (the hook
 treats it as optional) when the raw touched set was non-empty but every
 path was filtered — the all-filtered third state, whose evidence is the
-run's `changed_paths_filtered_noncanonical` count and bounded warning. A
+run's `changed_paths_filtered_noncanonical` count and bounded warning. A redacted
+replacement always omits `changed_paths`, independently of that filter result;
+the omission does not increment the noncanonical-path counter or claim an empty
+commit. A
 malformed `--name-only` token
 stream fails the phase (retried on the next pass via the cursor contract),
 and a walked commit with no recorded path set is skipped with a warning and
@@ -532,8 +560,8 @@ newest-first, so a header lost mid-stream attaches its record's path tokens
 to that NEWER commit — the commit already walked in the same stream — never
 to an older one. The parser does not guess at path content; containment is
 per-record, not per-stream: the missing sha has no path-set entry, so the
-run warns and stalls the cursor, but the polluted newer commit is created as
-usual — the orphaned tokens ride into its `changed_paths`, and commit notes
+run warns and stalls the cursor, but the polluted newer commit is still attempted.
+If stored without redaction, the orphaned tokens ride into its `changed_paths`, and commit notes
 are immutable, so the pollution persists (a re-ingest skips the stored sha;
 repair requires deleting the note and re-ingesting). At a bounded command
 chunk boundary, a missing first header instead leaves an orphan token and
@@ -568,11 +596,11 @@ inflate the count, and the run's bounded warning names the first skipped
 paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
 creation, or arbitrary winner. A failure to load the module index degrades
 the pass to no module annotation with a warning instead of aborting it,
-because the annotation is best-effort enrichment while `changed_paths` is
-the durable fact. This makes module churn and repeated
+because the annotation is best-effort enrichment while an unredacted note's
+`changed_paths` is the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
-exists.
+exists, except on redacted replacement notes, which omit it.
 
 Commit notes are keyed by SHA within a namespace, while commit checkpoints
 belong to individual projects. When a later project walks an already stored

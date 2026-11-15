@@ -1,4 +1,4 @@
-const REDACTED_COMMIT_MESSAGE: &str = "Commit message was redacted after a secret-gate refusal.";
+use khive_pack_git::ingest::REDACTED_COMMIT_MESSAGE;
 
 fn commit_message_refused_after_field_masking() -> String {
     use khive_runtime::secret_gate::{check, mask_for_redaction_surface, RedactionSurface};
@@ -115,11 +115,11 @@ async fn commit_redaction_preserves_provenance_and_advances_bounded_cursor() {
         .expect("redacted note");
     assert_eq!(note["content"], REDACTED_COMMIT_MESSAGE);
     assert!(note["name"].as_str().unwrap().ends_with(" [redacted]"));
-    assert_eq!(note["properties"]["author"], "Test User");
-    assert_eq!(note["properties"]["author_email"], "test@example.com");
+    assert!(note["properties"].get("author").is_none());
+    assert!(note["properties"].get("author_email").is_none());
     assert_eq!(note["properties"]["committed_at"], committed_at.trim());
     assert_eq!(note["properties"]["parents"], json!([root_sha]));
-    assert_eq!(note["properties"]["changed_paths"], json!(["changed.txt"]));
+    assert!(note["properties"].get("changed_paths").is_none());
     let note_id = note["id"].as_str().unwrap();
     for (direction, sha) in [
         ("incoming", root_sha.as_str()),
@@ -195,6 +195,123 @@ async fn commit_redaction_preserves_provenance_and_advances_bounded_cursor() {
     assert_eq!(replay.commits_ingested, 0);
     assert_eq!(replay.writes_refused, 0);
     assert!(replay.done);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn commit_redaction_drops_encoded_author_properties_and_advances_cursor() {
+    use khive_runtime::secret_gate::{check, mask_for_redaction_surface, RedactionSurface};
+
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project = create(
+        &registry,
+        json!({"kind":"project", "name":"encoded-commit-author"}),
+    )
+    .await;
+    let synthetic = ["AK", "IA", "QWERTYUIOPASDFGH"].concat();
+    let encoded_email = format!(r#""\u0041{}"@example.invalid"#, &synthetic[1..]);
+    assert_eq!(
+        mask_for_redaction_surface(RedactionSurface::GitIngest, &encoded_email),
+        encoded_email,
+        "the encoded author email must survive field masking"
+    );
+    assert!(matches!(
+        check(&encoded_email).expect_err("the gate must decode the synthetic credential"),
+        RuntimeError::SecretDetected(_)
+    ));
+    let message = "Document the author metadata format";
+    check(message).expect("the commit message itself must be safe");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "root.txt", "root\n");
+    commit(repo, &["root.txt"], "Root commit");
+    let root_sha = head_sha(repo);
+    git(repo, &["config", "user.email", &encoded_email]);
+    write(repo, "metadata.txt", "metadata\n");
+    commit(repo, &["metadata.txt"], message);
+    let redacted_sha = head_sha(repo);
+    let metadata = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", "-s", "--format=%ae%n%h%n%cI", &redacted_sha])
+        .output()
+        .expect("read actual commit metadata");
+    assert!(metadata.status.success());
+    let metadata = String::from_utf8(metadata.stdout).expect("metadata UTF-8");
+    let metadata: Vec<_> = metadata.lines().collect();
+    assert_eq!(metadata.len(), 3);
+    assert_eq!(
+        metadata[0], encoded_email,
+        "Git must preserve the fixture email"
+    );
+    git(repo, &["config", "user.email", "test@example.com"]);
+    write(repo, "later.txt", "later\n");
+    commit(repo, &["later.txt"], "Later commit");
+    let final_sha = head_sha(repo);
+
+    let mut opts = IngestOptions::unbounded(repo.to_path_buf(), project.to_string());
+    opts.include = IngestInclude {
+        commits: true,
+        issues: false,
+        pull_requests: false,
+    };
+    opts.max_items = Some(2);
+    let report = run_ingest(&rt, &token, &registry, opts.clone())
+        .await
+        .expect("ingest through the encoded author");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+    assert!(!report.cursor_stalled, "{report:?}");
+    assert_eq!(report.writes_refused, 1, "{report:?}");
+    assert_eq!(report.write_refusals.len(), 1);
+    assert_eq!(report.write_refusals[0].record_key, redacted_sha);
+    assert_eq!(report.write_refusals[0].redacted, Some(true));
+    assert_eq!(
+        read_git_cursor(&rt, project, "commits").await,
+        Some(redacted_sha.clone())
+    );
+    let stored = registry
+        .dispatch(
+            "get",
+            json!({"key":format!("git.commit:{redacted_sha}"), "note_kind":"commit"}),
+        )
+        .await
+        .expect("stored replacement");
+    assert_eq!(stored["content"], REDACTED_COMMIT_MESSAGE);
+    assert!(stored["name"].as_str().unwrap().ends_with(" [redacted]"));
+    assert_eq!(
+        stored["properties"],
+        json!({
+            "sha":redacted_sha, "short_sha":metadata[1],
+            "committed_at":metadata[2], "parents":[root_sha],
+        })
+    );
+    assert!(!stored.to_string().contains(&encoded_email));
+    assert!(!stored.to_string().contains(&synthetic));
+    let notes = registry
+        .dispatch("list", json!({"kind":"commit", "limit":10}))
+        .await
+        .expect("stored commit notes");
+    let ordinary = list_items(&notes)
+        .iter()
+        .find(|note| note["properties"]["sha"] == root_sha)
+        .expect("ordinary root commit");
+    assert_eq!(ordinary["properties"]["author"], "Test User");
+    assert_eq!(ordinary["properties"]["author_email"], "test@example.com");
+    assert_eq!(ordinary["properties"]["changed_paths"], json!(["root.txt"]));
+
+    let resumed = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("resume after the replacement");
+    assert_eq!(resumed.commits_ingested, 1, "{resumed:?}");
+    assert_eq!(resumed.writes_refused, 0);
+    assert!(!resumed.cursor_stalled);
+    assert_eq!(
+        read_git_cursor(&rt, project, "commits").await,
+        Some(final_sha)
+    );
 }
 
 #[tokio::test]

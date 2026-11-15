@@ -528,7 +528,6 @@ pub(super) async fn ingest_commits(
             create_request["embedding_content"] = json!(head);
         }
 
-        const REDACTED_CONTENT: &str = "Commit message was redacted after a secret-gate refusal.";
         let mut redacted_refusal = None;
         let mut stored_content = content.as_str();
         let mut embedding_truncated = embedding_head.is_some();
@@ -540,9 +539,9 @@ pub(super) async fn ingest_commits(
                 record_write_failure(report, "create", "commit", c.sha.clone(), error);
                 report.write_refusals[refusal].redacted = Some(false);
                 redacted_refusal = Some(refusal);
-                // Immutable messages cannot recover on a later pass. Keep the
-                // masked provenance, but never embed or link references from
-                // the refused message. The replacement still passes the gate.
+                // Masking can miss encoded credentials in author or path text.
+                // Drop those properties along with the message; retain only
+                // Git-generated IDs/date and submit the replacement to the gate.
                 crate::dispatch_from_token(
                     registry,
                     token,
@@ -551,8 +550,13 @@ pub(super) async fn ingest_commits(
                         "kind": "commit",
                         "key": format!("git.commit:{}", c.sha),
                         "name": format!("{} [redacted]", masked.short_sha),
-                        "content": REDACTED_CONTENT,
-                        "properties": properties,
+                        "content": REDACTED_COMMIT_MESSAGE,
+                        "properties": {
+                            "sha": masked.sha,
+                            "short_sha": masked.short_sha,
+                            "committed_at": masked.committed_at,
+                            "parents": masked.parents,
+                        },
                         "annotates": annotates.iter().cloned().collect::<Vec<_>>(),
                     }),
                 )
@@ -598,7 +602,7 @@ pub(super) async fn ingest_commits(
                 };
                 if let Some(refusal) = redacted_refusal {
                     report.write_refusals[refusal].redacted = Some(true);
-                    stored_content = REDACTED_CONTENT;
+                    stored_content = REDACTED_COMMIT_MESSAGE;
                     embedding_truncated = false;
                 }
                 (id, created)
@@ -634,13 +638,7 @@ pub(super) async fn ingest_commits(
                 (id, false)
             }
             Err(error) => {
-                let refusal = report.write_refusals.len();
                 record_write_failure(report, "create", "commit", c.sha.clone(), error);
-                if redacted_refusal.is_some() {
-                    if let Some(refusal) = report.write_refusals.get_mut(refusal) {
-                        refusal.redacted = Some(false);
-                    }
-                }
                 stall_cursor(&mut cursor_stalled, report);
                 continue;
             }
