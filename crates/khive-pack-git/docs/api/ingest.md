@@ -61,6 +61,32 @@ git history work remains outside this remote-command bound. Exact-budget
 passes retain the conservative
 `done=false` result; a subsequent pass proves completion.
 
+## Existing issue and pull-request annotations
+
+When a fresh, budgeted by-number lookup finds an existing issue or pull-request
+note, one additional point read checks for its live `annotates` edge to the
+project in the same namespace. A missing edge adds a warning naming the kind,
+number, note UUID and project UUID. This reports the observation without creating,
+restoring or changing an edge. The check revalidates the note's ID, namespace,
+kind, number, project and live state in the same read snapshot as the edge check.
+If that note no longer matches, or the read fails, a distinct annotation-check
+unavailable warning is emitted; storage details use the ingest secret masker.
+
+These warnings cover actual lookup hits, not every fetched record. An exact
+checkpoint acknowledgment still replays without lookup, annotation check or visit
+budget consumption. Notes outside the fetched window and acknowledged replays
+retain only the separate historical census coverage: the lowest 1,000 live
+project issue/PR note IDs, with at most 20 missing IDs displayed. Lookup warnings
+do not change that census's count, sample, completeness or scanned count and are
+not a global unique-note count.
+
+The point checks fit within the existing fresh-visit budget; an administrative
+call with `max_items=None` remains unbounded. Skipped-existing counts, checkpoint
+advancement, source status and completion semantics are unchanged. In particular,
+`done=true` can coexist with a missing or unavailable annotation warning: it
+describes the ingest walk, not graph integrity. The complete warnings array is
+also preserved in the durable `git.digest` receipt's result.
+
 ## Secret-gate refusal accounting
 
 `run_ingest` keeps its established per-record fail-closed/continue behavior: a refused
