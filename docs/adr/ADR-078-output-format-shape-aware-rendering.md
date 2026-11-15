@@ -661,8 +661,8 @@ scope-appropriate reduction policy is applied directly to those values.
 
 ## Amendment 4 (2026-11-15): explicit row fields and compact recall
 
-**Amendment status**: Proposed. This amendment preserves the status and history of
-the preceding decisions and amendments.
+**Amendment status**: Accepted 2026-11-15 (#6711). This amendment preserves the status
+and history of the preceding decisions and amendments.
 
 ### Explicit row projection
 
