@@ -342,6 +342,8 @@ Amendments whose own status reads accepted, independently of the record's header
 
 ## Proposed amendments
 
+- [ADR-056 amendment: Telegram inbound poll heartbeat](ADR-056-channel-transport-layer.md#amendment-2026-11-15----telegram-inbound-poll-heartbeat) (2026-11-15): Accepted. Completed poll observations and elapsed no-success age without changing offset or retry behavior (#6534).
+
 Amendments whose own status reads Proposed. Each needs the sign-off described under [ADR lifecycle](#adr-lifecycle) before it binds. Where this list and an amendment's own status line disagree, the status line is authoritative.
 
 Amendments to accepted records:
