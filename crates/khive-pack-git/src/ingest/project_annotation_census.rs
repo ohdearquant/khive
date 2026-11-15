@@ -2,6 +2,13 @@ use super::*;
 
 const NOTE_LIMIT: usize = 1000;
 const NOTE_ID_LIMIT: usize = 20;
+const EXISTING_WARNING_LIMIT: u64 = 20;
+fn append_existing_diagnostic(report: &mut IngestReport, detail: impl FnOnce() -> String) {
+    report.existing_project_annotation_warning_count += 1;
+    if report.existing_project_annotation_warning_count <= EXISTING_WARNING_LIMIT {
+        report.warnings.push(detail());
+    }
+}
 
 pub(super) async fn append_existing_note_warning(
     runtime: &KhiveRuntime,
@@ -16,15 +23,19 @@ pub(super) async fn append_existing_note_warning(
         .await
     {
         Ok(false) => {}
-        Ok(true) => report.warnings.push(format!(
+        Ok(true) => append_existing_diagnostic(report, || {
+            format!(
             "existing {kind} #{number} note {note_id} is missing a live project annotation to {project_id}"
-        )),
+        )
+        }),
         Err(error) => {
-            let detail = error.to_string();
-            report.warnings.push(format!(
-                "existing {kind} #{number} note {note_id} project annotation check unavailable: {}",
-                mask_git_ingest(&detail)
-            ));
+            append_existing_diagnostic(report, || {
+                let detail = error.to_string();
+                format!(
+                    "existing {kind} #{number} note {note_id} project annotation check unavailable: {}",
+                    mask_git_ingest(&detail)
+                )
+            });
         }
     }
 }
@@ -434,6 +445,7 @@ mod tests {
                 };
                 let mut expected = serde_json::to_value(&report).unwrap();
                 if case != "linked" {
+                    expected["existing_project_annotation_warning_count"] = json!(1);
                     expected["warnings"] = json!([format!(
                         "existing {kind} #{number} note {note_id} is missing a live project annotation to {project_id}"
                     )]);
@@ -526,6 +538,7 @@ mod tests {
                     ..IngestReport::default()
                 };
                 let mut expected = serde_json::to_value(&report).unwrap();
+                expected["existing_project_annotation_warning_count"] = json!(1);
                 expected["warnings"] = json!([format!(
                     "existing {kind} #{number} note {note_id} project annotation check unavailable: existing note changed"
                 )]);
@@ -628,6 +641,7 @@ mod tests {
         })
         .unwrap();
         expected["warnings"] = json!(unavailable.warnings);
+        expected["existing_project_annotation_warning_count"] = json!(1);
         assert_eq!(serde_json::to_value(&unavailable).unwrap(), expected);
         runtime
             .sql()

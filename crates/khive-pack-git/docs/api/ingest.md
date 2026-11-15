@@ -80,7 +80,22 @@ project issue/PR note IDs, with at most 20 missing IDs displayed. Lookup warning
 do not change that census's count, sample, completeness or scanned count and are
 not a global unique-note count.
 
-The point checks fit within the existing fresh-visit budget; an administrative
+`existing_project_annotation_warning_count` counts observed missing or unavailable
+checks from fresh lookup hits, across issues and pull requests. Only the first
+**20 corresponding detail strings**, in encounter order, are retained in
+`warnings`. The count continues after that cap and is always serialized, including
+zero. A count greater than the number of retained existing-note details means
+details were omitted; compare against this category's details, not the length of
+the heterogeneous `warnings` array. Successful live-edge checks contribute neither
+a detail nor a count. Unrelated warnings remain unchanged, so the cap bounds
+these details, not every warning or the whole receipt size. This is neither a
+unique-note count nor a global total of missing annotations. The complete returned
+report, including this count and retained details, is copied into the new durable
+receipt. Existing receipts retain their original result and are never rewritten
+to add this field or reflect later graph changes.
+
+Public `git.digest` defaults an omitted `max_items` to 500 and caps explicit values
+at 2,000. The point checks fit within that existing fresh-visit budget; an administrative
 call with `max_items=None` remains unbounded. Skipped-existing counts, checkpoint
 advancement, source status and completion semantics are unchanged. In particular,
 `done=true` can coexist with a missing or unavailable annotation warning: it
