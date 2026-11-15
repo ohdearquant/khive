@@ -24,7 +24,7 @@ adds `memory.apply_batch`, and its
 declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
 **Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
 the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
-`memory.remember` reserves the `supersedes` property (#6386; accepted 2026-11-14, #6390).
+`memory.remember` reserves the `supersedes` property (#6386; accepted 2026-11-15, #6390).
 **Amended**: 2026-11-04, [Delta 3](#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04) of
 the batch-apply amendment: an edge between two memory rows is written in the source row's namespace by every verb,
 and edge reads report how many such edges they left out (#6380; accepted 2026-11-05, except the amendment to rule
@@ -1014,7 +1014,7 @@ carrying no owned namespaces.
 
 ### Delta 2: supersedes reads cover the namespaces the reader can see (2026-11-03)
 
-**Status**: Accepted 2026-11-14 (Proposed 2026-11-03), implemented by #6390. Changes how recall's supersedes
+**Status**: Accepted 2026-11-15 (Proposed 2026-11-03), implemented by #6390. Changes how recall's supersedes
 suppression (Decision 7) reads, and the reserved
 `properties` keys of the 2026-11-01 amendment.
 
