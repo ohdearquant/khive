@@ -638,6 +638,13 @@ Amendment 3's separate requirement for unverifiable external IDs is unchanged.
 It does not create an ADR-105 sender transport record or map SMTP uncertainty to
 verified recipient storage.
 
+The outbound channel health summary counts an undelivered row only when it has no
+`delivery_hold`, so a held row of either kind is absent from that backlog count.
+For held rows, the Consequences line "every outbound email reaches a terminal
+recorded state or is visibly pending" therefore reads as "or carries a visible
+hold on its own properties". Counting held rows in channel health is tracked with
+the release path in #6676.
+
 There is currently no supported operator verb that clears `delivery_hold` and
 returns the held note to automatic outbox selection. In particular,
 `update(id="<outbound-note-UUID>", properties={"delivery_hold": null})` is refused:
