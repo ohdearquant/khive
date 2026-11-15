@@ -896,15 +896,30 @@ left to the plain link path:
 `SupersedeEntity` is entity-level supersession. At `propose`, both `old` and `new`
 must name live entities, including inside a `Compound` at any nesting depth. An
 operand that does not name a live entity is refused before proposal history is
-written, with a typed `NotFound` error naming the ID and stating that it does not
-name a live entity. The check uses the existing by-ID entity lookup on the selected
-runtime, without adding a namespace restriction.
+written, with a typed `NotFound` error whose detail is
+`{id} does not name a live entity: {runtime NotFound detail}`. The existing by-ID
+entity lookup on the selected runtime supplies that detail, without adding a
+namespace restriction. A merged-away operand therefore retains the kept ID and
+the instruction to query it; the proposal neither follows that redirect nor
+changes its stored operands.
 
-Once the translation specified by the 2026-11-14 compound amendment is implemented,
-an entity created by an earlier `AddEntity` step also satisfies this precondition.
-A note create, a forward reference or an unknown ID does not. This qualification
-does not itself enable compound translation or change the application of stored
-proposals.
+Apply preparation repeats this entity-only check for both operands before
+preparing the `new` → `old` supersedes link, including for stored proposals. A
+refusal produces the existing failed-apply outcome with zero applied steps and
+no domain writes. The existing generic link guard checks endpoint liveness again
+inside the writer transaction. Entity identity is checked during preparation;
+this is not an entity-only transactional guard against a trusted store creating
+a different substrate with the same UUID.
+
+Once the translation specified by C1/C2 of the Proposed 2026-11-14 compound
+amendment is implemented, an entity created by an earlier `AddEntity` step also
+satisfies this precondition. C2's optional caller-given full UUID lets a later
+step name that create. The ordered C1 translator tracks prior create IDs and
+kinds, checks those earlier entity creates before falling back to stored entity
+lookup, and emits one canonical change-set for transactional application. A note
+create, a forward reference or an unknown ID does not qualify. The lookup does
+not observe uncommitted creates. This qualification does not itself implement
+compound translation or add IDs to the current draft types.
 
 All other steps, including `AddEdge` for any other relation or endpoint pair, are
 unaffected by this amendment and keep the base ADR's review and apply semantics
@@ -1513,9 +1528,10 @@ ways the proposer can see:
 ### C2. Caller-given ids on `AddEntity` and `AddNote`
 
 `EntityDraft` and `NoteDraft` gain an optional `id`, a full UUID. `propose` refuses an id held by
-a live or deleted record, or by an edge or event, and names it. This is a new check:
-changeset validation at `propose` reads no stored rows today (the read of a parent proposal is
-separate). When the change-set lands, the canonical identity
+a live or deleted record, or by an edge or event, and names it. This is a new
+create-ID availability check; current supersession validation already reads
+stored entities to enforce A1's entity-only precondition (the read of a parent
+proposal is separate). When the change-set lands, the canonical identity
 check runs again, so a record created between proposal and approval refuses the unit, which rolls
 back whole, and the refusal names the operation index. When the
 id is absent, `propose` mints one while translating. The `propose` response gains `created_ids`,
