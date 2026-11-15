@@ -149,7 +149,7 @@ const P_TOOL: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub static TOOL_HANDLERS: [HandlerDef; 14] = [
+pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     HandlerDef {
         name: "tool.register",
         description: "Register one tool, skill, plugin or verb in the registry, with its capabilities, side-effect class and trust origin. Idempotent by name.",
@@ -167,6 +167,13 @@ pub static TOOL_HANDLERS: [HandlerDef; 14] = [
             ParamDef { name: "tags", param_type: "array of string", required: false, description: "Extra tags.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
+    },
+    HandlerDef {
+        name: "tool.unregister",
+        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[P_TOOL, P_NAMESPACE],
     },
     HandlerDef {
         name: "tool.ingest",
