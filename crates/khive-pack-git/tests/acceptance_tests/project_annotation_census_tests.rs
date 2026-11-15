@@ -971,6 +971,72 @@ async fn annotation_replay_link(
     ids: &[Uuid],
     deleted: bool,
 ) {
+    if deleted {
+        let graph = runtime.graph(token).unwrap();
+        for id in ids {
+            let edge_id = Uuid::from_u128(id.as_u128() ^ (2_u128 << 96)).into();
+            let before = graph
+                .get_edge(edge_id)
+                .await
+                .unwrap()
+                .expect("the annotation edge must be live before deletion");
+            assert_eq!(before.id, edge_id);
+            assert_eq!(before.namespace, token.namespace().as_str());
+            assert_eq!(before.source_id, *id);
+            assert_eq!(before.target_id, project);
+            assert_eq!(before.relation, khive_types::EdgeRelation::Annotates);
+            assert!(before.deleted_at.is_none());
+            let by_key = graph
+                .get_edge_by_natural_key_including_deleted(
+                    token.namespace().as_str(),
+                    *id,
+                    project,
+                    khive_types::EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .expect("the live natural key must select the same annotation");
+            assert_eq!(
+                serde_json::to_value(by_key).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert!(graph
+                .delete_edge(edge_id, khive_storage::DeleteMode::Soft)
+                .await
+                .unwrap());
+            assert!(graph.get_edge(edge_id).await.unwrap().is_none());
+            let after = graph
+                .get_edge_including_deleted(edge_id)
+                .await
+                .unwrap()
+                .expect("soft deletion must retain the annotation row");
+            assert_eq!(after.id, edge_id);
+            assert!(after.deleted_at.is_some());
+            assert_eq!(after.deleted_at, Some(after.updated_at));
+            let mut expected = before;
+            expected.updated_at = after.updated_at;
+            expected.deleted_at = after.deleted_at;
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let by_key = graph
+                .get_edge_by_natural_key_including_deleted(
+                    token.namespace().as_str(),
+                    *id,
+                    project,
+                    khive_types::EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .expect("the tombstone must retain the same natural key");
+            assert_eq!(
+                serde_json::to_value(by_key).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+        return;
+    }
     let at = chrono::DateTime::parse_from_rfc3339(ANNOTATION_ENCOUNTER_TIME)
         .unwrap()
         .with_timezone(&chrono::Utc);
