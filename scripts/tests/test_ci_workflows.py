@@ -533,6 +533,13 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     SCOPE_PREDICATE = ("(needs.changed-paths.outputs.test_scope == 'full'"
                        " || needs.changed-paths.outputs.test_scope == '')")
     SCOPED_SKIP_JOBS = {"coverage-measurement", "coverage-ratchet"}
+    # A draft pull request skips every lane job until it is marked ready; the gate refuses a draft by name.
+    DRAFT_PREDICATE = "github.event.pull_request.draft != true"
+    # Coverage runs on main pushes, the nightly run and manual dispatches only; the gate forgives its skip
+    # on pull requests and integration pushes (COVERAGE_SKIPS).
+    EVENT_PREDICATE = ("github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
+    EVENT_SKIP_JOBS = SCOPED_SKIP_JOBS
     DOCS_LANE_JOBS = {
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
@@ -553,7 +560,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full"):
+    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full", coverage_skips=None):
         """test_scope=None leaves the output unset, as when the scope step did not run."""
         needs = {job: {"result": result} for job, result in results.items()}
         if "changed-paths" in needs:
@@ -564,7 +571,8 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                 needs["changed-paths"]["outputs"]["test_scope"] = test_scope
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
-            env={**os.environ, "NEEDS": json.dumps(needs)},
+            env={**{k: v for k, v in os.environ.items() if k != "COVERAGE_SKIPS"}, "NEEDS": json.dumps(needs),
+                 **({} if coverage_skips is None else {"COVERAGE_SKIPS": coverage_skips})},
             capture_output=True, text=True, timeout=5, check=False,
         )
 
@@ -574,7 +582,9 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     def lane_conditions(self, job):
         predicate = self.DOCS_LANE_PREDICATE
         if job in self.SCOPED_SKIP_JOBS:
-            predicate = f"{predicate} && {self.SCOPE_PREDICATE}"
+            predicate = f"{predicate} && {self.SCOPE_PREDICATE} && {self.EVENT_PREDICATE}"
+        else:
+            predicate = f"{predicate} && {self.DRAFT_PREDICATE}"
         return [[predicate], [f"always() && {predicate}"]]
 
     def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
@@ -591,7 +601,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
         lists = [set(re.findall(r'"([a-z0-9-]+)"', block.split("]", 1)[0]))
                  for block in self.script.split("then [")[1:]]
-        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS])
+        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS, self.EVENT_SKIP_JOBS])
         scoped = {
             job for job in jobs
             if any(self.SCOPE_PREDICATE in condition for condition in self.job_conditions(job))
@@ -607,6 +617,33 @@ class AggregateGateWorkflowTests(unittest.TestCase):
             with self.subTest(kept=job):
                 self.assertNotIn(self.DOCS_LANE_PREDICATE, indented_block(self.workflow, job, 2))
         self.assertIn("- changed-paths", indented_block(self.gate, "needs", 4))
+
+    def test_coverage_skips_are_forgiven_only_on_pull_requests_and_integration_pushes(self):
+        for coverage_skips in ("true", "false", None, "TRUE"):
+            for job in sorted(self.needs):
+                with self.subTest(coverage_skips=coverage_skips, job=job):
+                    results = dict.fromkeys(self.needs, "success")
+                    results[job] = "skipped"
+                    result = self.run_gate(results, coverage_skips=coverage_skips)
+                    accepted = job in self.FORGIVEN_SKIPS or (
+                        coverage_skips == "true" and job in self.EVENT_SKIP_JOBS)
+                    self.assertEqual(result.returncode, 0 if accepted else 1, result.stdout + result.stderr)
+                    if job in self.EVENT_SKIP_JOBS:
+                        failed = dict.fromkeys(self.needs, "success")
+                        failed[job] = "failure"
+                        refused = self.run_gate(failed, coverage_skips=coverage_skips)
+                        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+
+    def test_the_gate_refuses_a_draft_pull_request_by_name(self):
+        steps = self.gate.split("- name: Check aggregated job results\n", 1)[0]
+        self.assertIn("- name: Refuse a draft pull request\n", steps)
+        self.assertIn("if: github.event_name == 'pull_request' && github.event.pull_request.draft == true\n", steps)
+        self.assertIn("exit 1\n", steps)
+        env = indented_block(self.gate.split("- name: Check aggregated job results\n", 1)[1], "env", 8)
+        self.assertIn("COVERAGE_SKIPS: ${{ github.event_name == 'pull_request' || "
+                      "startsWith(github.ref, 'refs/heads/integration/') }}", env)
+        triggers = indented_block(self.workflow, "pull_request", 2)
+        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", triggers)
 
     def test_failed_classifier_does_not_forgive_the_lane_skips(self):
         # A failed classifier already fails the gate by itself; the rejected list shows
@@ -788,7 +825,8 @@ class CiMatrixWorkflowTests(unittest.TestCase):
 
     UBUNTU = [{"os": "ubuntu-latest", "shard": 1}, {"os": "ubuntu-latest", "shard": 2}]
 
-    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive"):
+    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive",
+                   ref="refs/heads/main"):
         text = workflow_text("ci.yml")
         match = re.search(r"include: \$\{\{ fromJSON\((.*?)\) \}\}", text, re.S)
         self.assertIsNotNone(match, "the ci job's matrix include expression was not found")
@@ -798,6 +836,7 @@ class CiMatrixWorkflowTests(unittest.TestCase):
             "github.event_name": "event_name",
             "github.head_ref": "head_ref",
             "github.repository": "repository",
+            "github.ref": "ref",
         }
         for name, local in names.items():
             expression = expression.replace(name, local)
@@ -815,6 +854,7 @@ class CiMatrixWorkflowTests(unittest.TestCase):
             "head_ref": head_ref,
             "head_repo": head_repo,
             "repository": repository,
+            "ref": ref,
         }
         return json.loads(eval(expression, {"__builtins__": {}}, scope))
 
@@ -851,6 +891,17 @@ class CiMatrixWorkflowTests(unittest.TestCase):
         for event_name in ["push", "schedule", "workflow_dispatch"]:
             with self.subTest(event_name=event_name):
                 self.assertEqual(self.matrix_for(event_name), expected)
+        # Integration pushes other than trains keep all four, and so does a train-named ref on another event.
+        for event_name, ref in [("push", "refs/heads/integration/batch-7"), ("push", "refs/heads/main"),
+                                ("workflow_dispatch", "refs/heads/integration/train-12"),
+                                ("schedule", "refs/heads/integration/train-12")]:
+            with self.subTest(event_name=event_name, ref=ref):
+                self.assertEqual(self.matrix_for(event_name, ref=ref), expected)
+
+    def test_integration_train_pushes_run_the_linux_shards_only(self):
+        for ref in ["refs/heads/integration/train-12", "refs/heads/integration/train-213-a"]:
+            with self.subTest(ref=ref):
+                self.assertEqual(self.matrix_for("push", ref=ref), self.UBUNTU)
 
 
 class WasmtimeParityWorkflowTests(unittest.TestCase):
@@ -2425,9 +2476,13 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # for the coverage jobs, a successful crate-list test scope
         # (AggregateGateWorkflowTests). Gating the same jobs per step would
         # still start every runner, the macOS one included.
-        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
-        scoped_lane = (f"{docs_lane} && (needs.changed-paths.outputs.test_scope == 'full'"
-                       " || needs.changed-paths.outputs.test_scope == '')")
+        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                     " && github.event.pull_request.draft != true")
+        scoped_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                       " && (needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')"
+                       " && github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
@@ -2448,7 +2503,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
                 if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
-                    self.assertNotIn(docs_lane, job)
+                    self.assertNotIn("needs.changed-paths.outputs.docs_only != 'true'", job)
 
     def test_dependency_review_work_is_pr_only_after_revision_validation(self):
         job = indented_block(self.workflow, "dependency-review", 2)
@@ -2680,6 +2735,56 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
         verdict, reasons = self.classify(self.base, self.commit("adr"))
         self.assertEqual(verdict, "true", reasons)
+
+    def shared_readme_base(self):
+        """An ADR index and a crate readme share the base name README.md; the crate's code names its own."""
+        self.write("docs/adr/README.md", "# ADR index\n")
+        self.write("crates/widget/README.md", "# Widget\n")
+        self.write("crates/widget/src/lib.rs", '#![doc = include_str!("../README.md")]\n')
+        self.write("crates/widget/Cargo.toml", '[package]\nname = "widget"\nreadme = "README.md"\n')
+        return self.commit("shared readme base")
+
+    def test_a_shared_base_name_named_only_by_other_directories_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        verdict, reasons = self.classify(base, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the crate's own readme, which its code names relatively, still runs the full suite.
+        self.write("crates/widget/README.md", "# Widget\n\nChanged.\n")
+        verdict, reasons = self.classify(base, self.commit("crate readme"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("crates/widget/README.md is named by a non-Markdown file in crates/widget", reasons)
+
+    def test_a_shared_base_name_reached_by_path_runs_the_full_suite(self):
+        cases = [
+            ("tools/index.py", 'INDEX = "docs/adr/README.md"\n', "named as adr/README.md"),
+            ("tools/index.py", 'INDEX = ROOT / "docs" / "adr" / "README.md"\n', "named as a joined adr and README.md"),
+            ("tools/index.py", "index = join('adr', 'README.md')\n", "named as a joined adr and README.md"),
+            ("docs/adr/index.json", '{"index": "README.md"}\n', "named by a non-Markdown file in docs/adr"),
+        ]
+        for reader, text, reason in cases:
+            with self.subTest(reader=reader, text=text):
+                base = self.shared_readme_base()
+                self.write(reader, text)
+                with_reader = self.commit("reader")
+                self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+                verdict, reasons = self.classify(with_reader, self.commit("index row"))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"docs/adr/README.md is {reason}", reasons)
+                self.git("rm", "-q", "-r", "--cached", "tools", "docs/adr/index.json", "--ignore-unmatch")
+                for leftover in ("tools/index.py", "docs/adr/index.json"):
+                    (self.repo / leftover).unlink(missing_ok=True)
+                self.commit("drop reader")
+
+    def test_a_symlink_inside_the_directory_of_a_shared_base_name_runs_the_full_suite(self):
+        base = self.shared_readme_base()
+        (self.repo / "docs/adr/INDEX.md").symlink_to("README.md")
+        with_link = self.commit("link")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-003\n")
+        verdict, reasons = self.classify(with_link, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named by a symlink in docs/adr", reasons)
 
     def test_a_failing_count_scanner_runs_the_full_suite(self):
         # A copy of the classifier beside no scanner: the question cannot be answered, so the
