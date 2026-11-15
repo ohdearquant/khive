@@ -111,6 +111,7 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     pub(super) default_output_format: OutputFormat,
+    pub(super) catalog_verbosity: crate::args::CatalogVerbosity,
     /// Last instant at which this process's daemon schedule loop began a tick.
     /// Zero means this server instance has never observed the loop running.
     /// Shared by server clones but never persisted, so a replacement process
