@@ -91,7 +91,7 @@ struct AsyncBlockingSideEffectPack {
 }
 
 impl khive_types::Pack for AsyncBlockingSideEffectPack {
-    const NAME: &'static str = "async-blocking-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -192,7 +192,7 @@ impl Gate for DenyOrdinaryHandlerFailureGate {
 }
 
 impl khive_types::Pack for OrdinaryHandlerFailurePack {
-    const NAME: &'static str = "ordinary-handler-failure-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -239,7 +239,7 @@ impl khive_runtime::PackRuntime for OrdinaryHandlerFailurePack {
 }
 
 impl khive_types::Pack for AmbiguousSideEffectPack {
-    const NAME: &'static str = "ambiguous-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
