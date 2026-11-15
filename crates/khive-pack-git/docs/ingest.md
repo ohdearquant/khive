@@ -134,12 +134,24 @@ even with unused budget, so callers request the subsequent history. A pass that
 exactly consumes its budget retains the existing `done:false` convention and
 proves completion on the next call. Issue/PR page checkpoints are unchanged.
 
+If a commit's initial `create` returns `SecretDetected`, the refused payload never
+lands. The ingester makes one replacement attempt through the same gate, using a
+static redaction message and only the Git-generated `sha`, `short_sha`,
+`committed_at`, and `parents` properties. It drops `author`, `author_email`, and
+`changed_paths`, even if masking left those fields unchanged. The SHA-derived key,
+project annotations, and parent-edge processing remain. A valid replacement
+receipt sets the original refusal's report field `redacted: true` and counts as a
+success for cursor progress, provided no earlier record stalled the walk. The
+original refusal is still included in `writes_refused` and `write_refusals`.
+
 `cursor_stalled` freezes both commit cursor rows at the last contiguous successfully
-processed commit: once a record fails to create, later records in the same
+processed commit: any other unresolved create refusal, or a replacement failure
+that cannot be reconciled with a committed winner as described below, stalls the
+cursor. Later records in the same
 pass are still attempted (so a run surfaces every failure it can, not just
 the first), but the persisted cursor no longer advances past the failure.
 That guarantees a failed record is retried — and its warning re-surfaced —
-on every subsequent pass until it is fixed upstream, rather than being
+on every subsequent pass until it can be stored, rather than being
 silently skipped forever because the cursor moved past it. Records that do
 succeed after a stall are still written; they are idempotent via the `sha`
 natural key, so a retried pass never double-creates them.
@@ -158,8 +170,8 @@ operator must reconcile those duplicates separately.
 the same pass. Combined with `find_commit_by_sha`'s database lookup, it
 resolves `precedes` parent edges regardless of which pass the parent
 landed in. The stall guard applies to every cursor write in the loop:
-once a commit create fails, advancing the cursor past a later
-refused/failed record — including past a later _existing_ record, whose
+once a commit remains unwritten after its create and any permitted replacement,
+advancing the cursor past a later record — including a later _existing_ record, whose
 natural-key lookup proves only its own landing, not the failed record's —
 would strand the failed commit behind the floor and skip it forever instead
 of retrying it on the next pass.

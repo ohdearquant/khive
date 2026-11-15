@@ -51,6 +51,10 @@ pub(crate) use commit_history::*;
 #[path = "commit_text_tests.rs"]
 mod commit_text_tests;
 
+/// Content stored when a commit's original fields fail the secret gate.
+pub const REDACTED_COMMIT_MESSAGE: &str =
+    "Commit message was redacted after a secret-gate refusal.";
+
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
 }
@@ -262,7 +266,7 @@ pub struct IngestWriteRefusal {
     pub record_key: String,
     pub detector: String,
     pub masked: String,
-    /// Present only for a GitHub replacement attempt; true after a real UUID returns.
+    /// Present for a redacted replacement attempt; true after a valid create receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted: Option<bool>,
 }
