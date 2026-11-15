@@ -19,6 +19,30 @@ stdio, and `cargo test` finishes in 4 seconds.
 khive also runs hosted, as memory and a knowledge graph your agents reach over MCP:
 https://khive.ai/?utm_source=github&utm_campaign=khive-readme
 
+## Install
+
+With a Rust toolchain ([rustup](https://rustup.rs)), install the `kkernel` binary from crates.io:
+
+```bash
+cargo install kkernel --locked
+```
+
+The first build compiles about 330 crates, so expect it to take several minutes.
+
+Add khive to your MCP client config (`.mcp.json` in your project, or `~/.claude/mcp.json` for global):
+
+```json
+{ "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
+```
+
+Check the binary:
+
+```bash
+kkernel --version
+```
+
+To build from a source checkout instead, see [Quick start](#quick-start).
+
 ---
 
 ## What you get
