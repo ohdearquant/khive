@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.20.0] - 2026-11-15
 ### Added
 
 - `search` accepts `created_after` and `created_before` for entities and notes: inclusive RFC3339
