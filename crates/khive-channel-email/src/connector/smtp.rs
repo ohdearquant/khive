@@ -61,11 +61,16 @@ impl ConnectionAttempt {
             let permanent = matches!(error, ChannelError::Auth(_));
             let failure = format!("{address}: {error}");
             *self.last_failure.lock().await = Some(failure.clone());
-            last_failure = Some((permanent, failure));
+            if permanent {
+                return Err(classify_smtp_connection_error(
+                    true,
+                    format!("SMTP connection refused: {failure}"),
+                ));
+            }
+            last_failure = Some(failure);
         }
         Err(match last_failure {
-            Some((permanent, failure)) => classify_smtp_connection_error(
-                permanent,
+            Some(failure) => ChannelError::Transport(
                 format!("SMTP connection failed after all resolved addresses failed; last failure: {failure}"),
             ),
             None => ChannelError::Transport("SMTP relay resolved to no addresses".into()),
@@ -217,8 +222,8 @@ impl LettreSmtp {
             .map_err(|error| ChannelError::Transport(format!("SMTP relay lookup failed: {error}")))?
             .collect();
         // lettre's timeout covers only TCP. Bound each full greeting/EHLO/TLS
-        // handshake to 10 seconds, using implicit TLS on 465 and STARTTLS elsewhere.
-        // The 120-second transaction deadline can stop the walk before exhaustion.
+        // handshake with SMTP_ADDRESS_TIMEOUT, using implicit TLS on 465 and
+        // STARTTLS elsewhere. SMTP_TRANSACTION_TIMEOUT can stop the walk before exhaustion.
         attempt
             .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
                 let tls = tls.clone();
@@ -872,6 +877,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smtp_address_walk_stops_on_first_permanent_refusal() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(if address == addresses[0] {
+                    ChannelError::Auth("554 relay refused".into())
+                } else {
+                    ChannelError::Transport("421 relay unavailable".into())
+                }))
+            })
+            .await;
+        let error = result
+            .err()
+            .expect("address walk must refuse the connection");
+        assert_eq!(contacted, vec![addresses[0]]);
+        let ChannelError::Auth(message) = error else {
+            panic!("permanent connection refusal must stop the account: {error:?}");
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[0].to_string()), "{failure}");
+        assert!(failure.contains("554 relay refused"), "{failure}");
+        assert_eq!(message, format!("SMTP connection refused: {failure}"));
+        assert!(!message.contains(&addresses[1].to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_stops_on_permanent_refusal_after_transient_failure() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+            SocketAddr::from(([127, 0, 0, 1], 2527)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(if address == addresses[1] {
+                    ChannelError::Auth("554 relay refused".into())
+                } else {
+                    ChannelError::Transport("421 relay unavailable".into())
+                }))
+            })
+            .await;
+        let error = result
+            .err()
+            .expect("address walk must refuse the connection");
+        assert_eq!(contacted, addresses[..2]);
+        let ChannelError::Auth(message) = error else {
+            panic!(
+                "permanent connection refusal must survive an earlier transient error: {error:?}"
+            );
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[1].to_string()), "{failure}");
+        assert!(failure.contains("554 relay refused"), "{failure}");
+        assert_eq!(message, format!("SMTP connection refused: {failure}"));
+        assert!(!message.contains(&addresses[0].to_string()), "{message}");
+        assert!(!message.contains(&addresses[2].to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_reports_last_failure_when_all_addresses_are_transient() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(ChannelError::Transport(
+                    if address == addresses[0] {
+                        "421 first relay unavailable"
+                    } else {
+                        "421 last relay unavailable"
+                    }
+                    .into(),
+                )))
+            })
+            .await;
+        let error = result.err().expect("all transient attempts must fail");
+        assert_eq!(contacted, addresses);
+        let ChannelError::Transport(message) = error else {
+            panic!("transient connection failures must remain retryable: {error:?}");
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[1].to_string()), "{failure}");
+        assert!(failure.contains("421 last relay unavailable"), "{failure}");
+        assert_eq!(message, format!("SMTP connection failed after all resolved addresses failed; last failure: {failure}"));
+        assert!(!message.contains(&addresses[0].to_string()), "{message}");
+        assert!(
+            !message.contains("421 first relay unavailable"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn smtp_transaction_deadline_interrupts_silent_greeting() {
         let failed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -879,7 +989,7 @@ mod tests {
         let refusal = tokio::spawn(async move {
             let (mut socket, _) = failed.accept().await.unwrap();
             socket
-                .write_all(b"554 relay unavailable\r\n")
+                .write_all(b"421 relay unavailable\r\n")
                 .await
                 .unwrap();
         });
@@ -917,7 +1027,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&addresses[0].to_string()), "{message}");
-        assert!(message.contains("554"), "{message}");
+        assert!(message.contains("421"), "{message}");
         assert!(
             !message.contains("all resolved addresses failed"),
             "{message}"
