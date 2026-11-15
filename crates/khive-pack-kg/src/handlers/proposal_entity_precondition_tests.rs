@@ -285,7 +285,10 @@ fn assert_not_live(error: RuntimeError, id: Uuid) {
     let RuntimeError::NotFound(message) = error else {
         panic!("expected typed NotFound for {id}, got {error:?}");
     };
-    assert_eq!(message, format!("{id} does not name a live entity"));
+    assert_eq!(
+        message,
+        format!("{id} does not name a live entity: entity {id}")
+    );
 }
 
 #[tokio::test]
@@ -508,5 +511,78 @@ async fn propose_supersede_entity_valid_multi_step_keeps_existing_containment() 
             .expect_err("nested invalid operand precedes containment refusal");
         assert_not_live(error, missing);
         assert_eq!(f.snapshot().await, before);
+    }
+}
+
+#[tokio::test]
+async fn propose_supersede_entity_preserves_merged_operand_redirects() {
+    let f = Fixture::new();
+    f.populated().await;
+    let token = f.runtime.authorize(Namespace::local()).unwrap();
+    for old_operand in [true, false] {
+        for depth in [0, 2] {
+            let old = f.entity("Old before merge", "local").await;
+            let new = f.entity("New before merge", "local").await;
+            let consumed_name = if old_operand { &old.name } else { &new.name };
+            let kept = f.entity(&format!("{consumed_name} kept"), "local").await;
+            let consumed = if old_operand { old.id } else { new.id };
+            f.call(
+                "merge",
+                json!({"kind": "entity", "into_id": kept.id, "from_id": consumed}),
+            )
+            .await;
+            let tombstone = f
+                .runtime
+                .get_entity_including_deleted(&token, consumed)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tombstone.deleted_at.is_some());
+            assert_eq!(tombstone.merged_into, Some(kept.id));
+            let kept_after_merge = f.runtime.get_entity(&token, kept.id).await.unwrap();
+            assert!(kept_after_merge.deleted_at.is_none());
+            let redirect = format!("{consumed} was merged into {}; query the kept id", kept.id);
+            let runtime_error = f.runtime.get_entity(&token, consumed).await.unwrap_err();
+            assert!(
+                matches!(runtime_error, RuntimeError::NotFound(ref detail) if detail == &redirect)
+            );
+
+            let before = f.snapshot().await;
+            let error = f
+                .registry
+                .dispatch("propose", proposal(wrap(supersede(old.id, new.id), depth)))
+                .await
+                .expect_err("a merged operand must refuse without following its redirect");
+            let RuntimeError::NotFound(message) = error else {
+                panic!("expected typed NotFound for {consumed}, got {error:?}");
+            };
+            assert_eq!(
+                message,
+                format!("{consumed} does not name a live entity: {redirect}")
+            );
+            assert_eq!(f.snapshot().await, before);
+            assert_eq!(
+                serde_json::to_value(f.runtime.get_entity(&token, kept.id).await.unwrap()).unwrap(),
+                serde_json::to_value(kept_after_merge).unwrap()
+            );
+            let redirected_pair = if old_operand {
+                (new.id, kept.id)
+            } else {
+                (kept.id, old.id)
+            };
+            assert!(f
+                .runtime
+                .graph(&token)
+                .unwrap()
+                .get_edge_by_natural_key_including_deleted(
+                    "local",
+                    redirected_pair.0,
+                    redirected_pair.1,
+                    EdgeRelation::Supersedes,
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 }
