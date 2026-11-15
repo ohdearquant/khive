@@ -53,10 +53,10 @@ update):
 simply "no `delivery` key". Transient failures leave the note pending and
 are retried on later cycles, under the retry policy below.
 
-[Proposed Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) would add a held, nonterminal
-outcome for an ambiguous SMTP body attempt. Its proposed no-repeat rule starts
-only after that hold is persisted; it does not replace the accepted retry rules
-before ratification.
+[Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) adds a held, nonterminal
+outcome for an ambiguous SMTP body attempt. Its no-repeat rule starts only
+after that hold is persisted; the retry rules below are unchanged for transient
+failures.
 
 #### Transient-retry policy
 
@@ -120,7 +120,7 @@ the email component crate, not a second loop inside the inbound component:
   a definitive AUTH rejection stops visibly for operator action, while a
   post-auth per-message 5xx records `delivery = "failed"` only on that note
   and continues draining other recipients.
-  [Proposed Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) would distinguish a missing final
+  [Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) distinguishes a missing final
   outcome after a body attempt from those known refusals, while preserving
   credential-based AUTH classification.
 - Poll cadence matches the removed loop (short fixed interval, seconds);
@@ -243,7 +243,7 @@ The §1 outcome table is amended for outbound email as follows:
 | Permanent failure | Write `delivery = "failed"`, `failed_at`, and `last_error`; retain any earlier `external_id` claim.                          |
 | Transient failure | Increment `delivery_attempts` and write `last_error` and `next_attempt_at`; retain `external_id` and leave the note pending. |
 
-[Proposed Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) proposes an additional uncertainty
+[Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) adds an uncertainty
 hold, preserving the claimed Message-ID without scheduling an automatic retry
 after the hold is persisted. The three accepted outcomes above remain unchanged.
 
@@ -462,7 +462,7 @@ transient retry metadata and identity holds remain distinguishable through
 their existing properties. This does not attest that the remote recipient
 stored or read the message.
 
-[Proposed Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) proposes exposing its uncertainty
+[Amendment 5](#amendment-5-2026-11-15-hold-email-with-unknown-smtp-delivery) exposes its uncertainty
 hold through the same properties view. It adds neither a recipient receipt nor
 a new keyed diagnostic-note requirement.
 
@@ -526,15 +526,15 @@ channel prefixes.
 
 ## Amendment 5 (2026-11-15): hold email with unknown SMTP delivery
 
-**Status: Proposed.**
+**Status: Accepted 2026-11-15 (#6678).** Refs #6561. It does not change the status of the base ADR or of earlier amendments.
 
 ### Scope
 
-This amendment proposes a distinct outcome for an SMTP body attempt whose final
+This amendment specifies a distinct outcome for an SMTP body attempt whose final
 result cannot be established (#6561). It qualifies the outcome and retry rules in
 §1, the delivery-stage classification in §4, and Amendment 2's outcome table.
-Amendments 1–4 retain their accepted status and their other decisions. This
-section does not claim that the new behavior is implemented or ratified.
+Amendments 1–4 keep their other decisions. This section specifies required
+behavior; it does not claim that the behavior is implemented.
 
 The existing external-ID claim, own-note/domain verification and recipient policy
 still run before SMTP. An `external_id_unverifiable` hold takes precedence and is
@@ -557,7 +557,7 @@ RFC 5321 requires 354 before sending message data; after the terminating dot, a
 See [§3.3](https://www.rfc-editor.org/rfc/rfc5321.html#section-3.3) and
 [§4.2.5](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.2.5).
 
-| Observation                                                                                     | Proposed outcome                                                                                                                  |
+| Observation                                                                                     | Outcome                                                                                                                           |
 | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Connection or RCPT interruption before the body boundary                                        | Existing transient transport failure and retry policy.                                                                            |
 | DATA returns an unexpected positive reply instead of exact 354                                  | Discard the connection, send zero body bytes and return the existing Transport/transient outcome.                                 |
@@ -601,7 +601,7 @@ outcome, a conflicting hold or a changed bookkeeping preimage. An existing
 `delivery_unknown` hold is an idempotent no-op after validating the row's identity
 and nonterminal state.
 
-The proposed property change is:
+The property change is:
 
 | Property                                                 | Result                                                                                                                                                  |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -632,7 +632,7 @@ identity rule or add an operator unhold API.
 ### 3. Expose uncertainty without claiming receipt
 
 The sender can inspect the hold through the original outbound note's properties
-in its sent view, as Amendment 4 describes. This is the proposed attention
+in its sent view, as Amendment 4 describes. This is the attention
 mechanism. It does not add a keyed diagnostic note or a diagnostic reconciler;
 Amendment 3's separate requirement for unverifiable external IDs is unchanged.
 It does not create an ADR-105 sender transport record or map SMTP uncertainty to
