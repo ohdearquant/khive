@@ -31,7 +31,7 @@ and edge reads report how many such edges they left out (#6380; accepted 2026-11
 1's refusal text, which is proposed).
 **Amended**: 2026-11-14, [Delta 4](#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) of
 the batch-apply amendment: every writer of a `supersedes` edge or property applies the old-row namespace rule
-(#6607; accepted 2026-11-14).
+(#6607; accepted 2026-11-15).
 
 ## Context
 
@@ -1143,7 +1143,8 @@ run leaving all six in the source row's namespace.
 
 ### Delta 4: every writer of a supersede applies the old-row namespace rule (2026-11-14)
 
-**Status**: Accepted 2026-11-14 (#6607). Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
+**Status**: Accepted 2026-11-15 (#6607). Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
+The ADR lands before its code: on the day of acceptance no writer applies rule 1 yet, and the implementing change does.
 Recall and Delta 2 are unchanged. It amends Delta 1 rule 4 in one respect: the `owned_namespaces` declaration is also
 read by rule 1 below. It still grants no write into an owned namespace and widens no read. Who sets the
 declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
@@ -1236,9 +1237,13 @@ affected, because the edge or property sits outside its visible set.
    row it names is checked by rule 1 against its stored namespace. An id prefix (Delta 2 rule 3) can hide any memory
    row whose id starts with it, because recall hides the first ranked candidate that matches. The restore therefore
    resolves the prefix to every stored memory row, live or soft-deleted, whose id starts with it, and checks each by
-   rule 1. One refused row refuses the restore. A complete UUID that names no stored memory row, and a prefix that
-   matches none, are refused too: the check cannot name the namespace that will hold that id. The refusal says which
-   case applies. A refused restore leaves the carrier soft-deleted with its stored value unchanged.
+   rule 1. One refused row refuses the restore, and the refusal names the refused row's case. A complete UUID that
+   names no stored memory row, and a prefix that matches none, are admitted: no stored row can be checked, a live
+   carrier holding the same value keeps its effect untouched by rule 4, and a refusal would strand the carrier for
+   good, because `update` reads a note only while it is live and cannot clear the key on a soft-deleted row. Every
+   row `memory.apply_batch` rewrote carries the old row's id, so a rewritten row soft-deleted after its old row was
+   hard-deleted is in this case. A row later stored under that id is seen through rule 4's dry run, as it is for a
+   live carrier. A refused restore leaves the carrier soft-deleted with its stored value unchanged.
 
    `merge` is not checked, because it cannot change what rule 1 decides. A note merge (ADR-039) requires both notes to
    be in the caller's namespace (ADR-007 Rule 5; `ensure_namespace` on both notes in the runtime's note merge). It
@@ -1275,7 +1280,8 @@ affected, because the edge or property sits outside its visible set.
    It reads in id order and returns a cursor. A page is at most 1,000 rows read, counting every edge and memory row it
    examines, whether or not it is listed, so a page can list nothing and still return a cursor. One call's cost is
    bounded by the page, and a full pass grows with the number of live memory rows and `supersedes` edges in the
-   readable namespaces. It writes nothing.
+   readable namespaces. It writes nothing. The change that implements this delta names the verb and arguments that
+   carry the dry run.
    A soft-deleted carrier row is not listed: recall does not read it, and its restore is one of the writes rule 2 lists. Whether a
    listed supersede was meant is the target owner's question. Removing the edge or clearing the property is done by a
    caller who can read the namespace that stores it; when that is not the target's owner, the owner is asked.
@@ -1295,7 +1301,9 @@ affected, because the edge or property sits outside its visible set.
 
 **Known limit.** As in Delta 1, `owned_namespaces` is the caller's own claim, carried with its identity, so this rule
 bounds what these verbs agree to supersede. It protects no row from a caller that holds the row's id and uses
-`update(id)` or `delete(id)` (ADR-007 Rule 2).
+`update(id)` or `delete(id)` (ADR-007 Rule 2). A target that is hard-deleted and then stored again under the same id in
+another namespace is hidden by a carrier or edge stored before it: rule 1 never ran against that row, and rule 4's dry
+run is what lists it.
 
 **Alternatives considered.**
 
@@ -1345,8 +1353,10 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
   refused namespace is refused. When that row's owner later restores it, it stays in a two-namespace reader's recall.
   Control: a carrier naming a soft-deleted row in its own namespace restores.
 - `restore` of a soft-deleted carrier is refused when its stored prefix matches only a soft-deleted row in a refused
-  namespace, when its complete UUID names no stored memory row, and when its prefix matches none. Each refusal names
-  its case, and the carrier stays soft-deleted with its value unchanged.
+  namespace; the refusal names its case, and the carrier stays soft-deleted with its value unchanged.
+- `restore` of a soft-deleted carrier whose complete UUID names no stored memory row restores it, and so does one whose
+  prefix matches none, with the stored value unchanged. A memory row then stored under that id in a refused namespace
+  is listed by rule 4's dry run. Control: the same carrier with a refused target stays soft-deleted.
 - `update` setting `properties.supersedes` to an id prefix is refused, even when the prefix matches only the caller's
   own rows.
 - A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
