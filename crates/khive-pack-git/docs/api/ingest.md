@@ -219,6 +219,21 @@ scoped by kind + namespace + `project_id` since GitHub issue/PR numbers are
 repository-scoped — a bare `kind`+`number` filter would incorrectly collide
 two different repos' `#1`.
 
+Number lookups select the first live matching row by stored `id` in ascending
+binary order and read at most two candidates. Two returned rows emit one
+operational WARN, targeted at `khive_pack_git::ingest`, with `kind`, `namespace`,
+`project_id`, `number`, and `matched_at_least=2`. This is a lower bound, not an
+exact duplicate count. The warning contains no note content or properties and
+is not added to `IngestReport`. Each actual duplicate lookup may warn again;
+checkpoint or per-pass map hits that bypass the lookup do not emit it.
+
+The first row's ID is decoded as a UUID. A malformed first stored ID returns
+`None`, even if the second row has a valid UUID; the lookup neither skips nor
+repairs malformed rows. Zero matches return `None`, and one matching row emits
+no duplicate warning. The two-row limit bounds returned candidates, not the
+work SQLite may perform to order all matches. Commit-SHA lookup keeps its
+separate duplicate-refusal behavior.
+
 ## `find_document_for_path`
 
 Finds an existing `document` entity by exact `properties.source_uri`, then
