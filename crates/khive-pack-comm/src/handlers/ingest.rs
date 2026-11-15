@@ -114,6 +114,18 @@ async fn verify_duplicate_replay(
         }
         return Ok(());
     }
+    // Secondary records that never retained an original remain identity-only
+    // duplicates. A replay must not backfill historical or refused ownership.
+    // Withheld custody was validated above; main/legacy repair stays unchanged.
+    let retained_ref = props
+        .and_then(|properties| properties.get("quarantine_content_ref"))
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.is_empty());
+    if runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN
+        && (!stored_quarantine || retained_ref.is_none())
+    {
+        return Ok(());
+    }
     repair_duplicate_quarantine(
         runtime,
         capability,
@@ -224,7 +236,10 @@ async fn repair_duplicate_quarantine(
         .get_attachment(duplicate.id, "quarantine-original")
         .await?
     {
-        Some(existing) if existing.content_ref == attachment.content_ref => {}
+        Some(existing)
+            if existing.content_ref == attachment.content_ref
+                && (runtime.backend_id().as_str() == khive_runtime::BackendId::MAIN
+                    || existing.substrate == AttachmentSubstrate::Note) => {}
         Some(_) => {
             return Err(RuntimeError::Internal(
                 "ingest: duplicate quarantine attachment disagrees with note metadata".to_string(),
@@ -556,33 +571,6 @@ pub(crate) async fn handle_ingest(
         // UID in the coordinator's existing bounded hold ledger; retries are unique.
         super::record_reply_opt_out_suppression(runtime, &address, &actor).await?;
     }
-    // A quarantine original is owned by a main-backend attachment on its
-    // quarantine message (ADR-121 item 7), and the runtime refuses that write
-    // when the message lives on a secondary backend. Refusing the ingest held
-    // the channel cursor on that message for every later poll. Record the
-    // quarantine without its original instead, disclosed the same way as the
-    // retention limit: the reference is not persisted, so the uploaded object
-    // stays unowned, and the transport still holds the original message.
-    let quarantine_attachment = match quarantine_attachment {
-        Some(attachment) if runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN => {
-            tracing::warn!(
-                external_id = ?p.external_id,
-                backend = runtime.backend_id().as_str(),
-                content_ref = %attachment.content_ref,
-                "comm.ingest: dropping quarantine original reference on a secondary backend"
-            );
-            if let Some(metadata) = p.metadata.as_mut() {
-                metadata.remove("quarantine_content_ref");
-                metadata.insert("quarantine_original_retained".to_string(), json!("false"));
-                metadata.insert(
-                    "quarantine_original_not_retained_reason".to_string(),
-                    json!("secondary-backend"),
-                );
-            }
-            None
-        }
-        other => other,
-    };
 
     // One-release IMAP migration: read the pre-account key and keep its stored
     // external_id; a quarantine replay may only repair ownership and retention
@@ -820,13 +808,29 @@ pub(crate) async fn handle_ingest(
         }
     }
 
-    // Read the two retention facts a NEW quarantine record is stored with off
-    // `props`, before it is moved into the write: whether the original was kept
-    // (the attachment actually persisted) and, when it was not, the stored
-    // reason. A `secondary-backend` drop rewrote `props` above, so this reads
-    // the final state. `None` means the message is not a quarantine record, so
-    // the receipt emits neither key.
-    let quarantine_retention_disclosure = is_quarantined.then(|| {
+    // A secondary without a BlobStore still records quarantine without owning the original.
+    let quarantine_attachment = if is_quarantined
+        && quarantine_attachment.is_some()
+        && runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN
+        && runtime.core().blob_store().is_none()
+    {
+        if let Some(properties) = props.as_object_mut() {
+            properties.remove("quarantine_content_ref");
+            properties.insert("quarantine_original_retained".into(), json!("false"));
+            properties.insert(
+                "quarantine_original_not_retained_reason".into(),
+                json!("secondary-backend"),
+            );
+        }
+        None
+    } else {
+        quarantine_attachment
+    };
+
+    // Start with transport retention facts, then apply the runtime's canonical
+    // owner outcome before issuing a receipt, including committed degradations.
+    // Non-quarantine records emit neither retention field.
+    let mut quarantine_retention_disclosure = is_quarantined.then(|| {
         if quarantine_attachment.is_some() {
             QuarantineRetentionDisclosure {
                 retained: true,
@@ -844,8 +848,8 @@ pub(crate) async fn handle_ingest(
     });
 
     let created = if let Some(attachment) = quarantine_attachment.clone() {
-        runtime
-            .try_create_note_as_trusted_ingest_with_attachment(
+        let outcome = runtime
+            .try_create_note_as_trusted_ingest_with_attachment_report(
                 capability,
                 token,
                 "message",
@@ -855,7 +859,15 @@ pub(crate) async fn handle_ingest(
                 attachment,
                 is_quarantined.then_some(quarantine_retention),
             )
-            .await
+            .await;
+        if let (Some(disclosure), Some(reason)) = (
+            quarantine_retention_disclosure.as_mut(),
+            outcome.retention.not_retained_reason(),
+        ) {
+            disclosure.retained = false;
+            disclosure.reason = Some(reason.to_string());
+        }
+        outcome.result
     } else {
         runtime
             .try_create_note_as_trusted_ingest(

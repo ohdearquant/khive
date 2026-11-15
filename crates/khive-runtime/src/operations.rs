@@ -41,6 +41,7 @@ use khive_db::stores::text::insert_document_statements;
 
 mod note_search;
 mod quarantine_note_retention;
+pub use quarantine_note_retention::{QuarantineOriginalRetention, TrustedIngestAttachmentOutcome};
 
 #[cfg(test)]
 mod batch_edge_tests;
@@ -881,8 +882,10 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
-            .await
+        self.try_create_note_impl(
+            token, kind, name, content, properties, false, None, None, None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -896,25 +899,42 @@ impl KhiveRuntime {
         allow_transport_owned_message_properties: bool,
         attachment: Option<NewAttachment>,
         expires_after: Option<std::time::Duration>,
+        retention: Option<&mut QuarantineOriginalRetention>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         crate::secret_gate::check_note_fields_at(content, name, properties.as_ref(), "note")?;
+        let secondary_quarantine = allow_transport_owned_message_properties
+            && kind == "message"
+            && self.backend_id().as_str() != crate::BackendId::MAIN
+            && attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.role == "quarantine-original")
+            && properties.as_ref().is_some_and(|properties| {
+                properties.get("quarantined") == Some(&serde_json::Value::Bool(true))
+                    || properties
+                        .get("quarantined")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("true")
+            });
         if let Some(ref attachment) = attachment {
-            // The note and its owner row must share the main database. A
-            // secondary pack backend cannot atomically root the reference.
-            drop(self.attachments()?);
+            if !secondary_quarantine {
+                // Ordinary attachment writes still require the main backend.
+                drop(self.attachments()?);
+            }
             attachment.validate()?;
-            let blob_store = self.blob_store().ok_or_else(|| {
-                RuntimeError::Unconfigured(
-                    "trusted ingest attachment requires an installed BlobStore".to_string(),
-                )
-            })?;
-            if !blob_store.exists(&attachment.content_ref).await? {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "trusted ingest attachment refers to an unpublished blob: {}",
-                    attachment.content_ref
-                )));
+            if !secondary_quarantine {
+                let blob_store = self.blob_store().ok_or_else(|| {
+                    RuntimeError::Unconfigured(
+                        "trusted ingest attachment requires an installed BlobStore".to_string(),
+                    )
+                })?;
+                if !blob_store.exists(&attachment.content_ref).await? {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "trusted ingest attachment refers to an unpublished blob: {}",
+                        attachment.content_ref
+                    )));
+                }
             }
         }
         if !allow_transport_owned_message_properties && kind == "message" {
@@ -962,17 +982,33 @@ impl KhiveRuntime {
         // through a wrapper that cannot see the trust decision this function
         // just made.
         let inserted = if let Some(attachment) = attachment {
-            self.raw_notes(token)?
-                .try_insert_note_with_attachments(
-                    note.clone(),
-                    vec![Attachment::from_new(
-                        note.id,
-                        AttachmentSubstrate::Note,
+            if secondary_quarantine {
+                let mut outcome = QuarantineOriginalRetention::Retained;
+                let result = self
+                    .try_insert_secondary_quarantine_note(
+                        token,
+                        &mut note,
                         attachment,
-                        note.created_at,
-                    )],
-                )
-                .await?
+                        &mut outcome,
+                    )
+                    .await;
+                if let Some(retention) = retention {
+                    *retention = outcome;
+                }
+                result?
+            } else {
+                self.raw_notes(token)?
+                    .try_insert_note_with_attachments(
+                        note.clone(),
+                        vec![Attachment::from_new(
+                            note.id,
+                            AttachmentSubstrate::Note,
+                            attachment,
+                            note.created_at,
+                        )],
+                    )
+                    .await?
+            }
         } else {
             self.raw_notes(token)?.try_insert_note(note.clone()).await?
         };

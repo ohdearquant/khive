@@ -3680,3 +3680,7 @@ async fn transactional_orphan_sweep_walk_still_finds_a_real_orphan_past_its_grac
     );
     assert!(!store.exists(&orphan).await.unwrap());
 }
+
+#[cfg(test)]
+#[path = "blob_tests_secondary_quarantine.rs"]
+mod secondary_quarantine;
