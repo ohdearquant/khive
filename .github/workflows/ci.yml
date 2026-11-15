@@ -10,6 +10,9 @@ on:
   # too — a filtered trigger leaves them mergeStateStatus=CLEAN with zero checks,
   # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
+    # ready_for_review starts the full run when a draft is marked ready: a draft runs the lint and
+    # classify jobs only (see DRAFT below).
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       main_sha:
@@ -446,7 +449,7 @@ jobs:
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -743,7 +746,7 @@ jobs:
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -819,7 +822,7 @@ jobs:
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -946,7 +949,7 @@ jobs:
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1166,7 +1169,7 @@ jobs:
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -1189,7 +1192,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
     needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -1245,7 +1248,7 @@ jobs:
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -1457,7 +1460,7 @@ jobs:
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -1483,7 +1486,7 @@ jobs:
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1651,7 +1654,7 @@ jobs:
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1676,7 +1679,7 @@ jobs:
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -1793,7 +1796,7 @@ jobs:
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1885,9 +1888,11 @@ jobs:
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
     needs: [resolve-revision, changed-paths]
-    # A scoped pull request skips coverage: a number over a subset is not comparable with the baseline
-    # (ADR-205 D5). Every run on main keeps it.
-    if: needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
+    # Coverage runs on main pushes, the nightly run and manual dispatches only. Pull requests and
+    # integration trains skip it: it held a Linux runner for 40 minutes on every pull request run, and
+    # a regression is caught by the main push that lands it (fixed forward or reverted). A scoped run
+    # also skips it: a number over a subset is not comparable with the baseline (ADR-205 D5).
+    if: needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '') && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/integration/')
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -2075,7 +2080,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
     needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '') && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/integration/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -2145,9 +2150,18 @@ jobs:
       - core-only
     if: always()
     steps:
+      # DRAFT. A draft pull request runs the lint and classify jobs only; the heavy jobs skip until it is
+      # marked ready, and the ready_for_review event runs them. The gate refuses a draft by name rather
+      # than reading those skips as a pass.
+      - name: Refuse a draft pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "Gate failure: draft pull request. The full job set runs when it is marked ready for review."
+          exit 1
       - name: Check aggregated job results
         env:
           NEEDS: ${{ toJSON(needs) }}
+          COVERAGE_SKIPS: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/integration/') }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # The push guard may skip on run shape. Dependency review
@@ -2155,7 +2169,8 @@ jobs:
           # inputs fail the ratchet. The lane jobs may skip only when the
           # classifier succeeded and reported docs_only=true. The coverage
           # jobs may also skip when the classifier succeeded with a crate-list
-          # test scope (ADR-205 D6). Any other skip fails the gate.
+          # test scope (ADR-205 D6), and on every pull request and integration
+          # push, where coverage does not run. Any other skip fails the gate.
           echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
           echo "$NEEDS" | jq -r '"test scope: \(.["changed-paths"].result) test_scope=\(.["changed-paths"].outputs.test_scope // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
@@ -2172,10 +2187,12 @@ jobs:
                   and $scope != "" and ($scope | ascii_downcase) != "full"
                then ["coverage-measurement", "coverage-ratchet"]
                else [] end) as $scoped_skips
+            | (if env.COVERAGE_SKIPS == "true"
+               then ["coverage-measurement", "coverage-ratchet"] else [] end) as $event_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped"
-                  or (($allowed_skips + $docs_lane_skips + $scoped_skips) | index($job) | not)))
+                  or (($allowed_skips + $docs_lane_skips + $scoped_skips + $event_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"
