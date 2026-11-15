@@ -14466,7 +14466,9 @@ mod telegram_heartbeat_tests {
             1,
             "writable daemon reaches the same constructor probe"
         );
-        ready(writable_server.shutdown_audit_batch()).await;
+        ready(writable_server.shutdown_audit_batch())
+            .await
+            .expect("writable startup audit settlement succeeds");
 
         let directory = tempfile::tempdir().unwrap();
         let config = RuntimeConfig {
@@ -14486,7 +14488,9 @@ mod telegram_heartbeat_tests {
         });
         assert_eq!(count(&observed), 0, "read-only comm refuses both loops");
         assert_eq!(notes(&runtime, OPERATIONAL).await, before);
-        ready(server.shutdown_audit_batch()).await;
+        ready(server.shutdown_audit_batch())
+            .await
+            .expect("read-only startup audit settlement succeeds");
         // A read-only blob backend may still admit the outbox. The existing
         // mixed-topology admission test preserves that independent behavior.
     }
