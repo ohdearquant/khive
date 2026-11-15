@@ -659,6 +659,100 @@ chain is most likely to need — is never dropped from Agent JSON regardless. In
 response, JSON result payloads stay JSON values rather than rendered strings; the same
 scope-appropriate reduction policy is applied directly to those values.
 
+## Amendment 4 (2026-11-15): explicit row fields and compact recall
+
+**Amendment status**: Proposed. This amendment preserves the status and history of
+the preceding decisions and amendments.
+
+### Explicit row projection
+
+`gtd.tasks`, `gtd.next`, `memory.recall` and `session.list` accept optional `fields`.
+Omission or null retains the ordinary canonical row. A supplied value must be a
+nonempty array of names from the verb's documented closed field list. Unknown names
+and non-string entries are refused before retrieval; duplicate names produce one
+output key. There is no wildcard, dotted-path or arbitrary-property selection.
+
+Projection selects top-level row values. Documented property aliases may supply a
+value when no top-level value exists; a present null is not replaced by an alias.
+A requested optional value that is absent is represented as null, except for the
+actual-status-only recall diagnostics defined below. Session projection is limited to
+the existing content-free summaries. Projection does not enable optional recall
+computations such as source lookup or score breakdown generation.
+
+Projection changes rows only. Matching, ranking, eligibility, ordering, dependency
+checks, visibility and pagination remain unchanged. Envelope counts, totals,
+continuation fields, clamp reports and explanatory fields remain present. Recall
+serving evidence and hit/miss bookkeeping consume complete selected records before
+projection; projection changes neither selected identifiers nor existing write effects.
+
+The selected row is canonical handler output. `$prev` therefore sees the selected
+fields: a field omitted from a projection cannot be recovered through a chain path.
+Automatic display compaction continues to occur after canonical chain values are
+captured and does not restrict those values.
+
+Explicit fields take precedence over automatic metadata and redundancy reductions in
+all presentation modes and formats. Requested nulls, empty arrays/objects, UUIDs,
+timestamps and numeric precision are retained. The chosen format still controls how
+the selected data is rendered. This exception does not alter unrelated verbs, error
+entries or the behavior of requests without explicit projection.
+
+### Compact default recall
+
+With `fields` omitted, Agent JSON for `memory.recall` displays `id`, `full_id`,
+`content`, `name` and `score`, together with applicable serving-status markers and
+explicitly requested optional evidence. An unnamed record has `name: null`.
+Scoring internals, full properties and attribution details remain in canonical rows
+and are available through `presentation=verbose` or explicit field selection.
+Human JSON retains its full-row behavior. Verbose presentation does not implicitly
+enable optional breakdown generation, source lookup or full-content options.
+
+The existing JSON feedback handle is retained: `full_id` remains the canonical UUID
+in the default compact row and can be passed to strict `memory.feedback(id=...)`.
+This supersedes Amendment 3's retention of every other top-level field only for the
+default Agent display of `memory.recall`. Its JSON full-ID guarantee remains intact.
+Without explicit fields, `auto` and `table` retain their existing view reductions;
+with explicit fields, a selected `full_id` survives those reductions. A caller that
+projects away both identifier fields intentionally requests a row without a feedback
+handle.
+
+Compact display preserves the existing root-array and result-envelope shapes. It does
+not alter retrieval, ranking, content budgets, optional evidence computation or stored
+data, and it never rewrites canonical chain values.
+
+### Recall serving-status exception
+
+For `memory.recall` only, a row's actual `degraded`, `degraded_reason` and `truncated`
+values remain diagnostic siblings under both explicit `fields` and the compact Agent
+default. They remain at their existing row locations even when not selected. Copy only
+markers present in the canonical row: a healthy complete row gains no false or null
+marker, including when a diagnostic name appears in `fields`.
+
+Existing outer diagnostics also remain intact, including `budget_capped`,
+`truncated_for_budget`, degradation fields and timing reports. Existing root-array and
+result-envelope shapes are unchanged; this exception adds no wrapper and applies to no
+other verb.
+
+For a nonempty degraded hit, `fields=["content"]` retains content plus its actual
+`degraded` value and failure-site `degraded_reason`. A budget-capped hit retains its
+actual `truncated` marker. A healthy complete hit returns content alone. The compact
+default keeps the same actual diagnostics, so a degraded or partial serve cannot appear
+healthy and complete merely because fewer row fields were requested.
+
+### Acceptance
+
+- Refuse invalid field lists before retrieval, preserving redacted error diagnostics.
+- Prove row identities, order, page metadata, visibility and stored state are unchanged.
+- Preserve requested optional nulls, empty values and full UUIDs through both
+  presentation and format preparation in single, batch and chain execution.
+- Prove projected recall without an ID still records the actual selected IDs and a hit;
+  prove explicit projection restricts canonical chains while default compaction does not.
+- Preserve the JSON feedback handle and full Verbose evidence.
+- Under `fields=["content"]`, prove a nonempty degraded hit retains both its marker and
+  failure-site reason, and a nonempty budget-capped hit retains `truncated`. Prove a
+  healthy complete hit gains no marker, including when marker names are requested.
+- Prove the same actual diagnostics survive the compact default and existing empty or
+  enveloped branches. Controls that strip each required marker must fail these witnesses.
+
 ## References
 
 - ADR-016 (Request DSL) — short-UUID-prefix resolution; `$prev` chain semantics; `RequestParams`
