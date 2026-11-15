@@ -485,6 +485,11 @@ jobs:
       # The head-repository check keeps the rule to branches of this
       # repository: a pull request from a fork runs the three-job matrix
       # whatever its branch is called.
+      # A push to an `integration/train-*` branch runs the two Linux shards
+      # only, the same job set as those pull requests. A train's run is the
+      # merge gate for its members, and both macOS shards on it waited for a
+      # runner longer than the Linux lanes took. The push to main that lands
+      # each member still runs both macOS shards.
       #
       # Written as an explicit include list rather than an `exclude` expression
       # so every branch names every job it produces.
@@ -494,6 +499,9 @@ jobs:
             || startsWith(github.head_ref, 'split/')
             || startsWith(github.head_ref, 'docs/'))
           && github.event.pull_request.head.repo.full_name == github.repository
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
+          || github.event_name == 'push'
+          && startsWith(github.ref, 'refs/heads/integration/train-')
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
           || github.event_name == 'pull_request'
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1}]'
