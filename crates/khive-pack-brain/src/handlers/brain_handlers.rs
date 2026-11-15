@@ -45,6 +45,21 @@ fn parse_local_factor(raw: Option<&Value>) -> Result<Option<f64>, RuntimeError> 
 
 // ── BrainPack handler impl ────────────────────────────────────────────────────
 
+pub(super) fn parse_event_kind(raw: &str) -> Result<khive_types::EventKind, RuntimeError> {
+    raw.parse::<khive_types::EventKind>().map_err(|mut error| {
+        // EventKind normalizes case before constructing its error. Inspect the
+        // original operand so that case-sensitive credentials remain detectable.
+        let masked = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
+        if masked.as_ref() != raw {
+            error.value = masked.into_owned();
+        }
+        let message = format!("invalid `kind`: {error}");
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &message).into_owned(),
+        )
+    })
+}
+
 impl BrainPack {
     // ── brain.state ───────────────────────────────────────────────────────
 
@@ -358,13 +373,7 @@ impl BrainPack {
             None => Utc::now().timestamp_micros(),
         };
 
-        let kind_filter = match p.kind.as_deref() {
-            Some(k) => Some(
-                k.parse::<khive_types::EventKind>()
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid `kind`: {e}")))?,
-            ),
-            None => None,
-        };
+        let kind_filter = p.kind.as_deref().map(parse_event_kind).transpose()?;
 
         // The event plane is read through a store scoped to exactly one
         // namespace (`Runtime::events` opens `token.namespace()` and the SQL
@@ -502,7 +511,11 @@ impl BrainPack {
 
     // ── brain.profile ─────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_profile(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Accept both `profile_id` (canonical) and `id` (legacy alias).
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -523,6 +536,50 @@ impl BrainPack {
             .materialized_profile(&profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
         let record = &record;
+
+        let resolving_bindings: Vec<Value> = state
+            .bindings
+            .iter()
+            .filter(|binding| {
+                let namespace = token.namespace().as_str();
+                if binding.profile_id != profile_id
+                    || (binding.actor != "*"
+                        && Self::check_read_actor(token, &binding.actor).is_err())
+                    || (binding.namespace != "*" && binding.namespace != namespace)
+                {
+                    return false;
+                }
+                // Anonymous consumers are a real context for wildcard actors.
+                // Named actors only add more-specific candidates, so querying
+                // the current named caller alone could hide a usable wildcard.
+                let actor = (binding.actor != "*").then_some(binding.actor.as_str());
+                [
+                    ConsumerKind::Recall,
+                    ConsumerKind::KnowledgeCompose,
+                    ConsumerKind::Rerank,
+                ]
+                .into_iter()
+                .filter(|kind| {
+                    binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
+                })
+                .any(|kind| {
+                    state
+                        .resolve_with_match(actor, Some(namespace), kind.as_str())
+                        .is_some_and(|(resolved, _, matched_binding)| {
+                            matched_binding && resolved.id == profile_id
+                        })
+                })
+            })
+            .map(|binding| {
+                json!({
+                    "actor": binding.actor,
+                    "namespace": binding.namespace,
+                    "consumer_kind": binding.consumer_kind,
+                })
+            })
+            .collect();
+        let serving_through_visible_binding_while_inactive =
+            record.lifecycle == ProfileLifecycle::Inactive && !resolving_bindings.is_empty();
 
         // Build per-section posterior summary for the response.
         let section_summary = if let Some(ss) = state.section_states.get(&profile_id) {
@@ -572,6 +629,8 @@ impl BrainPack {
             "consumer_kind": record.consumer_kind,
             "state_class": record.state_class,
             "lifecycle": record.lifecycle,
+            "resolving_bindings": resolving_bindings,
+            "serving_through_visible_binding_while_inactive": serving_through_visible_binding_while_inactive,
             "total_events": record.total_events,
             "exploration_epoch": record.exploration_epoch,
             "created_at": record.created_at,
@@ -2205,8 +2264,12 @@ mod local_factor_tests {
             state.profiles.insert(record.id.clone(), record);
         }
 
+        let token = pack
+            .runtime
+            .authorize(Namespace::local())
+            .expect("local token");
         let profile = pack
-            .handle_profile(json!({ "profile_id": "bare-profile" }))
+            .handle_profile(&token, json!({ "profile_id": "bare-profile" }))
             .await
             .expect("brain.profile");
 

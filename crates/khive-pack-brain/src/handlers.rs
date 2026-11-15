@@ -231,7 +231,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profile",
-        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1). The response namespace identifies the selected catalog.",
+        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1). The response namespace identifies the selected catalog. resolving_bindings lists wildcard or actor-visible bindings that select this profile for a concrete recall, knowledge_compose or rerank consumer in that catalog; wildcard actors are checked with the anonymous consumer context. serving_through_visible_binding_while_inactive is true when the profile is inactive and that list is nonempty; false makes no claim about hidden bindings. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless of that lifecycle.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -266,7 +266,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to read and the binding namespace context. If omitted, uses the caller's default catalog and matches only bindings with namespace \"*\"; profile fallback still applies when none match.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -274,7 +274,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
         name: "brain.activate",
-        description: "Move a profile to Active (lifecycle transition; serving reads profile state per-request)",
+        description: "Move a profile to Active for the unbound fallback. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless of that lifecycle. Serving reads profile state per-request.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -287,7 +287,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.deactivate",
-        description: "Move a profile to Inactive (lifecycle transition; retain state)",
+        description: "Move a profile to Inactive while retaining state. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile continues serving regardless of that lifecycle. Deactivation does not remove bindings.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -558,7 +558,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to write and the binding namespace to match. If omitted, stores a \"*\" binding in the caller's default catalog, matching every namespace context within that catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -637,7 +637,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "The catalog this call reads and writes; omitted = local. Bindings match and resolve in this catalog.",
+                description: "The profile catalog to read and the binding namespace filter. If omitted, reads the caller's default catalog without filtering binding namespaces; other filters still apply.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -903,7 +903,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
                 Ok(answer)
             }
             "brain.profile" => {
-                let mut answer = self.handle_profile(params).await?;
+                let mut answer = self.handle_profile(token, params).await?;
                 answer["namespace"] = json!(token.namespace().as_str());
                 Ok(answer)
             }

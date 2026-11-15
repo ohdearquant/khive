@@ -405,16 +405,35 @@ impl KhiveRuntime {
             Err(RuntimeError::Internal("injected FTS failure".into()))
         } else {
             match self.text(token) {
-                Ok(text) => text.upsert_document(doc).await.map_err(Into::into),
+                Ok(_) => {
+                    let statements = khive_db::stores::text::delete_document_statements(
+                        "fts_entities",
+                        &entity.namespace,
+                        entity.id,
+                    )
+                    .into_iter()
+                    .chain(khive_db::stores::text::insert_document_statements(
+                        "fts_entities",
+                        &doc,
+                    ))
+                    .collect();
+                    self.apply_entity_index_revision(entity, statements).await
+                }
                 Err(error) => Err(error),
             }
         };
-        fts_result.map_err(|error| {
+        let published = fts_result.map_err(|error| {
             RuntimeError::Internal(format!(
                 "entity {} persists but its text index failed: {error}",
                 entity.id
             ))
         })?;
+        if !published {
+            return Err(RuntimeError::Internal(format!(
+                "entity {} persists but changed concurrently before text index publication; retry against the current row",
+                entity.id
+            )));
+        }
 
         for model_name in self.registered_embedding_model_names() {
             let outcome = self
@@ -436,20 +455,8 @@ impl KhiveRuntime {
                     entity.id
                 )));
             }
-            self.vectors_for_model(token, &model_name)
-                .map_err(|error| {
-                    RuntimeError::Internal(format!(
-                        "entity {} persists but model {model_name} vector store is unavailable: {error}",
-                        entity.id
-                    ))
-                })?
-                .insert(
-                    entity.id,
-                    SubstrateKind::Entity,
-                    &entity.namespace,
-                    "entity.body",
-                    vec![outcome.vector],
-                )
+            let published = self
+                .publish_entity_vector_revision(token, entity, &model_name, &outcome.vector)
                 .await
                 .map_err(|error| {
                     RuntimeError::Internal(format!(
@@ -457,6 +464,12 @@ impl KhiveRuntime {
                         entity.id
                     ))
                 })?;
+            if !published {
+                return Err(RuntimeError::Internal(format!(
+                    "entity {} persists but changed concurrently before model {model_name} vector publication; retry against the current row",
+                    entity.id
+                )));
+            }
         }
         Ok(())
     }

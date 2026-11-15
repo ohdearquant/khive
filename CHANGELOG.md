@@ -11,11 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
   `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
-  `legacy_preference_model_count`. An embedding host can bring a pre-V21 database forward without
-  depending on `khive-mcp`. `RuntimeError` gains `AttachmentCutoverRequired`.
+  `legacy_preference_model_count`. An embedding host can bring a V20 database to V21 without
+  depending on `khive-mcp`, provided that, when the database holds legacy moodboard preference
+  models, it passes a legacy-preference verifier and a blob hydrator; without them the call fails
+  closed. `RuntimeError` gains `AttachmentCutoverRequired`.
 
 ### Changed
 
+- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when more
+  matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)` that
+  works on a short queue fails with `substitution_error` once the queue passes the limit: read the
+  object's `tasks`, or read the page first and pass the id in a separate call.
 - `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
   `RuntimeError::AttachmentCutoverRequired`, whose message names
   `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
@@ -23,10 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_query::GqlQuery` adds `order_by: Vec<OrderItem>`, so direct Rust constructors must
+  initialize it; exhaustive `PropertyRef` matches must handle the new `MetadataPath` variant.
 - `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
   `RuntimeError` needs an arm for it.
 
 ## [0.19.0] - 2026-11-11
+
 ### Added
 
 - `[actor] require_attributed = true` turns on strict attributed-actor mode, the same as
@@ -72,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle the new arm.
 
 ## [0.18.0] - 2026-11-08
+
 ### Added
 
 - `kkernel exec --read-only` runs inline DSL against an existing file-backed database through a
@@ -236,6 +246,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kkernel::exec::ExecArgs` adds `read_only`.
 
 ## [0.17.0] - 2026-11-04
+
 ### Added
 
 - `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
@@ -300,6 +311,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
   posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
   event to the profile that served it, as the live path does.
+
 ### Fixed
 
 - `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
@@ -334,6 +346,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kkernel::reindex::ReindexArgs` adds `fts_only`.
 
 ## [0.16.0] - 2026-11-01
+
 ### Added
 
 - `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task

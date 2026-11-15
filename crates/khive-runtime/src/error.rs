@@ -15,7 +15,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub enum DomainDisposition {
     /// The handler returned its canonical success value before a later failure.
     Committed,
-    /// The operation was refused before its handler was invoked.
+    /// No requested domain write committed, established by pre-dispatch refusal
+    /// or an explicit handler/write proof.
     NotCommitted,
     /// The handler failed, so its domain effects are not established here.
     Unknown,
@@ -648,11 +649,73 @@ impl std::error::Error for ResolutionFailureContext {
     }
 }
 
+/// The substrate whose required search metadata could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadSubstrate {
+    Entity,
+    Note,
+}
+
+impl SearchReadSubstrate {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Search context with an intact typed cause that is never rendered publicly.
+#[derive(Debug)]
+pub struct SearchReadContext {
+    backend: crate::BackendId,
+    substrate: SearchReadSubstrate,
+    source: Box<RuntimeError>,
+}
+
+impl SearchReadContext {
+    pub fn backend(&self) -> &crate::BackendId {
+        &self.backend
+    }
+
+    pub fn substrate(&self) -> SearchReadSubstrate {
+        self.substrate
+    }
+
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> RuntimeError {
+        *self.source
+    }
+}
+
+impl fmt::Display for SearchReadContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "search metadata read failed on backend {} ({})",
+            self.backend,
+            self.substrate.as_str()
+        )
+    }
+}
+
+impl std::error::Error for SearchReadContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A required search read failed; public context excludes source contents.
+    #[error(transparent)]
+    SearchRead { context: SearchReadContext },
     /// A decoded canonical operation has no live apply implementation.
     #[error(
         "canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"
@@ -976,6 +1039,21 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Attach the owning backend and substrate without exposing the cause text.
+    pub fn with_search_read_context(
+        self,
+        backend: crate::BackendId,
+        substrate: SearchReadSubstrate,
+    ) -> Self {
+        Self::SearchRead {
+            context: SearchReadContext {
+                backend,
+                substrate,
+                source: Box::new(self),
+            },
+        }
+    }
+
     /// Certify that this operation refused before attempting requested data writes.
     pub fn before_requested_write(self) -> Self {
         Self::BatchWrite {
@@ -1027,6 +1105,7 @@ impl RuntimeError {
         match self {
             Self::BatchWrite { context } => Some(context.disposition),
             Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
+            Self::SearchRead { context } => context.source.batch_write_disposition(),
             _ => None,
         }
     }
@@ -1070,6 +1149,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => &context.source,
                 Self::BatchWrite { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
+                Self::SearchRead { context } => context.source.as_ref(),
                 Self::LintFix { source, .. } => source.as_ref(),
                 Self::CanonicalAdmission { source, .. } => source.as_ref(),
                 _ => return error,
@@ -1169,6 +1249,7 @@ impl RuntimeError {
             Self::RefusedWithEvents { context } => context.source.variant_name(),
             Self::BatchWrite { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
+            Self::SearchRead { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
             Self::CanonicalAdmission { source, .. } => source.variant_name(),
             Self::CanonicalUnsupportedOperation { .. } => "CanonicalUnsupportedOperation",
@@ -1291,6 +1372,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => enclosing = &context.source,
                 Self::BatchWrite { context } => enclosing = &context.source,
                 Self::WithResolution { context } => enclosing = &context.source,
+                Self::SearchRead { context } => enclosing = &context.source,
                 _ => break,
             }
         }
@@ -1431,6 +1513,47 @@ mod batch_write_proof_tests {
         let value = runtime_error_value(source, disposition);
         assert_eq!(value["domain_disposition"], disposition.as_str());
         (disposition, value)
+    }
+
+    #[test]
+    fn rejected_before_write_preserves_enclosing_disposition_and_error_class() {
+        let message = "decoding refused";
+        let (disposition, value) =
+            project_failed(RuntimeError::InvalidInput(message.into()).before_requested_write());
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["kind"], "runtime_error");
+        assert_eq!(value["message"], format!("invalid input: {message}"));
+        assert_eq!(
+            RuntimeError::InvalidInput(message.into())
+                .before_requested_write()
+                .audit_error_class(),
+            crate::audit_error::AuditErrorClass::InvalidParams
+        );
+        let (ordinary, _) = project_failed(RuntimeError::InvalidInput(message.into()));
+        assert_eq!(ordinary, DomainDisposition::Unknown);
+
+        let enclosing = RuntimeError::InvalidInput(message.into())
+            .before_requested_write()
+            .with_resolution(ResolutionFacts {
+                project_id: Uuid::new_v4(),
+                duplicate_anchor_ids: vec![],
+                slug_backfilled: false,
+                project_created: true,
+                orphaned_project_id: None,
+                orphaned_note_count: 0,
+            });
+        let (disposition, _) = project_failed(enclosing);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        let committed = DispatchError::after_handler(
+            RuntimeError::InvalidInput(message.into()).before_requested_write(),
+            true,
+        );
+        assert_eq!(committed.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = committed.into_parts();
+        assert_eq!(
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
+        );
     }
 
     #[test]

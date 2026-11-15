@@ -51,6 +51,10 @@ pub(crate) use commit_history::*;
 #[path = "commit_text_tests.rs"]
 mod commit_text_tests;
 
+/// Content stored when a commit's original fields fail the secret gate.
+pub const REDACTED_COMMIT_MESSAGE: &str =
+    "Commit message was redacted after a secret-gate refusal.";
+
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
 }
@@ -262,7 +266,7 @@ pub struct IngestWriteRefusal {
     pub record_key: String,
     pub detector: String,
     pub masked: String,
-    /// Present only for a GitHub replacement attempt; true after a real UUID returns.
+    /// Present for a redacted replacement attempt; true after a valid create receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted: Option<bool>,
 }
@@ -333,6 +337,13 @@ pub struct IngestReport {
     pub project_annotation_census_complete: bool,
     /// Notes classified in the census snapshot, at most 1000; zero if unavailable.
     pub project_annotation_notes_scanned: u64,
+    /// Missing or unavailable existing-note annotation checks observed this pass,
+    /// across fresh lookups and eligible acknowledged replays for issues and PRs.
+    /// Only the first 20 corresponding details are retained in `warnings`; a
+    /// count greater than the number of retained existing-note details means
+    /// details were omitted. Unrelated warnings and replay-budget exhaustion
+    /// are excluded. Always serialized, including zero; not a corpus-wide total.
+    pub existing_project_annotation_warning_count: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
     /// `Some(false)` when the source-bound `gh repo view` probe ran but could
