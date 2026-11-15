@@ -2,7 +2,7 @@
 
 use super::{
     build_note_filter_read_clause, build_note_filter_where, comm_filter_index_clause,
-    note_filter_page_order_clause, NOTE_COLUMNS,
+    note_filter_page_order_clause, note_filter_page_sql, NOTE_COLUMNS,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::SqlValue;
@@ -271,6 +271,23 @@ fn measure_with_sql(
         params.len() - 1,
         params.len(),
     ));
+    measure_statement(conn, sql, params)
+}
+
+fn measure_due_page(conn: &Connection, filter: &NoteFilter) -> Value {
+    let (sql, params) = note_filter_page_sql("default", filter, 21_i64, 0_i64).unwrap();
+    assert!(
+        !sql.contains("INDEXED BY"),
+        "due page must not force an index: {sql}"
+    );
+    measure_statement(conn, sql, params)
+}
+
+fn measure_statement(
+    conn: &Connection,
+    sql: String,
+    params: Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Value {
     let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let plan: Vec<String> = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -437,6 +454,11 @@ fn delivered_history_fixture(history: usize) -> (tempfile::TempDir, Connection) 
     conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
         .unwrap();
     register_comm_indexes(&conn);
+    seed_delivered_history(&mut conn, history);
+    (dir, conn)
+}
+
+fn seed_delivered_history(conn: &mut Connection, history: usize) {
     let tx = conn.transaction().unwrap();
     {
         let mut insert = tx.prepare(
@@ -492,7 +514,6 @@ fn delivered_history_fixture(history: usize) -> (tempfile::TempDir, Connection) 
          WHERE id >= '10000000' AND id < '20000000'", [],
     ).unwrap(), history);
     tx.commit().unwrap();
-    (dir, conn)
 }
 
 #[test]
@@ -538,6 +559,182 @@ fn outbox_due_work_is_independent_of_delivered_history() {
         }
         assert_eq!(outbox_row_snapshot(&small), small_before);
         assert_eq!(outbox_row_snapshot(&large), large_before);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MigratedHistorySchema {
+    Fresh,
+    V65Upgrade,
+}
+
+fn history_migration_ledger(conn: &Connection) -> Vec<(u32, String, i64)> {
+    conn.prepare("SELECT version, name, applied_at FROM _schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn installed_outbox_due_index(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_comm_message_outbound_due'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn assert_migrated_outbox_due_index(conn: &Connection) {
+    let (_, create) = OUTBOX_DUE_INDEX.split_once("CREATE INDEX").unwrap();
+    let expected = format!("CREATE INDEX{create}");
+    assert_eq!(
+        installed_outbox_due_index(conn)
+            .trim()
+            .trim_end_matches(';'),
+        expected.trim().trim_end_matches(';'),
+        "migration must install the complete authored index definition"
+    );
+}
+
+fn migrate_history_through_v65(conn: &mut Connection) {
+    conn.execute_batch(include_str!("../../sql/schema-migrations-table.sql"))
+        .unwrap();
+    for migration in crate::migrations::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 65)
+    {
+        let tx = conn.transaction().unwrap();
+        // The bounded DDL-history fixture includes the two Rust-owned schema
+        // bodies; the populated V65-to-current transition uses the real runner.
+        if migration.version == 44 {
+            crate::migrations::migrate_outbound_due_key(&tx).unwrap();
+        } else if migration.version == 48 {
+            crate::migrations::migrate_acknowledgement_journal(&tx).unwrap();
+        } else {
+            tx.execute_batch(migration.up).unwrap();
+        }
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+}
+
+fn migrated_delivered_history_fixture(
+    history: usize,
+    schema: MigratedHistorySchema,
+) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = Connection::open(dir.path().join("outbox.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "cache_size", crate::pool::sqlite_cache_size_pragma())
+        .unwrap();
+    conn.pragma_update(None, "mmap_size", crate::pool::sqlite_mmap_size_pragma())
+        .unwrap();
+    // Register the read function without replacing any migrated index.
+    crate::pool::register_rfc3339_key(&conn).unwrap();
+    let latest = crate::migrations::latest_schema_version();
+    match schema {
+        MigratedHistorySchema::Fresh => {
+            assert_eq!(
+                crate::migrations::run_migrations_for_test(&mut conn).unwrap(),
+                latest
+            );
+            assert_eq!(
+                crate::migrations::read_schema_version(&conn).unwrap(),
+                latest
+            );
+            seed_delivered_history(&mut conn, history);
+        }
+        MigratedHistorySchema::V65Upgrade => {
+            migrate_history_through_v65(&mut conn);
+            assert_eq!(crate::migrations::read_schema_version(&conn).unwrap(), 65);
+            assert!(
+                !installed_outbox_due_index(&conn).contains("$.delivered_at"),
+                "predecessor index must still include delivered history"
+            );
+            seed_delivered_history(&mut conn, history);
+            let rows_before = outbox_row_snapshot(&conn);
+            let ledger_before = history_migration_ledger(&conn);
+            assert_eq!(ledger_before.last().unwrap().0, 65);
+            assert_eq!(
+                crate::migrations::run_migrations_for_test(&mut conn).unwrap(),
+                latest
+            );
+            assert_eq!(outbox_row_snapshot(&conn), rows_before);
+            let ledger_after = history_migration_ledger(&conn);
+            assert_eq!(ledger_after.len(), crate::migrations::MIGRATIONS.len());
+            assert_eq!(
+                &ledger_after[..ledger_before.len()],
+                ledger_before.as_slice()
+            );
+            let first_new = &ledger_after[ledger_before.len()];
+            assert_eq!(
+                (first_new.0, first_new.1.as_str()),
+                (66, "comm_undelivered_due_index")
+            );
+        }
+    }
+    assert_eq!(
+        crate::migrations::read_schema_version(&conn).unwrap(),
+        latest
+    );
+    assert_migrated_outbox_due_index(&conn);
+    (dir, conn)
+}
+
+#[test]
+fn outbox_due_migrated_schemas_preserve_plans_and_work_bounds() {
+    for schema in [
+        MigratedHistorySchema::Fresh,
+        MigratedHistorySchema::V65Upgrade,
+    ] {
+        let (_small_dir, small) = migrated_delivered_history_fixture(1000, schema);
+        let (_large_dir, large) = migrated_delivered_history_fixture(10_000, schema);
+        for stage in ["fresh", "analyzed"] {
+            if stage == "analyzed" {
+                small.execute_batch("ANALYZE").unwrap();
+                large.execute_batch("ANALYZE").unwrap();
+            }
+            let small_before = outbox_row_snapshot(&small);
+            let large_before = outbox_row_snapshot(&large);
+            assert_eq!(small_before.len(), 3025);
+            assert_eq!(large_before.len(), 12_025);
+            for legacy in [false, true] {
+                let expected: Vec<_> = if legacy { vec![17, 16] } else { vec![3, 1, 2] }
+                    .into_iter()
+                    .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+                    .collect();
+                let filter = history_outbox_filter(legacy);
+                let small_read = measure_due_page(&small, &filter);
+                let large_read = measure_due_page(&large, &filter);
+                assert_eq!(
+                    small_read["ids"],
+                    json!(expected),
+                    "{schema:?}, {stage}, legacy={legacy}"
+                );
+                assert_eq!(large_read["ids"], small_read["ids"]);
+                for read in [&small_read, &large_read] {
+                    let plan = read["plan"].to_string();
+                    assert!(
+                        plan.contains("idx_comm_message_outbound_due")
+                            && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?")
+                            && plan.contains("<expr><?"),
+                        "{schema:?}, {stage}, legacy={legacy}: bucket/deadline seek missing: {plan}"
+                    );
+                }
+                let small_steps = small_read["vm_steps"].as_i64().unwrap();
+                let large_steps = large_read["vm_steps"].as_i64().unwrap();
+                assert!(large_steps <= small_steps + 128,
+                    "{schema:?}, {stage}, legacy={legacy}: delivered history added due-page work: {small_steps} -> {large_steps}");
+            }
+            assert_eq!(outbox_row_snapshot(&small), small_before);
+            assert_eq!(outbox_row_snapshot(&large), large_before);
+        }
     }
 }
 
