@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::future::{poll_fn, Future};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::Poll;
+use std::time::{Duration, Instant as WallInstant};
 
 use async_trait::async_trait;
 use khive_pack_kg::handlers::ValidatedSearchRequest;
@@ -63,9 +65,15 @@ impl ProbeCoordinator {
                 );
                 let deadline = context.deadline().expect("caller installed a deadline");
                 assert!(!*self.cancellation.borrow(), "no explicit cancellation");
-                // Cross the deadline after the populated result was obtained. A
-                // small tick avoids depending on the timer's exact boundary.
-                tokio::time::sleep_until(deadline.async_at() + Duration::from_millis(2)).await;
+                // Only advance after the populated result was obtained. The
+                // request driver prevents automatic jumps during admission.
+                tokio::time::advance(
+                    deadline
+                        .async_at()
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        + Duration::from_millis(2),
+                )
+                .await;
                 assert!(
                     !*self.cancellation.borrow(),
                     "deadline does not cancel the watch"
@@ -74,6 +82,8 @@ impl ProbeCoordinator {
                     context.stop_reason(),
                     Some(khive_storage::RequestReadStopReason::Deadline)
                 );
+                // Audit I/O and its timers use normal time after the refusal.
+                tokio::time::resume();
                 Ok(())
             }
             Outcome::Timeout {
@@ -138,7 +148,7 @@ impl CoordinatorService for ProbeCoordinator {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult {
+    ) -> Result<CoordSearchResult, RuntimeError> {
         self.inner
             .fan_out_search(request, namespace, extra_visible)
             .await
@@ -370,29 +380,53 @@ async fn coordinated_request_stop_is_not_committed_and_retryable() {
     }
 }
 
+async fn poll_clock_controlled_request<F: Future>(request: F) -> F::Output {
+    tokio::pin!(request);
+    let watchdog = WallInstant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            WallInstant::now() < watchdog,
+            "request wall watchdog expired"
+        );
+        let observed = poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await;
+        if let Poll::Ready(result) = observed {
+            return result;
+        }
+        // Keep the same task runnable so paused Tokio time cannot jump while
+        // admission is pending. This does not freeze the blocking wall clock.
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn coordinated_request_deadline_is_not_committed_and_retryable() {
     for kind in ["entity", "note"] {
+        // The failing audit sink deliberately cancels the watch; that precedence
+        // is covered by the stop test, while this case isolates deadline expiry.
         let expired = fixture(Outcome::DeadlineThenAnswer, false);
+        tokio::time::pause();
         let deadline = khive_storage::RequestReadDeadline::after(Duration::from_secs(1));
-        let entry = khive_storage::scope_request_read_deadline_at(deadline, async {
-            let entry = expired.entry(kind).await;
-            let context = khive_storage::capture_request_read_context();
-            assert_eq!(context.deadline().unwrap().async_at(), deadline.async_at());
-            assert_eq!(
-                context.stop_reason(),
-                Some(khive_storage::RequestReadStopReason::Deadline)
-            );
-            assert!(
-                matches!(
-                    khive_storage::ensure_request_read_active("search"),
-                    Err(StorageError::Timeout { operation }) if operation.as_ref() == "search"
-                ),
-                "retryability does not renew the original request"
-            );
-            entry
-        })
+        let entry = poll_clock_controlled_request(khive_storage::scope_request_read_deadline_at(
+            deadline,
+            async {
+                let entry = expired.entry(kind).await;
+                let context = khive_storage::capture_request_read_context();
+                assert_eq!(context.deadline().unwrap().async_at(), deadline.async_at());
+                assert_eq!(
+                    context.stop_reason(),
+                    Some(khive_storage::RequestReadStopReason::Deadline)
+                );
+                assert!(
+                    matches!(
+                        khive_storage::ensure_request_read_active("search"),
+                        Err(StorageError::Timeout { operation }) if operation.as_ref() == "search"
+                    ),
+                    "retryability does not renew the original request"
+                );
+                entry
+            },
+        ))
         .await;
         assert!(
             !*expired.receiver.borrow(),

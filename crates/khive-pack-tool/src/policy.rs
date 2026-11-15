@@ -30,6 +30,40 @@ pub fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32,
 
 pub use khive_storage::now_micros;
 
+/// Prepare the namespace-local authorization changes for a captured registry row.
+/// Execute these only with the row's guarded retirement in the same writer unit.
+pub fn registry_retirement_statements(
+    namespace: &str,
+    registry_id: Uuid,
+    name: &str,
+    retired_at: i64,
+    actor: &str,
+) -> [SqlStatement; 2] {
+    [
+        SqlStatement::new(
+            khive_runtime::sql!("unregister-policies"),
+            vec![
+                SqlValue::Integer(retired_at),
+                SqlValue::Text(actor.into()),
+                SqlValue::Text(namespace.into()),
+                SqlValue::Text(name.into()),
+            ],
+        )
+        .labelled("tool-unregister-policies"),
+        SqlStatement::new(
+            khive_runtime::sql!("unregister-grants"),
+            vec![
+                SqlValue::Integer(retired_at),
+                SqlValue::Text(actor.into()),
+                SqlValue::Text(namespace.into()),
+                SqlValue::Text(registry_id.to_string()),
+                SqlValue::Text(name.into()),
+            ],
+        )
+        .labelled("tool-unregister-grants"),
+    ]
+}
+
 /// The caller's actor as one label, `kind:id`, except that the plain `actor`
 /// kind collapses to its id so a configured `lambda:khive` reads back as
 /// itself.
@@ -946,6 +980,14 @@ pub(crate) async fn insert_grant_request(
     Ok(row)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static GRANT_PREPARED_PAUSE: (
+        tokio::sync::mpsc::UnboundedSender<Option<String>>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    );
+}
+
 pub(crate) async fn set_grant_status(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -962,6 +1004,19 @@ pub(crate) async fn set_grant_status(
         None
     };
     let pin = registration.as_ref().map(|row| row.pin()).transpose()?;
+    #[cfg(test)]
+    if let Ok((ready, release)) =
+        GRANT_PREPARED_PAUSE.try_with(|(ready, release)| (ready.clone(), release.clone()))
+    {
+        ready
+            .send(pin.as_ref().map(|pin| pin.registry_id().to_string()))
+            .expect("grant preparation observer");
+        release
+            .acquire()
+            .await
+            .expect("grant preparation release")
+            .forget();
+    }
     let prepared = prepared.clone();
     let ns = token.namespace().as_str().to_string();
     let visible_namespaces: Vec<String> = token
@@ -1212,6 +1267,133 @@ pub async fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn unregister_refuses_a_grant_prepared_against_the_retired_registration() {
+        use khive_pack_kg::KgPack;
+        use khive_runtime::{KhiveRuntime, RequestIdentity, RuntimeError, VerbRegistryBuilder};
+        use serde_json::{json, Value};
+        use std::{sync::Arc, time::Duration};
+
+        async fn stored_grant(rt: &KhiveRuntime, id: &str) -> Value {
+            let rows = rt
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(khive_storage::SqlStatement::new(
+                    "SELECT * FROM tool_grants WHERE namespace = ?1 AND id = ?2",
+                    vec![SqlValue::Text("local".into()), SqlValue::Text(id.into())],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            serde_json::to_value(rows).unwrap()
+        }
+
+        for retire in [false, true] {
+            let rt = KhiveRuntime::memory().unwrap();
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(crate::ToolPack::new(rt.clone()));
+            let registry = builder.build().unwrap();
+            registry.apply_schema_plans(rt.backend());
+            rt.install_edge_rules(registry.all_edge_rules());
+            let registered = registry
+                .dispatch(
+                    "tool.register",
+                    json!({
+                        "name":"prepared-retirement", "namespace":"owner", "source":"mcp:fixture",
+                        "side_effect":"write"
+                    }),
+                )
+                .await
+                .unwrap();
+            let registry_id = registered["tool"]["full_id"].as_str().unwrap().to_owned();
+            let identity = RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some("agent:decider".into()),
+                visible_namespaces: vec!["owner".into()],
+                ..Default::default()
+            };
+            let requested = registry.dispatch_with_identity("tool.request", json!({
+                "tool":"prepared-retirement", "actor":"agent:requester", "reason":"retirement race"
+            }), Some(identity.clone())).await.unwrap();
+            let request_id = requested["request_id"].as_str().unwrap().to_owned();
+            let before = stored_grant(&rt, &request_id).await;
+            assert_eq!(
+                super::get_grant(&rt, "local", &request_id)
+                    .await
+                    .unwrap()
+                    .status,
+                "requested"
+            );
+            let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let grant = super::GRANT_PREPARED_PAUSE.scope(
+                (ready_tx, release.clone()),
+                registry.dispatch_with_identity(
+                    "tool.grant",
+                    json!({"id":request_id}),
+                    Some(identity.clone()),
+                ),
+            );
+            let retire_after_prepare = async {
+                let captured_id = ready_rx.recv().await.expect("actual grant preparation");
+                assert_eq!(captured_id.as_deref(), Some(registry_id.as_str()));
+                if retire {
+                    let result = registry
+                        .dispatch(
+                            "tool.unregister",
+                            json!({
+                                "tool":registry_id, "namespace":"owner"
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result["retired"], true);
+                    assert_eq!(result["grants_revoked"], 0);
+                    assert_eq!(stored_grant(&rt, &request_id).await, before,
+                        "foreign request must still permit the ordinary requested-to-granted transition");
+                }
+                release.add_permits(1);
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(grant, retire_after_prepare)
+            })
+            .await
+            .expect("grant preparation and retirement must settle");
+            if retire {
+                assert_eq!(
+                    stored_grant(&rt, &request_id).await,
+                    before,
+                    "a stale prepared grant must not write its captured pin"
+                );
+                assert!(
+                    matches!(outcome, Err(RuntimeError::InvalidInput(ref message))
+                    if message.contains("registration changed while preparing the grant")),
+                    "{outcome:?}"
+                );
+            } else {
+                let granted = outcome.unwrap();
+                assert_eq!(granted["grant"]["status"], "granted");
+                assert_eq!(granted["grant"]["registry_id"], registry_id);
+                let check = registry
+                    .dispatch_with_identity(
+                        "tool.check",
+                        json!({
+                            "tool":"prepared-retirement", "actor":"agent:requester"
+                        }),
+                        Some(identity),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(check["source"], "grant");
+                assert_eq!(check["grant_id"], request_id);
+            }
+        }
+    }
+
     use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
 
     use super::{
