@@ -571,3 +571,404 @@ async fn gql_recursive_edge_metadata_uses_the_final_edge() {
         "{error}"
     );
 }
+
+struct GqlCommaStar {
+    root: Uuid,
+    left: Vec<khive_storage::Edge>,
+    right: Vec<khive_storage::Edge>,
+}
+
+impl GqlCommaStar {
+    fn pattern(&self) -> String {
+        format!("MATCH (a:concept {{fixture_name: 'comma root'}})-[e:extends]->(b:concept), (a)-[f:variant_of]->(c:concept) WHERE a.id = '{}'", self.root)
+    }
+
+    fn pairs(&self) -> Vec<(String, String)> {
+        self.left
+            .iter()
+            .flat_map(|left| {
+                self.right
+                    .iter()
+                    .map(move |right| (left.id.to_string(), right.id.to_string()))
+            })
+            .collect()
+    }
+}
+
+async fn gql_comma_branch(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    root: Uuid,
+    relation: EdgeRelation,
+    count: usize,
+    label: &str,
+) -> Vec<khive_storage::Edge> {
+    let mut edges = Vec::new();
+    for index in 0..count {
+        let target = gql_metadata_entity(runtime, token, &format!("comma {label} {index}")).await;
+        edges.push(
+            runtime
+                .link(token, root, target, relation, 1.0, None)
+                .await
+                .unwrap(),
+        );
+    }
+    edges.sort_by_key(|edge| edge.id.to_string());
+    for (index, edge) in edges.iter_mut().enumerate() {
+        let order = if index == 0 { count } else { 1 };
+        let updated = runtime
+            .link(
+                token,
+                root,
+                edge.target_id,
+                relation,
+                1.0,
+                Some(serde_json::json!({"order": order, "enabled": true, "group": label})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.id, edge.id);
+        *edge = updated;
+    }
+    edges
+}
+
+async fn gql_comma_star(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+) -> GqlCommaStar {
+    gql_metadata_observation(runtime, token).await;
+    let root = gql_metadata_entity(runtime, token, "comma root").await;
+    let left = gql_comma_branch(runtime, token, root, EdgeRelation::Extends, 2, "left").await;
+    let right = gql_comma_branch(runtime, token, root, EdgeRelation::VariantOf, 3, "right").await;
+    let other = gql_metadata_entity(runtime, token, "other center").await;
+    gql_comma_branch(
+        runtime,
+        token,
+        other,
+        EdgeRelation::Extends,
+        1,
+        "other-left",
+    )
+    .await;
+    gql_comma_branch(
+        runtime,
+        token,
+        other,
+        EdgeRelation::VariantOf,
+        1,
+        "other-right",
+    )
+    .await;
+    GqlCommaStar { root, left, right }
+}
+
+fn gql_comma_pairs(rows: &[khive_storage::SqlRow]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.text("e_id").unwrap().to_owned(),
+                row.text("f_id").unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn gql_comma_star_preserves_shared_identity_and_global_predicates() {
+    use khive_storage::{SqlStatement, SqlValue};
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let raw = "{\n  \"order\": 2, \"enabled\": true, \"group\": \"left\"\n}";
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+        fixture.left[0].metadata.clone().unwrap()
+    );
+    assert_eq!(
+        runtime
+            .sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(SqlStatement::new(
+                "UPDATE graph_edges SET metadata = ?1 WHERE id = ?2",
+                vec![
+                    SqlValue::Text(raw.into()),
+                    SqlValue::Text(fixture.left[0].id.to_string())
+                ]
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    let before = gql_metadata_snapshot(&runtime).await;
+    let rows = runtime
+        .query(
+            &token,
+            &format!(
+                "{} RETURN a.id, b.id, c.id, e.id, f.id, e.metadata, f.metadata",
+                fixture.pattern()
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gql_comma_pairs(&rows),
+        fixture.pairs(),
+        "exact six same-center tuples"
+    );
+    for row in &rows {
+        assert_eq!(row.text("a_id").unwrap(), fixture.root.to_string());
+        let left = fixture
+            .left
+            .iter()
+            .find(|edge| edge.id.to_string() == row.text("e_id").unwrap())
+            .unwrap();
+        let right = fixture
+            .right
+            .iter()
+            .find(|edge| edge.id.to_string() == row.text("f_id").unwrap())
+            .unwrap();
+        assert_eq!(row.text("b_id").unwrap(), left.target_id.to_string());
+        assert_eq!(row.text("c_id").unwrap(), right.target_id.to_string());
+        let left_raw = if left.id == fixture.left[0].id {
+            raw.to_owned()
+        } else {
+            serde_json::to_string(left.metadata.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(row.text("e_metadata").unwrap(), left_raw);
+        assert_eq!(
+            row.text("f_metadata").unwrap(),
+            serde_json::to_string(right.metadata.as_ref().unwrap()).unwrap()
+        );
+    }
+    let narrowed = runtime
+        .query(
+            &token,
+            &format!(
+                "{} AND e.metadata.order = 1 AND f.metadata.order = 1 RETURN e.id, f.id",
+                fixture.pattern()
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gql_comma_pairs(&narrowed),
+        vec![
+            (
+                fixture.left[1].id.to_string(),
+                fixture.right[1].id.to_string()
+            ),
+            (
+                fixture.left[1].id.to_string(),
+                fixture.right[2].id.to_string()
+            )
+        ]
+    );
+    // Keep OR global: neither branch alone may be discarded into its path's filters.
+    let global_or = runtime.query(&token, &format!("MATCH (a:concept {{fixture_name: 'comma root'}})-[e:extends]->(b), (a)-[f:variant_of]->(c) WHERE b.id = '{}' OR f.metadata.order = 3 RETURN e.id, f.id", fixture.left[0].target_id)).await.unwrap();
+    let expected = fixture
+        .pairs()
+        .into_iter()
+        .filter(|(e, f)| {
+            e == &fixture.left[0].id.to_string() || f == &fixture.right[0].id.to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(gql_comma_pairs(&global_or), expected);
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_shared_nodes_keep_every_occurrence_constraint() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let document = runtime
+        .create_entity_with_embedding_report(
+            &token,
+            "document",
+            Some("paper"),
+            "typed document",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap()
+        .0;
+    let before = gql_metadata_snapshot(&runtime).await;
+    for (constraint, count) in [
+        ("a:entity {order: -999}", 6),
+        ("a:concept {fixture_name: 'comma root'}", 6),
+        ("a:entity {fixture_name: 'not the root'}", 0),
+        ("a:note", 0),
+    ] {
+        let query = format!("MATCH (a:concept {{fixture_name: 'comma root'}})-[e:extends]->(b), ({constraint})-[f:variant_of]->(c) RETURN e.id, f.id");
+        let rows = runtime.query(&token, &query).await.unwrap();
+        assert_eq!(rows.len(), count, "{constraint}");
+        if count > 0 {
+            assert_eq!(gql_comma_pairs(&rows), fixture.pairs());
+        }
+    }
+    // Singleton paths add conjunctive constraints; subtype filters cannot overwrite each other.
+    for (subtype, count) in [("paper", 1), ("summary", 0)] {
+        let query = format!("MATCH (a:document {{entity_type: 'paper'}}), (a:entity {{entity_type: '{subtype}'}}) WHERE a.id = '{}' RETURN a.id", document.id);
+        let rows = runtime.query(&token, &query).await.unwrap();
+        assert_eq!(rows.len(), count, "{subtype}");
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_shared_identity_includes_the_substrate() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    // Trusted store setup intentionally overlaps IDs; ordinary create is not claimed to do so.
+    let mut note =
+        khive_storage::Note::new("local", "observation", "same UUID, different substrate");
+    note.id = fixture.root;
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(note)
+        .await
+        .unwrap();
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(fixture.root)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(fixture.root)
+        .await
+        .unwrap()
+        .is_some());
+    let before = gql_metadata_snapshot(&runtime).await;
+    for kind in ["entity", "note"] {
+        let rows = runtime
+            .query(
+                &token,
+                &format!(
+                    "MATCH (a:{kind}), (a:{kind}) WHERE a.id = '{}' RETURN a.id",
+                    fixture.root
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "same-substrate positive: {kind}");
+        assert_eq!(rows[0].text("a_id").unwrap(), fixture.root.to_string());
+    }
+    let rows = runtime
+        .query(
+            &token,
+            &format!(
+                "MATCH (a:entity), (a:note) WHERE a.id = '{}' RETURN a.id",
+                fixture.root
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "equal UUIDs on different substrates must not unify"
+    );
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_connectivity_is_global_and_directions_preserve_bindings() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let a = gql_metadata_entity(&runtime, &token, "bridge-a").await;
+    let b = gql_metadata_entity(&runtime, &token, "bridge-b").await;
+    let c = gql_metadata_entity(&runtime, &token, "bridge-c").await;
+    let d = gql_metadata_entity(&runtime, &token, "bridge-d").await;
+    gql_metadata_observation(&runtime, &token).await;
+    let ab = runtime
+        .link(&token, a, b, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    let bc = runtime
+        .link(&token, b, c, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    let cd = runtime
+        .link(&token, c, d, EdgeRelation::VariantOf, 1.0, None)
+        .await
+        .unwrap();
+    let da = runtime
+        .link(&token, d, a, EdgeRelation::VariantOf, 1.0, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    for pattern in [
+        "(a)-[e:extends]->(b), (c)-[f:variant_of]->(d), (b)-[g:extends]->(c)",
+        "(b)<-[e:extends]-(a), (d)<-[f:variant_of]-(c), (c)<-[g:extends]-(b)",
+        "(c)-[f:variant_of]->(d), (a)-[e:extends]->(b), (b)-[g:extends]->(c)",
+        "(a)-[e:extends]-(b), (c)-[f:variant_of]-(d), (b)-[g:extends]-(c)",
+        "(a)-[e:extends]->(b)-[g:extends]->(c), (c)-[f:variant_of]->(d)",
+    ] {
+        let rows = runtime
+            .query(
+                &token,
+                &format!(
+                    "MATCH {pattern} WHERE a.id = '{a}' AND d.id = '{d}' RETURN e.id, f.id, g.id"
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{pattern}");
+        assert_eq!(rows[0].text("e_id").unwrap(), ab.id.to_string());
+        assert_eq!(rows[0].text("f_id").unwrap(), cd.id.to_string());
+        assert_eq!(rows[0].text("g_id").unwrap(), bc.id.to_string());
+    }
+    let cycle = runtime.query(&token, &format!("MATCH (a)-[e:extends]->(b)-[g:extends]->(c), (c)-[f:variant_of]->(d)-[h:variant_of]->(a) WHERE a.id = '{a}' RETURN h.id")).await.unwrap();
+    assert_eq!(cycle.len(), 1);
+    assert_eq!(cycle[0].text("h_id").unwrap(), da.id.to_string());
+    // A and a are distinct, and an anonymous endpoint is a fresh occurrence; b connects both paths.
+    for other in ["A", ""] {
+        let rows = runtime.query(&token, &format!("MATCH (a)-[e:extends]->(b), (b)-[f:extends]->({other}) WHERE a.id = '{a}' RETURN e.id, f.id")).await.unwrap();
+        assert_eq!(
+            gql_comma_pairs(&rows),
+            vec![(ab.id.to_string(), bc.id.to_string())]
+        );
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_later_paths_keep_static_endpoint_warnings() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let base = format!("MATCH (a:concept)-[e:extends]->(b:concept), (a:concept)-[f:precedes]->(c:concept) WHERE a.id = '{}' RETURN a.id", fixture.root);
+    let result = runtime
+        .query_with_metadata(&token, &base, khive_query::CompileOptions::default())
+        .await
+        .unwrap();
+    assert!(result.rows.is_empty());
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("precedes")),
+        "{:?}",
+        result.warnings
+    );
+    let healthy = runtime
+        .query_with_metadata(
+            &token,
+            &format!("{} RETURN a.id", fixture.pattern()),
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(healthy.rows.len(), 6);
+    assert!(healthy.warnings.is_empty(), "{:?}", healthy.warnings);
+}

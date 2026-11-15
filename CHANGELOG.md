@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GQL accepts connected comma-separated `MATCH` paths with one global filter, projection, ordering
+  and paging tail. Shared nodes retain all occurrence constraints; matches preserve tuple
+  multiplicity. Each edge must be canonical and fixed at one hop.
 - `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
   `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
   `legacy_preference_model_count`. An embedding host can bring a pre-V21 database forward without
@@ -27,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_query::GqlQuery` adds `additional_patterns: Vec<MatchPattern>`; direct Rust constructors
+  must initialize it, using an empty vector for a single path. `patterns()` and `patterns_mut()`
+  iterate the required first path and the additional paths in textual order.
 - `khive_query::GqlQuery` adds `order_by: Vec<OrderItem>`, so direct Rust constructors must
   initialize it; exhaustive `PropertyRef` matches must handle the new `MetadataPath` variant.
 - `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
