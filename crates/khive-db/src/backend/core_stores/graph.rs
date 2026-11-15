@@ -212,6 +212,18 @@ impl GraphStore for StorageBackend {
             .await
     }
 
+    async fn count_hidden_incoming_memory_edges(
+        &self,
+        target_ids: &[String],
+        relations: Option<&[String]>,
+        visible_namespaces: &[String],
+    ) -> StorageResult<Vec<(String, String, u64)>> {
+        self.graph()
+            .map_err(|error| map_open_error(error, StorageCapability::Graph, "graph"))?
+            .count_hidden_incoming_memory_edges(target_ids, relations, visible_namespaces)
+            .await
+    }
+
     async fn count_edges_by_relation(&self) -> StorageResult<Vec<(EdgeRelation, u64)>> {
         self.graph()
             .map_err(|error| map_open_error(error, StorageCapability::Graph, "graph"))?

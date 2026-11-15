@@ -138,6 +138,9 @@ pub struct NamespaceToken {
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
+    /// Namespaces the caller declared it owns (`[actor] owned_namespaces`).
+    /// Read only through [`NamespaceToken::owns`]; it never widens visibility.
+    owned: Vec<Namespace>,
     _sealed: private::Sealed,
 }
 
@@ -167,6 +170,7 @@ impl NamespaceToken {
             visible,
             actor,
             process_ref: None,
+            owned: Vec::new(),
             _sealed: private::Sealed,
         }
     }
@@ -272,6 +276,27 @@ impl NamespaceToken {
         self
     }
 
+    /// Return whether the caller declared that it owns `namespace`.
+    ///
+    /// The declaration is the `[actor] owned_namespaces` list carried on the
+    /// caller's identity. It is consulted by the `memory.apply_batch` old-row
+    /// namespace check alone: ownership grants no write into the namespace and
+    /// widens no read.
+    pub fn owns(&self, namespace: &str) -> bool {
+        self.owned.iter().any(|owned| owned.as_str() == namespace)
+    }
+
+    /// The caller's declared owned namespaces, for carrying the declaration
+    /// onto a re-minted token or a nested dispatch identity.
+    pub(crate) fn owned_namespaces(&self) -> &[Namespace] {
+        &self.owned
+    }
+
+    pub(crate) fn with_owned_namespaces(mut self, owned: Vec<Namespace>) -> Self {
+        self.owned = owned;
+        self
+    }
+
     /// Return a new token with the same actor but a different namespace.
     /// The Gate namespace metadata is reset to the new primary namespace.
     ///
@@ -282,8 +307,13 @@ impl NamespaceToken {
     /// the intended narrow scope (e.g. a single `create_note` call). A future
     /// security model should replace this pattern with a type-enforced
     /// append-only capability that goes through the Gate.
+    ///
+    /// The owned-namespace declaration describes the caller, not the target
+    /// namespace, so it is kept on the new token.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
-        Self::mint_authorized(ns, self.actor.clone()).with_process_ref(self.process_ref.clone())
+        Self::mint_authorized(ns, self.actor.clone())
+            .with_process_ref(self.process_ref.clone())
+            .with_owned_namespaces(self.owned.clone())
     }
 }
 
@@ -430,6 +460,12 @@ pub struct RuntimeConfig {
     /// escape and is not widened. Populated from `actor.visible_namespaces`
     /// in `khive.toml`.
     pub visible_namespaces: Vec<Namespace>,
+    /// Namespaces this actor declared it owns (ADR-021 Delta 1). Populated from
+    /// `actor.owned_namespaces` in `khive.toml`. Empty by default. Ownership is
+    /// read by the `memory.apply_batch` old-row namespace check alone: it grants
+    /// no write into the namespace and widens no read, and it is NOT folded into
+    /// `visible_namespaces`.
+    pub owned_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
     /// in `khive.toml`. Empty by default — cross-namespace delivery denied
@@ -446,6 +482,11 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Strict attributed-actor mode requested by configuration: `[actor]
+    /// require_attributed = true` in the database-anchored or the project
+    /// config. The `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag is read
+    /// separately by the enforcing seam; either one turns the refusal on.
+    pub require_attributed_actor: bool,
     /// Resolved `[brain]` policy from the serving process's configuration.
     pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
@@ -602,8 +643,10 @@ impl Default for RuntimeConfig {
             backend_id: BackendId::main(),
             brain_profile,
             visible_namespaces: vec![],
+            owned_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            require_attributed_actor: false,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             blob: crate::engine_config::BlobSectionConfig {
@@ -948,6 +991,20 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier (the one anchored at `db_path` included), ORed.
+///
+/// The database-anchored load already carries the key into
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
+pub fn resolve_project_requires_attributed_actor(
+    config_path: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> Result<bool, crate::engine_config::ConfigError> {
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path, db_path)
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -1096,6 +1153,24 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces
     };
 
+    // `[actor] owned_namespaces` (ADR-021 Delta 1). KhiveConfig::validate()
+    // guarantees every entry parses, so a parse failure here is unreachable for
+    // a validated config; filter_map+warn guards against a validation bug
+    // panicking instead. A dropped entry can only shrink what the actor owns.
+    // The list is deliberately not folded into `visible_namespaces`.
+    let owned_namespaces: Vec<Namespace> = khive_cfg
+        .actor
+        .owned_namespaces
+        .iter()
+        .filter_map(|s| match Namespace::parse(s) {
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                tracing::warn!(ns = %s, error = %e, "actor.owned_namespaces: invalid namespace; skipped");
+                None
+            }
+        })
+        .collect();
+
     // KhiveConfig::validate() guarantees these are valid Namespace strings, so
     // parse failures here are unreachable for validated configs; filter_map+warn
     // guards against a validation bug panicking instead.
@@ -1123,6 +1198,8 @@ pub fn runtime_config_from_khive_config(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
+    let require_attributed_actor =
+        khive_cfg.actor.require_attributed || base.require_attributed_actor;
 
     let gate = khive_cfg
         .gate
@@ -1176,8 +1253,10 @@ pub fn runtime_config_from_khive_config(
             default_namespace,
             brain_profile,
             visible_namespaces,
+            owned_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            require_attributed_actor,
             gate,
             brain,
             git_write,
@@ -1216,8 +1295,10 @@ pub fn runtime_config_from_khive_config(
         default_namespace,
         brain_profile,
         visible_namespaces,
+        owned_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        require_attributed_actor,
         gate,
         brain,
         git_write,

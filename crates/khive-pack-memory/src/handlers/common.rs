@@ -407,6 +407,17 @@ pub(super) fn balanced_recall_state_from_profile_response(
     ))
 }
 
+/// The shared-pool factor a served profile carries, read from its `brain.profile` response.
+///
+/// A missing, null or non-numeric `local_factor`, and a value outside [0.5, 1] (which
+/// `brain.create_profile` never stores), yield 1: no scaling.
+pub(super) fn local_factor_from_profile_response(resp: &Value) -> f32 {
+    resp.get("local_factor")
+        .and_then(Value::as_f64)
+        .filter(|factor| factor.is_finite() && (0.5..=1.0).contains(factor))
+        .map_or(1.0, |factor| factor as f32)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
@@ -420,9 +431,15 @@ pub(super) struct RememberParams {
     #[serde(alias = "source")]
     pub(super) source_id: Option<String>,
     pub(super) tags: Option<Vec<String>>,
+    /// Caller-supplied structured fields stored beside `memory_type` and `tags`.
+    /// Validated by `validate_properties` in the remember handler.
+    #[serde(default)]
+    pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
+    /// Exact namespace override. Without it, both memory types use the caller's actor
+    /// namespace; an anonymous caller keeps the token's namespace. Every anonymous
+    /// memory is flagged `attribution: "unresolved"`, with or without this override.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
@@ -601,7 +618,49 @@ pub(super) fn compute_score(
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
+    let (total, mut breakdown) = compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        true,
+    );
+    breakdown.fused_score = raw_relevance;
+    (total, breakdown)
+}
 
+/// Breakdown for a hit `handle_recall` has already normalized: `relevance` is the value the
+/// ranking composite received, and the breakdown reports it unchanged.
+pub(super) fn compute_score_for_recall(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+) -> (f64, ScoreBreakdown) {
+    compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        false,
+    )
+}
+
+fn compute_score_inner(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+    report: bool,
+) -> (f64, ScoreBreakdown) {
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -635,6 +694,8 @@ pub(super) fn compute_score(
 
     let breakdown = ScoreBreakdown {
         relevance,
+        // The caller holds the score before normalization and sets it.
+        fused_score: 0.0,
         salience_raw: salience,
         salience_decayed: effective_salience,
         temporal,
@@ -643,10 +704,20 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
-        // ADR-104 §3: set to neutral/absent here; `handle_recall` overwrites
-        // both when a profile served the request (component 1 ran).
+        // Neutral/absent here; `handle_recall` fills the fields it reports.
+        composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        weights_served: if report {
+            "default".to_string()
+        } else {
+            String::new()
+        },
+        namespace: String::new(),
+        pre_entity_score: total as f32,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     (total, breakdown)
 }
@@ -1899,35 +1970,32 @@ async fn collect_model_ann_hits_inner(
             None
         }
         Ok(None) => {
+            use khive_runtime::resource_admission::JobOutcome;
+
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let rt_detached = runtime.clone();
-            let token_detached = token.clone();
-            let ann_detached = ann.clone();
+            let readiness = tokio::time::timeout(
+                std::time::Duration::from_millis(ann_ready_timeout_ms),
+                done_rx,
+            );
+            let (tracking, attempt) = ann::submit_recall_miss(
+                runtime.clone(),
+                token.clone(),
+                ann.clone(),
+                model_name.clone(),
+            );
+            #[cfg(test)]
             let model_detached = model_name.clone();
-            khive_runtime::track_named_background_task("memory_ann_build", async move {
+            drop(tokio::spawn(async move {
+                let _tracking = tracking;
                 #[cfg(test)]
                 retrieval_failpoints::before_ann_build(&model_detached).await;
-                let result = ann::ensure_ann_for_model(
-                    &rt_detached,
-                    &token_detached,
-                    &ann_detached,
-                    &model_detached,
-                )
-                .await;
+                let result = attempt.await;
                 #[cfg(test)]
                 retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
-            });
-            match khive_storage::await_request_read_phase(
-                "memory.recall",
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(ann_ready_timeout_ms),
-                    done_rx,
-                ),
-            )
-            .await?
-            {
-                Ok(Ok(Ok(status))) => {
+            }));
+            match khive_storage::await_request_read_phase("memory.recall", readiness).await? {
+                Ok(Ok(JobOutcome::Completed(Ok(status)))) => {
                     tracing::debug!(
                         ?status,
                         model = %model_name,
@@ -1939,7 +2007,46 @@ async fn collect_model_ann_hits_inner(
                     khive_storage::ensure_request_read_active("memory.recall")?;
                     searched
                 }
-                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Ok(JobOutcome::Completed(Err(e)))) => return Err(e),
+                Ok(Ok(JobOutcome::Cancelled)) => {
+                    tracing::warn!(
+                        outcome = "Cancelled",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Cancelled; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::Refused(_))) => {
+                    tracing::warn!(
+                        outcome = "Refused",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Refused; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::FinalizationTimedOut)) => {
+                    tracing::warn!(
+                        outcome = "FinalizationTimedOut",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt FinalizationTimedOut; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
                 Ok(Err(_sender_dropped)) => {
                     // A detached-task panic degrades this model instead of failing recall.
                     tracing::warn!(

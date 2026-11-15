@@ -293,7 +293,7 @@ fn live_concurrent_busy_checkpoints_preserve_a_reader_pin_run() {
     LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED.store(false, Ordering::SeqCst);
     let contender_path = path.clone();
     let contender = std::thread::spawn(move || {
-        let conn = rusqlite::Connection::open(contender_path).unwrap();
+        let mut conn = rusqlite::Connection::open(contender_path).unwrap();
         conn.busy_handler(Some(hold_checkpoint_lock_for_live_busy_probe))
             .unwrap();
         query_truncate_observation(&conn).unwrap()
@@ -1424,7 +1424,7 @@ async fn erroring_truncate_releases_full_scan_reservation_to_housekeeping() {
             .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
             .unwrap();
     }
-    let conn =
+    let mut conn =
         crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.authorizer(Some(
         |context: rusqlite::hooks::AuthContext<'_>| match context.action {
@@ -5493,7 +5493,7 @@ fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
 fn routine_checkpoint_timing_records_real_call_and_debug_fields() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("timed_tick.db"));
-    let conn =
+    let mut conn =
         crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
@@ -5612,7 +5612,7 @@ fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
         release: release_rx,
     });
     let competing = std::thread::spawn(move || {
-        let checkpoint = rusqlite::Connection::open(path).unwrap();
+        let mut checkpoint = rusqlite::Connection::open(path).unwrap();
         checkpoint.busy_handler(Some(hold_checkpoint_lock)).unwrap();
         checkpoint.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
             row.get::<_, i64>(0)
@@ -5677,7 +5677,7 @@ fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
 fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("failed_tick.db"));
-    let conn =
+    let mut conn =
         crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
         if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
@@ -5715,7 +5715,7 @@ fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
 fn failed_post_truncate_measurement_preserves_last_sample_and_failure_streak() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("unmeasured_truncate.db"));
-    let conn =
+    let mut conn =
         crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     let previous_pages = LAST_WAL_PAGES.swap(73, Ordering::Relaxed);
     let previous_attempts = TRUNCATE_ATTEMPTS.load(Ordering::Relaxed);

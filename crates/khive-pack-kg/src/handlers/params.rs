@@ -246,6 +246,8 @@ pub(crate) struct SearchParams {
     pub(crate) min_rank_score: Option<f64>,
     pub(crate) min_score: Option<f64>,
     pub(crate) order_by: Option<String>,
+    pub(crate) created_after: Option<String>,
+    pub(crate) created_before: Option<String>,
 }
 
 #[derive(Deserialize)]

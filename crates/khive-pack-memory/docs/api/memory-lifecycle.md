@@ -11,9 +11,9 @@ Defaults differ by type:
 | Type     | Salience | Decay factor | Default namespace        |
 | -------- | -------: | -----------: | ------------------------ |
 | episodic |    `0.3` |       `0.02` | caller/actor namespace   |
-| semantic |    `0.5` |      `0.005` | shared `local` namespace |
+| semantic |    `0.5` |      `0.005` | caller/actor namespace   |
 
-An explicit namespace overrides both routing rules. Salience must be finite and inside `[0, 1]`. Decay factor must be finite and non-negative; there is no arbitrary upper clamp. Explicit caller values always replace defaults.
+Both types write to the caller's actor namespace by default. An explicit namespace overrides that, and `local` may be named explicitly. A caller with no actor (anonymous) writes to its own namespace, `local`, and every memory it writes, with or without an explicit namespace, is flagged with `attribution: "unresolved"` in its properties and in the response; attributed writes carry no `attribution` key. Salience must be finite and inside `[0, 1]`. Decay factor must be finite and non-negative; there is no arbitrary upper clamp. Explicit caller values always replace defaults.
 
 The handler creates a `kind = "memory"` note and stores tags in properties. When `source_id` is supplied, it resolves the record and creates an `annotates` edge from the new memory to that source. Invalid source references fail the operation instead of creating a dangling edge.
 
@@ -35,7 +35,7 @@ Tier one wins over tier two. Namespace is included when dispatching to the brain
 
 ## Posterior update functions
 
-`on_recall_hit` increments total events and relevance success. Latency at or below 50,000 microseconds is a temporal success; slower hits are temporal failures. The target entity posterior receives a success.
+`on_recall_hit` increments total events and relevance success. Latency at or below 50,000 microseconds is a temporal success; slower hits are temporal failures. Per-entity posteriors are not changed: a recall hit is exposure, not a judgment, so only feedback that judges a result updates an entity posterior.
 
 `on_recall_miss` increments total events and records relevance and temporal failures without creating an entity posterior.
 

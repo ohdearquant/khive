@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -165,7 +166,7 @@ impl Fixture {
             .unwrap()
             .expect("same main-store writer used by atomic_unit")
             .send(move |conn| {
-                conn.authorizer(Some(move |context: AuthContext<'_>| {
+                conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                     if !authorize_fault.armed.load(Ordering::SeqCst) {
                         return Authorization::Allow;
                     }
@@ -193,7 +194,7 @@ impl Fixture {
                 .map_err(|error| {
                     StorageError::driver(StorageCapability::Sql, "test.install_authorizer", error)
                 })?;
-                conn.update_hook(Some(move |action, database: &str, table: &str, _rowid| {
+                conn.test_update_hook(Some(move |action, database: &str, table: &str, _rowid| {
                     if action == Action::SQLITE_INSERT && database == "main" {
                         match table {
                             "events" => {

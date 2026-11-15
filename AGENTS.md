@@ -140,7 +140,7 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 7 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 8 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
 | Verb             | What it does                                                   | When to use                              |
 | ---------------- | -------------------------------------------------------------- | ---------------------------------------- |
@@ -150,6 +150,7 @@ request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_c
 | `gtd.tasks`      | Filtered task listing                                          | Browse tasks by status/assignee/priority |
 | `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)             | Moving a task through its lifecycle      |
 | `gtd.census`     | Count raw task timestamp evidence; optionally page candidates  | Inspect historical task rows             |
+| `gtd.counts`     | Count one assignee's tasks by status; optional open tag rows   | Queue size without task bodies           |
 | `gtd.repair`     | Preview or explicitly apply exact-observation task corrections | Repair historical task rows              |
 
 `gtd.repair` is dry-run by default. `apply=true` commits each accepted row with its
@@ -179,15 +180,16 @@ mutation-free guarded assertion and does not persist that note. The assertion re
 prepare snapshot so an earlier op in the same atomic unit cannot make the no-op stale. Branch on
 `transitioned` before reading those fields.
 
-### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
+### Memory pack — 6 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                                  | When to use                                         |
-| ----------------- | ------------------------------------------------------------- | --------------------------------------------------- |
-| `memory.remember` | Store a memory with salience and decay                        | Cross-session context, agent state                  |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
-| `memory.feedback` | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
-| `memory.prune`    | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
-| `memory.vacuum`   | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
+| Verb                 | What it does                                                  | When to use                                         |
+| -------------------- | ------------------------------------------------------------- | --------------------------------------------------- |
+| `memory.remember`    | Store a memory with salience and decay                        | Cross-session context, agent state                  |
+| `memory.recall`      | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
+| `memory.feedback`    | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
+| `memory.prune`       | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
+| `memory.vacuum`      | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
+| `memory.apply_batch` | Apply a checked chunk of memory rewrites, dry run by default  | Rewrite or consolidate stored memories in bulk      |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
@@ -197,7 +199,9 @@ the strict `memory.feedback(id=...)` contract across requests. `full_id` is
 present under the default `json` output format in any presentation mode; the `auto`
 and `table` formats omit it unless the request sets `presentation=verbose`.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
-[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
+[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. A served
+profile scores with the configured default weights, and a profile created with `local_factor`
+multiplies the `rank_score` of rows in the shared `local` namespace by that factor. Typical
 production floor: 0.3-0.7.
 
 `memory.feedback` requires the recalled record's full UUID. It rejects prefixes because feedback

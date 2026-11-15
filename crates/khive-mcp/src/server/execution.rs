@@ -8,6 +8,7 @@ use khive_runtime::{DomainDisposition, PresentationMode, VerbPresentationPolicy}
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 
+use crate::args::CatalogVerbosity;
 use crate::coordinator::CoordinatorService;
 
 use super::batch_types::{
@@ -32,6 +33,66 @@ use super::{
     parse_content_requested, present_ok_envelope_or_depth_error, stamp_usage,
     substitution_error_payload, KhiveMcpServer, BATCH_RESPONSE_BUDGET_BYTES,
 };
+
+const COMPACT_CATALOG_HEADER: &str = "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.";
+const COMPACT_SUMMARY_LIMIT: usize = 160;
+
+fn compact_verb_summary(description: &str) -> String {
+    let summary = description
+        .split(['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'])
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| "Help available".to_owned());
+    if summary.chars().count() <= COMPACT_SUMMARY_LIMIT {
+        summary
+    } else {
+        let mut shortened: String = summary.chars().take(COMPACT_SUMMARY_LIMIT - 1).collect();
+        shortened.push('…');
+        shortened
+    }
+}
+
+fn build_compact_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>) -> String {
+    let mut by_verb: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (pack, name, description) in verbs {
+        by_verb
+            .entry(name)
+            .or_default()
+            .push((pack, compact_verb_summary(&description)));
+    }
+    let mut out = String::from(COMPACT_CATALOG_HEADER);
+    out.push('\n');
+    for (name, contributions) in by_verb {
+        if contributions.len() > 1 {
+            let packs: Vec<&str> = contributions
+                .iter()
+                .map(|(pack, _)| pack.as_str())
+                .collect();
+            tracing::warn!(
+                target: "khive_mcp::server",
+                verb = %name,
+                packs = ?packs,
+                "verb registered by multiple packs; all descriptions included in catalog"
+            );
+        }
+        out.push_str(&name);
+        out.push_str(": ");
+        for (index, (pack, summary)) in contributions.into_iter().enumerate() {
+            if index > 0 {
+                out.push_str(" | ");
+            }
+            out.push('[');
+            out.push_str(&pack);
+            out.push_str("] ");
+            out.push_str(&summary);
+        }
+        out.push_str(" — ");
+        out.push_str(&name);
+        out.push_str("(help=true)\n");
+    }
+    out
+}
 
 impl KhiveMcpServer {
     /// Serve over stdio (blocks until the connection closes).
@@ -156,7 +217,10 @@ impl KhiveMcpServer {
                     verb["description"].as_str().unwrap_or_default().to_owned(),
                 )
             });
-        build_verb_catalog(verbs.chain(mounted))
+        match self.catalog_verbosity {
+            CatalogVerbosity::Full => build_verb_catalog(verbs.chain(mounted)),
+            CatalogVerbosity::Compact => build_compact_verb_catalog(verbs.chain(mounted)),
+        }
     }
 
     /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
@@ -234,9 +298,9 @@ impl KhiveMcpServer {
                                     "kind": "substitution_error",
                                     "reason": "bare_ref_ambiguous",
                                     "message": format!(
-                                        "argument {name:?}: $prev requires a dotted path \
-                                         (e.g. $prev.0) when the prior result is an array. \
-                                         Use $prev.N to select a specific element."
+                                        "argument {name:?}: $prev requires an array index \
+                                         (e.g. `$prev[0]`) when the prior result is an array. \
+                                         Use `$prev[0].id` to select a field from an element."
                                     ),
                                 }),
                             ));
@@ -481,10 +545,13 @@ impl KhiveMcpServer {
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
                     let parse_content = parse_content[i];
-                    BatchTask {
+                    BatchTask::checked_inline_size(BatchTask {
                         index: i,
                         tool: task_tool,
-                        future: async move {
+                        // Boxed where it is built: the batch driver keeps several copies of
+                        // its task type in one stack frame, so an unboxed op future (tens of
+                        // KiB unoptimized) multiplies into that frame on every poll of the batch.
+                        future: Box::pin(async move {
                         // ADR-103 Amendment 2: one dispatch-accounting context
                         // per op; the entry is stamped with the frozen usage
                         // snapshot after dispatch resolves.
@@ -654,8 +721,8 @@ impl KhiveMcpServer {
                         .await;
                         stamp_usage(&mut entry, &usage_ctx);
                         entry
-                        },
-                    }
+                        }),
+                    })
                 });
                 let results =
                     execute_bounded_batch(futures, response_budget, max_batch_concurrency).await;
@@ -867,8 +934,10 @@ impl KhiveMcpServer {
                 let participants = conflict_ops[range.clone()].to_vec();
                 let budget = budget.clone();
                 let presentation_per_op = presentation_per_op.clone();
-                UnitTask {
-                    future: async move {
+                UnitTask::checked_inline_size(UnitTask {
+                    // Boxed where it is built, as the per-op batch futures above are: the
+                    // unit driver keeps several copies of its task type in one stack frame.
+                    future: Box::pin(async move {
                         let mut entries: Vec<Value> = Vec::with_capacity(leaves.len());
                         let mut content_updates: Vec<(usize, bool)> =
                             Vec::with_capacity(leaves.len());
@@ -1021,8 +1090,8 @@ impl KhiveMcpServer {
                             entries,
                             content_updates,
                         }
-                    },
-                }
+                    }),
+                })
             })
             .collect();
 
@@ -1065,5 +1134,224 @@ impl KhiveMcpServer {
             "status": batch_status(failed, aborted),
         });
         (response, content_updates)
+    }
+}
+
+#[cfg(test)]
+mod compact_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn compact_summary_normalizes_the_first_nonempty_logical_line() {
+        for separator in ['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let description =
+                format!(" \t{separator}  First\tline\u{00a0}summary  {separator}later text");
+            assert_eq!(compact_verb_summary(&description), "First line summary");
+        }
+        assert_eq!(compact_verb_summary("\r\n\t\u{2028}   "), "Help available");
+        assert_eq!(compact_verb_summary(""), "Help available");
+        assert_eq!(compact_verb_summary(" First \r\nsecond"), "First");
+        assert_eq!(
+            compact_verb_summary("first\u{000b}second\u{000c}third"),
+            "first second third"
+        );
+    }
+
+    #[test]
+    fn compact_summary_caps_unicode_scalars_including_ellipsis() {
+        for scalar in ['a', '界', '🦀'] {
+            for count in [159, 160] {
+                let description = scalar.to_string().repeat(count);
+                assert_eq!(compact_verb_summary(&description), description);
+            }
+            let description = scalar.to_string().repeat(161);
+            let summary = compact_verb_summary(&description);
+            assert_eq!(summary, format!("{}…", scalar.to_string().repeat(159)));
+            assert_eq!(summary.chars().count(), 160);
+        }
+        let combining = "e\u{0301}".repeat(80);
+        assert_eq!(compact_verb_summary(&combining), combining);
+        assert_eq!(
+            compact_verb_summary(&(combining.clone() + "x")),
+            format!("{}…", combining.chars().take(159).collect::<String>())
+        );
+    }
+
+    #[test]
+    fn compact_catalog_sorts_names_and_preserves_every_contributor_on_one_row() {
+        let entries = [
+            ("mounted", "zeta.run", " Last\nnot advertised"),
+            ("native-a", "alpha", " First\r\ncontinuation"),
+            (
+                "native-b",
+                "alpha",
+                "\u{2028}  Second\tcontributor\u{2029}hidden tail",
+            ),
+            ("empty", "beta", " \t"),
+        ]
+        .map(|(pack, name, description)| {
+            (pack.to_owned(), name.to_owned(), description.to_owned())
+        });
+        let catalog = build_compact_verb_catalog(entries);
+        assert_eq!(catalog, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "alpha: [native-a] First | [native-b] Second contributor — alpha(help=true)\n",
+            "beta: [empty] Help available — beta(help=true)\n",
+            "zeta.run: [mounted] Last — zeta.run(help=true)\n",
+        ));
+        assert_eq!(catalog.lines().count(), 4);
+        assert_eq!(
+            build_compact_verb_catalog([]),
+            format!("{COMPACT_CATALOG_HEADER}\n")
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedCatalogEvent {
+        level: tracing::Level,
+        target: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct CatalogEventFields(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for CatalogEventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    struct CaptureCatalogEvents {
+        events: Arc<std::sync::Mutex<Vec<CapturedCatalogEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureCatalogEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            let mut fields = CatalogEventFields::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("catalog event capture")
+                .push(CapturedCatalogEvent {
+                    level: *metadata.level(),
+                    target: metadata.target().to_owned(),
+                    fields: fields.0,
+                });
+        }
+    }
+
+    fn capture_catalog_events(
+        build: impl FnOnce() -> String,
+    ) -> (String, Vec<CapturedCatalogEvent>) {
+        use tracing_subscriber::prelude::*;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureCatalogEvents {
+            events: Arc::clone(&events),
+        });
+        let catalog = tracing::subscriber::with_default(subscriber, build);
+        let captured = {
+            let mut events = events.lock().expect("completed catalog event capture");
+            std::mem::take(&mut *events)
+        };
+        (catalog, captured)
+    }
+
+    #[test]
+    fn catalog_builders_warn_once_per_duplicate_verb() {
+        let entries = [
+            ("z-last", "zeta", "Z one\nhidden Z"),
+            ("a-two", "alpha", "A first\nhidden A"),
+            ("solo", "beta", "B full"),
+            ("a-one", "alpha", "A second"),
+            ("z-first", "zeta", "Z two"),
+            ("a-three", "alpha", "A third"),
+        ]
+        .map(|(pack, verb, description)| {
+            (pack.to_owned(), verb.to_owned(), description.to_owned())
+        });
+        let expected_events = Vec::from([
+            CapturedCatalogEvent {
+                level: tracing::Level::WARN,
+                target: "khive_mcp::server".to_owned(),
+                fields: std::collections::BTreeMap::from([
+                    ("verb".to_owned(), "alpha".to_owned()),
+                    (
+                        "packs".to_owned(),
+                        r#"["a-two", "a-one", "a-three"]"#.to_owned(),
+                    ),
+                    (
+                        "message".to_owned(),
+                        "verb registered by multiple packs; all descriptions included in catalog"
+                            .to_owned(),
+                    ),
+                ]),
+            },
+            CapturedCatalogEvent {
+                level: tracing::Level::WARN,
+                target: "khive_mcp::server".to_owned(),
+                fields: std::collections::BTreeMap::from([
+                    ("verb".to_owned(), "zeta".to_owned()),
+                    ("packs".to_owned(), r#"["z-last", "z-first"]"#.to_owned()),
+                    (
+                        "message".to_owned(),
+                        "verb registered by multiple packs; all descriptions included in catalog"
+                            .to_owned(),
+                    ),
+                ]),
+            },
+        ]);
+
+        let (full, full_events) = capture_catalog_events(|| build_verb_catalog(entries.clone()));
+        assert_eq!(full_events, expected_events);
+        assert_eq!(
+            full,
+            concat!(
+                "  alpha — [a-two] A first\nhidden A\n",
+                "    [a-one] A second\n",
+                "    [a-three] A third\n",
+                "  beta — B full\n",
+                "  zeta — [z-last] Z one\nhidden Z\n",
+                "    [z-first] Z two\n",
+            )
+        );
+
+        let (compact, compact_events) =
+            capture_catalog_events(|| build_compact_verb_catalog(entries));
+        assert_eq!(compact_events, expected_events);
+        assert_eq!(compact, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "alpha: [a-two] A first | [a-one] A second | [a-three] A third — alpha(help=true)\n",
+            "beta: [solo] B full — beta(help=true)\n",
+            "zeta: [z-last] Z one | [z-first] Z two — zeta(help=true)\n",
+        ));
+
+        let single = [("solo".to_owned(), "beta".to_owned(), "B full".to_owned())];
+        let (full, events) = capture_catalog_events(|| build_verb_catalog(single.clone()));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(full, "  beta — B full\n");
+        let (compact, events) = capture_catalog_events(|| build_compact_verb_catalog(single));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(compact, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "beta: [solo] B full — beta(help=true)\n",
+        ));
+
+        let (full, events) = capture_catalog_events(|| build_verb_catalog([]));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(full, "");
+        let (compact, events) = capture_catalog_events(|| build_compact_verb_catalog([]));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(compact, "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n");
     }
 }

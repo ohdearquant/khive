@@ -129,6 +129,8 @@ include!("integration_tests/supersedes_bound_tests.rs");
 
 include!("integration_tests/supersedes_batch_tests.rs");
 
+include!("integration_tests/apply_batch_tests.rs");
+
 include!("integration_tests/namespace_visibility_tests.rs");
 
 include!("integration_tests/actor_namespace_recall_tests.rs");
@@ -781,3 +783,5 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
 }
 
 include!("integration_tests/final_mmr_score_floor_tests.rs");
+
+include!("integration_tests/hidden_incoming_edges_tests.rs");

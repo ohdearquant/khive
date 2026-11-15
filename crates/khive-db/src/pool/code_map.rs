@@ -23,9 +23,13 @@ impl PoolConfig {
     ) -> Result<Connection, SqliteError> {
         match self.code_map_vfs.as_deref() {
             Some(vfs) => crate::code_map_vfs::naming_refusal(vfs, || {
-                Connection::open_with_flags_and_vfs(path, flags, vfs).map_err(Into::into)
+                Connection::open_with_flags_and_vfs(path, flags, vfs)
+                    .and_then(crate::pool::register_test_hooks)
+                    .map_err(Into::into)
             }),
-            None => Connection::open_with_flags(path, flags).map_err(Into::into),
+            None => Connection::open_with_flags(path, flags)
+                .and_then(crate::pool::register_test_hooks)
+                .map_err(Into::into),
         }
     }
 }

@@ -88,6 +88,7 @@ use forward_or_spawn::{
     supervisor_discovery_hook, SupervisorDiscoveryPoint, SUPERVISOR_DISCOVERY_HOOK,
 };
 
+pub use launch::select_daemon_spawn_overrides;
 use launch::{spawn_daemon, spawn_daemon_with_exe_and_config};
 
 #[cfg(test)]
@@ -166,6 +167,9 @@ mod demand_launch_tests;
 
 #[cfg(all(test, unix))]
 mod strict_default_tests;
+
+#[cfg(all(test, unix))]
+mod strict_actor_frame_tests;
 
 #[cfg(all(test, unix))]
 mod daemon_slow_tests;

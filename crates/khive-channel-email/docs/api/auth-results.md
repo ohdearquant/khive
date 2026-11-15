@@ -148,3 +148,21 @@ to choose or update the configured anchor. See the
 Trusted-header selection, alignment checks, maintainer attribution and quarantine
 custody are unchanged. Receiving-boundary header scrubbing remains an operational
 precondition; diagnostic observations do not prove that a header is authentic.
+
+## Exchange Online intra-tenant anchor
+
+`KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` defaults to `false`. Enable it only when the
+configured mailbox is hosted by Exchange Online and the deployment has confirmed
+Exchange's header firewall behavior for its own mailbox. It applies only when
+normal authentication evaluation returns `auth-absent`; messages with plain or ARC
+authentication headers follow the existing rules.
+
+The message is attributed to a maintainer only when it has exactly one From address,
+that address's domain exactly matches the mailbox domain without regard to ASCII
+case, the raw header block contains exactly one
+`X-MS-Exchange-Organization-AuthAs` field whose unfolded trimmed value is
+`Internal` without regard to ASCII case, and the existing From and Sender
+maintainer checks pass. Missing or duplicate stamp fields fail closed. This path
+never attributes external senders and never reaches inbound suppression handling.
+The stamp is meaningful only at an Exchange Online mailbox boundary because other
+mail systems may preserve a sender supplied value.

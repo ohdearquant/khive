@@ -194,7 +194,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::assert_daemon_store_identities(guards)?;
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(&args, &server)?;
+    let prepared_background = prepare_host_background_tasks(&args, &server).await?;
 
     #[cfg(unix)]
     if args.daemon {
@@ -266,7 +266,7 @@ pub(super) struct PreparedHostBackgroundTasks {
     pub(super) email: Option<PreparedEmailChannelLoops>,
 }
 
-pub(super) fn prepare_host_background_tasks(
+pub(super) async fn prepare_host_background_tasks(
     _args: &Args,
     _server: &KhiveMcpServer,
 ) -> anyhow::Result<PreparedHostBackgroundTasks> {

@@ -640,7 +640,7 @@ impl ConnectionPool {
         // Allocate once per physical reader; checkouts move the same box between
         // the queue and lease without allocating on every borrow/return.
         Ok(Box::new(PooledReader {
-            conn: self.open_reader_connection()?,
+            conn: crate::ProgressConn::new(self.open_reader_connection()?)?,
             opened_at,
             checkouts: 0,
         }))
@@ -683,7 +683,9 @@ impl ConnectionPool {
                 "database is read-only: standalone write transactions are not permitted".into(),
             ));
         }
-        let volume_lease = self.write_admission.acquire()?;
+        let volume_lease = self
+            .write_admission
+            .acquire(crate::disk_guard::LeaseClass::Standalone)?;
         let conn = self.open_standalone_connection()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
@@ -765,9 +767,12 @@ impl ConnectionPool {
         if !state.is_due(config, now) {
             return Ok(None);
         }
-        let unit = self
-            .standalone_write_unit()
-            .map_err(|error| format!("FTS maintenance admission: {error}"))?;
+        let unit = {
+            let _class =
+                crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Maintenance);
+            self.standalone_write_unit()
+        }
+        .map_err(|error| format!("FTS maintenance admission: {error}"))?;
         crate::fts_maintenance::run_if_due_with_admission(unit.conn(), config, state, now, || {
             self.write_admission
                 .check()
@@ -1044,7 +1049,7 @@ impl ConnectionPool {
             return;
         }
 
-        close_connection_quietly(conn.conn);
+        close_connection_quietly(conn.conn.into_inner());
         self.replace_discarded_reader_slot();
     }
 
@@ -1054,7 +1059,7 @@ impl ConnectionPool {
     fn enqueue_reader_slot(&self, conn: Box<PooledReader>) {
         if let Err(conn) = self.readers.push(conn) {
             eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
-            close_connection_quietly(conn.conn);
+            close_connection_quietly(conn.conn.into_inner());
         }
     }
 

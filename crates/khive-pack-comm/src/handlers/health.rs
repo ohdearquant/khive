@@ -11,6 +11,16 @@ use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 /// The grace avoids flagging a live poller during ordinary tick and I/O jitter.
 const STALLED_AFTER_INTERVALS: u64 = 3;
 
+fn age_secs(value: Option<&Value>, as_of: &DateTime<Utc>) -> Option<u64> {
+    let at = DateTime::parse_from_rfc3339(value?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if at > *as_of {
+        return None;
+    }
+    u64::try_from(as_of.signed_duration_since(at).num_seconds()).ok()
+}
+
 pub(super) fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
     // A known failure enters intentional exponential backoff, so the nominal
     // cadence cannot distinguish an overdue poll from a scheduled retry.
@@ -64,6 +74,7 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
         "poll_interval_secs": poll_interval_secs,
         "stalled": stalled,
         "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
+        "no_success_age_secs": age_secs(props.get("last_success_at"), as_of),
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
         "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
@@ -143,6 +154,13 @@ fn outbox_health_to_json(props: &Value, as_of: &DateTime<Utc>) -> Option<Value> 
         "pending_rows_seen",
         "pending_rows_limit",
         "oldest_pending_created_at",
+        "backlog_observed_at",
+        "undelivered_rows",
+        "backoff_rows",
+        "oldest_undelivered_created_at",
+        "oldest_backoff_created_at",
+        "earliest_backoff_next_attempt_at",
+        "max_backoff_delivery_attempts",
     ] {
         projected.insert(
             field.into(),
@@ -154,6 +172,10 @@ fn outbox_health_to_json(props: &Value, as_of: &DateTime<Utc>) -> Option<Value> 
     projected.insert(
         "oldest_pending_age_secs".into(),
         json!(oldest_pending_age_secs),
+    );
+    projected.insert(
+        "oldest_undelivered_age_secs".into(),
+        json!(age_secs(outbox.get("oldest_undelivered_created_at"), as_of)),
     );
     Some(Value::Object(projected))
 }
@@ -236,6 +258,7 @@ fn quarantine_only_channel_to_json(
         "poll_interval_secs": Value::Null,
         "stalled": Value::Null,
         "last_success_at": Value::Null,
+        "no_success_age_secs": Value::Null,
         "last_poll_attempt_at": Value::Null,
         "last_failure_at": Value::Null,
         "last_error": Value::Null,
@@ -271,9 +294,11 @@ mod outbox_health_tests;
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
-/// (via `getrusage`) plus in-flight background phase names. `cpu_us`/
-/// `rss_bytes` are `null` only if `getrusage` is unavailable; `active_phases`
-/// is always present and empty when nothing is in flight — raw observations
+/// plus in-flight background phase names. `rss_bytes` is current resident
+/// memory, and `max_rss_bytes` is the lifetime peak. A failed current RSS
+/// sample leaves CPU and peak intact; a failed getrusage leaves CPU and peak
+/// null while the independent current reading may still be available.
+/// `active_phases` is always present and empty when nothing is in flight — raw observations
 /// only, same "no computed healthy bool" rule as the rest of this verb.
 pub(crate) async fn handle_health(
     runtime: &KhiveRuntime,
@@ -368,12 +393,9 @@ pub(crate) async fn handle_health(
         ("daemon", Some("daemon-heartbeat"))
     };
 
+    let current = khive_runtime::resource::current_rss_bytes();
     let usage = khive_runtime::process_resource_usage();
-    let resource = json!({
-        "cpu_us": usage.map(|u| u.cpu_us),
-        "rss_bytes": usage.map(|u| u.rss_bytes),
-        "active_phases": khive_runtime::active_phase_names(),
-    });
+    let resource = resource_value(usage, current, json!(khive_runtime::active_phase_names()));
 
     Ok(json!({
         "role": role,
@@ -385,4 +407,51 @@ pub(crate) async fn handle_health(
         "channels": channels,
         "resource": resource,
     }))
+}
+
+fn resource_value(
+    usage: Option<khive_runtime::resource::ProcessResourceUsage>,
+    current: Option<i64>,
+    phases: Value,
+) -> Value {
+    json!({
+        "cpu_us": usage.map(|u| u.cpu_us),
+        "rss_bytes": current,
+        "max_rss_bytes": usage.map(|u| u.max_rss_bytes),
+        "active_phases": phases,
+    })
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::resource_value;
+    use serde_json::json;
+
+    #[test]
+    fn health_resource_keeps_both_keys_and_independent_samples() {
+        let usage = khive_runtime::resource::ProcessResourceUsage {
+            cpu_us: 12,
+            max_rss_bytes: 20,
+        };
+        let no_current = resource_value(Some(usage), None, json!([]));
+        assert!(no_current.get("rss_bytes").expect("current key").is_null());
+        assert_eq!(no_current["cpu_us"], 12);
+        assert_eq!(no_current["max_rss_bytes"], 20);
+        let no_usage = resource_value(None, Some(10), json!([]));
+        assert_eq!(no_usage["rss_bytes"], 10);
+        assert!(no_usage.get("max_rss_bytes").expect("peak key").is_null());
+        assert!(no_usage["cpu_us"].is_null());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn health_live_resource_has_null_or_positive_current_and_positive_peak() {
+        let current = khive_runtime::resource::current_rss_bytes();
+        let usage = khive_runtime::process_resource_usage().expect("getrusage fixture");
+        let result = resource_value(Some(usage), current, json!([]));
+        assert!(result.get("rss_bytes").is_some());
+        assert!(!matches!(current, Some(value) if value <= 0));
+        assert!(result.get("max_rss_bytes").is_some());
+        assert!(usage.max_rss_bytes > 0);
+    }
 }

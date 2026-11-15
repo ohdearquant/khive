@@ -8,6 +8,7 @@ const FILTERED_SCAN_CAP: u32 = 500;
 
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -25,7 +26,7 @@ use super::common::{
     reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
     validate_graph_read_kind, KindSpec, SearchParams,
 };
-use crate::handler_defs::KG_HANDLERS;
+use crate::handler_defs::SEARCH_PARAMS;
 use crate::KgPack;
 
 /// Canonical search ranking fields shared by KG and coordinated search.
@@ -86,9 +87,9 @@ impl SearchOrder {
 
 /// Reorder hits by a record timestamp, most recent first, then impose `limit`.
 ///
-/// A hit whose record was absent from the fetched batch has no timestamp and
-/// sorts last. The sort is stable, so hits sharing a timestamp keep the
-/// relevance order they arrived in, which makes the result deterministic.
+/// Entity search omits hits absent from its caller-visible metadata before
+/// sorting. Any missing timestamp sorts last. The sort is stable, so hits
+/// sharing a timestamp keep the relevance order they arrived in.
 fn apply_time_order<T>(hits: &mut Vec<T>, limit: usize, timestamp: impl Fn(&T) -> Option<i64>) {
     hits.sort_by_key(|hit| std::cmp::Reverse(timestamp(hit)));
     hits.truncate(limit);
@@ -103,6 +104,30 @@ struct EntityMeta {
     created_at: i64,
     updated_at: i64,
     version: i64,
+}
+
+// A scoped test-only rendezvous between candidate retrieval and metadata fetch.
+// Production builds have neither the hook nor a branch for it.
+#[cfg(test)]
+tokio::task_local! {
+    static ENTITY_HYDRATION_TEST_BARRIER: std::cell::RefCell<Option<(
+        tokio::sync::oneshot::Sender<Vec<Uuid>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>;
+}
+
+#[cfg(test)]
+async fn wait_for_entity_hydration_test_barrier(ids: &[Uuid]) {
+    let barrier = ENTITY_HYDRATION_TEST_BARRIER
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some((reached, proceed)) = barrier {
+        reached
+            .send(ids.to_vec())
+            .expect("entity test barrier observer");
+        proceed.await.expect("entity test barrier release");
+    }
 }
 
 /// Strict, canonical search request shared by the KG handler and the
@@ -128,6 +153,32 @@ pub struct ValidatedSearchRequest {
     min_score: f64,
     min_rank_score: DeterministicScore,
     order_by: SearchOrder,
+    created_after: Option<DateTime<Utc>>,
+    created_before: Option<DateTime<Utc>>,
+}
+
+fn parse_created_bound(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, RuntimeError> {
+    value
+        .map(|value| {
+            // Chrono silently discards fractional digits after the ninth. Refuse them
+            // before parsing so a lower bound cannot admit an earlier stored instant.
+            if value.split_once('.').is_some_and(|(_, fraction)| {
+                fraction.bytes().take_while(u8::is_ascii_digit).count() > 9
+            }) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{field} supports at most 9 fractional-second digits"
+                )));
+            }
+            DateTime::parse_from_rfc3339(value)
+                .map(|time| time.with_timezone(&Utc))
+                .map_err(|error| {
+                    RuntimeError::InvalidInput(format!("{field} must be RFC 3339: {error}"))
+                })
+        })
+        .transpose()
 }
 
 impl ValidatedSearchRequest {
@@ -135,9 +186,7 @@ impl ValidatedSearchRequest {
     pub fn from_value(mut params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
         // Coordinated search parses the caller's arguments here without going through registry
         // dispatch, so it applies the same whole-number float rule for integer parameters.
-        if let Some(search) = KG_HANDLERS.iter().find(|def| def.name == "search") {
-            integer_params_from_whole_floats(&mut params, search.params);
-        }
+        integer_params_from_whole_floats(&mut params, SEARCH_PARAMS);
         if params.get("min_rank_score").is_some() && params.get("min_score").is_some() {
             return Err(RuntimeError::InvalidInput(
                 "supply only min_rank_score; min_score is its deprecated alias".to_string(),
@@ -150,6 +199,16 @@ impl ValidatedSearchRequest {
         };
         let note_status_present = params.get("note_status").is_some();
         let p: SearchParams = deser(params)?;
+        let created_after = parse_created_bound(p.created_after.as_deref(), "created_after")?;
+        let created_before = parse_created_bound(p.created_before.as_deref(), "created_before")?;
+        if created_after
+            .zip(created_before)
+            .is_some_and(|(after, before)| after > before)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "created_after must not be later than created_before".into(),
+            ));
+        }
         let text_mode = match p.text_mode.as_deref() {
             None | Some("all_terms") => TextQueryMode::Plain,
             Some("any_term") => TextQueryMode::AnyTerm,
@@ -266,6 +325,8 @@ impl ValidatedSearchRequest {
                     min_score,
                     min_rank_score,
                     order_by,
+                    created_after,
+                    created_before,
                 })
             }
             KindSpec::Note { specific } => {
@@ -300,6 +361,8 @@ impl ValidatedSearchRequest {
                     min_score,
                     min_rank_score,
                     order_by,
+                    created_after,
+                    created_before,
                 })
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
@@ -397,6 +460,22 @@ impl ValidatedSearchRequest {
         self.order_by
     }
 
+    /// Whether an inclusive creation-time bound was supplied.
+    pub fn has_created_range(&self) -> bool {
+        self.created_after.is_some() || self.created_before.is_some()
+    }
+
+    /// Test the stored microsecond timestamp against the full-precision input bounds.
+    pub fn matches_created_at(&self, created_at: i64) -> bool {
+        if !self.has_created_range() {
+            return true;
+        }
+        DateTime::from_timestamp_micros(created_at).is_some_and(|at| {
+            self.created_after.is_none_or(|after| at >= after)
+                && self.created_before.is_none_or(|before| at <= before)
+        })
+    }
+
     /// Bounded backend candidate window used to preserve filtered-result recall.
     pub fn candidate_limit(&self) -> u32 {
         // A time order widens the window for the same reason a filter does: it
@@ -404,6 +483,7 @@ impl ValidatedSearchRequest {
         // the top `limit` scored hits would answer "the most recent of the most
         // relevant few" instead of the question asked.
         if self.properties.is_some()
+            || self.has_created_range()
             || !self.tags.is_empty()
             || self.source.is_some()
             || self.order_by != SearchOrder::Score
@@ -445,6 +525,9 @@ impl KgPack {
     }
 
     /// Execute the same search core while retaining note-only operation metadata.
+    /// Entity hits absent from the caller-visible metadata fetch are omitted.
+    /// Concurrent updates may leave fields from different generations: this is
+    /// not a snapshot, and an omitted hit is not replaced with another candidate.
     pub(crate) async fn handle_search_with_metadata(
         &self,
         token: &NamespaceToken,
@@ -480,6 +563,8 @@ impl KgPack {
                 hits.retain(|hit| hit.score >= request.min_rank_score());
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+                #[cfg(test)]
+                wait_for_entity_hydration_test_barrier(&candidate_ids).await;
                 let entity_meta: HashMap<Uuid, EntityMeta> = if candidate_ids.is_empty() {
                     HashMap::new()
                 } else {
@@ -523,31 +608,39 @@ impl KgPack {
                         .collect()
                 };
 
-                let mut filtered_hits =
-                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        let kept = hits.into_iter().filter(|h| {
-                            if source_filter.is_some_and(|source| h.source != source) {
-                                return false;
-                            }
-                            let Some(meta) = entity_meta.get(&h.entity_id) else {
-                                return false;
-                            };
-                            props_filter.is_none_or(|pf| props_match(meta.properties.as_ref(), pf))
-                                && tag_filter
-                                    .is_none_or(|wanted| tags_match_any(&meta.tags, wanted))
-                        });
-                        if request.order_by() == SearchOrder::Score {
-                            // Score order imposes the caller limit as candidates
-                            // stream past the filters, as it always has.
-                            kept.take(request.limit() as usize).collect::<Vec<_>>()
-                        } else {
-                            // A time order has to see every candidate that passed
-                            // the filters before it can pick the most recent ones.
-                            kept.collect::<Vec<_>>()
+                // A candidate can disappear or become invisible between the
+                // retrieval pass and this caller-visible metadata fetch.
+                hits.retain(|hit| entity_meta.contains_key(&hit.entity_id));
+
+                let mut filtered_hits = if props_filter.is_some()
+                    || tag_filter.is_some()
+                    || source_filter.is_some()
+                    || request.has_created_range()
+                {
+                    let kept = hits.into_iter().filter(|h| {
+                        if source_filter.is_some_and(|source| h.source != source) {
+                            return false;
                         }
+                        let Some(meta) = entity_meta.get(&h.entity_id) else {
+                            return false;
+                        };
+                        request.matches_created_at(meta.created_at)
+                            && props_filter
+                                .is_none_or(|pf| props_match(meta.properties.as_ref(), pf))
+                            && tag_filter.is_none_or(|wanted| tags_match_any(&meta.tags, wanted))
+                    });
+                    if request.order_by() == SearchOrder::Score {
+                        // Score order imposes the caller limit as candidates
+                        // stream past the filters, as it always has.
+                        kept.take(request.limit() as usize).collect::<Vec<_>>()
                     } else {
-                        hits
-                    };
+                        // A time order has to see every candidate that passed
+                        // the filters before it can pick the most recent ones.
+                        kept.collect::<Vec<_>>()
+                    }
+                } else {
+                    hits
+                };
 
                 if request.order_by() != SearchOrder::Score {
                     apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {
@@ -654,46 +747,49 @@ impl KgPack {
                         .is_some_and(|note| mailbox.permits_message_note(token, note))
                 });
 
-                let mut filtered_hits: Vec<_> =
-                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        let kept = hits.into_iter().filter(|h| {
-                            if source_filter.is_some_and(|source| h.source != source) {
-                                return false;
-                            }
-                            let Some(note) = note_meta.get(&h.note_id) else {
-                                return false;
-                            };
-                            let props = &note.properties;
-                            let props_ok =
-                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
-                            let tags_ok = tag_filter.is_none_or(|wanted| {
-                                let note_tags: Vec<String> = props
-                                    .as_ref()
-                                    .and_then(|p| p.get("tags"))
-                                    .and_then(Value::as_array)
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(Value::as_str)
-                                            .map(str::to_owned)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                tags_match_any(&note_tags, wanted)
-                            });
-                            props_ok && tags_ok
-                        });
-                        if request.order_by() == SearchOrder::Score {
-                            // Score order imposes the caller limit as candidates
-                            // stream past the filters, as it always has.
-                            kept.take(request.limit() as usize).collect()
-                        } else {
-                            // A time order has to see every candidate that passed
-                            // the filters before it can pick the most recent ones.
-                            kept.collect()
+                let mut filtered_hits: Vec<_> = if props_filter.is_some()
+                    || tag_filter.is_some()
+                    || source_filter.is_some()
+                    || request.has_created_range()
+                {
+                    let kept = hits.into_iter().filter(|h| {
+                        if source_filter.is_some_and(|source| h.source != source) {
+                            return false;
                         }
+                        let Some(note) = note_meta.get(&h.note_id) else {
+                            return false;
+                        };
+                        let props = &note.properties;
+                        let props_ok =
+                            props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
+                        let tags_ok = tag_filter.is_none_or(|wanted| {
+                            let note_tags: Vec<String> = props
+                                .as_ref()
+                                .and_then(|p| p.get("tags"))
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            tags_match_any(&note_tags, wanted)
+                        });
+                        request.matches_created_at(note.created_at) && props_ok && tags_ok
+                    });
+                    if request.order_by() == SearchOrder::Score {
+                        // Score order imposes the caller limit as candidates
+                        // stream past the filters, as it always has.
+                        kept.take(request.limit() as usize).collect()
                     } else {
-                        hits
-                    };
+                        // A time order has to see every candidate that passed
+                        // the filters before it can pick the most recent ones.
+                        kept.collect()
+                    }
+                } else {
+                    hits
+                };
 
                 if request.order_by() != SearchOrder::Score {
                     apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {
@@ -847,3 +943,7 @@ async fn emit_search_executed_event(
 #[cfg(test)]
 #[path = "search_note_status_tests.rs"]
 mod note_status_tests;
+
+#[cfg(test)]
+#[path = "search_entity_race_tests.rs"]
+mod entity_race_tests;

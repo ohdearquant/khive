@@ -226,10 +226,13 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool: None,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            catalog_verbosity: crate::args::CatalogVerbosity::Full,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             events_readiness: Arc::new(std::sync::OnceLock::new()),
@@ -274,6 +277,12 @@ impl KhiveMcpServer {
     /// `khive.toml`. Per-request `format` fields override this at dispatch time.
     pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
         self.default_output_format = fmt;
+        self
+    }
+
+    /// Select the advertised verb catalog detail without changing dispatch or full help.
+    pub fn with_catalog_verbosity(mut self, verbosity: crate::args::CatalogVerbosity) -> Self {
+        self.catalog_verbosity = verbosity;
         self
     }
 
@@ -410,6 +419,22 @@ impl KhiveMcpServer {
         self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
     }
 
+    /// Whether strict attributed-actor mode refuses a request made as
+    /// `actor_id`. The policy is the one checked when this server was built
+    /// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` or `[actor] require_attributed`,
+    /// with the default-backend runtime's pack list), applied here to the
+    /// caller's actor instead of this server's own. A server with no retained
+    /// runtime (registry-only construction) has no pack list to check and
+    /// refuses nothing.
+    pub(crate) fn strict_mode_refuses_actor(&self, actor_id: Option<&str>) -> bool {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return false;
+        };
+        let config = runtime.config();
+        (crate::serve::is_strict_actor_mode() || config.require_attributed_actor)
+            && crate::serve::should_warn_unattributed(actor_id, &config.packs)
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
@@ -429,6 +454,13 @@ impl KhiveMcpServer {
     /// (ADR-096 Fork 1).
     pub fn visible_namespaces(&self) -> &[khive_runtime::Namespace] {
         self.registry.visible_namespaces()
+    }
+
+    /// This server's resolved `[actor] owned_namespaces` (ADR-021 Delta 1).
+    /// Read when building the daemon request frame so the caller's declaration
+    /// travels with its identity; see [`Self::actor_id`] for why.
+    pub fn owned_namespaces(&self) -> &[khive_runtime::Namespace] {
+        self.registry.owned_namespaces()
     }
 
     /// The connection pool to use for background WAL checkpointing, if any.

@@ -358,3 +358,89 @@ fn add_hooks_remains_independent_of_config_initialization() {
         b"# legacy config\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn dangling_scaffold_leaves_are_skipped_without_creating_targets() {
+    for relative in [
+        ".khive/kg/entities.ndjson",
+        ".khive/kg/edges.ndjson",
+        ".khive/kg/hooks/pre-commit",
+        ".github/workflows/kg-validate.yml",
+    ] {
+        let fixture = Fixture::new();
+        let leaf = fixture.repo.join(relative);
+        let target = fixture.root.path().join("absent-operator-target");
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+        let output = fixture.init(&["--ci"]);
+        success(&output);
+        assert!(std::fs::symlink_metadata(&leaf)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&leaf).unwrap(), target);
+        let target_state = std::fs::symlink_metadata(&target);
+        assert!(
+            matches!(&target_state, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "dangling scaffold target must remain absent for {relative}: {target_state:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("Skipped {} (already exists)", leaf.display())),
+            "existing dangling leaf must be reported as skipped: {relative}"
+        );
+    }
+}
+
+#[test]
+fn regular_scaffold_leaves_keep_bytes_identity_and_permissions() {
+    let fixture = Fixture::new();
+    let leaves = [
+        ".khive/kg/entities.ndjson",
+        ".khive/kg/edges.ndjson",
+        ".khive/kg/hooks/pre-commit",
+        ".github/workflows/kg-validate.yml",
+    ];
+    for relative in leaves {
+        fixture.write(relative, format!("operator-owned {relative}\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                fixture.repo.join(relative),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    }
+    let before: Vec<_> = leaves
+        .iter()
+        .map(|relative| std::fs::metadata(fixture.repo.join(relative)).unwrap())
+        .collect();
+    let output = fixture.init(&["--ci"]);
+    success(&output);
+    for (relative, original) in leaves.iter().zip(before) {
+        let leaf = fixture.repo.join(relative);
+        assert_eq!(
+            std::fs::read(&leaf).unwrap(),
+            format!("operator-owned {relative}\n").as_bytes()
+        );
+        let current = std::fs::metadata(&leaf).unwrap();
+        assert_eq!(
+            current.permissions().readonly(),
+            original.permissions().readonly()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_eq!(
+                (current.dev(), current.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(current.permissions().mode(), original.permissions().mode());
+        }
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("Skipped {} (already exists)", leaf.display())));
+    }
+}

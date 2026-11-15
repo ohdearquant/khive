@@ -493,19 +493,19 @@ impl khive_storage::SqlAccess for SqlBridge {
                 let pool = Arc::clone(&self.pool);
                 let pending_event_rows = Arc::clone(&event_rows);
                 tokio::task::spawn_blocking(move || {
-                    let guard = pool.try_writer().map_err(|error: SqliteError| {
+                    let mut guard = pool.try_writer().map_err(|error: SqliteError| {
                         StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
                     })?;
                     let conn = guard.conn();
                     if !conn.is_autocommit() {
-                        pool.retire_pooled_writer(conn);
+                        pool.retire_pooled_writer(guard.conn_mut());
                         return Err(StorageError::writer_task_terminated(
                             khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                         ));
                     }
                     if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
                         if !conn.is_autocommit() {
-                            pool.retire_pooled_writer(conn);
+                            pool.retire_pooled_writer(guard.conn_mut());
                             return Err(SqliteError::settlement_with_cause(
                                 &error,
                                 khive_storage::error::SqliteWriteStage::Begin,
@@ -536,7 +536,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         },
                     );
                     if terminal_state.is_some() {
-                        pool.retire_pooled_writer(conn);
+                        pool.retire_pooled_writer(guard.conn_mut());
                     }
                     result.inspect_err(|error| pool.record_direct_writer_error(error))
                 })

@@ -76,6 +76,8 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     pub(super) config_id: String,
+    pub(super) spawn_config: Option<std::path::PathBuf>,
+    pub(super) spawn_db: Option<String>,
     /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
@@ -109,6 +111,7 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     pub(super) default_output_format: OutputFormat,
+    pub(super) catalog_verbosity: crate::args::CatalogVerbosity,
     /// Last instant at which this process's daemon schedule loop began a tick.
     /// Zero means this server instance has never observed the loop running.
     /// Shared by server clones but never persisted, so a replacement process

@@ -90,6 +90,36 @@ pub struct DocumentEmbeddingOutcome {
     pub truncated: bool,
 }
 
+// The provider's token count describes the byte-bounded input; it does not
+// estimate tokens discarded by the earlier byte limit.
+fn document_vector_or_refusal(outcome: DocumentEmbeddingOutcome) -> RuntimeResult<Vec<f32>> {
+    if !outcome.truncated {
+        return Ok(outcome.vector);
+    }
+    let token_count = outcome
+        .provider_token_count
+        .filter(|count| count.truncated());
+    let byte_cut = outcome.source_bytes > outcome.embedded_bytes;
+    let detail = match (byte_cut, token_count) {
+        (true, Some(count)) => format!(
+            "from {} to {} bytes and from {} to {} provider tokens for the byte-bounded input",
+            outcome.source_bytes, outcome.embedded_bytes, count.before_truncation, count.embedded
+        ),
+        (true, None) => format!(
+            "from {} to {} bytes",
+            outcome.source_bytes, outcome.embedded_bytes
+        ),
+        (false, Some(count)) => format!(
+            "from {} to {} provider tokens",
+            count.before_truncation, count.embedded
+        ),
+        (false, None) => "by an unspecified input limit".to_string(),
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "embedding input truncated {detail}; use embed_document_outcome to inspect the bounded vector"
+    )))
+}
+
 /// Aggregate truncation accounting for one logical write or reindex batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct EmbeddingTruncationReport {
@@ -417,13 +447,7 @@ impl KhiveRuntime {
     /// inspect the vector together with the truncation metadata.
     pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
         let outcome = self.embed_document_outcome(text).await?;
-        if outcome.truncated {
-            return Err(RuntimeError::InvalidInput(format!(
-                "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
-                outcome.source_bytes, outcome.embedded_bytes
-            )));
-        }
-        Ok(outcome.vector)
+        document_vector_or_refusal(outcome)
     }
 
     /// Embed a document with the default model and retain input-bounding metadata.

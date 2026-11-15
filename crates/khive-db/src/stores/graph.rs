@@ -341,7 +341,7 @@ impl SqlGraphStore {
 
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
-        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        F: FnOnce(&crate::ProgressConn) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
         super::run_pooled_store_read(

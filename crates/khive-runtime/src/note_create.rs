@@ -51,19 +51,52 @@ pub(crate) enum KeyPublication {
 }
 
 pub(crate) const KEY_CLAIM: &str = "memory-key-claim";
+pub(crate) const KEYED_ANNOTATION_ENDPOINT: &str = "memory-annotation-endpoint";
+
+pub(crate) enum NoteCreatePrepareError {
+    MissingAnnotation(Uuid),
+    Other(RuntimeError),
+}
+
+impl From<RuntimeError> for NoteCreatePrepareError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl NoteCreatePrepareError {
+    pub(crate) fn into_runtime(self) -> RuntimeError {
+        match self {
+            Self::MissingAnnotation(target) => {
+                RuntimeError::NotFound(format!("create_note annotates target {target} not found"))
+            }
+            Self::Other(error) => error,
+        }
+    }
+}
 
 pub(crate) async fn prepare_note_create(
+    runtime: &KhiveRuntime,
+    spec: AtomicNoteSpec<'_>,
+    options: AtomicNoteOptions<'_>,
+    annotates: &[Uuid],
+    publication: KeyPublication,
+) -> RuntimeResult<(PreparedAtomicNotes, Vec<Uuid>)> {
+    prepare_note_create_classified(runtime, spec, options, annotates, publication)
+        .await
+        .map_err(NoteCreatePrepareError::into_runtime)
+}
+
+pub(crate) async fn prepare_note_create_classified(
     runtime: &KhiveRuntime,
     spec: AtomicNoteSpec<'_>,
     mut options: AtomicNoteOptions<'_>,
     annotates: &[Uuid],
     publication: KeyPublication,
-) -> RuntimeResult<(PreparedAtomicNotes, Vec<Uuid>)> {
+) -> Result<(PreparedAtomicNotes, Vec<Uuid>), NoteCreatePrepareError> {
     for target in annotates {
         if !runtime.substrate_exists_by_id(spec.token, *target).await? {
-            return Err(RuntimeError::NotFound(format!(
-                "create_note annotates target {target} not found"
-            )));
+            return Err(NoteCreatePrepareError::MissingAnnotation(*target));
         }
     }
     let claim_last = match publication {
@@ -82,9 +115,7 @@ pub(crate) async fn prepare_note_create(
     let note = &prepared.notes[0];
     crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
     let AtomicOpPlan::AddNote(plan) = &mut prepared.plans[0] else {
-        return Err(RuntimeError::Internal(
-            "expected prepared note creation".into(),
-        ));
+        return Err(RuntimeError::Internal("expected prepared note creation".into()).into());
     };
     if claim_last.is_some() {
         plan.statements[0].statement =
@@ -107,10 +138,13 @@ pub(crate) async fn prepare_note_create(
             metadata: None,
             target_backend: None,
         };
+        let mut statement =
+            khive_db::stores::graph::edge_insert_only_guarded_by_endpoints_statement(&edge);
+        if claim_last.is_some() {
+            statement.label = Some(KEYED_ANNOTATION_ENDPOINT.into());
+        }
         plan.statements.push(PlanStatement {
-            statement: khive_db::stores::graph::edge_insert_only_guarded_by_endpoints_statement(
-                &edge,
-            ),
+            statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         });
         annotation_ids.push(id);

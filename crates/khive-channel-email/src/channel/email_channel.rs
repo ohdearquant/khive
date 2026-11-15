@@ -227,12 +227,29 @@ impl EmailChannel {
     /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
     /// any failing step quarantines it (never partially attributed).
     ///
+    /// Step 3 has one opt-in exception (ADR-056 Amendment 2026-11-01, Exchange Online intra-tenant
+    /// anchor). With `trust_exchange_internal` set, a message whose domain authentication is
+    /// `auth-absent` is attributed to the maintainer when `exchange_internal_maintainer` holds:
+    /// exactly one `From:` address on the configured mailbox's domain, exactly one
+    /// `X-MS-Exchange-Organization-AuthAs` field reading `Internal`, and the existing `From:` and
+    /// `Sender:` maintainer checks passing. Any failed condition stays `auth-absent`. This arm
+    /// never attributes external mail and never evaluates inbound suppression.
+    ///
     pub(super) fn gate(
         &self,
         email: &RawEmail,
         inbound: Option<&InboundSuppression>,
     ) -> Result<EmailAttribution, QuarantineReason> {
-        self.evaluate_auth(email)?;
+        match self.evaluate_auth(email) {
+            Ok(()) => {}
+            Err(QuarantineReason::AuthAbsent) if self.config.trust_exchange_internal => {
+                if self.exchange_internal_maintainer(email) {
+                    return Ok(EmailAttribution::Maintainer);
+                }
+                return Err(QuarantineReason::AuthAbsent);
+            }
+            Err(reason) => return Err(reason),
+        }
         if self
             .check_sender(&email.from_addrs, email.sender_addr.as_deref())
             .is_ok()
@@ -274,6 +291,28 @@ impl EmailChannel {
             }
         }
         Err(QuarantineReason::OffAllowlist)
+    }
+
+    fn exchange_internal_maintainer(&self, email: &RawEmail) -> bool {
+        let [from] = email.from_addrs.as_slice() else {
+            return false;
+        };
+        let Some((_, domain)) = from.rsplit_once('@') else {
+            return false;
+        };
+        let Some((_, mailbox_domain)) = self.config.mailbox.rsplit_once('@') else {
+            return false;
+        };
+        if !domain.eq_ignore_ascii_case(mailbox_domain)
+            || self
+                .check_sender(&email.from_addrs, email.sender_addr.as_deref())
+                .is_err()
+        {
+            return false;
+        }
+        let values =
+            auth_results::raw_header_values(&email.raw_bytes, b"X-MS-Exchange-Organization-AuthAs");
+        values.len() == 1 && values[0].trim().eq_ignore_ascii_case("Internal")
     }
 
     /// Build the envelope recorded for a message that failed the attribution

@@ -67,10 +67,12 @@ use storage_topology::plan_configured_storage_targets;
 mod server_build;
 
 pub use server_build::{
-    build_server, build_server_from_multi_backend_registry, build_server_multi_backend,
-    build_server_multi_backend_with_db_anchor, build_server_with_explicit_namespace,
-    checkpoint_pool_for, enforce_strict_actor_mode, is_forwarding_client, mark_mcp_host_role,
-    mcp_max_readers, WiringSurface,
+    build_server, build_server_from_multi_backend_registry,
+    build_server_from_multi_backend_registry_with_catalog_verbosity, build_server_multi_backend,
+    build_server_multi_backend_with_catalog_verbosity, build_server_multi_backend_with_db_anchor,
+    build_server_multi_backend_with_db_anchor_and_catalog_verbosity,
+    build_server_with_explicit_namespace, checkpoint_pool_for, enforce_strict_actor_mode,
+    is_forwarding_client, mark_mcp_host_role, mcp_max_readers, WiringSurface,
 };
 
 #[cfg(unix)]
@@ -79,10 +81,9 @@ pub use server_build::{
     MaintenanceTopologyRefusal,
 };
 
-#[cfg(test)]
-pub(crate) use server_build::is_strict_actor_mode;
-
-pub(crate) use server_build::{canonical_path_no_side_effects, should_warn_unattributed};
+pub(crate) use server_build::{
+    canonical_path_no_side_effects, is_strict_actor_mode, should_warn_unattributed,
+};
 
 use server_build::{
     build_server_from_prepared, canonical_backend_path, prepare_server_boot,
@@ -98,8 +99,9 @@ mod runtime_config;
 pub use runtime_config::{
     apply_env_output_format, build_single_backend_runtime, config_discovery_db_anchor,
     enable_events_forwarding_for_daemon, install_resolved_blob_store, resolve_runtime_config,
-    resolve_runtime_config_with_db_anchor, resolved_actor_disclosure, resolved_database_disclosure,
-    resolved_volume_lock_disclosure, resolved_wal_ceiling_disclosure, RuntimeConfigInputs,
+    resolve_runtime_config_with_actor_ownership, resolve_runtime_config_with_db_anchor,
+    resolved_actor_disclosure, resolved_database_disclosure, resolved_volume_lock_disclosure,
+    resolved_wal_ceiling_disclosure, ConfiguredActorOwnership, RuntimeConfigInputs,
 };
 
 use runtime_config::{
@@ -117,7 +119,8 @@ mod runtime_hooks;
 use disk_policy::{open_backend, open_backend_with_wal_ceiling};
 #[cfg(unix)]
 pub use events_socket_preflight::{
-    preflight_events_socket_for_boot, prepare_preflighted_daemon_store_plan,
+    preflight_daemon_configuration, preflight_events_socket_for_boot,
+    prepare_preflighted_daemon_store_plan,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -209,7 +212,7 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(args, &server)?;
+    let prepared_background = prepare_host_background_tasks(args, &server).await?;
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
@@ -365,6 +368,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     enforce_strict_actor_mode(
         default_runtime.config().actor_id.as_deref(),
         &default_runtime.config().packs,
+        default_runtime.config().require_attributed_actor,
     )?;
     if should_warn_unattributed(
         default_runtime.config().actor_id.as_deref(),
@@ -391,6 +395,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     builder.with_gate(gate);
     builder.with_default_namespace(default_namespace.as_str());
     builder.with_visible_namespaces(visible_namespaces);
+    builder.with_owned_namespaces(default_runtime.config().owned_namespaces.clone());
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
     if default_runtime.is_read_only() {

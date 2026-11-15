@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  160 public verbs (see the verb-catalog paragraph below       │
+│  163 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-010, forward-deployed,  │
@@ -111,7 +111,7 @@ not shipped.
 | `crates/khive-runtime-production-tests` | Private test consumer that exercises the runtime audit batcher without test-only features                                                                                                                                                                                                                                                                                         |
 | `crates/khive-request`                  | Request DSL parser (function-call + JSON forms, `\|` chains with `$prev`; LNDL planned)                                                                                                                                                                                                                                                                                           |
 | `crates/khive-pack-kg`                  | KG pack: vocabulary, 31 verb handlers, kind validation                                                                                                                                                                                                                                                                                                                            |
-| `crates/khive-pack-gtd`                 | GTD pack: 7 verbs over notes (assign / next / complete / tasks / transition / census / repair)                                                                                                                                                                                                                                                                                    |
+| `crates/khive-pack-gtd`                 | GTD pack: 8 verbs over notes (assign / next / complete / tasks / transition / census / counts / repair)                                                                                                                                                                                                                                                                           |
 | `crates/khive-pack-memory`              | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                                                                                                                                                             |
 | `crates/khive-pack-brain`               | Brain pack: profile management registry, Bayesian routing/feedback verbs                                                                                                                                                                                                                                                                                                          |
 | `crates/khive-pack-comm`                | Comm pack: threaded messaging, inbox/delivery/cursor/suppression verbs (fifteen public `comm.*` verbs)                                                                                                                                                                                                                                                                            |
@@ -280,7 +280,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `scan`            | `content`, `name?`, `properties?`                                                                                 | Would the secret gate refuse this note body: detector, field, exact refusal text, masked preview; no write                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `db_diagnostics`  | `backend?`, `size_composition?`                                                                                   | Writer-contention, graph-edge integrity, FTS5 segment/maintenance, and WAL/checkpoint diagnostics: aggregate plus pooled/standalone/writer-task acquisition counters, pooled checkout timeouts, audit failures, build identity, duplicate edge-ID and list-ledger counts, bounded one-row FTS structure readings, checkpoint/FTS maintenance counters, PASSIVE checkpoint probe, WAL file size, and explicitly qualified WAL-pin census. The probe may backfill WAL frames (normal checkpoint I/O); it never changes logical state, increments write-traffic acquisitions, escalates to TRUNCATE, or deletes sidecar evidence |
 
-### GTD pack verbs (7 — ADR-019)
+### GTD pack verbs (8 — ADR-019)
 
 In the default pack set; a non-empty `KHIVE_PACKS` or `--pack` list replaces that set, so it
 must name `gtd`. Adds the `task` note kind.
@@ -293,20 +293,22 @@ must name `gtd`. Adds the `task` note kind.
 | `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                                  |
 | `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation             |
 | `gtd.census`     | `include_candidates?`, `limit?`, `cursor?`                                   | Read-only task timestamp evidence and bounded candidates               |
+| `gtd.counts`     | `assignee`, `tag?`, `limit?`                                                 | Per-status counts for one assignee; open rows of one tag, no bodies    |
 | `gtd.repair`     | `items`, `apply?`                                                            | Preview or explicitly apply observed-value task repairs with audit     |
 
-### Memory pack verbs (5 — ADR-021)
+### Memory pack verbs (6 — ADR-021)
 
 In the default pack set; a non-empty `KHIVE_PACKS` or `--pack` list replaces that set, so it
 must name `memory`. Adds the `memory` note kind.
 
-| Verb              | Args                                                                                   | What it does                                                                                   |
-| ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                      |
-| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                             |
-| `memory.feedback` | `id`, `signal`                                                                         | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
-| `memory.prune`    | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014) |
-| `memory.vacuum`   | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                |
+| Verb                 | Args                                                                                   | What it does                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `memory.remember`    | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                                                       |
+| `memory.recall`      | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                                                              |
+| `memory.feedback`    | `id`, `signal`                                                                         | Emit explicit feedback on a recalled entity; updates recall posteriors                                                          |
+| `memory.prune`       | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014)                                  |
+| `memory.vacuum`      | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                                                 |
+| `memory.apply_batch` | `batch`, `rows`, `dry_run?`                                                            | Supersede, create, skip or list up to 200 memories under one batch name; dry run by default, re-runs write only what is missing |
 
 `get`/`update`/`delete`/`merge` resolve the substrate from the UUID, so `kind` is optional there;
 `get` also accepts a note `key` in place of `id`. `create`/`list`/`search` require `kind`.

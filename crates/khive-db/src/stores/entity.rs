@@ -375,7 +375,7 @@ impl SqlEntityStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool
+            let mut guard = pool
                 .transaction_write_unit()
                 .map_err(|error| map_sqlite_err(error, op))
                 .inspect_err(|error| pool.record_direct_writer_error(error))?;
@@ -384,7 +384,7 @@ impl SqlEntityStore {
                 f(conn).map_err(|error| map_err(error, op))
             });
             if terminal_state.is_some() {
-                pool.retire_pooled_writer(conn);
+                pool.retire_pooled_writer(guard.conn_mut());
             }
             result.inspect_err(|error| pool.record_direct_writer_error(error))
         })

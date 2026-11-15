@@ -87,7 +87,7 @@ fn pause_first_insert(
     pool.writer()
         .unwrap()
         .conn()
-        .authorizer(Some(move |ctx: AuthContext<'_>| {
+        .test_authorizer(Some(move |ctx: AuthContext<'_>| {
             if matches!(ctx.action, AuthAction::Insert { table_name } if table_name == table) {
                 if let Some(entered) = entered.take() {
                     entered.send(()).unwrap();

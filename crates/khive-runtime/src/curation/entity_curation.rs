@@ -482,6 +482,37 @@ impl KhiveRuntime {
         )
     }
 
+    /// Apply a guarded admin patch with one event in the same writer transaction.
+    /// The token stamps the required event's namespace, actor and operation;
+    /// callers supply its semantic kind, target and payload. An unchanged patch
+    /// appends nothing. A failed append rolls back the replacement. Existing
+    /// post-commit index and generic update-event reporting remains unchanged.
+    pub async fn update_entity_if_unchanged_with_required_event(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+        required_event: khive_storage::Event,
+    ) -> RuntimeResult<Entity> {
+        let (entity, embedding) = self
+            .update_entity_if_unchanged_with_optional_event(
+                token,
+                expected,
+                patch,
+                remove_properties,
+                Some(required_event),
+            )
+            .await?;
+        crate::operations::legacy_post_commit_result_with_embedding(
+            "update_entity_if_unchanged",
+            entity.id,
+            entity,
+            embedding,
+            Vec::new(),
+        )
+    }
+
     /// Apply a guarded admin patch and retain embedding truncation accounting.
     pub async fn update_entity_if_unchanged_with_embedding_report(
         &self,
@@ -489,6 +520,24 @@ impl KhiveRuntime {
         expected: &Entity,
         patch: EntityPatch,
         remove_properties: &[&str],
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        self.update_entity_if_unchanged_with_optional_event(
+            token,
+            expected,
+            patch,
+            remove_properties,
+            None,
+        )
+        .await
+    }
+
+    async fn update_entity_if_unchanged_with_optional_event(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+        required_event: Option<khive_storage::Event>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_guarded_entity_update(
@@ -506,7 +555,7 @@ impl KhiveRuntime {
             ));
         }
         let (entity, report) = self
-            .persist_prepared_entity_update(
+            .persist_prepared_entity_update_with_required_event(
                 token,
                 entity,
                 reindex_required,
@@ -514,6 +563,7 @@ impl KhiveRuntime {
                 expected_updated_at,
                 expected_deleted_at,
                 None,
+                required_event,
             )
             .await?;
         report.into_legacy(entity)
@@ -523,12 +573,37 @@ impl KhiveRuntime {
     pub(super) async fn persist_prepared_entity_update(
         &self,
         token: &NamespaceToken,
+        entity: Entity,
+        reindex_required: bool,
+        changed_fields: Vec<&'static str>,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+        expected_version: Option<i64>,
+    ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
+        self.persist_prepared_entity_update_with_required_event(
+            token,
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+            expected_version,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_prepared_entity_update_with_required_event(
+        &self,
+        token: &NamespaceToken,
         mut entity: Entity,
         reindex_required: bool,
         changed_fields: Vec<&'static str>,
         expected_updated_at: i64,
         expected_deleted_at: Option<i64>,
         expected_version: Option<i64>,
+        required_event: Option<khive_storage::Event>,
     ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         // This final whole-object replacement must reserve the complete
         // candidate, even if a future caller bypasses the patch preparer.
@@ -550,16 +625,31 @@ impl KhiveRuntime {
         } else {
             Vec::new()
         };
+        let mut statements = vec![PlanStatement {
+            statement: khive_db::stores::entity::entity_replace_if_unchanged_statement(
+                &entity,
+                expected_updated_at,
+                expected_deleted_at,
+            ),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        if let Some(event) = required_event {
+            let event = EventAttribution::from_token(token).stamp(event);
+            statements.extend(
+                khive_db::stores::event::event_insert_statements(&event)
+                    .map_err(|error| {
+                        RuntimeError::Internal(format!("required entity event: {error}"))
+                    })?
+                    .into_iter()
+                    .map(|statement| PlanStatement {
+                        statement,
+                        guard: None,
+                    }),
+            );
+        }
         let plan = UpdatePlan {
             target_id: id,
-            statements: vec![PlanStatement {
-                statement: khive_db::stores::entity::entity_replace_if_unchanged_statement(
-                    &entity,
-                    expected_updated_at,
-                    expected_deleted_at,
-                ),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }],
+            statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
@@ -951,7 +1041,7 @@ impl KhiveRuntime {
 
     // ---- Internal helpers ----
 
-    async fn apply_entity_index_revision(
+    pub(crate) async fn apply_entity_index_revision(
         &self,
         entity: &Entity,
         statements: Vec<SqlStatement>,

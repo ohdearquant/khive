@@ -14,7 +14,10 @@ mod pack;
 mod section_feedback;
 mod sql;
 
-pub(crate) use pack::{apply_dispatch_signal, sync_balanced_recall_record};
+pub(crate) use pack::{
+    apply_dispatch_signal, apply_feedback_signal, dispatch_route, refresh_named_profile_record,
+    sync_balanced_recall_record, FoldRoute,
+};
 pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 
 use std::collections::HashMap;

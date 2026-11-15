@@ -295,6 +295,32 @@ file) is the entry point for every MCP client. When your config declares
 declared `main` backend or is the explicit `:memory:` escape hatch. The config
 file is authoritative for backend paths.
 
+### Verb catalog verbosity
+
+MCP clients discover khive's verbs in the `request` tool description. The default
+`full` mode includes the complete catalog descriptions. To request shorter
+summaries for one client, add the option to that client's command arguments:
+
+```sh
+kkernel mcp --catalog-verbosity compact
+```
+
+Compact mode keeps every enabled callable verb, including mounted verbs, in
+sorted order. Each row retains its contributing packs and a `verb(help=true)`
+pointer. A contribution shows the first nonempty description line with normalized
+whitespace, up to 160 Unicode scalar values including any shortening ellipsis.
+A header identifies these summaries and explains how to obtain full help.
+`verb(help=true)` returns complete help, including argument definitions; `verbs`
+keeps its complete descriptions.
+
+Omit the option or pass `--catalog-verbosity full` to retain the original full
+request-tool description. This is a choice for the individual MCP server
+instance; it does not change the loaded packs, dispatch, daemon identity or
+forwarding. There is no corresponding environment variable or TOML setting.
+Rust callers can use
+`server.with_catalog_verbosity(khive_mcp::args::CatalogVerbosity::Compact)`;
+existing server constructors default to `Full`.
+
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
 ```json
@@ -524,6 +550,15 @@ carries an explicit offset or `Z` is unaffected. See
 [ADR-169](adr/ADR-169-timezone-correct-timestamps.md) for the full decision
 record, including which rendering-surface work this setting does and does not
 cover yet.
+
+---
+
+## `[channel.node]` — accepted and not interpreted
+
+The node channel is not part of this release. A `[channel.node]` table left in
+an existing configuration file still loads and is accepted as it stands: its
+contents are not read or checked, and it changes nothing about how the daemon
+runs. Any other key under `[channel]` is still rejected when the file loads.
 
 ---
 

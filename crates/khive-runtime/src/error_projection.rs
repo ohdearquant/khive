@@ -1,6 +1,7 @@
 //! Canonical typed runtime projection and per-operation failure construction.
 //!
-//! The typed projection remains lossless. The shared entry builder applies the
+//! Ordinary typed projections retain their structured evidence. Search-read
+//! context deliberately exposes only closed classifications and safe context. The shared entry builder applies the
 //! response boundary's nesting and domain-result retention rules afterwards.
 
 use khive_storage::{StorageCapability, StorageError};
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::{DomainDisposition, RuntimeError};
 
-/// Project the original typed error, preserving every structured source field.
+/// Project typed evidence, with explicit privacy narrowing for search-read context.
 ///
 /// `disposition` describes the enclosing operation. Named runtime refusals keep
 /// their existing wire override. This function moves an obligation's result
@@ -201,6 +202,47 @@ fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::SearchRead { context } => {
+            let message = context.to_string();
+            let backend = context.backend().as_str().to_owned();
+            let substrate = context.substrate().as_str();
+            let cause_class = context.source().audit_error_class().as_str();
+            let retryable = context.source().retryable_failure_context().is_some();
+            // Only the canonical source kind and typed outcome survive. Never
+            // copy arbitrary source messages, details, codes or retry values.
+            let source = runtime_error_value_inner(context.into_source(), disposition);
+            let kind = source["kind"]
+                .as_str()
+                .expect("canonical error kind is a string");
+            assert!(
+                matches!(
+                    kind,
+                    "runtime_error"
+                        | "obligation"
+                        | "internal"
+                        | "remote_fetch_error"
+                        | "not_found"
+                        | "storage"
+                        | "unavailable"
+                        | "invalid_input"
+                        | "unauthorized"
+                        | "conflict"
+                ),
+                "canonical error kind must have an explicit privacy classification"
+            );
+            let mut value = json!({
+                "kind": kind,
+                "code": "search_read_failed",
+                "message": message,
+                "cause_class": cause_class,
+                "domain_disposition": failure_error_disposition(&source).as_str(),
+                "search_context": {"backend": backend, "substrate": substrate},
+            });
+            if retryable {
+                value["retryable"] = json!(true);
+            }
+            return value;
+        }
         RuntimeError::CanonicalUnsupportedOperation {
             op_index,
             operation,
@@ -399,7 +441,8 @@ fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition
         | RuntimeError::AmbiguousId { .. }
         | RuntimeError::CrossNamespaceWrite { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::DeadlineExceeded { .. }) => {
+        | RuntimeError::DeadlineExceeded { .. }
+        | RuntimeError::AttachmentCutoverRequired { .. }) => {
             if let Some(capacity) = sqlite_capacity_failure(&other) {
                 let mut value = capacity.into_value(other.to_string());
                 if let Some(context) = other.writer_task_failure_context() {

@@ -33,6 +33,9 @@ pub struct CommPack {
     /// given to it.
     channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
     email_message_id_domains: Result<Option<EmailMessageIdDomains>, String>,
+    /// Route used by `comm.send` for node-addressed recipients. Without one, a send to a recipient
+    /// in the node address form is refused before anything is written.
+    node_route: Option<std::sync::Arc<dyn crate::node_route::NodeSendRoute>>,
 }
 
 impl Pack for CommPack {
@@ -111,12 +114,14 @@ impl CommPack {
     /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
         runtime.install_note_embedding_policies(<Self as Pack>::NOTE_EMBEDDING_POLICIES);
+        let node_route = None;
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
             quarantine_retention: std::time::Duration::from_secs(14 * 24 * 60 * 60),
             channel_ingest: std::sync::OnceLock::new(),
             email_message_id_domains: EmailMessageIdDomains::from_env(),
+            node_route,
         }
     }
 
@@ -130,6 +135,16 @@ impl CommPack {
 
     pub fn with_email_message_id_domains(mut self, domains: EmailMessageIdDomains) -> Self {
         self.email_message_id_domains = Ok(Some(domains));
+        self
+    }
+
+    /// Install the route that seals node-addressed `comm.send` recipients and refuses the ones
+    /// it cannot route (disabled channel, unparseable address, unknown recipient pin).
+    pub fn with_node_route(
+        mut self,
+        route: std::sync::Arc<dyn crate::node_route::NodeSendRoute>,
+    ) -> Self {
+        self.node_route = Some(route);
         self
     }
 
@@ -160,6 +175,16 @@ impl CommPack {
         &self,
     ) -> Option<&khive_runtime::ChannelIngestCapability> {
         self.channel_ingest.get()
+    }
+
+    /// This pack holds no shared host state.
+    fn node_host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// This pack has no configuration of its own to refuse, so every configuration is accepted.
+    fn validate_node_config(&self) -> Result<(), RuntimeError> {
+        Ok(())
     }
 }
 
@@ -385,6 +410,12 @@ inventory::submit! { khive_runtime::PackRegistration(&CommPackFactory) }
 #[async_trait]
 impl PackRuntime for CommPack {
     khive_runtime::pack_runtime_metadata!();
+    fn host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.node_host_state()
+    }
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        self.validate_node_config()
+    }
     fn note_property_policies(&self) -> &'static [NotePropertyPolicySpec] {
         <Self as Pack>::NOTE_PROPERTY_POLICIES
     }
@@ -422,7 +453,14 @@ impl PackRuntime for CommPack {
                 handlers::handle_withheld_body(self.runtime(), token, params).await
             }
             "comm.send" => {
-                handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await
+                handlers::handle_send_with_route(
+                    self.runtime(),
+                    &self.inbox_signal,
+                    token,
+                    params,
+                    self.node_route.as_deref(),
+                )
+                .await
             }
             "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
             "comm.transport_status" => {

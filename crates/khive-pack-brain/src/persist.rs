@@ -1045,6 +1045,110 @@ fn prepare_parked_state(mut state: BrainState, entity_capacity: usize) -> BrainS
     state
 }
 
+/// Serving profile of a replayed judgment-bearing feedback event, or `None`
+/// when the event records that no serving profile was resolved.
+///
+/// The feedback write path stamps the profile it resolved onto the persisted
+/// event as `served_by_profile_id`, and folds the signal by that value, so
+/// replay reads the same field:
+///
+/// - a string value is the profile the write path resolved;
+/// - an absent field is a row written before the stamp existed; it keeps the
+///   historical default-profile fold;
+/// - a null or any other non-string value means no serving profile was
+///   resolved; the live path folded nothing for it, neither a posterior nor a
+///   section state, so replay folds nothing either.
+fn replay_feedback_profile(event: &Event) -> Option<&str> {
+    match event.payload.get("served_by_profile_id") {
+        None => Some("balanced-recall-v1"),
+        Some(Value::String(profile_id)) => Some(profile_id.as_str()),
+        Some(_) => None,
+    }
+}
+
+/// Fold replayed events into `bs`, each into the one profile the live path
+/// folded it into.
+///
+/// - judgment-bearing feedback with a serving profile (see
+///   [`replay_feedback_profile`]) folds through [`crate::apply_feedback_signal`],
+///   the function the feedback write path folds with; judgment-bearing feedback
+///   with no resolved serving profile folds nothing;
+/// - every other signal follows [`crate::dispatch_route`];
+/// - unjudged telemetry is not folded, and section feedback is replayed into
+///   section state only.
+///
+/// Every other folded event also takes one section-state fold, seeded for the
+/// profile named on the event (the default profile when it names none). Named
+/// profiles folded by the dispatch rule have their records refreshed once,
+/// after the last event.
+pub(crate) fn replay_events(bs: &mut BrainState, events: &[Event]) {
+    // Named profiles that received at least one replayed dispatch signal.
+    let mut touched_profiles: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    for event in events {
+        // Do not count telemetry or seed a serving profile's section state.
+        if event.kind == EventKind::FeedbackUnjudged {
+            continue;
+        }
+        if event.verb == "brain.section_feedback" {
+            if let Err(error) = crate::section_feedback::replay(bs, event) {
+                tracing::warn!(event_id = %event.id, %error, "section feedback replay skipped");
+            }
+            continue;
+        }
+        let signal = interpret(event);
+
+        // Fold the event into the one profile the live path folded it into:
+        // judgment-bearing feedback by the profile stamped on the persisted
+        // event, through the write path's own fold; every other signal by the
+        // dispatch rule.
+        if matches!(
+            signal,
+            BrainSignal::Feedback { .. } | BrainSignal::SemanticFeedback { .. }
+        ) {
+            // apply_feedback_signal also takes the section-state fold, so
+            // nothing below runs for judgment feedback.
+            if let Some(serving_profile) = replay_feedback_profile(event) {
+                crate::apply_feedback_signal(bs, serving_profile, &signal);
+            }
+            continue;
+        } else {
+            match crate::dispatch_route(bs, &signal) {
+                crate::FoldRoute::Skip => {}
+                crate::FoldRoute::Balanced => bs.balanced_recall.apply_signal(&signal),
+                crate::FoldRoute::Named(profile_id) => {
+                    if let Some(profile_state) = bs.profile_states.get_mut(profile_id) {
+                        profile_state.apply_signal(&signal);
+                        touched_profiles.insert(profile_id.to_owned());
+                    } else {
+                        tracing::warn!(
+                            event_id = %event.id,
+                            profile_id,
+                            "replayed brain signal named an unavailable serving profile; signal was not applied"
+                        );
+                    }
+                }
+            }
+        }
+
+        let serving_profile = event
+            .payload
+            .get("served_by_profile_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("balanced-recall-v1");
+
+        let section_state =
+            crate::ensure_section_state_seeded(&mut bs.section_states, serving_profile);
+        section_state.apply_signal(&signal);
+    }
+
+    for profile_id in &touched_profiles {
+        crate::refresh_named_profile_record(bs, profile_id);
+    }
+    crate::sync_balanced_recall_record(bs);
+}
+
 pub async fn ensure_loaded(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1080,35 +1184,7 @@ pub async fn ensure_loaded(
             let replay_result = load_events_since(sql.as_ref(), &namespace, updated_at).await?;
 
             let mut bs = BrainState::from_snapshot(snapshot, entity_capacity);
-
-            for event in &replay_result.events {
-                // Do not count telemetry or seed a serving profile's section state.
-                if event.kind == EventKind::FeedbackUnjudged {
-                    continue;
-                }
-                if event.verb == "brain.section_feedback" {
-                    if let Err(error) = crate::section_feedback::replay(&mut bs, event) {
-                        tracing::warn!(event_id = %event.id, %error, "section feedback replay skipped");
-                    }
-                    continue;
-                }
-                let signal = interpret(event);
-                bs.balanced_recall.apply_signal(&signal);
-
-                let serving_profile = event
-                    .payload
-                    .get("served_by_profile_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("balanced-recall-v1");
-
-                {
-                    let section_state =
-                        crate::ensure_section_state_seeded(&mut bs.section_states, serving_profile);
-                    section_state.apply_signal(&signal);
-                }
-            }
-
-            crate::sync_balanced_recall_record(&mut bs);
+            replay_events(&mut bs, &replay_result.events);
             bs
         } else {
             BrainState::new(entity_capacity)
@@ -1215,6 +1291,12 @@ mod brain_007_replay_quarantine;
 #[cfg(test)]
 #[path = "persist/replay_policy_exclusion_tests.rs"]
 mod replay_policy_exclusion;
+
+// ── replay folds each event into the profile the live path credited ──────────
+
+#[cfg(test)]
+#[path = "persist/replay_routing_tests.rs"]
+mod replay_routing;
 
 // ── BRAINCORE-AUD-001: entity-posterior cache-capacity enforcement on load ────
 

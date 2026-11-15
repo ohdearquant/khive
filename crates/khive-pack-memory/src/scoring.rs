@@ -843,11 +843,76 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     calculate_score_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
 }
 
+/// The terms of the composite `calculate_score` ranks by.
+///
+/// `relevance_term × temporal_boost × salience_boost` is `base`; the configured adjustments
+/// and the final clamp to `[0, 1]` turn `base` into `score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScoreFactors {
+    /// `weights.relevance × relevance_score`.
+    pub(crate) relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub(crate) temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub(crate) salience_boost: f32,
+    /// `relevance_term × temporal_boost × salience_boost`, before any adjustment.
+    pub(crate) base: f32,
+    /// The value `calculate_score` returns.
+    pub(crate) score: f32,
+    /// False when the arithmetic fell back to a zero score (a boost or the composite was not a
+    /// finite number): the other fields then do not describe a computed composite.
+    pub(crate) complete: bool,
+}
+
+impl ScoreFactors {
+    /// The terms of a candidate whose boost arithmetic fell back to a zero score: the relevance
+    /// term is kept, no boost was computed, and the result is marked incomplete.
+    fn fallback(relevance_term: f32) -> Self {
+        Self {
+            relevance_term,
+            temporal_boost: 0.0,
+            salience_boost: 0.0,
+            base: 0.0,
+            score: 0.0,
+            complete: false,
+        }
+    }
+
+    /// The net multiplier of the configured adjustments and the final clamp, `score / base`, so
+    /// that `relevance_term × temporal_boost × salience_boost × adjustment_factor` is `score`.
+    ///
+    /// `None` when `base` is not a positive finite number: the adjustments then act on zero, and
+    /// whatever score they leave is not a multiple of `base`.
+    pub(crate) fn adjustment_factor(&self) -> Option<f32> {
+        if self.base.is_finite() && self.base > 0.0 {
+            Some(self.score / self.base)
+        } else {
+            None
+        }
+    }
+}
+
+/// `calculate_score`, returning the terms it multiplied alongside the score.
+pub(crate) fn calculate_score_factors(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+) -> ScoreFactors {
+    score_factors_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
 fn calculate_score_with_reporter(
     input: &ScoreInput<'_>,
     config: &ScoringConfig,
     reporter: &ScoreFallbackWarnings,
 ) -> f32 {
+    score_factors_with_reporter(input, config, reporter).score
+}
+
+fn score_factors_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> ScoreFactors {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
 
@@ -860,14 +925,15 @@ fn calculate_score_with_reporter(
 
     let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
         reporter.record(ScoreFallbackReason::TemporalBoost);
-        return 0.0;
+        return ScoreFactors::fallback(semantic_base);
     };
     let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
         reporter.record(ScoreFallbackReason::SalienceBoost);
-        return 0.0;
+        return ScoreFactors::fallback(semantic_base);
     };
 
-    let mut score = semantic_base * temporal_boost * salience_boost;
+    let base = semantic_base * temporal_boost * salience_boost;
+    let mut score = base;
 
     let ctx = CandidateContext {
         memory_type: input.memory_type_str,
@@ -885,9 +951,23 @@ fn calculate_score_with_reporter(
     // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
     if !score.is_finite() {
         reporter.record(ScoreFallbackReason::NonfiniteComposite);
-        return 0.0;
+        return ScoreFactors {
+            relevance_term: semantic_base,
+            temporal_boost,
+            salience_boost,
+            base,
+            score: 0.0,
+            complete: false,
+        };
     }
-    score.clamp(0.0, 1.0)
+    ScoreFactors {
+        relevance_term: semantic_base,
+        temporal_boost,
+        salience_boost,
+        base,
+        score: score.clamp(0.0, 1.0),
+        complete: true,
+    }
 }
 
 // ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────

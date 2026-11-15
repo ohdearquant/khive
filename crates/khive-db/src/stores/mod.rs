@@ -128,7 +128,7 @@ pub(crate) async fn run_pooled_store_read<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     run_pooled_store_read_with_state(pool, capability, operation, false, read).await
@@ -143,7 +143,7 @@ pub(crate) async fn run_stateful_pooled_store_read<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     run_pooled_store_read_with_state(pool, capability, operation, true, read).await
@@ -173,7 +173,7 @@ async fn run_pooled_store_read_with_state<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     let trace = khive_storage::request_context::capture_search_phase_trace();

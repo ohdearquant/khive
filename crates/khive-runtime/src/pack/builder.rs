@@ -57,6 +57,13 @@ pub struct VerbRegistryBuilder {
     /// is a precise escape and is not widened by this set. A cloud gate may also
     /// consult the list as policy input at its own layer.
     visible_namespaces: Vec<Namespace>,
+    /// Operator-declared namespaces the configured actor owns (`[actor]
+    /// owned_namespaces`, ADR-021 Delta 1).
+    ///
+    /// Threads into `VerbRegistry::owned_namespaces` and is stamped onto every
+    /// token the registry mints. It is read by the `memory.apply_batch` old-row
+    /// namespace check alone: it grants no write and widens no read.
+    owned_namespaces: Vec<Namespace>,
     /// Configured actor identity label (ADR-057). When set, dispatch mints tokens
     /// carrying this actor so that `comm.inbox` filters by `to_actor`.
     actor_id: Option<String>,
@@ -99,6 +106,7 @@ impl VerbRegistryBuilder {
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
+            owned_namespaces: vec![],
             actor_id: None,
             event_store: None,
             runtime_event_store: None,
@@ -126,6 +134,18 @@ impl VerbRegistryBuilder {
     /// policy input at its own layer.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
+        self
+    }
+
+    /// Set the namespaces the configured actor declared it owns (ADR-021 Delta 1).
+    ///
+    /// Every token the registry mints carries this list, and the
+    /// `memory.apply_batch` old-row namespace check admits an old row in a listed
+    /// namespace like one in the caller's own namespace. Ownership grants no
+    /// write into the namespace and widens no read; `visible_namespaces` stays a
+    /// read-only grant. A per-request identity overrides this baked list.
+    pub fn with_owned_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
+        self.owned_namespaces = ns;
         self
     }
 
@@ -687,6 +707,7 @@ impl VerbRegistryBuilder {
             gate: self.gate,
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
+            owned_namespaces: self.owned_namespaces,
             actor_id: self.actor_id,
             event_store,
             config_lock_runtime,

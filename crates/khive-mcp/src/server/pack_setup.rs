@@ -26,6 +26,7 @@ impl KhiveMcpServer {
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         builder.with_visible_namespaces(visible_namespaces);
+        builder.with_owned_namespaces(runtime.config().owned_namespaces.clone());
         builder.with_actor_id(actor_id);
         // A read-only snapshot deliberately retains no EventStore handle; the
         // registry exposes an advisory beside each successful result instead.
@@ -126,10 +127,13 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.as_str().to_string(),
             config_id,
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            catalog_verbosity: crate::args::CatalogVerbosity::Full,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             events_readiness: Arc::new(std::sync::OnceLock::new()),

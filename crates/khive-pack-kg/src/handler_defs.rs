@@ -13,7 +13,127 @@ use serde_json::Value;
 
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
-
+pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
+    ParamDef {
+        name: "created_after",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 lower bound on entity/note created_at (at most 9 fractional-second digits). Metadata filter before the final limit over returned candidates: limit × 50, capped at 500 per backend. Can underfill; does not scan the full time range or use the larger property/tag pushdown window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "created_before",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 upper bound on entity/note created_at (at most 9 fractional-second digits). Must not precede created_after. Omitted/null bounds are unrestricted; compared as instants before ordering and the final limit within the returned candidate window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "kind",
+        param_type: "string",
+        required: true,
+        description: "Substrate or granular kind to search.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "query",
+        param_type: "string",
+        required: true,
+        description: "Free-text search query.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "text_mode",
+        param_type: "string",
+        required: false,
+        description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "limit",
+        param_type: "integer",
+        required: false,
+        description: "Maximum results to return (default 10).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "entity_kind",
+        param_type: "string",
+        required: false,
+        description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "entity_type",
+        param_type: "string",
+        required: false,
+        description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "note_kind",
+        param_type: "string",
+        required: false,
+        description: "Filter search results to a specific note kind (kind=\"note\" only).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "note_status",
+        param_type: "string",
+        required: false,
+        description: "Notes only: active (default for omitted/null), archived, or any, selecting the note lifecycle status at hydration. The bounded gather may return a short page. Separate from workflow properties.status. Entity searches reject this parameter.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "include_superseded",
+        param_type: "boolean",
+        required: false,
+        description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "properties",
+        param_type: "object",
+        required: false,
+        description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "tags",
+        param_type: "array",
+        required: false,
+        description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "source",
+        param_type: "string",
+        required: false,
+        description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "min_rank_score",
+        param_type: "number",
+        required: false,
+        description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "min_score",
+        param_type: "number",
+        required: false,
+        description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "order_by",
+        param_type: "string",
+        required: false,
+        description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+];
 pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {
         name: "attach",
@@ -861,113 +981,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. Note searches default to active lifecycle status; note_status=archived or any provides explicit access, separately from workflow properties.status. Successful MCP note searches report note_status and note_status_dropped beside result, including zero; the count describes distinct gathered notes excluded by status after the other hydration predicates, not a corpus total or a promise of extra Any hits. Raw registry results remain hit arrays. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[
-            ParamDef {
-                name: "kind",
-                param_type: "string",
-                required: true,
-                description: "Substrate or granular kind to search.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "query",
-                param_type: "string",
-                required: true,
-                description: "Free-text search query.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "text_mode",
-                param_type: "string",
-                required: false,
-                description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "limit",
-                param_type: "integer",
-                required: false,
-                description: "Maximum results to return (default 10).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "entity_kind",
-                param_type: "string",
-                required: false,
-                description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "entity_type",
-                param_type: "string",
-                required: false,
-                description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "note_kind",
-                param_type: "string",
-                required: false,
-                description: "Filter search results to a specific note kind (kind=\"note\" only).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "note_status",
-                param_type: "string",
-                required: false,
-                description: "Notes only: active (default for omitted/null), archived, or any, selecting the note lifecycle status at hydration. The bounded gather may return a short page. Separate from workflow properties.status. Entity searches reject this parameter.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "include_superseded",
-                param_type: "boolean",
-                required: false,
-                description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "properties",
-                param_type: "object",
-                required: false,
-                description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "tags",
-                param_type: "array",
-                required: false,
-                description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "source",
-                param_type: "string",
-                required: false,
-                description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "min_rank_score",
-                param_type: "number",
-                required: false,
-                description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "min_score",
-                param_type: "number",
-                required: false,
-                description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "order_by",
-                param_type: "string",
-                required: false,
-                description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-        ],
+        params: SEARCH_PARAMS,
     },
     // Commissive: commits a typed edge to the graph
     HandlerDef {
@@ -1110,9 +1124,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors. With no explicit `limit`, the response remains a \
-                      bare array of hits. An explicit limit returns a `neighbors` page with \
-                      `requested_limit`, `effective_limit`, `limit_clamped`, and `next_after`. \
+        description: "Immediate graph neighbors. For an anchor that is not a memory row, a call \
+                      with no explicit `limit` returns a bare array of hits. An explicit limit \
+                      returns a `neighbors` page with `requested_limit`, `effective_limit`, \
+                      `limit_clamped`, and `next_after`. A call anchored on a memory row always \
+                      returns the object shape, with `next_after` null when no limit is given, \
+                      and carries `hidden_incoming_edges` once at the top: `{total, by_relation}` \
+                      counting the incoming memory edges stored in namespaces the caller cannot \
+                      read, with no endpoint id, namespace or content; `by_relation` lists each \
+                      relation of the filter, or with no filter each relation above zero, and \
+                      the count is 0 for direction `outgoing`. \
                       Each record hit carries origin_id for the queried node, edge_id, relation, \
                       weight, and the neighbor's id, kind and name; include_entity_type=true adds \
                       entity_type when the neighbor has one. This verb does not accept \
@@ -1416,7 +1437,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

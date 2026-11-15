@@ -214,6 +214,8 @@ async fn restricted_registry_pack_list_reaches_forward_seam() {
 
     fn spy_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -279,6 +281,8 @@ mod read_replay_tests {
 
     fn capture_forward_policy(
         frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         replay_read_only: bool,
     ) -> ForwardFuture {
@@ -594,6 +598,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
     // fixed delay is long enough.
     fn delayed_partial_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -672,6 +678,8 @@ async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
 async fn cancelled_request_with_save_to_refuses_before_local_dispatch() {
     fn unreachable_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -741,6 +749,8 @@ async fn cancellation_visible_after_forward_returns_none_refuses_local_dispatch(
 
     fn cancel_then_none_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -827,6 +837,8 @@ async fn dropping_handler_does_not_drop_an_admitted_forward() {
     // long enough for the detached task to finish.
     fn slow_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -911,6 +923,8 @@ async fn admitted_forward_that_never_resolves_reports_unknown_outcome_after_the_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -988,6 +1002,8 @@ async fn admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -1079,6 +1095,8 @@ async fn admitted_forward_without_installed_deadline_falls_back_to_request_read_
 
     fn never_resolves_forward(
         _frame: khive_runtime::DaemonRequestFrame,
+        _config: Option<std::path::PathBuf>,
+        _db: Option<String>,
         _packs: Option<Vec<String>>,
         _replay_read_only: bool,
     ) -> ForwardFuture {
@@ -6914,6 +6932,7 @@ fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRe
 
 fn request_identity_with_visible_namespaces(ns: Vec<&str>) -> khive_runtime::RequestIdentity {
     khive_runtime::RequestIdentity {
+        owned_namespaces: Vec::new(),
         namespace: "local".to_string(),
         actor_id: None,
         visible_namespaces: ns.into_iter().map(str::to_string).collect(),
@@ -6988,6 +7007,82 @@ async fn scheduled_replay_reads_its_own_actor_namespace_and_never_the_daemons_vi
             "daemon visibility leaked into a scheduled replay: {identity}"
         );
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn scheduled_replay_does_not_inherit_owned_namespaces() {
+    let archive = Namespace::parse("scheduled-owner:archive").unwrap();
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        actor_id: Some("scheduled-owner".to_string()),
+        owned_namespaces: vec![archive.clone()],
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory replay runtime");
+    let server = KhiveMcpServer::new(runtime.clone()).expect("replay server");
+    let token = runtime.authorize(archive).expect("archive namespace");
+    let old = runtime
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "archived migration tally",
+            Some(0.3),
+            Some(json!({"memory_type": "episodic"})),
+            vec![],
+        )
+        .await
+        .expect("seed archived memory");
+    let ops = json!([{
+        "tool": "memory.apply_batch",
+        "args": {
+            "batch": "scheduled-owned",
+            "rows": [{
+                "id": old.id.to_string(),
+                "action": "supersede",
+                "content": "revised migration tally",
+                "properties": {"who": "scheduled-owner"}
+            }],
+            "dry_run": true
+        }
+    }])
+    .to_string();
+    let request = || RequestParams {
+        ops: ops.clone(),
+        presentation: Some("verbose".to_string()),
+        format: Some("json".to_string()),
+        ..Default::default()
+    };
+    let local = server
+        .dispatch_request_local(request())
+        .await
+        .expect("configured owner dispatch");
+    let local: Value = serde_json::from_str(&local).expect("local JSON envelope");
+    assert_eq!(local["results"][0]["ok"], true, "{local}");
+    assert_eq!(
+        local["results"][0]["result"]["entries"][0]["outcome"],
+        "planned"
+    );
+
+    let replay = server
+        .dispatch_request_replay_as(
+            request(),
+            "local",
+            Some(khive_runtime::VerifiedActor::new("scheduled-owner").unwrap()),
+        )
+        .await
+        .expect("scheduled replay dispatch");
+    let replay: Value = serde_json::from_str(&replay).expect("replay JSON envelope");
+    assert_eq!(replay["results"][0]["ok"], true, "{replay}");
+    let entry = &replay["results"][0]["result"]["entries"][0];
+    assert_eq!(entry["outcome"], "refused");
+    assert_eq!(entry["reason"]["code"], "old-namespace");
+    assert_eq!(entry["old_namespace"], "scheduled-owner:archive");
 }
 
 #[tokio::test]

@@ -7,7 +7,58 @@ fn parse_handler_params<T: serde::de::DeserializeOwned>(params: Value) -> Result
     })
 }
 
+/// Smallest `local_factor` a profile may carry.
+const LOCAL_FACTOR_MIN: f64 = 0.5;
+/// Largest `local_factor` a profile may carry (1 means no scaling).
+const LOCAL_FACTOR_MAX: f64 = 1.0;
+
+/// Deserializes a field that is present, an explicit `null` included, as
+/// `Some`, so that the handler can tell "absent" from "null".
+fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// Validates the optional `local_factor` of `brain.create_profile`.
+///
+/// An absent field is `Ok(None)`. A present field must be a finite JSON number
+/// in `[0.5, 1]`; anything else (a string, a boolean, `null`, an object, or a
+/// number outside the range) is refused with an invalid-input error that names
+/// the range. The offending value is not echoed back.
+fn parse_local_factor(raw: Option<&Value>) -> Result<Option<f64>, RuntimeError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let refusal = || {
+        RuntimeError::InvalidInput(format!(
+            "local_factor must be a finite number in [{LOCAL_FACTOR_MIN}, {LOCAL_FACTOR_MAX}]"
+        ))
+    };
+    let number = raw.as_f64().ok_or_else(refusal)?;
+    if !number.is_finite() || !(LOCAL_FACTOR_MIN..=LOCAL_FACTOR_MAX).contains(&number) {
+        return Err(refusal());
+    }
+    Ok(Some(number))
+}
+
 // ── BrainPack handler impl ────────────────────────────────────────────────────
+
+pub(super) fn parse_event_kind(raw: &str) -> Result<khive_types::EventKind, RuntimeError> {
+    raw.parse::<khive_types::EventKind>().map_err(|mut error| {
+        // EventKind normalizes case before constructing its error. Inspect the
+        // original operand so that case-sensitive credentials remain detectable.
+        let masked = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
+        if masked.as_ref() != raw {
+            error.value = masked.into_owned();
+        }
+        let message = format!("invalid `kind`: {error}");
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &message).into_owned(),
+        )
+    })
+}
 
 impl BrainPack {
     // ── brain.state ───────────────────────────────────────────────────────
@@ -322,13 +373,7 @@ impl BrainPack {
             None => Utc::now().timestamp_micros(),
         };
 
-        let kind_filter = match p.kind.as_deref() {
-            Some(k) => Some(
-                k.parse::<khive_types::EventKind>()
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid `kind`: {e}")))?,
-            ),
-            None => None,
-        };
+        let kind_filter = p.kind.as_deref().map(parse_event_kind).transpose()?;
 
         // The event plane is read through a store scoped to exactly one
         // namespace (`Runtime::events` opens `token.namespace()` and the SQL
@@ -466,7 +511,11 @@ impl BrainPack {
 
     // ── brain.profile ─────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_profile(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Accept both `profile_id` (canonical) and `id` (legacy alias).
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -487,6 +536,50 @@ impl BrainPack {
             .materialized_profile(&profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
         let record = &record;
+
+        let resolving_bindings: Vec<Value> = state
+            .bindings
+            .iter()
+            .filter(|binding| {
+                let namespace = token.namespace().as_str();
+                if binding.profile_id != profile_id
+                    || (binding.actor != "*"
+                        && Self::check_read_actor(token, &binding.actor).is_err())
+                    || (binding.namespace != "*" && binding.namespace != namespace)
+                {
+                    return false;
+                }
+                // Anonymous consumers are a real context for wildcard actors.
+                // Named actors only add more-specific candidates, so querying
+                // the current named caller alone could hide a usable wildcard.
+                let actor = (binding.actor != "*").then_some(binding.actor.as_str());
+                [
+                    ConsumerKind::Recall,
+                    ConsumerKind::KnowledgeCompose,
+                    ConsumerKind::Rerank,
+                ]
+                .into_iter()
+                .filter(|kind| {
+                    binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
+                })
+                .any(|kind| {
+                    state
+                        .resolve_with_match(actor, Some(namespace), kind.as_str())
+                        .is_some_and(|(resolved, _, matched_binding)| {
+                            matched_binding && resolved.id == profile_id
+                        })
+                })
+            })
+            .map(|binding| {
+                json!({
+                    "actor": binding.actor,
+                    "namespace": binding.namespace,
+                    "consumer_kind": binding.consumer_kind,
+                })
+            })
+            .collect();
+        let serving_through_visible_binding_while_inactive =
+            record.lifecycle == ProfileLifecycle::Inactive && !resolving_bindings.is_empty();
 
         // Build per-section posterior summary for the response.
         let section_summary = if let Some(ss) = state.section_states.get(&profile_id) {
@@ -512,17 +605,39 @@ impl BrainPack {
             Value::Null
         };
 
+        // Means of the stored recall posteriors, read from the snapshot the
+        // profile record carries; null when there is no readable snapshot.
+        let posterior_means = record
+            .state_snapshot
+            .as_ref()
+            .and_then(|snap| {
+                serde_json::from_value::<khive_brain_core::BalancedRecallSnapshot>(snap.clone())
+                    .ok()
+            })
+            .map(|snap| {
+                json!({
+                    "relevance": snap.relevance.mean(),
+                    "salience": snap.salience.mean(),
+                    "temporal": snap.temporal.mean(),
+                })
+            })
+            .unwrap_or(Value::Null);
+
         Ok(json!({
             "id": record.id,
             "description": record.description,
             "consumer_kind": record.consumer_kind,
             "state_class": record.state_class,
             "lifecycle": record.lifecycle,
+            "resolving_bindings": resolving_bindings,
+            "serving_through_visible_binding_while_inactive": serving_through_visible_binding_while_inactive,
             "total_events": record.total_events,
             "exploration_epoch": record.exploration_epoch,
             "created_at": record.created_at,
             "state_snapshot": record.state_snapshot,
             "section_posteriors": section_summary,
+            "posterior_means": posterior_means,
+            "local_factor": record.local_factor,
         }))
     }
 
@@ -1235,33 +1350,12 @@ impl BrainPack {
                 {
                     let serving_profile_owned = serving_profile_owned.clone();
                     move |state: &mut khive_brain_core::BrainState, brain_signal| {
-                        let serving_profile = serving_profile_owned.as_str();
-
-                        if serving_profile == "balanced-recall-v1" {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
-                        } else if state.profile_states.contains_key(serving_profile) {
-                            let ps = state
-                                .profile_states
-                                .get_mut(serving_profile)
-                                .expect("key checked above");
-                            ps.apply_signal(brain_signal);
-                            let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                            let total = ps.total_events;
-                            if let Some(record) = state.profiles.get_mut(serving_profile) {
-                                record.total_events = total;
-                                record.state_snapshot = snap;
-                            }
-                        } else {
-                            state.balanced_recall.apply_signal(brain_signal);
-                            sync_balanced_recall_record(state);
-                        }
-
-                        let section_state = crate::ensure_section_state_seeded(
-                            &mut state.section_states,
-                            &serving_profile_owned,
+                        // The destination rule is shared with cold-load replay.
+                        crate::apply_feedback_signal(
+                            state,
+                            serving_profile_owned.as_str(),
+                            brain_signal,
                         );
-                        section_state.apply_signal(brain_signal);
                     }
                 },
             )
@@ -1608,6 +1702,7 @@ impl BrainPack {
 
         let profile_id = p.profile_id;
         let priority = p.priority.unwrap_or(0);
+        let catalog_namespace = token.namespace().as_str().to_owned();
         let event_payload = json!({
             "profile_id": profile_id,
             "actor": actor,
@@ -1634,7 +1729,9 @@ impl BrainPack {
                 // Verify the profile exists and is not archived (archived = terminal, no new bindings).
                 match state.profiles.get(&profile_id) {
                     None => {
-                        return Err(RuntimeError::NotFound(format!("profile {:?}", profile_id)));
+                        return Err(RuntimeError::NotFound(format!(
+                            "profile {profile_id:?} not found in namespace {catalog_namespace:?}; a profile created with namespace=X is bound with namespace=X"
+                        )));
                     }
                     Some(record) if record.lifecycle == ProfileLifecycle::Archived => {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -1725,6 +1822,7 @@ impl BrainPack {
             ENTITY_CACHE_CAPACITY,
             move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
                 let before = state.bindings.len();
+                let mut removed_by_namespace = std::collections::BTreeMap::<String, usize>::new();
 
                 state.bindings.retain(|b| {
                     let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
@@ -1737,7 +1835,11 @@ impl BrainPack {
                     // Retain if this binding does NOT match ALL of the provided filters.
                     // A filter that is absent (None) matches everything — only bindings
                     // satisfying every supplied criterion are removed.
-                    !(pid_match && actor_match && ns_match && kind_match)
+                    let should_remove = pid_match && actor_match && ns_match && kind_match;
+                    if should_remove {
+                        *removed_by_namespace.entry(b.namespace.clone()).or_default() += 1;
+                    }
+                    !should_remove
                 });
 
                 let removed = before - state.bindings.len();
@@ -1746,7 +1848,11 @@ impl BrainPack {
                 // tests. In particular, both fields remain present at zero so
                 // a successful no-op cannot be mistaken for a confirmed
                 // removal.
-                Ok(json!({ "removed": removed, "unbound": removed }))
+                Ok(json!({
+                    "removed": removed,
+                    "unbound": removed,
+                    "removed_by_namespace": removed_by_namespace,
+                }))
             },
         )
         .await
@@ -1797,7 +1903,11 @@ impl BrainPack {
             })
             .collect();
 
-        Ok(json!({ "count": rows.len(), "bindings": rows }))
+        Ok(json!({
+            "namespace": token.namespace().as_str(),
+            "count": rows.len(),
+            "bindings": rows,
+        }))
     }
 
     // ── brain.create_profile ──────────────────────────────────────────────
@@ -1815,9 +1925,14 @@ impl BrainPack {
             description: Option<String>,
             consumer_kind: Option<String>,
             seed_priors: Option<serde_json::Value>,
+            /// Kept as a raw value so that a non-number or an explicit `null`
+            /// is refused with a range message instead of being read as absent.
+            #[serde(default, deserialize_with = "deserialize_present")]
+            local_factor: Option<serde_json::Value>,
         }
         let p: CreateProfileParams =
             parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
+        let local_factor = parse_local_factor(p.local_factor.as_ref())?;
 
         // Validate profile-id grammar: trim, reject empty, enforce ASCII alphanumeric + hyphen.
         let name = p.name.trim().to_string();
@@ -1916,6 +2031,7 @@ impl BrainPack {
                     state_snapshot: snap,
                     total_events: 0,
                     exploration_epoch: 0,
+                    local_factor,
                 };
 
                 // Seed section posteriors: parse explicit section_posteriors object if provided,
@@ -2047,5 +2163,120 @@ impl BrainPack {
                 json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod local_factor_tests {
+    use super::*;
+
+    fn refusal_message(raw: &Value) -> String {
+        match parse_local_factor(Some(raw)) {
+            Err(RuntimeError::InvalidInput(message)) => message,
+            other => panic!("expected an invalid-input refusal for {raw}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_local_factor_means_no_factor() {
+        assert!(matches!(parse_local_factor(None), Ok(None)));
+    }
+
+    #[test]
+    fn local_factor_inside_the_range_is_stored_as_given() {
+        for value in [0.5_f64, 0.7, 1.0] {
+            let parsed = parse_local_factor(Some(&json!(value)));
+            assert!(
+                matches!(parsed, Ok(Some(stored)) if stored == value),
+                "{value}: {parsed:?}"
+            );
+        }
+        let integer = parse_local_factor(Some(&json!(1)));
+        assert!(
+            matches!(integer, Ok(Some(stored)) if stored == 1.0),
+            "an integer 1 is the upper bound: {integer:?}"
+        );
+    }
+
+    #[test]
+    fn local_factor_outside_the_range_is_refused_and_the_range_is_named() {
+        for raw in [
+            json!(0.49),
+            json!(1.01),
+            json!(0.0),
+            json!(-0.7),
+            json!(1e300),
+        ] {
+            let message = refusal_message(&raw);
+            assert!(message.contains("[0.5, 1]"), "{raw}: {message}");
+        }
+    }
+
+    #[test]
+    fn non_number_local_factor_is_refused_and_the_range_is_named() {
+        for raw in [
+            json!("0.7"),
+            json!(true),
+            json!(null),
+            json!([0.7]),
+            json!({ "value": 0.7 }),
+        ] {
+            let message = refusal_message(&raw);
+            assert!(message.contains("[0.5, 1]"), "{raw}: {message}");
+        }
+    }
+
+    #[test]
+    fn non_finite_floats_have_no_json_number_form_and_are_refused() {
+        for float in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let raw = json!(float);
+            assert!(raw.is_null(), "{float} is expected to serialize as null");
+            let message = refusal_message(&raw);
+            assert!(message.contains("[0.5, 1]"), "{float}: {message}");
+        }
+    }
+
+    #[test]
+    fn explicit_null_local_factor_is_present_and_not_read_as_absent() {
+        #[derive(Deserialize)]
+        struct Probe {
+            #[serde(default, deserialize_with = "deserialize_present")]
+            local_factor: Option<Value>,
+        }
+
+        let absent: Probe = serde_json::from_value(json!({})).expect("absent field");
+        assert!(absent.local_factor.is_none());
+
+        let null: Probe = serde_json::from_value(json!({ "local_factor": null })).expect("null");
+        assert_eq!(null.local_factor, Some(Value::Null));
+        assert!(parse_local_factor(null.local_factor.as_ref()).is_err());
+    }
+
+    #[tokio::test]
+    async fn profile_without_a_state_snapshot_reports_null_posterior_means_and_its_factor() {
+        let pack = BrainPack::new(KhiveRuntime::memory().expect("in-memory runtime"));
+        {
+            let mut state = pack.state.lock().unwrap();
+            let mut record = ProfileRecord::new_balanced_recall(ENTITY_CACHE_CAPACITY);
+            record.id = "bare-profile".to_owned();
+            record.state_snapshot = None;
+            record.local_factor = Some(0.8);
+            state.profiles.insert(record.id.clone(), record);
+        }
+
+        let token = pack
+            .runtime
+            .authorize(Namespace::local())
+            .expect("local token");
+        let profile = pack
+            .handle_profile(&token, json!({ "profile_id": "bare-profile" }))
+            .await
+            .expect("brain.profile");
+
+        assert!(
+            profile["posterior_means"].is_null(),
+            "no state snapshot means no posterior means: {profile}"
+        );
+        assert_eq!(profile["local_factor"].as_f64(), Some(0.8));
     }
 }

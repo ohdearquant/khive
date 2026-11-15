@@ -20,8 +20,8 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 31    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
+| `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `memory`    | 6     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
@@ -31,7 +31,7 @@ An always-machine-readable copy of this page is at
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
-| `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `tool`      | 15    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
@@ -427,6 +427,13 @@ Invalid JSON under `parse_content=true` returns `invalid_input`, naming the note
 refusal. One invalid returned note refuses its list operation. Both verbs reject
 unknown fields by name; older servers without `parse_content` explicitly reject that parameter.
 
+Entity and note offset pages are ordered newest first by `created_at`. Entities
+that share a `created_at` follow `id` descending, notes `id` ascending, so
+`list(kind="entity", entity_type="...", limit=1)` returns the newest entity of a
+type. A note listing by `key_prefix` has its own order and is not covered here.
+Cursor mode does not follow this order: it walks the insertion sequence, oldest
+first, as described below.
+
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
 server-side cap binds. Advance `offset` by `items.length`, not by either limit field;
@@ -508,6 +515,15 @@ full record with `get(id=...)` (or `list`) when you need more than what they ret
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
+
+Besides the substrate totals, the response breaks them down. `entities_by_type` is an array of
+`{"entity_type", "count"}` rows, one per stored `entity_type` label across entity kinds, and its
+counts sum to `entities`. The first row is always the untyped bucket: entities whose
+`entity_type` is null, with count zero when there are none. In Agent presentation that row carries
+only `count`, because null fields are dropped. A backend without grouped entity reporting omits
+`entities_by_type`, and the omission does not mean zero; see
+[KG stats](../../crates/khive-pack-kg/docs/api/stats.md). `edges_by_relation` maps each edge
+relation to its count.
 
 The response carries a `count_scope` object stating what the counts range over:
 `{"namespaces": "caller_visible", "rows": "live_only"}` — counts cover the namespaces visible to
@@ -627,6 +643,8 @@ Hybrid FTS + vector search with RRF fusion.
 | `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
 | `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
 | `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
+| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                       |
+| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                     |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -639,6 +657,20 @@ contradiction is rejected. Entity-only fields on a note search and note-only
 fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
+
+Creation-time bounds apply to both entities and notes, independently of `order_by`,
+and combine with kind, tags and entity-type filters. Omitted or null bounds are
+unrestricted. Offset spellings are compared as instants, retaining nanosecond input
+precision against stored microsecond timestamps; more than nine fractional digits
+is refused rather than rounded. Equal endpoints include a record at that instant.
+
+Time filtering reads metadata for the returned candidate window (`limit × 50`,
+capped at 500 per backend), before ordering and the final limit. Coordinated
+search combines those backend windows, so its merged window can exceed 500.
+Filtering can return fewer hits even
+when other matching records exist outside that window. It is not an exhaustive
+time-range scan and does not use the larger runtime window available to property
+and tag pushdown. These bounds are carried through coordinated search too.
 
 In multi-backend mode a backend failure with surviving hits yields those hits
 with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
@@ -821,7 +853,7 @@ the edge's mutation history.
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors. Without an explicit `limit` the response is the bare array of hits it has always been. An explicit `limit` returns a page instead: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
+Immediate graph neighbors. For an anchor that is not a memory row, a call without an explicit `limit` returns a bare array of hits. A call anchored on a memory row always returns the object shape, `{"neighbors": [...], "next_after": null, "hidden_incoming_edges": {"total": n, "by_relation": {"<relation>": n}}}` when no `limit` is given; `hidden_incoming_edges` counts the incoming memory edges stored in namespaces the caller cannot read and discloses no endpoint id, namespace or content. `by_relation` lists each relation of the request's filter, or with no filter each relation whose count is above zero; the count is 0 for direction `outgoing`. An explicit `limit` returns a page instead, with `hidden_incoming_edges` added for a memory anchor: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
@@ -1018,14 +1050,14 @@ Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. Th
 field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
 operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                           |
-| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                          |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                     |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                               |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                     |
-| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                    |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                                                                                                                 |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                                                                                                            |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`; one step only for now, and a compound with more than one step at any depth is refused). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                                                                                                                      |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                                                                                                            |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                                                                                                           |
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -1427,7 +1459,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 7 verbs
+## `gtd` pack — 8 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1491,19 +1523,41 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 
 ### `gtd.tasks` — Assertive
 
-List tasks filtered by status, assignee, priority.
+List tasks filtered by status, assignee, priority, tags, context and duplicate reference.
+With neither `status` nor `duplicate_of`, the default selects open statuses and the
+legacy missing/non-text `inbox` fallback, excluding terminal and unrecognized statuses.
 
 Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
 and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
 `soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
-| Param      | Type    | Required | Notes                                                                                              |
-| ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `status`   | string  | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`). |
-| `assignee` | string  | no       | Filter by assignee.                                                                                |
-| `priority` | string  | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                            |
-| `limit`    | integer | no       | Default 20.                                                                                        |
-| `offset`   | integer | no       | Default 0.                                                                                         |
+| Param               | Type            | Required | Notes                                                                                                                                          |
+| ------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`            | string          | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`).                                             |
+| `assignee`          | string          | no       | Filter by assignee.                                                                                                                            |
+| `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                                                                        |
+| `tags`              | array\<string\> | no       | SQLite `NOCASE` membership (ASCII case-insensitive). Omitted, null or empty adds no restriction.                                               |
+| `tag_mode`          | string          | no       | `any` (default, including null) or `all`; with no tags, either adds no restriction.                                                            |
+| `context_entity_id` | uuid            | no       | Full UUID only; compares its canonical spelling with the stored context reference, without an entity lookup. Omitted/null adds no restriction. |
+| `duplicate_of`      | uuid            | no       | Kept task UUID or unique 8+ hex prefix. Defaults to `status="cancelled"` when status is omitted; an explicit status overrides that default.    |
+| `limit`             | integer         | no       | Default 50; clamped to 1–200. A requested zero selects one row without an upper-limit clamp report.                                            |
+| `offset`            | integer         | no       | Default 0. Advance by the number of returned tasks, keeping the same filters.                                                                  |
+
+Filters apply before pagination in stable `created_at DESC, id ASC` order. See
+[task-query.md](../../crates/khive-pack-gtd/docs/api/task-query.md) for filter,
+namespace, retained-reference and dependency semantics.
+
+An incomplete page returns `{tasks: [...], has_more: true}`. An exhausted ordinary
+page returns an array, even when it is exactly full. A limit above 200 produces an
+object with `tasks`, `requested_limit`, `effective_limit` and `limit_clamped: true`;
+it includes `has_more: true` only if another matching row exists. An empty default
+page may instead include `filter_excluded` and `hint` when a matching task was
+excluded by status. No `has_more: false` field is added.
+
+Accept either a bare array or an object's `tasks` array, and continue when
+`has_more` is true. An object or a full page alone does not establish continuation.
+Successive offset pages use separate snapshots; concurrent changes can shift later
+pages. Blocked and broken tasks remain in the page with their diagnostics.
 
 ```
 request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
@@ -1544,6 +1598,26 @@ See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timesta
 request(ops="gtd.census()")
 ```
 
+### `gtd.counts` — Assertive
+
+Read-only count of one assignee's live tasks by status, without task bodies. `by_status` has an
+entry for every task status, zeros included; `open` sums the non-terminal statuses and `total`
+sums all of them. A task whose stored status is absent or not text counts as `inbox`, as
+`gtd.tasks` reads it. With `tag`, the reply adds `{name, open, rows, truncated}`: the assignee's
+open tasks carrying exactly that tag, each row only id, title, status, priority and updated_at,
+ordered by priority and then oldest update, at most `limit`; `truncated` is true exactly when
+`open` exceeds the rows returned.
+
+| Param      | Type    | Required | Notes                                                    |
+| ---------- | ------- | -------- | -------------------------------------------------------- |
+| `assignee` | string  | yes      | Exact stored assignee, as in `gtd.tasks`.                |
+| `tag`      | string  | no       | Exact tag; adds the tag block. Empty string is rejected. |
+| `limit`    | integer | no       | Tag rows, default 50, 1..=200; out of range is rejected. |
+
+```
+request(ops='gtd.counts(assignee="agent:alice", tag="sprint:12")')
+```
+
 ### `gtd.repair` — Declaration
 
 Preview explicit corrections to task `created_at`, `updated_at`, or a noncanonical text
@@ -1556,7 +1630,7 @@ for the request shape, refusal reasons, and preserved evidence.
 
 ---
 
-## `memory` pack — 5 verbs
+## `memory` pack — 6 verbs
 
 Salience- and decay-weighted memory notes. Optional; load with
 `KHIVE_PACKS=kg,memory`.
@@ -1574,8 +1648,20 @@ Create a memory note with salience and decay.
 | `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
 | `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
 | `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
+| `properties`      | object | no       | Structured fields stored beside `memory_type` and `tags` and returned on recall hits. Rules below.                                    |
+| `namespace`       | string | no       | Write namespace override. Default: caller's actor namespace (anonymous: `local`).                                                     |
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+`properties` is a JSON object of at most 32 keys. A key is 1-64 characters, a lowercase ASCII letter first,
+then lowercase letters, digits or `_`; the keys `memory_type`, `tags`, `attribution` and `supersedes` are reserved, and the refusal names the replacement for each (listed under [Reserved properties](memory.md#reserved-properties)). A value is a
+string, a finite number, a boolean or an array of strings. The serialized object is at most 8192 bytes. An
+object that breaks a rule is refused with an invalid-input error naming the key and the rule, never
+truncated.
+
+Without `namespace`, both memory types are written to the caller's actor namespace. A caller with
+no actor (anonymous) writes to `local`; every memory it writes, with or without `namespace`, is flagged
+with `attribution: "unresolved"` in its properties and in the response, and attributed writes carry no
+`attribution` key.
 
 With `idempotency_key`, a replay whose content matches the stored memory returns the original
 memory with `replayed=true`. Different content under the same key is refused with the conflict
@@ -1592,25 +1678,27 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 (read-model) values — `memory_type` defaults to `episodic` when unset; `salience` and
 `decay_factor` reflect the effective defaults used for ranking.
 
-| Param               | Type    | Required | Notes                                                                     |
-| ------------------- | ------- | -------- | ------------------------------------------------------------------------- |
-| `query`             | string  | yes      | Semantic recall query.                                                    |
-| `limit`             | integer | no       | Default 10.                                                               |
-| `top_k`             | integer | no       | Overrides `limit` (max 100).                                              |
-| `min_score`         | number  | no       | Composite score floor, always in [0,1]. Typical production floor 0.3–0.7. |
-| `score_floor`       | number  | no       | Alias for `min_score`.                                                    |
-| `min_salience`      | number  | no       | Salience floor.                                                           |
-| `memory_type`       | string  | no       | Filter to this type.                                                      |
-| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
-| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
-| `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
-| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
-| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
-| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
-| `tags`              | array   | no       | Filter by `properties.tags`.                                              |
-| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
-| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
+| Param               | Type    | Required | Notes                                                                   |
+| ------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `query`             | string  | yes      | Semantic recall query.                                                  |
+| `limit`             | integer | no       | Default 10.                                                             |
+| `top_k`             | integer | no       | Overrides `limit` (max 100).                                            |
+| `min_score`         | number  | no       | Floor on `rank_score`; see below. Typical production floor 0.3–0.7.     |
+| `score_floor`       | number  | no       | Alias for `min_score`.                                                  |
+| `min_salience`      | number  | no       | Salience floor.                                                         |
+| `memory_type`       | string  | no       | Filter to this type.                                                    |
+| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.              |
+| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                         |
+| `include_breakdown` | bool    | no       | Include per-component score breakdown; see below.                       |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                          |
+| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                          |
+| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                     |
+| `tags`              | array   | no       | Filter by `properties.tags`.                                            |
+| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
+| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
 
+Each result carries `namespace` (where the memory is stored), `tags` (`[]` when none) and
+`properties` (the stored object, including `memory_type` and `tags`; `{}` when none).
 Each result carries `serve_attribution` (`profile`, `unattributed`, or
 `unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
 means a selected profile record was unreadable and downstream feedback must not
@@ -1625,13 +1713,35 @@ unless the request sets `presentation=verbose`.
 vector index is not searched, so such a recall never reports `degraded`.
 `vector_only` runs only the vector search.
 
+`min_score` and `score_floor` filter `rank_score`, the ranking score, not `score`. `rank_score` is the weighted
+relevance, salience and temporal composite under the configured default weights, multiplied by the per-entity posterior
+term (bounded to 0.85 to 1.15) when a profile serves the request, and by the serving profile's `local_factor` for rows in
+the `local` namespace. Under a profile with a factor, `local` rows' `rank_score` is scaled by it; rows of every other
+namespace are not. `score` stays the absolute relevance in [0, 1] and is taken before the factor.
+
+With `include_breakdown=true` each hit's `breakdown` reports `relevance` (the value the ranking composite received,
+after the calibrated normalization and with no further scaling), `fused_score` (the fused score before that
+normalization) and `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`, the
+factors of the multiplicative composite that ranks the hit; with no `reranker_weights` their product is
+`pre_entity_score`, and `adjustment_factor` is `null` when the other three do not multiply to a positive number). The
+additive `weighted` contributions and the `temporal` and `salience_decayed` values are not the ranking composite:
+without `reranker_weights` a recall ranks by `composite`. The breakdown also reports `weights_served` (always
+`"default"`: a served profile
+scores with the configured default weights), `profile_component` (a diagnostic: the hit's composite under the weights
+the serving profile's posteriors project to, divided by its composite under the default weights; it never enters
+`rank_score`), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when none applies) and
+`duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that `rank_score` equals
+`pre_entity_score * entity_term * local_factor - duplicate_penalty` in 32-bit arithmetic evaluated left to right.
+
 `include_timings=true` adds a `timings` object: `total_us`, the stage wall times
 `embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
 stage did not run; the text and vector searches run concurrently, so the stages do
 not add up), `retrieval_rounds`, and `rounds[]` with each round's
 `candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
 and stage times. An array response becomes `{results, timings}`; an object
-response keeps its fields and gains `timings`.
+response keeps its fields and gains `timings`. `hidden_incoming_us` measures the
+post-ranking hidden incoming count, including graph access and the awaited query;
+it is `null` when the step is skipped and remains numeric when the count is zero.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1676,6 +1786,31 @@ Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows. No params.
 
 ```
 request(ops="memory.vacuum()")
+```
+
+### `memory.apply_batch` — Commissive
+
+Apply a chunk of memory rewrites under one batch name (ADR-021). Each row supersedes an existing memory with a new
+one and a `supersedes` edge, creates a memory, skips a row, or lists it as a deletion candidate. Every row is checked
+before anything is written; a refused row carries a reason and never stops the others. Writes go through the
+`memory.remember` path in the caller's own namespace, keyed `<batch>:<old id>:<part>` (or `<batch>:create:<part>`),
+so re-running a chunk writes only what is missing. An anonymous caller is refused.
+Each `create` row without an `id` needs a distinct `part` within the call. An omitted `part`
+defaults to 1, so multiple creates that omit it share `<batch>:create:1`; all rows with that key
+are refused with `duplicate-key`, even when their content differs. Set distinct parts such as
+1 and 2 to create both memories, and keep those parts on an exact retry to dedupe them.
+Within a call, identical `supersede` payloads apart from `part` preserve all existing keyed replays or, if
+none exist, the earliest new row, and refuse other new rows with `duplicate-payload`, the matched row's
+zero-based index, and its part.
+
+| Param     | Type   | Required | Notes                                                                                                                                                                                                                                                                                                                                              |
+| --------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `batch`   | string | yes      | At most 128 characters; stored on every written row as `properties.batch`.                                                                                                                                                                                                                                                                         |
+| `rows`    | array  | yes      | 1 to 200 rows `{id?, part?, action, content?, memory_type?, salience?, properties?, tags?}`; `action` is `supersede`, `create`, `skip` or `delete-candidate`. Every no-id `create` needs a distinct `part`; omitted parts default to 1, and all rows sharing a key are refused as `duplicate-key`. Salience above 0.4 needs `properties.verified`. |
+| `dry_run` | bool   | no       | Default true: checks every row and reports the plan without writing. Pass false to write.                                                                                                                                                                                                                                                          |
+
+```
+request(ops="memory.apply_batch(batch=\"rewrite-1\", rows=[{\"action\": \"skip\", \"id\": \"<uuid>\"}])")
 ```
 
 ---
@@ -1819,6 +1954,21 @@ Profile metadata, latest snapshot, current state summary.
 | ------------ | ------ | -------- | ------------------------------------------------------------- |
 | `profile_id` | string | yes      | Profile ID string (e.g. `"balanced-recall-v1"`) — not a UUID. |
 
+The response also carries `posterior_means`, an object `{relevance, salience, temporal}` holding the mean of each stored
+posterior (`null` when the profile has no state snapshot), and `local_factor`, the shared-pool factor set when the profile
+was created (`null` means no factor, the same as 1). A served profile scores with the configured default weights, so
+`posterior_means` is a diagnostic of what the posteriors project to, not what recall serves.
+
+`resolving_bindings` lists wildcard or actor-visible binding selectors that select this profile
+for a concrete `recall`, `knowledge_compose` or `rerank` consumer in the response's `namespace`
+catalog. A wildcard actor is checked with the anonymous consumer context, so the list can include
+a binding that serves other callers even when the current named caller has a more specific binding.
+Foreign-namespace selectors are excluded, as are selectors for which every matching concrete
+consumer selects a different profile.
+`serving_through_visible_binding_while_inactive` is true exactly when lifecycle is `inactive`
+and this list is nonempty; false makes no claim about hidden bindings. Active versus inactive
+lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless.
+
 ```
 request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 ```
@@ -1844,8 +1994,10 @@ require visibility. There is no `all_actors` resolution mode.
 
 ### `brain.activate` — Commissive
 
-Move a profile to Active. This is a lifecycle transition; serving reads profile state
-per request and no background update loop is started.
+Move a profile to Active for the unbound fallback. A bound, non-archived profile serves regardless
+of active versus inactive lifecycle. Serving reads profile state per request and no background
+update loop is started. Inspect `brain.profile`'s `resolving_bindings` and
+`serving_through_visible_binding_while_inactive` for visible binding status.
 
 | Param        | Type   | Required | Notes                |
 | ------------ | ------ | -------- | -------------------- |
@@ -1857,7 +2009,10 @@ request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
 
 ### `brain.deactivate` — Commissive
 
-Move a profile to Inactive (lifecycle transition; retain state).
+Move a profile to Inactive while retaining state. Active versus inactive lifecycle governs only
+the unbound fallback; deactivation does not remove bindings or stop a bound, non-archived profile
+from serving. `brain.profile` reports `resolving_bindings` and
+`serving_through_visible_binding_while_inactive` for visible binding status.
 
 | Param        | Type   | Required | Notes                  |
 | ------------ | ------ | -------- | ---------------------- |
@@ -2029,10 +2184,16 @@ Create a new brain profile with a given name and optional seed priors.
 | `description`   | string | no       | Human-readable description.                                                                                                                                              |
 | `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                      |
 | `seed_priors`   | object | no       | Section priors only: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}}}`. Recall priors cannot be seeded at creation; other top-level keys are rejected. |
+| `local_factor`  | number | no       | Finite number in [0.5, 1]; see below. Anything else is refused and no profile is created.                                                                                |
 
 ```
 request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
 ```
+
+`local_factor` is stored with the profile record and is set only here: no verb edits it, `brain.reset` keeps it, and a
+different value is a new profile. When the profile serves a `memory.recall`, the `rank_score` of every candidate in the
+`local` namespace (the shared pool) is multiplied by it and every other candidate by 1. A profile created without it
+behaves as factor 1.
 
 ### `brain.register_adapter` — Declaration
 
@@ -3513,7 +3674,7 @@ request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
 
-## `tool` pack — 14 verbs
+## `tool` pack — 15 verbs
 
 Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
 `tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges

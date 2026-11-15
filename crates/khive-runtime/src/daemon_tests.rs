@@ -426,6 +426,7 @@ impl DaemonDispatch for MockDispatch {
 
 fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
     DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         plan: false,
         ops: String::new(),
         presentation: None,
@@ -1369,6 +1370,27 @@ fn pid_directory_owned_by_another_uid_is_refused() {
 }
 
 include!("daemon/metrics_snapshot_tests.rs");
+/// ADR-021 Delta 1: a declared owned-namespace list survives a wire round
+/// trip, and an empty list is omitted from the encoded frame so an old daemon
+/// sees the same payload it always did.
+#[test]
+fn frame_owned_namespaces_round_trip_and_omit_when_empty() {
+    let mut frame = base_request_frame("cfg");
+    let encoded = serde_json::to_value(&frame).expect("encode request frame");
+    assert!(
+        encoded.get("owned_namespaces").is_none(),
+        "an empty owned_namespaces must be omitted from the wire"
+    );
+
+    frame.owned_namespaces = vec!["project:data".to_string(), "agent:legacy".to_string()];
+    let bytes = serde_json::to_vec(&frame).expect("encode request frame");
+    let decoded: DaemonRequestFrame = serde_json::from_slice(&bytes).expect("decode request frame");
+    assert_eq!(
+        decoded.owned_namespaces, frame.owned_namespaces,
+        "a non-empty owned_namespaces must survive the wire round trip"
+    );
+}
+
 /// Test 5: serde default back-compat in both directions — a request JSON
 /// without additive request fields deserializes to their defaults, and a
 /// response JSON without `metrics` (an old daemon's shape) deserializes
@@ -1407,6 +1429,14 @@ fn frame_serde_defaults_additive_fields_when_absent() {
     assert!(
         encoded_frame.get("process_ref").is_none(),
         "absent provenance must not change the serialized request wire shape"
+    );
+    assert!(
+        frame.owned_namespaces.is_empty(),
+        "owned_namespaces must default to empty when absent from the wire payload (ADR-021 Delta 1)"
+    );
+    assert!(
+        encoded_frame.get("owned_namespaces").is_none(),
+        "an empty owned_namespaces must not change the serialized request wire shape"
     );
 
     let resp_json = serde_json::json!({
