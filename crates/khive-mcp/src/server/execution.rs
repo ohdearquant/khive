@@ -64,6 +64,18 @@ fn build_compact_verb_catalog(verbs: impl IntoIterator<Item = (String, String, S
     let mut out = String::from(COMPACT_CATALOG_HEADER);
     out.push('\n');
     for (name, contributions) in by_verb {
+        if contributions.len() > 1 {
+            let packs: Vec<&str> = contributions
+                .iter()
+                .map(|(pack, _)| pack.as_str())
+                .collect();
+            tracing::warn!(
+                target: "khive_mcp::server",
+                verb = %name,
+                packs = ?packs,
+                "verb registered by multiple packs; all descriptions included in catalog"
+            );
+        }
         out.push_str(&name);
         out.push_str(": ");
         for (index, (pack, summary)) in contributions.into_iter().enumerate() {
@@ -1192,5 +1204,154 @@ mod compact_catalog_tests {
             build_compact_verb_catalog([]),
             format!("{COMPACT_CATALOG_HEADER}\n")
         );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedCatalogEvent {
+        level: tracing::Level,
+        target: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct CatalogEventFields(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for CatalogEventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    struct CaptureCatalogEvents {
+        events: Arc<std::sync::Mutex<Vec<CapturedCatalogEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureCatalogEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            let mut fields = CatalogEventFields::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("catalog event capture")
+                .push(CapturedCatalogEvent {
+                    level: *metadata.level(),
+                    target: metadata.target().to_owned(),
+                    fields: fields.0,
+                });
+        }
+    }
+
+    fn capture_catalog_events(
+        build: impl FnOnce() -> String,
+    ) -> (String, Vec<CapturedCatalogEvent>) {
+        use tracing_subscriber::prelude::*;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureCatalogEvents {
+            events: Arc::clone(&events),
+        });
+        let catalog = tracing::subscriber::with_default(subscriber, build);
+        let captured = {
+            let mut events = events.lock().expect("completed catalog event capture");
+            std::mem::take(&mut *events)
+        };
+        (catalog, captured)
+    }
+
+    #[test]
+    fn catalog_builders_warn_once_per_duplicate_verb() {
+        let entries = [
+            ("z-last", "zeta", "Z one\nhidden Z"),
+            ("a-two", "alpha", "A first\nhidden A"),
+            ("solo", "beta", "B full"),
+            ("a-one", "alpha", "A second"),
+            ("z-first", "zeta", "Z two"),
+            ("a-three", "alpha", "A third"),
+        ]
+        .map(|(pack, verb, description)| {
+            (pack.to_owned(), verb.to_owned(), description.to_owned())
+        });
+        let expected_events = Vec::from([
+            CapturedCatalogEvent {
+                level: tracing::Level::WARN,
+                target: "khive_mcp::server".to_owned(),
+                fields: std::collections::BTreeMap::from([
+                    ("verb".to_owned(), "alpha".to_owned()),
+                    (
+                        "packs".to_owned(),
+                        r#"["a-two", "a-one", "a-three"]"#.to_owned(),
+                    ),
+                    (
+                        "message".to_owned(),
+                        "verb registered by multiple packs; all descriptions included in catalog"
+                            .to_owned(),
+                    ),
+                ]),
+            },
+            CapturedCatalogEvent {
+                level: tracing::Level::WARN,
+                target: "khive_mcp::server".to_owned(),
+                fields: std::collections::BTreeMap::from([
+                    ("verb".to_owned(), "zeta".to_owned()),
+                    ("packs".to_owned(), r#"["z-last", "z-first"]"#.to_owned()),
+                    (
+                        "message".to_owned(),
+                        "verb registered by multiple packs; all descriptions included in catalog"
+                            .to_owned(),
+                    ),
+                ]),
+            },
+        ]);
+
+        let (full, full_events) = capture_catalog_events(|| build_verb_catalog(entries.clone()));
+        assert_eq!(full_events, expected_events);
+        assert_eq!(
+            full,
+            concat!(
+                "  alpha — [a-two] A first\nhidden A\n",
+                "    [a-one] A second\n",
+                "    [a-three] A third\n",
+                "  beta — B full\n",
+                "  zeta — [z-last] Z one\nhidden Z\n",
+                "    [z-first] Z two\n",
+            )
+        );
+
+        let (compact, compact_events) =
+            capture_catalog_events(|| build_compact_verb_catalog(entries));
+        assert_eq!(compact_events, expected_events);
+        assert_eq!(compact, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "alpha: [a-two] A first | [a-one] A second | [a-three] A third — alpha(help=true)\n",
+            "beta: [solo] B full — beta(help=true)\n",
+            "zeta: [z-last] Z one | [z-first] Z two — zeta(help=true)\n",
+        ));
+
+        let single = [("solo".to_owned(), "beta".to_owned(), "B full".to_owned())];
+        let (full, events) = capture_catalog_events(|| build_verb_catalog(single.clone()));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(full, "  beta — B full\n");
+        let (compact, events) = capture_catalog_events(|| build_compact_verb_catalog(single));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(compact, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "beta: [solo] B full — beta(help=true)\n",
+        ));
+
+        let (full, events) = capture_catalog_events(|| build_verb_catalog([]));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(full, "");
+        let (compact, events) = capture_catalog_events(|| build_compact_verb_catalog([]));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(compact, "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n");
     }
 }
