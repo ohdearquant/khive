@@ -174,7 +174,16 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(e) => {
                 if let Some(v) = e.variable.as_deref() {
-                    var_kinds.insert(v, VarKind::Edge);
+                    let kind = if e
+                        .relations
+                        .iter()
+                        .any(|r| SYNTHETIC_RELATIONS.contains(&r.as_str()))
+                    {
+                        VarKind::SyntheticEdge
+                    } else {
+                        VarKind::Edge
+                    };
+                    var_kinds.insert(v, kind);
                 }
             }
         }
@@ -185,17 +194,49 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         if validate_err.is_some() {
             return;
         }
-        let is_edge = var_kinds
+        let kind = var_kinds
             .get(cond.variable.as_str())
             .copied()
-            .unwrap_or(VarKind::Node)
-            == VarKind::Edge;
+            .unwrap_or(VarKind::Node);
+        if let PropertyRef::MetadataPath(_) = &cond.property {
+            if kind != VarKind::Edge {
+                validate_err = Some(QueryError::Validation(
+                    "metadata paths require a canonical edge binding".into(),
+                ));
+                return;
+            }
+        }
+        let is_edge = matches!(kind, VarKind::Edge | VarKind::SyntheticEdge);
         if let Err(e) = validate_condition(cond, is_edge) {
             validate_err = Some(e);
         }
     });
     if let Some(e) = validate_err {
         return Err(e);
+    }
+
+    for item in &query.order_by {
+        let kind = var_kinds.get(item.variable.as_str()).ok_or_else(|| {
+            QueryError::Validation(format!("unknown variable '{}' in ORDER BY", item.variable))
+        })?;
+        match &item.property {
+            PropertyRef::Field(field) if field == "namespace" => {
+                return Err(QueryError::Validation(
+                    "namespace is set by CompileOptions, not query text".into(),
+                ));
+            }
+            PropertyRef::Field(field) if matches!(field.as_str(), "properties" | "metadata") => {
+                return Err(QueryError::Validation(
+                    "ORDER BY requires a JSON path, not a properties or metadata container".into(),
+                ));
+            }
+            PropertyRef::MetadataPath(_) if *kind != VarKind::Edge => {
+                return Err(QueryError::Validation(
+                    "metadata paths require a canonical edge binding".into(),
+                ));
+            }
+            _ => {}
+        }
     }
 
     Ok(warnings)
@@ -205,6 +246,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
 enum VarKind {
     Node,
     Edge,
+    SyntheticEdge,
 }
 
 fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryError> {
