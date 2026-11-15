@@ -14,7 +14,7 @@ partially amends Rev 6's generic-memory-create equivalence; routing for
 **Qualified**: 2026-11-05, [ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)
 places an edge between two memory rows in its source row's namespace; Rule 9's qualifications and
 Rule 8 constraints 1 and 4 name it beside `restore`'s ownership comparison. No read gains a check.
-**Qualified (proposed)**: 2026-11-14, [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) extends that placement
+**Qualified**: 2026-11-14, [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) extends that placement
 rule to the memory row a `supersedes` write names; Rule 9's qualifications and Rule 8 constraint 1 name it under the same
 comparison. The id still resolves unscoped, and a target that is not a memory row keeps Rule 9 as written. No read
 gains a check.
@@ -208,7 +208,7 @@ The following constraints apply:
    KG, memory, gtd, brain, schedule, and knowledge packs and to any pack that uses the
    shared SQLite backend. No post-fetch namespace check is added to by-ID ops beyond the two
    write-effect comparisons named in Rule 9's qualifications (`restore`'s ownership comparison and
-   the memory-edge placement rule of ADR-021 Delta 3, which the proposed Delta 4 extends to the row a `supersedes`
+   the memory-edge placement rule of ADR-021 Delta 3, which Delta 4 extends to the row a `supersedes`
    write names); neither decides access to a record. The Gate
    remains the single enforcement seam for the shared substrate.
 
@@ -229,7 +229,7 @@ The following constraints apply:
    a backend whose isolation is enforced at connection time, not at per-record read time.
    No by-ID namespace check is added anywhere in the shared substrate layer, other than those two
    write-effect comparisons, which compare stored namespaces with each other or with the
-   gate-checked write namespace and never gate a read. Under the proposed ADR-021 Delta 4 the placement rule also
+   gate-checked write namespace and never gate a read. Under ADR-021 Delta 4 the placement rule also
    compares a superseded row's stored namespace with the shared `local` namespace and with the caller's declared
    `owned_namespaces`; that is still a write-effect comparison and still never gates a read.
 
@@ -274,7 +274,7 @@ read the handler, not only the declaration. An edge whose source and target are 
 is qualified the same way ([ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)):
 `link` resolves both ids unscoped, then compares the source row's stored namespace with the request's
 write namespace and refuses a mismatch, and `restore` of such an edge compares the edge's stored
-namespace with its source row's. Under the proposed [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14), the same comparison also
+namespace with its source row's. Under [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14), the same comparison also
 covers the memory row a `supersedes` write names, for the writes Delta 4 rule 2 lists: each compares that row's stored
 namespace with the write namespace under the batch old-row rule. The comparison applies only when the named row is a memory row and the relation is `supersedes`;
 the id is still resolved without a namespace check, and every other `link(target_id)` keeps the unscoped contract. These comparisons decide where an edge may be written, never who

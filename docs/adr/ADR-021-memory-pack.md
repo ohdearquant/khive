@@ -31,7 +31,7 @@ and edge reads report how many such edges they left out (#6380; accepted 2026-11
 1's refusal text, which is proposed).
 **Amended**: 2026-11-14, [Delta 4](#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) of
 the batch-apply amendment: every writer of a `supersedes` edge or property applies the old-row namespace rule
-(#6607; proposed).
+(#6607; accepted 2026-11-14).
 
 ## Context
 
@@ -985,7 +985,7 @@ Measured on one deployment's export: 369 rows sit in four such namespaces, one p
    `source_ids` rule does not apply to it. The new row is written in the caller's namespace as before, and the old
    row is not changed.
 4. **Scope.** The declaration is read by this check alone. It grants no write into the owned namespace, widens no
-   read, and no other verb consults it. (Delta 4, proposed, makes the supersede writes it names read the same list.)
+   read, and no other verb consults it. (Delta 4 makes the supersede writes it names read the same list.)
 
 **Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
 machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
@@ -1143,7 +1143,7 @@ run leaving all six in the source row's namespace.
 
 ### Delta 4: every writer of a supersede applies the old-row namespace rule (2026-11-14)
 
-**Status**: Proposed 2026-11-14. Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
+**Status**: Accepted 2026-11-14 (#6607). Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
 Recall and Delta 2 are unchanged. It amends Delta 1 rule 4 in one respect: the `owned_namespaces` declaration is also
 read by rule 1 below. It still grants no write into an owned namespace and widens no read. Who sets the
 declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
