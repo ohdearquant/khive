@@ -18,7 +18,8 @@ WITH eligible AS (
       AND json_extract(properties, '$.direction') = 'outbound'
       AND substr(json_extract(properties, '$.to_actor'), 1,
                  instr(json_extract(properties, '$.to_actor'), ':')) = ?2
-      AND ifnull(json_type(properties, '$.delivered_at'), 'null') = 'null'
+      AND (json_type(properties, '$.delivered_at') IS NULL
+           OR json_type(properties, '$.delivered_at') = 'null')
       AND (json_extract(properties, '$.delivery') IS NULL
            OR json_extract(properties, '$.delivery') NOT IN ('delivered', 'failed'))
       AND ifnull(json_type(properties, '$.delivery_hold'), 'null') = 'null'

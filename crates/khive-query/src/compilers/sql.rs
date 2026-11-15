@@ -657,7 +657,12 @@ fn compile_fixed_length(
                 }
 
                 if let Some(ref var) = ep.variable {
-                    var_to_alias.insert(var.clone(), (e_alias.clone(), VarKind::Edge));
+                    let kind = if has_synthetic {
+                        VarKind::SyntheticEdge
+                    } else {
+                        VarKind::Edge
+                    };
+                    var_to_alias.insert(var.clone(), (e_alias.clone(), kind));
                 }
 
                 edge_idx += 1;
@@ -714,7 +719,7 @@ fn compile_fixed_length(
                             ("payload", "payload"),
                             ("created_at", "created_at"),
                         ],
-                        VarKind::Edge => &[
+                        VarKind::Edge | VarKind::SyntheticEdge => &[
                             ("id", "id"),
                             ("source_id", "source"),
                             ("target_id", "target"),
@@ -733,6 +738,22 @@ fn compile_fixed_length(
                 "unknown variable '{var}' in RETURN clause"
             )));
         }
+    }
+
+    if !query.order_by.is_empty() {
+        let mut requested = Vec::new();
+        for item in &query.order_by {
+            let (alias, kind) = var_to_alias.get(&item.variable).ok_or_else(|| {
+                QueryError::Compile(format!("unknown variable '{}' in ORDER BY", item.variable))
+            })?;
+            let expression = order_property_expression(&item.property, kind, alias, &mut params)?;
+            requested.push(format!(
+                "{expression} COLLATE BINARY {}",
+                order_direction(item.direction)
+            ));
+        }
+        requested.extend(order_parts);
+        order_parts = requested;
     }
 
     let offset_i64 = i64::try_from(query.offset)
@@ -811,7 +832,7 @@ fn compile_single_condition(
         ))
     })?;
 
-    let col_expr = where_property_expression(&cond.property, kind, alias)?;
+    let col_expr = where_property_expression(&cond.property, kind, alias, params)?;
 
     compile_condition_predicate(&col_expr, cond, params)
 }
@@ -934,59 +955,65 @@ fn expr_endpoint_set(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
 ) -> (bool, bool) {
     match expr {
         WhereExpr::True => (false, false),
         WhereExpr::Condition(c) => {
             let is_start = start_var == Some(c.variable.as_str());
-            let is_end = end_var == Some(c.variable.as_str());
+            let is_end = end_var == Some(c.variable.as_str())
+                || (edge_var == Some(c.variable.as_str())
+                    && matches!(&c.property, PropertyRef::MetadataPath(_)));
             (is_start, is_end)
         }
         WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
-            let (ls, le) = expr_endpoint_set(l, start_var, end_var);
-            let (rs, re) = expr_endpoint_set(r, start_var, end_var);
+            let (ls, le) = expr_endpoint_set(l, start_var, end_var, edge_var);
+            let (rs, re) = expr_endpoint_set(r, start_var, end_var, edge_var);
             (ls || rs, le || re)
         }
     }
 }
 
-/// Rejects OR subtrees that cannot be preserved across CTE endpoint phases.
+/// Rejects OR subtrees spanning the start phase and final node/edge phase.
 fn reject_or_spanning_endpoints(
     expr: &WhereExpr,
     start: &NodePattern,
     end: &NodePattern,
+    edge: &EdgePattern,
 ) -> Result<(), QueryError> {
     let start_var = start.variable.as_deref();
     let end_var = end.variable.as_deref();
-    reject_or_spanning_impl(expr, start_var, end_var)
+    let edge_var = edge.variable.as_deref();
+    reject_or_spanning_impl(expr, start_var, end_var, edge_var)
 }
 
 fn reject_or_spanning_impl(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
 ) -> Result<(), QueryError> {
     match expr {
         WhereExpr::True | WhereExpr::Condition(_) => Ok(()),
         WhereExpr::And(l, r) => {
-            reject_or_spanning_impl(l, start_var, end_var)?;
-            reject_or_spanning_impl(r, start_var, end_var)
+            reject_or_spanning_impl(l, start_var, end_var, edge_var)?;
+            reject_or_spanning_impl(r, start_var, end_var, edge_var)
         }
         WhereExpr::Or(l, r) => {
-            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var);
-            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var);
+            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var, edge_var);
+            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var, edge_var);
             let spans_start = l_start || r_start;
             let spans_end = l_end || r_end;
             if spans_start && spans_end {
                 return Err(QueryError::Unsupported(
-                    "WHERE clauses that span both endpoints in a variable-length pattern \
+                    "WHERE clauses that span the start and final row in a variable-length pattern \
                      are not yet supported; rewrite as separate queries or restrict each \
-                     OR branch to one endpoint"
+                     OR branch to one phase"
                         .into(),
                 ));
             }
-            reject_or_spanning_impl(l, start_var, end_var)?;
-            reject_or_spanning_impl(r, start_var, end_var)
+            reject_or_spanning_impl(l, start_var, end_var, edge_var)?;
+            reject_or_spanning_impl(r, start_var, end_var, edge_var)
         }
     }
 }
@@ -995,8 +1022,16 @@ fn compile_var_len_condition(
     cond: &Condition,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
     params: &mut Vec<QueryValue>,
 ) -> Result<(String, &'static str), QueryError> {
+    if edge_var == Some(cond.variable.as_str()) {
+        if let PropertyRef::MetadataPath(path) = &cond.property {
+            let expression = bound_json_path_expression("t.via_metadata", path, params)?;
+            // Final-edge predicates share the final node's phase, not its SQL alias.
+            return Ok((compile_condition_predicate(&expression, cond, params)?, "r"));
+        }
+    }
     let col_alias = if start_var == Some(cond.variable.as_str()) {
         "s"
     } else if end_var == Some(cond.variable.as_str()) {
@@ -1009,7 +1044,7 @@ fn compile_var_len_condition(
         )));
     };
 
-    let col_expr = where_property_expression(&cond.property, &VarKind::Node, col_alias)?;
+    let col_expr = where_property_expression(&cond.property, &VarKind::Node, col_alias, params)?;
 
     let sql = compile_condition_predicate(&col_expr, cond, params)?;
     Ok((sql, col_alias))
@@ -1018,8 +1053,7 @@ fn compile_var_len_condition(
 /// Routes variable-length predicates to the start or end CTE phase.
 fn compile_variable_length_where(
     expr: &WhereExpr,
-    start_var: Option<&str>,
-    end_var: Option<&str>,
+    (start_var, end_var, edge_var): (Option<&str>, Option<&str>, Option<&str>),
     params: &mut Vec<QueryValue>,
     start_conditions: &mut Vec<String>,
     end_conditions: &mut Vec<String>,
@@ -1027,7 +1061,8 @@ fn compile_variable_length_where(
     match expr {
         WhereExpr::True => Ok(None),
         WhereExpr::Condition(cond) => {
-            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            let (sql, alias) =
+                compile_var_len_condition(cond, start_var, end_var, edge_var, params)?;
             if alias == "s" {
                 start_conditions.push(sql);
             } else {
@@ -1038,16 +1073,14 @@ fn compile_variable_length_where(
         WhereExpr::And(l, r) => {
             compile_variable_length_where(
                 l,
-                start_var,
-                end_var,
+                (start_var, end_var, edge_var),
                 params,
                 start_conditions,
                 end_conditions,
             )?;
             compile_variable_length_where(
                 r,
-                start_var,
-                end_var,
+                (start_var, end_var, edge_var),
                 params,
                 start_conditions,
                 end_conditions,
@@ -1056,8 +1089,10 @@ fn compile_variable_length_where(
         }
         WhereExpr::Or(l, r) => {
             // The prior spanning check guarantees both branches use one endpoint.
-            let l_sql = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let r_sql = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let l_sql =
+                compile_variable_length_where_to_sql(l, start_var, end_var, edge_var, params)?;
+            let r_sql =
+                compile_variable_length_where_to_sql(r, start_var, end_var, edge_var, params)?;
             match (l_sql, r_sql) {
                 (None, None) => {}
                 (Some((ls, la)), None) => {
@@ -1093,17 +1128,19 @@ fn compile_variable_length_where_to_sql(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
     params: &mut Vec<QueryValue>,
 ) -> Result<Option<(String, &'static str)>, QueryError> {
     match expr {
         WhereExpr::True => Ok(None),
         WhereExpr::Condition(cond) => {
-            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            let (sql, alias) =
+                compile_var_len_condition(cond, start_var, end_var, edge_var, params)?;
             Ok(Some((sql, alias)))
         }
         WhereExpr::And(l, r) => {
-            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, edge_var, params)?;
+            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, edge_var, params)?;
             Ok(match (ls, rs) {
                 (None, None) => None,
                 (Some(s), None) | (None, Some(s)) => Some(s),
@@ -1111,8 +1148,8 @@ fn compile_variable_length_where_to_sql(
             })
         }
         WhereExpr::Or(l, r) => {
-            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, edge_var, params)?;
+            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, edge_var, params)?;
             Ok(match (ls, rs) {
                 (None, None) => None,
                 (Some(s), None) | (None, Some(s)) => Some(s),
@@ -1158,6 +1195,23 @@ fn compile_variable_length(
                 .into(),
         ));
     }
+
+    let carries_metadata = query.return_items.iter().any(|item| {
+        matches!(item, ReturnItem::Property(var, field)
+            if edge.variable.as_deref() == Some(var.as_str()) && field == "metadata")
+    }) || query.where_clause.conditions().any(|condition| {
+        edge.variable.as_deref() == Some(condition.variable.as_str())
+            && matches!(&condition.property, PropertyRef::MetadataPath(_))
+    }) || query.order_by.iter().any(|item| {
+        edge.variable.as_deref() == Some(item.variable.as_str())
+            && matches!(&item.property, PropertyRef::MetadataPath(_))
+    });
+    let metadata_column = if carries_metadata {
+        ", via_metadata"
+    } else {
+        ""
+    };
+    let metadata_value = if carries_metadata { ", e.metadata" } else { "" };
 
     let max_depth = edge.max_hops.min(MAX_DEPTH);
     let min_depth = edge.min_hops;
@@ -1259,12 +1313,15 @@ fn compile_variable_length(
         )?);
     }
 
-    reject_or_spanning_endpoints(&query.where_clause, start, end)?;
+    reject_or_spanning_endpoints(&query.where_clause, start, end, edge)?;
 
     if let Some(where_sql) = compile_variable_length_where(
         &query.where_clause,
-        start.variable.as_deref(),
-        end.variable.as_deref(),
+        (
+            start.variable.as_deref(),
+            end.variable.as_deref(),
+            edge.variable.as_deref(),
+        ),
         &mut params,
         &mut start_conditions,
         &mut end_conditions,
@@ -1280,17 +1337,6 @@ fn compile_variable_length(
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
-    let offset_i64 = i64::try_from(query.offset)
-        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
-    params.push(QueryValue::Integer(offset_i64));
-    let offset_param = params.len();
-
-    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
-    let limit_i64 = i64::try_from(limit)
-        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
-    params.push(QueryValue::Integer(limit_i64));
-    let limit_param = params.len();
-
     if let Some(ref var) = start.variable {
         var_to_alias.insert(var.clone(), ("s".to_string(), VarKind::Node));
     }
@@ -1303,6 +1349,8 @@ fn compile_variable_length(
 
     let mut select_parts: Vec<String> = Vec::new();
     let mut projection_aliases: Vec<String> = Vec::new();
+    let mut returned_columns: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
     let mut has_start = false;
 
     for item in &query.return_items {
@@ -1311,7 +1359,12 @@ fn compile_variable_length(
             match item {
                 ReturnItem::Property(_, prop) => {
                     let is_start = start.variable.as_deref() == Some(var);
-                    if matches!(kind, VarKind::EventNode | VarKind::ObservationTargetNode) {
+                    if matches!(
+                        kind,
+                        VarKind::EventNode
+                            | VarKind::ObservationTargetNode
+                            | VarKind::SyntheticEdge
+                    ) {
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1326,21 +1379,26 @@ fn compile_variable_length(
                         let col = property_to_column(prop, kind)?;
                         let output_alias = quote_identifier(&format!("{var}_{prop}"));
                         select_parts.push(format!("{tbl}.{col} AS {output_alias}"));
+                        returned_columns
+                            .insert((var.to_owned(), prop.to_owned()), output_alias.clone());
                         projection_aliases.push(output_alias);
                     } else {
                         let col = match prop.as_str() {
                             "id" => "via_edge",
                             "relation" => "via_relation",
                             "weight" => "via_weight",
+                            "metadata" => "via_metadata",
                             _ => {
                                 return Err(QueryError::Compile(format!(
                                     "unknown edge property '{prop}' in RETURN projection. \
-                                     Valid: id, source_id, target_id, relation, weight"
+                                     Valid: id, relation, weight, metadata"
                                 )));
                             }
                         };
                         let output_alias = quote_identifier(&format!("{var}_{prop}"));
                         select_parts.push(format!("t.{col} AS {output_alias}"));
+                        returned_columns
+                            .insert((var.to_owned(), prop.to_owned()), output_alias.clone());
                         projection_aliases.push(output_alias);
                     }
                 }
@@ -1364,10 +1422,14 @@ fn compile_variable_length(
                         ] {
                             let output_alias = quote_identifier(&format!("{var}_{column}"));
                             select_parts.push(format!("{tbl}.{column} AS {output_alias}"));
+                            returned_columns
+                                .insert((var.to_owned(), column.to_owned()), output_alias.clone());
                             projection_aliases.push(output_alias);
                         }
                     }
-                    VarKind::EventNode | VarKind::ObservationTargetNode => {
+                    VarKind::EventNode
+                    | VarKind::ObservationTargetNode
+                    | VarKind::SyntheticEdge => {
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1382,6 +1444,8 @@ fn compile_variable_length(
                         ] {
                             let output_alias = quote_identifier(&format!("{var}_{suffix}"));
                             select_parts.push(format!("t.{column} AS {output_alias}"));
+                            returned_columns
+                                .insert((var.to_owned(), suffix.to_owned()), output_alias.clone());
                             projection_aliases.push(output_alias);
                         }
                     }
@@ -1412,6 +1476,48 @@ fn compile_variable_length(
         format!(", {projection_order}")
     };
 
+    let mut requested_order = Vec::new();
+    for item in &query.order_by {
+        let root = match &item.property {
+            PropertyRef::Field(field) => field.as_str(),
+            PropertyRef::JsonPath(_) => "properties",
+            PropertyRef::MetadataPath(_) => "metadata",
+        };
+        let projected = returned_columns
+            .get(&(item.variable.clone(), root.to_owned()))
+            .ok_or_else(|| {
+                QueryError::Unsupported(
+                    "variable-length ORDER BY must be derived from RETURN projections".into(),
+                )
+            })?;
+        let expression = match &item.property {
+            PropertyRef::Field(_) => projected.clone(),
+            PropertyRef::JsonPath(path) | PropertyRef::MetadataPath(path) => {
+                bound_json_path_expression(projected, path, &mut params)?
+            }
+        };
+        requested_order.push(format!(
+            "{expression} COLLATE BINARY {}",
+            order_direction(item.direction)
+        ));
+    }
+    let requested_order = if requested_order.is_empty() {
+        String::new()
+    } else {
+        format!("{}, ", requested_order.join(", "))
+    };
+
+    let offset_i64 = i64::try_from(query.offset)
+        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(offset_i64));
+    let offset_param = params.len();
+
+    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
+    let limit_i64 = i64::try_from(limit)
+        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(limit_i64));
+    let limit_param = params.len();
+
     // `r` is required by end filters; `s` is needed only for a start projection.
     let join_start = if has_start {
         "JOIN primary_nodes s ON s.id = t.start_id"
@@ -1428,9 +1534,9 @@ fn compile_variable_length(
 
     let sql = format!(
         "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
-         traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
+         traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight{metadata_column}) AS (\
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
-                    e.id, e.relation, e.weight \
+                    e.id, e.relation, e.weight{metadata_value} \
              FROM primary_nodes s \
              JOIN {edges} ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              JOIN primary_nodes next_node ON next_node.id = ({seed_next}) \
@@ -1440,7 +1546,7 @@ fn compile_variable_length(
              SELECT t.start_id, {recurse_next}, t.depth + 1, \
                     t.path || ',' || {recurse_next}, \
                     t.total_weight + e.weight, \
-                    e.id, e.relation, e.weight \
+                    e.id, e.relation, e.weight{metadata_value} \
              FROM traverse t CROSS JOIN {edges} \
                  ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
@@ -1452,7 +1558,7 @@ fn compile_variable_length(
          FROM traverse t \
          {join_start} {join_end} \
          WHERE {end_where} \
-         ORDER BY {depth_alias}, {total_weight_alias} DESC{projection_order_suffix} \
+         ORDER BY {requested_order}{depth_alias}, {total_weight_alias} DESC{projection_order_suffix} \
          LIMIT ?{limit_param} OFFSET ?{offset_param}",
         primary_nodes = primary_node_sql(mailbox),
         edges = edge_source("e", mailbox),
@@ -1491,6 +1597,8 @@ enum VarKind {
     /// Synthetic observation target backed by an entity/note referent.
     ObservationTargetNode,
     Edge,
+    /// Observation edges have no canonical graph-edge metadata column.
+    SyntheticEdge,
 }
 
 const NODE_COLUMNS: &[&str] = &[
@@ -1535,7 +1643,15 @@ const EVENT_COLUMNS: &[&str] = &[
     "session_id",
     "created_at",
 ];
-const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+const EDGE_COLUMNS: &[&str] = &[
+    "id",
+    "source_id",
+    "target_id",
+    "relation",
+    "weight",
+    "metadata",
+];
+const SYNTHETIC_EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
 const NODE_WHERE_COLUMNS: &[&str] = &[
     "id",
     "name",
@@ -1579,6 +1695,7 @@ fn property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
         VarKind::ObservationTargetNode => (OBSERVATION_TARGET_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_COLUMNS, "event"),
         VarKind::Edge => (EDGE_COLUMNS, "edge"),
+        VarKind::SyntheticEdge => (SYNTHETIC_EDGE_COLUMNS, "edge"),
     }
 }
 
@@ -1601,6 +1718,7 @@ fn where_property_columns(kind: &VarKind) -> (&'static [&'static str], &'static 
         VarKind::ObservationTargetNode => (OBSERVATION_TARGET_WHERE_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_WHERE_COLUMNS, "event"),
         VarKind::Edge => (EDGE_WHERE_COLUMNS, "edge"),
+        VarKind::SyntheticEdge => (EDGE_WHERE_COLUMNS, "edge"),
     }
 }
 
@@ -1608,6 +1726,7 @@ fn where_property_expression(
     property: &PropertyRef,
     kind: &VarKind,
     alias: &str,
+    params: &mut Vec<QueryValue>,
 ) -> Result<String, QueryError> {
     let (valid, kind_name) = where_property_columns(kind);
     match property {
@@ -1633,24 +1752,82 @@ fn where_property_expression(
                     valid.join(", ")
                 )));
             }
-            if path.is_empty() {
+            json_path_expression(&format!("{alias}.properties"), path)
+        }
+        PropertyRef::MetadataPath(path) => {
+            if *kind != VarKind::Edge {
                 return Err(QueryError::Compile(
-                    "JSON property path cannot be empty; use 'properties.<path>'".into(),
+                    "metadata paths require a canonical edge binding".into(),
                 ));
             }
-            if let Some(segment) = path.iter().find(|segment| {
-                segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            }) {
+            bound_json_path_expression(&format!("{alias}.metadata"), path, params)
+        }
+    }
+}
+
+fn validated_json_path(path: &[String]) -> Result<String, QueryError> {
+    if path.is_empty() {
+        return Err(QueryError::Compile(
+            "JSON property path cannot be empty; use a named path below the JSON container".into(),
+        ));
+    }
+    if let Some(segment) = path.iter().find(|segment| {
+        segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+    }) {
+        return Err(QueryError::Compile(format!(
+            "invalid JSON property path segment '{segment}'; path segments must be identifiers"
+        )));
+    }
+    Ok(format!("$.{}", path.join(".")))
+}
+
+fn json_path_expression(column: &str, path: &[String]) -> Result<String, QueryError> {
+    let path = validated_json_path(path)?;
+    Ok(format!("json_extract({column}, '{path}')"))
+}
+
+fn bound_json_path_expression(
+    column: &str,
+    path: &[String],
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    params.push(QueryValue::Text(validated_json_path(path)?));
+    Ok(format!("json_extract({column}, ?{})", params.len()))
+}
+
+fn order_property_expression(
+    property: &PropertyRef,
+    kind: &VarKind,
+    alias: &str,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    match property {
+        PropertyRef::Field(field) => {
+            if matches!(field.as_str(), "namespace" | "properties" | "metadata") {
+                return Err(QueryError::Compile(
+                    "ORDER BY requires a scalar field or explicit JSON path, not namespace or a JSON container".into(),
+                ));
+            }
+            let column = property_to_column(field, kind)?;
+            Ok(format!("{alias}.{column}"))
+        }
+        PropertyRef::JsonPath(path) => {
+            let (columns, kind_name) = property_columns(kind);
+            if !columns.contains(&"properties") {
                 return Err(QueryError::Compile(format!(
-                    "invalid JSON property path segment '{segment}'; \
-                     path segments must be identifiers"
+                    "{kind_name} variables do not expose JSON properties in ORDER BY"
                 )));
             }
-            Ok(format!(
-                "json_extract({alias}.properties, '$.{}')",
-                path.join(".")
-            ))
+            bound_json_path_expression(&format!("{alias}.properties"), path, params)
         }
+        PropertyRef::MetadataPath(_) => where_property_expression(property, kind, alias, params),
+    }
+}
+
+fn order_direction(direction: OrderDirection) -> &'static str {
+    match direction {
+        OrderDirection::Asc => "ASC",
+        OrderDirection::Desc => "DESC",
     }
 }
 

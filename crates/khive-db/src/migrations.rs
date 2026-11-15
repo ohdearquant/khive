@@ -421,6 +421,30 @@ const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
 const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
 const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
 const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
+const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
+
+/// Retained V66 schema needs only its ledger restored, not an index rebuild.
+fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let installed: Option<String> = tx
+        .query_row(
+            include_str!("../sql/comm-outbound-due-index-definition.sql"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (_, create) = V66_UP
+        .split_once("CREATE INDEX")
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let expected = format!("CREATE INDEX{create}");
+    // SQLite omits the terminal semicolon. Preserve every interior byte,
+    // including whitespace in SQL string literals, when comparing definitions.
+    if installed.as_deref().is_some_and(|sql| {
+        sql.trim().trim_end_matches(';') == expected.trim().trim_end_matches(';')
+    }) {
+        return Ok(());
+    }
+    tx.execute_batch(V66_UP)
+}
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
@@ -870,6 +894,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 65,
         name: "graph_edges_target_relation_index",
         up: V65_UP,
+    },
+    VersionedMigration {
+        version: 66,
+        name: "comm_undelivered_due_index",
+        up: V66_UP,
     },
 ];
 
@@ -2172,6 +2201,9 @@ fn apply_versioned_migration(
             .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 58 {
         migrate_proposal_archive(&tx)?;
+    } else if migration.version == 66 {
+        migrate_undelivered_due_index(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
         tx.execute_batch(migration.up)
             .map_err(|error| SqliteError::migration(migration.version, error))?;

@@ -423,6 +423,7 @@ pub(super) async fn build_server_from_prepared(
             .await
             .map(|s| {
                 s.with_default_output_format(fmt)
+                    .with_catalog_verbosity(args.catalog_verbosity)
                     .with_daemon_spawn_overrides(spawn_config, spawn_db)
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -446,6 +447,7 @@ pub(super) async fn build_server_from_prepared(
             .map(|rt| (**rt).clone()),
     );
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None)
+        .with_catalog_verbosity(args.catalog_verbosity)
         .with_daemon_spawn_overrides(spawn_config, spawn_db);
     Ok((server, schedule_rt))
 }
