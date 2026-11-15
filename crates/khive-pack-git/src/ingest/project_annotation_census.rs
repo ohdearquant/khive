@@ -3,6 +3,57 @@ use super::*;
 const NOTE_LIMIT: usize = 1000;
 const NOTE_ID_LIMIT: usize = 20;
 const EXISTING_WARNING_LIMIT: u64 = 20;
+const REPLAY_CHECK_LIMIT: usize = 128;
+
+pub(super) struct ReplayAnnotationChecks {
+    initial: PageCheckpoint,
+    attempted: BTreeSet<(u64, Uuid)>,
+    exhausted: bool,
+}
+
+impl ReplayAnnotationChecks {
+    pub(super) fn new(initial: &PageCheckpoint) -> Self {
+        Self {
+            initial: PageCheckpoint {
+                version: initial.version,
+                namespace: initial.namespace.clone(),
+                floor: initial.floor.clone(),
+                at_floor: initial.at_floor.clone(),
+                undated: initial.undated.clone(),
+            },
+            attempted: BTreeSet::new(),
+            exhausted: false,
+        }
+    }
+
+    pub(super) fn reserve(
+        &mut self,
+        source: &str,
+        number: u64,
+        updated_at: Option<&str>,
+        note_id: Uuid,
+        report: &mut IngestReport,
+    ) -> bool {
+        if self.initial.acknowledged(number, updated_at) != Some(note_id)
+            || self.attempted.contains(&(number, note_id))
+        {
+            return false;
+        }
+        if self.attempted.len() >= REPLAY_CHECK_LIMIT {
+            if !self.exhausted {
+                report.warnings.push(format!(
+                    "{source}: project annotation replay check limit of {REPLAY_CHECK_LIMIT} reached; additional acknowledged records were not checked"
+                ));
+                self.exhausted = true;
+            }
+            return false;
+        }
+        // Reserve before reading so absent notes and read errors consume the same allowance.
+        self.attempted.insert((number, note_id));
+        true
+    }
+}
+
 fn append_existing_diagnostic(report: &mut IngestReport, detail: impl FnOnce() -> String) {
     report.existing_project_annotation_warning_count += 1;
     if report.existing_project_annotation_warning_count <= EXISTING_WARNING_LIMIT {
@@ -667,6 +718,187 @@ mod tests {
         )
         .await;
         assert!(restored.warnings.is_empty(), "restored linked positive");
+        assert_eq!(annotation_rows(&runtime).await, before);
+    }
+
+    #[test]
+    fn replay_annotation_checks_require_the_initial_observation() {
+        let first = Uuid::from_u128(1);
+        let undated = Uuid::from_u128(2);
+        let learned = Uuid::from_u128(3);
+        let initial_time = "2026-01-01T00:00:00Z";
+        let later_time = "2026-01-02T00:00:00Z";
+        let mut checkpoint = PageCheckpoint::new("local", Some(initial_time.into()));
+        assert!(checkpoint.acknowledge(1, Some(initial_time), first));
+        assert!(checkpoint.acknowledge(2, None, undated));
+        let mut replay = ReplayAnnotationChecks::new(&checkpoint);
+        assert!(checkpoint.acknowledge(2, Some(later_time), undated));
+        assert!(checkpoint.acknowledge(3, Some(later_time), learned));
+        let mut report = IngestReport::default();
+        let before = serde_json::to_value(&report).unwrap();
+
+        assert!(!replay.reserve("issues", 1, Some(initial_time), learned, &mut report));
+        assert!(!replay.reserve("issues", 1, None, first, &mut report));
+        assert!(!replay.reserve("issues", 1, Some(later_time), first, &mut report));
+        assert!(!replay.reserve("issues", 2, Some(later_time), undated, &mut report));
+        assert!(!replay.reserve("issues", 3, Some(later_time), learned, &mut report));
+        assert!(replay.attempted.is_empty());
+        assert!(replay.reserve("issues", 1, Some(initial_time), first, &mut report));
+        assert!(replay.reserve("issues", 2, None, undated, &mut report));
+        assert!(!replay.reserve("issues", 1, Some(initial_time), first, &mut report));
+        assert!(!replay.reserve("issues", 2, None, undated, &mut report));
+        assert_eq!(replay.attempted, BTreeSet::from([(1, first), (2, undated)]));
+        assert_eq!(serde_json::to_value(&report).unwrap(), before);
+    }
+
+    #[test]
+    fn replay_annotation_checks_bound_attempts_independently_of_diagnostics() {
+        let mut checkpoint = PageCheckpoint::new("local", None);
+        for number in 1..=1000 {
+            assert!(checkpoint.acknowledge(number, None, Uuid::from_u128(number.into())));
+        }
+        let mut report = IngestReport {
+            done: true,
+            ..IngestReport::default()
+        };
+        let mut expected = serde_json::to_value(&report).unwrap();
+        for source in ["prs", "issues"] {
+            let mut replay = ReplayAnnotationChecks::new(&checkpoint);
+            for number in 1..=128 {
+                let id = Uuid::from_u128(number.into());
+                assert!(replay.reserve(source, number, None, id, &mut report));
+                assert!(!replay.reserve(source, number, None, id, &mut report));
+            }
+            for number in 129..=1000 {
+                assert!(!replay.reserve(
+                    source,
+                    number,
+                    None,
+                    Uuid::from_u128(number.into()),
+                    &mut report
+                ));
+            }
+            assert!(!replay.reserve(source, 129, None, Uuid::from_u128(129), &mut report));
+            assert_eq!(replay.attempted.len(), 128);
+            assert!(replay.exhausted);
+        }
+        expected["warnings"] = json!([
+            "prs: project annotation replay check limit of 128 reached; additional acknowledged records were not checked",
+            "issues: project annotation replay check limit of 128 reached; additional acknowledged records were not checked"
+        ]);
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        let mut next_invocation = ReplayAnnotationChecks::new(&checkpoint);
+        assert!(next_invocation.reserve("issues", 1, None, Uuid::from_u128(1), &mut report));
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn existing_annotation_details_share_one_cap_across_sources_and_outcomes() {
+        let (runtime, token, registry) = fixture().await;
+        let project_id = create(
+            &registry,
+            json!({"kind": "project", "name": "bounded-existing-annotation-details"}),
+        )
+        .await;
+        let notes = runtime.notes(&token).unwrap();
+        let healthy = annotation_note("issue", 25, project_id);
+        let healthy_id = healthy.id;
+        notes.upsert_note(healthy).await.unwrap();
+        runtime
+            .graph(&token)
+            .unwrap()
+            .upsert_edge(annotation_edge(healthy_id, project_id))
+            .await
+            .unwrap();
+        let mut cases = Vec::new();
+        let mut issue_checkpoint = PageCheckpoint::new("local", None);
+        let mut pr_checkpoint = PageCheckpoint::new("local", None);
+        for number in 1..=24 {
+            let kind = if number % 2 == 0 {
+                "pull_request"
+            } else {
+                "issue"
+            };
+            let note = annotation_note(kind, number, project_id);
+            let id = note.id;
+            let missing_note = number % 3 == 0;
+            if !missing_note {
+                notes.upsert_note(note).await.unwrap();
+            }
+            let checkpoint = if kind == "issue" {
+                &mut issue_checkpoint
+            } else {
+                &mut pr_checkpoint
+            };
+            assert!(checkpoint.acknowledge(number, None, id));
+            cases.push((kind, number, id, missing_note));
+        }
+        let before = annotation_rows(&runtime).await;
+        let mut issue_replay = ReplayAnnotationChecks::new(&issue_checkpoint);
+        let mut pr_replay = ReplayAnnotationChecks::new(&pr_checkpoint);
+        let mut report = IngestReport {
+            done: true,
+            warnings: vec!["unrelated warning before details".into()],
+            ..IngestReport::default()
+        };
+        let mut expected = serde_json::to_value(&report).unwrap();
+        let mut expected_warnings = report.warnings.clone();
+        append_existing_note_warning(
+            &runtime,
+            &token,
+            project_id,
+            "issue",
+            25,
+            healthy_id,
+            &mut report,
+        )
+        .await;
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+
+        for (kind, number, id, missing_note) in cases {
+            let (source, replay) = if kind == "issue" {
+                ("issues", &mut issue_replay)
+            } else {
+                ("prs", &mut pr_replay)
+            };
+            // Mix fresh and replay checks; unavailable replays must remain reserved.
+            if missing_note {
+                assert!(replay.reserve(source, number, None, id, &mut report));
+            }
+            append_existing_note_warning(
+                &runtime,
+                &token,
+                project_id,
+                kind,
+                number,
+                id,
+                &mut report,
+            )
+            .await;
+            if missing_note {
+                assert!(!replay.reserve(source, number, None, id, &mut report));
+            }
+            if number <= 20 {
+                expected_warnings.push(if missing_note {
+                    format!("existing {kind} #{number} note {id} project annotation check unavailable: existing note changed")
+                } else {
+                    format!("existing {kind} #{number} note {id} is missing a live project annotation to {project_id}")
+                });
+            }
+            assert_eq!(report.existing_project_annotation_warning_count, number);
+            if number == 21 {
+                report
+                    .warnings
+                    .push("unrelated warning after detail cap".into());
+                expected_warnings.push("unrelated warning after detail cap".into());
+            }
+        }
+        expected["existing_project_annotation_warning_count"] = json!(24);
+        expected["warnings"] = json!(expected_warnings);
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        assert_eq!(issue_replay.attempted.len(), 4);
+        assert_eq!(pr_replay.attempted.len(), 4);
         assert_eq!(annotation_rows(&runtime).await, before);
     }
 }

@@ -519,10 +519,87 @@ async fn annotation_encounter_above_prefix(prs: bool) {
     assert_eq!(report["missing_project_annotation_count"], 0);
     assert_eq!(report["missing_project_annotation_note_ids"], json!([]));
     assert_eq!(report["project_annotation_census_complete"], false);
-    annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await;
-    annotation_encounter_receipt(&registry, &report).await;
+    assert_eq!(report["existing_project_annotation_warning_count"], 1);
+    let checkpoint =
+        annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await;
+    let mut receipts = vec![annotation_encounter_receipt(&registry, &report).await];
     assert_eq!(annotation_encounter_rows(&runtime).await, before);
-    annotation_encounter_fetches(&logs, prs, &[10]);
+    for _ in 0..2 {
+        let replay = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 10),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&replay, prs, 0, true);
+        assert_eq!(replay["existing_project_annotation_warning_count"], 1);
+        assert_eq!(
+            annotation_encounter_warnings(&replay),
+            vec![annotation_encounter_missing(prs, 1002, target, project)]
+        );
+        assert_eq!(
+            annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)])
+                .await,
+            checkpoint
+        );
+        receipts.push(annotation_encounter_receipt(&registry, &replay).await);
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+    }
+    // The acknowledgement is unchanged: only the actual edge changes whether
+    // the next read warns. Each deliberate fixture mutation precedes its baseline.
+    for deleted in [false, true] {
+        annotation_replay_link(&runtime, &token, project, &[target], deleted).await;
+        let current = annotation_encounter_rows(&runtime).await;
+        let replay = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 10),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&replay, prs, 0, true);
+        assert_eq!(
+            replay["existing_project_annotation_warning_count"],
+            u64::from(deleted)
+        );
+        let expected = if deleted {
+            vec![annotation_encounter_missing(prs, 1002, target, project)]
+        } else {
+            vec![]
+        };
+        assert_eq!(annotation_encounter_warnings(&replay), expected);
+        assert_eq!(
+            annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)])
+                .await,
+            checkpoint
+        );
+        receipts.push(annotation_encounter_receipt(&registry, &replay).await);
+        assert_eq!(annotation_encounter_rows(&runtime).await, current);
+    }
+    registry
+        .dispatch("delete", json!({"id":target.to_string()}))
+        .await
+        .unwrap();
+    let current = annotation_encounter_rows(&runtime).await;
+    let unavailable = registry
+        .dispatch(
+            "git.digest",
+            annotation_encounter_params(&repo, project, prs, 10),
+        )
+        .await
+        .unwrap();
+    annotation_encounter_state(&unavailable, prs, 0, true);
+    assert_eq!(unavailable["existing_project_annotation_warning_count"], 1);
+    assert_eq!(annotation_encounter_warnings(&unavailable),vec![format!("existing {} #1002 note {target} project annotation check unavailable: existing note changed",if prs {"pull_request"} else {"issue"})]);
+    assert_eq!(
+        annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await,
+        checkpoint
+    );
+    receipts.push(annotation_encounter_receipt(&registry, &unavailable).await);
+    assert_eq!(annotation_encounter_rows(&runtime).await, current);
+    annotation_replay_receipts_unchanged(&registry, &receipts).await;
+    annotation_encounter_fetches(&logs, prs, &[10, 11, 11, 11, 11, 11]);
     registry.shutdown_audit_batch().await.unwrap();
 }
 
@@ -564,6 +641,7 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
         assert_eq!(before.1.as_array().unwrap().len(), 0);
         let (_dir, repo, logs, _path) = annotation_encounter_remote(prs, &[1, 2]);
         let mut completed_checkpoint = None;
+        let mut receipts = Vec::new();
         for pass in 0..3 {
             let report = registry
                 .dispatch(
@@ -573,20 +651,19 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
                 .await
                 .expect("budgeted existing-note digest");
             annotation_encounter_state(&report, prs, u64::from(pass < 2), pass == 2);
-            let expected = if pass < 2 {
-                vec![annotation_encounter_missing(
-                    prs,
-                    pass as u64 + 1,
-                    ids[pass],
-                    project,
-                )]
-            } else {
-                vec![]
-            };
+            let expected = (0..if pass == 0 { 1 } else { 2 })
+                .map(|index| {
+                    annotation_encounter_missing(prs, index as u64 + 1, ids[index], project)
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
                 annotation_encounter_warnings(&report),
                 expected,
-                "only fresh lookup hits warn"
+                "fresh hits and initially acknowledged observations both warn"
+            );
+            assert_eq!(
+                report["existing_project_annotation_warning_count"],
+                expected.len()
             );
             let acknowledgments = if pass == 0 {
                 vec![(1, ids[0])]
@@ -602,7 +679,8 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
             if pass == 2 {
                 assert_eq!(Some(checkpoint), completed_checkpoint);
             }
-            annotation_encounter_receipt(&registry, &report).await;
+            receipts.push(annotation_encounter_receipt(&registry, &report).await);
+            annotation_replay_receipts_unchanged(&registry, &receipts).await;
             assert_eq!(annotation_encounter_rows(&runtime).await, before);
         }
         annotation_encounter_fetches(&logs, prs, &[1, 2, 3]);
@@ -731,6 +809,8 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
     registry.shutdown_audit_batch().await.unwrap();
 }
 
+// Select each page from its actual inclusive search floor, rather than from a
+// fixture call counter. Undated observations remain visible on later pages.
 fn annotation_replay_remote() -> (tempfile::TempDir, PathBuf, PathBuf, PathGuard) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -829,6 +909,12 @@ fn annotation_replay_pages(logs: &Path, expected: &[(bool, Option<&str>, u64)]) 
     }
 }
 
+fn annotation_replay_time(index: u64) -> String {
+    let start = chrono::DateTime::parse_from_rfc3339(ANNOTATION_ENCOUNTER_TIME).unwrap();
+    (start + chrono::Duration::seconds(index as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 async fn annotation_replay_checkpoint(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -915,6 +1001,23 @@ async fn annotation_replay_link(
     assert_eq!(summary.failed, 0, "{}", summary.first_error);
 }
 
+fn annotation_replay_exhaustions(report: &Value) -> Vec<&str> {
+    report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .filter(|warning| warning.contains("project annotation replay check limit"))
+        .collect()
+}
+
+fn annotation_replay_limit_warning(prs: bool) -> String {
+    format!(
+        "{}: project annotation replay check limit of 128 reached; additional acknowledged records were not checked",
+        if prs { "prs" } else { "issues" }
+    )
+}
+
 async fn annotation_replay_receipts_unchanged(registry: &VerbRegistry, receipts: &[Value]) {
     for receipt in receipts {
         let reread = registry
@@ -974,6 +1077,315 @@ fn annotation_replay_clear_graph_fault(runtime: &KhiveRuntime) {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_attempt_limit_counts_healthy_and_unavailable_reads() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        for mode in ["missing", "healthy", "unavailable"] {
+            let (runtime, token, registry) = fixture().await;
+            let project = create(
+                &registry,
+                json!({"kind":"project","name":"replay attempt limit"}),
+            )
+            .await;
+            let ids = annotation_encounter_seed(
+                &runtime,
+                &token,
+                project,
+                prs,
+                129,
+                if mode == "missing" { 0 } else { 128 },
+            )
+            .await;
+            let before = annotation_encounter_rows(&runtime).await;
+            let (_dir, repo, logs, _path) =
+                annotation_encounter_remote(prs, &(1..=129).collect::<Vec<_>>());
+            let first = registry
+                .dispatch(
+                    "git.digest",
+                    annotation_encounter_params(&repo, project, prs, 2000),
+                )
+                .await
+                .unwrap();
+            annotation_encounter_state(&first, prs, 129, true);
+            assert_eq!(
+                first["existing_project_annotation_warning_count"],
+                if mode == "missing" { 129 } else { 1 }
+            );
+            assert!(
+                annotation_replay_exhaustions(&first).is_empty(),
+                "fresh hits do not use replay allowance"
+            );
+            let acknowledgments = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (index as u64 + 1, *id))
+                .collect::<Vec<_>>();
+            let checkpoint =
+                annotation_encounter_checkpoint(&runtime, &token, project, prs, &acknowledgments)
+                    .await;
+            let mut receipts = vec![annotation_encounter_receipt(&registry, &first).await];
+            for _ in 0..2 {
+                let denied = (mode == "unavailable")
+                    .then(|| annotation_replay_deny_first_graph_read(&runtime));
+                let outcome = registry
+                    .dispatch(
+                        "git.digest",
+                        annotation_encounter_params(&repo, project, prs, 1),
+                    )
+                    .await;
+                if let Some(denied) = denied {
+                    annotation_replay_clear_graph_fault(&runtime);
+                    assert_eq!(denied.load(Ordering::SeqCst), 1);
+                }
+                let report = outcome.expect("bounded replay remains a successful digest");
+                annotation_encounter_state(&report, prs, 0, true);
+                assert_eq!(
+                    annotation_replay_exhaustions(&report),
+                    vec![annotation_replay_limit_warning(prs)]
+                );
+                let warnings = annotation_encounter_warnings(&report);
+                match mode {
+                    "missing" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 128);
+                        assert_eq!(
+                            warnings,
+                            (0..20)
+                                .map(|index| annotation_encounter_missing(
+                                    prs,
+                                    index as u64 + 1,
+                                    ids[index],
+                                    project
+                                ))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    "healthy" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 0);
+                        assert!(
+                            warnings.is_empty(),
+                            "the unchecked missing 129th row is not an observed warning"
+                        );
+                    }
+                    "unavailable" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 1);
+                        assert_eq!(warnings.len(), 1);
+                        assert!(warnings[0].starts_with(&format!(
+                            "existing {} #1 note {} project annotation check unavailable: ",
+                            if prs { "pull_request" } else { "issue" },
+                            ids[0]
+                        )));
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    annotation_encounter_checkpoint(
+                        &runtime,
+                        &token,
+                        project,
+                        prs,
+                        &acknowledgments
+                    )
+                    .await,
+                    checkpoint
+                );
+                receipts.push(annotation_encounter_receipt(&registry, &report).await);
+                annotation_replay_receipts_unchanged(&registry, &receipts).await;
+                assert_eq!(annotation_encounter_rows(&runtime).await, before);
+            }
+            annotation_encounter_fetches(&logs, prs, &[1000, 130, 130]);
+            registry.shutdown_audit_batch().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_limit_survives_real_page_transitions() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        let (runtime, token, registry) = fixture().await;
+        let project = create(
+            &registry,
+            json!({"kind":"project","name":"replay page boundary"}),
+        )
+        .await;
+        let ids = annotation_encounter_seed(&runtime, &token, project, prs, 1000, 0).await;
+        annotation_replay_link(&runtime, &token, project, &ids[129..], false).await;
+        let before = annotation_encounter_rows(&runtime).await;
+        let (_dir, repo, logs, _path) = annotation_replay_remote();
+        let undated = (1..=129).map(|number| (number, None)).collect::<Vec<_>>();
+        annotation_replay_remote_rows(&logs, prs, &undated);
+        let first = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&first, prs, 129, true);
+        assert_eq!(first["existing_project_annotation_warning_count"], 129);
+        let acknowledgments = ids[..129]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u64 + 1, *id))
+            .collect::<Vec<_>>();
+        annotation_replay_checkpoint(&runtime, &token, project, prs, None, &[], &acknowledgments)
+            .await;
+        let first_receipt = annotation_encounter_receipt(&registry, &first).await;
+        let mut rows = undated;
+        rows.extend(
+            (130..=1000).map(|number| (number, Some(annotation_replay_time(number - 129)))),
+        );
+        annotation_replay_remote_rows(&logs, prs, &rows);
+        let report = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&report, prs, 871, true);
+        assert_eq!(
+            report["existing_project_annotation_warning_count"], 128,
+            "page two must not reset replay attempts"
+        );
+        assert_eq!(
+            annotation_encounter_warnings(&report),
+            (0..20)
+                .map(|index| annotation_encounter_missing(
+                    prs,
+                    index as u64 + 1,
+                    ids[index],
+                    project
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            annotation_replay_exhaustions(&report),
+            vec![annotation_replay_limit_warning(prs)]
+        );
+        let last = annotation_replay_time(871);
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            Some(&last),
+            &[(1000, ids[999])],
+            &acknowledgments,
+        )
+        .await;
+        annotation_replay_pages(
+            &logs,
+            &[
+                (prs, None, 1000),
+                (prs, None, 1000),
+                (prs, Some(&last), 1000),
+            ],
+        );
+        let receipt = annotation_encounter_receipt(&registry, &report).await;
+        annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+        registry.shutdown_audit_batch().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_uses_initial_observations_across_real_pages() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        let (runtime, token, registry) = fixture().await;
+        let project = create(
+            &registry,
+            json!({"kind":"project","name":"initial replay observation"}),
+        )
+        .await;
+        let ids = annotation_encounter_seed(&runtime, &token, project, prs, 1000, 0).await;
+        annotation_replay_link(&runtime, &token, project, &ids[2..], false).await;
+        let before = annotation_encounter_rows(&runtime).await;
+        let (_dir, repo, logs, _path) = annotation_replay_remote();
+        annotation_replay_remote_rows(&logs, prs, &[(1, None), (2, None)]);
+        let first = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&first, prs, 2, true);
+        assert_eq!(first["existing_project_annotation_warning_count"], 2);
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            None,
+            &[],
+            &[(1, ids[0]), (2, ids[1])],
+        )
+        .await;
+        let first_receipt = annotation_encounter_receipt(&registry, &first).await;
+        let last = annotation_replay_time(999);
+        let mut rows = vec![(1, None), (2, Some(last.clone()))];
+        rows.extend((3..=1000).map(|number| (number, Some(annotation_replay_time(number - 2)))));
+        annotation_replay_remote_rows(&logs, prs, &rows);
+        let report = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&report, prs, 999, true);
+        assert_eq!(
+            report["existing_project_annotation_warning_count"], 2,
+            "the changed observation is fresh once, not an initial replay on page two"
+        );
+        assert_eq!(
+            annotation_encounter_warnings(&report),
+            vec![
+                annotation_encounter_missing(prs, 1, ids[0], project),
+                annotation_encounter_missing(prs, 2, ids[1], project)
+            ]
+        );
+        assert!(annotation_replay_exhaustions(&report).is_empty());
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            Some(&last),
+            &[(2, ids[1])],
+            &[(1, ids[0])],
+        )
+        .await;
+        annotation_replay_pages(
+            &logs,
+            &[
+                (prs, None, 1000),
+                (prs, None, 1000),
+                (prs, Some(&last), 1000),
+            ],
+        );
+        let receipt = annotation_encounter_receipt(&registry, &report).await;
+        annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+        registry.shutdown_audit_batch().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn existing_annotation_warning_details_are_report_wide_and_count_all_outcomes() {
     if crate::test_process::run_in_child() {
         return;
@@ -1010,6 +1422,7 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
                 ))
                 .collect::<Vec<_>>()
         );
+        assert!(annotation_replay_exhaustions(&report).is_empty());
         let acknowledgments = ids
             .iter()
             .enumerate()
@@ -1033,7 +1446,16 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
     let before = annotation_encounter_rows(&runtime).await;
     let (_dir, repo, logs, _path) = annotation_replay_remote();
     let at = Some(ANNOTATION_ENCOUNTER_TIME.to_owned());
+    for source in [true, false] {
+        annotation_replay_remote_rows(&logs, source, &[(1, at.clone())]);
+    }
     let params = json!({"source":repo.to_str().unwrap(),"project":project.to_string(),"include":["pull_requests","issues"],"max_items":2001});
+    let first = registry
+        .dispatch("git.digest", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["existing_project_annotation_warning_count"], 2);
+    let first_receipt = annotation_encounter_receipt(&registry, &first).await;
     for source in [true, false] {
         let mut rows = (1..=13)
             .map(|number| (number, at.clone()))
@@ -1046,15 +1468,15 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
         annotation_replay_remote_rows(&logs, source, &rows);
     }
     let denied = annotation_replay_deny_first_graph_read(&runtime);
-    let outcome = registry.dispatch("git.digest", params.clone()).await;
+    let outcome = registry.dispatch("git.digest", params).await;
     annotation_replay_clear_graph_fault(&runtime);
     assert_eq!(denied.load(Ordering::SeqCst), 1);
-    let report = outcome.expect("mixed fresh diagnostics preserve digest completion");
+    let report = outcome.expect("mixed fresh/replay diagnostics preserve digest completion");
     assert_eq!(report["prs_ingested"], 0);
     assert_eq!(report["issues_ingested"], 0);
     assert_eq!(report["commits_ingested"], 0);
-    assert_eq!(report["prs_skipped_existing"], 13);
-    assert_eq!(report["issues_skipped_existing"], 14);
+    assert_eq!(report["prs_skipped_existing"], 12);
+    assert_eq!(report["issues_skipped_existing"], 13);
     assert_eq!(report["done"], true);
     assert_eq!(report["history_exhausted"], true);
     assert_eq!(report["cursor_stalled"], false);
@@ -1075,6 +1497,7 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
         annotation_encounter_missing(false, number, issues[number as usize - 1], project)
     }));
     assert_eq!(&warnings[1..], expected);
+    assert!(annotation_replay_exhaustions(&report).is_empty());
     assert!(
         report["warnings"]
             .as_array()
@@ -1114,18 +1537,6 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
         )
         .await;
     }
-    let first_receipt = annotation_encounter_receipt(&registry, &report).await;
-    for source in [true, false] {
-        annotation_replay_remote_rows(&logs, source, &[]);
-    }
-    let zero = registry.dispatch("git.digest", params).await.unwrap();
-    assert_eq!(zero["existing_project_annotation_warning_count"], 0);
-    assert!(annotation_encounter_warnings(&zero).is_empty());
-    assert_eq!(zero["prs_skipped_existing"], 0);
-    assert_eq!(zero["issues_skipped_existing"], 0);
-    assert_eq!(zero["done"], true);
-    let zero_receipt = annotation_encounter_receipt(&registry, &zero).await;
-    annotation_replay_receipts_unchanged(&registry, &[first_receipt, zero_receipt]).await;
     annotation_replay_pages(
         &logs,
         &[
@@ -1135,6 +1546,8 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
             (false, Some(ANNOTATION_ENCOUNTER_TIME), 1000),
         ],
     );
+    let receipt = annotation_encounter_receipt(&registry, &report).await;
+    annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
     assert_eq!(annotation_encounter_rows(&runtime).await, before);
     registry.shutdown_audit_batch().await.unwrap();
 }
