@@ -197,7 +197,7 @@ impl Kernel {
         let payload = crate::CapPayload::new(
             target,
             parent.target(),
-            child_rights.clone(),
+            child_rights,
             Some(parent_id),
             epoch,
         );

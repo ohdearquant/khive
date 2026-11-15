@@ -37,14 +37,13 @@ pub enum TerminalScope {
 /// The wire (`snake_case`) names of every code in the closed set for
 /// protocol version 1, in ADR-137's "Wire error taxonomy" table order.
 ///
-/// The codec's decode-time error-scope check applies only to codes in this
-/// set: their terminal scopes are fixed by the table. A code outside the
-/// set fell back to [`WireErrorCode::Internal`] via `#[serde(other)]`; its
-/// true scope is unknown to this protocol version, and ADR-137 directs the
-/// client to treat it as `internal` rather than reject the frame. Code
-/// names are case-sensitive: a case-variant of a known code (`"Cancelled"`)
-/// is simply an unknown code string and takes the same documented fallback
-/// — the exemption is one rule, not a bypass of the closed set.
+/// The codec enforces the id/scope pairing when decoding an error frame.
+/// Under ADR-137 Amendment 1 Decision 5, an unknown code is accepted only
+/// with a non-empty operation id. It becomes request-terminal
+/// [`WireErrorCode::Internal`], retains its raw string for diagnostics, and
+/// cannot be re-encoded. An unknown code without an operation id is malformed
+/// and connection-terminal. Names are case-sensitive: `"Cancelled"` is an
+/// unknown spelling and follows the same rule.
 pub const WIRE_ERROR_CODES: &[&str] = &[
     "unsupported_version",
     "identity_rejected",

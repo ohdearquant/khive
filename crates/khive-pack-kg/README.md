@@ -119,7 +119,7 @@ even when `comm` and `kg` use different databases:
 request(ops='search(kind="message", query="handoff")')
 # Replace <message-uuid> with a full UUID returned by search.
 request(ops='get(id="<message-uuid>")')
-request(ops='brain.feedback(target_id="<message-uuid>", signal="useful")')
+request(ops='brain.feedback(id="<message-uuid>", signal="useful")')
 ```
 
 The normal Gate still authorizes each operation; by-ID resolution does not

@@ -1,15 +1,20 @@
 #[cfg(doc)]
 use super::contains_bounded_word;
+use super::credential_triggers::find_trigger_in_contexts;
+use super::false_positive_filters::{
+    has_normalized_hex_credential_span_overlapping, has_path_context_credential_label,
+};
 #[cfg(test)]
 use super::ENTROPY_TOKENIZATION_COUNT;
 use super::{
     after_last_sentence_boundary, assignment_credential_trigger, before_first_sentence_boundary,
-    bridge_fragment_chain, find_trigger, has_clause_credential_label_with_inline,
-    has_direct_repository_credential_label_with_inline, has_immediate_credential_label,
-    inline_credential_trigger, is_aws_resource_name, is_base64_content_hash,
-    is_bridge_fragment_shape, is_environment_name, is_git_revision_reference,
-    is_labeled_sha256_digest, is_latex_fragment_without_credential_run, is_latex_prose_macro,
-    is_plausible_file_path, is_prose_code_reference, is_pure_hex, is_repository_revision_reference,
+    bridge_fragment_chain, check_known_patterns, find_trigger,
+    has_clause_credential_label_with_inline, has_direct_repository_credential_label_with_inline,
+    has_immediate_credential_label, inline_credential_trigger, is_aws_resource_name,
+    is_base64_content_hash, is_bridge_fragment_shape, is_credential_token_label,
+    is_environment_name, is_git_revision_reference, is_labeled_sha256_digest,
+    is_latex_fragment_without_credential_run, is_latex_prose_macro, is_plausible_file_path,
+    is_prose_code_reference, is_pure_hex, is_repository_revision_reference,
     is_structured_identifier, is_uuid_canonical, is_vcs_marker_before_hex,
     normalized_hex_credential_span, shannon_entropy, strip_delimiters, value_candidates,
     wrapper_strip_repeated, ClauseValueKind,
@@ -108,13 +113,36 @@ struct JsonScalarContext {
 pub(super) struct EntropyScanContext<'a> {
     pub(super) tokens: Vec<(usize, &'a str)>,
     scalars: Vec<JsonScalarContext>,
+    path_references: Vec<bool>,
 }
 
 impl<'a> EntropyScanContext<'a> {
     pub(super) fn new(text: &'a str) -> Self {
+        let tokens = tokenize_entropy_tokens(text);
+        let scalars = json_scalar_contexts(text);
+        // Classify complete original tokens once, before a window or sentence
+        // clips their spelling. JSON retains its existing scalar attribution.
+        let mut clause_context = scalars.is_empty().then(|| text.to_owned());
+        let mut path_references = Vec::with_capacity(tokens.len());
+        for (index, &(offset, raw)) in tokens.iter().enumerate() {
+            let reference = clause_context.as_ref().is_some_and(|clause_context| {
+                is_path_reference_context(text, clause_context, &tokens, index)
+            });
+            path_references.push(reference);
+            if reference {
+                // Only the backward label-attribution view changes. Keep byte
+                // offsets and original sentence boundaries; later ordinary paths
+                // cannot inherit a label from an earlier ordinary path.
+                let placeholder = path_clause_placeholder(raw);
+                if let Some(clause_context) = clause_context.as_mut() {
+                    clause_context.replace_range(offset..offset + raw.len(), &placeholder);
+                }
+            }
+        }
         Self {
-            tokens: tokenize_entropy_tokens(text),
-            scalars: json_scalar_contexts(text),
+            tokens,
+            scalars,
+            path_references,
         }
     }
 
@@ -209,16 +237,161 @@ fn json_scalar_contexts(text: &str) -> Vec<JsonScalarContext> {
     scalars
 }
 
+/// Match the existing per-run credential checks without changing their order.
+fn credential_run_match(token: &str, hex_exempt: bool) -> Option<(&str, &'static str)> {
+    for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if run.len() < MIN_ENTROPY_LEN {
+            continue;
+        }
+        if !hex_exempt && is_pure_hex(run) && HEX_CREDENTIAL_LENGTHS.contains(&run.len()) {
+            return Some((run, "hex-credential-token"));
+        }
+        if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
+            return Some((token, "high-entropy-token"));
+        }
+    }
+    None
+}
+
+fn normalized_bridge_hex_span<'a>(
+    text: &'a str,
+    from: usize,
+    fragments: &[&str],
+) -> Option<&'a str> {
+    if fragments.len() < 2 {
+        return None;
+    }
+    let first = fragments[0];
+    let last = fragments[fragments.len() - 1];
+    let chain_start = first.as_ptr() as usize - text.as_ptr() as usize;
+    let chain_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+    let search_start = chain_start.max(from);
+    normalized_hex_credential_span(&text[search_start..chain_end])
+}
+
+/// Only an ordinary path reference loses authority over a different token.
+/// Credential-valued or credential-bearing paths keep their existing context.
+fn is_path_reference_context(
+    text: &str,
+    clause_context: &str,
+    tokens: &[(usize, &str)],
+    index: usize,
+) -> bool {
+    let (offset, raw) = tokens[index];
+    // Identifier-free punctuation cannot label a neighbor. Skip it before the
+    // clause walk so repeated absolute paths such as `/./` do not repeatedly
+    // trim their entire punctuation-only prefix. Underscores are identifiers.
+    if !raw
+        .bytes()
+        .any(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return false;
+    }
+    // Test the original spelling: stripping '=' would turn an assignment such
+    // as `docs/secret=` into a path. A recognized nonempty numeric location
+    // suffix is not a credential assignment, including `docs/secret:120`.
+    if !is_plausible_file_path(raw) {
+        return false;
+    }
+    let inline_label =
+        wrapper_strip_repeated(raw).ends_with(':') && inline_credential_trigger(raw).is_some();
+    if has_path_context_credential_label(clause_context, offset, inline_label) {
+        return false;
+    }
+    let token = strip_delimiters(raw);
+    if check_known_patterns(raw).is_some()
+        || credential_run_match(token, false).is_some()
+        || normalized_hex_credential_span(token).is_some()
+    {
+        return false;
+    }
+    // A path contains '/', so it cannot be an all-alphanumeric opaque bridge.
+    // Hex reconstruction can still span its final run and adjacent fragments.
+    // The path must contribute material: a complete neighboring digest alone
+    // does not make this path credential-bearing.
+    let fragments = bridge_fragment_chain(tokens, text, index);
+    if fragments.len() < 2 {
+        return true;
+    }
+    let first = fragments[0];
+    let last = fragments[fragments.len() - 1];
+    let chain_start = first.as_ptr() as usize - text.as_ptr() as usize;
+    let chain_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+    !has_normalized_hex_credential_span_overlapping(
+        &text[chain_start..chain_end],
+        offset.saturating_sub(chain_start),
+        (offset + raw.len()).min(chain_end) - chain_start,
+    )
+}
+
+/// Neutralize credential-label identifiers only in a proven reference's
+/// backward-clause view. Preserve every original identifier boundary and all
+/// other words/punctuation, so the existing clause budget still makes progress.
+/// The source and candidate/reconstruction slices remain the original text.
+fn path_clause_placeholder(raw: &str) -> String {
+    let mut placeholder = String::with_capacity(raw.len());
+    for part in raw.split_inclusive(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+        let label_end = part
+            .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .unwrap_or(part.len());
+        let label = &part[..label_end];
+        let credential_label = !label.is_empty()
+            && (find_trigger(label, false).is_some()
+                || inline_credential_trigger(label).is_some()
+                || is_credential_token_label(&label.to_ascii_lowercase()));
+        if credential_label {
+            placeholder.extend(label.chars().map(|ch| if ch == '_' { '_' } else { 'x' }));
+        } else {
+            placeholder.push_str(label);
+        }
+        placeholder.push_str(&part[label_end..]);
+    }
+    placeholder
+}
+
+fn find_surrounding_trigger(
+    text: &str,
+    context: &EntropyScanContext<'_>,
+    window: &str,
+    credential_label_only: bool,
+) -> Option<&'static str> {
+    if window.is_empty() || !context.scalars.is_empty() {
+        return find_trigger(window, credential_label_only);
+    }
+    let start = window.as_ptr() as usize - text.as_ptr() as usize;
+    let end = start + window.len();
+    let first = context
+        .tokens
+        .partition_point(|&(offset, raw)| offset + raw.len() <= start);
+    let mut retained = Vec::new();
+    let mut cursor = start;
+    for (index, &(offset, raw)) in context.tokens.iter().enumerate().skip(first) {
+        if offset >= end {
+            break;
+        }
+        if context.path_references[index] {
+            retained.push(&text[cursor..offset.max(start)]);
+            cursor = (offset + raw.len()).min(end);
+        }
+    }
+    if retained.is_empty() {
+        return find_trigger(window, credential_label_only);
+    }
+    retained.push(&text[cursor..end]);
+    find_trigger_in_contexts(&retained, credential_label_only)
+}
+
 // A bare Git-length value uses line-local context. The preceding label line
 // remains authoritative when it explicitly ends in an assignment delimiter.
 // Bridge anchors retain full-window context so masking cannot leave a fragment behind.
 fn entropy_trigger(
     text: &str,
-    tokens: &[(usize, &str)],
+    context: &EntropyScanContext<'_>,
     index: usize,
     credential_label_only: bool,
     candidate: EntropyCandidate<'_>,
 ) -> Option<&'static str> {
+    let tokens = &context.tokens;
     let (mut offset, raw) = tokens[index];
     let mut token_end = offset + raw.len();
     if let Some(scalar) = candidate.scalar {
@@ -253,7 +426,7 @@ fn entropy_trigger(
         let previous_start = previous.rfind(['\r', '\n']).map_or(0, |i| i + 1);
         let previous = previous[previous_start..].trim_end();
         let label = if previous.ends_with([':', '=']) {
-            find_trigger(previous, credential_label_only)
+            find_surrounding_trigger(text, context, previous, credential_label_only)
         } else {
             None
         };
@@ -269,12 +442,16 @@ fn entropy_trigger(
     // unrelated clause in the preceding sentence is not context for this token
     // (issue #2056). The preceding-label fallback is exempt because that line
     // was already required to end in an assignment delimiter.
-    find_trigger(
+    find_surrounding_trigger(
+        text,
+        context,
         after_last_sentence_boundary(&text[start..offset]),
         credential_label_only,
     )
     .or_else(|| {
-        find_trigger(
+        find_surrounding_trigger(
+            text,
+            context,
             before_first_sentence_boundary(&text[token_end..end]),
             credential_label_only,
         )
@@ -454,7 +631,7 @@ pub(super) fn check_entropy_heuristic<'a>(
                 continue;
             }
             if let Some(found) =
-                check_entropy_candidate(text, from, tokens, idx, context_offset, candidate)
+                check_entropy_candidate(text, from, context, idx, context_offset, candidate)
             {
                 if best
                     .as_ref()
@@ -474,11 +651,12 @@ pub(super) fn check_entropy_heuristic<'a>(
 fn check_entropy_candidate<'a>(
     text: &'a str,
     from: usize,
-    tokens: &[(usize, &'a str)],
+    context: &EntropyScanContext<'a>,
     idx: usize,
     context_offset: usize,
     candidate: EntropyCandidate<'a>,
 ) -> Option<(&'a str, &'static str, Option<&'static str>)> {
+    let tokens = &context.tokens;
     let raw_token = candidate.value;
     // Strip common delimiters that wrap the actual value.
     let original_offset = raw_token.as_ptr() as usize - text.as_ptr() as usize;
@@ -505,9 +683,9 @@ fn check_entropy_candidate<'a>(
     // UUIDs require credential-label context rather than a generic mention
     // of `token`; base64 content-hash exemptions remain trigger-sensitive.
     // VCS revisions and file paths use narrower syntactic context below.
-    let trigger = entropy_trigger(text, tokens, idx, false, candidate);
+    let trigger = entropy_trigger(text, context, idx, false, candidate);
     let near_trigger = trigger.is_some();
-    let uuid_trigger = entropy_trigger(text, tokens, idx, true, candidate);
+    let uuid_trigger = entropy_trigger(text, context, idx, true, candidate);
     let uuid_near_credential_label = uuid_trigger.is_some();
 
     // Step 1 (see doc: per-token flagging sequence). UUIDs fall through only
@@ -603,20 +781,10 @@ fn check_entropy_candidate<'a>(
     if near_trigger {
         // vcs_reference_exempt also covers single-token forms below (`rev:<hex>`);
         // it does not cover fragment reconstruction.
-        for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
-            if run.len() < MIN_ENTROPY_LEN {
-                continue;
-            }
-            if !vcs_reference_exempt
-                && !labeled_sha256_digest
-                && is_pure_hex(run)
-                && HEX_CREDENTIAL_LENGTHS.contains(&run.len())
-            {
-                return Some((run, "hex-credential-token", trigger));
-            }
-            if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
-                return Some((token, "high-entropy-token", trigger));
-            }
+        if let Some((value, detector)) =
+            credential_run_match(token, vcs_reference_exempt || labeled_sha256_digest)
+        {
+            return Some((value, detector, trigger));
         }
 
         // Step 5 (#1062): concatenate consecutive pure-hex runs (dropping
@@ -640,14 +808,7 @@ fn check_entropy_candidate<'a>(
         {
             let fragments = entropy_bridge_fragments(tokens, text, idx, candidate);
             if fragments.len() > 1 {
-                let first = fragments[0];
-                let last = fragments[fragments.len() - 1];
-                let chain_start = first.as_ptr() as usize - text.as_ptr() as usize;
-                let chain_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
-                let search_start = chain_start.max(from);
-                if let Some(candidate) =
-                    normalized_hex_credential_span(&text[search_start..chain_end])
-                {
+                if let Some(candidate) = normalized_bridge_hex_span(text, from, &fragments) {
                     return Some((candidate, "hex-credential-token", trigger));
                 }
                 let concatenated: String = fragments.concat();
@@ -710,3 +871,6 @@ fn check_entropy_candidate<'a>(
     }
     None
 }
+
+#[cfg(test)]
+mod issue_6100_tests;

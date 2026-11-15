@@ -149,6 +149,7 @@ impl Fixture {
 
 fn identity(process_ref: Option<&str>) -> RequestIdentity {
     RequestIdentity {
+        owned_namespaces: Vec::new(),
         namespace: CALLER_NS.into(),
         actor_id: Some(CALLER.into()),
         visible_namespaces: vec!["caller-visible".into()],

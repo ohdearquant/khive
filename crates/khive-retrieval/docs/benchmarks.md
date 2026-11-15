@@ -8,10 +8,11 @@
 | `benches/fusion_bench.rs` | `fuse/weighted`      | input sizes 50 / 100 / 250 / 500                   | `fuse_search_results` with weighted strategy   |
 | `benches/fusion_bench.rs` | `fuse/union`         | input sizes 50 / 100 / 250 / 500                   | `fuse_search_results` with union strategy      |
 | `benches/fusion_bench.rs` | `fuse/three_sources` | input sizes 50 / 200 / 500                         | three-source RRF fusion                        |
-| `benches/fusion_bench.rs` | `hybrid_config`      | new / builder_rrf / builder_weighted               | `HybridConfig` construction and builder chains |
-| `benches/fusion_bench.rs` | `config/search`      | default / preset_vector_only / preset_keyword_only | `SearchConfig` construction                    |
-| `benches/fusion_bench.rs` | `policy`             | by_policy / by_predicate                           | policy filtering over 1000-item result sets    |
-| `benches/fusion_bench.rs` | `eval`               | compute_all_100 / compute_all_1000                 | retrieval eval metric computation              |
+| `benches/fusion_bench.rs` | `hybrid_config`      | new / builder_rrf / builder_weighted / normalized_weights | `HybridConfig` construction, builder chains and weight normalization |
+| `benches/fusion_bench.rs` | `search_config`      | default / vector_only / keyword_only / hybrid_balanced / candidate_pool_size | `SearchConfig` construction and candidate-pool lookup |
+| `benches/fusion_bench.rs` | `policy_filter`      | filter_by_policy_public / filter_by_policy_mixed / filter_by_predicate | policy/predicate filtering over 50 / 200 / 500 results |
+| `benches/fusion_bench.rs` | `eval_metrics`       | compute_all / recall_at_k_5 / ndcg_at_k_10 / mrr | eval metrics over 10 / 50 / 100 / 500 labeled results |
+| `benches/fusion_bench.rs` | `label_scoring`      | gain_all_variants / is_relevant_all_variants | `RetrievalLabel` gain/relevance across five variants |
 
 ## Run command
 
@@ -114,8 +115,13 @@ indexes, materialize results or open databases. Selected correctness runs still 
 their full workload and checks; the limits-only scene needs no generated fixture.
 Selected scenes reuse their target's initialized inputs. Initialization remains outside
 recorded operation intervals. Profiling (`--bench --profile-time`, including the `=value`
-form) preserves eager initialization before each group, including for unmatched filters,
-so fixture construction stays outside the external profiler's callback. Criterion rejects
+form) preserves eager initialization of the shared runtimes and generated corpora before
+each group, including for unmatched filters, so only that construction stays outside the
+external profiler's callback. Per-iteration fixtures still run inside it:
+`retrieval_persistence` builds a fresh store in every iteration (and saves the prior
+indexes for the replace and shadow scenes), and `retrieval_ann_registry` builds and seeds
+a memory backend in every iteration. That setup is outside the recorded interval but is
+sampled by the profiler. Criterion rejects
 `--list` combined with `--profile-time`; options after `--` are literal filter text.
 
 - HNSW uses 500 vectors of 384 dimensions, an LCG corpus seed of 42 and HNSW level seed 42,

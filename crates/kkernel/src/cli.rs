@@ -82,7 +82,7 @@ enum Command {
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
-    /// Schema migration lifecycle: migrate and check.
+    /// Schema migration lifecycle and store maintenance: migrate, check, events-prune, import-notes.
     #[command(subcommand)]
     Db(DbCommand),
 
@@ -104,6 +104,9 @@ enum Command {
 
     /// Promote registered legacy entity subtypes and remove redundant kind echoes.
     EntityTypeBackfill(crate::entity_type_backfill::EntityTypeBackfillArgs),
+
+    /// Preview or apply source-namespace repair for live memory-to-memory edges.
+    MemoryEdgeNamespaceMove(crate::memory_edge_namespace_move::MemoryEdgeNamespaceMoveArgs),
 
     /// Execute a verb DSL expression (same syntax as MCP `request` tool).
     Exec(exec::ExecArgs),
@@ -293,6 +296,12 @@ enum DbCommand {
 
     /// Report per-backend schema state without applying changes.
     Check(DbCheckArgs),
+
+    /// Prune expendable polling-dispatch audit rows from an events store (ADR-212 §4). Dry run unless --apply.
+    EventsPrune(crate::events_prune::EventsPruneArgs),
+
+    /// Restore exported note rows (JSONL) into a database file with their original ids and timestamps.
+    ImportNotes(crate::import_notes::ImportNotesArgs),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -418,15 +427,118 @@ enum BackendCommand {
 /// reach the daemon however it is spawned. Real environment variables win over
 /// the file (dotenvy does not override what is already set), and a missing file
 /// is not an error.
+///
+/// The file is skipped entirely for an agent process (`KHIVE_ACTOR` or
+/// `KHIVE_NAMESPACE` in the process environment, or any `--actor` or
+/// `--namespace` argument, including one after `--` such as a supervisor's
+/// daemon arguments, names an `agent:` actor) and when
+/// `KHIVE_LOAD_DOTENV` is off or unrecognized. This runs before argument
+/// parsing and config discovery, so an agent identity that arrives only
+/// through a config file cannot decide it; such launches set
+/// `KHIVE_LOAD_DOTENV=0`.
 fn load_khive_dotenv() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let path = std::path::Path::new(&home).join(".khive/.env");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let env_actor = std::env::var_os("KHIVE_ACTOR");
+    let env_namespace = std::env::var_os("KHIVE_NAMESPACE");
+    let argv_actors = argv_flag_values(&args, "--actor");
+    let argv_namespaces = argv_flag_values(&args, "--namespace");
+    let mut identities = vec![
+        ("KHIVE_ACTOR", env_actor.as_deref()),
+        ("KHIVE_NAMESPACE", env_namespace.as_deref()),
+    ];
+    identities.extend(argv_actors.iter().map(|v| ("--actor", Some(v.as_os_str()))));
+    identities.extend(
+        argv_namespaces
+            .iter()
+            .map(|v| ("--namespace", Some(v.as_os_str()))),
+    );
+    load_khive_dotenv_from(
+        std::path::Path::new(&home),
+        &identities,
+        std::env::var_os("KHIVE_LOAD_DOTENV").as_deref(),
+    );
+}
+
+/// Every `FLAG VALUE` or `FLAG=VALUE` value in `args`, including those after
+/// `--`, where a supervisor receives the daemon's own arguments. A `FLAG=`
+/// argument that is not valid UTF-8 is returned whole so it is refused as
+/// unreadable rather than ignored.
+fn argv_flag_values(args: &[std::ffi::OsString], flag: &str) -> Vec<std::ffi::OsString> {
+    let prefix = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            values.extend(args.next().cloned());
+        } else if let Some(text) = arg.to_str() {
+            if let Some(value) = text.strip_prefix(&prefix) {
+                values.push(value.into());
+            }
+        } else if arg.to_string_lossy().starts_with(&prefix) {
+            values.push(arg.clone());
+        }
+    }
+    values
+}
+
+const AGENT_ACTOR_PREFIX: &str = "agent:";
+
+/// `identities` pairs each place an actor can be named with its value, if any.
+fn load_khive_dotenv_from(
+    home: &std::path::Path,
+    identities: &[(&str, Option<&std::ffi::OsStr>)],
+    switch: Option<&std::ffi::OsStr>,
+) {
+    let path = home.join(".khive/.env");
+    let reason = identities
+        .iter()
+        .find_map(|(source, actor)| khive_dotenv_actor_skip(source, (*actor)?))
+        .or_else(|| khive_dotenv_switch_skip(switch?));
+    if let Some(reason) = reason {
+        if path.exists() {
+            eprintln!("kkernel: not loading {}: {reason}", path.display());
+        }
+        return;
+    }
     match dotenvy::from_path(&path) {
         Ok(()) => {}
         Err(e) if e.not_found() => {}
         Err(e) => eprintln!("warning: failed to load {}: {e}", path.display()),
+    }
+}
+
+/// Why an actor keeps the per-user dotenv file from loading. A value that is
+/// not valid UTF-8 cannot be ruled out as an agent, so it skips the file.
+fn khive_dotenv_actor_skip(source: &str, actor: &std::ffi::OsStr) -> Option<String> {
+    match actor.to_str() {
+        None => Some(format!("{source} is not valid UTF-8")),
+        Some(actor)
+            if actor
+                .trim_start()
+                .get(..AGENT_ACTOR_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AGENT_ACTOR_PREFIX)) =>
+        {
+            Some(format!("{source} {} is an agent actor", actor.trim()))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Why `KHIVE_LOAD_DOTENV` keeps the file from loading. An empty value counts
+/// as unset; an unrecognized value skips the file.
+fn khive_dotenv_switch_skip(switch: &std::ffi::OsStr) -> Option<String> {
+    match switch.to_str().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "" | "1" | "true" | "yes" | "on") => None,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => {
+            Some("KHIVE_LOAD_DOTENV is off".to_string())
+        }
+        _ => Some(format!(
+            "KHIVE_LOAD_DOTENV has unrecognized value {:?}; expected 1, true, yes, on, 0, false, no or off",
+            switch.to_string_lossy()
+        )),
     }
 }
 
@@ -467,6 +579,9 @@ pub async fn cli_main() -> Result<()> {
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::EntityTypeBackfill(args) => {
             crate::entity_type_backfill::run_entity_type_backfill(args).await
+        }
+        Command::MemoryEdgeNamespaceMove(args) => {
+            crate::memory_edge_namespace_move::run_memory_edge_namespace_move(args).await
         }
         Command::Exec(e) => {
             let result = exec::run_exec(e).await;
@@ -541,183 +656,9 @@ pub async fn cli_main() -> Result<()> {
             }
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
-            // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
-            //
-            // Resolve the tier-3 discovery anchor with the SAME
-            // `config_discovery_db_anchor` semantics `resolve_runtime_config`
-            // below uses (explicit `--db`/`KHIVE_DB` -> that path; unset ->
-            // `None`, falling through to cwd-anchored discovery) so this early
-            // multi-backend classification sees the identical config file the
-            // per-request `config_id` path resolves further down (#689: using
-            // `resolve_db_anchor`'s materialized `$HOME/.khive/khive.db`
-            // default here anchored classification to the home directory
-            // instead of the project, silently skipping a project-local
-            // `.khive/config.toml`).
-            let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
-            // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
-            // malformed file OR a missing one — must fail loud: silently
-            // defaulting would boot against a config the operator did not
-            // select (ADR-035). The loader itself enforces the explicit tier
-            // (`load_with_home_fallback_and_source` returns
-            // `ConfigError::ExplicitConfigMissing` for a missing explicit
-            // path), so every entry point inherits the refusal; the
-            // automatic-discovery tiers keep the historical tolerant
-            // default: the CLI-level topology check is advisory, and a
-            // malformed discovered file is still reported by the builder's
-            // own load further down.
-            let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
-                a.config.as_deref(),
-                db_path_hint.as_deref(),
-            ) {
-                Ok(loaded) => loaded,
-                Err(load_error) => {
-                    if a.config.is_some() {
-                        return Err(load_error)
-                            .context("failed to load the explicitly selected config file");
-                    }
-                    None
-                }
-            };
-            let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
-            let mut khive_cfg = loaded_config
-                .as_ref()
-                .map(|(config, _)| config.clone())
-                .unwrap_or_default();
-
-            if !khive_cfg.backends.is_empty() {
-                khive_mcp::serve::reject_conflicting_db_override_with_source(
-                    a.db.as_deref(),
-                    &khive_cfg.backends,
-                    config_source,
-                )?;
-            }
-
-            if khive_cfg.backends.len() <= 1 {
-                // Single-backend: zero-change path — no coordinator.
-                khive_mcp::serve::run(a, &transport_registry).await
-            } else {
-                // Multi-backend: build registry, attach the SubstrateCoordinator,
-                // and finish server assembly through the shared #603 constructor
-                // (`build_multi_backend_server_with_coordinator`) — this branch
-                // contains no server-assembly logic of its own beyond building
-                // the coordinator's BackendRegistry and attaching it.
-                let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                let (base_cfg, mut db_anchor) =
-                    khive_mcp::serve::resolve_runtime_config_with_db_anchor(
-                        khive_mcp::serve::RuntimeConfigInputs {
-                            db: a.db.as_deref(),
-                            config: a.config.as_deref(),
-                            namespace: cli_ns,
-                            namespace_explicit: cli_ns_explicit,
-                            actor_explicit: cli_ns_explicit,
-                            no_embed: a.no_embed,
-                            packs: if a.pack.is_empty() {
-                                None
-                            } else {
-                                Some(a.pack.clone())
-                            },
-                            brain_profile: a.brain_profile.clone(),
-                        },
-                    )?;
-                // ADR-170: this arm is a resident daemon host when `--daemon`
-                // is set — it supervises an events daemon at the derived
-                // socket (`start_daemon_components_if_daemon`), so upgrade
-                // the resolved event plane from direct mode to forwarding.
-                let mut base_cfg = {
-                    let mut base_cfg = base_cfg;
-                    if a.daemon {
-                        khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
-                    }
-                    base_cfg
-                };
-
-                let max_readers =
-                    khive_mcp::serve::mcp_max_readers(&a, &base_cfg, &khive_cfg.backends, None);
-
-                #[cfg(unix)]
-                let store_plan = if a.daemon {
-                    Some(khive_mcp::serve::prepare_preflighted_daemon_store_plan(
-                        &mut base_cfg,
-                        &mut db_anchor,
-                        &mut khive_cfg.backends,
-                        a.db.as_deref() == Some(":memory:"),
-                    )?)
-                } else {
-                    None
-                };
-
-                // #667: acquire the boot/recovery lock before building the
-                // coordinator server — that construction runs migrations and
-                // applies pack schema plans (FTS DDL included) — and hold it
-                // through `serve_server`'s daemon bind+pid-write, so a second
-                // concurrently-booting process cannot run schema DDL against
-                // the same database file at the same time. In daemon mode,
-                // failing to acquire the lock here must abort before that
-                // unguarded construction runs, rather than silently
-                // proceeding with `boot_guard = None`.
-                khive_mcp::serve::mark_mcp_host_role(&a);
-                #[cfg(unix)]
-                let boot_guard = if a.daemon {
-                    Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
-                } else {
-                    khive_runtime::daemon::acquire_recovery_lock()
-                };
-                // Claim every physical SQLite backend before the coordinator
-                // opens stores. The binding remains live through serve_server
-                // so a daemon under another HOME cannot serve an overlapping
-                // backend set while this daemon owns it (#3069).
-                #[cfg(unix)]
-                if a.daemon {
-                    khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
-                }
-                #[cfg(unix)]
-                let store_guards = if let Some(plan) = store_plan {
-                    let mut guards =
-                        khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
-                    plan.assert_aliases_unchanged()?;
-                    khive_runtime::daemon::bind_daemon_store_files(
-                        &mut guards,
-                        &plan.read_only_paths,
-                    )?;
-                    // Check the binding now; each pool also verifies the held
-                    // file identity before identity initialization and WAL setup.
-                    khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
-                    Some(guards)
-                } else {
-                    None
-                };
-                #[cfg(not(unix))]
-                let boot_guard: Option<std::fs::File> = None;
-
-                #[cfg(unix)]
-                let daemon_claims = store_guards.as_deref();
-                #[cfg(not(unix))]
-                let daemon_claims = None;
-                let (server, schedule_rt) =
-                    build_multi_backend_server_with_coordinator_and_pool_size(
-                        base_cfg,
-                        &khive_cfg,
-                        a.db.as_deref(),
-                        db_anchor.as_deref(),
-                        max_readers,
-                        daemon_claims,
-                    )
-                    .await?;
-                #[cfg(unix)]
-                if let Some(guards) = store_guards.as_deref() {
-                    khive_runtime::daemon::assert_daemon_store_identities(guards)?;
-                }
-
-                khive_mcp::serve::serve_server(
-                    server,
-                    &a,
-                    &transport_registry,
-                    boot_guard,
-                    schedule_rt,
-                )
-                .await
+            match prepare_multi_backend_mcp_command(&a).await? {
+                Some(host) => host.serve(&a, &transport_registry).await,
+                None => khive_mcp::serve::run(a, &transport_registry).await,
             }
         }
         Command::Backend(b) => cmd_backend(b),
@@ -781,6 +722,211 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
     }
 }
 
+// Fields drop in this order before serving: runtimes, store claims, then boot lock.
+struct PreparedMultiBackendMcpHost {
+    schedule_rt: Option<KhiveRuntime>,
+    server: khive_mcp::server::KhiveMcpServer,
+    #[cfg(unix)]
+    store_guards: Option<Vec<khive_runtime::daemon::DaemonStoreGuard>>,
+    boot_guard: Option<std::fs::File>,
+}
+
+impl PreparedMultiBackendMcpHost {
+    async fn serve(
+        self,
+        args: &khive_mcp::args::Args,
+        registry: &khive_mcp::transport::TransportRegistry,
+    ) -> Result<()> {
+        let result = {
+            let serving = khive_mcp::serve::serve_server(
+                self.server,
+                args,
+                registry,
+                self.boot_guard,
+                self.schedule_rt,
+            );
+            serving.await
+        };
+        #[cfg(unix)]
+        drop(self.store_guards);
+        result
+    }
+}
+
+async fn prepare_multi_backend_mcp_command(
+    a: &khive_mcp::args::Args,
+) -> Result<Option<PreparedMultiBackendMcpHost>> {
+    // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
+    //
+    // Resolve the tier-3 discovery anchor with the SAME
+    // `config_discovery_db_anchor` semantics `resolve_runtime_config`
+    // below uses (explicit `--db`/`KHIVE_DB` -> that path; unset ->
+    // `None`, falling through to cwd-anchored discovery) so this early
+    // multi-backend classification sees the identical config file the
+    // per-request `config_id` path resolves further down (#689: using
+    // `resolve_db_anchor`'s materialized `$HOME/.khive/khive.db`
+    // default here anchored classification to the home directory
+    // instead of the project, silently skipping a project-local
+    // `.khive/config.toml`).
+    let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
+    // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
+    // malformed file OR a missing one — must fail loud: silently
+    // defaulting would boot against a config the operator did not
+    // select (ADR-035). The loader itself enforces the explicit tier
+    // (`load_with_home_fallback_and_source` returns
+    // `ConfigError::ExplicitConfigMissing` for a missing explicit
+    // path), so every entry point inherits the refusal; the
+    // automatic-discovery tiers keep the historical tolerant
+    // default: the CLI-level topology check is advisory, and a
+    // malformed discovered file is still reported by the builder's
+    // own load further down.
+    let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
+        a.config.as_deref(),
+        db_path_hint.as_deref(),
+    ) {
+        Ok(loaded) => loaded,
+        Err(load_error) => {
+            if a.config.is_some() {
+                return Err(load_error)
+                    .context("failed to load the explicitly selected config file");
+            }
+            None
+        }
+    };
+    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+    let mut khive_cfg = loaded_config
+        .as_ref()
+        .map(|(config, _)| config.clone())
+        .unwrap_or_default();
+
+    if !khive_cfg.backends.is_empty() {
+        khive_mcp::serve::reject_conflicting_db_override_with_source(
+            a.db.as_deref(),
+            &khive_cfg.backends,
+            config_source,
+        )?;
+    }
+
+    if khive_cfg.backends.len() <= 1 {
+        return Ok(None);
+    }
+    // Multi-backend: build registry, attach the SubstrateCoordinator,
+    // and finish server assembly through the shared #603 constructor
+    // (`build_multi_backend_server_with_coordinator`) — this branch
+    // contains no server-assembly logic of its own beyond building
+    // the coordinator's BackendRegistry and attaching it.
+    let (cli_ns_explicit, cli_ns) =
+        khive_mcp::args::resolve_cli_namespace(a).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (base_cfg, mut db_anchor) = khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+        khive_mcp::serve::RuntimeConfigInputs {
+            db: a.db.as_deref(),
+            config: a.config.as_deref(),
+            namespace: cli_ns,
+            namespace_explicit: cli_ns_explicit,
+            actor_explicit: cli_ns_explicit,
+            no_embed: a.no_embed,
+            packs: if a.pack.is_empty() {
+                None
+            } else {
+                Some(a.pack.clone())
+            },
+            brain_profile: a.brain_profile.clone(),
+        },
+    )?;
+    // ADR-170: this arm is a resident daemon host when `--daemon`
+    // is set — it supervises an events daemon at the derived
+    // socket (`start_daemon_components_if_daemon`), so upgrade
+    // the resolved event plane from direct mode to forwarding.
+    let mut base_cfg = {
+        let mut base_cfg = base_cfg;
+        if a.daemon {
+            khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
+        }
+        base_cfg
+    };
+
+    let max_readers = khive_mcp::serve::mcp_max_readers(a, &base_cfg, &khive_cfg.backends, None);
+
+    #[cfg(unix)]
+    let store_plan = if a.daemon {
+        Some(khive_mcp::serve::prepare_preflighted_daemon_store_plan(
+            &mut base_cfg,
+            &mut db_anchor,
+            &mut khive_cfg.backends,
+            a.db.as_deref() == Some(":memory:"),
+        )?)
+    } else {
+        None
+    };
+
+    // #667: acquire the boot/recovery lock before building the
+    // coordinator server — that construction runs migrations and
+    // applies pack schema plans (FTS DDL included) — and hold it
+    // through `serve_server`'s daemon bind+pid-write, so a second
+    // concurrently-booting process cannot run schema DDL against
+    // the same database file at the same time. In daemon mode,
+    // failing to acquire the lock here must abort before that
+    // unguarded construction runs, rather than silently
+    // proceeding with `boot_guard = None`.
+    khive_mcp::serve::mark_mcp_host_role(a);
+    #[cfg(unix)]
+    let boot_guard = if a.daemon {
+        Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
+    } else {
+        khive_runtime::daemon::acquire_recovery_lock()
+    };
+    // Claim every physical SQLite backend before the coordinator
+    // opens stores. The binding remains live through serve_server
+    // so a daemon under another HOME cannot serve an overlapping
+    // backend set while this daemon owns it (#3069).
+    #[cfg(unix)]
+    if a.daemon {
+        khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
+    }
+    #[cfg(unix)]
+    let store_guards = if let Some(plan) = store_plan {
+        let mut guards = khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
+        plan.assert_aliases_unchanged()?;
+        khive_runtime::daemon::bind_daemon_store_files(&mut guards, &plan.read_only_paths)?;
+        // Check the binding now; each pool also verifies the held
+        // file identity before identity initialization and WAL setup.
+        khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
+        Some(guards)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let boot_guard: Option<std::fs::File> = None;
+
+    #[cfg(unix)]
+    let daemon_claims = store_guards.as_deref();
+    #[cfg(not(unix))]
+    let daemon_claims = None;
+    let (server, schedule_rt) = build_multi_backend_server_with_coordinator_and_pool_size(
+        base_cfg,
+        &khive_cfg,
+        a.db.as_deref(),
+        db_anchor.as_deref(),
+        max_readers,
+        daemon_claims,
+        a.catalog_verbosity,
+    )
+    .await?;
+    #[cfg(unix)]
+    if let Some(guards) = store_guards.as_deref() {
+        khive_runtime::daemon::assert_daemon_store_identities(guards)?;
+    }
+
+    Ok(Some(PreparedMultiBackendMcpHost {
+        schedule_rt,
+        server,
+        #[cfg(unix)]
+        store_guards,
+        boot_guard,
+    }))
+}
+
 /// Build the coordinator-attached multi-backend server for `kkernel mcp` (the
 /// `Command::Mcp` branch, when `[[backends]]` declares more than one backend).
 /// See `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`
@@ -819,6 +965,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         db_anchor,
         None,
         None,
+        khive_mcp::args::CatalogVerbosity::Full,
     )
     .await
 }
@@ -830,6 +977,7 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
     db_anchor: Option<&std::path::Path>,
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
+    catalog_verbosity: khive_mcp::args::CatalogVerbosity,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
     let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
         base_cfg,
@@ -850,10 +998,11 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
 
     let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
-    let server = khive_mcp::serve::build_server_from_multi_backend_registry(
+    let server = khive_mcp::serve::build_server_from_multi_backend_registry_with_catalog_verbosity(
         multi,
         khive_cfg,
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
+        catalog_verbosity,
     );
     Ok((server, schedule_rt))
 }
@@ -908,6 +1057,8 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate(args) => cmd_db_migrate(args).await,
         DbCommand::Check(args) => cmd_db_check(args).await,
+        DbCommand::EventsPrune(args) => crate::events_prune::run(args).await,
+        DbCommand::ImportNotes(args) => crate::import_notes::run(args).await,
     }
 }
 
@@ -1260,16 +1411,20 @@ impl<W: std::io::Write> std::io::Write for BestEffortWriter<W> {
 fn init_tracing(level: &str) {
     // Tracing goes to stderr — stdout is reserved for JSON / MCP results.
     //
-    // Silence the benign `lattice_inference` tokenizer warning ("tokenizer and
-    // model vocab sizes differ" — the multilingual paraphrase model carries a
-    // handful of extra reserved tokens) while honoring the caller's level for
-    // everything else.
+    // Silence the benign BERT tokenizer warning ("tokenizer and model vocab
+    // sizes differ" — the multilingual paraphrase model carries a handful of
+    // extra reserved tokens), logged by `lattice_model_bert` (by
+    // `lattice_inference` before lattice 0.15), and the `lattice_tokenizer`
+    // truncation warnings (WordPiece, SentencePiece and BPE: an input longer
+    // than the model's max_seq_len is cut to fit; khive reports that itself per
+    // write through `EmbeddingTruncationReport`) while honoring the caller's
+    // level for everything else.
     //
     // Force-enable `khive.boot` at INFO: the resolved-database disclosure
     // (issue #1586) is emitted on that target at startup, and the global
     // default level is `warn` — without this pin the disclosure would be
     // silently filtered for every operator who never sets KHIVE_LOG.
-    let filter = format!("{level},khive.boot=info,khive.import.schema=warn,khive.config.schema=warn,lattice_inference=error");
+    let filter = format!("{level},khive.boot=info,khive.import.schema=warn,khive.config.schema=warn,lattice_inference=error,lattice_model_bert=error,lattice_tokenizer=error");
     tracing_subscriber::fmt()
         .with_writer(|| BestEffortWriter(std::io::stderr()))
         .with_env_filter(filter)
@@ -1400,6 +1555,10 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
 mod events_wal_policy_tests;
 
 #[cfg(test)]
+#[path = "cli_catalog_verbosity_tests.rs"]
+mod catalog_verbosity_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn events_daemon_disk_policy_round_trips_and_rejects_partial_or_invalid_input() {
@@ -1455,6 +1614,245 @@ mod tests {
     use clap::CommandFactory;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    fn dotenv_home_with(var: &str) -> TempDir {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".khive")).unwrap();
+        std::fs::write(
+            home.path().join(".khive/.env"),
+            format!("{var}=from-file\n"),
+        )
+        .unwrap();
+        std::env::remove_var(var);
+        home
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn an_agent_actor_process_does_not_load_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let var = "KHIVE_DOTENV_PROBE_AGENT_SKIP";
+        let home = dotenv_home_with(var);
+        for actor in ["agent:example", " Agent:Example "] {
+            for source in ["KHIVE_ACTOR", "KHIVE_NAMESPACE", "--actor", "--namespace"] {
+                load_khive_dotenv_from(
+                    home.path(),
+                    &[(source, Some(std::ffi::OsStr::new(actor)))],
+                    None,
+                );
+                assert_eq!(
+                    std::env::var_os(var),
+                    None,
+                    "{source} {actor:?} loaded the file"
+                );
+            }
+        }
+        load_khive_dotenv_from(
+            home.path(),
+            &[("KHIVE_ACTOR", Some(std::ffi::OsStr::new("agent:example")))],
+            Some(std::ffi::OsStr::new("1")),
+        );
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "the switch overrode an agent actor"
+        );
+        for (env_actor, argv_namespace) in [
+            (None, "agent:example"),
+            (Some("lambda:example"), "agent:example"),
+        ] {
+            load_khive_dotenv_from(
+                home.path(),
+                &[
+                    ("KHIVE_ACTOR", env_actor.map(std::ffi::OsStr::new)),
+                    ("--namespace", Some(std::ffi::OsStr::new(argv_namespace))),
+                ],
+                None,
+            );
+            assert_eq!(
+                std::env::var_os(var),
+                None,
+                "--namespace {argv_namespace:?} with KHIVE_ACTOR {env_actor:?} loaded the file"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn the_startup_loader_reads_the_namespace_alias_from_the_environment() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let var = "KHIVE_DOTENV_PROBE_STARTUP_NAMESPACE";
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        std::fs::create_dir_all(home.join(".khive")).unwrap();
+        std::fs::write(home.join(".khive/.env"), format!("{var}=from-file\n")).unwrap();
+        std::env::remove_var(var);
+        std::env::set_var("KHIVE_NAMESPACE", "agent:example");
+        load_khive_dotenv();
+        let agent = std::env::var_os(var);
+        std::env::set_var("KHIVE_NAMESPACE", "lambda:example");
+        load_khive_dotenv();
+        let non_agent = std::env::var(var);
+        // The isolated child must leave its HOME empty.
+        std::fs::remove_dir_all(home.join(".khive")).unwrap();
+        assert_eq!(agent, None, "KHIVE_NAMESPACE agent:example loaded the file");
+        assert_eq!(
+            non_agent.as_deref(),
+            Ok("from-file"),
+            "a non-agent namespace did not load the file"
+        );
+    }
+
+    #[test]
+    fn every_actor_argument_is_read_in_both_spellings_including_after_a_separator() {
+        let parse_flag = |args: &[&str], flag: &str| {
+            let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+            argv_flag_values(&args, flag)
+                .into_iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let parse = |args: &[&str]| parse_flag(args, "--actor");
+        assert_eq!(
+            parse_flag(&["mcp", "--namespace", "agent:n"], "--namespace"),
+            ["agent:n"]
+        );
+        assert_eq!(
+            parse_flag(&["mcp", "--namespace=agent:m"], "--namespace"),
+            ["agent:m"]
+        );
+        assert_eq!(parse(&["mcp", "--actor", "agent:a"]), ["agent:a"]);
+        assert_eq!(parse(&["exec", "--actor=agent:b", "stats()"]), ["agent:b"]);
+        assert_eq!(
+            parse(&[
+                "supervisor",
+                "launch",
+                "--label",
+                "d",
+                "--",
+                "--actor",
+                "agent:c"
+            ]),
+            ["agent:c"]
+        );
+        assert_eq!(
+            parse(&["mcp", "--actor", "lambda:x", "--", "--actor=agent:y"]),
+            ["lambda:x", "agent:y"]
+        );
+        assert!(parse(&["exec", "--actor-x", "agent:d"]).is_empty());
+        assert!(parse(&["exec", "--actor"]).is_empty());
+        assert!(parse(&["mcp"]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_equals_spelling_is_kept_whole() {
+        use std::os::unix::ffi::OsStringExt;
+        let arg = std::ffi::OsString::from_vec(b"--actor=agent:\xff".to_vec());
+        let values = argv_flag_values(&["mcp".into(), arg.clone()], "--actor");
+        assert_eq!(values, [arg]);
+        assert!(khive_dotenv_actor_skip("--actor", &values[0]).is_some());
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn a_supervised_agent_daemon_argument_keeps_the_file_out_of_the_supervisor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let var = "KHIVE_DOTENV_PROBE_SUPERVISOR";
+        let home = dotenv_home_with(var);
+        let args: Vec<std::ffi::OsString> = [
+            "supervisor",
+            "launch",
+            "--label",
+            "agent-daemon",
+            "--restart-interval-secs",
+            "5",
+            "--",
+            "--actor",
+            "agent:example",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+        let actors = argv_flag_values(&args, "--actor");
+        let identities: Vec<_> = actors
+            .iter()
+            .map(|v| ("--actor", Some(v.as_os_str())))
+            .collect();
+        load_khive_dotenv_from(home.path(), &identities, None);
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "the supervisor loaded the file its agent daemon would inherit"
+        );
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn a_process_without_an_agent_actor_loads_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        for (index, actor) in [None, Some("lambda:example"), Some("agentx:example")]
+            .into_iter()
+            .enumerate()
+        {
+            let var = format!("KHIVE_DOTENV_PROBE_LOADS_{index}");
+            let home = dotenv_home_with(&var);
+            load_khive_dotenv_from(
+                home.path(),
+                &[
+                    ("KHIVE_ACTOR", actor.map(std::ffi::OsStr::new)),
+                    ("KHIVE_NAMESPACE", actor.map(std::ffi::OsStr::new)),
+                ],
+                None,
+            );
+            assert_eq!(
+                std::env::var(&var).as_deref(),
+                Ok("from-file"),
+                "actor {actor:?} did not load the file"
+            );
+            std::env::remove_var(&var);
+        }
+    }
+
+    #[test]
+    #[serial(khive_dotenv)]
+    fn the_load_switch_off_or_unrecognized_skips_the_dotenv_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        for (index, value) in ["0", "false", "OFF", "maybe"].into_iter().enumerate() {
+            let var = format!("KHIVE_DOTENV_PROBE_SWITCH_{index}");
+            let home = dotenv_home_with(&var);
+            load_khive_dotenv_from(
+                home.path(),
+                &[("KHIVE_ACTOR", Some(std::ffi::OsStr::new("lambda:example")))],
+                Some(std::ffi::OsStr::new(value)),
+            );
+            assert_eq!(
+                std::env::var_os(&var),
+                None,
+                "switch {value:?} loaded the file"
+            );
+        }
+        for (index, value) in ["1", ""].into_iter().enumerate() {
+            let var = format!("KHIVE_DOTENV_PROBE_SWITCH_ON_{index}");
+            let home = dotenv_home_with(&var);
+            load_khive_dotenv_from(home.path(), &[], Some(std::ffi::OsStr::new(value)));
+            assert_eq!(
+                std::env::var(&var).as_deref(),
+                Ok("from-file"),
+                "switch {value:?} did not load the file"
+            );
+            std::env::remove_var(&var);
+        }
+    }
 
     fn write_empty_config(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("empty-khive.toml");
@@ -1614,6 +2012,7 @@ mod tests {
             namespace: None,
             no_embed: true,
             pack: Vec::new(),
+            catalog_verbosity: khive_mcp::args::CatalogVerbosity::Full,
             config: Some(config_path.clone()),
             daemon: false,
             lifetime: None,
@@ -2557,7 +2956,8 @@ no_embed = true
 
         let (_, control_hits, _) = SubstrateCoordinator::single(Arc::clone(no_embed))
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(
             control_hits.is_empty(),
             "text-only handle cannot find a vector-only match"
@@ -2576,7 +2976,8 @@ no_embed = true
         let registry = coordinator_backend_registry(&multi.per_pack_runtimes, &khive_cfg).unwrap();
         let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(outcomes
             .iter()
             .all(|outcome| outcome.error.is_none() && outcome.vector_error.is_none()));

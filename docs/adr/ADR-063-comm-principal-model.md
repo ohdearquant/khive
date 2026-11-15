@@ -5,7 +5,8 @@
 **Authors**: khive maintainers
 **Depends on**: ADR-007 Rev 7 (namespace carve-out for principal-scoped backends) |
 ADR-028 (Pack-Scoped Backends) | ADR-040 (Communication and Schedule Packs) |
-ADR-057 (Comm Actor-Addressed Delivery) | ADR-053 (ActorStore / SessionStore — pending)
+ADR-057 (Comm Actor-Addressed Delivery) | ADR-127 (Authenticated Actor and Grant Primitive) |
+ADR-129 (Fail-Closed Authorization Gate Default)
 **Related issues**: #75 (actor identity on every request) | #112 (khive-channel umbrella) |
 #113 (Telegram adapter)
 **Related ADRs**: ADR-056 (Channel Transport Layer — human out-of-band; sibling, not the same)
@@ -85,29 +86,29 @@ surface. The pack interface (`comm.send`, `comm.inbox`, `comm.reply`, `comm.thre
 
 ## Current State (fact-refreshed 2026-07-04 against shipped `main`)
 
+The facts below were refreshed on 2026-10-23 at commit `8f2f867d` (Amendment 1, Decision 3).
 This ADR was drafted on 2026-06-19 against a codebase that lacked actor identity plumbing.
-Both Step 1 and Step 2 below have since shipped. This section describes the state as of
-`main`, superseding the original "Current State / Bug" framing that described a still-open
-issue #75. The Decision and Alternatives sections were authored against the pre-fix state and
+Both Step 1 and Step 2 below have since shipped. This section describes the state at commit
+`8f2f867d`, superseding the original "Current State / Bug" framing that described a still-open issue
+#75. The Decision and Alternatives sections were authored against the pre-fix state and
 are retained below for their design rationale; the Migration and Sequencing section (§5) has
 been updated to mark Steps 1-2 as shipped.
 
 Issue #75 landed in commit `f1061d27` ("thread authenticated actor identity into request
-token"). `RuntimeConfig` (`crates/khive-runtime/src/config.rs:267`) now carries:
+token"). `RuntimeConfig` (`crates/khive-runtime/src/config.rs:443`) now carries:
 
 ```rust
 pub actor_id: Option<String>,
 ```
 
-populated from the `KHIVE_ACTOR` environment variable or `[actor] id` in `khive.toml`
-(`config.rs:316-318`, `config.rs:479`). At token-mint time (`crates/khive-runtime/src/pack.rs`
-and `runtime.rs:423-425`), the runtime builds the `ActorRef` from this field:
+populated from the `KHIVE_ACTOR` environment variable (`crates/khive-runtime/src/config.rs:570-572`) or
+`[actor] id` in `khive.toml` (`config.rs:1108-1118`). At token-mint time, the runtime resolves the actor
+from this field (`crates/khive-runtime/src/runtime.rs:1707-1708, 1763-1768`). `resolve_actor` maps a
+non-empty id to a named actor and empty or missing input to an anonymous actor
+(`crates/khive-runtime/src/actor_identity.rs:18-22`):
 
 ```rust
-let actor = match self.config.actor_id.as_deref() {
-    Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-    _ => ActorRef::anonymous(),
-};
+resolve_actor(self.config.actor_id.as_deref())
 ```
 
 `ActorRef::anonymous()` (`crates/khive-gate/src/actor.rs:65`) still resolves to
@@ -115,40 +116,35 @@ let actor = match self.config.actor_id.as_deref() {
 its original behavior. The comm handlers no longer derive the caller's actor label from the
 namespace string; they read it directly off the token:
 
-**`crates/khive-pack-comm/src/handlers.rs`, `handle_inbox` (line 154):**
+**`crates/khive-pack-comm/src/handlers/inbox.rs`, `handle_inbox` (lines 11-13, 174-192):**
 
 ```rust
-let caller_actor = token.actor().id.clone();
+let include_legacy = !view.delegated && caller_inherits_legacy_pool(token);
 ```
 
-**`crates/khive-pack-comm/src/handlers.rs`, `handle_send` (line 77):**
+**`crates/khive-pack-comm/src/handlers.rs`, `handle_send` (lines 141-143):**
 
 ```rust
 let from_actor = token.actor().id.clone();
 ```
 
-Sender attribution (`from_actor`) is therefore effective for any deployment that configures
-`actor_id`; it degrades to `"local"` only in the undecorated default, which is the documented
-degenerate case, not a bug.
+Sender attribution (`from_actor`) is effective for deployments that configure
+`actor_id`; it uses the anonymous `"local"` identity only when no actor is configured.
 
 Commit `091231cd` ("close anonymous inbox read leak and warn on unattributed addressed send",
-issues #199/#200, PR #213) then removed the `if caller_actor != "local"` conditional entirely.
-The `to_actor` filter in `handle_inbox` is now unconditional
-(`crates/khive-pack-comm/src/handlers.rs:188-192`):
+issues #199/#200, PR #213) changed the inbox visibility rule.
+The `to_actor` filter in `handle_inbox` uses an indexed exact-recipient filter for named and
+delegated views, and a legacy-recipient filter only for the anonymous fallback
+(`crates/khive-pack-comm/src/handlers/inbox.rs:13,174-192`):
 
-```rust
-property_filters.push(PropertyFilter {
-    json_path: "$.to_actor".to_string(),
-    op: FilterOp::EqOrMissing,
-    value: SqlValue::Text(caller_actor.clone()),
-});
-```
+The predicate is selected as `EqOrMissingIndexed` when `include_legacy` is false and
+`EqOrLegacyIndexed` when it is true; the actor id comes from the authorized mailbox view.
 
-For an anonymous caller (`caller_actor == "local"`), this applies `EqOrMissing("local")`
-instead of skipping the filter, so the caller sees only party-line messages (`to_actor` equal
-to `"local"` or absent). This closes the #199 multi-actor read leak described in this ADR's
-original "Current State / Bug" section: an anonymous caller can no longer read messages
-explicitly addressed to a different configured actor.
+Only the anonymous fallback inherits rows with missing or null `to_actor`; named actors require an exact
+addressed recipient. ADR-057 Q3 states this rule
+(`docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`), and the comm handlers implement it
+(`crates/khive-pack-comm/src/handlers/validation.rs:265-273`, `handlers/inbox.rs:13,174-192`). This
+closes the #199 multi-actor read leak described in this ADR's original "Current State / Bug" section.
 
 This state supersedes the "dormant until issue #75 lands" framing throughout the rest of this
 document. Where later sections describe the filter as forward-deployed-but-inactive, read
@@ -174,7 +170,10 @@ sourced from `RuntimeConfig.actor_id` (configured via `KHIVE_ACTOR` / `[actor] i
 falling back to `ActorRef::anonymous()`'s `"local"` id when unconfigured. The per-actor inbox
 filter (`to_actor`) is active unconditionally: configured actors see only messages addressed
 to them (plus legacy messages with no `to_actor`), and anonymous (`"local"`) callers see only
-party-line messages, closing the multi-actor read leak that motivated this ADR.
+party-line messages, closing the multi-actor read leak that motivated this ADR. (superseded by Amendment 1, Decision 1)
+
+At commit `8f2f867d`, only the anonymous fallback inherits messages with missing or null `to_actor`;
+named actors require an exact addressed recipient (corrected by Amendment 1).
 
 This implementation is correctness-for-now. It is explicitly NOT a security boundary. Any
 process with SQLite store access can read any message row regardless of the `to_actor`
@@ -232,35 +231,41 @@ ADR-028's multi-backend machinery landing first; the remote broker work is separ
 ### 5. Migration and sequencing
 
 The work to close the inbox leak and enable remote delivery proceeds in three steps. Steps 1
-and 2 are SHIPPED (fact-refreshed 2026-07-04); only Step 3 remains future work.
+and 2 are SHIPPED (fact-refreshed 2026-10-23); only Step 3 remains future work.
 
 **Step 1 — Actor identity plumbing (issue #75, prerequisite for both Step 2 and Step 3):
 SHIPPED (commit `f1061d27`).**
 
 The `NamespaceToken` now carries a distinct, non-anonymous `ActorRef` per lambda when
 configured. `RuntimeConfig` gained an `actor_id: Option<String>` field
-(`crates/khive-runtime/src/config.rs:267`), populated from `KHIVE_ACTOR` / `[actor] id` and
-threaded through the token-mint sites in `runtime.rs` and `pack.rs` into the `ActorRef`.
+(`crates/khive-runtime/src/config.rs:437-443`), populated from `KHIVE_ACTOR` and `[actor] id`
+(`config.rs:570-572,1108-1118`) and
+resolved at token authorization (`crates/khive-runtime/src/runtime.rs:1707-1708,1763-1768`,
+`crates/khive-runtime/src/actor_identity.rs:18-22`).
 
 Changes landed as Step 1:
 
-- `RuntimeConfig`: `actor_id: Option<String>` (`config.rs:267`).
-- Token-mint sites (`runtime.rs:423-425`, `pack.rs:854-856, 898-900, 990-992`): populate
-  `ActorRef::new("actor", id)` from `actor_id` when configured, else `ActorRef::anonymous()`.
-- `comm` handlers: derive actor label from `token.actor().id` directly
-  (`handlers.rs:77, 154`) rather than from `token.namespace().as_str()`.
+- `RuntimeConfig`: `actor_id: Option<String>` (`crates/khive-runtime/src/config.rs:437-443`),
+  populated from `KHIVE_ACTOR` and `[actor] id` (`config.rs:570-572,1108-1118`).
+- Token authorization resolves the actor from `actor_id` (`crates/khive-runtime/src/runtime.rs:1707-1708,1763-1768`).
+- `comm.send` reads sender identity from `token.actor().id`
+  (`crates/khive-pack-comm/src/handlers.rs:141-143`). Inbox recipient visibility is selected from the
+  authorized mailbox view and anonymous legacy-pool predicate
+  (`crates/khive-pack-comm/src/handlers/inbox.rs:11-13,174-192`,
+  `crates/khive-pack-comm/src/handlers/validation.rs:265-273`).
 
 Step 1 shipped as shared infrastructure, not comm-specific — the actor identity is available
-for attribution across all packs, per the original design intent (ADR-053).
+for attribution across all packs. ADR-053 is superseded and retained as historical context
+(corrected by Amendment 1, Decision 2; `docs/adr/ADR-053-authorization-gate.md:3-8,16-27`).
 
 **Step 2 — Local inbox scope (fix the leak): SHIPPED (commit `091231cd`, PR #213, issues
 #199/#200).**
 
-The `comm.inbox` filter is active: `caller_actor` is `token.actor().id`, and messages
-addressed to a specific configured actor are returned only to that actor. PR #213 additionally
-made the `to_actor` filter unconditional (removed the `if caller_actor != "local"` gate), so
-even anonymous (`"local"`) callers now get an explicit `EqOrMissing("local")` scope rather than
-an unfiltered read — closing the #199 multi-actor read leak on the anonymous path as well.
+The `comm.inbox` filter uses the authorized mailbox view and an indexed `to_actor` predicate. Named actors require exact
+addressed recipients; only the anonymous fallback inherits rows with missing or null `to_actor`
+(corrected by Amendment 1, Decision 1; `crates/khive-pack-comm/src/handlers/inbox.rs:11-13,174-192`,
+`crates/khive-pack-comm/src/handlers/validation.rs:265-273`,
+`docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`).
 
 This resolves the inbox leak for the single-machine deployment. The security model remains
 the local view-layer filter (not a security boundary for adversarial principals, but adequate
@@ -270,13 +275,14 @@ for co-located, cooperating lambdas), per Decision §1a above.
 
 The remote broker backend is a future implementation. It requires:
 
-- An authentication mechanism per lambda (credential format TBD in a transport ADR).
+- An authentication mechanism per lambda (credential details are addressed in Amendment 1, Decision 2).
 - A broker implementation that enforces per-principal scope server-side.
-- Pack-scoped backend configuration (ADR-028 multi-backend machinery or an equivalent).
+- Pack-scoped backend configuration (ADR-028 multi-backend machinery or an equivalent; see Amendment
+  1, Decision 2 for its relationship to ADR-105).
 - The same `comm.*` verb surface, unchanged. Callers do not change; only the backend changes.
 
-Step 1 has shipped, satisfying that prerequisite. Step 3 remains blocked on the transport ADR
-(which specifies the credential format and broker protocol) and is otherwise unblocked. It was
+Step 1 has shipped. The former ADR-053 prerequisite is superseded by ADR-127 and ADR-129. Step 3
+remains gated by the questions recorded in Amendment 1, Decision 2. It was
 never blocked on Step 2; the local fix and remote broker can be developed independently.
 
 ### 6. Pack verb surface
@@ -354,12 +360,12 @@ rule for the shared substrate.
 ### Option D: Wait for ADR-053 ActorStore before specifying the comm isolation model
 
 Defer this ADR until ADR-053 (ActorStore, SessionStore, cloud-tier actor threading) is fully
-implemented and ratified.
+implemented and ratified. (superseded by Amendment 1, Decision 2)
 
 Rejected. ADR-053 is a prerequisite for the remote broker (it specifies the authenticated
 actor model the broker credential builds on), but the comm isolation model can be specified
 now. Specifying it now gives issue #75 a clear target and prevents the inbox leak from being
-treated as a permanent state.
+treated as a permanent state. (superseded by Amendment 1, Decision 2)
 
 ---
 
@@ -369,7 +375,10 @@ treated as a permanent state.
 
 The credential format (token type, rotation policy, revocation mechanism) for the remote
 broker is unspecified. This is intentional: the credential is part of the transport layer,
-which will be addressed in a dedicated transport ADR before Step 3 implementation begins.
+which will be addressed in a dedicated transport ADR before Step 3 implementation begins
+(corrected by Amendment 1, Decision 2: ADR-127 defines authentication and principal assurance
+without this broker's credential format, rotation or revocation, and ADR-105's per-node bearer
+covers its node channel; whether either governs this backend remains open).
 The open question is whether the credential should be a symmetric pre-shared
 key per lambda pair, a public-key credential per lambda, or a centrally-issued token (e.g.,
 from a khive-cloud authority). Decision needed before any Step 3 implementation PR is opened.
@@ -387,8 +396,9 @@ In the remote broker backend, messages destined for `lambda:leo` must be readabl
   the scope clause.
 
 The correct choice depends on the broker technology selected for Step 3. This is left to the
-transport ADR. The isolation contract (per-principal scope, server-enforced) is specified here;
-the physical layout is not.
+transport ADR (corrected by Amendment 1, Decision 2: ADR-105, the transport record, does not
+define the broker storage partition, so the choice remains open). The isolation contract
+(per-principal scope, server-enforced) is specified here; the physical layout is not.
 
 ### OQ-3: Legacy message visibility under Step 2 — RESOLVED as shipped (commit `091231cd`, PR #213)
 
@@ -397,10 +407,15 @@ Q3): whether legacy messages without a `to_actor` field should be backfilled wit
 `to_actor="local"` or declared out-of-scope for actor-scoped inboxes. It was resolved by
 implementation rather than by a separate backfill decision. The shipped `EqOrMissing` filter
 (`handlers.rs:188-192`) makes messages with no `to_actor` field visible to any caller whose
-actor label matches the filter value, including the anonymous `"local"` caller. No backfill
+actor label matches the filter value, including the anonymous `"local"` caller (corrected by
+Amendment 1, Decision 1: only the anonymous fallback inherits messages with a missing or null
+`to_actor`, and a configured actor sees only messages addressed to it;
+`crates/khive-pack-comm/src/handlers/inbox.rs:13,174-192`). No backfill
 migration was performed or is required: legacy messages remain visible under the
 `EqOrMissing` semantics as originally implemented in ADR-057, and PR #213's unconditional
-filter (see "Current State" above) extends the same semantics to the anonymous path. This
+filter (see "Current State" above) extends the same semantics to the anonymous path
+(superseded by Amendment 1, Decision 1; ADR-057's compatibility view does not rewrite legacy
+records, `docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`). This
 question is closed; no further decision is pending on it.
 
 ---
@@ -410,13 +425,18 @@ question is closed; no further decision is pending on it.
 - ADR-007 Rev 7, Rule 8 — the carve-out this ADR invokes.
 - ADR-028 — Pack-Scoped Backends; the deferred multi-backend configuration mechanism.
 - ADR-040 — Communication and Schedule Packs; the original comm verb surface.
-- ADR-053 — ActorStore, SessionStore (Proposed); actor identity threading, prerequisite for
-  Step 1 and Step 3.
+- ADR-053: Authorization Gate; superseded and retained for history (corrected by Amendment 1, Decision 2).
+- ADR-127: Authenticated actor and grant primitive; credential and principal decisions relevant to Step 3
+  (see Amendment 1, Decision 2).
+- ADR-129: Fail-closed authorization gate default; authorization gate decisions relevant to Step 3
+  (see Amendment 1, Decision 2).
+- ADR-105: Cross-node comm transport; hub topology and node transport (see Amendment 1, Decision 2).
 - ADR-056 — Channel Transport Layer; the sibling human out-of-band transport. Distinct from
   this ADR: ADR-056 bridges external channels (Telegram, email) to the comm verb surface;
   this ADR specifies the lambda-to-lambda isolation contract behind that same surface.
-- ADR-057 — Comm Actor-Addressed Delivery (Accepted); the forward-deployed `to_actor` filter
-  that Step 2 activates. ADR-057 Q3 was resolved as shipped by PR #213 (see OQ-3 above).
+- ADR-057 — Comm Actor-Addressed Delivery (Accepted); the `to_actor` filter
+  used by Step 2. Q3 was revised on 2026-09-22 (see
+  `docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`, corrected by Amendment 1).
 - Issue #75 — Actor identity on every request; Step 1. SHIPPED, commit `f1061d27`.
 - Issue #112 — khive-channel umbrella; Step 3 transport work.
 - PR #213 (issues #199/#200) — closed the anonymous inbox read leak by making the `to_actor`
@@ -428,3 +448,86 @@ question is closed; no further decision is pending on it.
 - Commit `f816c3e6` (PR #526) — dual-write rollback atomicity fix for comm message writes.
   Adjacent hardening on the comm pack's write path; no design change to the principal model
   here.
+
+## Amendment 1 (2026-10-23) -- Actor visibility and remote transport references
+
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#5549](https://github.com/ohdearquant/khive/issues/5549).
+
+**Trigger.** The local inbox rule in §1a and OQ-3 says configured actors inherit legacy messages, while the current
+ADR-057 rule and inbox implementation grant the missing/null recipient pool only to the anonymous fallback
+(`docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`,
+`crates/khive-pack-comm/src/handlers/inbox.rs:13,174-192`). Step 3 also depends on ADR-053, which is superseded,
+and leaves credential and hub layout decisions pointing to an unnamed transport record
+(`docs/adr/ADR-053-authorization-gate.md:3-8,20-27`).
+
+### Decision 1 -- Legacy inbox visibility
+
+The local inbox rule is the ADR-057 Q3 rule: only the anonymous fallback inherits messages with missing or null
+`to_actor`; named actors require exact addressed recipients. This preserves legacy message visibility for the
+anonymous compatibility path without granting that pool to configured actors. ADR-057 Q3 states this rule
+(`docs/adr/ADR-057-comm-actor-addressed-delivery.md:488-503`); `caller_inherits_legacy_pool` identifies the
+anonymous `local` actor (`crates/khive-pack-comm/src/handlers/validation.rs:265-273`), and `handle_inbox` uses
+that predicate to select the indexed recipient filter (`crates/khive-pack-comm/src/handlers/inbox.rs:11-13,174-192`).
+
+### Decision 2 -- Step 3 decision references and remaining questions
+
+Step 3 references ADR-127 for authenticated principal and credential decisions, and ADR-129 for authorization
+gate administration. ADR-053 is superseded: its own supersession note assigns authentication to ADR-127 and
+multi-actor authorization to ADR-129 (`docs/adr/ADR-053-authorization-gate.md:3-8,20-27`). ADR-127 requires
+caller authentication from a presented credential and classifies its assurance
+(`docs/adr/ADR-127-authenticated-actor-and-grant-primitive.md:62-88`); ADR-129 specifies a staged fail-closed
+authorization gate (`docs/adr/ADR-129-fail-closed-gate-default.md:82-106`). These records do not specify the
+broker-specific token format, rotation, or revocation contract for this ADR. ADR-105 specifies a hub-and-spoke
+node channel and per-node bearer over TLS (`docs/adr/ADR-105-cross-node-comm-transport.md:42-44,116-123`), but
+that transport's relationship to this ADR's backend swap remains open. ADR-105 says `comm.send`, `comm.reply`,
+and dual-write are untouched (`docs/adr/ADR-105-cross-node-comm-transport.md:1226-1230`), so it does not choose
+between a separate broker backend and that node channel.
+
+OQ-1 points to ADR-127 for the authenticated-principal and credential model. The concrete broker credential
+format and lifecycle remain open because ADR-127 does not specify them for this backend. The per-node bearer
+selected by ADR-105 applies to its node channel; whether it also supplies Step 3's backend credential remains
+open (`docs/adr/ADR-105-cross-node-comm-transport.md:116-123`).
+
+OQ-2 points to ADR-105 for hub and transport topology. ADR-105 specifies the star topology and hub ingress
+(`docs/adr/ADR-105-cross-node-comm-transport.md:42-44,74-84`), but does not choose the remote broker's storage
+partition. The choice between separate storage per principal and a shared store with mandatory server-side
+scope remains open. The relationship between ADR-105's node channel and this ADR's pack backend also remains
+open; ADR-105 preserves dual-write (`docs/adr/ADR-105-cross-node-comm-transport.md:1226-1230`).
+
+The relationship to ADR-028 also remains open. ADR-028 says `[[backends]]` and per-pack backend assignment
+are deferred (`docs/adr/ADR-028-pack-scoped-backends.md:51-63`), while the checkout has closed `[[backends]]`
+config entries and a multi-backend server boot path (`crates/khive-runtime/src/engine_config.rs:1402-1403`,
+`crates/khive-mcp/src/serve/server_build.rs:677-688`); the namespace-move module describes comm notes on a
+separate backend (`crates/khive-db/src/namespace_move.rs:13-20`). This record does not resolve
+how this affects ADR-063's backend dependency, so that relationship remains open. Step 3 implementation
+waits on the OQ-1 broker credential format and lifecycle, the OQ-2 storage partition, and the
+relationship between ADR-105's node channel and this pack backend.
+
+### Decision 3 -- Current state and citation refresh
+
+Current State and §5 describe the checkout at `8f2f867d` as of 2026-10-23. Their actor configuration, token
+authorization, sender attribution, and inbox visibility citations are refreshed to the current source locations
+(`crates/khive-runtime/src/config.rs:437-443,570-572,1108-1118`,
+`crates/khive-runtime/src/runtime.rs:1707-1708,1763-1768`,
+`crates/khive-runtime/src/actor_identity.rs:18-22`,
+`crates/khive-pack-comm/src/handlers.rs:141-143`,
+`crates/khive-pack-comm/src/handlers/inbox.rs:11-13,174-192`,
+`crates/khive-db/src/stores/note.rs:1117-1121,1176-1185`). ADR-053 is labeled superseded in its own status
+and supersession note (`docs/adr/ADR-053-authorization-gate.md:3-8,10-27`).
+
+### Acceptance
+
+| ID  | Statement                                                                                                                                                 | Evidence                                                                                                                                                      |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1a | Named actors receive only messages addressed to that actor, while the anonymous fallback also receives missing or null `to_actor` rows.                   | `crates/khive-pack-comm/tests/integration.rs::i1739_named_own_views_do_not_inherit_the_anonymous_pool`                                                        |
+| A1b | The inbox selects the indexed exact-recipient predicate for named and delegated views and the legacy-recipient predicate only for the anonymous fallback. | `crates/khive-pack-comm/src/handlers/inbox.rs:11-13,174-192`                                                                                                  |
+| A2a | Runtime actor identity accepts `KHIVE_ACTOR` and `[actor] id`, then resolves configured ids to named actors.                                              | `crates/khive-runtime/src/config.rs:437-443,570-572,1108-1118`; `crates/khive-runtime/src/actor_identity.rs:18-22`                                            |
+| A2b | Comm sender attribution uses the actor id carried by the request token.                                                                                   | `crates/khive-pack-comm/src/handlers.rs:141-143`                                                                                                              |
+| A3  | ADR-053 assigns authentication decisions to ADR-127 and multi-actor authorization decisions to ADR-129.                                                   | `docs/adr/ADR-053-authorization-gate.md:3-8,20-27`                                                                                                            |
+| A4  | ADR-127 defines credential-based caller authentication and assurance classes, but leaves this broker's credential format and lifecycle open.              | `docs/adr/ADR-127-authenticated-actor-and-grant-primitive.md:62-88`                                                                                           |
+| A5a | ADR-105 specifies hub topology and a per-node bearer over TLS, while its dual-write rule does not select this ADR's backend.                              | `docs/adr/ADR-105-cross-node-comm-transport.md:42-44,116-123,1226-1230`                                                                                       |
+| A5b | OQ-1 leaves the broker credential format and lifecycle open, and OQ-2 leaves the storage partition open.                                                  | `docs/adr/ADR-063-comm-principal-model.md:374-395`                                                                                                            |
+| A6a | ADR-028 defers `[[backends]]` and per-pack backend assignment, while the checkout parses `[[backends]]` and boots a multi-backend server.                 | `docs/adr/ADR-028-pack-scoped-backends.md:51-63`; `crates/khive-runtime/src/engine_config.rs:1402-1428`; `crates/khive-mcp/src/serve/server_build.rs:677-688` |
+| A6b | The namespace-move module describes comm notes on a separate backend but does not resolve ADR-063's backend dependency.                                   | `crates/khive-db/src/namespace_move.rs:13-20`                                                                                                                 |

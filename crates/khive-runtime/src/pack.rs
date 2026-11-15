@@ -182,8 +182,13 @@ use crate::error::DispatchError;
 use crate::error::{AuditObligationFailure, RuntimeError};
 use crate::KhiveRuntime;
 
+mod audit_success_rows;
+pub use audit_success_rows::{AuditSuccessRowForcingRule, AuditSuccessRowsMode};
+
 mod builder;
 pub use builder::{PackMetadataRegistry, VerbRegistryBuilder};
+
+mod declaration_validation;
 
 mod catalog;
 pub(crate) use catalog::CanonicalNoteHookLookup;
@@ -250,6 +255,10 @@ pub(crate) mod tests;
 #[path = "pack/dep_tests.rs"]
 mod dep_tests;
 
+#[cfg(test)]
+#[path = "pack/declaration_validation_tests.rs"]
+mod declaration_validation_tests;
+
 // ── Note-update hook sequencing tests ───────────────────────────
 //
 // These tests exercise the DISPATCHER (`VerbRegistry::prepare_note_update_hook`),
@@ -283,3 +292,15 @@ mod admission_allowlist_adr_tests;
 #[cfg(test)]
 #[path = "gate_argument_contract_tests.rs"]
 mod gate_argument_contract_tests;
+
+#[cfg(test)]
+#[path = "pack/audit_success_rows_tests.rs"]
+mod audit_success_rows_tests;
+
+#[cfg(test)]
+#[path = "pack/audit_success_rows_metrics_tests.rs"]
+mod audit_success_rows_metrics_tests;
+
+#[cfg(test)]
+#[path = "pack/audit_success_rows_cut_tests.rs"]
+mod audit_success_rows_cut_tests;

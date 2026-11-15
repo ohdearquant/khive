@@ -170,3 +170,129 @@ async fn kg_create_unknown_note_kind_lists_merged_pack_vocabulary() -> anyhow::R
     );
     Ok(())
 }
+
+// This leaf is include!-expanded at the integration target root, so this
+// selector is intentionally unprefixed (there is no kind_hooks module).
+#[tokio::test]
+async fn schema_declares_every_entity_and_note_kind_written_by_driven_store() -> anyhow::Result<()>
+{
+    disable_daemon();
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test")?,
+        packs: vec!["kg".into(), "gtd".into()],
+        ..RuntimeConfig::no_embeddings()
+    })?;
+    let server = KhiveMcpServer::new(runtime.clone())?;
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server_task = tokio::spawn(async move {
+        if let Ok(service) = server.serve(server_transport).await {
+            let _ = service.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    let concept = ok_one(&client,
+        r#"create(kind="concept", name="kind census concept", description="actual entity", skip_dedup_check=true)"#).await?;
+    let concept_id = uuid::Uuid::parse_str(concept["id"].as_str().expect("created entity id"))?;
+    let observation = ok_one(&client,
+        r#"create(kind="note", note_kind="observation", content="actual note", skip_dedup_check=true)"#).await?;
+    let observation_id =
+        uuid::Uuid::parse_str(observation["id"].as_str().expect("created observation id"))?;
+    let task = ok_one(
+        &client,
+        r#"create(kind="note", note_kind="task", title="kind census blocker")"#,
+    )
+    .await?;
+    let task_id = task["id"].as_str().expect("created task id");
+    let dependent = ok_one(
+        &client,
+        &format!(
+            r#"gtd.assign(title="kind census dependent", depends_on=["{}"])"#,
+            task_id
+        ),
+    )
+    .await?;
+    let dependent_id = dependent["full_id"]
+        .as_str()
+        .expect("assigned task full id");
+    let neighbors = ok_one(
+        &client,
+        &format!(
+            r#"neighbors(id="{}", direction="out", relations=["depends_on"])"#,
+            dependent_id
+        ),
+    )
+    .await?;
+    assert!(
+        neighbors
+            .as_array()
+            .expect("neighbors record array")
+            .iter()
+            .any(|hit| hit["id"].as_str() == Some(task_id)),
+        "actual dependency edge is persisted: {neighbors}"
+    );
+    let token = runtime.authorize(Namespace::parse("test")?)?;
+    assert_eq!(
+        runtime.get_entity(&token, concept_id).await?.kind,
+        "concept"
+    );
+    let stored_observation = runtime
+        .backend()
+        .notes()?
+        .get_note(observation_id)
+        .await?
+        .expect("publicly created observation is stored");
+    assert_eq!(stored_observation.kind, "observation");
+
+    let schema = ok_one(&client, "schema()").await?;
+    let declared_entities: std::collections::BTreeSet<String> = schema["entity_kinds"]
+        .as_array()
+        .expect("merged entity vocabulary")
+        .iter()
+        .map(|kind| kind.as_str().expect("entity kind string").to_owned())
+        .collect();
+    let declared_notes: std::collections::BTreeSet<String> = schema["note_kinds"]
+        .as_array()
+        .expect("merged note vocabulary")
+        .iter()
+        .map(|kind| kind.as_str().expect("note kind string").to_owned())
+        .collect();
+    // Inspect every stored kind, including tombstones/startup/hook writes, not
+    // just the returned IDs or one limited public page of the driven store.
+    let (stored_entities, stored_notes) =
+        runtime.backend().pool().writer()?.autocommit(|conn| {
+            let mut entities = conn.prepare("SELECT DISTINCT kind FROM entities")?;
+            let entity_rows = entities.query_map([], |row| row.get::<_, String>(0))?;
+            let entity_kinds = entity_rows.collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+            let mut notes = conn.prepare("SELECT DISTINCT kind FROM notes")?;
+            let note_rows = notes.query_map([], |row| row.get::<_, String>(0))?;
+            let note_kinds = note_rows.collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+            Ok((entity_kinds, note_kinds))
+        })?;
+    let undeclared_entities: Vec<_> = stored_entities.difference(&declared_entities).collect();
+    let undeclared_notes: Vec<_> = stored_notes.difference(&declared_notes).collect();
+    assert!(
+        undeclared_entities.is_empty(),
+        "driven store wrote undeclared entity kinds: {undeclared_entities:?}"
+    );
+    assert!(
+        undeclared_notes.is_empty(),
+        "driven store wrote undeclared note kinds: {undeclared_notes:?}"
+    );
+    assert!(
+        stored_entities.contains("concept"),
+        "entity drive cannot be vacuous"
+    );
+    for kind in ["observation", "task"] {
+        assert!(
+            stored_notes.contains(kind),
+            "stored note drive must include {kind}"
+        );
+    }
+    drop(client);
+    server_task.abort();
+    if let Err(error) = server_task.await {
+        assert!(error.is_cancelled(), "MCP server task failed: {error}");
+    }
+    Ok(())
+}

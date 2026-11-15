@@ -377,10 +377,10 @@ where
                 )
             })
         } else {
-            let guard = pool
+            let mut guard = pool
                 .writer()
                 .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
-            run_graph_mutation_transaction(&pool, guard.conn(), true, move |conn| {
+            run_graph_mutation_transaction(&pool, guard.conn_mut(), true, move |conn| {
                 graph_mutation_events_enlisted(
                     conn,
                     mutation,
@@ -556,7 +556,7 @@ where
         let statement =
             edge_soft_delete_statement(Uuid::from(edge.id), Utc::now().timestamp_micros());
         let mut stmt = conn
-            .prepare(&statement.sql)
+            .prepare_cached(&statement.sql)
             .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
         bind_params(&mut stmt, &statement.params)
             .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;

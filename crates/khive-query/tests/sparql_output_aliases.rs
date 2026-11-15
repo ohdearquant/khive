@@ -73,7 +73,7 @@ fn run(conn: &Connection, query: &GqlQuery, columns: &[&str]) -> Vec<Vec<Value>>
     let mut statement = conn
         .prepare(&compiled.sql)
         .unwrap_or_else(|error| panic!("{error}; SQL: {}", compiled.sql));
-    assert_eq!(statement.column_names(), columns);
+    assert_eq!(statement.column_names().collect::<Vec<_>>(), columns);
     let width = statement.column_count();
     let rows = statement
         .query_map(params_from_iter(params), |row| {

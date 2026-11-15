@@ -155,7 +155,7 @@ impl Serialize for CanonicalEdge<'_> {
 
 /// Sort nested object keys without cloning property values. Array order stays
 /// unchanged; JSON string and number rendering remains serde_json's own.
-struct SortedValue<'a>(&'a Value);
+pub(crate) struct SortedValue<'a>(pub(crate) &'a Value);
 
 impl Serialize for SortedValue<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

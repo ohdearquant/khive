@@ -98,6 +98,221 @@ Status: Accepted (2026-10-13). Implemented in #5308.
 - A degrade-safe read returns its result when its audit row ends `RetryExhausted`; a write verb's dispatch still fails on the same reason.
 - Through the events-daemon socket the outcome stays retryable and its message names the phase; the socket protocol does not change.
 
+#### Amendment 3 — A long write is a scheduling problem, not an admission problem
+
+**Trigger.** On a server that serves many tenants' stores from one volume, one store's schema migration (one transaction
+over about 5M edge rows, about 12 s) held the volume lease for its whole transaction. Every other database's lease-taking
+call on that volume waited out `disk_guard_deadline_ms` (2,000 ms) and was refused `lock_contended`: first opens, writes,
+and reads whose audit row needs the lease.
+
+**What was considered and rejected.** A reservation ledger (hold the lease only for probe and booking, admit other
+writers against free space minus outstanding bookings) does not keep §3's guarantee for a write of unknown size. Two
+writers can both be admitted against headroom that the first one's actual growth then consumes. Hold-for-duration admits
+the second only after the first has settled and its growth is visible. Shared-short/exclusive-long and per-database
+leases fail for the same reason, and an exclusive migration still blocks every short write. These designs stay closed
+until a writer can prove or enforce a bound on its own peak allocation (decision 5).
+
+**Decision.**
+
+1. **The guarantee is unchanged.** §2, §3, §4 and §7 stand as written. This amendment adds no guarantee and removes none;
+   it changes when schema work runs, not how a write is admitted.
+2. **Data-proportional schema work runs before readiness.** Before a process reports ready, it runs all schema work that
+   can scan, rewrite or index the rows a populated store already holds, for every store it serves. The work is classified
+   by its effect, not by the function that does it.
+
+   **Stores.**
+   - Each configured SQLite backend runs the whole barrier below.
+   - A separately configured events database, which sits beside the `main` backend only, runs its own events migrations
+     in the process that owns it: the events daemon in daemon mode, the serving process otherwise. In daemon mode the
+     host already holds requests at an events readiness gate until the events daemon answers; this change makes the
+     daemon answer only after its events migrations have finished, so no request is admitted before them.
+   - A configured code map is out of the barrier: serving reads open it read-only and run no schema work on it. A code
+     map that `code.ingest` opens for writing is a store first named after readiness (below).
+   - A store the host serves but does not configure as a backend, such as one database file per tenant in a directory,
+     is handed to the barrier by the host. The barrier is one runtime call per store, the same call the runtime makes
+     for its configured backends; a host that opens its stores before it binds (for example, a boot step that lists
+     the tenant directory and opens each store whose tenant is active) makes that call for each store in that step,
+     before it accepts traffic. Building a runtime for a store runs its versioned migrations, but the store-schema ensures,
+     the FTS rowid-map backfill and the `notes_seq` repair wait for the first request that reaches each store kind; the call
+     is what moves that work to boot. A store the host does not hand in is a store first named after
+     readiness.
+
+   **In the barrier.**
+   - Every pending versioned migration, including the attachment cutover and the versions after it, which already run
+     before readiness. The cutover's holds are migration class.
+   - Every store-schema ensure that can create an index or add a column on a populated table (entities, notes, graph,
+     agents, events).
+   - Pack schema plans.
+   - The FTS rowid-map backfill, on each rowid-mapped FTS table without its completion marker. On such a table that is
+     empty when the barrier reaches it, the barrier writes the marker, because every insert maintains the map. FTS
+     tables kept in step by triggers (knowledge, sections, session messages) have no map and need no backfill.
+   - The `notes_seq` repair, an anti-join over `notes` that today runs on the first notes-store acquisition.
+   - The legacy quarantine repair, which already runs at boot over every backend.
+   - The vector table and ANN sidecar ensure for each configured embedding model, and the sparse table and its index
+     for each configured model key.
+   - The forced-index check, once per store. A forced-index repair on a request after readiness then means an index was
+     dropped while serving; it is reported as such, not treated as routine.
+
+   Every lease a barrier schema unit takes is recorded as migration class. The class scope is thread-local, and many
+   barrier writes run on the pool's writer task or a blocking thread, not on the thread that issued them; such a write
+   carries its class with the request to the thread that takes the lease. Opening pools and their first write remain
+   bootstrap class.
+
+   **Left lazy, fixed cost.** The sparse table and index for a model key first used after readiness, which start empty,
+   with the ensure cached per (store, model key) after its first success, so a later call takes no write unit (this
+   cache is part of this change); embedding model registration; the identity row of a pool opened after readiness; the
+   config-lock audit drain; request audit appends. Their holds appear in the lease-hold report under the class of the
+   site that takes them, which does not name the path; a path moves into the barrier when a measurement that names it
+   shows a long hold.
+
+   **Stores first named after readiness.** A store opened for writing after readiness (a code map given to
+   `code.ingest`, an archive) migrates when it is opened, as it does today, and its hold is recorded as migration class.
+   A store created after readiness runs every version against empty tables, one short admission per version.
+
+   **The drain is the deploy's precondition.** No barrier work on a populated store starts while any process serves traffic on the volume, and
+   khive-db does not detect other serving processes: the deploy stops them first. A release that carries a pending
+   migration on a populated store is therefore a drain deploy on that volume for the migration's duration, not a rolling
+   one. A migration that must run under traffic uses decision 3 instead. Bounded retry on `lock_contended` (Amendment 2)
+   is for contention before execution, within the caller's total budget; an accepted write whose outcome is unknown is
+   never replayed.
+
+   **A store that fails the barrier fails the boot, with one exception.** The process does not report ready, and its
+   error names the store, its schema version and the step that failed. This is chosen knowingly: on a host with many
+   stores, one store that fails for a reason a restart can clear (lease contention, I/O, free space) keeps every store
+   down until the operator clears the cause and restarts. The exception is a failure no restart can change, from a closed
+   list (the file is not a SQLite database, SQLite reports it corrupt, or the store waits on an application-assisted
+   cutover): the host may refuse that one store by name on every request and serve the rest, provided the refusal is
+   counted on a surface a health probe reads, so the outage does not read as healthy. The operator's move is the same
+   either way: read the store and the step from the error, fix or restore that store, restart.
+
+   Versions commit one at a time, so a boot that fails at version N leaves the store at N-1. When N-1 is newer than the
+   previous binary's latest version, that binary refuses to open it ("database schema version N-1 is ahead of the latest
+   known migration"). Pre-migration copies that let an operator
+   return such a store to the previous binary are decided in their own amendment.
+3. **An online data backfill is a resumable, chunked operation, by declaration.** A migration that must run while traffic
+   is served declares an intermediate-state contract: an expand step, a backfill in chunks that each commit their data and
+   their progress marker in one transaction and take a fresh admission, a validation step, and a short cutover that marks
+   the migration complete. No lease is held across chunks. Releasing the lease between chunks does not by itself let a
+   waiter in another process in while the chunking process has other lease traffic; that hand-off is the later
+   amendment's, and the first chunked migration does not ship before it. Existing atomic migrations, batch APIs and
+   import transactions are not split implicitly.
+4. **Deadlines and recovery unchanged.** The 2,000 ms default, its [100, 10,000] range, the `lock` / `lock_contended`
+   split, same-thread re-entry refusal, and §5's bypasses all stand. A waiter's expiry never interrupts an admitted write.
+5. **Gate for any future concurrent admission.** A design that admits two writers on one volume concurrently must give
+   each admitted writer a bound on its additional peak allocation (database, WAL, journal, index, temporary and settlement
+   bytes) that is proved or enforced before the excess is allocated; an estimate alone is not a bound. Such a design is
+   admitted only after it answers each of these, each with a named test or measurement:
+   1. A process that dies holding bookings: how a stale booking is detected and reclaimed, and why reclaim can never free
+      a live writer's booking (reclaim only by obtaining the booking's kernel lock; never by process id, time-to-live or
+      caller cancellation).
+   2. The booking of a write whose size bound is wrong in either direction: an overestimate refuses safe work with a
+      stated cause; an underestimate is stopped before it allocates past its bound and rolls back.
+   3. A writer when bookings exhaust the headroom: it waits under one absolute deadline with no SQLite writer or
+      accounting mutex held, then is refused with a distinct retryable reason, never `sqlite_capacity_refused`.
+   4. Fairness between one long writer and many short ones across processes: arrival tickets, and no younger admission
+      ahead of the oldest live eligible ticket.
+   5. The cross-process file format and its upgrade from today's lock file with old and new binaries on one volume: the
+      legacy lock file kept as a lifetime gate, so an old binary still excludes a new one.
+   6. The guarantee of §3, and what the design weakens relative to hold-for-duration, in one sentence.
+
+   Until a design answers all six, the duration-held lease stays.
+
+**What remains open after this amendment.** A long ordinary write (a large batch insert, an atomic multi-record update,
+a VACUUM, a scheduled FTS merge) still blocks other databases on the volume for its duration, and a store first opened
+after readiness migrates under traffic. This amendment fixes neither. Fixing them needs decision 5's bound, decision 3's
+chunking, or independent volumes per capacity domain. How a released lease reaches a waiter in another process, and the
+refusal a bystander receives while a late-named store migrates, are left to a later amendment sized from the lease-hold
+report in production traffic.
+
+**Acceptance.**
+
+- `deploy_readiness_volume_barrier`: two stores on one volume, each populated at the old schema, with a migration
+  fixture, a store-schema ensure that adds an index, a rowid-mapped FTS table with its completion marker cleared after
+  the rowid-map migration has run, an empty rowid-mapped FTS table, deleted `notes_seq` rows, and a configured embedding model whose vector table is absent.
+  At readiness every store reads the latest schema version, every rowid-mapped FTS table carries its completion marker,
+  the `notes_seq` repair count equals the deleted rows, the vector table exists, and no data-proportional transaction
+  overlaps a request on the volume over the whole run. Must-fail: one store left out of the barrier; expected red on the
+  `notes_seq`, sparse index and vector table assertions (runtime construction still migrates the schema version).
+- `barrier_holds_are_migration_class_and_none_follow_readiness`: before readiness, every lease a barrier schema unit
+  takes is recorded as migration class in the lease-hold report, including the legacy quarantine repair's writes, which
+  run on the writer task. After readiness, a first request against every in-scope store kind, other than a model key
+  first used after readiness, executes no schema statement (counted through a test-only statement hook) and records no migration-class hold. Must-fail controls: one
+  store-schema ensure left lazy; expected red on the statement count. The class set only on the issuing thread and not
+  carried to the writer task; expected red on the class assertion for the quarantine repair's writes.
+- `host_handed_store_runs_the_barrier`: a store that is not a configured backend, populated at a schema version at or above the
+  FTS rowid-map migration, with the completion marker cleared after migrating and the rest of the fixture of
+  `deploy_readiness_volume_barrier`, is handed in by a host boot step before binding. At readiness it
+  meets the same assertions, and a first request against it executes no schema statement. Must-fail: the host opens the
+  store without the barrier call; expected red on the `notes_seq` and FTS marker assertions.
+- `structural_refusal_is_per_store_and_visible`: one handed-in store is not a SQLite database and another is healthy.
+  The host serves the healthy store, refuses the bad one by name, and the refusal count read by the health probe is 1.
+  A second fixture whose failure is lease contention fails the boot naming the store. Must-fail: contention placed on
+  the closed list; expected red on the boot assertion.
+- `empty_fts_table_marker`: the test reads `{table}_rowids_state` at readiness and finds the marker, then inserts rows
+  and finds them through a freshly opened text handle with no backfill. Must-fail: the barrier's marker write removed;
+  expected red on the state read.
+- `sparse_ensure_is_cached`: the second sparse call for a (store, model key) takes no write unit. Must-fail: the cache
+  removed; expected red.
+- `chunk_restart` (with the first migration that declares decision 3): kill at every data, progress and cutover
+  boundary; restart resumes exactly, and no lease is held from one chunk into the next. Must-fail: one lease held across
+  chunks, or the progress marker committed before the data. Bystander progress across processes during the chunks is
+  tested under the later amendment that chooses the hand-off mechanism.
+- Unchanged-guarantee control: two writers on two different databases on one volume, the first holding an admitted
+  transaction. The second is not admitted until the first settles. Must-fail: the lease released after the probe; the
+  second is admitted early.
+
+**Effects on callers.** A multi-tenant deployment drains the volume, then runs the barrier, before traffic. A
+single-process deployment runs the same barrier at start, which moves first-use schema work from its first requests to
+its boot. `code.ingest` into a code map behind the current schema still migrates that map under traffic.
+
+#### Amendment 4 — A released lease reaches a waiter in another process
+
+**Trigger.** A volume-lease waiter in another process can lose every release to waiters in the process that holds the
+lease, until its deadline (#6463). In each process only the thread that holds the process's slot polls the volume lock
+file; the others wait on the slot's condition variable. When the holder drops its lease it unlocks the file and frees the
+slot, and the next waiter in the same process takes the slot and calls `try_lock` at once. The waiter in the other process
+is asleep for up to one poll interval (10 ms) and finds the file locked again. With steady traffic in the holding process,
+the other process's waiter is refused `lock_contended` at `disk_guard_deadline_ms` although the lease was free many times
+inside its deadline. Amendment 3's chunked migrations release the lease between chunks to let other databases in; across
+processes that release does not reliably reach the other database's waiter.
+
+**Decision.**
+
+1. **The property.** With two processes on one volume, a lease waiter in one process is admitted within its deadline
+   while the other process holds and releases the lease under steady local traffic.
+2. **Invariants any mechanism keeps.**
+   - The guarantee is unchanged. Admission still requires the exclusive lock on the volume lock file, held from the floor
+     sample to settlement, as §3, §4 and §7 state. Any file the mechanism adds beside the lock file authorizes nothing:
+     losing it, deleting it or a process that never writes it changes only who tries first.
+   - Deadlines are unchanged. Any waiting the mechanism adds happens inside the waiting thread's own deadline, and a
+     thread whose deadline passes is refused `lock_contended`, as today. No thread blocks on a file lock.
+3. **Mixed binaries.** This concerns binaries that take the volume lease; binaries that predate it are outside the
+   guarantee, as §7 states. A lease-taking binary without the mechanism takes part in neither side of it, so the
+   property holds only while every process on the volume runs the mechanism; during a mixed deployment a waiting process
+   can still lose every release, as today.
+4. **The mechanism is chosen in the implementation change**, against the tests below, executed across processes on each
+   supported platform. That change records the designs it considered and the races each one admits.
+5. **What starts the implementation.** Either the lease-hold report from production showing a cross-process waiter
+   refused `lock_contended` while the lease was being released, or the first migration that declares Amendment 3's
+   decision 3, whichever comes first. The first chunked migration does not ship before the mechanism.
+6. **The bystander's refusal while a late-named store migrates** stays Amendment 2's: a waiter that waits out its
+   deadline is refused `lock_contended`, which is retryable within the caller's own budget, never a capacity refusal.
+   This amendment adds no retry hint; one is sized from the lease-hold report when production shows the need.
+
+**Acceptance.** Each test states its process count, thread count, hold time, deadline and run count, and the change
+records each must-fail control's red rate at those settings before the mechanism lands.
+
+- `cross_process_waiter_is_admitted_under_local_traffic`: process A runs short writes through the lease from several
+  threads with no gap between holds; a waiter in process B on another database of the same volume is admitted within its
+  deadline in every run. Must-fail: today's behaviour; the settings are chosen so the control is red in every run, and
+  that rate is recorded.
+- Unchanged-guarantee control (as in Amendment 3): two writers on two databases of one volume, the first holding an
+  admitted transaction; the second is not admitted until the first settles, with the mechanism in place. Must-fail: the
+  volume lease released after the floor sample; the second is admitted early.
+
+**Effects on callers.** None at the API. Under cross-process contention a process's local throughput drops toward its
+share of the volume.
+
 ### 2. Reserve configuration and daemon coherence
 
 Every writable SQLite backend resolves two independent values:

@@ -411,6 +411,7 @@ def _run_nodaemon_control(binary):
         env["KHIVE_PID"] = pid_path_file
         env["KHIVE_LOCK"] = os.path.join(tmpdir, "khived.recovery.lock")
         env["KHIVE_PACKS"] = _DEFAULT_PACKS
+        env["KHIVE_AUDIT_SUCCESS_ROWS"] = "all"
         env["KHIVE_NO_DAEMON"] = "1"
 
         proc = subprocess.Popen(
@@ -421,6 +422,7 @@ def _run_nodaemon_control(binary):
             env=env,
         )
         _handshake(proc)
+        mbc.require_all_audit_success_rows(proc)
 
         # Minimal ingest: just first 2 notes
         corpus = generate_corpus()
@@ -487,6 +489,7 @@ def main():
         # Set KHIVE_PACKS explicitly to the default production set so that the
         # front-end and its daemon child compute identical config_id values.
         env["KHIVE_PACKS"] = _DEFAULT_PACKS
+        env["KHIVE_AUDIT_SUCCESS_ROWS"] = "all"
         # Do NOT set KHIVE_NO_DAEMON — we WANT the daemon path.
         env.pop("KHIVE_NO_DAEMON", None)
 
@@ -540,6 +543,7 @@ def main():
         while not pathlib.Path(sock_path).exists() and time.time() < deadline:
             time.sleep(0.1)
         assert_daemon_engaged(sock_path, pid_path_file, bench_db, label="main")
+        mbc.require_all_audit_success_rows(proc)
 
         # Deterministic settle: block until the ANN background rebuild
         # triggered by ingest has actually installed a corpus-covering index,

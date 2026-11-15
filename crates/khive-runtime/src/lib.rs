@@ -16,6 +16,11 @@ pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod attachment_cutover;
+pub use attachment_cutover::{
+    coordinate_attachment_cutover, coordinate_empty_secondary_attachment_cutover,
+    legacy_preference_model_count, require_secondary_attachment_empty,
+};
 pub mod audit_batch;
 pub mod audit_error;
 pub mod backend_handle;
@@ -34,6 +39,7 @@ pub mod config_ledger;
 pub mod context;
 pub mod cost_unit;
 pub mod credentials;
+pub mod node_pins;
 mod visibility_receipts;
 pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
@@ -58,6 +64,8 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
 pub mod graph_lint;
 pub mod input_schema;
@@ -68,6 +76,9 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
+pub mod node_config;
+#[cfg(test)]
+mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -98,6 +109,7 @@ pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
 pub mod resource;
+pub mod resource_admission;
 pub mod retrieval;
 pub mod runtime;
 pub mod search_audit;
@@ -178,7 +190,10 @@ pub use error::{
     WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
-pub use error_projection::runtime_error_value;
+pub use error_projection::{
+    failure_entry_parts, failure_error_disposition, runtime_error_value, FailureEntryParts,
+    FailureEntrySource,
+};
 pub use event_actor_scope::{resolve_event_actor_read_scope, EventActorReadScope};
 pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
@@ -203,6 +218,8 @@ pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
@@ -230,7 +247,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
-pub use params::deser_params;
+pub use params::{deser_params, integer_params_from_whole_floats};
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
@@ -247,9 +264,10 @@ pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken, NoteMutationHookFn,
+    NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use secret_gate_finalizer::{

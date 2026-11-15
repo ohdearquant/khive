@@ -54,6 +54,58 @@ impl ThreadRow {
     }
 }
 
+/// The selected note and the rows retained in a thread use the same mailbox view.
+fn thread_note_visible(
+    note: &Note,
+    actor_id: &str,
+    delegated: bool,
+    inherits_legacy_pool: bool,
+) -> bool {
+    let props = note.properties.as_ref();
+    let to_actor = props
+        .and_then(|props| props.get("to_actor"))
+        .and_then(Value::as_str);
+    let from_actor = props
+        .and_then(|props| props.get("from_actor"))
+        .and_then(Value::as_str);
+    if delegated {
+        to_actor.is_some_and(|recipient| {
+            is_valid_mailbox_actor_label(recipient)
+                && (from_actor == Some(actor_id) || recipient == actor_id)
+        })
+    } else {
+        addressed_recipient(props)
+            .is_some_and(|recipient| from_actor == Some(actor_id) || recipient == actor_id)
+            || (inherits_legacy_pool && legacy_recipient(props))
+    }
+}
+
+// Preserve the shared resolver's invalid-shape and ambiguity errors while
+// treating an absent valid prefix like an absent UUID at this mailbox surface.
+async fn resolve_thread_id(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+) -> Result<Option<Uuid>, RuntimeError> {
+    if let Ok(id) = raw.parse::<Uuid>() {
+        return Ok(Some(id));
+    }
+    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return runtime.resolve_prefix(token, raw).await;
+    }
+    runtime
+        .resolve_uuid_or_prefix_for_verb(token, raw, "thread")
+        .await
+        .map(Some)
+}
+
+fn invalid_after_cursor(raw: &str) -> RuntimeError {
+    let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
+    RuntimeError::InvalidInput(format!(
+        "thread: `after` cursor {raw:?} does not resolve to a message"
+    ))
+}
+
 /// Fold captured rows in physical encounter order after mailbox visibility.
 /// An outbound owner inherits the first pre-promotion read value; later inbound
 /// rows replace only the display value, never the owner's captured properties.
@@ -65,25 +117,7 @@ fn fold_thread_note(
     delegated: bool,
     inherits_legacy_pool: bool,
 ) {
-    // Apply the same shared mailbox predicates before retaining an owner.
-    let props = note.properties.as_ref();
-    let to_actor = props
-        .and_then(|props| props.get("to_actor"))
-        .and_then(Value::as_str);
-    let from_actor = props
-        .and_then(|props| props.get("from_actor"))
-        .and_then(Value::as_str);
-    let visible = if delegated {
-        to_actor.is_some_and(|recipient| {
-            is_valid_mailbox_actor_label(recipient)
-                && (from_actor == Some(actor_id) || recipient == actor_id)
-        })
-    } else {
-        addressed_recipient(props)
-            .is_some_and(|recipient| from_actor == Some(actor_id) || recipient == actor_id)
-            || (inherits_legacy_pool && legacy_recipient(props))
-    };
-    if !visible {
+    if !thread_note_visible(&note, actor_id, delegated, inherits_legacy_pool) {
         return;
     }
 
@@ -125,6 +159,7 @@ pub(crate) async fn handle_thread(
     )?;
     validate_message_projection_fields("thread", p.fields.as_deref())?;
     let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
+    let inherits_legacy_pool = caller_inherits_legacy_pool(token);
 
     // #494: order — "asc" (default, unchanged) | "desc". Closed set.
     let order = match p.order.as_deref().unwrap_or("asc") {
@@ -138,9 +173,9 @@ pub(crate) async fn handle_thread(
     };
 
     // Resolve and validate the passed ID.
-    let passed_uuid = runtime
-        .resolve_uuid_or_prefix_for_verb(token, &p.id, "thread")
-        .await?;
+    let passed_uuid = resolve_thread_id(runtime, token, &p.id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound("thread: message not found".into()))?;
 
     let (canonical_thread_id, selected_raw_thread_id, root_note): (String, Option<String>, Note) = {
         let store = runtime.notes(token)?;
@@ -148,14 +183,12 @@ pub(crate) async fn handle_thread(
             .get_note(passed_uuid)
             .await
             .map_err(|e| RuntimeError::Internal(format!("thread: get_note: {e}")))?
-            .ok_or_else(|| {
-                RuntimeError::NotFound(format!("thread: message {passed_uuid} not found"))
-            })?;
+            .ok_or_else(|| RuntimeError::NotFound("thread: message not found".into()))?;
 
-        if note.namespace != token.namespace().as_str() {
-            return Err(RuntimeError::NotFound(format!(
-                "thread: message {passed_uuid} not found"
-            )));
+        if note.namespace != token.namespace().as_str()
+            || !thread_note_visible(&note, &view.actor_id, view.delegated, inherits_legacy_pool)
+        {
+            return Err(RuntimeError::NotFound("thread: message not found".into()));
         }
         if note.kind != "message" {
             return Err(RuntimeError::InvalidInput(format!(
@@ -194,7 +227,6 @@ pub(crate) async fn handle_thread(
     const PAGE_SIZE: u32 = 200;
     let mut canonical_order: Vec<Uuid> = Vec::new();
     let mut canonical: HashMap<Uuid, ThreadRow> = HashMap::new();
-    let inherits_legacy_pool = caller_inherits_legacy_pool(token);
     let canonical_root = canonical_thread_id
         .parse::<Uuid>()
         .expect("canonical_thread_id is produced from a parsed UUID");
@@ -305,21 +337,28 @@ pub(crate) async fn handle_thread(
             let looks_like_id = raw.parse::<Uuid>().is_ok()
                 || (raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()));
             if looks_like_id {
-                let cursor_uuid = runtime
-                    .resolve_uuid_or_prefix_for_verb(token, raw, "thread")
-                    .await?;
+                let cursor_uuid = resolve_thread_id(runtime, token, raw)
+                    .await?
+                    .ok_or_else(|| invalid_after_cursor(raw))?;
                 let cursor_store = runtime.notes(token)?;
                 let cursor_note = cursor_store
                     .get_note(cursor_uuid)
                     .await
                     .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
-                    .filter(|note| note.kind == "message")
-                    .ok_or_else(|| {
-                        let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
-                        RuntimeError::InvalidInput(format!(
-                            "thread: `after` cursor {raw:?} does not resolve to a message"
-                        ))
-                    })?;
+                    .ok_or_else(|| invalid_after_cursor(raw))?;
+                if cursor_note.namespace != token.namespace().as_str()
+                    || !thread_note_visible(
+                        &cursor_note,
+                        &view.actor_id,
+                        view.delegated,
+                        inherits_legacy_pool,
+                    )
+                {
+                    return Err(invalid_after_cursor(raw));
+                }
+                if cursor_note.kind != "message" {
+                    return Err(invalid_after_cursor(raw));
+                }
                 Some(AfterCursor::Id {
                     created_at: cursor_note.created_at,
                     full_id: cursor_note.id,

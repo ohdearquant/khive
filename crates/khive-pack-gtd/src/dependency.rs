@@ -290,7 +290,11 @@ pub(crate) async fn validate_property_update(
         })?;
         let dependency_id = Uuid::parse_str(raw).map_err(|_| {
             RuntimeError::InvalidInput(format!(
-                "task properties.depends_on entry {raw:?} must be a full UUID"
+                "task properties.depends_on entry {:?} must be a full UUID",
+                khive_runtime::secret_gate::mask_for_redaction_surface(
+                    khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                    raw,
+                )
             ))
         })?;
         let canonical = dependency_id.as_hyphenated().to_string();

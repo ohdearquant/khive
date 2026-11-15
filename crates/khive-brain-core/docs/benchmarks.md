@@ -6,6 +6,8 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-brain-core`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
 | Benchmark                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
 | --------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
 | `core_primitives/apply_signal/feedback_useful`                  | 54.861 ns        | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
@@ -57,7 +59,9 @@ smoke run. Timing is an advisory comparison against rolling and fixed references
 ## Timing boundaries and state
 
 The new `feedback_posteriors` group uses target UUID 42 and 25 recall hits
-interleaved with 25 misses. It retains one entity posterior in capacity-100 state.
+interleaved with 25 misses, then one useful judgment on the target. Recall hits
+carry no per-entity evidence, so that judgment creates the one entity posterior
+retained in capacity-100 state.
 Each measured call starts from that same snapshot; cloning and restoring the
 state, allocating its map and dropping it are outside the timer. Criterion
 `iter_batched_ref` with `PerIteration` keeps one input per iteration and avoids

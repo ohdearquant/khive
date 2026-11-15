@@ -1013,20 +1013,25 @@ pub fn normalize_redundant_db_override_with_source(
         config.wal_ceiling_configured_bytes = 0;
         config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
     } else {
-        if let Some(main) = backends
-            .iter()
-            .find(|backend| backend.name == BackendId::MAIN)
-        {
-            config.db_path = match main.kind {
-                BackendKind::Sqlite => main
-                    .path
-                    .as_ref()
-                    .map(|path| khive_runtime::expand_tilde(path)),
-                BackendKind::Memory => None,
-            };
-        }
+        select_declared_main_db_path(config, backends);
     }
     Ok(force_memory)
+}
+
+/// Apply the declared main choice without re-reading CLI or environment inputs.
+pub(super) fn select_declared_main_db_path(config: &mut RuntimeConfig, backends: &[BackendConfig]) {
+    if let Some(main) = backends
+        .iter()
+        .find(|backend| backend.name == BackendId::MAIN)
+    {
+        config.db_path = match main.kind {
+            BackendKind::Sqlite => main
+                .path
+                .as_ref()
+                .map(|path| khive_runtime::expand_tilde(path)),
+            BackendKind::Memory => None,
+        };
+    }
 }
 
 fn override_matches_declared_main_backend(
@@ -1137,24 +1142,12 @@ pub(super) async fn schema_admin_requires_blob_hydrator(
     )
 }
 
-pub(super) async fn prepare_configured_storage_topology(
-    mut base_config: RuntimeConfig,
-    khive_cfg: &KhiveConfig,
-    cli_db_override: Option<&str>,
-    purpose: StorageTopologyPurpose,
-    max_readers: Option<usize>,
-    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
-) -> anyhow::Result<PreparedStorageTopology> {
-    let force_memory =
-        normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
-    let effective_backends = effective_backend_configs(&khive_cfg.backends, force_memory);
-    // Validate every physical alias before opening the first database. A
-    // targeted admin command and full server boot must reject the same mixed
-    // read-only/read-write alias topology without creating a partial set of
-    // database files.
-    validate_effective_backend_alias_modes(&effective_backends)?;
-    validate_wal_ceiling_topology(&base_config, &effective_backends, false)?;
-
+/// Re-anchor an already resolved split for the declared-backend boot path.
+/// The implicit single-backend path must retain its captured split unchanged.
+pub(super) fn reanchor_declared_events_split(
+    base_config: &mut RuntimeConfig,
+    effective_backends: &[BackendConfig],
+) {
     // ADR-170: the events split must anchor beside the store that actually
     // holds this deployment's data. The resolver derived it from
     // `base_config.db_path`, which for declared-backend configs is the
@@ -1181,6 +1174,27 @@ pub(super) async fn prepare_configured_storage_topology(
             });
         }
     }
+}
+
+pub(super) async fn prepare_configured_storage_topology(
+    mut base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    purpose: StorageTopologyPurpose,
+    max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
+) -> anyhow::Result<PreparedStorageTopology> {
+    let force_memory =
+        normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
+    let effective_backends = effective_backend_configs(&khive_cfg.backends, force_memory);
+    // Validate every physical alias before opening the first database. A
+    // targeted admin command and full server boot must reject the same mixed
+    // read-only/read-write alias topology without creating a partial set of
+    // database files.
+    validate_effective_backend_alias_modes(&effective_backends)?;
+    validate_wal_ceiling_topology(&base_config, &effective_backends, false)?;
+
+    reanchor_declared_events_split(&mut base_config, &effective_backends);
 
     // Open each declared backend, deduplicating SQLite backends by physical
     // file identity (or canonical path before creation; ADR-028 §8). Schema

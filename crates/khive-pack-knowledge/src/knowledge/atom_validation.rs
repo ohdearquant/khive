@@ -14,6 +14,30 @@ pub(super) async fn target(
     namespace: &str,
     atom: &AtomWrite,
 ) -> Result<Option<String>, RuntimeError> {
+    target_inner(reader, namespace, atom, false).await
+}
+
+pub(super) async fn target_for_admission(
+    reader: &mut dyn SqlReader,
+    namespace: &str,
+    atom: &AtomWrite,
+) -> Result<Option<String>, RuntimeError> {
+    target_inner(reader, namespace, atom, true).await
+}
+
+async fn target_inner(
+    reader: &mut dyn SqlReader,
+    namespace: &str,
+    atom: &AtomWrite,
+    typed_storage: bool,
+) -> Result<Option<String>, RuntimeError> {
+    let storage_error = |context: &str, error: khive_storage::StorageError| {
+        if typed_storage {
+            RuntimeError::Storage(error)
+        } else {
+            sql_err(context, error)
+        }
+    };
     let input = match atom {
         AtomWrite::Upsert(input) => input,
         AtomWrite::PropertiesOnly(input) => {
@@ -25,7 +49,7 @@ pub(super) async fn target(
                     label: None,
                 })
                 .await
-                .map_err(|error| sql_err("upsert_atoms domain lookup", error))?;
+                .map_err(|error| storage_error("upsert_atoms domain lookup", error))?;
             if domain.is_some() {
                 return Err(RuntimeError::InvalidInput(
                     "properties-only target is a domain; use domain verbs instead".into(),
@@ -38,7 +62,7 @@ pub(super) async fn target(
                     label: None,
                 })
                 .await
-                .map_err(|error| sql_err("upsert_atoms id lookup", error))?
+                .map_err(|error| storage_error("upsert_atoms id lookup", error))?
                 .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id}")))?;
             if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
                 return Err(RuntimeError::InvalidInput(
@@ -60,7 +84,7 @@ pub(super) async fn target(
             label: None,
         })
         .await
-        .map_err(|error| sql_err("upsert_atoms lookup", error))?;
+        .map_err(|error| storage_error("upsert_atoms lookup", error))?;
     let Some(row) = existing else {
         return Ok(None);
     };

@@ -403,3 +403,162 @@ fn materialize_refuses_an_existing_root_before_writes() {
     );
     assert_eq!(std::fs::read(existing).unwrap(), b"unchanged");
 }
+
+fn assert_binary_digest_non_regular(path: &Path, expected_class: &str) {
+    let budget = BinaryDigestBudget {
+        started: Instant::now(),
+        timeout: Duration::from_secs(5),
+        max_bytes: MAX_TOOL_BINARY_BYTES,
+    };
+    let error = hash_tool_binary(path, budget, &BinaryDigestProgress::default()).unwrap_err();
+    assert_eq!(error.kind, BinaryDigestErrorKind::Read);
+    assert_eq!(error.kind.code(), "binary_digest_read");
+    assert_eq!(error.bytes_read, 0);
+    assert_eq!(error.path_class, Some(expected_class));
+    assert_eq!(
+        error.cause.as_deref(),
+        Some("registered tool is not a regular file")
+    );
+    let detail = error.detail();
+    assert_eq!(detail["bytes_read"], 0);
+    assert_eq!(detail["path_class"], expected_class);
+    assert_eq!(detail["cause"], "registered tool is not a regular file");
+}
+
+#[test]
+fn binary_digest_nofollow_keeps_regular_bytes_and_directory_error_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("regular-tool");
+    let bytes = b"real regular tool bytes";
+    std::fs::write(&binary, bytes).unwrap();
+    let budget = BinaryDigestBudget {
+        started: Instant::now(),
+        timeout: Duration::from_secs(5),
+        max_bytes: MAX_TOOL_BINARY_BYTES,
+    };
+    let progress = BinaryDigestProgress::default();
+    assert_eq!(
+        hash_tool_binary(&binary, budget, &progress).unwrap(),
+        digest_hex(bytes)
+    );
+    assert_eq!(
+        progress.bytes_read.load(Ordering::Relaxed),
+        bytes.len() as u64
+    );
+    assert_eq!(*progress.path_class.lock().unwrap(), Some("regular_file"));
+    assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+    let directory = dir.path().join("directory-tool");
+    std::fs::create_dir(&directory).unwrap();
+    assert_binary_digest_non_regular(&directory, "directory");
+}
+
+struct BoundedDigestChild {
+    child: std::process::Child,
+    cleanup_attempted: bool,
+}
+
+impl BoundedDigestChild {
+    fn stop_and_reap(&mut self) -> bool {
+        self.cleanup_attempted = true;
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn wait_bounded(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("poll binary digest FIFO child")
+            {
+                self.cleanup_attempted = true;
+                return status;
+            }
+            if Instant::now() >= deadline {
+                assert!(
+                    self.stop_and_reap(),
+                    "binary digest FIFO child exceeded the reap deadline"
+                );
+                panic!("binary digest FIFO open waited for a writer");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for BoundedDigestChild {
+    fn drop(&mut self) {
+        if !self.cleanup_attempted {
+            let _ = self.stop_and_reap();
+        }
+    }
+}
+
+const DIGEST_FIFO_PATH: &str = "KHIVE_EXEC_NOFOLLOW_FIFO_PATH";
+const DIGEST_FIFO_MARKER: &str = "KHIVE_EXEC_NOFOLLOW_FIFO_MARKER";
+
+#[test]
+#[ignore = "invoked only by binary_digest_fifo_refusal_is_bounded_and_keeps_details in an owned child"]
+fn binary_digest_fifo_child_case() {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let path = PathBuf::from(std::env::var_os(DIGEST_FIFO_PATH).expect("binary digest FIFO path"));
+    let marker =
+        PathBuf::from(std::env::var_os(DIGEST_FIFO_MARKER).expect("binary digest FIFO marker"));
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_fifo());
+    assert_binary_digest_non_regular(&path, "other");
+    std::fs::write(marker, b"binary digest FIFO refusal checked").unwrap();
+}
+
+#[test]
+fn binary_digest_fifo_refusal_is_bounded_and_keeps_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("digest-fifo");
+    let marker = dir.path().join("digest-done");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is NUL-terminated and remains alive for mkfifo.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let child_name = concat!(module_path!(), "::binary_digest_fifo_child_case");
+    let (_, child_name) = child_name
+        .split_once("::")
+        .expect("crate-qualified child test");
+    let mut child = BoundedDigestChild {
+        child: std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                child_name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DIGEST_FIFO_PATH, &fifo)
+            .env(DIGEST_FIFO_MARKER, &marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn binary digest FIFO child"),
+        cleanup_attempted: false,
+    };
+    assert!(
+        child.wait_bounded().success(),
+        "binary digest FIFO child failed"
+    );
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"binary digest FIFO refusal checked"
+    );
+}

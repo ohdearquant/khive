@@ -151,7 +151,15 @@ pub fn last_writer_stage_observation(pool: &ConnectionPool) -> Option<WriterStag
         .cloned()
 }
 
+#[cfg(test)]
+trait TestWriterStageClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn at_commit(&self);
+}
+
 struct WriteTelemetry {
+    #[cfg(test)]
+    test_clock: Option<std::sync::Arc<dyn TestWriterStageClock>>,
     backend_key: Option<PathBuf>,
     db: String,
     submitted_at: Instant,
@@ -169,6 +177,8 @@ impl WriteTelemetry {
         labels: SubmitLabels,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            test_clock: None,
             backend_key,
             db,
             submitted_at: Instant::now(),
@@ -263,6 +273,9 @@ pub struct WriteRequest<R: Send + 'static> {
     /// Only the typed checkpoint entry point may bypass disk admission.
     checkpoint_bypass: bool,
     vacuum_copy_headroom: bool,
+    /// The lease class of the issuing thread's scope when the request was
+    /// queued, applied on the writer thread when it takes the volume lease.
+    lease_class: crate::disk_guard::WriteClassContext,
     telemetry: WriteTelemetry,
     admission: Option<AdmissionObservation>,
 }
@@ -351,6 +364,9 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
 
     fn needs_vacuum_headroom(&self) -> bool;
 
+    /// The issuing thread's lease-class context, captured when it was queued.
+    fn lease_class(&self) -> crate::disk_guard::WriteClassContext;
+
     /// Time from the caller constructing this request (before bounded-channel
     /// admission) until the writer task dequeued it.
     fn queue_wait(&self) -> Duration;
@@ -401,8 +417,15 @@ pub(crate) fn execute_wrapped_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    let profiled =
-        execute_wrapped_transaction_profiled(conn, commit_operation, None, false, operation);
+    let profiled = execute_wrapped_transaction_profiled(
+        conn,
+        commit_operation,
+        None,
+        false,
+        operation,
+        #[cfg(test)]
+        None,
+    );
     (profiled.result, profiled.terminal_state)
 }
 
@@ -417,8 +440,15 @@ pub(crate) fn execute_wrapped_sql_bridge_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    let profiled =
-        execute_wrapped_transaction_profiled(conn, commit_operation, Some(db), true, operation);
+    let profiled = execute_wrapped_transaction_profiled(
+        conn,
+        commit_operation,
+        Some(db),
+        true,
+        operation,
+        #[cfg(test)]
+        None,
+    );
     (profiled.result, profiled.terminal_state)
 }
 
@@ -435,23 +465,44 @@ fn execute_wrapped_transaction_profiled<R, F>(
     db: Option<&str>,
     direct_sql_bridge: bool,
     operation: F,
+    #[cfg(test)] test_clock: Option<&dyn TestWriterStageClock>,
 ) -> ProfiledWrappedTransaction<R>
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
     let body_started = Instant::now();
+    #[cfg(test)]
+    let body_started = test_clock.map_or(body_started, TestWriterStageClock::now);
     // Keep panic-to-terminal conversion local to this adapter; the public
     // WriterGuard transaction intentionally propagates the callback's unwind.
     let operation_outcome = catch_unwind(AssertUnwindSafe(|| {
         operation(conn).map_err(crate::error::statement_failure)
     }));
+    #[cfg(not(test))]
     let body = body_started.elapsed();
+    #[cfg(test)]
+    let body = test_clock.map_or_else(
+        || body_started.elapsed(),
+        |clock| clock.now().duration_since(body_started),
+    );
 
     match operation_outcome {
         Ok(Ok(value)) => {
             let commit_started = Instant::now();
+            #[cfg(test)]
+            let commit_started = test_clock.map_or(commit_started, TestWriterStageClock::now);
+            #[cfg(test)]
+            if let Some(clock) = test_clock {
+                clock.at_commit();
+            }
             let commit_outcome = conn.execute_batch("COMMIT");
+            #[cfg(not(test))]
             let commit = commit_started.elapsed();
+            #[cfg(test)]
+            let commit = test_clock.map_or_else(
+                || commit_started.elapsed(),
+                |clock| clock.now().duration_since(commit_started),
+            );
             match commit_outcome {
                 Ok(()) if conn.is_autocommit() => ProfiledWrappedTransaction {
                     result: Ok(value),
@@ -622,6 +673,8 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             Some(&telemetry.db),
             false,
             op,
+            #[cfg(test)]
+            telemetry.test_clock.as_deref(),
         );
         if let Err(error) = &profiled.result {
             crate::timeout_sink::maybe_emit_sqlite_full(&telemetry.db, error);
@@ -757,6 +810,10 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
 
     fn needs_vacuum_headroom(&self) -> bool {
         self.vacuum_copy_headroom
+    }
+
+    fn lease_class(&self) -> crate::disk_guard::WriteClassContext {
+        self.lease_class
     }
 
     fn queue_wait(&self) -> Duration {
@@ -932,6 +989,7 @@ impl WriterTaskHandle {
             top_level,
             checkpoint_bypass,
             vacuum_copy_headroom,
+            lease_class: crate::disk_guard::WriteClassContext::capture(),
             telemetry,
             admission: None,
         });
@@ -1403,6 +1461,10 @@ async fn run_writer_task(
     write_admission: Arc<crate::pool::WriteAdmission>,
     busy_timeout: Duration,
 ) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Err(error) = crate::test_hooks::adopt(&mut owner.0) {
+        tracing::error!(%error, "writer task: test hook registration failed");
+    }
     while let Some(mut request) = rx.recv().await {
         // The bounded-channel wait ends at this exact dequeue boundary.
         // Sampling inside the blocking closure would misattribute a saturated
@@ -1418,6 +1480,9 @@ async fn run_writer_task(
         let conn = owner.0;
         let blocking_sink_lease = owner.1.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            // The issuer's lease class applies on this thread, so the lease
+            // taken below is recorded as what the issuer's work is for.
+            let _lease_class = request.lease_class().enter();
             let outcome = (|| {
                 let mut conn = BlockingWriterConnection::new(conn, Arc::clone(&blocking_admission));
                 let acquisition_counters = blocking_counters;
@@ -1441,7 +1506,12 @@ async fn run_writer_task(
                 conn.volume_lease = if request.is_checkpoint_bypass() {
                     None
                 } else {
-                    match blocking_admission.acquire() {
+                    let class = if request.needs_vacuum_headroom() {
+                        crate::disk_guard::LeaseClass::Maintenance
+                    } else {
+                        crate::disk_guard::LeaseClass::WriterTask
+                    };
+                    match blocking_admission.acquire(class) {
                         Ok(lease) => lease,
                         Err(error) => {
                             request.reply_error(error.into_storage_error(

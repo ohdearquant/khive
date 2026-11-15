@@ -63,7 +63,6 @@ cd "$SCRIPT_DIR/../crates"
 CRATES=(
     khive-lion-core      # copied kernel; no khive-* dependencies
     khive-types
-    khive-capability
     khive-score
     khive-quant
     khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first
@@ -75,6 +74,7 @@ CRATES=(
     khive-bm25
     khive-fusion
     khive-db
+    khive-capability     # needs khive-db and khive-storage (above); no workspace crate depends on it
     khive-hnsw
     khive-query
     khive-gate
@@ -152,8 +152,7 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # `make publish-dry` validates SemVer before any real publish. The shared exclude
 # list covers pre-1.0 surfaces still moving under active development, including
 # some crates that already have a crates.io baseline. Its full policy lives in
-# scripts/lib/semver_excludes.txt (#568), also consumed by release.yml so the two
-# gates cannot drift out of sync with each other.
+# scripts/lib/semver_excludes.txt (#568).
 echo ""
 # The gate rebuilds every crate's rustdoc against its crates.io baseline. When it
 # already ran at this exact commit on another machine (the release dry run), the

@@ -80,37 +80,73 @@ pub(super) fn is_credential_token_label(label: &str) -> bool {
 /// Finds a canonical compound credential label beginning at an identifier
 /// boundary. The trailing edge is deliberately unbounded so version suffixes
 /// and larger underscore-composed labels remain protected.
-fn compound_trigger(low_text: &str) -> Option<&'static str> {
+fn compound_trigger(low_contexts: &[&str]) -> Option<&'static str> {
     COMPOUND_TRIGGER_WORDS.iter().copied().find(|needle| {
-        let mut start = 0;
-        while let Some(rel) = low_text[start..].find(needle) {
-            let abs = start + rel;
-            let before_ok = abs == 0
-                || low_text[..abs]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|c| !c.is_ascii_alphanumeric());
-            if before_ok {
-                return true;
+        low_contexts.iter().any(|low_text| {
+            let mut start = 0;
+            while let Some(rel) = low_text[start..].find(needle) {
+                let abs = start + rel;
+                let before_ok = abs == 0
+                    || low_text[..abs]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric());
+                if before_ok {
+                    return true;
+                }
+                start = abs + needle.len();
             }
-            start = abs + needle.len();
-        }
-        false
+            false
+        })
     })
 }
 
 pub(super) fn find_trigger(text: &str, credential_label_only: bool) -> Option<&'static str> {
     let low = text.to_ascii_lowercase();
+    find_trigger_lowercase_contexts(&[&low], credential_label_only)
+}
+
+/// Search disjoint context slices without joining across an excluded path.
+/// Vocabulary/category priority stays the same as a single context search.
+pub(super) fn find_trigger_in_contexts(
+    contexts: &[&str],
+    credential_label_only: bool,
+) -> Option<&'static str> {
+    let lowercase: Vec<String> = contexts
+        .iter()
+        .map(|context| context.to_ascii_lowercase())
+        .collect();
+    let lowercase: Vec<&str> = lowercase.iter().map(String::as_str).collect();
+    find_trigger_lowercase_contexts(&lowercase, credential_label_only)
+}
+
+fn find_trigger_lowercase_contexts(
+    low_contexts: &[&str],
+    credential_label_only: bool,
+) -> Option<&'static str> {
     TRIGGER_WORDS
         .iter()
         .copied()
-        .find(|tw| contains_bounded_word(&low, tw))
-        .or_else(|| compound_trigger(&low))
+        .find(|tw| {
+            low_contexts
+                .iter()
+                .any(|low| contains_bounded_word(low, tw))
+        })
+        .or_else(|| compound_trigger(low_contexts))
         .or_else(|| {
-            ((!credential_label_only && has_standalone_token(&low)) || has_token_assignment(&low))
+            low_contexts
+                .iter()
+                .any(|low| {
+                    (!credential_label_only && has_standalone_token(low))
+                        || has_token_assignment(low)
+                })
                 .then_some("token")
         })
-        .or_else(|| assignment_credential_trigger(&low))
+        .or_else(|| {
+            low_contexts
+                .iter()
+                .find_map(|low| assignment_credential_trigger(low))
+        })
 }
 
 /// Detect a credential-bearing assignment label before an `=` or `:`.

@@ -2,6 +2,7 @@
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::FoldError;
@@ -94,6 +95,37 @@ pub trait Anchor: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BfsAnchor;
 
+// Rebuild from the public vectors for each traversal. Keep the first node for a
+// repeated ID and preserve edge insertion order within each adjacency list.
+struct TraversalIndex<'a> {
+    nodes: HashMap<Uuid, &'a AnchorRef>,
+    neighbors: HashMap<Uuid, Vec<Uuid>>,
+}
+
+impl<'a> TraversalIndex<'a> {
+    fn new(graph: &'a AnchorGraph, reverse: bool) -> Self {
+        let mut nodes = HashMap::new();
+        for node in &graph.nodes {
+            nodes.entry(node.id).or_insert(node);
+        }
+
+        let mut neighbors: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (from, to, _) in &graph.edges {
+            let (key, neighbor) = if reverse { (*to, *from) } else { (*from, *to) };
+            neighbors.entry(key).or_default().push(neighbor);
+        }
+        Self { nodes, neighbors }
+    }
+
+    fn find_node(&self, id: Uuid) -> Option<&'a AnchorRef> {
+        self.nodes.get(&id).copied()
+    }
+
+    fn neighbors(&self, id: Uuid) -> impl Iterator<Item = Uuid> + '_ {
+        self.neighbors.get(&id).into_iter().flatten().copied()
+    }
+}
+
 impl Anchor for BfsAnchor {
     fn trace(
         &self,
@@ -104,6 +136,10 @@ impl Anchor for BfsAnchor {
         if graph.find_node(start.id).is_none() {
             return Err(FoldError::AnchorNotFound(start.id.to_string()));
         }
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let index = TraversalIndex::new(graph, false);
 
         let mut visited = std::collections::HashSet::new();
         let mut result = Vec::new();
@@ -113,13 +149,13 @@ impl Anchor for BfsAnchor {
         queue.push_back((start.id, 0usize));
 
         while let Some((current_id, depth)) = queue.pop_front() {
-            if let Some(node) = graph.find_node(current_id) {
+            if let Some(node) = index.find_node(current_id) {
                 if current_id != start.id {
                     result.push(node.clone());
                 }
 
                 if depth < max_depth {
-                    for (next_id, _rel) in graph.outgoing(current_id) {
+                    for next_id in index.neighbors(current_id) {
                         if visited.insert(next_id) {
                             queue.push_back((next_id, depth + 1));
                         }
@@ -140,6 +176,10 @@ impl Anchor for BfsAnchor {
         if graph.find_node(outcome.id).is_none() {
             return Err(FoldError::AnchorNotFound(outcome.id.to_string()));
         }
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let index = TraversalIndex::new(graph, true);
 
         let mut visited = std::collections::HashSet::new();
         let mut result = Vec::new();
@@ -150,16 +190,16 @@ impl Anchor for BfsAnchor {
 
         while let Some((current_id, depth, weight)) = queue.pop_front() {
             if current_id != outcome.id {
-                if let Some(node) = graph.find_node(current_id) {
+                if let Some(node) = index.find_node(current_id) {
                     result.push((node.clone(), weight));
                 }
             }
 
             if depth < max_depth {
-                let predecessors: Vec<(Uuid, f64)> = graph
-                    .incoming(current_id)
-                    .filter(|(id, _)| visited.insert(*id))
-                    .map(|(id, _)| (id, weight * 0.5))
+                let predecessors: Vec<(Uuid, f64)> = index
+                    .neighbors(current_id)
+                    .filter(|id| visited.insert(*id))
+                    .map(|id| (id, weight * 0.5))
                     .collect();
 
                 for (pred_id, pred_weight) in predecessors {

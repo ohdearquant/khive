@@ -33,6 +33,10 @@ mod remote_cache_perf_tests;
 #[path = "remote_cache_recovery_tests.rs"]
 mod remote_cache_recovery_tests;
 
+#[cfg(test)]
+#[path = "ndjson_export_tests.rs"]
+mod ndjson_export_tests;
+
 /// Per-record entity shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEntity {
@@ -72,6 +76,128 @@ struct NdjsonEdge {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+/// Write canonical ADR-020 entity records, each terminated by LF.
+///
+/// The input is borrowed and unchanged. Empty input emits no bytes. This
+/// writer flushes buffered bytes but does not publish or sync a file; an
+/// error can leave partial bytes in the caller's sink.
+pub fn write_entities_ndjson<W: Write + ?Sized>(
+    records: &[ExportedEntity],
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut sorted: Vec<_> = records.iter().collect();
+    sorted.sort_by_key(|record| record.id);
+    let mut writer = BufWriter::new(writer);
+    for record in sorted {
+        write_export_ndjson_record(&mut writer, &ExportNdjsonEntity(record))?;
+    }
+    writer.flush()
+}
+
+/// Write canonical ADR-020 edge records, each terminated by LF.
+///
+/// Rows are ordered by their stored source, target and canonical relation
+/// string. Invalid weights are refused before any edge bytes are emitted.
+/// Structural graph validation remains the sync reader's responsibility.
+pub fn write_edges_ndjson<W: Write + ?Sized>(
+    records: &[ExportedEdge],
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut sorted = Vec::with_capacity(records.len());
+    for record in records {
+        if !khive_types::validate_edge_weight(record.weight) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "edge {}: weight {} must be finite and in [0.0, 1.0]",
+                    record.edge_id, record.weight
+                ),
+            ));
+        }
+        sorted.push((record, record.relation.as_str()));
+    }
+    sorted.sort_by(|a, b| (a.0.source, a.0.target, a.1).cmp(&(b.0.source, b.0.target, b.1)));
+    let mut writer = BufWriter::new(writer);
+    for (record, relation) in sorted {
+        write_export_ndjson_record(&mut writer, &ExportNdjsonEdge { record, relation })?;
+    }
+    writer.flush()
+}
+
+fn write_export_ndjson_record<W: Write + ?Sized, T: Serialize>(
+    writer: &mut W,
+    record: &T,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, record).map_err(|error| {
+        let kind = error.io_error_kind().unwrap_or(ErrorKind::InvalidData);
+        std::io::Error::new(kind, error)
+    })?;
+    writer.write_all(b"\n")
+}
+
+// These wire adapters retain provenance and ADR-020 field order. The snapshot
+// hash's canonical archive adapters intentionally have a different projection.
+struct ExportNdjsonEntity<'a>(&'a ExportedEntity);
+
+impl Serialize for ExportNdjsonEntity<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let record = self.0;
+        let mut tags: Vec<_> = record.tags.iter().map(String::as_str).collect();
+        tags.sort_unstable();
+        let mut map =
+            serializer.serialize_map(Some(if record.entity_type.is_some() { 9 } else { 8 }))?;
+        map.serialize_entry("id", &record.id)?;
+        map.serialize_entry("kind", &record.kind)?;
+        if let Some(entity_type) = &record.entity_type {
+            map.serialize_entry("entity_type", entity_type)?;
+        }
+        map.serialize_entry("name", &record.name)?;
+        map.serialize_entry("description", &record.description)?;
+        map.serialize_entry(
+            "properties",
+            &record.properties.as_ref().map(crate::hash::SortedValue),
+        )?;
+        map.serialize_entry("tags", &tags)?;
+        map.serialize_entry("created_at", &record.created_at.to_rfc3339())?;
+        map.serialize_entry("updated_at", &record.updated_at.to_rfc3339())?;
+        map.end()
+    }
+}
+
+struct ExportNdjsonEdge<'a> {
+    record: &'a ExportedEdge,
+    relation: &'a str,
+}
+
+impl Serialize for ExportNdjsonEdge<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let record = self.record;
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("edge_id", &record.edge_id)?;
+        map.serialize_entry("source", &record.source)?;
+        map.serialize_entry("target", &record.target)?;
+        map.serialize_entry("relation", self.relation)?;
+        map.serialize_entry("weight", &record.weight)?;
+        map.serialize_entry(
+            "properties",
+            &record.properties.as_ref().map(crate::hash::SortedValue),
+        )?;
+        map.serialize_entry("created_at", &record.created_at.to_rfc3339())?;
+        map.serialize_entry("updated_at", &record.updated_at.to_rfc3339())?;
+        map.end()
+    }
 }
 
 /// Parse a present RFC3339 timestamp exactly; only absence uses `fallback`.

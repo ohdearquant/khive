@@ -38,6 +38,9 @@ registered object points at each capability it implements with an `implements` e
 unique per namespace; re-registering an existing name returns the existing object and links any
 new capabilities without changing its properties. `tool.register(name, kind, description, schema, source, side_effect, trust, capabilities, tags)` creates the object; `kind` defaults to `tool`, `side_effect` to `write` and `trust` to `external`.
 
+[Amendment 10](#amendment-10-2026-11-14-correcting-an-existing-registration) qualifies
+the existing-name behavior of `tool.register`; `tool.ingest` keeps the original behavior.
+
 **Discovery.** `tool.suggest(query, limit, kind, actor)` runs two arms and merges them: hybrid
 search over the registry, and hybrid search over capability concepts expanded through their
 `implements` edges to the objects that implement them, scored at nine tenths of the concept hit.
@@ -98,6 +101,8 @@ Re-registration does not update properties; pattern matching is prefix only; the
 best effort and reported in `notified`; capability expansion reads up to fifty implementers per
 concept; the grants table is pack-local until the grants primitive exists. These are listed for the
 audit pass, not hidden.
+
+The re-registration limitation is addressed by Amendment 10 for `tool.register`.
 
 ## Amendment 1 (2026-09-10): a grant resolves on the registry row, not on the name
 
@@ -697,8 +702,7 @@ Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.
 
 ## Amendment 7 (2026-10-21): a unit checks the grant it holds, by id, on the writer it was handed
 
-**Status: Proposed; this amendment requires hash sign-off before the dependent
-implementation merges.**
+**Status: Accepted 2026-10-22.** It does not change the status of the base ADR or of earlier amendments.
 
 `decide` (`crates/khive-pack-tool/src/policy.rs:872` at `98508c8f`) finds a live grant through
 `select_active_grant` (`:371`), which reads `tool_grants` on a pooled reader of its own,
@@ -856,3 +860,510 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    non-retryable one (`Probe`), so a retry keyed on that variant's retryability turns one of the two red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
+
+## Amendment 8 (2026-10-27): an approval can cover one program run by an interpreter
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent implementation merges.** It amends
+[ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+item 1 for one property and adds fields to Amendment 6's decision event. It does not change the status of the base
+ADR or of earlier amendments.
+
+A tool whose registered executable is an interpreter (`source` `exec:/.../python3.12`, a shell, a JavaScript runtime)
+runs whatever program the caller's `args` name. A grant on that tool therefore approves every program the actor will
+ever run with it, and an approver asked to allow one weekly script has to approve all scripts or none. The registration
+today pins the executable's path, side effect, trust and schema (Amendment 1 item 1; `crates/khive-pack-tool/src/pin.rs`,
+`policy_inputs`); `exec.run` passes the caller's `args` after the registered path unchanged
+(`crates/khive-pack-exec/src/handlers.rs`, the launch in `execute`). Nothing an approver can see names the program.
+
+Amendment 4 item 7 names this question and leaves it open: a grant's `scope` is free text and decides nothing, and
+making it binding would change what rows already granted allow. This amendment answers it without touching grants.
+
+1. **The program is part of the registration.** `tool.register` takes an optional `program` object on a tool whose
+   `source` is `exec:`. It is versioned and closed:
+
+   - `version`: `1`.
+   - `fixed_args`: a non-empty array; each element is either a string (a literal argument) or `{path, content_ref}`,
+     a file in the run's input tree named by its path relative to the tree root and the content ref that file must have.
+   - `extra_args`: `"none"` (the caller may pass no `args`) or `"append"` (the caller's `args` follow the fixed ones).
+     Required; there is no default.
+   - `tree`: optional; an input tree id the run must equal exactly.
+
+   Unknown keys, an unknown version, a null, an empty `fixed_args`, a NUL byte, an element that is neither form, a
+   path that is absolute, empty or contains `.` or `..` components, and a value over the size limits fixed by the
+   implementation plan are refused at registration, each with its reason named. So is a program whose `extra_args`
+   is `"append"` and whose `fixed_args` hold no file element, because the caller's arguments would then name the
+   program. A program of literals only is accepted under `"none"`, where the whole command is fixed.
+
+2. **It joins the pinned inputs only on rows that carry it.** When a row has a `program` key, the whole stored object
+   joins Amendment 1's policy inputs, serialized by the one canonical function (Amendment 2,
+   `khive_types::canonical_json_bytes`). A row without the key keeps its four inputs byte for byte, so no stored grant
+   changes meaning: the absent key is never written as `null`, which would move every existing digest. A grant on a
+   row carrying `program` approves that program and nothing else, because the grant's pin is the row id and the digest
+   over those inputs (Amendment 1 items 1 and 2).
+
+3. **A revised program is a new registration.** Re-registering an existing name returns the stored row unchanged
+   (Decision, `tool.register`; test `re_registration_updates_definition_and_invalidates_only_mismatched_grants`), so editing a script cannot update its approval in place. A revised script, constraint
+   or interpreter is registered under a new name and granted again, as ADR-181 Amendment 14 already rules for an
+   upgraded executable. `tool.register` on an existing name with a passed `program` that differs from the stored one
+   is refused, on both paths that return an existing row (the name lookup and the losing side of a concurrent claim),
+   before any capability is linked. An omitted `program` returns the stored row and never removes a restriction. No
+   update verb is added.
+
+4. **Every decision source is held to the program.** `exec.run` builds the run from the stored definition: the
+   registered executable, then `fixed_args` in order (a file element contributes its path as one argument), then the
+   caller's `args` only when `extra_args` is `"append"`. Before materializing anything it checks, on the entries it is
+   about to materialize: each file element names a regular file (mode 644 or 755, not a symbolic link, with no
+   symbolic link among its parent directories) whose content ref equals the stored one; `cwd` is the tree root; the
+   tree id equals `tree` when one is stored; and no `args` were passed under `"none"`. A failed check refuses the run
+   whatever answered the policy question. This matters because a grant that does not match falls through to policy
+   and then to the side-effect default (`decide` in `crates/khive-pack-tool/src/policy.rs`), so a program constraint
+   enforced only as "the grant stops matching" would let a policy `allow`, or the `read` default, run a mismatching
+   program. A run that passes the policy question and fails this check is a refusal, not a different grant search.
+
+5. **The interpreter's bytes are pinned too.** A row carrying `program` also carries `executable_digest`, and the run
+   executes the staged copy whose digest was compared, under ADR-181 Amendment 14's staging, deadline, size cap and
+   cleanup rules. This amends Amendment 14 item 1, which today requires `executable_digest` when `network` is passed
+   and refuses it otherwise: the key is required when `network` or `program` is passed and refused when neither is. A
+   `program` row without `network` gets no network and needs no network host setting; its refusals name the program
+   condition that failed, not a network one. Replacing the interpreter at its registered path would otherwise change
+   the meaning of every approved program without moving any pin.
+
+6. **The receipts say which definition approved the run.** Amendment 6's `tool_check_decided` event gains the registry
+   id and definition digest the decision was evaluated against, and for `exec.run` the run's receipt id (null for
+   `tool.check`). The exec receipt records, outside its `sandbox` block so that a preflight refusal carries it: the
+   canonical program object or a content ref to its exact bytes, its BLAKE3 digest, the input tree id, the caller's
+   `args`, the effective argument vector, each file element's expected and observed content ref and mode, the expected
+   and observed executable digest, and a validation state of `not_checked`, `matched`, `mismatch` or `invalid` with the
+   failed condition named. An `allow` event beside a refused receipt is a valid pair: the policy question and the run's
+   admission are separate answers, as ADR-181 Amendment 14 item 7 already states for networked rows.
+
+7. **Amendment 7 is unchanged.** Its by-id entry keeps its signature and predicate. Its pin now covers the program
+   when the row carries one, and its `true` still means only that the grant is live for that pin; it never asserts that
+   a particular run matches. A caller consuming on the strength of a grant validates the run separately.
+
+### What this does not cover
+
+An approval covers the registered executable's bytes and the fixed argument definition, and `exec.run` checks the
+declared files and, when stored, the whole input tree before launch. It does not identify every file, module,
+subprocess or download the program loads, prove that appended arguments are harmless, or make the run's files
+read-only. Each limit, with what shows it:
+
+- Other tree files are not pinned unless `tree` is stored: a module beside the script that the script imports changes
+  what runs. With `tree` stored the changed tree is refused, which says nothing about whether the approved tree was
+  benign.
+- Host libraries and configured read roots are outside the tree, as ADR-181 Amendment 14 states for executables (its
+  section on what a networked grant approves, item 8).
+- The caller's environment is not bound. Allowed environment keys can carry loader settings (for Python,
+  `PYTHONPATH`), and `HOME` is the run directory, so a tree can carry per-user startup files. An approver who wants an
+  interpreter's isolation mode puts its flag among `fixed_args` (for Python, `-I`); khive does not add flags, classify
+  interpreters or claim that any loader path is closed.
+- Materialized input files are writable, so the program can change a pinned file before it reads it again.
+- An interpreter that evaluates its input, or a networked row that fetches code (ADR-181 Amendment 13), runs code no pin
+  names.
+- `"append"` is broader than `"none"` by design, not certified safe: an appended argument can change what a pinned
+  program does. khive does not interpret an interpreter's argument grammar, so the refusal in item 1 closes only the
+  shape with no file element. A file element in an option position (for example a module the interpreter loads before
+  its program) still leaves the appended arguments free to name the program that runs after it. The approver reads
+  `fixed_args` and `extra_args` before granting.
+- The approval is reusable for the life of the grant. "Exactly one execution" needs a consumption protocol, which this
+  amendment does not specify.
+- Approval cardinality: one registration per program revision and invocation contract. If real traffic needs many
+  short-lived approvals of different subsets of one unchanged tool, the constraint belongs on the grant instead (a
+  nullable grant column, a run-aware selection and an Amendment 7 rule); that case would falsify the choice here and
+  reopens it.
+
+### Relation to immutable tool definitions
+
+A later grant model that keeps tool definitions as immutable, digest-addressed records and binds each grant to the
+exact definition digest takes a `program` row losslessly: the program is part of the definition, and the grant binds
+its digest. This amendment does not depend on such a model.
+
+### Acceptance for Amendment 8
+
+Each arm names its must-fail control, stated before the run. Every refusal arm has an otherwise identical passing
+control and asserts that no child process was spawned.
+
+1. Legacy bytes. Rows without `program`, and network-only rows once Amendments 13 and 14 are implemented, produce the
+   same canonical input bytes and the same decisions as before. A `program` key moves the digest; each nested field
+   (literal, path, content ref, `extra_args`, `tree`, `version`) moves it independently; key order does not, argument
+   order does. Control: write `program: null` into every row's inputs; the first assertion goes red.
+2. Registration lifecycle. A conflicting `program` on an existing name is refused, serially and on both orders of a
+   forced concurrent claim; the stored row, its grants and its capability links are unchanged. An identical or omitted
+   `program` returns the stored row. A revision under a new name gets a new registry id, and a grant on the old row does
+   not allow it. Control: compare only on the name lookup path; the concurrent arm goes red.
+3. Argument vector. A marker program receives exactly the fixed literals, the file paths and the permitted suffix;
+   arguments with spaces and quotes stay single arguments; `"none"` refuses any suffix; under `"append"` a suffix that
+   changes the fixture's behaviour runs, showing that `"append"` admits more than the fixed program. Control: spawn
+   with the caller's `args` in place of the built vector.
+4. File identity. Changed bytes at the pinned path, a missing entry, a symbolic link entry and a symbolic link parent
+   are each refused; a matching regular file runs. Control: check the path only, ignoring content ref and mode.
+5. Working directory. The root runs; a subdirectory holding a same-named different script is refused, and so is a
+   symbolic link resolving to the root. Rows without `program` keep accepting a valid subdirectory. Control: join the
+   requested `cwd` silently.
+6. Whole tree. Without `tree` an unrelated data file change runs; with `tree` it is refused; a changed pinned script is
+   refused in both. Control: ignore `tree`.
+7. Every allow source. A mismatching run is refused under a grant, an explicit policy `allow` and the `read` default.
+   Control: validate only when the decision source is `grant`; the policy and default arms go red.
+8. Interpreter bytes. A replaced interpreter before staging is refused; a replacement after staging leaves the run on
+   the compared copy; a `program` row without `network` runs with no network. Control: execute the registered path
+   after the comparison.
+9. Loading limits, per interpreter claimed. For Python: separate fixtures plant a module beside the script, a per-user
+   startup file under `HOME`, and a module on an allowed `PYTHONPATH`, each printing a marker. Each marker is first
+   shown to load without isolation on that exact interpreter, then shown absent with `-I` among `fixed_args`. An
+   interpreter or version not present is reported as not run, never as passed. Control: remove `-I`.
+10. Receipts. A grant-allowed, file-mismatching run leaves one `allow` event naming the definition and the run and a
+    correlated refused receipt in state `mismatch`; `tool.check` leaves no match state; an event append failure prevents
+    the launch; a passing run's recorded argument vector equals the spawned one and its recorded program bytes rehash to
+    its recorded digest. Control: record `matched` at the policy answer, before the file checks.
+11. Malformed state. A malformed, null or unknown-version `program`, a non-`exec` source, a bad content ref or digest,
+    an unsafe path and an argument list one over each size limit are refused at registration and again at run time when
+    written straight to storage, whatever policy answers. Controls: read a malformed `program` as absent; default
+    `extra_args` to `"append"`; remove one size limit. A program with `extra_args` `"append"` and no file element is
+    refused at registration and at run time, and the same literals under `"none"` register and run. Control: accept a
+    flag-only `"append"` row; the refusal arm goes red.
+
+The implementation stores `program` in the registry row's existing properties and adds no grant or policy column. Its
+receipt fields may need a migration, numbered when the change is written. Before release it confirms that no stored row
+already carries a `program` property; if any does, the key is renamed before this ships rather than giving old rows a
+new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is implemented.
+
+## Amendment 10 (2026-11-14): correcting an existing registration
+
+**Status: Accepted 2026-11-14 (#6616).** Refs #6597. This qualifies the Decision's existing-name
+behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest` and
+the grant pin predicate unchanged. The network, executable and program
+declaration rules keep their content and their governing amendments' status;
+item 4 checks them against the corrected row as a whole. The statements of the
+old existing-name contract are listed at the end with what happens to each.
+
+1. **Supplied fields correct the same row.** A public registration resolves the
+   name in the request's write namespace. A live existing row keeps its UUID,
+   name spelling, namespace, creation time, `registered_at` and unrelated
+   properties. Nonnull supplied `description`, `side_effect`, `trust` and
+   `schema` replace those fields, subject to items 4 and 5. On every existing
+   row, a supplied nonnull `source` or `kind` that differs from the stored
+   value is refused; equal values are not changes. A different source or kind
+   is registered under a new name, for the reason in item 4. Schema replacement
+   is whole-object, including nested members; `{}` stores an empty object.
+   Omitted and null fields preserve stored values. Incoming field validation
+   remains in force, and creation retains its current defaults. Tags are
+   part of the row: a supplied tag the row does not carry is added, no stored
+   tag is removed, and a call whose supplied tags are all stored leaves them
+   as they are. Capability links are not part of the row and are only added.
+   No removal operation is introduced.
+   A stored schema or description therefore cannot be cleared: a correction
+   can replace the schema with `{}`, a description must be a nonempty string,
+   and omitting either field or passing null keeps the stored value.
+
+2. **The result distinguishes row outcomes.** Creation returns `created:true`,
+   `updated:false`, `unchanged:false`. An existing row correction returns
+   `created:false`, `updated:true`, `unchanged:false`. An equal row returns
+   `created:false`, `updated:false`, `unchanged:true` without advancing its
+   revision or update timestamp. A call that adds a tag and changes nothing
+   else is a correction: it returns `updated:true` and advances the revision.
+   These flags concern the registry entity only: a call can still add
+   capability links or repair indexes when its row is unchanged, so a call
+   that adds only capability links returns `unchanged:true`. The existing
+   `tool` and `capabilities` fields remain.
+
+3. **Updates retain the registration and grant safeguards.** The same update
+   rule applies after a concurrent first-registration claim loses. Existing
+   derived-ID uniqueness, legacy-ID selection and tombstone refusals remain.
+   In particular, [Amendment 5](#amendment-5-2026-09-25-uniqueness-by-name-is-held-by-the-store-not-by-a-lookup)
+   item 5 and acceptance arms 39 and 41 keep a soft-deleted registration's
+   ASCII-folded name reserved in its owning namespace, for both derived and
+   legacy minted IDs. Updates compare the read snapshot and use a guarded
+   replacement; a stale snapshot refuses
+   before adding capability links. Secret checks and kind validation apply to
+   the correction, and changed descriptions are reindexed. Index or event
+   repair after a surviving claim remains repeatable. Each text or vector
+   publication compares the captured entity revision with the live row in the
+   same writer transaction as its index changes. A stale repair refuses with
+   the surviving entity ID and cannot overwrite a newer index. Repair itself
+   does not advance the entity revision.
+
+   The public base delete surface refuses a tool registry row, including hard
+   deletion of a live row or tombstone; atomic requests and canonical
+   changesets preserve that refusal. A soft-deleted registry name remains
+   reserved under Amendment 5, so registration cannot replace its definition.
+   This amendment introduces no public purge or revival route. This clause
+   covers the public verb surface only. Direct Rust or store maintenance runs
+   with the embedder's trust, outside this public-verb ownership boundary, and
+   must not be described as preserving that reservation after a privileged
+   purge.
+
+   The grant-definition digest includes Amendment 1's `source`, `side_effect`,
+   `trust` and `schema`, plus the conditional declaration inputs specified by
+   ADR-181 Amendments 13 and 14 and Amendment 8 of this record: `network`,
+   `executable_digest` and `program` join the canonical inputs on rows carrying
+   their respective keys. An absent declaration key is omitted, not inserted
+   as null, preserving the original four-input bytes on rows without those
+   keys. These extensions retain their governing amendments' applicability
+   and implementation requirements. A changed input changes the computed
+   digest and an old grant no longer matches; its persisted status and pin are
+   not rewritten. Metadata or capability changes leave the digest unchanged.
+   Restoring an earlier schema can make the old grant active again when all
+   its other pinned inputs match and the grant is otherwise active. Source and
+   kind corrections are refused. Tightening `side_effect` or `trust` cannot be
+   reversed to the earlier, looser value through `tool.register`, because item
+   5 refuses that restore. A nonmatching grant still falls through to policy
+   and default; this is not permanent revocation.
+
+   An admitted correction that changes a digest input appends exactly one
+   event of kind `tool_registration_changed`, verb `tool.register`, substrate
+   `event`, with the authenticated actor, in the namespace of the row it
+   changes: the request's write namespace, where item 1 resolves the name.
+   Its typed data is `{actor, id, digest_before, digest_after}`: the authenticated actor,
+   the registry row's UUID, and the same full canonical per-row grant-definition
+   digest before and after the correction, including any applicable conditional
+   declaration inputs. The event does not use a separate four-field digest or
+   carry field values. It goes through the same event store as Amendment 6's
+   `tool_check_decided`, and `actor` passes the same ADR-115 credential gate
+   before the correction is applied. The append is part of the guarded
+   replacement: a failed append refuses the correction and leaves the row
+   unchanged. A correction that changes only metadata, tags or capabilities,
+   and an unchanged registration, append none. The generic dispatch `Audit`
+   row for `tool.register` records the call, not which row changed or how its
+   digest moved. The class's ADR-168 retention class is `pinned_while_referenced`;
+   its referent is the registry row and its terminal condition is that row's
+   deletion. The digests are unkeyed over short inputs; because the event lives
+   in the row's namespace, its readers can already read the row it describes.
+   Who may correct a row is decided where creation is decided, by the Gate on
+   `tool.register` in that namespace; an explicit namespace argument behaves as
+   it does for creation.
+
+4. **The corrected row is validated whole and keeps its source and kind.**
+   Before the guarded replacement, the row that would result (stored fields
+   with the supplied ones applied) is checked against the declaration rules
+   for `network`, `executable_digest` and `program`
+   ([ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations)
+   Decision item 1, [ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+   items 1 and 2, and Amendment 8 of this record), not only the supplied fields.
+   Every existing row refuses a supplied nonnull `source` or `kind` that differs
+   from storage, whether or not the row carries any declaration. This includes
+   plain `exec:` rows, `mcp:` and other non-exec rows, changes between executable
+   paths, and changes into or out of an `exec:` source. The refusal names
+   `source`, `kind` or both and directs the caller to register a different
+   source or kind under a new name. No part of the correction or its capability
+   additions is applied, and no `tool_registration_changed` event is appended.
+
+   `tool.check` can allow a name through the `read` default or a name-keyed
+   policy without a grant. Those allows are not pinned to the definition;
+   only grants are. Changing an established name's source or kind could
+   therefore retarget what other callers already trust even when there are no
+   policy or grant rows. The refusal has no reference-presence exception and
+   applies to every caller. Rows with `network`, `executable_digest` or
+   `program` are included in this same rule: their declarations cannot be
+   carried to a different binary, server or kind. A passed `network`,
+   `executable_digest` or `program` that differs from the stored value is still
+   refused as those amendments say; this amendment adds none of the three to
+   the correctable fields.
+
+5. **A correction cannot loosen the definition.** `tool.check` resolves by
+   name, so a correction to an existing row changes the default answer every
+   caller of that name receives. A correction that moves `side_effect` to a
+   less strict class, or `trust` to a more trusted origin, is refused, and the
+   reason names the field, the stored value and the passed one. The orders are
+   the Decision's own listings: `side_effect` from `read` (least strict, the
+   only class the default allows) through `write` and `egress` to
+   `irreversible`, and `trust` from `first_party` (most trusted) through
+   `marketplace` to `external`.
+
+   A changed, supplied nonnull field also has a conservative floor when its
+   stored value is absent, null, non-string or unrecognized. Such a
+   `side_effect` refuses `read` and permits `write`, `egress` or `irreversible`;
+   such a `trust` permits only `external` and refuses `first_party` and
+   `marketplace`. The refusal names the field and a fixed classification of
+   the stored state, without echoing arbitrary legacy content. The trust floor
+   is a correction rule, not a trust-based default decision: the default
+   decision uses `side_effect`. Omitted or null fields and unrelated
+   corrections preserve unknown stored values rather than initialize them;
+   incoming enum validation is unchanged.
+
+   A looser definition is a new registration under a new name. Moving a known
+   field toward the stricter end, and other correctable fields allowed by
+   items 1 and 4, corrects in place. The registry row records no registrant, so
+   no caller is exempt.
+
+### Statements of the old existing-name contract
+
+- ADR-180 Decision, "re-registering an existing name returns the existing object
+  and links any new capabilities without changing its properties": scoped to
+  `tool.ingest` by the pointer under the Decision; `tool.register` follows this
+  amendment.
+- ADR-180 Amendment 5 Context, the same sentence quoted: kept as the record of
+  what Amendment 5 addressed. Its acceptance arms 37, 38 and 41 still hold: the
+  existing row keeps its id and reports `created: false`, while a matching
+  tombstone refuses under item 5 and acceptance arms 39 and 41.
+- ADR-180 Decision acceptance arms 1, 2 and 8: still hold as written. Arm 1's
+  second call returns the same id with `created: false`, and arm 8 is
+  `tool.ingest`.
+- ADR-180 Amendment 8 item 3, "Re-registering an existing name returns the stored
+  row unchanged": rewritten by item 4 for correctable fields. A differing
+  `program` remains refused, as does a differing source or kind on every
+  existing row, including one carrying `program`.
+- ADR-181 Amendment 13 Decision item 1, "Re-registering an existing name keeps
+  the stored row unchanged": rewritten. A passed `network` follows Amendment 14
+  item 2; the other supplied fields follow items 1, 4 and 5.
+- ADR-181 Amendment 14 item 1, "Re-registering an existing name never changes the
+  stored row", and item 2, "the existing row is returned unchanged as today":
+  rewritten for `tool.register`. The refusal of a differing `network` or
+  `executable_digest` stands. Source and kind are immutable on every existing
+  row, including rows carrying either declaration.
+- The test `re_registration_keeps_the_approved_object_and_definition`, cited by
+  ADR-181 Amendments 13 and 14 as proof of the old contract, is replaced by
+  `re_registration_updates_definition_and_invalidates_only_mismatched_grants`.
+
+### Acceptance for Amendment 10
+
+- `register_updates_supplied_fields_and_preserves_identity` adds a schema to an
+  existing registration, replaces nested schema members, and observes the
+  updated row and description through public readers. Omitting the update or
+  merging the old nested schema must fail its stored-value assertions.
+- `register_equal_and_omitted_fields_preserve_the_stored_row` pins equal,
+  omitted and null behavior, including source and kind, with additive-tag and
+  capability controls. Applying creation defaults to an existing row must fail
+  this test.
+- `re_registration_updates_definition_and_invalidates_only_mismatched_grants`
+  changes schema, `side_effect` and `trust` independently through registration
+  and checks the real grant consumer and reapproval. Schema changes and
+  restores in either direction. `side_effect` and `trust` start from a looser
+  stored value, are tightened, and their restore to the looser value is refused
+  with the grant left inactive. Source and kind changes are refused with the
+  original row and grant meaning intact.
+- `concurrent_register_claim_loser_applies_its_supplied_definition` and
+  `concurrent_registration_updates_refuse_a_stale_snapshot_before_linking`
+  exercise both the claim-loser path and a competing update using permitted
+  corrections. Skipping the losing caller's correction or replacing the
+  guarded update with an unguarded one must fail the corresponding behavioral
+  assertion.
+- `register_digest_input_change_appends_one_registration_changed_event` corrects
+  each admitted digest input on a row another actor registered and reads
+  exactly one `tool_registration_changed` event per correction, carrying the
+  correcting actor, the row id and the full before/after grant-definition
+  digests, and no field value. Conditional declaration inputs follow their
+  governing amendments' acceptance requirements. A description-only correction
+  and an unchanged registration append none, and a refused correction leaves
+  neither a changed row nor a correction event.
+- `register_correction_refuses_source_or_kind_change_on_existing_rows` stores
+  plain `exec:` rows, `mcp:` rows, rows carrying `network` with
+  `executable_digest`, and rows carrying `program`. Source changes to another
+  executable and into or out of `exec:`, kind changes, and both together are
+  refused naming the differing fields and the new-name remedy. The row,
+  capabilities, grants and correction events remain unchanged, including when
+  the call requests new capability links or another actor makes it. Equal,
+  omitted and null source/kind values remain admissible. Restoring the former
+  declaration-only condition must fail the plain-row refusal arm.
+- `register_correction_refuses_loosening` moves `side_effect` to each less
+  strict class and `trust` to each more trusted origin on a row another actor
+  registered: each call is refused naming the field, with the row unchanged and
+  no `tool_registration_changed` event. Tightening either field succeeds and
+  appends one event (control). Dropping the order check must fail it.
+- `register_correction_applies_conservative_unknown_policy_floors` covers
+  absent, null, non-string and unrecognized stored values. It refuses `read`
+  for unknown `side_effect` and `first_party`/`marketplace` for unknown `trust`;
+  `write`/`egress`/`irreversible` and `external`, respectively, succeed. Public
+  reads and event queries verify the full stored result, digest and event on
+  success, and unchanged state with no correction event on refusal. Omitting
+  those fields, passing null or correcting unrelated metadata preserves the
+  legacy values. Restoring the absent/non-string skip and the unknown-string
+  skip independently must fail the corresponding refusal assertions.
+- Existing namespace, retired-name and ingest tests retain their contracts;
+  Amendment 5 acceptance arms 39 and 41 retain the same-name tombstone
+  refusal for derived and legacy IDs. `refused_registration_updates_preserve_rows_and_capabilities`
+  checks refusal against a populated registration before and after the call.
+- A populated historical registry tombstone followed by `tool.register` of
+  the same name with a different source is refused without changing the row,
+  policies, grants or capability links. Use a legacy minted ID for the control
+  that omits the matching-tombstone refusal, so an independent derived-ID
+  claim refusal cannot mask its effect; it must fail the registration-refusal
+  assertion after the fixture is ready.
+- A live registry row and a registry tombstone, each with a matching policy,
+  reject public hard deletion. A subsequent same-name source replacement is
+  also refused, preserving the original rows, policies, grants and capability
+  links. Exercise ordinary and atomic delete requests; canonical changesets
+  use the same guarded atomic preparer and retain its refusal. Independently
+  removing each public deletion guard must fail its declared refusal
+  assertion. Each control requires a nonzero passing baseline and an actual
+  behavioral failure, not a compilation, setup, timeout or selection failure.
+- `unchanged_registration_cannot_overwrite_newer_search_document` pauses an
+  equal registration before repair, completes a newer description update, and
+  verifies the actual text document and search results remain current.
+- `claimed_entity_reindex_preserves_newer_vector_publication` pauses a prepared
+  vector, publishes a newer revision, then verifies its vector bytes and ANN
+  log remain unchanged. Removing either publication guard must fail the
+  corresponding index-preservation assertion; the vector control retains its
+  prepublication pause. Existing index-failure/retry behavior remains covered.
+
+## Amendment 11 (2026-11-14): retiring a tool registration
+
+**Status:** Accepted 2026-11-14 (#6623).
+
+`tool.unregister(tool, namespace)` retires one Tool registry entity in the selected write
+namespace. It accepts the live registry's name, full UUID or unambiguous UUID prefix; the exact
+owning name or full UUID also identifies an already-retired row for retry. A visible foreign
+registration, capability or ordinary project is not a retirement target. Normal namespace
+authorization applies. Generic KG mutation of registry rows remains refused.
+
+The first successful call soft-deletes the entity and advances its version while preserving its
+identity, properties, tags and creation history. Capability concepts and `implements` edges stay
+stored. List, describe and suggest exclude the retired registration through their live-entity
+checks. Retirement neither uninstalls an executable nor creates a universal deny rule.
+
+Authorization rows change in the same transaction as the entity:
+
+| Row                                                                                                                                               | Change                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Live policy in the selected namespace, with a byte-exact stored tool label equal to the registration's canonical name and no `*` anywhere         | Set the existing deletion time and actor, across all actor labels.                    |
+| Non-revoked grant in the selected namespace, pinned to this registry UUID                                                                         | Set status to `revoked` and stamp the decision time, actor and fixed retirement note. |
+| Unpinned grant in the selected namespace, with both pin fields null, a byte-exact non-pattern name, and status `requested`, `granted` or `denied` | Make the same terminal transition to `revoked`.                                       |
+| Every other row                                                                                                                                   | Preserve it unchanged.                                                                |
+
+The last row includes wildcard and prefix policies, case-distinct labels, already-revoked grants,
+other registry UUIDs and every other namespace. A foreign grant pinned to the retired UUID remains
+stored unchanged but is inactive because its registration is no longer live; it is not reported as
+revoked. A foreign same-name registration is an independent identity. Pin, scope, reason, request
+time, expiry and prior invalidation evidence are preserved when a local grant is revoked. A name
+containing a literal `*` does not authorize retirement of a pattern with those same bytes.
+
+The runtime retirement boundary validates the captured entity's namespace, registry kind and tag,
+then applies a version/time/deletion-marker compare-and-set and the two prepared companion UPDATEs
+inside one `atomic_unit`. A stale entity or either failed statement returns the transaction's outer
+error, rolling back all three domains. Clocks, actor labels, serialization, token validation and
+statement preparation precede writer admission. Existing grant decisions still revalidate their
+captured registration inside the applying writer, so a prepared decision cannot bind a registration
+retired before that decision commits.
+
+After confirmed commit, existing entity deletion cleanup attempts FTS removal, vector removal for
+each registered model, and the lifecycle event. Failures are reported as postcommit degradations;
+they do not change the committed retirement into a rollback. The result contains `id`, `full_id`,
+`retired`, `policies_retired`, `grants_revoked` and `post_commit_degradations`. The two counts describe
+rows changed by this transaction, not all rules that might still affect the name.
+
+A recognized tombstone returns `retired:false`, zero counts and no cleanup attempt. In particular,
+it does not change policies or requests created after the original retirement. An unknown target
+refuses. Registration and ingest retain their refusal to revive a retired name, and the generic
+`restore` refuses a registry row as the other generic mutations do, so no verb restores a retired
+registration and the policies and grants its retirement changed stay retired. Surviving broad
+policies or later requests can still decide an unregistered name under the ordinary policy rules.
+
+### Acceptance for Amendment 11
+
+1. Actual register, request, grant and unregister calls prove entity retirement, exact local row
+   counts, preserved history, inactive discovery and a surviving searchable registration.
+2. Populated namespace, actor, case, embedded-NUL, wildcard, prefix and registry-ID controls prove
+   the literal selection boundary and unchanged shared authorization rows.
+3. A real foreign pinned grant remains byte-identical while the actual foreign `tool.check` no
+   longer answers from it; a foreign same-name registration remains usable independently.
+4. Existing local unpinned requests and denied/granted rows become terminal, while unrelated and
+   already-revoked rows stay unchanged.
+5. Owned live reference forms work; foreign and nonregistry targets refuse. Tombstone retry leaves
+   newly created policies and requests unchanged, and register/ingest cannot revive the target.
+6. Separate failures in each companion UPDATE roll back the entity and both authorization tables;
+   a healthy retry commits.
+7. A stale captured entity refuses before companion changes. A grant prepared before retirement
+   cannot attach afterward.
+8. An actual FTS cleanup failure leaves the domain retirement committed and reports the cleanup
+   degradation; the healthy path removes the text entry.
+9. The loaded verb catalog, dispatch and write classification agree. Read-only gates and malformed
+   arguments refuse without changing domain rows.

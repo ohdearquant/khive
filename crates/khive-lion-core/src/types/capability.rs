@@ -436,7 +436,7 @@ impl Capability {
         CapPayload {
             holder: self.holder,
             target: self.target,
-            rights: self.rights.clone(),
+            rights: self.rights,
             parent: self.parent,
             epoch: self.epoch,
         }

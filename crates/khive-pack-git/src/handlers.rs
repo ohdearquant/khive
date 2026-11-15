@@ -1813,13 +1813,11 @@ mod tests {
         );
     }
 
-    /// Public-surface regression (ADR-088 Amendment 2 round-2 finding): the
+    /// The public `git.digest` report (ADR-088 Amendment 2) must expose the
     /// duplicate-anchor warning and selected id, and all three orphan
-    /// report fields (including the no-orphan defaults), must be observable
-    /// on the real `git.digest` verb's serialized `IngestReport` -- not
-    /// merely on the private `resolve_or_create_project` helper's return
-    /// value. Driven through `registry.dispatch("git.digest", ...)` over a
-    /// LOCAL (no-network) source so it needs no real remote clone.
+    /// report fields (including the no-orphan defaults), through its
+    /// serialized `IngestReport`. Dispatch a local (no-network) source
+    /// to exercise the public response without a remote clone.
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn git_digest_public_surface_reports_duplicate_and_selects_oldest_no_third_anchor() {
@@ -1903,7 +1901,7 @@ mod tests {
         assert_eq!(live.len(), 2, "no third anchor should be minted: {live:?}");
     }
 
-    /// Exact step-2 multi-match (ADR-088 Amendment 2 round-3 finding): two
+    /// Exact step-2 multi-match (ADR-088 Amendment 2): two
     /// live pre-slug anchors sharing the source's exact `repo_url` spelling
     /// must resolve to the oldest deterministically, surface the remainder
     /// in the report warning, and mint no third anchor -- observed on the

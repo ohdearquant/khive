@@ -109,10 +109,26 @@ pub(super) fn is_repository_revision_reference(raw_token: &str) -> bool {
     false
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CLAUSE_IDENTIFIER_WORK_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_clause_identifier_work_bytes() -> usize {
+    CLAUSE_IDENTIFIER_WORK_BYTES.with(|count| count.replace(0))
+}
+
+fn clause_identifier_boundary(ch: char) -> bool {
+    #[cfg(test)]
+    CLAUSE_IDENTIFIER_WORK_BYTES.with(|count| count.set(count.get() + ch.len_utf8()));
+    !ch.is_ascii_alphanumeric() && ch != '_'
+}
+
 fn trailing_identifier(text: &str) -> &str {
-    let trimmed = text.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    let trimmed = text.trim_end_matches(clause_identifier_boundary);
     trimmed
-        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .rsplit(clause_identifier_boundary)
         .next()
         .unwrap_or_default()
 }
@@ -227,6 +243,11 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
 /// stays in range without exhaustion.
 const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
 
+// A quoted line reference can be crossed without knowing whether it sits in
+// an assignment. Continue looking for the clause head, but keep the extra
+// work bounded and fail closed if it cannot be reached.
+const QUOTED_LINE_CLAUSE_WALK_LIMIT: usize = 64;
+
 /// File-path candidates may walk across at most this many content identifiers
 /// without a `:`/`=` delimiter. Two reaches the direct-label shapes that need
 /// protection (`auth scanner found <path>`) while keeping the walk local.
@@ -314,6 +335,35 @@ fn is_version_fragment(word: &str) -> bool {
         .or_else(|| word.strip_prefix('V'))
         .unwrap_or(word);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The colon of an isolated backtick-quoted line reference, if `word` is its
+/// complete numeric component. A colon that assigns the quoted reference is
+/// separate and remains visible to the clause walk.
+fn quoted_line_reference_colon(text: &str, word: &str) -> Option<usize> {
+    if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let start = word.as_ptr() as usize - text.as_ptr() as usize;
+    let end = start + word.len();
+    let bytes = text.as_bytes();
+    if start < 2 || bytes.get(start - 2..start) != Some(&b"`:"[..]) || bytes.get(end) != Some(&b'`')
+    {
+        return None;
+    }
+    let before = start - 2;
+    if before > 0
+        && !bytes[before - 1].is_ascii_whitespace()
+        && !matches!(bytes[before - 1], b'(' | b'[' | b'{' | b',')
+    {
+        return None;
+    }
+    if bytes.get(end + 1).is_some_and(|byte| {
+        !byte.is_ascii_whitespace() && !matches!(*byte, b')' | b']' | b'}' | b',' | b'.' | b';')
+    }) {
+        return None;
+    }
+    Some(start - 1)
 }
 
 /// Hex-run identifier long enough to be credential material rather than a
@@ -417,6 +467,33 @@ pub(super) fn has_clause_credential_label_with_inline(
     inline_trigger: bool,
     value_kind: ClauseValueKind,
 ) -> bool {
+    has_clause_credential_label(text, token_offset, inline_trigger, value_kind, false)
+}
+
+/// Path trigger attribution must retain every credential-token label recognized
+/// by assignment detection. Existing candidate exemption guards keep their
+/// original vocabulary through the wrapper above.
+pub(super) fn has_path_context_credential_label(
+    text: &str,
+    token_offset: usize,
+    inline_trigger: bool,
+) -> bool {
+    has_clause_credential_label(
+        text,
+        token_offset,
+        inline_trigger,
+        ClauseValueKind::FilePath,
+        true,
+    )
+}
+
+fn has_clause_credential_label(
+    text: &str,
+    token_offset: usize,
+    inline_trigger: bool,
+    value_kind: ClauseValueKind,
+    credential_token_labels: bool,
+) -> bool {
     if inline_trigger {
         return true;
     }
@@ -432,7 +509,12 @@ pub(super) fn has_clause_credential_label_with_inline(
     // was connector material. Starts true: step 0 is adjacent to the value or
     // its delimiter.
     let mut arrived_through_connector = true;
-    for step in 0..LABEL_CLAUSE_WALK_LIMIT {
+    let mut previous_line_reference_colon = None;
+    let mut crossed_quoted_line_reference = false;
+    for step in 0..QUOTED_LINE_CLAUSE_WALK_LIMIT {
+        if step >= LABEL_CLAUSE_WALK_LIMIT && !crossed_quoted_line_reference {
+            return crossed_value_delimiter;
+        }
         let label = trailing_identifier(rest);
         if label.is_empty() {
             return false;
@@ -441,10 +523,20 @@ pub(super) fn has_clause_credential_label_with_inline(
         if step > 0 && gap_has_sentence_boundary(gap) {
             return false;
         }
-        if gap.contains([':', '=']) {
+        let gap_start = gap.as_ptr() as usize - text.as_ptr() as usize;
+        if gap.bytes().enumerate().any(|(offset, byte)| {
+            matches!(byte, b':' | b'=') && Some(gap_start + offset) != previous_line_reference_colon
+        }) {
             crossed_value_delimiter = true;
         }
-        if clause_label_has_credential_trigger(label) {
+        if previous_line_reference_colon
+            .is_some_and(|colon| (gap_start..gap_start + gap.len()).contains(&colon))
+        {
+            crossed_quoted_line_reference = true;
+        }
+        if clause_label_has_credential_trigger(label)
+            || (credential_token_labels && is_credential_token_label(&label.to_ascii_lowercase()))
+        {
             return true;
         }
         let skippable = is_label_clause_skip_word(label)
@@ -466,12 +558,13 @@ pub(super) fn has_clause_credential_label_with_inline(
             // <value>` stop before reaching the trigger.
             let regular_participle_narrative = is_clause_narrative_participle(label)
                 && (crossed_value_delimiter || value_kind != ClauseValueKind::FilePath || step > 0);
-            if arrived_through_connector
+            if !crossed_quoted_line_reference
+                && arrived_through_connector
                 && (regular_participle_narrative || no_delimiter_file_path_narrative)
             {
                 return false;
             }
-            if !crossed_value_delimiter {
+            if !crossed_value_delimiter && !crossed_quoted_line_reference {
                 if value_kind != ClauseValueKind::FilePath
                     || no_delimiter_content_words >= FILE_PATH_NO_DELIMITER_CONTENT_LIMIT
                 {
@@ -489,6 +582,11 @@ pub(super) fn has_clause_credential_label_with_inline(
             arrived_through_connector = skippable;
         }
         arrived_through_in_preposition = label.eq_ignore_ascii_case("in");
+        previous_line_reference_colon = if value_kind == ClauseValueKind::FilePath {
+            quoted_line_reference_colon(text, label)
+        } else {
+            None
+        };
         let start = label.as_ptr() as usize - rest.as_ptr() as usize;
         rest = &rest[..start];
     }
@@ -496,7 +594,7 @@ pub(super) fn has_clause_credential_label_with_inline(
     // of steps without a sentence boundary or verb-position participle is
     // assignment-shaped with an unscanned head — fail closed rather than let
     // clause length launder a labeled credential into the exemptions.
-    crossed_value_delimiter
+    crossed_value_delimiter || crossed_quoted_line_reference
 }
 
 pub(super) fn is_plausible_file_path(token: &str) -> bool {
@@ -760,4 +858,178 @@ pub(super) fn normalized_hex_credential_span(token: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Attribution-only: inspect every whole-hex-run start, including subranges
+/// hidden by an earlier complete digest or a cumulative prefix above the limit.
+/// The legacy first-span detector above deliberately retains its exact grammar.
+pub(super) fn has_normalized_hex_credential_span_overlapping(
+    token: &str,
+    overlap_start: usize,
+    overlap_end: usize,
+) -> bool {
+    if overlap_start >= overlap_end {
+        return false;
+    }
+    let max_len = HEX_CREDENTIAL_LENGTHS.iter().copied().max().unwrap_or(0);
+    let mut starts = std::collections::VecDeque::<(usize, usize)>::with_capacity(max_len);
+    let mut concatenated_len = 0usize;
+    for run in token.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        if run.is_empty() {
+            continue;
+        }
+        if !is_hex_run(run) {
+            starts.clear();
+            concatenated_len = 0;
+            continue;
+        }
+        let run_start = run.as_ptr() as usize - token.as_ptr() as usize;
+        let next_len = concatenated_len + run.len();
+        while starts
+            .front()
+            .is_some_and(|&(prefix_len, _)| next_len - prefix_len > max_len)
+        {
+            starts.pop_front();
+        }
+        if run.len() <= max_len {
+            starts.push_back((concatenated_len, run_start));
+        }
+        concatenated_len = next_len;
+        let run_end = run_start + run.len();
+        if run_end <= overlap_start {
+            continue;
+        }
+        if starts.iter().any(|&(prefix_len, span_start)| {
+            span_start < overlap_end
+                && HEX_CREDENTIAL_LENGTHS.contains(&(concatenated_len - prefix_len))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod issue_6263_tests {
+    use super::super::entropy::{check_entropy_heuristic, EntropyScanContext};
+    use super::{
+        has_clause_credential_label_with_inline, has_path_context_credential_label,
+        is_labeled_sha256_digest, ClauseValueKind,
+    };
+
+    const PATH: &str = "docs/Unforgeability/Theorems.md:349";
+
+    fn path_is_labeled(text: &str) -> bool {
+        let offset = text.find(PATH).expect("fixture contains the path");
+        has_path_context_credential_label(text, offset, false)
+    }
+
+    fn final_path_guard_is_labeled(text: &str) -> bool {
+        let offset = text.find(PATH).expect("fixture contains the path");
+        has_clause_credential_label_with_inline(text, offset, false, ClauseValueKind::FilePath)
+    }
+
+    fn entropy_refuses(text: &str) -> bool {
+        check_entropy_heuristic(text, 0, &EntropyScanContext::new(text)).is_some()
+    }
+
+    #[test]
+    fn quoted_line_reference_does_not_label_a_later_citation() {
+        let context = format!(
+            "{}\n`:1324`), x\n(`{PATH}`). x rests on the key",
+            "word ".repeat(21)
+        );
+        assert!(!path_is_labeled(&context));
+        assert!(!final_path_guard_is_labeled(&context));
+        assert!(!entropy_refuses(&context));
+        for prefix in ["", "word ", "word word word word word word word "] {
+            let input = format!("{prefix}`:1324`), x\n(`{PATH}`). x rests on the key");
+            assert!(!path_is_labeled(&input));
+            assert!(!final_path_guard_is_labeled(&input));
+            assert!(!entropy_refuses(&input));
+        }
+    }
+
+    #[test]
+    fn quoted_reference_cannot_hide_credential_assignments() {
+        for text in [
+            format!("api key:1324 `:1324` x {PATH}"),
+            format!("api key: `:1324` x {PATH}"),
+            format!("`:1324` x api key:1324 {PATH}"),
+            format!("api key {}: `:1324` x {PATH}", "word ".repeat(12)),
+        ] {
+            assert!(path_is_labeled(&text), "must retain label: {text}");
+            assert!(
+                final_path_guard_is_labeled(&text),
+                "must retain label: {text}"
+            );
+        }
+        // Assembled at run time so the high-entropy fixture is not a source literal.
+        let value = ["Aa9bB8cC", "7dD6eE5f", "F4gG3hH2", "iI1jJ0kK"].concat();
+        assert!(entropy_refuses(&format!("api key: `:1324` x {value}")));
+        assert!(entropy_refuses(&format!(
+            "api key: `:1324` x assets/{value}/file"
+        )));
+        assert!(entropy_refuses(
+            "api key: `:1324` x docs/0123456789abcdef0123/456789abcdef01234567/file"
+        ));
+    }
+
+    #[test]
+    fn path_shaped_high_entropy_values_remain_refused_under_credential_labels() {
+        // Each alphanumeric run is shorter than a standalone credential run,
+        // and none is a normalized credential-length hex span. These cases
+        // exercise the path exemption's label guard rather than relying on an
+        // independently detected secret inside the path.
+        let candidate = "assets/R9vQ4m7J/K2xW8p6S/L5dT3n1Y.dat:349";
+        let unlabeled = format!("source {candidate} is related to key handling");
+        assert!(!entropy_refuses(&unlabeled), "unlabeled path is a control");
+        for text in [
+            format!("api key: {candidate}"),
+            format!("api key: `:1324` x {candidate}"),
+            format!("api key:1324 `:1324` x {candidate}"),
+            format!("api key {}: `:1324` x {candidate}", "word ".repeat(12)),
+        ] {
+            assert!(entropy_refuses(&text), "must refuse labeled value: {text}");
+        }
+    }
+
+    #[test]
+    fn assignment_and_extended_citation_budgets_fail_closed() {
+        let assignment = format!("api key {}: {PATH}", "word ".repeat(8));
+        assert!(path_is_labeled(&assignment));
+        assert!(final_path_guard_is_labeled(&assignment));
+        let under_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(60));
+        let over_extended_budget = format!("{} `:1324` x {PATH}", "word ".repeat(64));
+        assert!(!path_is_labeled(&under_extended_budget));
+        assert!(path_is_labeled(&over_extended_budget));
+        assert!(!final_path_guard_is_labeled(&under_extended_budget));
+        assert!(final_path_guard_is_labeled(&over_extended_budget));
+    }
+
+    #[test]
+    fn quoted_line_reference_preserves_vcs_and_digest_credential_guards() {
+        let vcs = format!("api key: `:1324` {PATH}");
+        let offset = vcs.find(PATH).expect("fixture contains the path");
+        assert!(has_clause_credential_label_with_inline(
+            &vcs,
+            offset,
+            false,
+            ClauseValueKind::VcsReference
+        ));
+
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let benign = format!("sha256: {digest}");
+        assert!(is_labeled_sha256_digest(
+            &benign,
+            benign.find(digest).expect("fixture contains the digest"),
+            digest
+        ));
+        let labeled = format!("api key: `:1324` x sha256: {digest}");
+        assert!(!is_labeled_sha256_digest(
+            &labeled,
+            labeled.find(digest).expect("fixture contains the digest"),
+            digest
+        ));
+    }
 }

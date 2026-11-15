@@ -117,6 +117,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("gtd.assign", OperationAccess::Write),
     ("gtd.census", OperationAccess::Read),
     ("gtd.complete", OperationAccess::Write),
+    ("gtd.counts", OperationAccess::Read),
     ("gtd.next", OperationAccess::Read),
     ("gtd.repair", OperationAccess::Write),
     ("gtd.tasks", OperationAccess::Read),
@@ -146,6 +147,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("knowledge.upsert_domains", OperationAccess::Write),
     ("link", OperationAccess::Write),
     ("list", OperationAccess::Read),
+    ("memory.apply_batch", OperationAccess::Write),
     ("memory.feedback", OperationAccess::Write),
     ("memory.prune", OperationAccess::Write),
     ("memory.recall", OperationAccess::Read),
@@ -208,6 +210,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("tool.requests", OperationAccess::Read),
     ("tool.revoke", OperationAccess::Write),
     ("tool.suggest", OperationAccess::Read),
+    ("tool.unregister", OperationAccess::Write),
     ("traverse", OperationAccess::Read),
     ("update", OperationAccess::Write),
     ("verbs", OperationAccess::Read),
@@ -222,7 +225,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v23");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v26");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

@@ -12,6 +12,8 @@
 //! and releases the lease. The process keeps running: the host decides whether
 //! to exit.
 
+/// Transaction-scoped persistence for shared authority records.
+pub mod authority;
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
 /// Periodic WAL checkpoint task.
@@ -31,6 +33,11 @@ mod disk_guard_config;
 pub mod env;
 /// Error types for the SQLite layer.
 pub mod error;
+
+/// Bounded prune of expendable polling-dispatch audit rows (ADR-212 §4, operator maintenance).
+pub mod events_prune;
+#[cfg(test)]
+mod events_prune_tests;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
 /// Physical file identity shared by pool admission and backend alias routing.
@@ -39,6 +46,9 @@ pub mod file_identity;
 mod fts_maintenance;
 /// Read predicates and transaction assertions for the graph-lint caller.
 pub mod graph_lint;
+/// Canonical physical store sets for cooperative maintenance metadata.
+#[cfg(unix)]
+pub mod maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).
@@ -51,8 +61,15 @@ pub mod namespace_move_fixture;
 /// Feature-gated namespace-bounded FTS5 trigram prototype.
 #[cfg(feature = "namespace-trigram-proto")]
 pub mod namespace_trigram_proto;
+/// Durable deferred entity-index obligations (ADR-014 Amendment 7).
+pub mod pending_index;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
+mod progress_conn;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks;
+#[doc(hidden)]
+pub use progress_conn::ProgressConn;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
@@ -93,6 +110,7 @@ pub use checkpoint::{
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 pub use disk_guard::harness_scoped_process_leases;
+pub use disk_guard::{ScopedFuture, WriteClassContext};
 pub use disk_guard_config::{
     default_volume_lock_dir, require_volume_lock_dir, resolve_disk_guard_config,
     DiskGuardConfigSource, DiskGuardEnvironment, EffectiveDiskGuardConfig,

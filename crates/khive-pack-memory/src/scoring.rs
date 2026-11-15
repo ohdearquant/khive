@@ -1,6 +1,7 @@
 //! Tunable composite scoring, normalization, adjustments, and language routing.
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub use khive_text::{contains_cjk_f32 as contains_cjk, is_cjk_char};
 use serde::{Deserialize, Serialize};
@@ -773,6 +774,62 @@ pub struct ScoreInput<'a> {
     pub entity_names: &'a [String],
 }
 
+#[derive(Clone, Copy)]
+enum ScoreFallbackReason {
+    TemporalBoost,
+    SalienceBoost,
+    NonfiniteComposite,
+}
+
+impl ScoreFallbackReason {
+    fn bit(self) -> u8 {
+        match self {
+            Self::TemporalBoost => 1,
+            Self::SalienceBoost => 2,
+            Self::NonfiniteComposite => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TemporalBoost => "temporal_boost",
+            Self::SalienceBoost => "salience_boost",
+            Self::NonfiniteComposite => "nonfinite_composite",
+        }
+    }
+}
+
+struct ScoreFallbackWarnings {
+    emitted: AtomicU8,
+}
+
+impl ScoreFallbackWarnings {
+    const fn new() -> Self {
+        Self {
+            emitted: AtomicU8::new(0),
+        }
+    }
+
+    fn record(&self, reason: ScoreFallbackReason) {
+        if !tracing::enabled!(target: "khive.memory.scoring", tracing::Level::WARN) {
+            return;
+        }
+        let bit = reason.bit();
+        if self.emitted.load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        if self.emitted.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            tracing::warn!(
+                target: "khive.memory.scoring",
+                reason = reason.as_str(),
+                "Memory score arithmetic fallback returned zero"
+            );
+        }
+    }
+}
+
+static SCORE_FALLBACK_WARNINGS: ScoreFallbackWarnings = ScoreFallbackWarnings::new();
+
 /// Composite score for a single memory candidate.
 ///
 /// Formula (semantic-gate model, multiplicative):
@@ -780,7 +837,82 @@ pub struct ScoreInput<'a> {
 ///
 /// Then each `ScoreAdjustment` in `config.adjustments` is evaluated and applied in order.
 /// Non-finite results fall to zero; finite results are clamped to `[0, 1]`.
+/// Arithmetic fallbacks emit at most one WARN per reason per process while WARN
+/// is enabled; genuine finite zero scores do not emit fallback warnings.
 pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
+    calculate_score_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
+/// The terms of the composite `calculate_score` ranks by.
+///
+/// `relevance_term × temporal_boost × salience_boost` is `base`; the configured adjustments
+/// and the final clamp to `[0, 1]` turn `base` into `score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScoreFactors {
+    /// `weights.relevance × relevance_score`.
+    pub(crate) relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub(crate) temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub(crate) salience_boost: f32,
+    /// `relevance_term × temporal_boost × salience_boost`, before any adjustment.
+    pub(crate) base: f32,
+    /// The value `calculate_score` returns.
+    pub(crate) score: f32,
+    /// False when the arithmetic fell back to a zero score (a boost or the composite was not a
+    /// finite number): the other fields then do not describe a computed composite.
+    pub(crate) complete: bool,
+}
+
+impl ScoreFactors {
+    /// The terms of a candidate whose boost arithmetic fell back to a zero score: the relevance
+    /// term is kept, no boost was computed, and the result is marked incomplete.
+    fn fallback(relevance_term: f32) -> Self {
+        Self {
+            relevance_term,
+            temporal_boost: 0.0,
+            salience_boost: 0.0,
+            base: 0.0,
+            score: 0.0,
+            complete: false,
+        }
+    }
+
+    /// The net multiplier of the configured adjustments and the final clamp, `score / base`, so
+    /// that `relevance_term × temporal_boost × salience_boost × adjustment_factor` is `score`.
+    ///
+    /// `None` when `base` is not a positive finite number: the adjustments then act on zero, and
+    /// whatever score they leave is not a multiple of `base`.
+    pub(crate) fn adjustment_factor(&self) -> Option<f32> {
+        if self.base.is_finite() && self.base > 0.0 {
+            Some(self.score / self.base)
+        } else {
+            None
+        }
+    }
+}
+
+/// `calculate_score`, returning the terms it multiplied alongside the score.
+pub(crate) fn calculate_score_factors(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+) -> ScoreFactors {
+    score_factors_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
+fn calculate_score_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> f32 {
+    score_factors_with_reporter(input, config, reporter).score
+}
+
+fn score_factors_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> ScoreFactors {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
 
@@ -791,10 +923,17 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let capped_decay = input.decay_factor.min(config.decay_cap);
     let temporal_recency = (-capped_decay * time_diff_days).exp();
 
-    let temporal_boost = 1.0 + w.temporal * temporal_recency;
-    let salience_boost = 1.0 + w.salience * input.salience;
+    let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
+        reporter.record(ScoreFallbackReason::TemporalBoost);
+        return ScoreFactors::fallback(semantic_base);
+    };
+    let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
+        reporter.record(ScoreFallbackReason::SalienceBoost);
+        return ScoreFactors::fallback(semantic_base);
+    };
 
-    let mut score = semantic_base * temporal_boost * salience_boost;
+    let base = semantic_base * temporal_boost * salience_boost;
+    let mut score = base;
 
     let ctx = CandidateContext {
         memory_type: input.memory_type_str,
@@ -811,9 +950,24 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     // Individually finite adjustments can overflow before a later operation
     // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
     if !score.is_finite() {
-        return 0.0;
+        reporter.record(ScoreFallbackReason::NonfiniteComposite);
+        return ScoreFactors {
+            relevance_term: semantic_base,
+            temporal_boost,
+            salience_boost,
+            base,
+            score: 0.0,
+            complete: false,
+        };
     }
-    score.clamp(0.0, 1.0)
+    ScoreFactors {
+        relevance_term: semantic_base,
+        temporal_boost,
+        salience_boost,
+        base,
+        score: score.clamp(0.0, 1.0),
+        complete: true,
+    }
 }
 
 // ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────
@@ -858,3 +1012,7 @@ mod tests;
 #[cfg(test)]
 #[path = "scoring_normalization_tests.rs"]
 mod normalization_tests;
+
+#[cfg(test)]
+#[path = "scoring/fallback_warning_tests.rs"]
+mod fallback_warning_tests;

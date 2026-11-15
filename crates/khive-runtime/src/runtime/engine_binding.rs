@@ -63,6 +63,32 @@ impl KhiveRuntime {
             .unwrap_or_default()
     }
 
+    /// Capture storage identities and dimensions under one registry read lock.
+    /// No service is resolved and no writer is held while taking this snapshot.
+    pub(crate) fn entity_index_model_snapshot(&self) -> RuntimeResult<Vec<(String, usize)>> {
+        let registry = self
+            .embedder_registry
+            .read()
+            .map_err(|_| RuntimeError::Internal("embedder registry lock poisoned".into()))?;
+        registry
+            .names()
+            .into_iter()
+            .filter(|name| !request_excludes_embedder(name))
+            .map(|name| {
+                if let Some(model) = parse_embedding_model_alias(&name) {
+                    let key = model.to_string();
+                    if registry.contains(&key) {
+                        return Ok((key, model.dimensions()));
+                    }
+                }
+                registry
+                    .get_provider(&name)
+                    .map(|provider| (name.clone(), provider.dimensions()))
+                    .ok_or_else(|| RuntimeError::UnknownModel(name))
+            })
+            .collect()
+    }
+
     /// Get the lazily-initialized embedding service for the named model.
     ///
     /// Accepts both built-in lattice model names (e.g. `"all-minilm-l6-v2"`,

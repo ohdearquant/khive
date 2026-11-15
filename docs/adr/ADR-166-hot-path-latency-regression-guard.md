@@ -47,14 +47,16 @@ fit to be the gate.
 ## Decision
 
 Two tiers with different gating authority: deterministic mechanism invariants gate
-every PR; timed trend measurement informs but never gates.
+every PR; timed trend measurement informs but never gates. (Which PRs run the invariants:
+Amendment 1, Decision 3.)
 
 ### D1 — Mechanism invariants: per-PR, deterministic, gating
 
 A dedicated integration-test suite (`hot_path_guard`) runs the canonical read verbs
 against a seeded file-backed store and asserts counter deltas before/after each
 operation. The suite is ordinary `cargo test` — no timing, no statistics, no machine
-dependence — and a violated invariant fails CI like any other test.
+dependence — and a violated invariant fails CI like any other test. (G1-G5 landed as
+assertions in existing test modules rather than a dedicated suite: Amendment 1, Decision 4.)
 
 **Counter prerequisites.** `db_diagnostics` today exposes writer-side counters only
 (pooled/standalone/writer-task acquisitions, begin-refusal counters, checkpoint/WAL
@@ -73,7 +75,7 @@ documents the known-bad state instead of hiding it):
 | Invariant | Property asserted                                                                                                                                                                                                                                                                                        | Guards          |
 | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
 | G1        | One `memory.recall` performs no per-target writer-task acquisition and at most ONE writer-task acquisition for the shared batch carrying its rows (ADR-133 D1/D7 semantics: the batch may also carry other dispatches' rows; attribution is to the batch, asserted after the harness quiescence barrier) | ADR-165 Slice 1 |
-| G2        | One `search` / `memory.recall` performs 0 standalone-reader opens (pooled-reader checkout counter carries the traffic)                                                                                                                                                                                   | ADR-165 Slice 2 |
+| G2        | One `search` / `memory.recall` performs 0 standalone-reader opens (pooled-reader checkout counter carries the traffic; narrowed to store-level reads by Amendment 1, Decision 2)                                                                                                                         | ADR-165 Slice 2 |
 | G3        | On a store with installed ANN graphs, a note-substrate `search`'s vector leg is ANN-served; full-scan fallback count is 0                                                                                                                                                                                | ADR-165 Slice 3 |
 | G4        | A `kind=note` search dispatches 0 operations to a registered backend whose declaration excludes notes                                                                                                                                                                                                    | ADR-165 Slice 4 |
 | G5        | A note-substrate `search` hydrates no more candidate rows than the documented per-arm overfetch times the number of arms (today: `limit x 4` per arm, two arms) plus the registered ANN consumer's fresh-tail contribution, measured at the hydration seam after fusion and fresh-tail merge             | ADR-165 Slice 3 |
@@ -132,6 +134,9 @@ noise floor for that execution.
 
 ### D3 — The budget and thresholds are versioned with the code
 
+(Superseded by Amendment 1, Decision 1: budgets, their schema and `noise_ceiling` belong to
+ADR-206, and the unified 10-15 ms budget is withdrawn.)
+
 A checked-in trend-configuration file — `bench/trend-config.toml`, read by the D2
 lane — defines every normative value D2 references; none may live only in prose or
 in an implementer's judgment:
@@ -171,6 +176,7 @@ noticing.
 - Expected-fail entries make the current known-bad state executable documentation:
   the suite tells the truth about today while gating tomorrow.
 - Marginal CI cost is one integration-test binary per PR and a scheduled bench job.
+  (Status as of Amendment 1, Decision 4: G1-G5 have landed in existing test modules.)
 
 ## Verification
 
@@ -194,3 +200,88 @@ multi-call deferred read transaction, tested separately from ordinary traffic.
 entity, note, graph, event, text, agent, attachment, sparse, raw-SQL, and (when
 enabled) vector reads through one file-backed backend and asserts one pooled
 checkout per operation with no standalone-open delta.
+
+## Amendment 1 (2026-10-23) -- Counter guards and trend-budget ownership
+
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#2027](https://github.com/ohdearquant/khive/issues/2027).
+
+**Trigger.** G1-G5 live in existing test modules, while this ADR describes a dedicated suite and a per-PR gate
+(crates/khive-pack-memory/src/handlers/recall_tests.rs:1274,
+crates/khive-db/src/backend_read_admission_tests.rs:60,
+crates/khive-pack-memory/src/note_search_tests.rs:375,
+crates/kkernel/src/coordinator/tests.rs:356, .github/workflows/ci.yml:515). G2's test counts store-level reads,
+not `search` or `memory.recall` dispatches
+(crates/khive-db/src/backend_read_admission_tests.rs:81-131). The old trend-budget text names a second schema and a
+withdrawn unified latency number (docs/adr/ADR-206-crate-performance-guarantees.md:152-156;
+docs/adr/ADR-166-hot-path-latency-regression-guard.md:144-162).
+
+### Decision 1 -- ADR-206 owns trend budgets
+
+Latency budgets for the verbs this ADR guards, their schema, and `noise_ceiling` belong to ADR-206. ADR-166 defines
+G1-G5 as exact counter invariants and carries no latency number
+(docs/adr/ADR-166-hot-path-latency-regression-guard.md:75-81); a counter invariant needs no timing noise allowance.
+The unified verb budget of 10-15 ms in D3 (docs/adr/ADR-166-hot-path-latency-regression-guard.md:144) is withdrawn,
+and D3's other seed values (`noise_ceiling`, `breach_multiplier`, `baseline_window`, runner-class matching) are
+historical. A latency budget for one of these verbs is a guarantee in an ADR-206 crate manifest, with its value taken
+from a recorded baseline. This leaves one budget schema and one owner.
+
+The repository does not yet match ADR-206's text on where these values live. ADR-206 names `bench/trend-config.toml`,
+"delivered with ADR-166 D3", as the single source, keyed by guarantee ID and comparison class
+(docs/adr/ADR-206-crate-performance-guarantees.md:152-156). No such file is tracked. The 18
+`crates/*/perf/reference.json` files each carry `noise_ceiling` inside their `reduction` object (for example
+crates/khive-fold/perf/reference.json:1137-1147). Each carries the comparison class as its top-level `class` object
+(crates/khive-fold/perf/reference.json:1093; ADR-206:674), and none carries a guarantee ID. Where the
+values live and how they are keyed is ADR-206's decision; this amendment only withdraws ADR-166's claim on them.
+
+### Decision 2 -- G2 covers the store reads its test exercises
+
+G2 states that ordinary file-backed store reads use a pooled-reader checkout and do not open a standalone reader.
+An explicitly requested multi-call deferred read transaction may open one standalone reader for that transaction.
+The test exercises store reads and checks pooled and standalone deltas
+(crates/khive-db/src/backend_read_admission_tests.rs:81-136); the transaction carve-out is asserted separately
+(crates/khive-db/src/sql_bridge_tests.rs:1420-1458). G2 therefore makes no claim about the `search` or
+`memory.recall` verb dispatch paths (docs/adr/ADR-166-hot-path-latency-regression-guard.md:75-81).
+
+### Decision 3 -- PR guards follow the declared test scope
+
+The guards run on a pull request when its test scope includes `khive-db`, `khive-pack-memory`, or `kkernel`, and on
+every full run. Pull-request CI supplies a scoped `TEST_SCOPE` (.github/workflows/ci.yml:513-515),
+`scripts/ci-test-scope.py` derives changed crates and their dependency closure
+(scripts/ci-test-scope.py:1016-1025), and `scripts/ci.sh` runs only those packages when scoped
+(scripts/ci.sh:327-348). ADR-166 says the mechanism invariants gate every PR
+(docs/adr/ADR-166-hot-path-latency-regression-guard.md:49-51).
+
+### Decision 4 -- Record implementation status and task barriers per invariant
+
+G1-G5 have landed as named tests: G1 in `recall_tests.rs`, G2 in `backend_read_admission_tests.rs`, G3 and G5 in
+`note_search_tests.rs`, and G4 in `coordinator/tests.rs` (crates/khive-pack-memory/src/handlers/recall_tests.rs:1274,
+crates/khive-db/src/backend_read_admission_tests.rs:60, crates/khive-pack-memory/src/note_search_tests.rs:375,
+crates/khive-pack-memory/src/note_search_tests.rs:414, crates/kkernel/src/coordinator/tests.rs:356). G1's recall
+serve-ledger work is tracked and the test drains tracked tasks before counter snapshots
+(crates/khive-runtime/src/daemon/load_limits.rs:350-375,
+crates/khive-pack-memory/src/handlers/recall_tests.rs:1277-1284,1321-1356). Recall event telemetry is submitted to
+the audit batch (crates/khive-pack-memory/src/handlers/recall.rs:1466-1482,1597-1613). G2 exercises store methods
+and has no tracked-task barrier (crates/khive-db/src/backend_read_admission_tests.rs:81-136). G3 warms its graph
+before the measured searches and serializes access to process-lifetime route counters
+(crates/khive-pack-memory/src/note_search_tests.rs:372-406; crates/khive-runtime/src/note_search_ann.rs:13-15,56-62).
+G4 measures coordinator dispatch counts without a task barrier
+(crates/kkernel/src/coordinator/tests.rs:354-415). G5 warms the graph, adds a fresh-tail note, then measures
+hydration without a task barrier (crates/khive-pack-memory/src/note_search_tests.rs:414-459). Note search can
+enqueue a tracked ANN rebuild when its graph is inactive or stale (crates/khive-pack-memory/src/note_search.rs:90-120;
+crates/khive-pack-memory/src/ann/warm.rs:34-39). The G5 test does not establish whether that path runs after its
+fresh-tail write; if it does, the counter snapshot needs a task barrier. The code leaves that point unresolved, so
+Acceptance A7 makes the test settle it.
+
+### Acceptance
+
+| ID | Statement                                                                                                                          | Evidence                                                                   |
+| -- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| A1 | Each G1-G5 assertion remains present in its named test module.                                                                     | The five function declarations cited in Decision 4.                        |
+| A2 | G2 checks ordinary store reads and the deferred-transaction carve-out.                                                             | `backend_read_admission_tests.rs:60-136`; `sql_bridge_tests.rs:1388-1461`. |
+| A3 | A scoped PR runs these tests when its scope includes one of the three named crates.                                                | `ci.yml:513-515`; `ci-test-scope.py:1016-1025`; `ci.sh:327-348`.           |
+| A4 | A full run still runs the workspace tests containing these guards.                                                                 | `scripts/ci.sh:343-348`.                                                   |
+| A5 | ADR-166 states no budget, `noise_ceiling` or trend schema as current; ADR-206 is the only record that places them.                 | This amendment's Decision 1; ADR-206:152-156.                              |
+| A6 | The unified 10-15 ms value is absent as an active latency budget.                                                                  | ADR-166 D3; applicable ADR-206 reference files.                            |
+| A7 | G5 either drains tracked tasks before its counter snapshot or asserts that no ANN rebuild was enqueued after its fresh-tail write. | `note_search_tests.rs:414-459`; `note_search.rs:90-120`.                   |

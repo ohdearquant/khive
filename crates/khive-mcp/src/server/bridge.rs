@@ -28,9 +28,10 @@ pub(super) fn request_read_timeout() -> std::time::Duration {
     *TIMEOUT.get_or_init(|| {
         // The storage resolver owns the accepted range and warns on a corrected value.
         let timeout = khive_storage::request_read_timeout_from_env();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
-            timeout.as_secs().to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            value = timeout.as_secs(),
         );
         timeout
     })
@@ -118,12 +119,17 @@ pub(super) type ForwardFuture = std::pin::Pin<
 /// tests must not do. `packs` mirrors `forward_or_spawn_with_config_and_packs`'s own
 /// optional `packs` argument exactly: the `Some`/`None` decision is made by
 /// the shared call site in `request_with_forward`, not inside the adapter,
-/// so a spy standing in for this seam observes the same optional argument
-/// the real function would receive. `config`/`db` are always `None` at this
-/// call site.
+/// so a spy standing in for this seam observes the same optional arguments
+/// the real function would receive. Config and database overrides are owned
+/// because the admitted exchange is run in a separate task.
 #[cfg(unix)]
-pub(super) type ForwardFnPtr =
-    fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>, bool) -> ForwardFuture;
+pub(super) type ForwardFnPtr = fn(
+    khive_runtime::DaemonRequestFrame,
+    Option<std::path::PathBuf>,
+    Option<String>,
+    Option<Vec<String>>,
+    bool,
+) -> ForwardFuture;
 
 /// Adapts the real `forward_or_spawn_with_replay_policy` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
@@ -132,14 +138,16 @@ pub(super) type ForwardFnPtr =
 #[cfg(unix)]
 fn forward_or_spawn_boxed(
     frame: khive_runtime::DaemonRequestFrame,
+    config: Option<std::path::PathBuf>,
+    db: Option<String>,
     packs: Option<Vec<String>>,
     replay_read_only: bool,
 ) -> ForwardFuture {
     Box::pin(async move {
         crate::daemon::forward_or_spawn_with_replay_policy(
             &frame,
-            None,
-            None,
+            config.as_deref(),
+            db.as_deref(),
             packs.as_deref(),
             replay_read_only,
         )
@@ -148,6 +156,21 @@ fn forward_or_spawn_boxed(
 }
 
 impl KhiveMcpServer {
+    pub(crate) fn with_daemon_spawn_overrides(
+        mut self,
+        config: Option<std::path::PathBuf>,
+        db: Option<String>,
+    ) -> Self {
+        self.spawn_config = config;
+        self.spawn_db = db;
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn daemon_spawn_overrides(&self) -> (Option<&std::path::Path>, Option<&str>) {
+        (self.spawn_config.as_deref(), self.spawn_db.as_deref())
+    }
+
     pub(crate) fn plan_ops(&self, ops: &str) -> String {
         let catalog = self
             .registry
@@ -454,9 +477,18 @@ impl KhiveMcpServer {
             let post_cancellation_deadline = khive_storage::capture_request_read_context()
                 .deadline()
                 .map(khive_storage::RequestReadDeadline::async_at);
+            let spawn_config = self.spawn_config.clone();
+            let spawn_db = self.spawn_db.clone();
             let mut forward_task =
                 tokio::spawn(khive_storage::inherit_request_read_context(async move {
-                    let outcome = forward_fn(frame, Some(resolved_packs), replay_read_only).await;
+                    let outcome = forward_fn(
+                        frame,
+                        spawn_config,
+                        spawn_db,
+                        Some(resolved_packs),
+                        replay_read_only,
+                    )
+                    .await;
                     tracing::debug!(
                         target: "khive_mcp::server",
                         request_id,

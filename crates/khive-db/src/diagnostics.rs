@@ -73,7 +73,9 @@ mod writer_contention;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
@@ -84,7 +86,7 @@ use serde::Serialize;
 use crate::checkpoint;
 use crate::pool::{ConnectionPool, WalCeilingSource};
 
-pub use disk_guard::DiskGuardDiagnostics;
+pub use disk_guard::{DiskGuardDiagnostics, LeaseHoldDiagnostics};
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
@@ -351,6 +353,7 @@ pub struct WalPinCensusProcessStart {
     pub process_start_time_unavailable_reason: Option<String>,
 }
 
+#[cfg(unix)]
 fn census_process_start_times(holder_pids: &[u32]) -> Vec<WalPinCensusProcessStart> {
     holder_pids
         .iter()
@@ -431,6 +434,7 @@ pub enum WalPinCensus {
 /// misbehaved. Describing both as "truncated" would make the report cry wolf
 /// on every bounded call, which is how the sentence that matters stops being
 /// read.
+#[cfg(any(unix, test))]
 fn census_truncation_cause(budget_exhausted: bool) -> String {
     if budget_exhausted {
         "the OS process walk stopped at its wall-clock budget (see          collection_cost.wal_pin_census_budget_ms)"
@@ -1083,9 +1087,15 @@ pub struct WriterContentionDiagnostics {
     /// Why `audit_admission_unresolved_obligations` is unavailable to this
     /// caller.
     pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
+    /// Process-wide omitted success decisions by verb; unavailable without registry metrics.
+    pub audit_success_rows_omitted: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide unselected, unforced success decisions by verb.
+    pub audit_success_rows_sampled_out: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide force-only success decisions, including rows that do not commit.
+    pub audit_success_rows_forced: Option<std::collections::BTreeMap<&'static str, u64>>,
 }
 
-/// Process-wide audit-batch health counters, supplied by the runtime layer
+/// Process-wide audit health and success-row decision counters, supplied by the runtime layer
 /// that owns the audit-batch control. `khive-db` never produces these itself
 /// — a direct `khive-db` caller always sees the corresponding
 /// `WriterContentionDiagnostics` fields as `None` plus an explicit reason.
@@ -1120,6 +1130,12 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_unresolved_obligations` last moved;
     /// `None` until it moves.
     pub admission_unresolved_obligations_last_at_ms: Option<u64>,
+    /// Bounded per-verb decision snapshots (ADR-103 Amendment 7), independent of commits.
+    pub audit_success_rows_omitted: [(&'static str, u64); 4],
+    /// Sampled successes that produced no row.
+    pub audit_success_rows_sampled_out: [(&'static str, u64); 2],
+    /// Successes retained only by their forcing rule.
+    pub audit_success_rows_forced: [(&'static str, u64); 2],
 }
 
 /// Live graph-edge rows compared with the durable list-cursor ledger.
@@ -1525,6 +1541,10 @@ pub struct DbDiagnostics {
     /// report's database file and reset only with the serving process.
     pub note_search_ann_route_total: u64,
     pub note_search_fallback_route_total: u64,
+    /// Note-search route totals and fallback causes for this report's opened
+    /// pool. Shared by its runtime handles; reset on pool reconstruction.
+    /// Aliases report the representative pool; separate opens are not summed.
+    pub note_search_routes: crate::pool::NoteSearchRouteSnapshot,
     /// Pool-scoped, monotonic coordinator dispatch and note-candidate
     /// hydration counts used by ADR-166 G4/G5. Reset on pool reconstruction.
     pub search_mechanism: crate::pool::SearchMechanismSnapshot,
@@ -1811,6 +1831,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -1825,6 +1846,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
@@ -1888,6 +1910,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
@@ -1950,6 +1973,7 @@ fn collect_inner(
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -1963,6 +1987,7 @@ fn collect_inner(
             code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
@@ -2021,6 +2046,7 @@ fn collect_inner(
         code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
@@ -2122,6 +2148,20 @@ fn inspect_pool_interruptibly(
     pool.inspect_diagnostic_connection_interruptibly(scope, collect_size_composition)
 }
 
+#[cfg(test)]
+struct DiagnosticConnectionDropWitness(
+    Option<Arc<crate::read_cancellation::DiagnosticGraphTestProbe>>,
+);
+
+#[cfg(test)]
+impl Drop for DiagnosticConnectionDropWitness {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.connection_dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub(crate) fn inspect_open_connection_interruptibly(
     pool: &ConnectionPool,
     opened: Result<rusqlite::Connection, crate::error::SqliteError>,
@@ -2129,6 +2169,10 @@ pub(crate) fn inspect_open_connection_interruptibly(
     collect_size_composition: bool,
 ) -> StorageResult<PoolInspection> {
     scope.ensure_active()?;
+    // Declared before `conn`, so this witness runs after the connection drops.
+    #[cfg(test)]
+    let _connection_witness = DiagnosticConnectionDropWitness(scope.diagnostic_graph_probe());
+    let opened = opened.and_then(|conn| crate::ProgressConn::new(conn).map_err(Into::into));
     let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
@@ -2185,8 +2229,20 @@ pub(crate) fn inspect_open_connection_interruptibly(
     // keep each query's ordinary SQLite result nested inside one guarded
     // execution while allowing the outer cancellation cause to remain typed.
     let (integrity, pages, fts_segments) = scope.run(&conn, || {
+        #[cfg(test)]
+        let graph_probe = scope.diagnostic_graph_probe();
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(true, Ordering::Release);
+        }
+        let integrity = graph_edge_integrity(&conn);
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(false, Ordering::Release);
+            probe.graph_returned.store(true, Ordering::Release);
+        }
         Ok((
-            graph_edge_integrity(&conn),
+            integrity,
             size_composition::collect(&conn, collect_size_composition),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))

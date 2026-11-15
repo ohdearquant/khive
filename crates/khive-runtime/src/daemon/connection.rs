@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::*;
 
 #[cfg(unix)]
@@ -155,6 +156,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
             return;
         }
     };
+    drop(raw);
     let supervisor_probe = frame.probe_only;
     let handover_accepted = handover_requested
         && supervisor_probe
@@ -417,6 +419,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
             visible_namespaces: frame.visible_namespaces.clone(),
+            owned_namespaces: frame.owned_namespaces.clone(),
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };

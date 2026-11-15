@@ -10,6 +10,8 @@ use khive_score::DeterministicScore;
 
 use crate::error::FoldError;
 
+mod diversity;
+
 /// A single input item to a selector operation.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -100,7 +102,7 @@ pub trait Selector<T>: Send + Sync {
 ///
 /// Filters by `SelectorWeights.min_score`, applies `category_weights` multipliers
 /// to adjust scores, then greedily packs until the budget is exhausted. When
-/// `diversity_bias > 0`, uses a pick-best-remaining loop instead of a single
+/// `diversity_bias > 0`, uses indexed category winners instead of a single
 /// sort pass. Tie-breaking is deterministic: effective score descending, size
 /// ascending, then id ascending. This is an ordering heuristic, not a knapsack
 /// optimizer, and provides no optimality or approximation-ratio guarantee. See
@@ -124,25 +126,6 @@ fn pragmatic_plus_epistemic<T>(item: &SelectorInput<T>, epistemic_weight: f32) -
         return base;
     }
     base + epistemic_weight as f64 * item.information_gain.unwrap_or(0.0) as f64
-}
-
-fn effective_score<T>(
-    item: &SelectorInput<T>,
-    counts: &std::collections::BTreeMap<String, usize>,
-    bias: f32,
-    epistemic_weight: f32,
-) -> f64 {
-    let base = pragmatic_plus_epistemic(item, epistemic_weight);
-    if bias == 0.0 {
-        return base;
-    }
-    let count = item
-        .category
-        .as_ref()
-        .and_then(|c| counts.get(c))
-        .copied()
-        .unwrap_or(0);
-    base * (1.0 - bias as f64 * count as f64 / (count as f64 + 1.0))
 }
 
 fn validate_selector_weights(weights: &SelectorWeights) -> Result<(), FoldError> {
@@ -259,48 +242,12 @@ impl<T: Clone> Selector<T> for GreedySelector {
                 }
             }
         } else {
-            // Diversity path: pick-best-remaining with per-step effective score.
-            let mut remaining = inputs;
-            let mut category_counts: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-
-            while !remaining.is_empty() {
-                let mut candidates = Vec::with_capacity(remaining.len());
-                for (i, item) in remaining.iter().enumerate() {
-                    if item.size > budget.saturating_sub(total_size) {
-                        continue;
-                    }
-                    let eff = effective_score(item, &category_counts, weights.diversity_bias, ew);
-                    if !eff.is_finite() {
-                        return Err(FoldError::InvalidInput(format!(
-                            "effective score for '{}' must be finite",
-                            item.id
-                        )));
-                    }
-                    candidates.push((i, DeterministicScore::from_f64(eff)));
-                }
-
-                let best_idx = candidates
-                    .into_iter()
-                    .max_by(|&(i, a_det), &(j, b_det)| {
-                        a_det
-                            .cmp(&b_det)
-                            .then_with(|| remaining[j].size.cmp(&remaining[i].size))
-                            .then_with(|| remaining[j].id.cmp(&remaining[i].id))
-                    })
-                    .map(|(i, _)| i);
-
-                match best_idx {
-                    Some(idx) => {
-                        let item = remaining.swap_remove(idx);
-                        if let Some(ref cat) = item.category {
-                            *category_counts.entry(cat.clone()).or_default() += 1;
-                        }
-                        total_size += item.size;
-                        selected.push(item);
-                    }
-                    None => break,
-                }
+            let indices = diversity::select(&inputs, budget, weights);
+            let mut inputs: Vec<_> = inputs.into_iter().map(Some).collect();
+            for index in indices {
+                let input = inputs[index].take().expect("selected once");
+                total_size += input.size;
+                selected.push(input);
             }
         }
 

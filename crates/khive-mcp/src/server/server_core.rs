@@ -76,6 +76,8 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     pub(super) config_id: String,
+    pub(super) spawn_config: Option<std::path::PathBuf>,
+    pub(super) spawn_db: Option<String>,
     /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
@@ -109,6 +111,7 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     pub(super) default_output_format: OutputFormat,
+    pub(super) catalog_verbosity: crate::args::CatalogVerbosity,
     /// Last instant at which this process's daemon schedule loop began a tick.
     /// Zero means this server instance has never observed the loop running.
     /// Shared by server clones but never persisted, so a replacement process
@@ -213,6 +216,24 @@ pub(super) enum StdioServeMode {
     /// generation of a prior self-heal re-exec (`crate::daemon`, #714 §2.3).
     Resumed,
 }
+
+#[cfg(unix)]
+impl StdioServeMode {
+    /// Apply the same handshake state used by the stdio serving path.
+    pub(super) fn wrap_transport<T>(
+        self,
+        inner: T,
+    ) -> crate::transport::PreInitializeRequestTransport<T> {
+        crate::transport::PreInitializeRequestTransport::with_initialize_forwarded(
+            inner,
+            matches!(self, Self::Resumed),
+        )
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "server_core/stdio_serve_mode_tests.rs"]
+mod stdio_serve_mode_tests;
 
 /// Pure decision behind [`StdioServeMode`], factored out so it is
 /// unit-testable without driving real stdio I/O. `resumed_generation` is
@@ -356,4 +377,15 @@ pub(super) fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::t
         );
     }
     Ok(std::time::Duration::from_secs(secs))
+}
+
+impl KhiveMcpServer {
+    /// Lifecycle control for the shared domain retained by the serving root.
+    pub(crate) fn background_resources_control(
+        &self,
+    ) -> Option<khive_runtime::resource_admission::BackgroundDomainControl> {
+        self.runtime
+            .as_ref()
+            .map(KhiveRuntime::background_resources_control)
+    }
 }

@@ -1,6 +1,6 @@
 # Scoring and Reranking
 
-The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score. The response `score` field is clamped to `[0, 1]`; the ordering `rank_score` is multiplied by the entity posterior term without a final clamp and may exceed `1.0`. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
+The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score. The response `score` field is clamped to `[0, 1]`; the ordering `rank_score` is multiplied by the entity posterior term without a final clamp and may exceed `1.0`. When a serving profile carries a `local_factor`, the `rank_score` of rows in the `local` namespace is also multiplied by it. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
 
 ## `calculate_score`
 
@@ -12,7 +12,7 @@ score = w_rel * relevance
       * (1 + w_imp * salience)
 ```
 
-Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`.
+Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`. A recall with `include_breakdown` reports the factors of this product in `breakdown.composite` (see `configuration.md#score-breakdowns`).
 
 `ScoreInput` groups candidate fields to keep the function interface manageable: salience, memory type, content, creation time, decay factor, current time, normalized relevance, and entity names.
 

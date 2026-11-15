@@ -102,8 +102,8 @@ pub(super) async fn find_by_number(
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: sql!("notes_by_number_select").into(),
             params: vec![
                 SqlValue::Text(kind.to_string()),
@@ -115,14 +115,26 @@ pub(super) async fn find_by_number(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| r.uuid("id").ok()))
+    if rows.len() > 1 {
+        tracing::warn!(
+            target: "khive_pack_git::ingest",
+            kind,
+            namespace = token.namespace().as_str(),
+            project_id = %project_id,
+            number,
+            matched_at_least = 2_u64,
+            "multiple live notes match GitHub number; selecting first by stored ID"
+        );
+    }
+    Ok(rows.first().and_then(|row| row.uuid("id").ok()))
 }
 
-/// Find an existing `document` entity whose `properties.source_uri` or
-/// `name` matches `path` (ADR-086 keying convention); `None` when no match
-/// (v0 never creates documents on the ingester's behalf). See
+/// Find an existing `document` entity by exact `properties.source_uri`, then
+/// by a source-URI suffix, then by basename only when `source_uri` is absent
+/// (ADR-086 Amendment 1); `None` when no match. The ingester never creates
+/// documents on the caller's behalf. See
 /// crates/khive-pack-git/docs/api/ingest.md#find_document_for_path for the
-/// single-query exact-vs-suffix-match ordering rationale.
+/// single-query ordering rationale.
 pub(super) async fn find_document_for_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -134,7 +146,7 @@ pub(super) async fn find_document_for_path(
         .unwrap_or(path);
     let sql = runtime.sql();
     let namespace = token.namespace().as_str().to_string();
-    let like_pattern = format!("%{}", khive_types::escape_like_literal(path));
+    let like_pattern = format!("%/{}", khive_types::escape_like_literal(path));
 
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r

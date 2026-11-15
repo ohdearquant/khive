@@ -4191,11 +4191,12 @@ async fn t1_send_within_namespace_unchanged() {
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed" }),
@@ -4206,10 +4207,10 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4251,11 +4252,12 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "hello cross-ns" }),
@@ -4271,10 +4273,10 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4353,11 +4355,12 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "ns stamp check" }),
@@ -4365,10 +4368,10 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4576,13 +4579,13 @@ async fn t5b_reply_always_writes_same_namespace() {
 #[tokio::test]
 async fn t6_sender_inbox_does_not_see_inbound_copy() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) = build_crossns_registry(
+    let (registry_sender, _rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
         "lambda:leo",
         vec![Namespace::parse("lambda:khive").unwrap()],
     );
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "isolation check" }),
@@ -4590,7 +4593,7 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
         .await
         .expect("T6: send must succeed");
 
-    let inbox = registry_leo
+    let inbox = registry_sender
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
         .expect("T6: sender inbox dispatch must succeed");
@@ -4604,7 +4607,7 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
-    let (_registry_leo, rt_leo) = build_crossns_registry(
+    let (_registry_sender, rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
         "lambda:leo",
         vec![Namespace::parse("lambda:khive").unwrap()],
@@ -4612,12 +4615,12 @@ async fn t7_with_namespace_token_scoping() {
     let (_registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let leo_tok = rt_leo
+    let sender_tok = rt_sender
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
-    let sender_note = rt_leo
+    let sender_note = rt_sender
         .create_note(
-            &leo_tok,
+            &sender_tok,
             "observation",
             None,
             "sender-ns note",
@@ -4645,9 +4648,9 @@ async fn t7_with_namespace_token_scoping() {
         .expect("T7: create recipient note");
 
     let recipient_tok: NamespaceToken =
-        leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
+        sender_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    let can_see_sender = rt_leo
+    let can_see_sender = rt_sender
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
     match can_see_sender {
@@ -4682,11 +4685,12 @@ async fn t7_with_namespace_token_scoping() {
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "append-only check" }),
@@ -4694,10 +4698,10 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4714,7 +4718,7 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .map(|n| n.id)
         .expect("T8: must find inbound note in local ns (ADR-007 all-local)");
 
-    let can_read = rt_leo
+    let can_read = rt_sender
         .get_note_including_deleted(&local_tok, inbound_id)
         .await;
     match can_read {
@@ -4823,12 +4827,12 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
 #[tokio::test]
 async fn t10_reply_cross_ns_denied_when_empty() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) =
+    let (registry_sender, _rt_sender) =
         build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "setup for T10" }),
@@ -4859,9 +4863,10 @@ async fn t10_reply_cross_ns_denied_when_empty() {
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed always succeeds" }),
@@ -4872,10 +4877,10 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         "T11: actor-addressed send must succeed; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4892,30 +4897,31 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result_leo = registry_leo
+    let sender_result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "leo to khive" }),
         )
         .await;
     assert!(
-        result_leo.is_ok(),
-        "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
+        sender_result.is_ok(),
+        "T12: leo→khive send must succeed under ADR-057; got {sender_result:?}"
     );
 
-    let local_tok_leo = rt_leo
+    let sender_local_token = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_local_notes = rt_leo
-        .list_notes(&local_tok_leo, Some("message"), 100, 0)
+    let sender_local_notes = rt_sender
+        .list_notes(&sender_local_token, Some("message"), 100, 0)
         .await
         .unwrap();
     assert_eq!(
-        leo_local_notes
+        sender_local_notes
             .iter()
             .filter(|n| n.deleted_at.is_none())
             .count(),
@@ -11166,16 +11172,19 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
         .expect("A sends to B");
     let root_id = sent["full_id"].as_str().expect("full_id").to_string();
 
+    let missing = uuid::Uuid::new_v4();
+    let unknown_from_c = registry_c
+        .dispatch("comm.thread", serde_json::json!({ "id": missing }))
+        .await
+        .expect_err("unknown thread root must be refused");
     let thread_from_c = registry_c
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
-        .expect("C can resolve the root id but must see zero messages");
+        .expect_err("an unrelated actor must not resolve the hidden root");
     assert_eq!(
-        thread_from_c["count"].as_u64().unwrap_or(99),
-        0,
-        "an actor who is neither sender nor addressee must see zero thread messages \
-         (issue #94: thread previously exposed every actor's copies unfiltered); \
-         got {thread_from_c}"
+        thread_from_c.to_string(),
+        unknown_from_c.to_string(),
+        "an unrelated actor must receive the same error as for an unknown root"
     );
 
     let thread_from_a = registry_a
@@ -16292,6 +16301,14 @@ mod mailbox_views {
                         "{actor}/{verb} changed message rows"
                     );
                 }
+                let unknown = call_as(
+                    &fixture.registry,
+                    Some(actor),
+                    "comm.thread",
+                    json!({"id":Uuid::new_v4()}),
+                )
+                .await
+                .expect_err("unknown thread root must be refused");
                 let thread = call_as(
                     &fixture.registry,
                     Some(actor),
@@ -16299,8 +16316,9 @@ mod mailbox_views {
                     json!({"id":id}),
                 )
                 .await
-                .unwrap();
-                assert_eq!(thread["count"], 0, "{actor}: {thread}");
+                .expect_err("hidden thread root must be refused");
+                assert_eq!(thread.to_string(), unknown.to_string(), "{actor}");
+                assert_eq!(message_snapshot(&fixture).await, before);
             }
         }
         // An enrolled mailbox reader's delegated read grant does not enlarge
@@ -16536,11 +16554,15 @@ mod mailbox_views {
             )
             .await
             .expect_err("matching sender must not reopen the legacy pool");
+        let unknown = fixture
+            .call(OWNER, "comm.thread", json!({"id":Uuid::new_v4()}))
+            .await
+            .expect_err("unknown thread root must be refused");
         let thread = fixture
             .call(OWNER, "comm.thread", json!({"id":missing_recipient}))
             .await
-            .unwrap();
-        assert_eq!(thread["count"], 0);
+            .expect_err("hidden thread root must be refused");
+        assert_eq!(thread.to_string(), unknown.to_string());
         assert_eq!(message_snapshot(&fixture).await, before);
     }
 
@@ -16942,7 +16964,7 @@ mod mailbox_views {
     async fn delegated_thread_filters_physical_rows_before_dedup_and_cursor_projection() {
         let fixture = Fixture::new(true, OWNER);
         let root = Uuid::from_u128(100);
-        // Root insertion itself must pass strict filtering, even without thread_id.
+        // The legacy root is retained in storage but excluded from this mailbox.
         fixture
             .seed(
                 root,
@@ -16970,9 +16992,8 @@ mod mailbox_views {
         fixture.seed(Uuid::from_u128(104), "valid pair", p).await;
         let mut p = props(Some(json!(OWNER)), None, "inbound", false);
         p["thread_id"] = json!(root);
-        fixture
-            .seed(Uuid::from_u128(105), "unattributed sender", p)
-            .await;
+        let anchor = Uuid::from_u128(105);
+        fixture.seed(anchor, "unattributed sender", p).await;
         for (n, recipient) in [
             None,
             Some(Value::Null),
@@ -16996,11 +17017,28 @@ mod mailbox_views {
             .seed(Uuid::from_u128(120), "unrelated attributed", p)
             .await;
         let before = fixture.owner_state().await;
-        let full = fixture
+        let unknown = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":Uuid::new_v4()}),
+            )
+            .await
+            .expect_err("unknown root must be refused");
+        let hidden = fixture
             .call(
                 HELPER,
                 "comm.thread",
                 json!({"mailbox_actor":OWNER,"id":root}),
+            )
+            .await
+            .expect_err("hidden legacy root must be refused");
+        assert_eq!(hidden.to_string(), unknown.to_string());
+        let full = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":anchor}),
             )
             .await
             .unwrap();
@@ -17023,10 +17061,10 @@ mod mailbox_views {
         assert_eq!(rows[1]["read"], true, "eligible twins still fold normally");
         // Descending `after` advances to a smaller (created_at, UUID) tuple.
         // All fixture timestamps are equal, so the oldest retained row has no successor.
-        let empty = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        let empty = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":anchor,"after":outbound,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
         assert_eq!(empty["count"], 0);
         assert_eq!(empty["messages"], json!([]));
-        let page = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":Uuid::from_u128(105),"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        let page = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":anchor,"after":anchor,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
         assert_eq!(page["count"], 1, "the projection control must have a row");
         assert_eq!(page["messages"][0]["full_id"], json!(valid_out));
         assert_eq!(page["messages"][0]["read"], true);
@@ -17035,7 +17073,7 @@ mod mailbox_views {
             .call(
                 HELPER,
                 "comm.thread",
-                json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"limit":1}),
+                json!({"mailbox_actor":OWNER,"id":anchor,"after":outbound,"limit":1}),
             )
             .await
             .unwrap();
@@ -17045,14 +17083,14 @@ mod mailbox_views {
             "equal-timestamp UUID cursor remains stable"
         );
         let own = fixture
-            .call(OWNER, "comm.thread", json!({"id":root}))
+            .call(OWNER, "comm.thread", json!({"id":anchor}))
             .await
             .unwrap();
         let explicit = fixture
             .call(
                 OWNER,
                 "comm.thread",
-                json!({"id":root,"mailbox_actor":OWNER}),
+                json!({"id":anchor,"mailbox_actor":OWNER}),
             )
             .await
             .unwrap();

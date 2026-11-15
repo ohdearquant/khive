@@ -283,7 +283,7 @@ def main():
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 160 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 163 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -320,18 +320,20 @@ def main():
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
         # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
-        # tool contributes fourteen verbs, including tool.policy_delete, and
+        # tool contributes fifteen verbs, including tool.policy_delete, and
         # exec nine (the tool registry with use policy and sandboxed runs over trees);
         # knowledge contributes knowledge.lint for graph hygiene inspection;
         # comm contributes comm.withheld_body, the recipient's or maintainer's
         # read of a withheld external message's original (ADR-200 Amendment 1);
         # kg contributes apply_changeset, the atomic apply of one canonical
         # NDJSON change-set; attach records a rendition of a record and
-        # hydrates the selected roles.
+        # hydrates the selected roles; gtd contributes gtd.counts, one assignee's
+        # task counts by status without task bodies; memory contributes
+        # memory.apply_batch, checked and resumable memory rewrites (ADR-021).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 160, (
-            f"expected 160 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 163, (
+            f"expected 163 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -355,16 +357,21 @@ def main():
             f"(ADR-174); "
             f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "
-            f"tool contributes fourteen verbs including tool.policy_delete "
+            f"tool contributes fifteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "
             f"knowledge contributes knowledge.lint; "
             f"kg contributes attach, which records a rendition of a record and "
             f"hydrates the selected roles; "
+            f"gtd contributes gtd.counts; "
+            f"memory contributes memory.apply_batch; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
         assert "gtd.repair" in verb_names, (
             f"'gtd.repair' (ADR-019 Amendment 7) must appear in verbs listing: {verb_names}"
+        )
+        assert "gtd.counts" in verb_names, (
+            f"'gtd.counts' must appear in verbs listing: {verb_names}"
         )
         assert "tool.policy_delete" in verb_names, (
             f"'tool.policy_delete' must appear in verbs listing: {verb_names}"

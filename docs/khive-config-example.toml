@@ -81,6 +81,21 @@ strict = true
 # denies all cross-namespace delivery. Each entry must be a valid namespace.
 # allowed_outbound_namespaces = ["lambda:otherbot"]
 
+# Strict attributed-actor mode while the comm pack is loaded, the same as
+# KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1; either one turns it on. An actor is
+# unattributed when it is absent, empty or `local`. The server refuses to start
+# and `kkernel exec` refuses to run when its own actor is unattributed, and a
+# daemon refuses each request frame whose actor is unattributed. The refusal is per
+# frame and comes before any op runs, so a batch frame is refused whole, read ops
+# included. Unlike other keys it is ORed across every config file found (the
+# database's, the cwd khive.toml and .khive/config.toml, and ~/.khive/config.toml),
+# so a project file without it cannot shadow a home config that sets it. Every one of
+# those files is therefore read, and one that fails to load refuses every command,
+# naming the file, the file in use, and the fact that it was read only for this key.
+# An explicit --config/KHIVE_CONFIG file is the only one read. Valid without `id`.
+# Default false.
+# require_attributed = true
+
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
 
 [runtime]
@@ -313,6 +328,7 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                When exactly "1": refuse to start if the comm pack is loaded with
 #                                no actor identity (id None / local), preventing a shared "party-
 #                                line" inbox. Default: off. Only the literal "1" enables it.
+#                                [actor] require_attributed = true requests the same refusal.
 #
 # ── Session transcript mirror (pack `session`, ADR-080) ──────────────────────────
 #   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes/on.

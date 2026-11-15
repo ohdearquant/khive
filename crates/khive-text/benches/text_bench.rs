@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use khive_text::{
     analyzer::StandardAnalyzer,
     filter::{LowercaseFilter, MinLengthFilter, StopWordFilter},
@@ -48,12 +50,14 @@ fn bench_tokenize(c: &mut Criterion) {
     let tok = WhitespaceTokenizer;
 
     for (label, text) in [("short", SHORT), ("medium", MEDIUM), ("long", LONG)] {
+        g.throughput(Throughput::Elements(text.chars().count() as u64));
         g.bench_with_input(BenchmarkId::new("whitespace", label), text, |b, t| {
             b.iter(|| tok.tokenize(black_box(t)))
         });
     }
 
     let cjk_tok = CjkCharTokenizer;
+    g.throughput(Throughput::Elements(MIXED_CJK.chars().count() as u64));
     g.bench_with_input(BenchmarkId::new("cjk", "mixed"), MIXED_CJK, |b, t| {
         b.iter(|| cjk_tok.tokenize(black_box(t)))
     });

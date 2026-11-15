@@ -294,6 +294,7 @@ class ClosedLoopCompatibilityTests(unittest.TestCase):
                 patch.object(harness.bpd, "_handshake"),
                 patch.object(harness.bpd, "_call_verb"),
                 patch.object(harness.bpd, "assert_daemon_engaged"),
+                patch.object(harness.mbc, "require_all_audit_success_rows"),
                 patch.object(harness.bpd, "_teardown_daemon"),
                 patch.object(harness.bpd, "_git_sha", return_value="fixture-sha"),
                 patch.object(harness.bpd, "_iso_now", return_value="fixture-time"),
@@ -307,6 +308,76 @@ class ClosedLoopCompatibilityTests(unittest.TestCase):
         text = output.getvalue()
         actual_json = text[text.index("{\n"):text.rindex("}") + 1]
         self.assertEqual(actual_json, json.dumps(CLOSED_LOOP_GOLDEN, indent=2, default=str))
+
+
+class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
+    def run_to_worker_boundary(self, arrival_rate=None, refuse=False):
+        events, worker_envs, process = [], [], Mock()
+        def preflight(proc):
+            self.assertIs(proc, process)
+            events.append("preflight")
+            if refuse:
+                raise RuntimeError("reduced mode refused")
+        def oracle(*args):
+            events.append("oracle")
+            return {"oracle": "PENDING", "detail": "fixture"}
+        def worker(*args):
+            events.append("worker")
+            worker_envs.append(dict(args[2] if arrival_rate else args[3]))
+            raise RuntimeError("worker boundary")
+        argv = ["bench_load_harness.py", "--mode", "bench", "--workers", "1",
+                "--tenants", "1", "--ops-per-worker", "1"]
+        if arrival_rate:
+            argv.extend(["--arrival-rate", str(arrival_rate)])
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(output))
+            stack.enter_context(patch.dict(harness.os.environ, {"KHIVE_AUDIT_SUCCESS_ROWS": "reduced"}))
+            patches = [patch.object(harness.sys, "argv", argv),
+                       patch.object(harness, "_resolve_binary", return_value="fixture-binary"),
+                       patch.object(harness.tempfile, "mkdtemp", return_value="/fixture"),
+                       patch.object(harness.pathlib.Path, "write_text", return_value=0),
+                       patch.object(harness.pathlib.Path, "exists", return_value=True),
+                       patch.object(harness, "_assert_not_live_db"),
+                       patch.object(harness.subprocess, "Popen", return_value=process),
+                       patch.object(harness.bpd, "_handshake"),
+                       patch.object(harness.bpd, "_call_verb"),
+                       patch.object(harness.bpd, "assert_daemon_engaged", side_effect=lambda *a, **k: events.append("engaged")),
+                       patch.object(harness.mbc, "require_all_audit_success_rows", side_effect=preflight),
+                       patch.object(harness.bpd, "_teardown_daemon"),
+                       patch.object(harness.bpd, "_git_sha", return_value="fixture-sha"),
+                       patch.object(harness.bpd, "_iso_now", return_value="fixture-time"),
+                       patch.object(harness, "probe_oracle_channel", side_effect=oracle),
+                       patch.object(harness, "_run_worker", side_effect=worker),
+                       patch.object(harness, "_run_open_workers", side_effect=worker),
+                       patch.object(harness, "ThreadPoolExecutor", ImmediatePool)]
+            mocks = [stack.enter_context(selected) for selected in patches]
+            self.assertEqual(harness.main(), 1)
+        process.stdin.close.assert_called_once()
+        process.wait.assert_called_once()
+        mocks[11].assert_called_once()
+        self.assertIn("reduced mode refused" if refuse else "worker boundary", output.getvalue())
+        return events, mocks[6].call_args.kwargs["env"], worker_envs
+
+    def test_preflight_precedes_oracle_and_worker_fanout(self):
+        for rate in (None, 10):
+            with self.subTest(rate=rate):
+                events, _, _ = self.run_to_worker_boundary(rate)
+                self.assertEqual(events, ["engaged", "preflight", "oracle", "worker"])
+
+    def test_refusal_prevents_oracle_and_worker_fanout(self):
+        for rate in (None, 10):
+            with self.subTest(rate=rate):
+                events, _, _ = self.run_to_worker_boundary(rate, refuse=True)
+                self.assertEqual(events, ["engaged", "preflight"])
+
+    def test_bootstrap_and_workers_inherit_all(self):
+        for rate in (None, 10):
+            with self.subTest(rate=rate):
+                _, bootstrap_env, worker_envs = self.run_to_worker_boundary(rate)
+                self.assertEqual(bootstrap_env["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
+                self.assertEqual(len(worker_envs), 1)
+                self.assertEqual(worker_envs[0]["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
 
 
 if __name__ == "__main__":

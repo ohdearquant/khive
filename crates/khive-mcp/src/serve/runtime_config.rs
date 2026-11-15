@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
+    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, Namespace, OpenedDiagnosticBackend,
     OutboundEmailPolicy, OutputFormat, RuntimeConfig, StorageBackend,
 };
 
@@ -36,6 +36,7 @@ pub(super) async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    KhiveRuntime::validated_background_limits(&config)?;
     config.prepare_engines()?;
     #[cfg(unix)]
     preflight_events_socket_for_boot(&config, &[], false)?;
@@ -108,10 +109,13 @@ pub(super) async fn prepare_core_schema_for_boot(
     label: impl Into<String>,
 ) -> anyhow::Result<u32> {
     let label = label.into();
-    tokio::task::spawn_blocking(move || backend.prepare_core_schema())
-        .await
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
+    tokio::task::spawn_blocking(
+        khive_db::WriteClassContext::migration()
+            .wrap_blocking(move || backend.prepare_core_schema()),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
 }
 
 /// Resolve and install blob hydration on an already prepared runtime.
@@ -206,13 +210,19 @@ pub(super) fn build_pack_runtime(
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config)
-        .with_outbound_email_policy(main_runtime.outbound_email_policy().clone())
-        .with_declared_backend_db_paths(declared_backend_db_paths)
-        .with_diagnostic_backends(diagnostic_backends)
-        .with_diagnostic_observer_from(main_runtime)
-        .with_core_embedders_from(main_runtime)
-        .with_code_map_registry_from(main_runtime);
+    let rt = KhiveRuntime::from_backend_in_domain(
+        backend,
+        rt_config,
+        main_runtime
+            .background_root()
+            .expect("main runtime owns its background domain"),
+    )
+    .with_outbound_email_policy(main_runtime.outbound_email_policy().clone())
+    .with_declared_backend_db_paths(declared_backend_db_paths)
+    .with_diagnostic_backends(diagnostic_backends)
+    .with_diagnostic_observer_from(main_runtime)
+    .with_core_embedders_from(main_runtime)
+    .with_code_map_registry_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -431,9 +441,10 @@ pub struct RuntimeConfigInputs<'a> {
     ///
     /// Distinct from `namespace_explicit`: `kkernel exec` and `kkernel reindex`
     /// set `namespace_explicit: true` unconditionally (their `--namespace` arg
-    /// has no `Option` to distinguish "typed" from "default"), but they have no
-    /// `--actor` flag and must NOT suppress the project/db actor-id tiers when
-    /// their namespace happens to resolve to `"local"`. Only `kkernel mcp`
+    /// has no `Option` to distinguish "typed" from "default") and must NOT
+    /// suppress the project/db actor-id tiers when their namespace resolves to
+    /// `"local"`. Exec's optional actor pin is applied after those tiers. Only
+    /// `kkernel mcp`
     /// (`build_server`, via `resolve_cli_namespace`) sets this to a value that
     /// can suppress those tiers — everyone else passes `false`.
     pub actor_explicit: bool,
@@ -461,12 +472,41 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     Ok(config)
 }
 
+/// Ownership declared by the selected configuration, before actor overrides.
+#[must_use = "finalize configured ownership after selecting the final actor"]
+pub struct ConfiguredActorOwnership {
+    declaring_actor: Option<String>,
+    namespaces: Vec<Namespace>,
+}
+
+impl ConfiguredActorOwnership {
+    /// Apply this declaration once, only to its final declaring actor.
+    pub fn finalize(self, config: &mut RuntimeConfig) {
+        let matches = self
+            .declaring_actor
+            .as_deref()
+            .is_some_and(|actor| config.actor_id.as_deref() == Some(actor));
+        config.owned_namespaces = if matches { self.namespaces } else { Vec::new() };
+    }
+}
+
 /// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
 /// same construction boundary. Server boot paths thread this value through
 /// consistency validation and registry construction without re-reading HOME.
 pub fn resolve_runtime_config_with_db_anchor(
     inputs: RuntimeConfigInputs<'_>,
 ) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let (mut config, db_anchor, ownership) = resolve_runtime_config_with_actor_ownership(inputs)?;
+    ownership.finalize(&mut config);
+    Ok((config, db_anchor))
+}
+
+/// Resolve config and actor tiers while deferring ownership finalization.
+/// The returned config has no ownership grants until the declaration is finalized
+/// after any remaining actor override and expectation checks.
+pub fn resolve_runtime_config_with_actor_ownership(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>, ConfiguredActorOwnership)> {
     let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
     let db_path = db_anchor.clone();
 
@@ -536,6 +576,12 @@ pub fn resolve_runtime_config_with_db_anchor(
         )?
     };
 
+    let mut resolved = resolved;
+    let ownership = ConfiguredActorOwnership {
+        declaring_actor: resolved.actor_id.clone(),
+        namespaces: std::mem::take(&mut resolved.owned_namespaces),
+    };
+
     // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
     // lowest), ratified 2026-07-05:
     //
@@ -553,7 +599,8 @@ pub fn resolve_runtime_config_with_db_anchor(
     //      closes). `kkernel exec`/`reindex` force
     //      `namespace_explicit: true` for unrelated reasons (no `Option` on
     //      their `--namespace` arg) but always pass `actor_explicit: false`,
-    //      so they keep falling through to tiers 2-3 exactly as before.
+    //      so they keep falling through to tiers 2-3 exactly as before. Exec's
+    //      optional actor pin is applied after those lookups.
     //   2. Project/cwd-anchored config `[actor].id`, resolved INDEPENDENTLY of
     //      the database-anchored config load above (`resolve_project_actor_id`).
     //      Commit 10d9c92c (#651) anchored tier-3 `.khive/config.toml` discovery
@@ -591,14 +638,23 @@ pub fn resolve_runtime_config_with_db_anchor(
             // "local" also looks like "unset". Gated on `actor_explicit`
             // (not the broader `namespace_explicit`) so `kkernel exec`/
             // `reindex` — which force `namespace_explicit: true` for
-            // unrelated reasons and have no `--actor` flag — keep falling
-            // through exactly as before.
+            // unrelated reasons, keep falling through exactly as before.
+            // Exec's optional actor pin is a separate late tier.
             resolved.actor_id = None;
         } else {
             let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
                 .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
             resolved.actor_id = project_actor.or(resolved.actor_id);
         }
+        // Strict attributed-actor mode is read from the project config on every
+        // branch above, including an explicit actor or namespace: a project
+        // that asks for it keeps it whatever identity the caller supplies.
+        resolved.require_attributed_actor |=
+            khive_runtime::resolve_project_requires_attributed_actor(
+                inputs.config,
+                db_path_for_config.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
         resolved
     };
 
@@ -627,7 +683,7 @@ pub fn resolve_runtime_config_with_db_anchor(
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok((apply_env_brain_profile(resolved), db_anchor))
+    Ok((apply_env_brain_profile(resolved), db_anchor, ownership))
 }
 
 /// Upgrade a resolved config's event plane from direct (embedded) mode to
@@ -910,5 +966,151 @@ mod code_map_registry_tests {
             .expect("pack registration")
             .generation();
         assert_eq!(pack_generation, main_generation);
+    }
+}
+
+#[cfg(test)]
+mod background_limit_host_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raw_single_host_refuses_invalid_limits_before_creating_storage() {
+        for (warm, maintenance) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+            let fixture = tempfile::tempdir().expect("isolated host target");
+            let db_path = fixture.path().join("must-not-open.db");
+            // Keep the opener lock-directory prerequisite independent of the environment so
+            // removing early validation cannot stop at a missing lock directory.
+            let lock_fixture = tempfile::tempdir().expect("isolated volume lock directory");
+            let config = RuntimeConfig {
+                db_path: Some(db_path.clone()),
+                volume_lock_dir: Some(lock_fixture.path().to_path_buf()),
+                warm_concurrency: warm,
+                maintenance_concurrency: maintenance,
+                ..RuntimeConfig::no_embeddings()
+            };
+            assert!(!db_path.exists());
+            assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
+            assert!(std::fs::read_dir(lock_fixture.path())
+                .unwrap()
+                .next()
+                .is_none());
+            // Exercise the raw public host with caller-built config, bypassing
+            // loaded-TOML validation. No opener substitute or fake store is used.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                build_single_backend_runtime(config, &KhiveConfig::default()),
+            )
+            .await
+            .expect("invalid raw host config did not refuse within wall-clock budget");
+            let error = match result {
+                Ok(_) => panic!("invalid raw host background limits were accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.downcast_ref::<khive_runtime::RuntimeError>(),
+                    Some(khive_runtime::RuntimeError::InvalidInput(_))
+                ),
+                "expected actual limit refusal, got {error:#}"
+            );
+            assert!(
+                !db_path.exists(),
+                "limit refusal occurred after the target was opened"
+            );
+            assert!(
+                std::fs::read_dir(fixture.path()).unwrap().next().is_none(),
+                "limit refusal left database, sidecar, or boot artifacts"
+            );
+            assert!(
+                std::fs::read_dir(lock_fixture.path())
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "limit refusal reached volume-lock acquisition"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_multi_host_refuses_invalid_limits_before_creating_storage() {
+        for (warm, maintenance) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+            let fixture = tempfile::tempdir().expect("isolated multi-backend targets");
+            let lock_fixture = tempfile::tempdir().expect("isolated volume lock directory");
+            let main_path = fixture.path().join("main.db");
+            let secondary_path = fixture.path().join("notes.db");
+            let config = RuntimeConfig {
+                db_path: Some(main_path.clone()),
+                volume_lock_dir: Some(lock_fixture.path().to_path_buf()),
+                warm_concurrency: warm,
+                maintenance_concurrency: maintenance,
+                packs: Vec::new(),
+                events_split: None,
+                wal_ceiling_bytes: 0,
+                wal_ceiling_configured_bytes: 0,
+                wal_ceiling_source: Default::default(),
+                wal_ceiling_env_raw: None,
+                disk_guard_environment: khive_db::DiskGuardEnvironment {
+                    reserve: None,
+                    legacy_reserve: None,
+                    deadline: None,
+                },
+                ..RuntimeConfig::no_embeddings()
+            };
+            let declared_backend = |name: &str, path: PathBuf| BackendConfig {
+                name: name.to_owned(),
+                kind: BackendKind::Sqlite,
+                path: Some(path),
+                cache_mb: None,
+                journal_mode: None,
+                served_kinds: None,
+                read_only: false,
+                wal_ceiling_bytes: Some(0),
+                disk_reserve_bytes: Some(0),
+                disk_guard_deadline_ms: Some(100),
+            };
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    declared_backend("main", main_path.clone()),
+                    declared_backend("notes", secondary_path.clone()),
+                ],
+                ..KhiveConfig::default()
+            };
+            assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
+            assert!(std::fs::read_dir(lock_fixture.path())
+                .unwrap()
+                .next()
+                .is_none());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::build_registry_for_multi_backend_inner_with_max_readers(
+                    config, &khive_cfg, None, None, None,
+                ),
+            )
+            .await
+            .expect("invalid multi-backend limits did not refuse within the wall-clock budget");
+            let error = match result {
+                Ok(_) => panic!("invalid multi-backend background limits were accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.downcast_ref::<khive_runtime::RuntimeError>(),
+                    Some(khive_runtime::RuntimeError::InvalidInput(_))
+                ),
+                "expected actual limit refusal, got {error:#}"
+            );
+            assert!(!main_path.exists() && !secondary_path.exists());
+            assert!(
+                std::fs::read_dir(fixture.path()).unwrap().next().is_none(),
+                "limit refusal left database, sidecar, or boot artifacts"
+            );
+            assert!(
+                std::fs::read_dir(lock_fixture.path())
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "limit refusal reached volume-lock acquisition"
+            );
+        }
     }
 }

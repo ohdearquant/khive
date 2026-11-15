@@ -13,8 +13,12 @@ fn brain_feedback_params_non_empty_and_has_target_and_signal() {
     let h = find_handler("brain.feedback");
     assert!(!h.params.is_empty(), "brain.feedback must have params");
     assert!(
-        h.params.iter().any(|p| p.name == "target_id" && p.required),
-        "brain.feedback must have required target_id param"
+        h.params.iter().any(|p| p.name == "id" && p.required),
+        "brain.feedback must have required id param"
+    );
+    assert!(
+        h.params.iter().all(|p| p.name != "target_id"),
+        "brain.feedback must advertise only the canonical id parameter"
     );
     assert!(
         h.params.iter().any(|p| p.name == "signal" && p.required),

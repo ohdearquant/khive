@@ -2549,3 +2549,257 @@ async fn effective_output_cap_explains_truncated_receipts() {
         check_effective_output_cap(&f, receipt, cap).await;
     }
 }
+
+struct StringRefusalFixture {
+    registry: VerbRegistry,
+    _dir: tempfile::TempDir,
+    root: std::path::PathBuf,
+}
+
+fn string_refusal_fixture() -> StringRefusalFixture {
+    const ACTOR: &str = "exec-string-refusal-fixture";
+    let dir = tempfile::tempdir().expect("private exec refusal scratch");
+    let root = dir
+        .path()
+        .canonicalize()
+        .expect("private scratch parent exists")
+        .join("exec-root");
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        events_split: None,
+        actor_id: Some(ACTOR.into()),
+        packs: vec!["kg".into()],
+        exec: ExecSectionConfig {
+            root: Some(root.to_string_lossy().to_string()),
+            read_roots: vec!["/bin".into(), "/usr/bin".into()],
+            env: vec!["E1_ALLOWED".into()],
+            never: vec!["/usr/bin/true".into()],
+            max_output_bytes: Some(128),
+            timeout_default_s: Some(5.0),
+            timeout_max_s: Some(10.0),
+            binary_digest_timeout_s: None,
+            keep: false,
+            limits: ExecLimitsConfig::default(),
+        },
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("private memory exec refusal runtime");
+    assert!(rt.backend().pool().canonical_path().is_none());
+    assert!(rt.backend_data_dir().is_none());
+    assert!(rt.backend_ann_root().is_none());
+    assert!(rt.default_embedder_name().is_empty());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ACTOR.into()));
+    builder.with_default_namespace("local");
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(BlobPack::new(rt.clone()));
+    builder.register(ToolPack::new(rt.clone()));
+    builder.register(ExecPack::new(rt.clone()));
+    let registry = builder.build().expect("private exec refusal registry");
+    registry
+        .apply_schema_plans_with_map(&Default::default(), rt.backend())
+        .expect("actual exec receipt schema");
+    rt.install_edge_rules(registry.all_edge_rules());
+    StringRefusalFixture {
+        registry,
+        _dir: dir,
+        root,
+    }
+}
+
+// Preserve absence versus an existing empty directory, and fail on unreadable
+// state rather than treating an I/O error as evidence that nothing was written.
+fn string_refusal_root_state(root: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("cannot inspect private exec root: {error}"),
+        Ok(metadata) => {
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            let first = std::fs::read_dir(root)
+                .expect("read actual private exec root")
+                .next()
+                .transpose()
+                .expect("read actual private root entry");
+            assert!(first.is_none(), "private exec root must remain empty");
+            true
+        }
+    }
+}
+
+#[tokio::test]
+async fn wrong_type_exec_string_operands_mask_credentials_without_new_receipts() {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+    use khive_runtime::RuntimeError;
+
+    const ACTOR: &str = "exec-string-refusal-fixture";
+    const TOOL: &str = "exec-string-refusal-never-registered";
+    let f = string_refusal_fixture();
+    let identity = f
+        .registry
+        .dispatch("exec.identity", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(identity["root"], f.root.to_string_lossy().to_string());
+    let initial_root = string_refusal_root_state(&f.root);
+    let tree = "0".repeat(64);
+    // Registration refuses before tree dereference or binary execution. This
+    // deliberately seeds a real denied receipt, not a successful tool run.
+    let run_args = json!({"tree": tree, "tool": TOOL, "args": [], "actor": ACTOR});
+    let error = f
+        .registry
+        .dispatch("exec.run", run_args.clone())
+        .await
+        .expect_err("unregistered tool must produce a real refusal receipt");
+    assert!(
+        matches!(&error, RuntimeError::RefusedWithReceipt(_)),
+        "{error:?}"
+    );
+    let projected = runtime_error_value(error, DomainDisposition::Unknown);
+    assert_eq!(projected["code"], "exec_refused");
+    let receipt_id = projected["receipt_id"]
+        .as_str()
+        .expect("actual refusal receipt id")
+        .to_string();
+    let receipt = f
+        .registry
+        .dispatch("exec.receipt", json!({"id": receipt_id}))
+        .await
+        .expect("actual stored registration-refusal row");
+    assert_eq!(receipt["id"], receipt_id);
+    assert_eq!(receipt["actor"], ACTOR);
+    assert_eq!(receipt["tool"], TOOL);
+    assert_eq!(receipt["denied"], true);
+    assert_eq!(receipt["success"], false);
+    assert!(receipt["started_at"].is_null());
+    assert!(receipt["exit_code"].is_null());
+    assert!(receipt["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("not registered")));
+    assert_eq!(projected["reason"], receipt["reason"]);
+    let populated = f
+        .registry
+        .dispatch("exec.runs", json!({"actor": ACTOR}))
+        .await
+        .unwrap();
+    assert_eq!(populated["count"], 1);
+    assert_eq!(populated["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(populated["runs"][0], receipt);
+    for args in [
+        json!({"actor": ACTOR, "tool": null, "session_id": null}),
+        json!({"actor": ACTOR, "tool": TOOL}),
+    ] {
+        assert_eq!(
+            f.registry.dispatch("exec.runs", args).await.unwrap(),
+            populated,
+            "absent/null/string filters preserve the populated reader"
+        );
+    }
+    assert_eq!(string_refusal_root_state(&f.root), initial_root);
+    let secret = format!("sk-proj-{}", "A".repeat(80));
+    for (verb, field) in [("exec.runs", "tool"), ("exec.run", "cwd")] {
+        for (operand, masked) in [
+            (json!(17), false),
+            (json!({"label": "ordinary"}), false),
+            (json!({"credential": secret.clone()}), true),
+            (json!([{"credential": secret.clone()}]), true),
+        ] {
+            let serialized = operand.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+            if masked {
+                assert!(
+                    serialized.contains(&secret),
+                    "credential fixture must be present"
+                );
+                assert!(
+                    !shown.contains(&secret),
+                    "fixture must be recognized by the masker"
+                );
+                assert!(shown.contains("***MASKED***"));
+            } else {
+                assert_eq!(shown, serialized, "ordinary JSON diagnostic stays exact");
+            }
+            let expected = format!("{field} must be a string; got {shown}");
+            let before_runs = f
+                .registry
+                .dispatch("exec.runs", json!({"actor": ACTOR}))
+                .await
+                .unwrap();
+            assert_eq!(before_runs, populated, "real populated receipt baseline");
+            let before_receipt = f
+                .registry
+                .dispatch("exec.receipt", json!({"id": receipt_id}))
+                .await
+                .unwrap();
+            assert_eq!(
+                before_receipt, receipt,
+                "the complete stored receipt remains visible"
+            );
+            let before_events = f.registry.dispatch("exec.events", json!({})).await.unwrap();
+            assert_eq!(
+                before_events["count"], 0,
+                "registration refusal never launched"
+            );
+            let before_root = string_refusal_root_state(&f.root);
+            let mut args = if verb == "exec.runs" {
+                json!({"actor": ACTOR})
+            } else {
+                run_args.clone()
+            };
+            args[field] = operand;
+            let error = f
+                .registry
+                .dispatch(verb, args)
+                .await
+                .expect_err("wrong string type");
+            let RuntimeError::InvalidInput(message) = &error else {
+                panic!("{verb} changed wrong-type refusal kind: {error:?}");
+            };
+            if masked {
+                assert!(
+                    !message.contains(&secret),
+                    "actual Exec InvalidInput exposed the synthetic credential before projection"
+                );
+                assert!(
+                    message.contains("***MASKED***"),
+                    "actual Exec mask marker missing"
+                );
+            }
+            assert_eq!(
+                message, &expected,
+                "exact public {verb} {field} refusal path"
+            );
+            let projected = runtime_error_value(error, DomainDisposition::Unknown);
+            assert!(
+                projected.get("receipt_id").is_none(),
+                "parse error minted no receipt"
+            );
+            assert_eq!(projected["message"], format!("invalid input: {expected}"));
+            if masked {
+                assert!(!projected.to_string().contains(&secret));
+            }
+            assert_eq!(
+                f.registry
+                    .dispatch("exec.runs", json!({"actor": ACTOR}))
+                    .await
+                    .unwrap(),
+                before_runs,
+                "wrong-type refusal changed the full populated receipt census"
+            );
+            assert_eq!(
+                f.registry
+                    .dispatch("exec.receipt", json!({"id": receipt_id}))
+                    .await
+                    .unwrap(),
+                before_receipt,
+                "wrong-type refusal changed the complete existing receipt"
+            );
+            assert_eq!(
+                f.registry.dispatch("exec.events", json!({})).await.unwrap(),
+                before_events,
+                "wrong-type refusal changed execution events; dispatch audits are outside this reader"
+            );
+            assert_eq!(string_refusal_root_state(&f.root), before_root);
+        }
+    }
+}

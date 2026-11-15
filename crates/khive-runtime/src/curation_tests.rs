@@ -303,7 +303,7 @@ async fn list_undelivered_outbound_messages_email_row_past_the_scan_window() {
     email.created_at -= 1_000_000;
     email.updated_at = email.created_at;
     email.properties =
-        Some(serde_json::json!({"direction": "outbound", "to_actor": "email:ocean@example.test"}));
+        Some(serde_json::json!({"direction": "outbound", "to_actor": "email:reader@example.test"}));
     let email_id = email.id;
 
     let mut fillers = Vec::with_capacity(FILLERS);
@@ -10330,7 +10330,16 @@ async fn committed_entity_update_records_event_before_reindex_failure() {
         )
         .await
         .expect_err("the injected reindex error must be surfaced");
-    assert!(error.to_string().contains("injected FTS failure"));
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected committed-update diagnostic");
+    };
+    let details = error.details().unwrap();
+    assert_eq!(details.get("committed"), Some("true"));
+    assert_eq!(details.get("retryable"), Some("false"));
+    assert!(details
+        .get("post_commit_degradations")
+        .unwrap()
+        .contains("fts_prepare"));
     assert_eq!(rt.get_entity(&tok, entity.id).await.unwrap().name, "After");
     let events = rt
         .events(&tok)

@@ -567,3 +567,150 @@ fn meaningful_query_policies_keep_distinct_admission_rules() {
         );
     }
 }
+
+fn scalar_boost_input() -> ScoreInput<'static> {
+    ScoreInput {
+        salience: 1.0,
+        memory_type_str: "episodic",
+        content: "scalar boost fixture",
+        created_at_millis: 0,
+        decay_factor: 0.0,
+        now_millis: 0,
+        relevance_score: 0.25,
+        entity_names: &[],
+    }
+}
+
+fn scalar_boost_config() -> ScoringConfig {
+    ScoringConfig {
+        weights: ScoringWeights {
+            relevance: 1.0,
+            temporal: 0.0,
+            salience: 0.0,
+        },
+        adjustments: Vec::new(),
+        ..ScoringConfig::default()
+    }
+}
+
+fn assert_invalid_boost_stays_zero(mut input: ScoreInput<'_>, config: &ScoringConfig) {
+    for relevance_score in [0.0, 0.25] {
+        input.relevance_score = relevance_score;
+        assert_eq!(
+            calculate_score(&input, config).to_bits(),
+            0.0_f32.to_bits(),
+            "invalid boost at relevance {relevance_score}"
+        );
+    }
+}
+
+#[test]
+fn calculate_score_isolates_temporal_boost() {
+    let input = scalar_boost_input();
+    let mut config = scalar_boost_config();
+
+    for (weight, expected) in [(0.0, 0.25_f32), (1.0, 0.5), (2.0, 0.75)] {
+        config.weights.temporal = weight;
+        assert_eq!(
+            calculate_score(&input, &config).to_bits(),
+            expected.to_bits()
+        );
+    }
+}
+
+#[test]
+fn calculate_score_temporal_boost_errors_return_terminal_zero() {
+    let mut config = scalar_boost_config();
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Add { value: 0.5 },
+    });
+
+    for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        config.weights.temporal = weight;
+        assert_invalid_boost_stays_zero(scalar_boost_input(), &config);
+    }
+
+    let mut input = scalar_boost_input();
+    input.now_millis = 86_400_000;
+    input.decay_factor = f32::NEG_INFINITY;
+    config.weights.temporal = 0.0;
+    assert_eq!(
+        khive_score::boost_factor_f32(0.0, f32::INFINITY),
+        Err(khive_score::ArithmeticError::NonFinite { parameter: "x" })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+
+    let mut input = scalar_boost_input();
+    input.now_millis = 86_400_000;
+    input.decay_factor = -80.0;
+    config.weights.temporal = f32::MAX;
+    let recency = 80.0_f32.exp();
+    assert!(recency.is_finite());
+    assert_eq!(
+        khive_score::boost_factor_f32(f32::MAX, recency),
+        Err(khive_score::ArithmeticError::Overflow {
+            operation: "boost product",
+        })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+}
+
+#[test]
+fn calculate_score_salience_boost_errors_return_terminal_zero() {
+    let mut config = scalar_boost_config();
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Add { value: 0.5 },
+    });
+
+    for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        config.weights.salience = weight;
+        assert_invalid_boost_stays_zero(scalar_boost_input(), &config);
+    }
+
+    config.weights.salience = 0.0;
+    for salience in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut input = scalar_boost_input();
+        input.salience = salience;
+        assert_invalid_boost_stays_zero(input, &config);
+    }
+
+    let mut input = scalar_boost_input();
+    input.salience = 2.0;
+    config.weights.salience = f32::MAX;
+    assert_eq!(
+        khive_score::boost_factor_f32(f32::MAX, 2.0),
+        Err(khive_score::ArithmeticError::Overflow {
+            operation: "boost product",
+        })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+}
+
+#[test]
+fn calculate_score_clamps_only_after_subtract_adjustment() {
+    let input = scalar_boost_input();
+    let mut config = scalar_boost_config();
+    config.weights.temporal = 3.0;
+    config.weights.salience = 1.0;
+
+    assert_eq!(calculate_score(&input, &config), 1.0);
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Subtract { value: 1.5 },
+    });
+    assert_eq!(calculate_score(&input, &config), 0.5);
+
+    config.adjustments[0].operation = AdjustmentOp::Subtract { value: 2.5 };
+    assert_eq!(
+        calculate_score(&input, &config).to_bits(),
+        0.0_f32.to_bits()
+    );
+}

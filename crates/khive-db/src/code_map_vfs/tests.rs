@@ -62,7 +62,7 @@ fn open_code_map(
         protected_main,
         protected_events,
         crate::DiskGuardEnvironment::default()
-            .resolve(Some(0), Some(100))
+            .resolve(Some(0), None)
             .unwrap(),
         crate::PoolConfig::for_test()
             .volume_lock_dir
@@ -722,17 +722,36 @@ fn quarantine_cap_refuses_before_another_native_open() {
     let dir = fixture();
     let diagnostic_pool = crate::ConnectionPool::new(crate::PoolConfig::for_test()).unwrap();
     let production = dir.path().join("production.db");
-    let target = dir.path().join("code-map.db");
+    let mut target = dir.path().join("code-map.db");
     seed_rollback(&production);
     std::fs::copy(&production, &target).unwrap();
-    let guard =
+    let mut guard =
         CodeMapHandleGuard::new(target.clone(), Mode::Rollback, vec![main_base(&production)])
             .unwrap();
+    let global_probe_target = dir.path().join("global-cap-probe.db");
+    std::fs::copy(&production, &global_probe_target).unwrap();
+    let global_probe = CodeMapHandleGuard::new(
+        global_probe_target,
+        Mode::Rollback,
+        vec![main_base(&production)],
+    )
+    .unwrap();
     assert_eq!(super::quarantine_occupancy(), 0);
     for count in 1..=super::QUARANTINE_CAP {
         if count > 1 {
             std::fs::remove_file(&target).unwrap();
+            if matches!(count, 9 | 17 | 25) {
+                target = dir.path().join(format!("code-map-{}.db", (count - 1) / 8));
+            }
             std::fs::copy(&production, &target).unwrap();
+            if matches!(count, 9 | 17 | 25) {
+                guard = CodeMapHandleGuard::new(
+                    target.clone(),
+                    Mode::Rollback,
+                    vec![main_base(&production)],
+                )
+                .unwrap();
+            }
         }
         let swap_target = target.clone();
         let swap_production = production.clone();
@@ -760,7 +779,7 @@ fn quarantine_cap_refuses_before_another_native_open() {
     let opened = Arc::new(AtomicBool::new(false));
     let hook_opened = Arc::clone(&opened);
     super::set_before_os_open(move || hook_opened.store(true, Ordering::SeqCst));
-    let error = guard
+    let error = global_probe
         .open(Role::Main, OpenAccess::ReadWrite)
         .expect_err("quarantine cap must refuse further opens");
     assert!(matches!(&error, GuardError::QuarantineFull), "{error}");
@@ -867,10 +886,7 @@ fn migration_failure_names_a_recorded_refusal_once() {
         matches!(&unrelated, SqliteError::InvalidData(message) if message == "unrelated"),
         "{unrelated}"
     );
-    let failed = || SqliteError::Migration {
-        version: 5,
-        error: "unable to open database file".into(),
-    };
+    let failed = || SqliteError::migration_message(5, "unable to open database file");
     assert_eq!(
         super::with_refusal(failed(), &name).to_string(),
         "migration v5 failed: unable to open database file; code-map VFS refused the Journal \
@@ -949,10 +965,7 @@ fn migration_failure_for_another_cause_leaves_the_refusal() {
     let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
     let name = vfs::register(Arc::clone(&guard)).unwrap();
     guard.record_refusal("unrelated refusal".into());
-    let failed = SqliteError::Migration {
-        version: 5,
-        error: "near \"x\": syntax error".into(),
-    };
+    let failed = SqliteError::migration_message(5, "near \"x\": syntax error");
     assert_eq!(
         super::with_refusal(failed, &name).to_string(),
         "migration v5 failed: near \"x\": syntax error"

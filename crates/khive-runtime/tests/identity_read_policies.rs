@@ -123,15 +123,11 @@ async fn event_probes_and_entity_note_precedence_remain_distinct() {
             .await
             .unwrap()
             .is_none());
-        // The event store reads by ID within the caller's namespace, so an edge
-        // endpoint resolves only the caller's own events.
-        assert_eq!(
-            matches!(
-                runtime.resolve_edge_endpoint(&local, id).await.unwrap(),
-                Some(Resolved::Event(_))
-            ),
-            owner.namespace() == local.namespace()
-        );
+        // By-ID edge endpoint validation resolves events regardless of their namespace.
+        assert!(matches!(
+            runtime.resolve_edge_endpoint(&local, id).await.unwrap(),
+            Some(Resolved::Event(_))
+        ));
         assert_eq!(
             runtime.resolve_primary(&local, id).await.unwrap().is_some(),
             owner.namespace() == local.namespace()
@@ -194,6 +190,66 @@ async fn event_probes_and_entity_note_precedence_remain_distinct() {
             .unwrap(),
         Some(Resolved::Entity(_))
     ));
+}
+
+#[tokio::test]
+async fn annotates_link_accepts_foreign_event_by_id() {
+    let runtime = runtime();
+    let local = runtime.authorize(Namespace::local()).unwrap();
+    let foreign = runtime
+        .authorize(Namespace::parse("identity-other").unwrap())
+        .unwrap();
+    let note = Note::new(
+        local.namespace().as_str(),
+        "observation",
+        "event annotation",
+    );
+    let source_id = note.id;
+    runtime
+        .notes(&local)
+        .unwrap()
+        .upsert_note(note)
+        .await
+        .unwrap();
+    let event = Event::new(
+        foreign.namespace().as_str(),
+        "create",
+        EventKind::EntityCreated,
+        SubstrateKind::Entity,
+        "identity-fixture",
+    );
+    let target_id = event.id;
+    runtime
+        .events(&foreign)
+        .unwrap()
+        .append_event(event)
+        .await
+        .unwrap();
+
+    let edge = runtime
+        .link(
+            &local,
+            source_id,
+            target_id,
+            EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .expect("annotates accepts a foreign event by ID");
+    assert_eq!(edge.namespace, local.namespace().as_str());
+    assert_eq!(edge.source_id, source_id);
+    assert_eq!(edge.target_id, target_id);
+    assert_eq!(edge.relation, EdgeRelation::Annotates);
+    let stored = runtime
+        .get_edge(&local, edge.id.into())
+        .await
+        .unwrap()
+        .expect("the annotation edge is stored");
+    assert_eq!(stored.namespace, local.namespace().as_str());
+    assert_eq!(stored.source_id, source_id);
+    assert_eq!(stored.target_id, target_id);
+    assert_eq!(stored.relation, EdgeRelation::Annotates);
 }
 
 #[tokio::test]

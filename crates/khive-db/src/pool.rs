@@ -6,6 +6,7 @@ mod construction;
 mod external_writer_fixture;
 mod guards;
 mod identity;
+mod note_search_routes;
 mod pool_impl;
 mod reader_counters;
 mod standalone_checkpoint;
@@ -36,6 +37,8 @@ pub use crate::timeout_sink::{TimeoutSinkCloseError, TimeoutSinkCloseHandle};
 use guards::{PooledReader, ReaderLease};
 pub(crate) use guards::{ReaderAdmission, SharedReaderTransactionGuard};
 pub use guards::{ReaderGuard, ReaderRow};
+use note_search_routes::NoteSearchRouteCounters;
+pub use note_search_routes::{NoteSearchFallbackCause, NoteSearchRouteSnapshot};
 use reader_counters::ReaderAcquisitionCounters;
 pub use reader_counters::ReaderAcquisitionSnapshot;
 pub(crate) use reader_counters::StandaloneReaderPurpose;
@@ -74,6 +77,8 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+
+use crate::ProgressConn;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -241,6 +246,14 @@ pub(crate) use admission::FALLBACK_WAL_AUTOCHECKPOINT_PAGES;
 #[cfg(test)]
 use admission::{CheckpointConnectionConfigPause, CheckpointOwnership};
 
+/// Registers a newly opened connection for test hooks; the identity outside tests.
+pub(crate) fn register_test_hooks(conn: Connection) -> rusqlite::Result<Connection> {
+    #[cfg(any(test, feature = "test-support"))]
+    return crate::test_hooks::register_opened(conn);
+    #[cfg(not(any(test, feature = "test-support")))]
+    Ok(conn)
+}
+
 fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
     Authorization::Deny
 }
@@ -278,9 +291,9 @@ pub struct SearchMechanismSnapshot {
 /// snapshots do not need WAL to support concurrent readers, and inspection must
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
-    writer: Arc<Mutex<Connection>>,
+    writer: Arc<Mutex<ProgressConn>>,
     // Prepared before admission so terminal cleanup cannot fail while allocating a replacement.
-    retirement_connection: Mutex<Option<Connection>>,
+    retirement_connection: Mutex<Option<ProgressConn>>,
     #[cfg(any(test, feature = "test-support"))]
     statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,
@@ -314,6 +327,8 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    /// Note-search route counters belong to this opened pool, not a logical ID.
+    note_search_routes: NoteSearchRouteCounters,
     reader_checkouts: Mutex<BTreeMap<Instant, usize>>,
     /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
     /// backend. Backend IDs remain separate even when aliases share a pool.

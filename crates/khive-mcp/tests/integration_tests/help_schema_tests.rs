@@ -124,10 +124,14 @@ async fn help_brain_feedback_params_non_empty_with_target_and_signal() -> anyhow
         !params.is_empty(),
         "brain.feedback help=true must return non-empty params"
     );
-    let has_target_id = params.iter().any(|p| p["name"] == json!("target_id"));
+    let has_id = params.iter().any(|p| p["name"] == json!("id"));
     assert!(
-        has_target_id,
-        "brain.feedback params must include 'target_id'; got: {params:?}"
+        has_id,
+        "brain.feedback params must include 'id'; got: {params:?}"
+    );
+    assert!(
+        !params.iter().any(|p| p["name"] == json!("target_id")),
+        "brain.feedback must not advertise legacy 'target_id'; got: {params:?}"
     );
     let has_signal = params.iter().any(|p| p["name"] == json!("signal"));
     assert!(

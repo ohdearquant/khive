@@ -35,7 +35,7 @@ impl KindHook for RewriteHook {
 struct RewritePack(KhiveRuntime);
 impl Pack for RewritePack {
     const NAME: &'static str = "argument-contract-probe";
-    const NOTE_KINDS: &'static [&'static str] = &["argument-contract-note"];
+    const NOTE_KINDS: &'static [&'static str] = &["argument_contract_note"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
         name: "argument_contract.update",
@@ -60,7 +60,7 @@ impl PackRuntime for RewritePack {
         Self::HANDLERS
     }
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-        (kind == "argument-contract-note").then(|| Arc::new(RewriteHook) as Arc<dyn KindHook>)
+        (kind == "argument_contract_note").then(|| Arc::new(RewriteHook) as Arc<dyn KindHook>)
     }
     async fn dispatch(
         &self,
@@ -69,7 +69,7 @@ impl PackRuntime for RewritePack {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        let note = khive_storage::Note::new("local", "argument-contract-note", "body");
+        let note = khive_storage::Note::new("local", "argument_contract_note", "body");
         registry
             .prepare_note_update_hook(&self.0, token, &note, &mut params)
             .await?;

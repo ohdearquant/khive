@@ -1,9 +1,9 @@
 # ADR-208: Charter Workflows — Declared Topologies over Registered Phrases
 
-- **Status:** Proposed
+- **Status:** Accepted 2026-10-22
 - **Date:** 2026-10-21
 - **Relates to:** ADR-193 (charter runs), ADR-127 and ADR-143 (authenticated grant seams), ADR-182 (git merge verb).
-- **Supersedes, when accepted:** ADR-193 D2 (definitions are bounded data for one closed template), the ADR-193 Context
+- **Supersedes:** ADR-193 D2 (definitions are bounded data for one closed template), the ADR-193 Context
   sentence "There is no language", and the ADR-193 deferred items "charter topologies beyond the template", "any
   definition language" and "cross-charter cascades". Every other ADR-193 decision and Amendments 1 to 4 stand
   unchanged.

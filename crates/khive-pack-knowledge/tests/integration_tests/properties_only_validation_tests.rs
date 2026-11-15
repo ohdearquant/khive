@@ -185,7 +185,10 @@ async fn upsert_atoms_properties_only_missing_id_is_not_found() {
         "missing target must not commit a valid prefix"
     );
     assert!(
-        matches!(domain, Err(RuntimeError::InvalidInput(_))),
+        matches!(
+            domain.as_ref().map_err(RuntimeError::refusal_source),
+            Err(RuntimeError::InvalidInput(_))
+        ),
         "{domain:?}"
     );
     assert_eq!(domain_after, domain_before);

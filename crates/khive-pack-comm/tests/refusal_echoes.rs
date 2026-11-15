@@ -373,3 +373,62 @@ async fn shared_uuid_resolver_masks_both_error_styles_and_preserves_uuid_and_pre
         );
     }
 }
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn unknown_uuid_after_cursor_preserves_benign_echo_and_populated_thread() {
+    let (runtime, registry) = fixture();
+    let id = root(&registry).await;
+    let root_uuid = uuid::Uuid::parse_str(id.as_str().unwrap()).unwrap();
+    let raw = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    let unknown = uuid::Uuid::parse_str(raw).unwrap();
+    assert_eq!(unknown.to_string(), raw);
+    assert_ne!(unknown, root_uuid);
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let notes = runtime.notes(&token).unwrap();
+    let stored_before = notes.get_note(root_uuid).await.unwrap().unwrap();
+    assert!(notes.get_note(unknown).await.unwrap().is_none());
+    let before = registry
+        .dispatch("comm.thread", json!({"id":id}))
+        .await
+        .unwrap();
+    assert_eq!(before["count"], 1);
+    assert_eq!(before["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(before["messages"][0]["full_id"], id);
+    assert_eq!(before["messages"][0]["content"], "refusal fixture");
+
+    let error = registry
+        .dispatch("comm.thread", json!({"id":id,"after":raw}))
+        .await
+        .unwrap_err();
+    let expected = format!("thread: `after` cursor {raw:?} does not resolve to a message");
+    let RuntimeError::InvalidInput(message) = &error else {
+        panic!("wrong unknown-UUID refusal kind: {error:?}");
+    };
+    assert_eq!(message, &expected);
+    assert!(message.contains(&format!("{raw:?}")));
+    assert!(!message.contains("***MASKED***"));
+    assert_eq!(
+        runtime_error_value(error, DomainDisposition::NotCommitted),
+        json!({"kind":"runtime_error", "message":format!("invalid input: {expected}"),
+            "domain_disposition":"not_committed"})
+    );
+
+    let after = registry
+        .dispatch("comm.thread", json!({"id":id}))
+        .await
+        .unwrap();
+    assert_eq!(after, before, "the populated thread must remain unchanged");
+    assert_eq!(
+        notes.get_note(root_uuid).await.unwrap().unwrap(),
+        stored_before
+    );
+    assert!(notes.get_note(unknown).await.unwrap().is_none());
+    let exhausted = registry
+        .dispatch("comm.thread", json!({"id":id,"after":id}))
+        .await
+        .unwrap();
+    assert_eq!(exhausted["thread_id"], id);
+    assert_eq!(exhausted["count"], 0);
+    assert_eq!(exhausted["messages"], json!([]));
+}

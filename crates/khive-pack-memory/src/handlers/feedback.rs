@@ -14,6 +14,7 @@ use super::common::decode_params;
 
 #[derive(Debug, Deserialize)]
 struct FeedbackParams {
+    #[serde(alias = "id")]
     target_id: String,
     signal: String,
 }
@@ -117,3 +118,7 @@ async fn route_to_brain(
 #[cfg(test)]
 #[path = "feedback_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "feedback_parameter_names_tests.rs"]
+mod parameter_names_tests;

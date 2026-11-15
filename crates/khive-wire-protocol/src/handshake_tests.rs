@@ -103,7 +103,7 @@ fn rejects_server_only_kinds_on_the_inbound_gate() {
         },
         Frame::Response {
             id: crate::frame::OperationId::from("op-1"),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         },
         Frame::Error {
             id: None,
@@ -124,7 +124,7 @@ fn rejects_server_only_kinds_on_the_inbound_gate() {
             topic: "a.b".to_string(),
             cursor: 1,
             occurred_at: "2026-08-04T11:00:00Z".to_string(),
-            payload: serde_json::json!({}),
+            payload: serde_json::json!({}).into(),
         },
     ];
     for frame in server_only_frames {
@@ -142,7 +142,7 @@ fn rejects_a_server_only_kind_with_the_gates_rejection_shape() {
     let mut gate = completed_gate();
     let response = Frame::Response {
         id: crate::frame::OperationId::from("op-1"),
-        result: serde_json::json!({}),
+        result: serde_json::json!({}).into(),
     };
     let err = gate.admit(&response).unwrap_err();
     match err.error.as_ref() {
@@ -311,7 +311,7 @@ fn closed_state_reports_a_server_only_kind_reason() {
     let mut gate = completed_gate();
     gate.admit(&Frame::Response {
         id: crate::frame::OperationId::from("op-1"),
-        result: serde_json::json!({}),
+        result: serde_json::json!({}).into(),
     })
     .unwrap_err();
 

@@ -353,106 +353,217 @@ impl KnowledgeHandlers {
         params: Value,
         preserve_content_whitespace: bool,
     ) -> Result<Value, RuntimeError> {
-        let p: UpsertAtomsParams = deser(params)?;
-        if p.chunk_size.is_some() {
-            tracing::warn!(
-                chunk_size = ?p.chunk_size,
-                "upsert_atoms: chunk_size is accepted but not yet implemented; \
-                 server-side chunking is not performed"
-            );
-        }
-        if p.atoms.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "atoms list must not be empty".into(),
-            ));
-        }
-        if p.atoms.len() > 5000 {
-            return Err(RuntimeError::InvalidInput(
-                "max 5000 atoms per request".into(),
-            ));
-        }
+        Self::upsert_atoms_with_sql(
+            runtime,
+            token,
+            params,
+            preserve_content_whitespace,
+            runtime.sql(),
+        )
+        .await
+    }
 
-        if p.dry_run {
+    async fn upsert_atoms_with_sql(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        preserve_content_whitespace: bool,
+        sql: std::sync::Arc<dyn khive_storage::SqlAccess>,
+    ) -> Result<Value, RuntimeError> {
+        use khive_runtime::error::{BatchAdmissionReport, BatchRefusal};
+        let prewrite = |error: RuntimeError| {
+            if preserve_content_whitespace {
+                error
+            } else {
+                error.before_requested_write()
+            }
+        };
+        let mut failures = Vec::new();
+        let mut refusals = Vec::new();
+        let (atoms, dry_run, chunk_size): (Vec<Option<AtomWrite>>, bool, Option<usize>) =
+            if preserve_content_whitespace {
+                let p: UpsertAtomsParams = deser(params)?;
+                failures.resize_with(p.atoms.len(), || None);
+                refusals.resize_with(p.atoms.len(), || None);
+                (
+                    p.atoms.into_iter().map(Some).collect(),
+                    p.dry_run,
+                    p.chunk_size,
+                )
+            } else {
+                let p: super::schema::UpsertAtomsAdmissionParams =
+                    deser(params).map_err(prewrite)?;
+                let atoms = p
+                    .atoms
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| match deser::<AtomWrite>(value) {
+                        Ok(atom) => {
+                            failures.push(None);
+                            refusals.push(None);
+                            Some(atom)
+                        }
+                        Err(error) => {
+                            refusals.push(Some(BatchRefusal {
+                                index,
+                                field: "item",
+                                reason: "invalid_input",
+                            }));
+                            failures.push(Some(error));
+                            None
+                        }
+                    })
+                    .collect();
+                (atoms, p.dry_run, p.chunk_size)
+            };
+        if chunk_size.is_some() {
+            tracing::warn!(?chunk_size, "upsert_atoms: chunk_size is accepted but not yet implemented; server-side chunking is not performed");
+        }
+        if atoms.is_empty() {
+            return Err(prewrite(RuntimeError::InvalidInput(
+                "atoms list must not be empty".into(),
+            )));
+        }
+        if atoms.len() > 5000 {
+            return Err(prewrite(RuntimeError::InvalidInput(
+                "max 5000 atoms per request".into(),
+            )));
+        }
+        if dry_run {
+            if let Some(error) = failures.into_iter().flatten().next() {
+                return Err(prewrite(error));
+            }
+            let atoms: Vec<_> = atoms.into_iter().flatten().collect();
             return super::atom_validation::dry_run(
                 runtime,
                 token,
-                &p.atoms,
+                &atoms,
                 preserve_content_whitespace,
             )
             .await;
         }
-
-        let ns = token.namespace().as_str().to_owned();
-        let sql = runtime.sql();
-        let now = now_us();
-
-        let failures: Vec<_> = p
-            .atoms
-            .iter()
-            .enumerate()
-            .map(|(index, atom)| {
-                super::refusal::validate_submission(atom, index, preserve_content_whitespace).err()
-            })
-            .collect();
-        if failures.iter().any(Option::is_some) {
-            return Err(super::refusal::refuse_batch(
-                runtime,
-                token,
-                &p.atoms,
-                failures,
+        for (index, atom) in atoms.iter().enumerate() {
+            let Some(atom) = atom else {
+                continue;
+            };
+            if let Err(failure) = super::refusal::validate_submission_located(
+                atom,
+                index,
                 preserve_content_whitespace,
-            )
-            .await);
+            ) {
+                let reason = match failure.source.refusal_source() {
+                    RuntimeError::SecretDetected(_) => "secret_detected",
+                    _ => "invalid_input",
+                };
+                refusals[index] = Some(BatchRefusal {
+                    index,
+                    field: failure.field,
+                    reason,
+                });
+                failures[index] = Some(failure.source);
+            }
         }
-
-        let mut reader = sql
-            .reader()
-            .await
-            .map_err(|e| sql_err("upsert_atoms reader", e))?;
+        if preserve_content_whitespace && failures.iter().any(Option::is_some) {
+            return Err(super::refusal::refuse_batch(runtime, token, &atoms, failures, true).await);
+        }
+        let ns = token.namespace().as_str().to_owned();
+        let now = now_us();
         let mut ids_by_slug: HashMap<String, String> = HashMap::new();
-        let mut operations = Vec::with_capacity(p.atoms.len());
-        let mut failed_index = 0;
-        let preparation: Result<(), RuntimeError> = async {
-            for (index, atom_in) in p.atoms.iter().enumerate() {
-                failed_index = index;
-                if let AtomWrite::Upsert(input) = atom_in {
+        let mut operations = vec![None; atoms.len()];
+        let mut checked: Vec<bool> = failures.iter().map(Option::is_some).collect();
+        let report = |checked: &[bool], refusals: &[Option<BatchRefusal>]| BatchAdmissionReport {
+            refused: refusals.iter().flatten().cloned().collect(),
+            validation_complete: checked.iter().all(|checked| *checked),
+            unchecked_indices: checked
+                .iter()
+                .enumerate()
+                .filter_map(|(index, checked)| (!checked).then_some(index))
+                .collect(),
+        };
+        if checked.iter().any(|checked| !checked) {
+            let mut reader = sql.reader().await.map_err(|error| {
+                if preserve_content_whitespace {
+                    sql_err("upsert_atoms reader", error)
+                } else {
+                    RuntimeError::Storage(error).with_batch_admission(report(&checked, &refusals))
+                }
+            })?;
+            for (index, atom) in atoms.iter().enumerate() {
+                if checked[index] {
+                    continue;
+                }
+                let atom = atom
+                    .as_ref()
+                    .expect("unchecked admission has a decoded item");
+                if let AtomWrite::Upsert(input) = atom {
                     if let Some(id) = ids_by_slug.get(input.slug.trim()) {
-                        operations.push((id.clone(), false));
+                        operations[index] = Some((id.clone(), false));
+                        checked[index] = true;
                         continue;
                     }
                 }
-                let target = super::atom_validation::target(reader.as_mut(), &ns, atom_in).await?;
-                let (id, insert) = match target {
-                    Some(id) => (id, false),
-                    None => (new_id(), true),
+                let target = if preserve_content_whitespace {
+                    super::atom_validation::target(reader.as_mut(), &ns, atom).await
+                } else {
+                    super::atom_validation::target_for_admission(reader.as_mut(), &ns, atom).await
                 };
-                if let AtomWrite::Upsert(input) = atom_in {
-                    ids_by_slug.insert(input.slug.trim().to_owned(), id.clone());
+                match target {
+                    Ok(target) => {
+                        let (id, insert) =
+                            target.map_or_else(|| (new_id(), true), |id| (id, false));
+                        if let AtomWrite::Upsert(input) = atom {
+                            ids_by_slug.insert(input.slug.trim().to_owned(), id.clone());
+                        }
+                        operations[index] = Some((id, insert));
+                        checked[index] = true;
+                    }
+                    Err(error @ (RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_))) => {
+                        if preserve_content_whitespace {
+                            return Err(error);
+                        }
+                        let field = match atom {
+                            AtomWrite::Upsert(_) => "slug",
+                            AtomWrite::PropertiesOnly(_) => "id",
+                        };
+                        let reason = if matches!(error, RuntimeError::NotFound(_)) {
+                            "not_found"
+                        } else {
+                            "invalid_input"
+                        };
+                        refusals[index] = Some(BatchRefusal {
+                            index,
+                            field,
+                            reason,
+                        });
+                        failures[index] = Some(error);
+                        checked[index] = true;
+                    }
+                    Err(error) => {
+                        if preserve_content_whitespace {
+                            return Err(error);
+                        }
+                        return Err(error.with_batch_admission(report(&checked, &refusals)));
+                    }
                 }
-                operations.push((id, insert));
             }
-            Ok(())
         }
-        .await;
-        drop(reader);
-        if let Err(error) = preparation {
-            if matches!(
-                error,
-                RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_)
-            ) {
-                let mut failures: Vec<_> = (0..p.atoms.len()).map(|_| None).collect();
-                failures[failed_index] = Some(error);
-                return Err(super::refusal::refuse_batch(
-                    runtime,
-                    token,
-                    &p.atoms,
-                    failures,
-                    preserve_content_whitespace,
-                )
-                .await);
-            }
-            return Err(error);
+        if failures.iter().any(Option::is_some) {
+            let admission = report(&checked, &refusals);
+            let error = super::refusal::refuse_batch(runtime, token, &atoms, failures, false).await;
+            return Err(error.with_batch_admission(admission));
         }
+        let p = UpsertAtomsParams {
+            atoms: atoms
+                .into_iter()
+                .map(|atom| atom.expect("successful admission decoded every item"))
+                .collect(),
+            dry_run,
+            chunk_size,
+        };
+        let operations: Vec<_> = operations
+            .into_iter()
+            .map(|operation| operation.expect("successful admission prepared every target"))
+            .collect();
 
         let mut created = 0usize;
         let mut updated = 0usize;
@@ -570,14 +681,20 @@ impl KnowledgeHandlers {
             }
         }
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("upsert_atoms writer", e))?;
-        writer
-            .execute_batch(statements)
-            .await
-            .map_err(|e| sql_err("upsert_atoms batch", e))?;
+        let mut writer = sql.writer().await.map_err(|error| {
+            if preserve_content_whitespace {
+                sql_err("upsert_atoms writer", error)
+            } else {
+                RuntimeError::Storage(error).before_requested_write()
+            }
+        })?;
+        writer.execute_batch(statements).await.map_err(|error| {
+            if preserve_content_whitespace {
+                sql_err("upsert_atoms batch", error)
+            } else {
+                RuntimeError::atomic_write_failure(error)
+            }
+        })?;
         Ok(json!({
             "created": created,
             "updated": updated,
@@ -590,11 +707,12 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let p: UpsertDomainsParams = deser(params)?;
+        let p: UpsertDomainsParams = deser(params).map_err(RuntimeError::before_requested_write)?;
         if p.domains.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "domains list must not be empty".into(),
-            ));
+            return Err(
+                RuntimeError::InvalidInput("domains list must not be empty".into())
+                    .before_requested_write(),
+            );
         }
 
         let ns = token.namespace().as_str().to_owned();
@@ -604,36 +722,48 @@ impl KnowledgeHandlers {
         let mut updated = 0usize;
 
         for domain_in in &p.domains {
+            let prewrite = |error: RuntimeError| {
+                if created == 0 && updated == 0 {
+                    error.before_requested_write()
+                } else {
+                    error
+                }
+            };
             let slug = domain_in.slug.trim().to_string();
             let name = domain_in.name.trim().to_string();
             if slug.is_empty() {
-                return Err(RuntimeError::InvalidInput(
+                return Err(prewrite(RuntimeError::InvalidInput(
                     "domain slug must not be empty".into(),
-                ));
+                )));
             }
             if name.is_empty() {
-                return Err(RuntimeError::InvalidInput(
+                return Err(prewrite(RuntimeError::InvalidInput(
                     "domain name must not be empty".into(),
-                ));
+                )));
             }
             // Secret gate: scan slug and name first (before content-length validation)
             // so security violations short-circuit before business logic errors.
-            khive_runtime::secret_gate::check_at(&slug, "domain", "slug")?;
-            khive_runtime::secret_gate::check_at(&name, "domain", "name")?;
+            khive_runtime::secret_gate::check_at(&slug, "domain", "slug").map_err(prewrite)?;
+            khive_runtime::secret_gate::check_at(&name, "domain", "name").map_err(prewrite)?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
             let mirror_content = domain_in.description.as_deref().unwrap_or("").trim();
             validate_atom_content(mirror_content).map_err(|e| {
-                RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
+                prewrite(RuntimeError::InvalidInput(format!(
+                    "domain {slug:?}: description {e}"
+                )))
             })?;
             // Secret gate: scan remaining caller-supplied text.
-            khive_runtime::secret_gate::check_at(mirror_content, "domain", "description")?;
+            khive_runtime::secret_gate::check_at(mirror_content, "domain", "description")
+                .map_err(prewrite)?;
             if let Some(ref tags_vec) = domain_in.tags {
-                khive_runtime::secret_gate::check_tags_at(tags_vec, "domain", "tags")?;
+                khive_runtime::secret_gate::check_tags_at(tags_vec, "domain", "tags")
+                    .map_err(prewrite)?;
             }
             if let Some(ref members_vec) = domain_in.members {
-                khive_runtime::secret_gate::check_tags_at(members_vec, "domain", "members")?;
+                khive_runtime::secret_gate::check_tags_at(members_vec, "domain", "members")
+                    .map_err(prewrite)?;
             }
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
@@ -670,9 +800,9 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("upsert_domains lookup", e))?;
             if let Some(row) = &existing {
                 if row_i64(row, "deleted_at").is_some() {
-                    return Err(RuntimeError::InvalidInput(format!(
+                    return Err(prewrite(RuntimeError::InvalidInput(format!(
                         "domain slug {slug:?} was previously deleted; choose a new slug"
-                    )));
+                    ))));
                 }
             }
 
@@ -702,9 +832,9 @@ impl KnowledgeHandlers {
                     RuntimeError::Internal("missing id in colliding atom row".into())
                 })?;
                 if collision_id != id {
-                    return Err(RuntimeError::InvalidInput(format!(
+                    return Err(prewrite(RuntimeError::InvalidInput(format!(
                         "domain slug {slug:?} collides with an existing atom of the same slug"
-                    )));
+                    ))));
                 }
             }
 

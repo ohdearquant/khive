@@ -48,7 +48,7 @@ pub enum WeightChannel {
     Ambient,
     /// η = 0.10 — voluntary quality signal via note.create / note.correct.
     Explicit,
-    /// η = 0.50 — Atlas eval or manual CLI trigger.
+    /// η = 0.50 — an offline evaluation or a manual CLI trigger.
     GroundTruth,
 }
 
@@ -101,8 +101,8 @@ pub async fn apply_weight_delta(
 
 /// Variant of [`apply_weight_delta`] that accepts a runtime-overridden `eta`.
 ///
-/// Use this when the caller loads η from runtime config (e.g., atlas's
-/// `knowledge.toml` override of Channel C's default 0.50). Same algorithm
+/// Use this when a runtime config loader supplies a `knowledge.toml`
+/// override of Channel C's default 0.50. Same algorithm
 /// and transactional guarantees as [`apply_weight_delta`].
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_weight_delta_with_eta(

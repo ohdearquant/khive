@@ -166,49 +166,38 @@ tokio::task_local! {
     pub(super) static PROF_CID: u64;
 }
 
-pub(super) fn recall_profile_enabled() -> bool {
+pub(super) fn recall_profile_enabled(runtime: &khive_runtime::KhiveRuntime) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("KHIVE_RECALL_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_RECALL_PROFILE",
-            enabled.to_string(),
-        );
-        enabled
-    })
+    let enabled = *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok());
+    runtime.record_config_locked("KHIVE_RECALL_PROFILE", || enabled.to_string());
+    enabled
 }
 
-pub(crate) fn ann_overfetch_max_rounds() -> usize {
+pub(crate) fn ann_overfetch_max_rounds(runtime: &khive_runtime::KhiveRuntime) -> usize {
     static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROUNDS.get_or_init(|| {
-        let rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+    let rounds = *ROUNDS.get_or_init(|| {
+        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        khive_runtime::config_ledger::record_config_locked(
-            "ANN_OVERFETCH_MAX_ROUNDS",
-            rounds.to_string(),
-        );
-        rounds
-    })
+            .unwrap_or(3)
+    });
+    runtime.record_config_locked("ANN_OVERFETCH_MAX_ROUNDS", || rounds.to_string());
+    rounds
 }
 
 /// Return the cached ANN readiness timeout, defaulting to 8 seconds.
 /// See `crates/khive-pack-memory/docs/api/configuration.md`.
-pub(super) fn ann_ready_timeout_ms() -> u64 {
+pub(super) fn ann_ready_timeout_ms(runtime: &khive_runtime::KhiveRuntime) -> u64 {
     static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| {
+    let ms = *TIMEOUT_MS.get_or_init(|| {
         const DEFAULT_ANN_READY_TIMEOUT_MS: u64 = 8_000;
-        let ms = std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
+        std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_MEMORY_ANN_READY_TIMEOUT_MS",
-            ms.to_string(),
-        );
-        ms
-    })
+            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS)
+    });
+    runtime.record_config_locked("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS", || ms.to_string());
+    ms
 }
 
 #[inline(always)]
@@ -418,6 +407,17 @@ pub(super) fn balanced_recall_state_from_profile_response(
     ))
 }
 
+/// The shared-pool factor a served profile carries, read from its `brain.profile` response.
+///
+/// A missing, null or non-numeric `local_factor`, and a value outside [0.5, 1] (which
+/// `brain.create_profile` never stores), yield 1: no scaling.
+pub(super) fn local_factor_from_profile_response(resp: &Value) -> f32 {
+    resp.get("local_factor")
+        .and_then(Value::as_f64)
+        .filter(|factor| factor.is_finite() && (0.5..=1.0).contains(factor))
+        .map_or(1.0, |factor| factor as f32)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
@@ -431,9 +431,15 @@ pub(super) struct RememberParams {
     #[serde(alias = "source")]
     pub(super) source_id: Option<String>,
     pub(super) tags: Option<Vec<String>>,
+    /// Caller-supplied structured fields stored beside `memory_type` and `tags`.
+    /// Validated by `validate_properties` in the remember handler.
+    #[serde(default)]
+    pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
+    /// Exact namespace override. Without it, both memory types use the caller's actor
+    /// namespace; an anonymous caller keeps the token's namespace. Every anonymous
+    /// memory is flagged `attribution: "unresolved"`, with or without this override.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
@@ -600,14 +606,7 @@ pub(crate) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
 /// Default decay_factor for semantic memories (~139-day half-life).
 pub(crate) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
 
-/// `memory.recall` requests whose total handler time reaches this are logged at WARN
-/// with a duration/result-shape breakdown, unconditionally (unlike the opt-in
-/// `KHIVE_RECALL_PROFILE` per-stage eprintln profiler). Matches the threshold and
-/// rationale established for `knowledge.compose` (#887 / PR #915): well above a
-/// healthy recall (sub-second in the common case) but comfortably inside the
-/// end-to-end `recall_deadline_ms` budget (30s default), so a slow-but-completing
-/// recall is visible in the daemon log before it ever risks tripping the deadline
-/// or a client-side timeout (#30 / originally #889).
+/// Warn on recalls reaching 10 seconds; see `docs/api/recall-pipeline.md#slow-request-stage-telemetry`.
 pub(super) const RECALL_SLOW_THRESHOLD_MS: u64 = 10_000;
 
 pub(super) fn compute_score(
@@ -619,7 +618,49 @@ pub(super) fn compute_score(
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
+    let (total, mut breakdown) = compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        true,
+    );
+    breakdown.fused_score = raw_relevance;
+    (total, breakdown)
+}
 
+/// Breakdown for a hit `handle_recall` has already normalized: `relevance` is the value the
+/// ranking composite received, and the breakdown reports it unchanged.
+pub(super) fn compute_score_for_recall(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+) -> (f64, ScoreBreakdown) {
+    compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        false,
+    )
+}
+
+fn compute_score_inner(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+    report: bool,
+) -> (f64, ScoreBreakdown) {
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -653,6 +694,8 @@ pub(super) fn compute_score(
 
     let breakdown = ScoreBreakdown {
         relevance,
+        // The caller holds the score before normalization and sets it.
+        fused_score: 0.0,
         salience_raw: salience,
         salience_decayed: effective_salience,
         temporal,
@@ -661,10 +704,20 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
-        // ADR-104 §3: set to neutral/absent here; `handle_recall` overwrites
-        // both when a profile served the request (component 1 ran).
+        // Neutral/absent here; `handle_recall` fills the fields it reports.
+        composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        weights_served: if report {
+            "default".to_string()
+        } else {
+            String::new()
+        },
+        namespace: String::new(),
+        pre_entity_score: total as f32,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     (total, breakdown)
 }
@@ -1177,7 +1230,7 @@ impl MemoryPack {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
@@ -1347,7 +1400,7 @@ impl MemoryPack {
         const ANN_OVERFETCH_MARGIN: usize = 32;
         let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
             .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
 
         let mut ann_degraded = false;
@@ -1508,11 +1561,8 @@ impl MemoryPack {
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
 
-            // Per-model ANN/sqlite-vec resolution is independent I/O (durable-epoch
-            // check, warm-cache search, possible detached ensure-wait, possible
-            // exact-scan fallback) — fan the models out concurrently instead of
-            // paying their latency serially. Mirrors the embed step's 1/2/N
-            // dispatch immediately above.
+            // Resolve independent model I/O concurrently.
+            // See `docs/api/recall-pipeline.md#vector-candidate-collection`.
             let per_model_results: Vec<PerModelAnnHits> = match query_vecs.len() {
                 0 => Vec::new(),
                 1 => {
@@ -1868,11 +1918,8 @@ pub(super) async fn collect_model_ann_hits(
     }
 }
 
-/// Split out of `collect_recall_vector_hits` so per-model units — each with independent
-/// durable-epoch checks, warm-cache search, possible detached ensure-wait, and possible
-/// exact-scan fallback — can run concurrently instead of serially. All error paths
-/// propagate via `?`; the [`collect_model_ann_hits`] wrapper converts them into a
-/// degraded outcome for this model rather than aborting every engine's recall.
+/// Propagate errors to the wrapper for per-model degradation (ADR-031).
+/// See `docs/api/recall-pipeline.md#vector-candidate-collection`.
 #[allow(clippy::too_many_arguments)]
 async fn collect_model_ann_hits_inner(
     runtime: &khive_runtime::KhiveRuntime,
@@ -1923,35 +1970,32 @@ async fn collect_model_ann_hits_inner(
             None
         }
         Ok(None) => {
+            use khive_runtime::resource_admission::JobOutcome;
+
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let rt_detached = runtime.clone();
-            let token_detached = token.clone();
-            let ann_detached = ann.clone();
+            let readiness = tokio::time::timeout(
+                std::time::Duration::from_millis(ann_ready_timeout_ms),
+                done_rx,
+            );
+            let (tracking, attempt) = ann::submit_recall_miss(
+                runtime.clone(),
+                token.clone(),
+                ann.clone(),
+                model_name.clone(),
+            );
+            #[cfg(test)]
             let model_detached = model_name.clone();
-            khive_runtime::track_named_background_task("memory_ann_build", async move {
+            drop(tokio::spawn(async move {
+                let _tracking = tracking;
                 #[cfg(test)]
                 retrieval_failpoints::before_ann_build(&model_detached).await;
-                let result = ann::ensure_ann_for_model(
-                    &rt_detached,
-                    &token_detached,
-                    &ann_detached,
-                    &model_detached,
-                )
-                .await;
+                let result = attempt.await;
                 #[cfg(test)]
                 retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
-            });
-            match khive_storage::await_request_read_phase(
-                "memory.recall",
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(ann_ready_timeout_ms),
-                    done_rx,
-                ),
-            )
-            .await?
-            {
-                Ok(Ok(Ok(status))) => {
+            }));
+            match khive_storage::await_request_read_phase("memory.recall", readiness).await? {
+                Ok(Ok(JobOutcome::Completed(Ok(status)))) => {
                     tracing::debug!(
                         ?status,
                         model = %model_name,
@@ -1963,7 +2007,46 @@ async fn collect_model_ann_hits_inner(
                     khive_storage::ensure_request_read_active("memory.recall")?;
                     searched
                 }
-                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Ok(JobOutcome::Completed(Err(e)))) => return Err(e),
+                Ok(Ok(JobOutcome::Cancelled)) => {
+                    tracing::warn!(
+                        outcome = "Cancelled",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Cancelled; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::Refused(_))) => {
+                    tracing::warn!(
+                        outcome = "Refused",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Refused; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::FinalizationTimedOut)) => {
+                    tracing::warn!(
+                        outcome = "FinalizationTimedOut",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt FinalizationTimedOut; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
                 Ok(Err(_sender_dropped)) => {
                     // A detached-task panic degrades this model instead of failing recall.
                     tracing::warn!(

@@ -2,6 +2,7 @@
 //! The timing fixture explicitly freezes the context inside the handler;
 //! it does not exercise the generated enclosing audit append.
 
+use khive_db::test_hooks::TestHooks;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -103,7 +104,7 @@ impl Lane {
             self.writer
                 .send_top_level(move |connection| {
                     connection
-                        .authorizer(Some(move |context: AuthContext<'_>| {
+                        .test_authorizer(Some(move |context: AuthContext<'_>| {
                             match context.action {
                                 // rusqlite 0.40 reports SQLite COMMIT as Unknown.
                                 AuthAction::Transaction {
@@ -179,7 +180,7 @@ impl Lane {
                     self.writer
                         .send_top_level(|connection| {
                             connection
-                                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                                .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                                 .map_err(|error| StorageError::Pool {
                                     operation: "usage_fixture_remove_authorizer".into(),
                                     message: error.to_string(),

@@ -6,6 +6,7 @@ use serde::ser::{Error as SerError, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::version::ProtocolVersion;
+use crate::OpaqueValue;
 
 /// A caller-generated operation id.
 ///
@@ -108,6 +109,17 @@ pub struct HandshakeAckPayload {
     pub version: ProtocolVersion,
 }
 
+// Optional envelope fields distinguish omission from an explicit null under
+// ADR-137 Amendment 1 Decision 4. The field default handles omission; a
+// present field must deserialize as T itself, rather than Option<T>.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// The field set of a [`Frame::Request`] payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,23 +128,39 @@ pub struct RequestPayload {
     pub id: OperationId,
     /// The request DSL string (ADR-016's function-call or JSON form).
     pub ops: String,
-    /// Optional deadline in milliseconds, measured from server receipt
+    /// Optional positive deadline in milliseconds, measured from server receipt
     /// of this frame against the server's monotonic clock. Scopes the
     /// entire request frame (the whole DSL batch or chain).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub deadline_ms: Option<u64>,
     /// Frame-level namespace override. Legal only on transports that
     /// accept caller-supplied identity context; a mapped transport
     /// (ADR-137's TCP transport) rejects any request carrying this with
     /// [`crate::error::WireErrorCode::ContextRejected`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub namespace: Option<String>,
     /// Frame-level actor override; see `namespace` above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub actor_id: Option<String>,
     /// Frame-level visible-namespace-set override; see `namespace`
     /// above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub visible_namespaces: Option<Vec<String>>,
 }
 
@@ -145,7 +173,7 @@ pub struct ResponsePayload {
     /// The verb-dispatch result, exactly as ADR-016's `request` verb
     /// surface returns it (an aggregate `{ok, tool, result}` /
     /// `{ok, summary, ...}` payload). Opaque to this crate.
-    pub result: serde_json::Value,
+    pub result: OpaqueValue,
 }
 
 /// The field set of a [`Frame::Error`] payload.
@@ -155,7 +183,11 @@ pub struct ErrorPayload {
     /// The operation id this error terminates, for a request-scoped
     /// error. `None` for a connection-terminal error, which carries no
     /// operation id (ADR-137, "Operation correlation").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub id: Option<OperationId>,
     /// The wire error code.
     pub code: crate::error::WireErrorCode,
@@ -185,7 +217,11 @@ pub struct SubscribePayload {
     /// Resume position. Absent starts delivery at new events only;
     /// present replays every retained event with a cursor greater than
     /// this value before delivering new events.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub resume_cursor: Option<Cursor>,
 }
 
@@ -233,10 +269,10 @@ pub struct EventPayload {
     pub cursor: Cursor,
     /// Server-assigned event time, RFC 3339.
     pub occurred_at: String,
-    /// Topic-specific payload. Field-by-field shape is owned by the
-    /// per-topic catalog (ADR-137, "Implementation-phase deliverables"),
-    /// not by this crate.
-    pub payload: serde_json::Value,
+    /// Topic-specific JSON object. Its field-by-field shape is owned by
+    /// the per-topic catalog (ADR-137, "Implementation-phase deliverables").
+    /// Amendment 1 Decision 10 requires the outer object shape on the wire.
+    pub payload: OpaqueValue,
 }
 
 /// One application frame.
@@ -291,7 +327,7 @@ pub enum Frame {
         id: OperationId,
         /// The request DSL string (ADR-016's function-call or JSON form).
         ops: String,
-        /// Optional deadline in milliseconds, measured from server receipt
+        /// Optional positive deadline in milliseconds, measured from server receipt
         /// of this frame against the server's monotonic clock. Scopes the
         /// entire request frame (the whole DSL batch or chain).
         deadline_ms: Option<u64>,
@@ -314,7 +350,7 @@ pub enum Frame {
         /// The verb-dispatch result, exactly as ADR-016's `request` verb
         /// surface returns it (an aggregate `{ok, tool, result}` /
         /// `{ok, summary, ...}` payload). Opaque to this crate.
-        result: serde_json::Value,
+        result: OpaqueValue,
     },
 
     /// A wire-level failure terminal frame.
@@ -341,9 +377,9 @@ pub enum Frame {
         /// rejects it ([`crate::codec::CodecError::FallbackFrameNotEncodable`])
         /// rather than emit `internal` and silently discard the newer code.
         /// The connection remains healthy; only this relay attempt failed.
-        /// If it has no operation id, a consumer should surface it as a
-        /// connection-level diagnostic rather than guess which request to
-        /// fail.
+        /// Under ADR-137 Amendment 1 Decision 5, only an unknown code with
+        /// an operation id can decode to this fallback. An id-less unknown
+        /// code is rejected as malformed at the decode boundary.
         unrecognized_code: Option<String>,
     },
 
@@ -406,10 +442,10 @@ pub enum Frame {
         cursor: Cursor,
         /// Server-assigned event time, RFC 3339.
         occurred_at: String,
-        /// Topic-specific payload. Field-by-field shape is owned by the
-        /// per-topic catalog (ADR-137, "Implementation-phase deliverables"),
-        /// not by this crate.
-        payload: serde_json::Value,
+        /// Topic-specific JSON object on the wire (Amendment 1 Decision 10).
+        /// Its members are opaque to this crate and owned by the per-topic
+        /// catalog; local Value construction uses `OpaqueValue::from`.
+        payload: OpaqueValue,
     },
 }
 
@@ -458,14 +494,27 @@ fn validate_frame_for_serialize(frame: &Frame) -> Result<(), String> {
     match frame {
         Frame::Handshake { version } => check_version("handshake", *version)?,
         Frame::HandshakeAck { version } => check_version("handshake_ack", *version)?,
-        Frame::Request { id, .. } => check_id("request", id)?,
+        Frame::Request {
+            id, deadline_ms, ..
+        } => {
+            check_id("request", id)?;
+            if *deadline_ms == Some(0) {
+                return Err(
+                    "frame kind \"request\": deadline_ms must be a positive integer".to_string(),
+                );
+            }
+        }
         Frame::Response { id, .. } => check_id("response", id)?,
         Frame::Cancel { id } => check_id("cancel", id)?,
         Frame::Subscribe { id, .. } => check_id("subscribe", id)?,
         Frame::SubscribeAck { id, .. } => check_id("subscribe_ack", id)?,
         Frame::Unsubscribe { id, .. } => check_id("unsubscribe", id)?,
         Frame::UnsubscribeAck { id, .. } => check_id("unsubscribe_ack", id)?,
-        Frame::Event { .. } => {}
+        Frame::Event { payload, .. } => {
+            if !payload.is_object() {
+                return Err("frame kind \"event\": payload must be a JSON object".to_string());
+            }
+        }
         Frame::Error {
             id,
             code,
@@ -631,9 +680,9 @@ impl Serialize for Frame {
 
 /// The decode half of the closed grammar; see the type-level docs and the
 /// crate documentation's "Strict field rejection" section. The codec's
-/// `decode_payload` drives this via `serde_json::from_value::<Frame>`
-/// after its own closed-set `"kind"` check (which produces the
-/// finer-grained [`crate::codec::CodecError::UnknownFrameKind`]).
+/// `decode_payload` drives this directly from the raw JSON bytes, before
+/// any diagnostic parsing into a Value can discard duplicate members.
+/// It re-classifies refusals into the codec's finer-grained error types.
 ///
 /// The visitor enforces every decode-time rule that only needs the fields
 /// of one frame, so a DIRECT serde decode of `Frame` (e.g.
@@ -664,27 +713,36 @@ impl<'de> Deserialize<'de> for Frame {
                 formatter.write_str("a JSON object with a string \"kind\" discriminant field")
             }
 
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Frame, A::Error> {
-                // Buffer the whole object, then inspect `"kind"` before any
-                // per-kind parsing: the closed-set check needs the
-                // discriminant up front, and the per-kind payload structs
-                // (all `deny_unknown_fields`) must never see the `"kind"`
-                // key itself.
-                let mut object: serde_json::Map<String, serde_json::Value> =
-                    Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Frame, A::Error> {
+                // Decision 4: reject every repeated decoded envelope key
+                // before kind or per-kind field validation. Values inside
+                // result/payload remain opaque JSON, not envelope grammar.
+                let mut object = std::collections::BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if object.contains_key(&key) {
+                        return Err(A::Error::custom(format!(
+                            "duplicate envelope field `{key}`"
+                        )));
+                    }
+                    let value = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                    object.insert(key, value);
+                }
                 let kind_value = object
                     .get("kind")
                     .ok_or_else(|| A::Error::custom("missing field `kind`"))?;
-                let kind = kind_value
-                    .as_str()
-                    .ok_or_else(|| A::Error::custom("field `kind` must be a string"))?;
-                let kind = kind.to_string();
+                let kind: String = serde_json::from_str(kind_value.get())
+                    .map_err(|_| A::Error::custom("field `kind` must be a string"))?;
                 object.remove("kind");
 
                 fn parse<T: serde::de::DeserializeOwned>(
-                    object: &serde_json::Map<String, serde_json::Value>,
+                    object: &std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
                 ) -> Result<T, serde_json::Error> {
-                    serde_json::from_value(serde_json::Value::Object(object.clone()))
+                    // Decision 9: serialize raw root members without projecting them
+                    // through Value, then deserialize a plain payload struct. A
+                    // tagged/untagged Content intermediary would lose raw tokens.
+                    // This functional-first path makes a transient JSON byte copy.
+                    let bytes = serde_json::to_vec(object)?;
+                    serde_json::from_slice(&bytes)
                 }
 
                 match kind.as_str() {
@@ -703,6 +761,9 @@ impl<'de> Deserialize<'de> for Frame {
                     }
                     "request" => {
                         let payload: RequestPayload = parse(&object).map_err(A::Error::custom)?;
+                        if payload.deadline_ms == Some(0) {
+                            return Err(A::Error::custom("deadline_ms must be a positive integer"));
+                        }
                         Ok(Frame::Request {
                             id: payload.id,
                             ops: payload.ops,
@@ -730,8 +791,7 @@ impl<'de> Deserialize<'de> for Frame {
                         // below need the pre-fallback string.
                         let raw_code = object
                             .get("code")
-                            .and_then(|c| c.as_str())
-                            .map(str::to_string);
+                            .and_then(|c| serde_json::from_str::<String>(c.get()).ok());
                         let payload: ErrorPayload = parse(&object).map_err(A::Error::custom)?;
 
                         // ADR-137, "Operation correlation": a
@@ -745,13 +805,19 @@ impl<'de> Deserialize<'de> for Frame {
                         // this same visitor) re-classifies the rejection
                         // into its typed
                         // [`crate::codec::CodecError::InconsistentErrorScope`].
-                        // The check covers closed-set codes only: an unknown
-                        // code's true scope is unknowable to this protocol
-                        // version, and the ADR directs the fallback-to-
-                        // `internal` treatment rather than rejection.
+                        // ADR-137 Amendment 1 Decision 5: an unknown code
+                        // falls back to request-terminal `internal` only
+                        // when it carries an operation id. Without one it
+                        // is malformed at this role-agnostic decode boundary.
                         let code_in_closed_set = raw_code
                             .as_deref()
                             .is_some_and(|c| crate::error::WIRE_ERROR_CODES.contains(&c));
+                        if !code_in_closed_set && payload.id.is_none() {
+                            return Err(A::Error::custom(format!(
+                                "{}unknown error code requires an operation id",
+                                crate::codec::INCONSISTENT_SCOPE_ERROR_PREFIX,
+                            )));
+                        }
                         if code_in_closed_set {
                             match (payload.code.terminal_scope(), payload.id.as_ref()) {
                                 (crate::error::TerminalScope::Connection, Some(id)) => {
@@ -825,6 +891,9 @@ impl<'de> Deserialize<'de> for Frame {
                     }
                     "event" => {
                         let payload: EventPayload = parse(&object).map_err(A::Error::custom)?;
+                        if !payload.payload.is_object() {
+                            return Err(A::Error::custom("event payload must be a JSON object"));
+                        }
                         Ok(Frame::Event {
                             topic: payload.topic,
                             cursor: payload.cursor,
@@ -832,10 +901,9 @@ impl<'de> Deserialize<'de> for Frame {
                             payload: payload.payload,
                         })
                     }
-                    // The codec's closed-set check against `FRAME_KINDS`
-                    // rejects unknown kinds with `UnknownFrameKind` before
-                    // this point; this arm only fires for a direct
-                    // `serde_json::from_value::<Frame>` call.
+                    // The codec re-classifies this refusal as
+                    // UnknownFrameKind. Direct serde retains its own
+                    // deserializer error type.
                     other => Err(A::Error::custom(format!("unknown frame kind: {other:?}"))),
                 }
             }

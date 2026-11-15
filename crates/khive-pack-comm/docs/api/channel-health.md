@@ -50,7 +50,53 @@ identical string `"khive:channel_health:a:b:c:d"` under the old scheme.
 quoted and internal quotes/backslashes are escaped — so distinct triples
 always serialize to distinct byte sequences.
 
+### Telegram poll observations
+
+The Telegram daemon loop dispatches `comm.heartbeat` through the same registry
+and uses `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` explicitly. Its rows land on
+the backend assigned to comm, independently of `KHIVE_TELEGRAM_INGEST_NAMESPACE`.
+The kind and configured slug keep channel observations separate.
+
+A completed `Ok` poll reports success even when its page is empty, all updates
+are filtered, or ingestion holds an envelope. The writer supplies the captured
+poll-completion `at` plus actual `held_messages` and `quarantined_after_hold`
+counts after handling the batch. These observations do not change the rule for
+acknowledging the Telegram offset. A transport error reports a safe error class
+and fixed message, retains the last success and hold facts, and keeps the
+existing five-second retry. A canceled pending poll produces no observation.
+Heartbeat persistence is best effort and does not hold a released batch.
+
+Telegram omits `poll_interval_secs`; an error retry or long-poll timeout is not
+a nominal success cadence. Newly written Telegram rows have no cadence, so
+`stalled` stays null by design and `no_success_age_secs` is the elapsed-time
+signal. As for other writers, an omitted field preserves a previously explicit
+cadence on an existing row. Missing success remains null rather than being
+replaced with process start time. The reader stays read-only. This writer adds
+no notices or channel lifecycle events and leaves email behavior unchanged.
+
 <a id="handlersrshandle_heartbeat"></a>
+
+### Configured identity and historical quarantine rows
+
+The real Telegram adapter uses its configured `maintainer_slug` consistently for
+inbound deduplication, quarantine, heartbeat and registered outbox routing.
+`from_env` defaults a missing, empty, whitespace-only or non-Unicode slug to
+`maintainer`. A manually constructed empty or whitespace-only slug instead falls
+back to the channel kind, `telegram`; nonblank configured values are preserved.
+An existing outbound message without a `channel_slug` still routes through the
+sole configured Telegram adapter. Normal comm producers do not stamp the old
+kind-only `telegram` slug; manually written backend rows are outside that
+producer guarantee.
+
+Normal polling also ages out expired quarantine rows explicitly named
+`telegram` from before the configured-slug upgrade. In the original ingest
+namespace, each poll retains the configured-slug and historical slugless cleanup
+passes, then selects the exact old kind-only slug when it differs from the
+configured slug. Each selector keeps the existing maximum of 128 rows and its
+expiry rules; the additional named selector removes only expired live rows.
+Unexpired rows, named rows without an expiry, other namespaced rows and unrelated
+slugs are untouched. A cleanup error holds the poll with the existing retry and
+records no completed-poll heartbeat. No manual maintenance step is required.
 
 ## `handlers/quarantine_heartbeat.rs::handle_heartbeat`
 
@@ -73,7 +119,7 @@ Read-modify-write against the existing row (if any) so that:
   read from the prior row rather than any in-process counter, so it is
   correct even across a daemon restart.
 - `poll_interval_secs`, when supplied, records the writer's positive nominal
-  cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
+  cadence. The shipped email loop supplies `5` on every heartbeat. Omission
   remains accepted for a mixed-version internal writer and preserves any
   previously recorded cadence on that row.
 - `held_messages` and `quarantined_after_hold` are accepted only with a
@@ -258,6 +304,13 @@ delayed sweep. ADR-119's component supervisor remains authoritative for hung
 task detection and restart. All channel projections use the same captured
 `as_of`, so a multi-channel response has one consistent comparison instant.
 
+`no_success_age_secs` reports whole seconds since a valid `last_success_at`,
+even while failures put the channel in backoff. A channel with 79 consecutive
+failures and a success ten hours before `as_of` reports 36000. Missing,
+malformed or future success timestamps produce null, including channels that
+have never reported success, outbox-only rows and quarantine-only entries.
+The reader does not substitute its own process start time or send notices.
+
 ### Outbox scan observations
 
 Issue #5213 adds `outbox` beside the inbound poll fields. It is `null` when
@@ -266,7 +319,7 @@ An outbox-only channel has null inbound poll facts; an outbox report never
 establishes an inbound poll or resets its failures.
 
 The email and Telegram delivery paths record the result immediately after the
-pending-row query completes, before attempting any delivery. Empty successful
+due-page and backlog queries complete, before attempting any delivery. Empty successful
 scans still update `last_scan_completed_at` and `last_success_at`. The nested
 object contains:
 
@@ -291,6 +344,31 @@ object contains:
   have unknown age. The queue may change after the scan, and an older row may
   lie beyond the newest-first page, so this is not the oldest row of the whole
   queue. `last_success_at` dates the observation, including after a scan error.
+- `undelivered_rows`: all eligible due and future-retry rows, without the
+  delivery page's bound. `backoff_rows` counts the subset whose valid retry
+  timestamp is in the future. Missing or malformed retry timestamps remain
+  due, matching delivery's strict RFC 3339 rules and microsecond boundary.
+- `earliest_backoff_next_attempt_at`, `oldest_backoff_created_at` and
+  `max_backoff_delivery_attempts`: the earliest retry instant, earliest
+  creation time and greatest unsigned retry count among the backoff rows.
+  These are null when that subset is empty; absent or invalid attempt
+  counters contribute zero.
+- `oldest_undelivered_created_at` and `oldest_undelivered_age_secs`: the
+  earliest creation time across the entire eligible backlog and its age at
+  `as_of`, covering both due and backoff rows. Empty backlogs have null
+  timestamps and ages; malformed or future creation timestamps have unknown age.
+- `backlog_observed_at`: the backlog query's observation time. The due page
+  and backlog are separate reads, so concurrent queue changes can make their
+  counts differ. Both observations retain their dates and values after a
+  failed query; they are not a live count at the health response's `as_of`.
+
+The aggregate reads metadata on the same comm backend and namespace as delivery.
+It excludes terminal, delivered and held rows, unrelated recipients and other
+channel slugs. Missing slugs are eligible only with one configured adapter of
+that kind; null and blank slugs are not missing. It returns scalar observations
+without loading message bodies, but still reads the matching backlog metadata.
+Older heartbeat rows have null aggregate fields until a successful new scan.
+No age threshold, outage notification or retry-policy change is implied.
 
 Agent presentation, the MCP default, keeps a null `outbox` and every null field
 inside it, so a channel with no recorded scan, a scan that has not yet
@@ -312,15 +390,19 @@ and message namespaces must read each scope explicitly. No fallback to `local`
 is performed.
 
 `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report of
-this process's own cumulative CPU time and RSS (via `getrusage`,
-`khive_runtime::process_resource_usage`) plus the names of any background
+this process's own cumulative CPU time, current RSS, and lifetime peak RSS plus the names of any background
 phases (e.g. `ann_warm`) currently in flight in this process
 (`khive_runtime::active_phase_names`). "This process" is, in the common case,
 the daemon itself: a client-role stdio session without an in-memory poll loop
 of its own still forwards `dispatch` calls to the daemon over its socket, so
 this handler body executes inside the daemon process, not the thin client.
-`cpu_us`/`rss_bytes` are `null` only if the underlying `getrusage` read is
-unavailable on this platform; `active_phases` is always present and empty
+`cpu_us` is cumulative microseconds from `getrusage`; `rss_bytes` is current
+resident bytes (macOS task info or Linux `/proc/self/statm`), and
+`max_rss_bytes` is the lifetime `getrusage` peak normalized to bytes. Each
+field is `null` when its reading is unavailable; a failed current RSS sample
+does not discard a successful CPU or peak reading. If `getrusage` fails, CPU
+and peak are `null`, while the independently sampled current RSS may remain
+available. These readings cover only the executing process, not its descendants; `active_phases` is always present and empty
 when nothing is in flight. Raw observations only, per the same "no computed
 healthy bool" rule as the rest of this verb — attributing severity to a given
 CPU/RSS number is the caller's judgment, not this verb's.

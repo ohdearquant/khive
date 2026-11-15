@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v23";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v26";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +131,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("gtd.assign", OperationAccess::Write),
     ("gtd.census", OperationAccess::Read),
     ("gtd.complete", OperationAccess::Write),
+    ("gtd.counts", OperationAccess::Read),
     ("gtd.next", OperationAccess::Read),
     ("gtd.repair", OperationAccess::Write),
     ("gtd.tasks", OperationAccess::Read),
@@ -160,6 +161,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("knowledge.upsert_domains", OperationAccess::Write),
     ("link", OperationAccess::Write),
     ("list", OperationAccess::Read),
+    ("memory.apply_batch", OperationAccess::Write),
     ("memory.feedback", OperationAccess::Write),
     ("memory.prune", OperationAccess::Write),
     ("memory.recall", OperationAccess::Read),
@@ -222,6 +224,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("tool.requests", OperationAccess::Read),
     ("tool.revoke", OperationAccess::Write),
     ("tool.suggest", OperationAccess::Read),
+    ("tool.unregister", OperationAccess::Write),
     ("traverse", OperationAccess::Read),
     ("update", OperationAccess::Write),
     ("verbs", OperationAccess::Read),

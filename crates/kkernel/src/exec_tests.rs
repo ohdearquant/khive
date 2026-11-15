@@ -2491,9 +2491,8 @@ async fn atomic_delete_unknown_field_rejected_well_formed_succeeds() {
 }
 
 /// `link`: a typo'd key (`relatoin` for `relation`) must be rejected
-/// before any write; a well-formed link still succeeds. (Distinct from
-/// the Leo-accepted `target_backend` conflict-arm deferral — out of
-/// scope here.)
+/// before any write; a well-formed link still succeeds. Validation of the
+/// `target_backend` conflict arm remains deferred and is out of scope here.
 #[tokio::test]
 async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
     if crate::test_process::run_in_child() {

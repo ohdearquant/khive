@@ -16,7 +16,7 @@ use crate::ann;
 use crate::MemoryPack;
 
 use super::common::{
-    deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
+    decode_params, deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
 };
 
@@ -49,43 +49,288 @@ fn receipt_issuance_error(error: RuntimeError, memory_id: Uuid, replayed: bool) 
         .into()
 }
 
+/// Most keys a `properties` object may carry.
+const MAX_PROPERTY_KEYS: usize = 32;
+/// Longest accepted `properties` key, in characters.
+const MAX_PROPERTY_KEY_CHARS: usize = 64;
+/// Largest accepted serialized `properties` object, in bytes.
+const MAX_PROPERTIES_BYTES: usize = 8192;
+/// Keys a caller may not set through `properties`, each with the replacement
+/// its refusal names. `docs/guide/memory.md` lists the same pairs, and
+/// `memory_guide_reserved_properties_match_handler` keeps the two equal.
+/// `supersedes` is reserved because recall hides the row it names.
+const RESERVED_PROPERTY_KEYS: [(&str, &str); 4] = [
+    ("memory_type", "use the top-level memory_type parameter"),
+    ("tags", "use the top-level tags parameter"),
+    (
+        "attribution",
+        "omit attribution; the runtime sets it for anonymous callers",
+    ),
+    (
+        "supersedes",
+        "use a memory.apply_batch row with action=\"supersede\", or link(relation=\"supersedes\") from the new memory to the old memory",
+    ),
+];
+
+/// Reserved keys `memory.apply_batch` adds to the rows it writes through the
+/// remember path. Its rows carry them past [`validate_properties`]; the batch
+/// refuses a caller-supplied one under its own `reserved-property` code.
+pub(super) const BATCH_WRITTEN_PROPERTY_KEYS: &[&str] = &["supersedes"];
+
+/// A key is 1-64 characters: a lowercase ASCII letter first, then lowercase
+/// ASCII letters, digits or `_`.
+fn is_valid_property_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    key.chars().count() <= MAX_PROPERTY_KEY_CHARS
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Validate a caller-supplied `properties` value and return its entries.
+///
+/// The value must be a JSON object with at most 32 keys. Each key is 1-64
+/// characters (a lowercase ASCII letter, then lowercase letters, digits or `_`)
+/// and is not reserved, unless it is one of the reserved keys in `permitted`.
+/// Each value is a string, a finite number, a boolean or an
+/// array of strings. The serialized object is at most 8192 bytes; an object over
+/// the limit is refused, never truncated. Every refusal is an
+/// `InvalidInput` that names the offending key and the rule.
+fn validate_properties(
+    raw: &Value,
+    permitted: &[&str],
+) -> Result<serde_json::Map<String, Value>, RuntimeError> {
+    let object = raw.as_object().ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "properties must be a JSON object whose values are strings, finite numbers, booleans or arrays of strings"
+                .into(),
+        )
+    })?;
+    if object.len() > MAX_PROPERTY_KEYS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "properties has {} keys; at most {} keys are allowed",
+            object.len(),
+            MAX_PROPERTY_KEYS
+        )));
+    }
+    for (key, value) in object {
+        if !is_valid_property_key(key) {
+            let mut shown: String = key.chars().take(MAX_PROPERTY_KEY_CHARS).collect();
+            if key.chars().count() > MAX_PROPERTY_KEY_CHARS {
+                shown.push_str("...");
+            }
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {:?} is invalid: a key is 1-{} characters, a lowercase ASCII letter first, then lowercase letters, digits or '_'",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &shown),
+                MAX_PROPERTY_KEY_CHARS
+            )));
+        }
+        if let Some((_, reason)) = RESERVED_PROPERTY_KEYS
+            .iter()
+            .find(|(reserved, _)| *reserved == key.as_str() && !permitted.contains(reserved))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {key:?} is reserved: {reason}"
+            )));
+        }
+        let refusal: Option<&str> = match value {
+            Value::String(_) | Value::Bool(_) => None,
+            Value::Number(n) => {
+                if n.as_f64().is_some_and(f64::is_finite) {
+                    None
+                } else {
+                    Some("a number must be finite")
+                }
+            }
+            Value::Array(items) => {
+                if items.iter().all(Value::is_string) {
+                    None
+                } else {
+                    Some("an array may hold strings only")
+                }
+            }
+            Value::Null => Some("null is not allowed"),
+            Value::Object(_) => Some("nested objects are not allowed"),
+        };
+        if let Some(reason) = refusal {
+            let shown_key = mask_for_redaction_surface(RedactionSurface::GateProbe, key);
+            return Err(RuntimeError::InvalidInput(format!(
+                "properties key {shown_key:?} has an invalid value: {reason}; a value is a string, a finite number, a boolean or an array of strings"
+            )));
+        }
+    }
+    let size = serde_json::to_string(raw)
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!("properties could not be serialized: {e}"))
+        })?
+        .len();
+    if size > MAX_PROPERTIES_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "properties serialize to {} bytes; the limit is {} bytes",
+            size, MAX_PROPERTIES_BYTES
+        )));
+    }
+    Ok(object.clone())
+}
+
+/// The resolved memory type and the validated extra properties of a
+/// `memory.remember` call, as `check_remember_fields` returns them.
+pub(super) type RememberFields<'a> = (&'a str, Option<serde_json::Map<String, Value>>);
+
+/// The checks `memory.remember` applies to a memory's content, type and
+/// `properties`, in that order: the content is not blank, the memory type is
+/// known (`episodic` when absent) and the `properties` object passes
+/// [`validate_properties`] with the reserved keys in `permitted` accepted
+/// (`memory.remember` permits none). Returns the resolved memory type and the
+/// validated extra properties. Callers that need to know whether a write would
+/// be accepted without performing it, such as `memory.apply_batch`, share this
+/// function with the write path.
+pub(super) fn check_remember_fields<'a>(
+    content: &str,
+    memory_type: Option<&'a str>,
+    properties: Option<&Value>,
+    permitted: &[&str],
+) -> Result<RememberFields<'a>, RuntimeError> {
+    if content.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "content must not be empty".into(),
+        ));
+    }
+
+    let memory_type = memory_type.unwrap_or("episodic");
+    validate_memory_type(memory_type)?;
+
+    let extra_properties = match properties {
+        Some(raw) => Some(validate_properties(raw, permitted)?),
+        None => None,
+    };
+    Ok((memory_type, extra_properties))
+}
+
+/// The namespace a caller's own writes land in: the namespace spelled by the
+/// actor id. `memory.apply_batch` uses it to look up keyed rows and to write
+/// edges where `memory.remember` writes the rows.
+pub(super) fn actor_namespace(token: &NamespaceToken) -> Result<Namespace, RuntimeError> {
+    let actor_id = token.actor().id.as_str();
+    Namespace::parse(actor_id).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "actor id {actor_id:?} is not a valid namespace: {e}"
+        ))
+    })
+}
+
 impl MemoryPack {
     pub(crate) async fn handle_remember(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let decoded = decode_params(params)
+            .map_err(|message| RuntimeError::InvalidInput(message).before_requested_write())?;
+        self.remember_decoded_with_properties(token, decoded, &[], None)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// `memory.remember` with the reserved `properties` keys in `permitted`
+    /// accepted. `memory.apply_batch` writes its rows through this with
+    /// [`BATCH_WRITTEN_PROPERTY_KEYS`]; the verb itself permits none.
+    #[cfg(test)]
+    pub(super) async fn remember_permitting(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+    ) -> Result<Value, RuntimeError> {
+        self.remember_permitting_with_properties(token, params, permitted)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// The remember response and, on replay, the held row's properties. Batch
+    /// writes compare those properties before reporting a replay as deduped or
+    /// asserting an edge.
+    #[cfg(test)]
+    pub(super) async fn remember_permitting_with_properties(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
+        self.remember_permitting_with_properties_inner(token, params, permitted, None)
+            .await
+    }
+
+    /// Remember in the batch's already resolved write namespace while retaining
+    /// the original caller identity and the replayed row's properties.
+    pub(super) async fn remember_permitting_with_properties_in_namespace(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+        write_namespace: &Namespace,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
+        self.remember_permitting_with_properties_inner(
+            token,
+            params,
+            permitted,
+            Some(write_namespace),
+        )
+        .await
+    }
+
+    async fn remember_permitting_with_properties_inner(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        permitted: &[&str],
+        write_namespace: Option<&Namespace>,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
         let p: RememberParams = deser(params)?;
+        self.remember_decoded_with_properties(token, p, permitted, write_namespace)
+            .await
+    }
+
+    async fn remember_decoded_with_properties(
+        &self,
+        token: &NamespaceToken,
+        p: RememberParams,
+        permitted: &[&str],
+        write_namespace: Option<&Namespace>,
+    ) -> Result<(Value, Option<Value>), RuntimeError> {
         if let Some(key) = p.key.as_deref() {
             validate_memory_key(key)?;
         }
-        if p.content.trim().is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "content must not be empty".into(),
-            ));
-        }
+        let (memory_type, extra_properties) = check_remember_fields(
+            &p.content,
+            p.memory_type.as_deref(),
+            p.properties.as_ref(),
+            permitted,
+        )?;
 
-        let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
-        validate_memory_type(memory_type)?;
-
-        // Explicit namespace wins; otherwise episodic uses actor scope and semantic uses local.
+        // An internal target wins, then an explicit namespace. Otherwise both memory
+        // types use the caller's actor namespace. An anonymous caller (no actor
+        // configured, id `local`) has no actor namespace of its own: with no namespace
+        // argument its write stays in the token's namespace. Every anonymous write is
+        // flagged `attribution: "unresolved"` instead of being refused, whether or not
+        // it names a namespace: the flag follows the caller.
+        let unresolved_attribution = token.actor().is_anonymous();
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
-        let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
-        {
+        let write_token_owned: Option<NamespaceToken> = if let Some(namespace) = write_namespace {
+            // The internal batch target is already resolved and takes precedence
+            // over serialized parameters. Ordinary remember calls pass None.
+            Some(token.with_namespace(namespace.clone()))
+        } else if let Some(ns_str) = p.namespace.as_deref() {
             let ns = Namespace::parse(ns_str).map_err(|e| {
                 RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
             })?;
             Some(token.with_namespace(ns))
-        } else if memory_type == "episodic" {
-            let actor_id = token.actor().id.as_str();
-            let ns = Namespace::parse(actor_id).map_err(|e| {
-                RuntimeError::InvalidInput(format!(
-                    "actor id {actor_id:?} is not a valid namespace: {e}"
-                ))
-            })?;
-            Some(token.with_namespace(ns))
-        } else {
+        } else if unresolved_attribution {
             None
+        } else {
+            Some(token.with_namespace(actor_namespace(token)?))
         };
         let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
 
@@ -121,6 +366,15 @@ impl MemoryPack {
             if !tags.is_empty() {
                 props["tags"] = json!(tags);
             }
+        }
+        // Validated keys never collide with `memory_type`, `tags`, `attribution` or `supersedes`.
+        if let Some(extra) = extra_properties {
+            for (key, value) in extra {
+                props[key.as_str()] = value;
+            }
+        }
+        if unresolved_attribution {
+            props["attribution"] = json!("unresolved");
         }
 
         let mut annotates: Vec<Uuid> = vec![];
@@ -281,14 +535,62 @@ impl MemoryPack {
         if replayed {
             response["replayed"] = json!(true);
         }
+        if unresolved_attribution {
+            response["attribution"] = json!("unresolved");
+        }
         if embedding_truncation.any_truncated() {
             response["warnings"] =
                 json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
-        to_json(&response)
+        let stored_properties = if replayed { note.properties } else { None };
+        Ok((to_json(&response)?, stored_properties))
     }
 }
 
 #[cfg(test)]
 #[path = "remember_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod rejected_before_write_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn internal_batch_remember_decode_remains_uncertified_after_an_earlier_write() {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            events_split: None,
+            actor_id: Some("actor:batch-decode".into()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let pack = MemoryPack::new_with_index_role(runtime.clone(), false);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let stored = pack
+            .handle_remember(
+                &token,
+                json!({"content":"earlier batch write", "namespace":"local"}),
+            )
+            .await
+            .unwrap();
+        let id = stored["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+        let notes = runtime.notes(&token).unwrap();
+        let before = notes.get_note(id).await.unwrap().unwrap();
+        let error = pack
+            .remember_permitting_with_properties_in_namespace(
+                &token,
+                json!({"content":"refused row", "key":"same", "idempotency_key":"same"}),
+                BATCH_WRITTEN_PROPERTY_KEYS,
+                &Namespace::local(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(notes.get_note(id).await.unwrap().unwrap(), before);
+        assert_eq!(notes.count_notes("local", Some("memory")).await.unwrap(), 1);
+        assert_eq!(error.batch_write_disposition(), None);
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message == "duplicate field `key`")
+        );
+    }
+}

@@ -6,7 +6,7 @@ dependencies = [
     "pytest>=8",
     "pytest-benchmark>=4",
     "jsonschema>=4",
-    "anyio>=4",
+    "anyio>=4.14.2",
 ]
 
 [tool.uv]

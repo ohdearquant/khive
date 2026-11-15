@@ -55,6 +55,7 @@ use crate::error::{RuntimeError, RuntimeResult};
 mod bridge_fragments;
 mod credential_triggers;
 mod entropy;
+mod escaped_json;
 mod false_positive_filters;
 mod known_patterns;
 mod masking;
@@ -164,6 +165,11 @@ fn block_guidance(detector: &'static str) -> &'static str {
              paragraph from those words, or express a source hash as an explicit \
              commit/revision reference."
         }
+        "nested-escaped-json" => {
+            "This value holds JSON text with escaped strings nested deeper than the \
+             gate decodes. Store the inner document unescaped, or flatten the nesting, \
+             before writing."
+        }
         _ => {
             "If this is a real credential, remove it before writing; store secrets \
               in an env var or secrets manager instead."
@@ -176,8 +182,25 @@ fn block_guidance(detector: &'static str) -> &'static str {
 /// Returns `Err(RuntimeError::SecretDetected)` on the first match found, or
 /// `Ok(())` if no secret pattern fires.
 pub fn check(content: &str) -> RuntimeResult<()> {
+    check_decoded(content, 0)
+}
+
+/// JSON documents nested inside escaped string values deeper than this are
+/// refused rather than passed unread.
+const MAX_ESCAPED_JSON_DEPTH: usize = 8;
+
+fn check_decoded(content: &str, depth: usize) -> RuntimeResult<()> {
     if let Some(m) = scan(content) {
         return Err(RuntimeError::SecretDetected(m));
+    }
+    for decoded in escaped_json::escaped_strings(content) {
+        if depth == MAX_ESCAPED_JSON_DEPTH {
+            return Err(RuntimeError::SecretDetected(build_match(
+                "nested-escaped-json",
+                &decoded,
+            )));
+        }
+        check_decoded(&decoded, depth + 1)?;
     }
     Ok(())
 }
@@ -541,6 +564,8 @@ pub enum RedactionSurface {
     GitIngest,
     /// Session mirroring stores only masked `text` and `raw` projections.
     SessionMirror,
+    /// Workspace mirroring stores masked document descriptions.
+    WorkspaceMirror,
     /// MCP diagnostics are bounded caller-visible transport data, not records.
     McpDiagnostic,
     /// The kg `scan` verb's masked preview: caller-visible, never stored.
@@ -580,11 +605,17 @@ pub const SESSION_MIRROR_STORED_TARGET: &str =
     "session_messages.text, session_messages.raw, sessions.cwd, sessions.git_branch, \
      and sessions.slug";
 
+/// Final stored target for [`RedactionSurface::WorkspaceMirror`] — see
+/// [`redaction_surface_contract`]. The mirror passes masked text into the
+/// document entity's `description`; source URI, type, and checksum are separate.
+pub const WORKSPACE_MIRROR_STORED_TARGET: &str = "workspace mirror document.description";
+
 /// Return the closed contract for a named redact-not-block surface.
 pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
     let final_stored_target = match surface {
         RedactionSurface::GitIngest => Some(GIT_INGEST_STORED_TARGET),
         RedactionSurface::SessionMirror => Some(SESSION_MIRROR_STORED_TARGET),
+        RedactionSurface::WorkspaceMirror => Some(WORKSPACE_MIRROR_STORED_TARGET),
         RedactionSurface::McpDiagnostic | RedactionSurface::GateProbe => None,
     };
 
@@ -617,6 +648,10 @@ mod issue_2655_tests;
 #[cfg(test)]
 #[path = "secret_gate/note_fields_tests.rs"]
 mod note_fields_tests;
+
+#[cfg(test)]
+#[path = "secret_gate/escaped_json_tests.rs"]
+mod escaped_json_tests;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

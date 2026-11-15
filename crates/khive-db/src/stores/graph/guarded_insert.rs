@@ -94,7 +94,7 @@ pub(super) fn insert_edge_if_absent(
     (edge.source_id, edge.target_id) =
         canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
     let insert = edge_insert_if_absent_statement(&edge);
-    let mut statement = conn.prepare(&insert.sql)?;
+    let mut statement = conn.prepare_cached(&insert.sql)?;
     bind_params(&mut statement, &insert.params)?;
     if statement.raw_execute()? == 1 {
         return Ok(EdgeInsertIfAbsentOutcome::Created(edge));

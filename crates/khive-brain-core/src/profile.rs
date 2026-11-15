@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::brain_signal::{entity_signal, is_recall_positive, BrainSignal};
+use crate::brain_signal::{is_recall_positive, BrainSignal};
 use crate::posterior::{BetaPosterior, EntityPosteriors};
 use crate::signal::{FeedbackEventKind, FeedbackSignal};
 
@@ -81,6 +81,14 @@ pub struct ProfileRecord {
     /// `reset_epoch` is a versioned output-shape change deferred to the
     /// posterior-serving lane (ADR-104 follow-up).
     pub exploration_epoch: u64,
+    /// Fixed multiplier a recall served by this profile applies to the rank
+    /// score of every candidate in the shared pool (namespace `local`); all
+    /// other candidates are multiplied by 1. A finite number in `[0.5, 1]`,
+    /// stored as given and converted to `f32` when applied. It is set only
+    /// when the profile is created and no operation edits it. `None` (a
+    /// record written without the field) means no factor, equivalent to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_factor: Option<f64>,
 }
 
 impl ProfileRecord {
@@ -97,6 +105,7 @@ impl ProfileRecord {
             state_snapshot: serde_json::to_value(snapshot).ok(),
             total_events: 0,
             exploration_epoch: 0,
+            local_factor: None,
         }
     }
 }
@@ -234,6 +243,10 @@ impl BalancedRecallState {
 
     /// Apply a brain signal to update posteriors in place.
     /// This is the core profile update logic — pure, deterministic, no IO.
+    ///
+    /// Per-entity posteriors move only through `apply_feedback_posteriors`, that
+    /// is, only for judgment-bearing signals. Recall hits and note accesses never
+    /// touch the entity map.
     pub fn apply_signal(&mut self, signal: &BrainSignal) {
         self.total_events += 1;
 
@@ -260,23 +273,6 @@ impl BalancedRecallState {
             }
             BrainSignal::RecallMiss => self.temporal.update_failure(),
             _ => {}
-        }
-
-        if matches!(
-            signal,
-            BrainSignal::Feedback { .. } | BrainSignal::SemanticFeedback { .. }
-        ) {
-            return;
-        }
-        if let Some((entity_id, positive)) = entity_signal(signal) {
-            let posterior = self
-                .entity_posteriors
-                .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
-            if positive {
-                posterior.update_success();
-            } else {
-                posterior.update_failure();
-            }
         }
     }
 

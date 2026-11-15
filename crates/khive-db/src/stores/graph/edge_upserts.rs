@@ -119,7 +119,7 @@ pub(super) fn observed_edge_upsert(
     }
 
     let statement = edge_upsert_statement_with_resurrection(&request.edge, request.resurrect);
-    let mut stmt = conn.prepare(&statement.sql)?;
+    let mut stmt = conn.prepare_cached(&statement.sql)?;
     bind_params(&mut stmt, &statement.params)?;
     let affected = stmt.raw_execute()?;
     if affected == 0 {

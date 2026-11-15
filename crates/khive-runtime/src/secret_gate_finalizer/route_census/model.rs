@@ -35,6 +35,7 @@ pub(super) const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
     "get_entity_including_deleted",
     "get_live_notes_by_key",
     "query_keyed_notes",
+    "assign_note_key_if_unset",
     "get_note",
     "get_note_including_deleted",
     "delete_note",

@@ -1098,6 +1098,116 @@ fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
     );
 }
 
+/// Resolve a seat-shaped config: `seat_toml` in the cwd project config and
+/// `db_toml` (when given) beside a database in a different directory.
+fn resolve_seat_shaped(
+    seat_toml: &str,
+    db_toml: Option<&str>,
+    namespace: &str,
+    namespace_explicit: bool,
+) -> RuntimeConfig {
+    std::env::remove_var("KHIVE_ACTOR");
+    let seat_dir = tempfile::tempdir().expect("seat tempdir");
+    std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+    std::fs::write(seat_dir.path().join(".khive/config.toml"), seat_toml)
+        .expect("write seat config");
+    let db_dir = tempfile::tempdir().expect("db tempdir");
+    let khive_dir = db_dir.path().join(".khive");
+    std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+    if let Some(toml) = db_toml {
+        std::fs::write(khive_dir.join("config.toml"), toml).expect("write db config");
+    }
+    let db_path = khive_dir.join("khive.db");
+    std::fs::write(&db_path, b"").expect("touch db file");
+    let db_str = db_path.to_str().expect("utf8 path").to_string();
+    let _seat_env = SeatEnv::enter(seat_dir.path());
+    resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(&db_str),
+        config: None,
+        namespace: Namespace::parse(namespace).expect("ns"),
+        namespace_explicit,
+        actor_explicit: false,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve seat-shaped config")
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_project_config_reaches_the_resolved_config() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved =
+        resolve_seat_shaped("[actor]\nrequire_attributed = true\n", None, "local", false);
+    assert!(
+        resolved.require_attributed_actor,
+        "a project config that requires an attributed actor must reach the resolved config"
+    );
+    assert_eq!(
+        resolved.actor_id, None,
+        "the knob names no actor of its own"
+    );
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_database_config_survives_a_project_config_without_it() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nid = \"lambda:seat-actor\"\n",
+        Some("[actor]\nrequire_attributed = true\n"),
+        "local",
+        false,
+    );
+    assert!(
+        resolved.require_attributed_actor,
+        "the database-anchored request for strict mode must hold when the project config is silent"
+    );
+    assert_eq!(resolved.actor_id.as_deref(), Some("lambda:seat-actor"));
+}
+
+#[test]
+#[serial]
+fn require_attributed_in_the_project_config_holds_under_an_explicit_namespace() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nrequire_attributed = true\n",
+        None,
+        "lambda:explicit",
+        true,
+    );
+    assert!(
+        resolved.require_attributed_actor,
+        "an explicit namespace skips the project actor lookup but must not skip strict mode"
+    );
+    assert_eq!(resolved.actor_id.as_deref(), Some("lambda:explicit"));
+}
+
+#[test]
+#[serial]
+fn require_attributed_is_off_when_no_config_sets_it() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let resolved = resolve_seat_shaped(
+        "[actor]\nid = \"lambda:seat-actor\"\n",
+        Some("[actor]\nid = \"lambda:db-actor\"\n"),
+        "local",
+        false,
+    );
+    assert!(
+        !resolved.require_attributed_actor,
+        "strict mode stays off unless a config asks for it"
+    );
+}
+
 /// #689 regression: an unset `--db`/`KHIVE_DB` must anchor tier-3
 /// `.khive/config.toml` discovery on the process cwd, not on
 /// `resolve_db_anchor(None)`'s materialized `$HOME/.khive/khive.db`
@@ -1449,6 +1559,174 @@ fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
         resolved.default_namespace.as_str(),
         "local",
         "explicit --actor local must keep default_namespace local"
+    );
+}
+
+/// A configured actor that declares an owned namespace (ADR-021 Delta 1).
+const OWNED_NAMESPACE_ACTOR_CONFIG: &str = r#"
+[actor]
+id = "lambda:alpha"
+owned_namespaces = ["lambda:alpha-helper"]
+"#;
+
+/// `[actor] owned_namespaces` is declared for the configured actor, so an
+/// explicit `--actor` pin to a different actor must not inherit it.
+#[test]
+#[serial]
+fn explicit_actor_pin_to_another_actor_drops_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("lambda:beta").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:beta"),
+        "the explicit pin must win as the actor"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "a pin to another actor must carry none of the configured actor's \
+         owned namespaces — got {:?}",
+        resolved.owned_namespaces
+    );
+}
+
+/// An explicit `--actor local` is a pin to the anonymous identity, which
+/// carries none of the configured actor's owned namespaces either.
+#[test]
+#[serial]
+fn explicit_actor_local_pin_drops_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("local").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id, None,
+        "explicit --actor local must resolve to anonymous"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "the anonymous pin must carry none of the configured actor's owned \
+         namespaces — got {:?}",
+        resolved.owned_namespaces
+    );
+}
+
+/// A pin to the configured actor itself keeps the list: the drop applies only
+/// when the resolved actor differs from the one the list was declared for.
+#[test]
+#[serial]
+fn explicit_actor_pin_to_configured_actor_keeps_owned_namespaces() {
+    std::env::remove_var("KHIVE_ACTOR");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_config(dir.path(), OWNED_NAMESPACE_ACTOR_CONFIG);
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(":memory:"),
+        config: Some(&path),
+        namespace: Namespace::parse("lambda:alpha").expect("ns"),
+        namespace_explicit: true,
+        actor_explicit: true,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:alpha"),
+        "the explicit pin resolves to the configured actor"
+    );
+    assert_eq!(
+        resolved.owned_namespaces,
+        vec![Namespace::parse("lambda:alpha-helper").expect("ns")],
+        "a pin to the configured actor must keep its owned namespaces"
+    );
+}
+
+/// The project-actor tier replacing the database-anchored config's actor with
+/// a different one drops the owned list declared for the database-anchored
+/// actor.
+#[test]
+#[serial]
+fn project_actor_replacing_configured_actor_drops_owned_namespaces() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
+    std::env::remove_var("KHIVE_ACTOR");
+
+    // The project directory resolves a different actor than the database's.
+    let seat_dir = tempfile::tempdir().expect("seat tempdir");
+    std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+    std::fs::write(
+        seat_dir.path().join(".khive/config.toml"),
+        "[actor]\nid = \"lambda:beta\"\n",
+    )
+    .expect("write seat config");
+
+    // The database-anchored config declares the actor and its owned namespace.
+    let db_dir = tempfile::tempdir().expect("db tempdir");
+    let khive_dir = db_dir.path().join(".khive");
+    std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+    std::fs::write(khive_dir.join("config.toml"), OWNED_NAMESPACE_ACTOR_CONFIG)
+        .expect("write db-anchored config");
+    let db_path = khive_dir.join("khive.db");
+    std::fs::write(&db_path, b"").expect("touch db file");
+    let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+    let _seat_env = SeatEnv::enter(seat_dir.path());
+
+    let resolved = resolve_runtime_config(RuntimeConfigInputs {
+        db: Some(&db_str),
+        config: None,
+        namespace: Namespace::parse("local").expect("ns"),
+        namespace_explicit: false,
+        actor_explicit: false,
+        no_embed: true,
+        packs: Some(kg_test_packs()),
+        brain_profile: None,
+    })
+    .expect("resolve config");
+
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:beta"),
+        "the project actor must replace the database-anchored actor"
+    );
+    assert!(
+        resolved.owned_namespaces.is_empty(),
+        "an actor swapped in by the project tier must carry none of the \
+         database-anchored actor's owned namespaces — got {:?}",
+        resolved.owned_namespaces
     );
 }
 
@@ -7267,7 +7545,7 @@ fn enforce_strict_actor_mode_returns_err_when_strict_and_no_actor() {
     // Strict mode ON + no actor + comm pack = Err.
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7294,7 +7572,7 @@ fn enforce_strict_actor_mode_ok_when_strict_and_actor_configured() {
     // Strict mode ON + proper actor = Ok (comm pack present is irrelevant).
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]));
+    let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7313,7 +7591,7 @@ fn enforce_strict_actor_mode_ok_when_strict_off_and_no_actor() {
     // never fires the guard.
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7331,7 +7609,7 @@ fn enforce_strict_actor_mode_ok_when_strict_on_but_no_comm_pack() {
     // Strict mode ON but comm pack not loaded = Ok (no risk of party-line).
     let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
     std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-    let result = enforce_strict_actor_mode(None, &packs(&["kg", "memory"]));
+    let result = enforce_strict_actor_mode(None, &packs(&["kg", "memory"]), false);
     match prev {
         Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
         None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
@@ -7340,6 +7618,88 @@ fn enforce_strict_actor_mode_ok_when_strict_on_but_no_comm_pack() {
         result.is_ok(),
         "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
              (no party-line risk even without actor)"
+    );
+}
+
+// --- enforce_strict_actor_mode: `[actor] require_attributed` ---
+
+fn with_strict_env_unset<T>(f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+    std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+    let out = f();
+    if let Some(v) = prev {
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v);
+    }
+    out
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_refuses_without_actor_when_env_is_unset() {
+    let result =
+        with_strict_env_unset(|| enforce_strict_actor_mode(None, &packs(&["kg", "comm"]), true));
+    let msg = result
+        .expect_err("[actor] require_attributed must refuse an unattributed comm caller")
+        .to_string();
+    assert!(
+        msg.contains("[actor] require_attributed = true"),
+        "error message must name the config key; got: {msg}"
+    );
+    assert!(
+        !msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        "error message must not blame an env flag that is unset; got: {msg}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_refuses_the_local_actor() {
+    let result = with_strict_env_unset(|| {
+        enforce_strict_actor_mode(Some("local"), &packs(&["kg", "comm"]), true)
+    });
+    assert!(
+        result.is_err(),
+        "the shared local identity is unattributed and must be refused"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_admits_a_named_actor() {
+    let result = with_strict_env_unset(|| {
+        enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]), true)
+    });
+    assert!(
+        result.is_ok(),
+        "a named actor satisfies strict mode: {result:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_require_attributed_admits_a_registry_without_comm() {
+    let result =
+        with_strict_env_unset(|| enforce_strict_actor_mode(None, &packs(&["kg", "memory"]), true));
+    assert!(
+        result.is_ok(),
+        "strict mode only guards the comm pack: {result:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn env_and_config_together_name_both_sources() {
+    let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+    std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+    let result = enforce_strict_actor_mode(None, &packs(&["comm"]), true);
+    match prev {
+        Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+        None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+    }
+    let msg = result.expect_err("both sources on must refuse").to_string();
+    assert!(
+        msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1") && msg.contains("require_attributed"),
+        "error message must name both sources; got: {msg}"
     );
 }
 
@@ -13465,5 +13825,960 @@ async fn issue2768_read_only_boot_refuses_missing_columns_and_accepts_current_sc
         }
         assert_eq!(issue2768_tool_shape(&backend), before);
         assert_eq!(backend.pool().writer_acquisition_snapshot(), writes_before);
+    }
+}
+
+#[cfg(feature = "test-channel-timing")]
+mod telegram_heartbeat_tests {
+    use super::super::telegram::heartbeat_test_seam;
+    use super::*;
+    use chrono::DateTime;
+    use khive_channel::ChannelError;
+    use khive_channel_telegram::test_support::{TelegramPollStep, TelegramScriptedFixture};
+    use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    const OPERATIONAL: &str = khive_pack_comm::CHANNEL_HEALTH_NAMESPACE;
+
+    fn update(id: i64, text: &str, sender: i64) -> serde_json::Value {
+        json!({"update_id": id, "message": {
+            "message_id": id, "date": 1_700_000_000,
+            "chat": {"id": 555}, "from": {"id": sender}, "text": text
+        }})
+    }
+
+    fn registry() -> (KhiveRuntime, khive_runtime::VerbRegistry) {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        khive_runtime::PackRegistry::register_packs(
+            &["kg".into(), "comm".into()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .unwrap();
+        (runtime, builder.build().unwrap())
+    }
+
+    // Self-waking polls prevent Tokio's paused clock from advancing while a real
+    // SQLite/blocking operation is pending. The wall bound is only a safety guard.
+    async fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = Box::pin(future);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        std::future::poll_fn(|cx| {
+            assert!(
+                Instant::now() < deadline,
+                "fixture operation did not settle"
+            );
+            match future.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(value),
+                Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    async fn drive(mut future: Pin<&mut impl Future<Output = ()>>, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        std::future::poll_fn(|cx| {
+            assert!(
+                Instant::now() < deadline,
+                "actual poll loop missed its boundary"
+            );
+            if done() {
+                return Poll::Ready(());
+            }
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "loop exited before cancellation"
+            );
+            if done() {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    async fn poll_once(mut future: Pin<&mut impl Future<Output = ()>>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await
+    }
+
+    async fn health(registry: &khive_runtime::VerbRegistry, namespace: &str) -> serde_json::Value {
+        ready(registry.dispatch("comm.health", json!({"namespace": namespace})))
+            .await
+            .unwrap()
+    }
+
+    fn channel(health: &serde_json::Value, slug: &str) -> serde_json::Value {
+        health["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["channel_kind"] == "telegram" && row["channel_slug"] == slug)
+            .unwrap_or_else(|| panic!("missing Telegram heartbeat for {slug}: {health}"))
+            .clone()
+    }
+
+    async fn notes(runtime: &KhiveRuntime, namespace: &str) -> serde_json::Value {
+        let token = runtime
+            .authorize(Namespace::parse(namespace).unwrap())
+            .unwrap();
+        let page = ready(runtime.notes(&token).unwrap().query_notes(
+            namespace,
+            None,
+            khive_storage::types::PageRequest {
+                limit: 1000,
+                offset: 0,
+            },
+        ))
+        .await
+        .unwrap();
+        serde_json::to_value(page.items).unwrap()
+    }
+
+    async fn edges(runtime: &KhiveRuntime) -> serde_json::Value {
+        let rows = ready(async {
+            runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(khive_storage::types::SqlStatement {
+                    sql: "SELECT * FROM graph_edges ORDER BY id".into(),
+                    params: vec![],
+                    label: Some("telegram_heartbeat_read_only_edges".into()),
+                })
+                .await
+                .unwrap()
+        })
+        .await;
+        serde_json::to_value(rows).unwrap()
+    }
+
+    fn count(completed: &AtomicUsize) -> usize {
+        completed.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn completed_polls_report_success_independently_of_ingest_and_offset() {
+        let (runtime, registry) = registry();
+        let mut steps = vec![
+            TelegramPollStep::updates(vec![]),
+            TelegramPollStep::updates(vec![update(10, "accepted", 555)]),
+            TelegramPollStep::updates(vec![update(11, "filtered", 999)]),
+        ];
+        steps.extend((0..5).map(|_| TelegramPollStep::updates(vec![update(12, "", 555)])));
+        let fixture = TelegramScriptedFixture::new("held", steps);
+        let shutdown = CancellationToken::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            completed.clone(),
+            telegram_poll_loop(
+                fixture.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                shutdown.clone(),
+            ),
+        ));
+        let initial_clock = tokio::time::Instant::now();
+        for index in 0..8 {
+            drive(task.as_mut(), || {
+                fixture.requested_offsets().len() == index + 1
+            })
+            .await;
+            fixture.release_next();
+            drive(task.as_mut(), || count(&completed) == index + 1).await;
+            let row = channel(&health(&registry, OPERATIONAL).await, "held");
+            assert!(
+                row["last_success_at"].is_string(),
+                "every Ok page is a poll success"
+            );
+            assert_eq!(row["consecutive_failures"], 0);
+            assert!(row["poll_interval_secs"].is_null());
+            assert!(row["stalled"].is_null());
+            assert!(row["no_success_age_secs"].is_u64());
+            let expected = match index {
+                0 => (None, None),
+                1 => (Some(11), None),
+                2 => (Some(12), None),
+                3..=6 => (Some(12), Some(13)),
+                7 => (Some(13), None),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                fixture.offsets(),
+                expected,
+                "actual adapter offset at page {index}"
+            );
+            assert_eq!(row["held_messages"], u64::from((3..=6).contains(&index)));
+            if (3..=6).contains(&index) {
+                assert_eq!(row["consecutive_held_polls"], index - 2);
+            }
+            if index == 7 {
+                assert_eq!(row["consecutive_held_polls"], 0);
+                assert!(row["last_quarantined_after_hold_at"].is_string());
+            }
+            assert_eq!(
+                tokio::time::Instant::now(),
+                initial_clock,
+                "no success sleep"
+            );
+        }
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 9).await;
+        assert_eq!(
+            fixture.requested_offsets(),
+            vec![
+                None,
+                None,
+                Some(11),
+                Some(12),
+                Some(12),
+                Some(12),
+                Some(12),
+                Some(12),
+                Some(13)
+            ]
+        );
+        let stored = notes(&runtime, "messages").await;
+        let messages: Vec<_> = stored
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "message")
+            .collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "accepted message plus one durable quarantine"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|row| row["properties"]["external_id"] == "tg:555:10")
+                .count(),
+            1
+        );
+        let quarantined = messages
+            .iter()
+            .find(|row| row["properties"]["external_id"] == "tg:555:12")
+            .unwrap();
+        assert_eq!(quarantined["properties"]["quarantined"], "true");
+        assert_eq!(quarantined["properties"]["quarantine_failed_polls"], "5");
+        shutdown.cancel();
+        ready(task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn failed_polls_keep_last_success_and_report_elapsed_age() {
+        let (runtime, registry) = registry();
+        let fixture = TelegramScriptedFixture::new(
+            "failures",
+            vec![
+                TelegramPollStep::updates(vec![update(70, "age fixture message", 555)]),
+                TelegramPollStep::failure(ChannelError::Transport(
+                    "private transport detail".into(),
+                )),
+                TelegramPollStep::failure(ChannelError::Auth("private auth detail".into())),
+            ],
+        );
+        let shutdown = CancellationToken::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            completed.clone(),
+            telegram_poll_loop(
+                fixture.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                shutdown.clone(),
+            ),
+        ));
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 1).await;
+        fixture.release_next();
+        drive(task.as_mut(), || count(&completed) == 1).await;
+        let success = channel(&health(&registry, OPERATIONAL).await, "failures");
+        for index in 1..=2 {
+            drive(task.as_mut(), || {
+                fixture.requested_offsets().len() == index + 1
+            })
+            .await;
+            fixture.release_next();
+            drive(task.as_mut(), || count(&completed) == index + 1).await;
+            let row = channel(&health(&registry, OPERATIONAL).await, "failures");
+            assert_eq!(row["last_success_at"], success["last_success_at"]);
+            assert_eq!(row["consecutive_failures"], index);
+            assert_eq!(
+                row["last_error"]["class"],
+                if index == 1 { "transport" } else { "auth" }
+            );
+            assert_eq!(row["last_error"]["message"], "Telegram poll failed");
+            assert!(!row.to_string().contains("private"));
+            assert!(row["stalled"].is_null());
+            if index == 1 {
+                tokio::time::advance(Duration::from_secs(5)).await;
+            }
+        }
+        let before = notes(&runtime, OPERATIONAL).await;
+        let messages_before = notes(&runtime, "messages").await;
+        assert!(!messages_before.as_array().unwrap().is_empty());
+        let edges_before = edges(&runtime).await;
+        tokio::time::resume();
+        let initial = health(&registry, OPERATIONAL).await;
+        let first_age = channel(&initial, "failures")["no_success_age_secs"]
+            .as_u64()
+            .unwrap();
+        let success_at =
+            DateTime::parse_from_rfc3339(success["last_success_at"].as_str().unwrap()).unwrap();
+        let mut grew = false;
+        for _ in 0..50 {
+            let observation = health(&registry, OPERATIONAL).await;
+            let row = channel(&observation, "failures");
+            let as_of =
+                DateTime::parse_from_rfc3339(observation["as_of"].as_str().unwrap()).unwrap();
+            let expected = (as_of - success_at).num_seconds() as u64;
+            assert_eq!(row["no_success_age_secs"], expected);
+            assert_eq!(row["last_success_at"], success["last_success_at"]);
+            if expected > first_age {
+                grew = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            grew,
+            "real UTC no-success age must grow while the failed loop is parked"
+        );
+        assert_eq!(notes(&runtime, OPERATIONAL).await, before);
+        assert_eq!(notes(&runtime, "messages").await, messages_before);
+        assert_eq!(edges(&runtime).await, edges_before);
+        shutdown.cancel();
+        ready(task).await;
+
+        let never = TelegramScriptedFixture::new(
+            "never",
+            vec![TelegramPollStep::failure(ChannelError::Transport(
+                "never connected".into(),
+            ))],
+        );
+        let cancel = CancellationToken::new();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            done.clone(),
+            telegram_poll_loop(
+                never.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                cancel.clone(),
+            ),
+        ));
+        drive(task.as_mut(), || never.requested_offsets().len() == 1).await;
+        never.release_next();
+        drive(task.as_mut(), || count(&done) == 1).await;
+        let row = channel(&health(&registry, OPERATIONAL).await, "never");
+        assert_eq!(row["consecutive_failures"], 1);
+        assert!(row["last_success_at"].is_null());
+        assert!(row["no_success_age_secs"].is_null());
+        cancel.cancel();
+        ready(task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn poll_timing_and_cancellation_preserve_heartbeat_and_offsets() {
+        let (runtime, registry) = registry();
+        let fixture = TelegramScriptedFixture::new(
+            "timing",
+            vec![
+                TelegramPollStep::updates(vec![update(20, "delivered", 555)]),
+                TelegramPollStep::failure(ChannelError::Transport("offline".into())),
+            ],
+        );
+        let cancel = CancellationToken::new();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            done.clone(),
+            telegram_poll_loop(
+                fixture.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                cancel.clone(),
+            ),
+        ));
+        let start = tokio::time::Instant::now();
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 1).await;
+        fixture.release_next();
+        drive(task.as_mut(), || count(&done) == 1).await;
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 2).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start,
+            "success does not add delay"
+        );
+        fixture.release_next();
+        drive(task.as_mut(), || count(&done) == 2).await;
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        poll_once(task.as_mut()).await;
+        assert_eq!(
+            fixture.requested_offsets().len(),
+            2,
+            "error waits the full five seconds"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 3).await;
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(5));
+        let before = notes(&runtime, OPERATIONAL).await;
+        cancel.cancel();
+        ready(task).await;
+        assert_eq!(fixture.dropped_pending(), 1);
+        assert_eq!(count(&done), 2);
+        assert_eq!(fixture.offsets(), (Some(21), None));
+        assert_eq!(notes(&runtime, OPERATIONAL).await, before);
+
+        // Cancel during the selected response's poll, after select checked its
+        // cancel-first branch. The selected batch must finish its real writes.
+        let selected_cancel = CancellationToken::new();
+        let signal = selected_cancel.clone();
+        let selected = TelegramScriptedFixture::new(
+            "selected",
+            vec![
+                TelegramPollStep::updates(vec![update(30, "selected batch", 555)])
+                    .after_response(move || signal.cancel()),
+            ],
+        );
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            done.clone(),
+            telegram_poll_loop(
+                selected.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                selected_cancel.clone(),
+            ),
+        ));
+        drive(task.as_mut(), || selected.requested_offsets().len() == 1).await;
+        selected.release_next();
+        ready(task).await;
+        assert!(selected_cancel.is_cancelled());
+        assert_eq!(count(&done), 1);
+        assert_eq!(selected.offsets(), (Some(31), None));
+        assert_eq!(selected.dropped_pending(), 0);
+        assert!(
+            channel(&health(&registry, OPERATIONAL).await, "selected")["last_success_at"]
+                .is_string()
+        );
+        assert!(notes(&runtime, "messages")
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["properties"]["external_id"] == "tg:555:30"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn heartbeat_routes_by_comm_backend_operational_namespace_and_slug() {
+        let backend = |name: &str| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let config = KhiveConfig {
+            backends: vec![backend("main"), backend("comm-store")],
+            packs: HashMap::from([(
+                "comm".into(),
+                khive_runtime::PackConfig {
+                    backend: "comm-store".into(),
+                    verbs_disabled: vec![],
+                    no_embed: false,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut base = base_runtime_config_for_multi_backend();
+        base.db_path = Some(directory.path().join("config-anchor.db"));
+        let multi = ready(build_registry_for_multi_backend_inner(base, &config, None))
+            .await
+            .unwrap();
+        let main = multi.default_runtime.clone();
+        let comm = multi.per_pack_runtimes["comm"].clone();
+        let registry = multi.registry.clone();
+        assert_ne!(main.backend_id(), comm.backend_id());
+        for (slug, id) in [("alpha", 40), ("beta", 40)] {
+            let fixture = TelegramScriptedFixture::new(
+                slug,
+                vec![TelegramPollStep::updates(vec![update(id, slug, 555)])],
+            );
+            let cancel = CancellationToken::new();
+            let done = Arc::new(AtomicUsize::new(0));
+            let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+                done.clone(),
+                telegram_poll_loop(
+                    fixture.channel(),
+                    registry.clone(),
+                    "message-tenant".into(),
+                    "actor:receiver".into(),
+                    cancel.clone(),
+                ),
+            ));
+            drive(task.as_mut(), || fixture.requested_offsets().len() == 1).await;
+            fixture.release_next();
+            drive(task.as_mut(), || count(&done) == 1).await;
+            assert_eq!(fixture.offsets(), (Some(id + 1), None));
+            cancel.cancel();
+            ready(task).await;
+        }
+        let local = health(&registry, OPERATIONAL).await;
+        assert_eq!(local["channels"].as_array().unwrap().len(), 2);
+        let alpha = channel(&local, "alpha");
+        let beta = channel(&local, "beta");
+        assert!(alpha["last_success_at"].is_string());
+        assert!(beta["last_success_at"].is_string());
+        assert!(notes(&main, OPERATIONAL)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let comm_rows = notes(&comm, OPERATIONAL).await;
+        assert_eq!(
+            comm_rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["kind"] == "channel_health")
+                .count(),
+            2
+        );
+        assert_eq!(
+            notes(&comm, "message-tenant")
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["kind"] == "message")
+                .count(),
+            2
+        );
+        assert!(notes(&main, "message-tenant")
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let messages = notes(&comm, "message-tenant").await;
+        let stored_slugs: std::collections::BTreeSet<_> = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "message")
+            .map(|row| {
+                assert_eq!(row["properties"]["external_id"], "tg:555:40");
+                row["properties"]["channel_slug"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            stored_slugs,
+            std::collections::BTreeSet::from(["alpha".into(), "beta".into()])
+        );
+
+        assert!(health(&registry, "message-tenant").await["channels"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // The existing trusted internal writer can use another authorized
+        // namespace, while scoped health never substitutes operational rows.
+        ready(registry.dispatch(
+            "comm.heartbeat",
+            json!({
+                "namespace": "tenant-health", "channel_kind": "telegram", "channel_slug": "alpha",
+                "outcome": "failure", "error_class": "transport", "error_message": "tenant fixture"
+            }),
+        ))
+        .await
+        .unwrap();
+        let tenant = health(&registry, "tenant-health").await;
+        assert_eq!(tenant["channels"].as_array().unwrap().len(), 1);
+        let tenant_alpha = channel(&tenant, "alpha");
+        assert!(tenant_alpha["last_success_at"].is_null());
+        assert_eq!(tenant_alpha["consecutive_failures"], 1);
+        let after = channel(&health(&registry, OPERATIONAL).await, "alpha");
+        assert_eq!(after["last_success_at"], alpha["last_success_at"]);
+        assert_eq!(after["consecutive_failures"], alpha["consecutive_failures"]);
+        assert_eq!(notes(&comm, OPERATIONAL).await, comm_rows);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn client_and_read_only_startup_do_not_start_heartbeat_work() {
+        use clap::Parser;
+        let (writable, _) = registry();
+        let writable_server =
+            KhiveMcpServer::with_packs(writable.clone(), &["kg".into(), "comm".into()]).unwrap();
+        let client = Args::parse_from(["mcp"]);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+        let observed = Arc::new(AtomicUsize::new(0));
+        let before = notes(&writable, OPERATIONAL).await;
+        heartbeat_test_seam::with_constructor_probe(observed.clone(), || {
+            spawn_telegram_channel_loops_if_daemon(&writable_server, &client);
+        });
+        assert_eq!(
+            count(&observed),
+            0,
+            "client refuses both loops before transport construction"
+        );
+        assert_eq!(notes(&writable, OPERATIONAL).await, before);
+        heartbeat_test_seam::with_constructor_probe(observed.clone(), || {
+            spawn_telegram_channel_loops_if_daemon(&writable_server, &daemon);
+        });
+        assert_eq!(
+            count(&observed),
+            1,
+            "writable daemon reaches the same constructor probe"
+        );
+        ready(writable_server.shutdown_audit_batch())
+            .await
+            .expect("writable startup audit settlement succeeds");
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(directory.path().join("telegram-read-only.db")),
+            packs: vec!["kg".into(), "comm".into()],
+            ..RuntimeConfig::no_embeddings()
+        };
+        drop(KhiveRuntime::new(config.clone()).unwrap());
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(config.db_path.as_ref().unwrap());
+        let runtime = KhiveRuntime::new_readonly(config).unwrap();
+        let server = KhiveMcpServer::new(runtime.clone()).unwrap();
+        let before = notes(&runtime, OPERATIONAL).await;
+        let observed = Arc::new(AtomicUsize::new(0));
+        heartbeat_test_seam::with_constructor_probe(observed.clone(), || {
+            spawn_telegram_channel_loops_if_daemon(&server, &daemon);
+        });
+        assert_eq!(count(&observed), 0, "read-only comm refuses both loops");
+        assert_eq!(notes(&runtime, OPERATIONAL).await, before);
+        ready(server.shutdown_audit_batch())
+            .await
+            .expect("read-only startup audit settlement succeeds");
+        // A read-only blob backend may still admit the outbox. The existing
+        // mixed-topology admission test preserves that independent behavior.
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn normal_poll_ages_legacy_quarantine_without_removing_live_rows() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let (runtime, registry) = registry();
+        let now = chrono::Utc::now().timestamp_micros();
+        let mut retained = Vec::new();
+        let mut expired_id = None;
+        for (index, namespace, slug, expires) in [
+            (0, "messages", "telegram", now - 1_000_000),
+            (1, "messages", "telegram", now + 86_400_000_000),
+            (2, "other-messages", "telegram", now - 1_000_000),
+            (3, "messages", "another-adapter", now - 1_000_000),
+        ] {
+            let created = ready(registry.dispatch(
+                "comm.ingest",
+                json!({"namespace": namespace, "from": "telegram:quarantine",
+                    "to": "actor:receiver", "content": "Inbound message quarantined",
+                    "channel_kind": "telegram", "channel_slug": slug,
+                    "external_id": format!("tg:legacy:{index}"),
+                    "metadata": {"quarantined": "true"}}),
+            ))
+            .await
+            .unwrap();
+            let id: uuid::Uuid = created["full_id"].as_str().unwrap().parse().unwrap();
+            // Use actual ingest for provenance, then place the stored row on
+            // either side of the existing expiry predicate without clock races.
+            let sql = runtime.sql();
+            let mut writer = ready(sql.writer()).await.unwrap();
+            assert_eq!(
+                ready(writer.execute(SqlStatement {
+                    sql: "UPDATE notes SET expires_at = ?1 WHERE id = ?2".into(),
+                    params: vec![SqlValue::Integer(expires), SqlValue::Text(id.to_string())],
+                    label: Some("telegram_legacy_quarantine_expiry_fixture".into()),
+                }))
+                .await
+                .unwrap(),
+                1
+            );
+            drop(writer);
+            let token = runtime
+                .authorize(Namespace::parse(namespace).unwrap())
+                .unwrap();
+            let stored = ready(
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note_including_deleted(id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.expires_at, Some(expires));
+            assert_eq!(stored.properties.as_ref().unwrap()["channel_slug"], slug);
+            if index == 0 {
+                expired_id = Some(id);
+            } else {
+                retained.push((namespace, id, serde_json::to_value(stored).unwrap()));
+            }
+        }
+        let fixture = TelegramScriptedFixture::new(
+            "configured-alpha",
+            vec![TelegramPollStep::updates(vec![])],
+        );
+        let cancel = CancellationToken::new();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+            done.clone(),
+            telegram_poll_loop(
+                fixture.channel(),
+                registry.clone(),
+                "messages".into(),
+                "actor:receiver".into(),
+                cancel.clone(),
+            ),
+        ));
+        drive(task.as_mut(), || fixture.requested_offsets().len() == 1).await;
+        fixture.release_next();
+        drive(task.as_mut(), || count(&done) == 1).await;
+        let token = runtime
+            .authorize(Namespace::parse("messages").unwrap())
+            .unwrap();
+        assert!(
+            ready(
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note_including_deleted(expired_id.unwrap())
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "normal configured poll removes the expired kind-only legacy row"
+        );
+        for (namespace, id, before) in retained {
+            let token = runtime
+                .authorize(Namespace::parse(namespace).unwrap())
+                .unwrap();
+            let stored = ready(
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note_including_deleted(id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(stored).unwrap(),
+                before,
+                "unexpired or differently scoped row is untouched"
+            );
+        }
+        assert!(
+            channel(&health(&registry, OPERATIONAL).await, "configured-alpha")["last_success_at"]
+                .is_string()
+        );
+        assert_eq!(fixture.offsets(), (None, None));
+        cancel.cancel();
+        ready(task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn configured_telegram_slug_delivers_existing_slugless_outbound_rows() {
+        use super::super::outbox::{outbox_once, OutboxChannels, OutboxPolicy};
+        use khive_channel::{Channel, ChannelRegistry};
+
+        let (runtime, registry) = registry();
+        // This is the real producer shape from before configured slug routing:
+        // a pending outbound note without any channel_slug property.
+        let sent = ready(registry.dispatch(
+            "comm.send",
+            json!({"namespace": "messages", "to": "telegram:maintainer-alpha",
+                "content": "pending before the configured adapter starts"}),
+        ))
+        .await
+        .unwrap();
+        let id = sent["full_id"].as_str().unwrap();
+        let before = notes(&runtime, "messages").await;
+        let pending = before
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(pending["properties"]["direction"], "outbound");
+        assert!(pending["properties"].get("channel_slug").is_none());
+        assert_ne!(pending["properties"]["delivery"], "delivered");
+
+        let fixture = TelegramScriptedFixture::new("maintainer-alpha", vec![]);
+        fixture.allow_outbound();
+        assert_eq!(fixture.channel().slug(), "maintainer-alpha");
+        let mut channels = ChannelRegistry::new();
+        channels.register(fixture.channel());
+        let namespace = Namespace::parse("messages").unwrap();
+        let cancellation = CancellationToken::new();
+        let mut pause_until = None;
+        for expected_sends in [1, 1] {
+            ready(outbox_once(
+                OutboxChannels::Registered {
+                    registry: &channels,
+                    slug: "maintainer-alpha",
+                },
+                OutboxPolicy::Telegram(std::marker::PhantomData),
+                &runtime,
+                &namespace,
+                &cancellation,
+                &mut pause_until,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(fixture.sent_messages().len(), expected_sends);
+        }
+        assert_eq!(
+            fixture.sent_messages(),
+            vec![(
+                555,
+                "pending before the configured adapter starts".to_string()
+            )]
+        );
+        let after = notes(&runtime, "messages").await;
+        let delivered = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(delivered["properties"]["delivery"], "delivered");
+        assert!(delivered["properties"].get("channel_slug").is_none());
+        assert!(
+            fixture.requested_offsets().is_empty(),
+            "outbox delivery never polls Telegram"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn heartbeat_write_refusal_does_not_hold_a_released_batch() {
+        #[derive(Debug)]
+        struct HeartbeatGate {
+            refuse: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        impl khive_runtime::Gate for HeartbeatGate {
+            fn check(
+                &self,
+                request: &khive_runtime::GateRequest,
+            ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+                if request.verb == "comm.heartbeat" {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    if self.refuse {
+                        return Ok(khive_runtime::GateDecision::deny(
+                            "heartbeat fixture refusal",
+                        ));
+                    }
+                }
+                Ok(khive_runtime::GateDecision::allow())
+            }
+        }
+        for refuse in [false, true] {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let observed = Arc::new(AtomicUsize::new(0));
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_gate(Arc::new(HeartbeatGate {
+                refuse,
+                calls: observed.clone(),
+            }));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".into(), "comm".into()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .unwrap();
+            let registry = builder.build().unwrap();
+            let fixture = TelegramScriptedFixture::new(
+                "best-effort",
+                vec![TelegramPollStep::updates(vec![update(
+                    60,
+                    "durable despite heartbeat",
+                    555,
+                )])],
+            );
+            let cancel = CancellationToken::new();
+            let done = Arc::new(AtomicUsize::new(0));
+            let mut task = Box::pin(heartbeat_test_seam::COMPLETED.scope(
+                done.clone(),
+                telegram_poll_loop(
+                    fixture.channel(),
+                    registry.clone(),
+                    "messages".into(),
+                    "actor:receiver".into(),
+                    cancel.clone(),
+                ),
+            ));
+            let start = tokio::time::Instant::now();
+            drive(task.as_mut(), || fixture.requested_offsets().len() == 1).await;
+            fixture.release_next();
+            drive(task.as_mut(), || count(&done) == 1).await;
+            assert_eq!(
+                count(&observed),
+                1,
+                "actual heartbeat passed through the selective Gate"
+            );
+            assert_eq!(fixture.offsets(), (Some(61), None));
+            assert_eq!(tokio::time::Instant::now(), start);
+            assert_eq!(
+                notes(&runtime, "messages")
+                    .await
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["properties"]["external_id"] == "tg:555:60")
+                    .count(),
+                1
+            );
+            let state = health(&registry, OPERATIONAL).await;
+            assert_eq!(
+                state["channels"].as_array().unwrap().len(),
+                usize::from(!refuse)
+            );
+            cancel.cancel();
+            ready(task).await;
+        }
     }
 }

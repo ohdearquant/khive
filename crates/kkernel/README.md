@@ -9,22 +9,12 @@ persistent Unix-socket daemon); the rest of the subcommand tree covers everythin
 operator needs outside of agent dispatch — schema migrations, KG sync/validate/fetch,
 pack introspection, embedding-model lifecycle, and reindexing.
 
-## Install
-
-```bash
-cargo install kkernel
-```
-
-or build from source:
+## Install from source
 
 ```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
+cargo install --path crates/kkernel --locked
 ```
-
-The npm package `khive` installs a thin `khive` / `khive-mcp` shim that forwards to
-`kkernel mcp` for users who prefer `npm install -g khive` over Rust tooling; the two
-install paths produce the same binary underneath.
 
 ## Usage
 
@@ -110,7 +100,8 @@ unresolvable ref, or non-commit object leaves the original schema intact.
 This Git `commit` is independent of the optional SHA-256 archive `pin`. Update does
 not change that pin, `khive_version`, other schema values, NDJSON, cached archives,
 or a database. Current `kg fetch` still takes explicit `--url`/`--ref`/`--pin`
-arguments; it does not load schema remotes. `kg init` does not create schema.yaml.
+arguments; it does not load schema remotes. `kg init` creates `.khive/kg/schema.yaml`
+when absent and preserves an existing regular schema and its pins.
 
 Successful edits preserve YAML values but normalize formatting and discard comments.
 An unchanged commit returns `updated: false` without rewriting any bytes. Updates
@@ -128,7 +119,11 @@ Resolution precedence for the default namespace: `--actor` > `--namespace` (lega
 `[actor] id` in a `khive.toml` config file > `"local"`. Config file search order when
 `--config` is not given: `./khive.toml`, `./.khive/config.toml`, `~/.khive/config.toml`.
 `~/.khive/.env` is loaded into the process environment at startup if present (real env vars
-take precedence).
+take precedence). It is skipped when `KHIVE_ACTOR`, `KHIVE_NAMESPACE`, or any `--actor` or `--namespace`
+argument (including one after `--`, such as the daemon arguments of `kkernel supervisor launch`)
+names an agent actor (`agent:` prefix, any case, leading whitespace
+ignored), or when `KHIVE_LOAD_DOTENV` is `0`, `false`, `no`, `off` or an unrecognized value; when
+the file exists, startup prints one line saying why.
 
 | Environment variable              | Effect                                                        |
 | --------------------------------- | ------------------------------------------------------------- |

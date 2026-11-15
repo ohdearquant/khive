@@ -8,6 +8,8 @@ fn brain_profile_params_has_required_profile_id() {
             .any(|p| p.name == "profile_id" && p.required),
         "brain.profile must have required profile_id param"
     );
+    let profile_id = h.params.iter().find(|p| p.name == "profile_id").unwrap();
+    assert!(profile_id.description.contains("unique within a namespace"));
 }
 
 #[test]
@@ -38,6 +40,41 @@ fn brain_resolve_params_has_consumer_kind_required() {
         h.params.iter().any(|p| p.name == "namespace"),
         "brain.resolve must document optional namespace"
     );
+    for (verb, description) in [
+        (
+            "brain.bind",
+            "The profile catalog to write and the binding namespace to match. If omitted, stores a \"*\" binding in the caller's default catalog, matching every namespace context within that catalog.",
+        ),
+        (
+            "brain.bindings",
+            "The profile catalog to read and the binding namespace filter. If omitted, reads the caller's default catalog without filtering binding namespaces; other filters still apply.",
+        ),
+        (
+            "brain.resolve",
+            "The profile catalog to read and the binding namespace context. If omitted, uses the caller's default catalog and matches only bindings with namespace \"*\"; profile fallback still applies when none match.",
+        ),
+    ] {
+        let handler = find_handler(verb);
+        let namespace = handler
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .unwrap();
+        assert_eq!(
+            namespace.description,
+            description,
+            "{verb} namespace help must describe the catalog and binding match behavior"
+        );
+    }
+    let unbind = find_handler("brain.unbind");
+    let namespace = unbind
+        .params
+        .iter()
+        .find(|p| p.name == "namespace")
+        .unwrap();
+    assert!(namespace.description.contains("every namespace"));
+    assert!(namespace.description.contains("default catalog"));
+    assert!(unbind.description.contains("removed_by_namespace"));
 }
 
 #[test]
@@ -110,4 +147,23 @@ fn brain_reset_params_has_optional_profile_id() {
             .any(|p| p.name == "profile_id" && !p.required),
         "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
     );
+}
+
+#[test]
+fn profile_lifecycle_help_explains_binding_resolution() {
+    for verb in ["brain.profile", "brain.activate", "brain.deactivate"] {
+        let description = find_handler(verb).description;
+        assert!(
+            description.contains("lifecycle governs only the unbound fallback"),
+            "{verb}: {description}"
+        );
+        assert!(
+            description.contains("bound, non-archived profile"),
+            "{verb}: {description}"
+        );
+    }
+    let profile = find_handler("brain.profile").description;
+    assert!(profile.contains("resolving_bindings"));
+    assert!(profile.contains("serving_through_visible_binding_while_inactive"));
+    assert!(profile.contains("false makes no claim about hidden bindings"));
 }

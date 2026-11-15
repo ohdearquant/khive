@@ -9,11 +9,9 @@ use khive_runtime::{
     OutputFormat, RuntimeConfig, StorageBackend,
 };
 
-use crate::args::{resolve_cli_namespace, Args};
+use crate::args::{resolve_cli_namespace, Args, CatalogVerbosity};
 use crate::server::KhiveMcpServer;
 
-#[cfg(doc)]
-use super::build_registry_for_multi_backend;
 #[cfg(unix)]
 use super::validate_effective_backend_alias_modes;
 use super::{
@@ -45,12 +43,14 @@ pub(crate) fn should_warn_unattributed(actor_id: Option<&str>, loaded_packs: &[S
     khive_runtime::should_warn_unattributed_actor(actor_id, loaded_packs)
 }
 
-/// Return true when strict actor-attribution mode is active.
+/// Return true when the `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag
+/// requests strict actor-attribution mode.
 ///
-/// Set `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` to opt in. When active, starting the
-/// server with the `comm` pack loaded and no actor identity configured is a fatal
-/// error instead of a warning. Default is OFF to preserve OSS single-actor
-/// behaviour.
+/// When strict mode is active, starting the server with the `comm` pack loaded
+/// and no actor identity configured is a fatal error instead of a warning.
+/// Strict mode is also requested by `[actor] require_attributed = true`
+/// (carried as [`RuntimeConfig::require_attributed_actor`]); either source
+/// turns it on. Default is OFF to preserve OSS single-actor behaviour.
 ///
 /// This closes the #199/#200 misconfiguration window for cloud deployments where
 /// an operator who misses the startup warning would silently expose a party-line
@@ -63,7 +63,8 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 
 /// Enforce the strict-actor mode contract at server construction time.
 ///
-/// When `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`:
+/// When `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` or `config_requires` (the resolved
+/// `[actor] require_attributed`) is true:
 ///   - If `actor_id` is `None`/`"local"` AND `"comm"` is in the pack list →
 ///     return `Err` with a clear message. The server must NOT be constructed.
 ///
@@ -81,6 +82,11 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
 ///   scheduled events
 ///
+/// A daemon serves each request frame under the frame's actor rather than its
+/// own, so its dispatch adapter (`crate::daemon::dispatch`) applies the same
+/// policy to every frame's actor through
+/// `KhiveMcpServer::strict_mode_refuses_actor`.
+///
 /// **Pure-introspection registry construction is intentionally EXEMPT**
 /// (`build_registry` in `crates/kkernel/src/pack_introspect.rs`,
 /// `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`) because it never
@@ -89,13 +95,22 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],
+    config_requires: bool,
 ) -> anyhow::Result<()> {
-    if is_strict_actor_mode() && should_warn_unattributed(actor_id, loaded_packs) {
+    let env_requires = is_strict_actor_mode();
+    if (env_requires || config_requires) && should_warn_unattributed(actor_id, loaded_packs) {
+        let source = match (env_requires, config_requires) {
+            (true, true) => {
+                "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 and [actor] require_attributed = true are set"
+            }
+            (true, false) => "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set",
+            _ => "[actor] require_attributed = true is set",
+        };
         anyhow::bail!(
-            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-             configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
-             starting in strict mode (comm pack requires an attributed actor to \
-             prevent party-line inbox exposure)."
+            "{source} but no actor identity is configured. Set KHIVE_ACTOR, \
+             --actor or [actor] id to this lambda's id before starting in strict \
+             mode (comm pack requires an attributed actor to prevent party-line \
+             inbox exposure)."
         );
     }
     Ok(())
@@ -237,6 +252,7 @@ pub(super) struct PreparedServerBoot {
     pub(super) config: RuntimeConfig,
     pub(super) db_anchor: Option<PathBuf>,
     pub(super) khive_cfg: KhiveConfig,
+    pub(super) config_source: Option<PathBuf>,
 }
 
 /// Resolve storage topology without opening a database. The daemon takes its
@@ -314,6 +330,7 @@ pub(super) fn prepare_server_boot(
         config,
         db_anchor,
         khive_cfg,
+        config_source: config_source.map(|path| path.to_path_buf()),
     })
 }
 
@@ -327,7 +344,20 @@ pub(super) async fn build_server_from_prepared(
         config,
         db_anchor,
         khive_cfg,
+        config_source,
     } = prepared;
+
+    #[cfg(unix)]
+    let (spawn_config, spawn_db) = crate::daemon::select_daemon_spawn_overrides(
+        args.config.as_deref().map(std::path::Path::new),
+        args.db.as_deref(),
+        config_source.as_deref(),
+        !khive_cfg.backends.is_empty(),
+    );
+    #[cfg(not(unix))]
+    let _ = config_source;
+    #[cfg(not(unix))]
+    let (spawn_config, spawn_db): (Option<PathBuf>, Option<String>) = (None, None);
 
     let max_readers = if mcp_host {
         mcp_max_readers(args, &config, &khive_cfg.backends, None)
@@ -365,6 +395,7 @@ pub(super) async fn build_server_from_prepared(
         enforce_strict_actor_mode(
             runtime.config().actor_id.as_deref(),
             &runtime.config().packs,
+            runtime.config().require_attributed_actor,
         )?;
         if should_warn_unattributed(
             runtime.config().actor_id.as_deref(),
@@ -388,7 +419,11 @@ pub(super) async fn build_server_from_prepared(
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         let server = KhiveMcpServer::new_with_mounts_and_config(runtime, Some(&khive_cfg))
             .await
-            .map(|s| s.with_default_output_format(fmt))
+            .map(|s| {
+                s.with_default_output_format(fmt)
+                    .with_catalog_verbosity(args.catalog_verbosity)
+                    .with_daemon_spawn_overrides(spawn_config, spawn_db)
+            })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok((server, schedule_rt));
     }
@@ -409,7 +444,13 @@ pub(super) async fn build_server_from_prepared(
             .get("schedule")
             .map(|rt| (**rt).clone()),
     );
-    let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+    let server = build_server_from_multi_backend_registry_with_catalog_verbosity(
+        multi,
+        &khive_cfg,
+        None,
+        args.catalog_verbosity,
+    )
+    .with_daemon_spawn_overrides(spawn_config, spawn_db);
     Ok((server, schedule_rt))
 }
 
@@ -432,6 +473,148 @@ pub(super) fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Opti
     canonical_path_no_side_effects(&path)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("backend {}: cannot resolve path: {e}", cfg.name))
+}
+
+/// A maintenance-only topology that cannot have one persistent main record.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceTopologyRefusal {
+    /// A memory main has persistent stores that must not be silently omitted.
+    MemoryMainWithPersistentStores {
+        /// Every canonical persistent member discovered in the topology.
+        paths: Vec<PathBuf>,
+    },
+    /// Distinct canonical paths currently name one existing physical store.
+    HardLinkedStores {
+        /// First canonical member in raw pathname-byte order.
+        first: PathBuf,
+        /// Later canonical member with the same observed physical identity.
+        second: PathBuf,
+    },
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for MaintenanceTopologyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryMainWithPersistentStores { paths } => write!(
+                f,
+                "maintenance requires a persistent main database; memory main has persistent stores: {paths:?}"
+            ),
+            Self::HardLinkedStores { first, second } => write!(
+                f,
+                "maintenance store paths {first:?} and {second:?} name the same physical database; configure one canonical spelling per physical store"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for MaintenanceTopologyRefusal {}
+
+/// Resolve the complete physical store set without opening stores or creating paths.
+///
+/// Inputs must already be resolved, including the captured force-memory choice.
+/// Declared backends own storage instead of a HOME-derived discovery anchor.
+/// This prepares metadata only: it publishes no declaration and grants no lease.
+/// Existing members with distinct canonical spellings but equal physical file
+/// identities are refused. Missing files remain members by spelling; discovery
+/// creates nothing. These metadata observations neither lock pathnames nor close
+/// replacement races between the observations or after this function returns.
+#[cfg(unix)]
+pub fn maintenance_store_set(
+    resolved: &RuntimeConfig,
+    config: &KhiveConfig,
+    force_memory: bool,
+) -> anyhow::Result<Option<khive_db::maintenance::StoreSet>> {
+    use super::storage_topology::{
+        effective_backend_configs, reanchor_declared_events_split, select_declared_main_db_path,
+    };
+    use std::os::unix::ffi::OsStrExt;
+
+    if force_memory {
+        return Ok(None);
+    }
+    let backends = effective_backend_configs(&config.backends, force_memory);
+    let mut normalized = resolved.clone();
+    let mut paths = Vec::new();
+    if backends.is_empty() {
+        if let Some(path) = &normalized.db_path {
+            paths.push(canonical_path_no_side_effects(path)?);
+        }
+    } else {
+        anyhow::ensure!(
+            backends
+                .iter()
+                .any(|backend| backend.name == BackendId::MAIN),
+            "maintenance topology requires a declared main backend"
+        );
+        select_declared_main_db_path(&mut normalized, &backends);
+        for backend in &backends {
+            if backend.kind == BackendKind::Sqlite {
+                let path = backend.path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("sqlite backend {} requires a path field", backend.name)
+                })?;
+                paths.push(canonical_path_no_side_effects(path)?);
+            }
+        }
+        reanchor_declared_events_split(&mut normalized, &backends);
+    }
+    if let Some(split) = &normalized.events_split {
+        paths.push(canonical_path_no_side_effects(&split.db_path)?);
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(main) = &normalized.db_path else {
+        paths.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+        paths.dedup();
+        return Err(MaintenanceTopologyRefusal::MemoryMainWithPersistentStores { paths }.into());
+    };
+    let main = canonical_path_no_side_effects(main)?;
+    let stores = khive_db::maintenance::StoreSet::from_canonical(main, paths)?;
+    validate_maintenance_store_identities_with(
+        &stores,
+        khive_db::file_identity::database_file_identity,
+    )?;
+    Ok(Some(stores))
+}
+
+/// Check already sorted, deduplicated members without changing their spellings.
+/// The probe is injectable for deterministic absence and I/O-error coverage.
+#[cfg(unix)]
+pub(super) fn validate_maintenance_store_identities_with<F>(
+    stores: &khive_db::maintenance::StoreSet,
+    mut identity_for: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&std::path::Path) -> std::io::Result<khive_db::file_identity::DatabaseFileIdentity>,
+{
+    use std::collections::HashMap;
+
+    use khive_db::file_identity::DatabaseFileIdentity;
+
+    let mut paths_by_identity: HashMap<DatabaseFileIdentity, PathBuf> = HashMap::new();
+    for path in stores.paths() {
+        let identity = match identity_for(path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "cannot inspect maintenance database identity at {}",
+                    path.display()
+                )));
+            }
+        };
+        if let Some(first) = paths_by_identity.insert(identity, path.clone()) {
+            return Err(MaintenanceTopologyRefusal::HardLinkedStores {
+                first,
+                second: path.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the daemon's physical SQLite targets before runtime construction.
@@ -665,26 +848,43 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
 /// V21 `Complete`. This ordering prevents a main-database GC sweep from becoming
 /// eligible while a secondary still carries legacy blob liveness.
 ///
-/// Called only when `[[backends]]` is non-empty in `khive.toml`. Delegates
-/// registry assembly to [`build_registry_for_multi_backend`] and finishing
-/// (pool + output format) to [`build_server_from_multi_backend_registry`] —
-/// this function's entire body used to duplicate both (#603); it is now a
-/// thin pass-through so a future wiring addition lands in exactly one place.
-///
-/// `pub` so `kkernel`'s coordinator-attached boot path can be compared
-/// against it directly in the #603 parity regression test — both call sites
-/// must produce servers with an identical wiring surface for the same config.
+/// Uses the full advertised verb catalog. See
+/// [`build_server_multi_backend_with_catalog_verbosity`] to select its detail.
 pub async fn build_server_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    build_server_multi_backend_with_catalog_verbosity(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        CatalogVerbosity::Full,
+    )
+    .await
+}
+
+/// Build a multi-backend server with the selected advertised catalog detail.
+///
+/// Registry assembly retains the inventory and V21-completion guarantees of
+/// [`build_server_multi_backend`]; final wiring uses the shared constructor.
+pub async fn build_server_multi_backend_with_catalog_verbosity(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    catalog_verbosity: CatalogVerbosity,
+) -> anyhow::Result<KhiveMcpServer> {
     khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
     let multi =
         build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override).await?;
-    Ok(build_server_from_multi_backend_registry(
-        multi, khive_cfg, None,
-    ))
+    Ok(
+        build_server_from_multi_backend_registry_with_catalog_verbosity(
+            multi,
+            khive_cfg,
+            None,
+            catalog_verbosity,
+        ),
+    )
 }
 
 /// Build a coordinated multi-backend server while checking a canonical
@@ -698,6 +898,27 @@ pub async fn build_server_multi_backend_with_db_anchor(
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    build_server_multi_backend_with_db_anchor_and_catalog_verbosity(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+        CatalogVerbosity::Full,
+    )
+    .await
+}
+
+/// Build a multi-backend server with a captured database anchor and catalog detail.
+///
+/// This retains the anchor, inventory and V21-completion guarantees of
+/// [`build_server_multi_backend_with_db_anchor`].
+pub async fn build_server_multi_backend_with_db_anchor_and_catalog_verbosity(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+    catalog_verbosity: CatalogVerbosity,
+) -> anyhow::Result<KhiveMcpServer> {
     // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
     // (the shared choke point every multi-backend boot path funnels through),
     // so it is not duplicated here.
@@ -708,28 +929,45 @@ pub async fn build_server_multi_backend_with_db_anchor(
         db_anchor,
     )
     .await?;
-    Ok(build_server_from_multi_backend_registry(
-        multi, khive_cfg, None,
-    ))
+    Ok(
+        build_server_from_multi_backend_registry_with_catalog_verbosity(
+            multi,
+            khive_cfg,
+            None,
+            catalog_verbosity,
+        ),
+    )
 }
 
 /// Finish constructing a `KhiveMcpServer` from an already-built
 /// [`MultiBackendRegistry`] (#603).
 ///
-/// This is the ONE place that applies every wiring step a multi-backend boot
-/// needs on top of the registry: the ADR-078 output-format default, the
-/// ADR-091 Planks 0+2 checkpoint pool, and — only for callers that pass one —
-/// the cross-backend coordinator (ADR-029 Phase 2). [`build_server_multi_backend`]
-/// (this file, `coordinator: None`) and `kkernel`'s `Command::Mcp` multi-backend
-/// branch (`crates/kkernel/src/main.rs`, `coordinator: Some(..)`) both call this
-/// instead of hand-assembling the server, so a future wiring addition (the
-/// fourth `pool`-style patch) is a change to this one function, not to two
-/// call sites — #503, ADR-078's inline output-format patch, and #601 each
-/// missed wiring by landing only in the hand-copied kkernel branch.
+/// Uses the full advertised verb catalog. See
+/// [`build_server_from_multi_backend_registry_with_catalog_verbosity`] to select
+/// its detail while retaining the same shared wiring.
 pub fn build_server_from_multi_backend_registry(
     multi: MultiBackendRegistry,
     khive_cfg: &KhiveConfig,
     coordinator: Option<Arc<dyn crate::coordinator::CoordinatorService>>,
+) -> KhiveMcpServer {
+    build_server_from_multi_backend_registry_with_catalog_verbosity(
+        multi,
+        khive_cfg,
+        coordinator,
+        CatalogVerbosity::Full,
+    )
+}
+
+/// Apply shared multi-backend wiring, including the advertised catalog detail.
+///
+/// The public builders and `kkernel`'s coordinator path in `cli.rs` share the
+/// ADR-078 output format, ADR-091 checkpoint pools, channel runtimes, and optional
+/// ADR-029 coordinator through this constructor.
+pub fn build_server_from_multi_backend_registry_with_catalog_verbosity(
+    multi: MultiBackendRegistry,
+    khive_cfg: &KhiveConfig,
+    coordinator: Option<Arc<dyn crate::coordinator::CoordinatorService>>,
+    catalog_verbosity: CatalogVerbosity,
 ) -> KhiveMcpServer {
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
@@ -763,13 +1001,14 @@ pub fn build_server_from_multi_backend_registry(
         &multi.config_id,
     )
     .with_default_output_format(fmt)
+    .with_catalog_verbosity(catalog_verbosity)
     .with_secondary_pools(secondary_pools)
     .with_runtime(default_runtime);
 
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    let server = server
-        .with_channel_outbox_runtime(channel_outbox_runtime)
-        .with_channel_loop_admission(channel_loop_admission);
+    let server = server.with_channel_outbox_runtime(channel_outbox_runtime);
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let server = server.with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -826,7 +1065,7 @@ pub(super) fn secondary_file_backed_pools(
 
 /// Construction-time facts that every multi-backend boot path must agree on
 /// for identical input config (#603) — the parity contract the shared
-/// [`build_server_from_multi_backend_registry`] constructor exists to
+/// [`build_server_from_multi_backend_registry_with_catalog_verbosity`] constructor exists to
 /// guarantee. Extend this struct (not the call sites) when a future wiring
 /// addition needs its own parity coverage.
 #[derive(Debug, PartialEq, Eq)]
@@ -864,7 +1103,7 @@ impl WiringSurface {
 /// in-memory backends must never drive `checkpoint_once` on a non-WAL
 /// connection.
 ///
-/// Called from exactly one place now: [`build_server_from_multi_backend_registry`]
+/// Called from [`build_server_from_multi_backend_registry_with_catalog_verbosity`]
 /// (#603) — both multi-backend boot paths (`build_server_multi_backend` in this
 /// file and `kkernel`'s `Command::Mcp` coordinator branch) go through that shared
 /// constructor, so this derivation is no longer hand-copied at each call site
@@ -928,5 +1167,362 @@ pub(super) fn resolve_blob_hydrator_for_boot(
         Err(error) => Err(anyhow::anyhow!(
             "[storage.blob] configuration error: {error}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::coordinator::tests::MockCoordinator;
+    use khive_runtime::{AllowAllGate, Namespace, PackConfig};
+    use rmcp::{
+        model::{CallToolRequestParams, ClientInfo},
+        ClientHandler, ServiceExt,
+    };
+    use serde_json::{json, Value};
+    use std::collections::{BTreeSet, HashMap};
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    const HEADING: &str = "\n\nVerbs registered on this server:\n";
+    const COMPACT_HEADER: &str = "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        Plain,
+        Anchored,
+        Coordinated,
+    }
+
+    struct Client;
+
+    impl ClientHandler for Client {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default()
+        }
+    }
+
+    struct Observation {
+        identity: String,
+        surface: WiringSurface,
+        secondary_pools: usize,
+        listed: Value,
+        verbs: Value,
+    }
+
+    async fn observe(server: KhiveMcpServer) -> Result<Observation, String> {
+        let identity = server.config_id().to_owned();
+        let surface = WiringSurface::capture(&server);
+        let secondary_pools = server.secondary_pools().len();
+        let audit = server.clone();
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let mut serving = tokio::spawn(async move {
+            let service = server
+                .serve(server_io)
+                .await
+                .map_err(|error| error.to_string())?;
+            service.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        let observed = async {
+            let client = tokio::time::timeout(WAIT, Client.serve(client_io))
+                .await
+                .map_err(|_| "client handshake deadline".to_owned())?
+                .map_err(|error| error.to_string())?;
+            let replies = async {
+                let listed = tokio::time::timeout(WAIT, client.list_tools(None))
+                    .await
+                    .map_err(|_| "tools/list deadline".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                let params = CallToolRequestParams::new("request").with_arguments(
+                    json!({"ops":"verbs()", "presentation":"verbose", "format":"json"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+                let verbs = tokio::time::timeout(WAIT, client.call_tool(params))
+                    .await
+                    .map_err(|_| "verbs request deadline".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((
+                    serde_json::to_value(listed).map_err(|error| error.to_string())?,
+                    serde_json::to_value(verbs).map_err(|error| error.to_string())?,
+                ))
+            }
+            .await;
+            tokio::time::timeout(WAIT, client.cancel())
+                .await
+                .map_err(|_| "client shutdown deadline".to_owned())?
+                .map_err(|error| error.to_string())?;
+            replies
+        }
+        .await;
+        let settled = match tokio::time::timeout(WAIT, &mut serving).await {
+            Ok(result) => result
+                .map_err(|error| error.to_string())
+                .and_then(|result| result),
+            Err(_) => {
+                serving.abort();
+                let _ = serving.await;
+                Err("server shutdown deadline".to_owned())
+            }
+        };
+        let drained = tokio::time::timeout(WAIT, audit.shutdown_audit_batch())
+            .await
+            .map_err(|_| "audit shutdown deadline".to_owned())?
+            .map_err(|error| format!("audit shutdown: {error:?}"));
+        settled?;
+        drained?;
+        let (listed, verbs) = observed?;
+        Ok(Observation {
+            identity,
+            surface,
+            secondary_pools,
+            listed,
+            verbs,
+        })
+    }
+
+    async fn build(
+        route: Route,
+        verbosity: Option<CatalogVerbosity>,
+        config: RuntimeConfig,
+        khive_cfg: &KhiveConfig,
+    ) -> anyhow::Result<KhiveMcpServer> {
+        let anchor = config.db_path.clone();
+        match (route, verbosity) {
+            (Route::Plain, None) => {
+                crate::serve::build_server_multi_backend(config, khive_cfg, None).await
+            }
+            (Route::Plain, Some(mode)) => {
+                crate::serve::build_server_multi_backend_with_catalog_verbosity(
+                    config, khive_cfg, None, mode,
+                )
+                .await
+            }
+            (Route::Anchored, None) => {
+                crate::serve::build_server_multi_backend_with_db_anchor(
+                    config,
+                    khive_cfg,
+                    None,
+                    anchor.as_deref(),
+                )
+                .await
+            }
+            (Route::Anchored, Some(mode)) => {
+                crate::serve::build_server_multi_backend_with_db_anchor_and_catalog_verbosity(
+                    config,
+                    khive_cfg,
+                    None,
+                    anchor.as_deref(),
+                    mode,
+                )
+                .await
+            }
+            (Route::Coordinated, mode) => {
+                let multi =
+                    crate::serve::build_registry_for_multi_backend(config, khive_cfg, None).await?;
+                let coordinator: Arc<dyn crate::coordinator::CoordinatorService> =
+                    MockCoordinator::multi_backend();
+                Ok(match mode {
+                    None => crate::serve::build_server_from_multi_backend_registry(
+                        multi,
+                        khive_cfg,
+                        Some(coordinator),
+                    ),
+                    Some(mode) => {
+                        crate::serve::build_server_from_multi_backend_registry_with_catalog_verbosity(
+                            multi,
+                            khive_cfg,
+                            Some(coordinator),
+                            mode,
+                        )
+                    }
+                })
+            }
+        }
+    }
+
+    fn descriptor(listed: &Value) -> &Value {
+        let tools = listed["tools"].as_array().expect("tools/list array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "request");
+        &tools[0]
+    }
+
+    fn verbs_result(reply: &Value) -> Value {
+        let text = reply["content"][0]["text"].as_str().expect("request text");
+        let body: Value = serde_json::from_str(text).expect("request envelope");
+        assert_eq!(body["results"][0]["ok"], true, "{body}");
+        body["results"][0]["result"].clone()
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn multi_backend_catalog_builders_preserve_verbosity_and_wiring() {
+        let home = tempfile::tempdir().unwrap();
+        if khive_storage::test_support::run_exact_test_in_child(
+            "KHIVE_MULTI_BACKEND_CATALOG_TEST_CHILD",
+            false,
+            |command| {
+                command
+                    .env_clear()
+                    .env("HOME", home.path())
+                    .env("XDG_CONFIG_HOME", home.path().join("config"))
+                    .env("TMPDIR", home.path())
+                    .env("KHIVE_TEST_HARNESS", "1")
+                    .env("KHIVE_NO_DAEMON", "1")
+                    .current_dir(home.path());
+            },
+        ) {
+            return;
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for file_backed in [false, true] {
+                    let fixture = tempfile::tempdir().unwrap();
+                    let backends = ["main", "tasks"]
+                        .into_iter()
+                        .map(|name| BackendConfig {
+                            name: name.into(),
+                            kind: if file_backed {
+                                BackendKind::Sqlite
+                            } else {
+                                BackendKind::Memory
+                            },
+                            path: file_backed.then(|| fixture.path().join(format!("{name}.db"))),
+                            cache_mb: None,
+                            journal_mode: None,
+                            wal_ceiling_bytes: None,
+                            disk_reserve_bytes: None,
+                            disk_guard_deadline_ms: None,
+                            served_kinds: None,
+                            read_only: false,
+                        })
+                        .collect();
+                    let mut khive_cfg = KhiveConfig {
+                        backends,
+                        packs: HashMap::from([
+                            (
+                                "kg".into(),
+                                PackConfig {
+                                    backend: "main".into(),
+                                    verbs_disabled: Vec::new(),
+                                    no_embed: true,
+                                },
+                            ),
+                            (
+                                "gtd".into(),
+                                PackConfig {
+                                    backend: "tasks".into(),
+                                    verbs_disabled: Vec::new(),
+                                    no_embed: true,
+                                },
+                            ),
+                        ]),
+                        ..KhiveConfig::default()
+                    };
+                    khive_cfg.runtime.default_output_format = Some(OutputFormat::Table);
+                    let config = RuntimeConfig {
+                        db_path: khive_runtime::resolve_db_anchor(None),
+                        gate: Arc::new(AllowAllGate),
+                        default_namespace: Namespace::parse("local").unwrap(),
+                        actor_id: Some("catalog-builder-test".into()),
+                        embedding_model: None,
+                        additional_embedding_models: vec![],
+                        packs: vec!["kg".into(), "gtd".into()],
+                        backend_id: BackendId::main(),
+                        ..RuntimeConfig::default()
+                    };
+                    let mut observations = Vec::new();
+                    for route in [Route::Plain, Route::Anchored, Route::Coordinated] {
+                        for mode in [
+                            None,
+                            Some(CatalogVerbosity::Full),
+                            Some(CatalogVerbosity::Compact),
+                        ] {
+                            let server = build(route, mode, config.clone(), &khive_cfg)
+                                .await
+                                .expect("public multi-backend builder");
+                            observations.push((
+                                route,
+                                mode,
+                                observe(server).await.expect("settled RMCP catalog"),
+                            ));
+                        }
+                    }
+                    let baseline = &observations[0].2;
+                    let full = descriptor(&baseline.listed);
+                    let full_description = full["description"].as_str().unwrap();
+                    let (full_prefix, full_catalog) = full_description.split_once(HEADING).unwrap();
+                    assert!(!full_catalog.contains(COMPACT_HEADER));
+                    let verbs = verbs_result(&baseline.verbs);
+                    let mut expected = verbs["verbs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|verb| verb["verb"].as_str().unwrap())
+                        .collect::<Vec<_>>();
+                    expected.sort_unstable();
+                    assert!(!expected.is_empty());
+                    assert_eq!(
+                        verbs["pack_counts"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(["gtd", "kg"])
+                    );
+                    for (route, mode, observed) in &observations {
+                        assert_eq!(observed.identity, baseline.identity, "{route:?} {mode:?}");
+                        assert_eq!(observed.surface, baseline.surface, "{route:?} {mode:?}");
+                        assert_eq!(observed.surface.has_checkpoint_pool, file_backed);
+                        assert_eq!(observed.surface.output_format, OutputFormat::Table);
+                        assert_eq!(observed.secondary_pools, usize::from(file_backed));
+                        assert_eq!(verbs_result(&observed.verbs), verbs);
+                        let tool = descriptor(&observed.listed);
+                        if *mode != Some(CatalogVerbosity::Compact) {
+                            assert_eq!(
+                                tool, full,
+                                "{route:?}: legacy and explicit Full must match"
+                            );
+                            continue;
+                        }
+                        let (prefix, catalog) = tool["description"]
+                            .as_str()
+                            .unwrap()
+                            .split_once(HEADING)
+                            .unwrap();
+                        let (header, entries) = catalog.split_once('\n').unwrap();
+                        assert_eq!(
+                            header, COMPACT_HEADER,
+                            "{route:?}: Compact must reach the shared finalizer"
+                        );
+                        assert_eq!(prefix, full_prefix);
+                        assert_ne!(catalog, full_catalog);
+                        assert_eq!(tool, descriptor(&observations[2].2.listed));
+                        let mut schema = tool.clone();
+                        schema.as_object_mut().unwrap().remove("description");
+                        let mut full_schema = full.clone();
+                        full_schema.as_object_mut().unwrap().remove("description");
+                        assert_eq!(schema, full_schema);
+                        let actual = entries
+                            .lines()
+                            .map(|line| {
+                                let (name, contribution) =
+                                    line.split_once(": ").expect("compact catalog row");
+                                assert!(contribution.ends_with(&format!(" — {name}(help=true)")));
+                                name
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual, expected);
+                    }
+                }
+            });
     }
 }

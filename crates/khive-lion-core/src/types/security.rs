@@ -9,10 +9,11 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Security classification levels forming a lattice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[must_use = "security levels must be checked or applied"]
 pub enum SecurityLevel {
     /// Publicly accessible data
+    #[default]
     Public,
     /// Internal use only (within organization)
     Internal,
@@ -188,11 +189,5 @@ impl Ord for SecurityLevel {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.to_u8().cmp(&other.to_u8())
-    }
-}
-
-impl Default for SecurityLevel {
-    fn default() -> Self {
-        SecurityLevel::Public
     }
 }

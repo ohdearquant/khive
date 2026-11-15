@@ -24,6 +24,32 @@ fn event_kind_parse_roundtrip() {
     }
 }
 
+#[test]
+fn grant_change_kind_has_canonical_name_and_caller_sink() {
+    let kind = EventKind::GrantChange;
+    assert!(EventKind::ALL.contains(&kind));
+    assert_eq!(kind.name(), "grant_change");
+    assert_eq!("grant_change".parse::<EventKind>().unwrap(), kind);
+    assert_eq!(kind.sink(), EventSink::CallerEventStore);
+    assert!("unknown"
+        .parse::<EventKind>()
+        .unwrap_err()
+        .valid
+        .contains(&"grant_change"));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn grant_change_kind_has_canonical_display_and_serde_roundtrip() {
+    let kind = EventKind::GrantChange;
+    assert_eq!(kind.to_string(), "grant_change");
+    assert_eq!(serde_json::to_string(&kind).unwrap(), "\"grant_change\"");
+    assert_eq!(
+        serde_json::from_str::<EventKind>("\"grant_change\"").unwrap(),
+        kind
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn feedback_unjudged_kind_has_canonical_string_and_serde_roundtrip() {

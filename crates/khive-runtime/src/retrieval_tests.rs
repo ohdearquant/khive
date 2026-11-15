@@ -2001,3 +2001,276 @@ async fn backfill_failed_pages_retry_singly_without_duplicate_index_rows() {
         0
     );
 }
+
+// ---- Note-search route attribution (#6075) ----
+
+struct RouteTestAnnProvider {
+    owner: KhiveRuntime,
+    eligible: bool,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::note_search_ann::NoteSearchAnnProvider for RouteTestAnnProvider {
+    fn backend_id(&self) -> &str {
+        self.owner.backend_id().as_str()
+    }
+
+    fn serves_backend(&self, runtime: &KhiveRuntime) -> bool {
+        self.owner.shares_backend_storage_with(runtime)
+    }
+
+    async fn search(
+        &self,
+        _token: &NamespaceToken,
+        _model: &str,
+        _query_embedding: &[f32],
+        _top_k: u32,
+    ) -> RuntimeResult<Option<Vec<VectorSearchHit>>> {
+        if self.fail {
+            return Err(RuntimeError::Internal("injected ANN provider error".into()));
+        }
+        Ok(self.eligible.then(Vec::new))
+    }
+}
+
+fn install_route_test_provider(runtime: &KhiveRuntime, eligible: bool, fail: bool) {
+    runtime.install_note_search_ann_provider(Arc::new(RouteTestAnnProvider {
+        owner: runtime.detached_for_note_search_ann_provider(),
+        eligible,
+        fail,
+    }));
+}
+
+async fn run_note_search_vector_route(
+    runtime: &KhiveRuntime,
+) -> RuntimeResult<Vec<VectorSearchHit>> {
+    runtime
+        .note_search_vector_search(
+            &NamespaceToken::local(),
+            Some(vec![1.0; EmbeddingModel::AllMiniLmL6V2.dimensions()]),
+            "route test",
+            1,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn note_search_routes_and_diagnostics_are_scoped_to_the_opened_backend() {
+    use khive_db::pool::NoteSearchRouteSnapshot;
+
+    let with_provider = runtime_with_constant_embeddings();
+    let without_provider = runtime_with_constant_embeddings();
+    assert_eq!(
+        with_provider.backend_id().as_str(),
+        without_provider.backend_id().as_str()
+    );
+    install_route_test_provider(&with_provider, true, false);
+    let process_before = crate::note_search_ann::route_totals();
+    for _ in 0..2 {
+        assert!(run_note_search_vector_route(&with_provider)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert!(run_note_search_vector_route(&without_provider)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let ann_expected = NoteSearchRouteSnapshot {
+        ann_route_total: 2,
+        ..Default::default()
+    };
+    let fallback_expected = NoteSearchRouteSnapshot {
+        fallback_route_total: 1,
+        fallback_no_provider_total: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        with_provider.backend().pool().note_search_route_snapshot(),
+        ann_expected
+    );
+    assert_eq!(
+        without_provider
+            .backend()
+            .pool()
+            .note_search_route_snapshot(),
+        fallback_expected
+    );
+
+    let opened = crate::runtime::OpenedDiagnosticBackend {
+        backend_names: vec!["without_provider".into()],
+        canonical_path: None,
+        pool: without_provider.backend().pool_arc(),
+    };
+    let fallback_report = with_provider
+        .db_diagnostics_for_opened_backend_with_audit_metrics(&opened, None, false)
+        .await
+        .unwrap();
+    assert_eq!(fallback_report.note_search_routes, fallback_expected);
+    assert_eq!(
+        with_provider
+            .db_diagnostics()
+            .await
+            .unwrap()
+            .note_search_routes,
+        ann_expected
+    );
+    assert_eq!(
+        without_provider
+            .db_diagnostics()
+            .await
+            .unwrap()
+            .note_search_routes,
+        fallback_expected
+    );
+    // Other tests may search concurrently, so process totals have a lower bound.
+    let process_after = crate::note_search_ann::route_totals();
+    assert!(process_after.0 >= process_before.0.saturating_add(2));
+    assert!(process_after.1 >= process_before.1.saturating_add(1));
+    assert!(fallback_report.note_search_ann_route_total >= process_before.0.saturating_add(2));
+    assert!(fallback_report.note_search_fallback_route_total >= process_before.1.saturating_add(1));
+    let value = serde_json::to_value(&fallback_report).unwrap();
+    assert_eq!(value["note_search_routes"]["fallback_no_provider_total"], 1);
+    assert_eq!(
+        without_provider
+            .backend()
+            .pool()
+            .note_search_route_snapshot(),
+        fallback_expected,
+        "diagnostics must not reset route counters"
+    );
+}
+
+#[tokio::test]
+async fn note_search_fallback_causes_are_distinct_and_provider_errors_do_not_fallback() {
+    use khive_db::pool::NoteSearchRouteSnapshot;
+
+    let no_model = KhiveRuntime::memory().unwrap();
+    // Supplied vectors reach fallback selection; exact search still requires a model.
+    assert!(matches!(
+        run_note_search_vector_route(&no_model).await,
+        Err(RuntimeError::Unconfigured(_))
+    ));
+    assert_eq!(
+        no_model.backend().pool().note_search_route_snapshot(),
+        NoteSearchRouteSnapshot {
+            fallback_route_total: 1,
+            fallback_no_model_total: 1,
+            ..Default::default()
+        }
+    );
+
+    let no_provider = runtime_with_constant_embeddings();
+    run_note_search_vector_route(&no_provider).await.unwrap();
+    assert_eq!(
+        no_provider.backend().pool().note_search_route_snapshot(),
+        NoteSearchRouteSnapshot {
+            fallback_route_total: 1,
+            fallback_no_provider_total: 1,
+            ..Default::default()
+        }
+    );
+
+    let no_graph = runtime_with_constant_embeddings();
+    install_route_test_provider(&no_graph, false, false);
+    run_note_search_vector_route(&no_graph).await.unwrap();
+    assert_eq!(
+        no_graph.backend().pool().note_search_route_snapshot(),
+        NoteSearchRouteSnapshot {
+            fallback_route_total: 1,
+            fallback_no_eligible_graph_total: 1,
+            ..Default::default()
+        }
+    );
+
+    let provider_error = runtime_with_constant_embeddings();
+    install_route_test_provider(&provider_error, false, true);
+    assert!(matches!(
+        run_note_search_vector_route(&provider_error).await,
+        Err(RuntimeError::Internal(_))
+    ));
+    assert_eq!(
+        provider_error.backend().pool().note_search_route_snapshot(),
+        NoteSearchRouteSnapshot::default()
+    );
+    let embedding_error = KhiveRuntime::memory().unwrap();
+    assert!(embedding_error
+        .note_search_vector_search(&NamespaceToken::local(), None, "no model", 1)
+        .await
+        .is_err());
+    assert_eq!(
+        embedding_error
+            .backend()
+            .pool()
+            .note_search_route_snapshot(),
+        NoteSearchRouteSnapshot::default(),
+        "embedding errors precede route selection"
+    );
+}
+
+#[tokio::test]
+async fn note_search_routes_follow_shared_pool_handles_and_end_with_the_pool() {
+    use khive_db::pool::NoteSearchRouteSnapshot;
+
+    let backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    backend.prepare_core_schema().unwrap();
+    let pool = backend.pool_arc();
+    let weak_pool = Arc::downgrade(&pool);
+    drop(pool);
+    let config = RuntimeConfig {
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        packs: vec!["kg".into()],
+        ..RuntimeConfig::no_embeddings()
+    };
+    let first = KhiveRuntime::from_backend(Arc::clone(&backend), config.clone());
+    let separately_assembled = KhiveRuntime::from_backend(Arc::clone(&backend), config);
+    let no_model = KhiveRuntime::from_backend(Arc::clone(&backend), RuntimeConfig::no_embeddings());
+    install_route_test_provider(&first, true, false);
+    let cloned = first.clone();
+    let detached = first.detached_for_note_search_ann_provider();
+    run_note_search_vector_route(&cloned).await.unwrap();
+    run_note_search_vector_route(&separately_assembled)
+        .await
+        .unwrap();
+    run_note_search_vector_route(&detached).await.unwrap();
+    assert!(matches!(
+        run_note_search_vector_route(&no_model).await,
+        Err(RuntimeError::Unconfigured(_))
+    ));
+    let expected = NoteSearchRouteSnapshot {
+        ann_route_total: 1,
+        fallback_route_total: 3,
+        fallback_no_model_total: 1,
+        fallback_no_provider_total: 2,
+        ..Default::default()
+    };
+    for runtime in [&first, &cloned, &detached, &separately_assembled, &no_model] {
+        assert_eq!(
+            runtime.backend().pool().note_search_route_snapshot(),
+            expected
+        );
+    }
+    let independent = KhiveRuntime::memory().unwrap();
+    assert_eq!(
+        first.backend_id().as_str(),
+        independent.backend_id().as_str()
+    );
+    assert_eq!(
+        independent.backend().pool().note_search_route_snapshot(),
+        NoteSearchRouteSnapshot::default()
+    );
+    drop((
+        first,
+        cloned,
+        detached,
+        separately_assembled,
+        no_model,
+        backend,
+    ));
+    assert!(
+        weak_pool.upgrade().is_none(),
+        "counters must not retain their pool"
+    );
+}

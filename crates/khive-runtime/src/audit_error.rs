@@ -72,7 +72,9 @@ impl RuntimeError {
                 source.audit_error_class()
             }
             Self::RefusedWithEvents { context } => context.source.audit_error_class(),
+            Self::BatchWrite { context } => context.source.audit_error_class(),
             Self::WithResolution { context } => context.source.audit_error_class(),
+            Self::SearchRead { context } => context.source().audit_error_class(),
             Self::Storage(error) => storage_class(error),
             Self::Query(error) => match error {
                 khive_query::QueryError::Parse { .. }
@@ -99,7 +101,8 @@ impl RuntimeError {
             | Self::CircularPackDependency(_)
             | Self::PackRedeclared { .. }
             | Self::VerbCollision { .. }
-            | Self::ReservedEnvelopeParam { .. } => C::Configuration,
+            | Self::ReservedEnvelopeParam { .. }
+            | Self::AttachmentCutoverRequired { .. } => C::Configuration,
             Self::CanonicalUnsupportedOperation { .. }
             | Self::CrossBackendMergeUnsupported { .. } => C::Unsupported,
             Self::PermissionDenied { .. }
@@ -189,5 +192,416 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
         | StorageError::WriterTaskTerminated { .. }
         | StorageError::Internal(_)
         | StorageError::CapacityUnavailable { .. } => C::Storage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditErrorClass;
+    use crate::error::{BatchAdmissionReport, BatchRefusal, DomainDisposition, RuntimeError};
+    use khive_storage::{StorageError, WriterTaskRequestState};
+
+    #[test]
+    fn batch_write_delegates_audit_class_without_changing_settlement() {
+        for (source, expected) in [
+            (
+                RuntimeError::InvalidInput("fixture input".into()),
+                AuditErrorClass::InvalidParams,
+            ),
+            (
+                RuntimeError::NotFound("fixture target".into()),
+                AuditErrorClass::NotFoundOrNotAddressed,
+            ),
+            (
+                RuntimeError::Internal("fixture internal".into()),
+                AuditErrorClass::Internal,
+            ),
+        ] {
+            assert_eq!(
+                source.audit_error_class(),
+                expected,
+                "unwrapped source control"
+            );
+            let refusal = source.before_requested_write();
+            assert_eq!(
+                refusal.audit_error_class(),
+                expected,
+                "BatchWrite must retain the source audit class"
+            );
+            assert_eq!(
+                refusal.batch_write_disposition(),
+                Some(DomainDisposition::NotCommitted)
+            );
+        }
+
+        let admission = RuntimeError::InvalidInput("fixture admission".into())
+            .with_batch_admission(BatchAdmissionReport {
+                refused: vec![BatchRefusal {
+                    index: 0,
+                    field: "content",
+                    reason: "fixture-refusal",
+                }],
+                validation_complete: true,
+                unchecked_indices: vec![],
+            });
+        assert_eq!(
+            admission.audit_error_class(),
+            AuditErrorClass::InvalidParams
+        );
+        assert_eq!(
+            admission.batch_write_disposition(),
+            Some(DomainDisposition::NotCommitted)
+        );
+
+        for (state, expected) in [
+            (
+                WriterTaskRequestState::NotStarted,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::TransactionRolledBack,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::SideEffectsUnknown,
+                DomainDisposition::Unknown,
+            ),
+        ] {
+            let failure =
+                RuntimeError::atomic_write_failure(StorageError::WriterTaskRequestFailed {
+                    request_state: state,
+                    source: Box::new(StorageError::Internal("fixture write cause".into())),
+                });
+            assert_eq!(failure.audit_error_class(), AuditErrorClass::Storage);
+            assert_eq!(failure.batch_write_disposition(), Some(expected));
+        }
+
+        for (state, expected) in [
+            (
+                WriterTaskRequestState::NotStarted,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::TransactionRolledBack,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                WriterTaskRequestState::SideEffectsUnknown,
+                DomainDisposition::Unknown,
+            ),
+        ] {
+            let failure =
+                RuntimeError::atomic_write_failure(StorageError::writer_task_terminated(state));
+            assert_eq!(failure.audit_error_class(), AuditErrorClass::Storage);
+            assert_eq!(failure.batch_write_disposition(), Some(expected));
+        }
+    }
+    fn search_context(source: RuntimeError) -> RuntimeError {
+        source.with_search_read_context(
+            crate::BackendId::parse("archive").unwrap(),
+            crate::error::SearchReadSubstrate::Note,
+        )
+    }
+
+    #[test]
+    fn search_read_preserves_projected_kinds_and_typed_classification() {
+        use khive_types::KhiveError;
+        type Factory = fn() -> RuntimeError;
+        let cases: &[(Factory, &str)] = &[
+            (
+                || RuntimeError::RemoteFetchError {
+                    remote: "private remote".into(),
+                    message: "private message".into(),
+                },
+                "remote_fetch_error",
+            ),
+            (
+                || RuntimeError::AuditObligation {
+                    failure: Box::new(crate::error::AuditObligationFailure::new(
+                        "search",
+                        crate::audit_batch::AuditTerminalReason::StoreFailure,
+                    )),
+                    domain_result: serde_json::json!({"private": "ordinary domain canary"}),
+                },
+                "obligation",
+            ),
+            (
+                || {
+                    StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
+                        .into()
+                },
+                "storage",
+            ),
+            (
+                || {
+                    StorageError::AdmissionTimeout {
+                        operation: "metadata".into(),
+                        timeout_ms: 7,
+                        pool_identity: Some("private pool".into()),
+                    }
+                    .into()
+                },
+                "unavailable",
+            ),
+            (
+                || {
+                    StorageError::Timeout {
+                        operation: "metadata".into(),
+                    }
+                    .into()
+                },
+                "runtime_error",
+            ),
+            (
+                || RuntimeError::permission_denied("search", "private policy"),
+                "runtime_error",
+            ),
+            (
+                || KhiveError::not_found("record", "private id").into(),
+                "not_found",
+            ),
+            (
+                || KhiveError::invalid_input("private input").into(),
+                "invalid_input",
+            ),
+            (
+                || KhiveError::unauthorized("private identity").into(),
+                "unauthorized",
+            ),
+            (
+                || KhiveError::conflict("private conflict").into(),
+                "conflict",
+            ),
+            (
+                || KhiveError::unavailable("private availability").into(),
+                "unavailable",
+            ),
+            (
+                || KhiveError::internal("private internal").into(),
+                "internal",
+            ),
+            (
+                || RuntimeError::Internal("private internal".into()),
+                "runtime_error",
+            ),
+            (
+                || RuntimeError::CanonicalAdmission {
+                    op_index: 3,
+                    source: Box::new(KhiveError::not_found("record", "private id").into()),
+                },
+                "not_found",
+            ),
+        ];
+        for &(factory, expected_kind) in cases {
+            let source = factory();
+            let audit_class = source.audit_error_class();
+            let retry = source.retryable_failure_context();
+            let channel_class = source.channel_ingest_failure_class();
+            let raw =
+                crate::error_projection::runtime_error_value(source, DomainDisposition::Unknown);
+            assert_eq!(raw["kind"], expected_kind, "raw kind discriminator");
+            let wrapped = search_context(factory());
+            assert_eq!(wrapped.audit_error_class(), audit_class);
+            assert_eq!(wrapped.retryable_failure_context(), retry);
+            assert_eq!(wrapped.channel_ingest_failure_class(), channel_class);
+            let value =
+                crate::error_projection::runtime_error_value(wrapped, DomainDisposition::Unknown);
+            assert_eq!(value["kind"], raw["kind"]);
+            assert_eq!(value["domain_disposition"], raw["domain_disposition"]);
+            let mut expected = serde_json::json!({
+                "kind": expected_kind,
+                "code": "search_read_failed",
+                "message": "search metadata read failed on backend archive (note)",
+                "cause_class": audit_class.as_str(),
+                "domain_disposition": raw["domain_disposition"],
+                "search_context": {"backend": "archive", "substrate": "note"},
+            });
+            if retry.is_some() {
+                expected["retryable"] = serde_json::json!(true);
+            }
+            assert_eq!(value, expected);
+        }
+        let wrapped = search_context(
+            RuntimeError::InvalidInput("private input".into()).before_requested_write(),
+        );
+        assert_eq!(
+            wrapped.batch_write_disposition(),
+            Some(DomainDisposition::NotCommitted)
+        );
+        assert!(
+            matches!(wrapped.refusal_source(), RuntimeError::InvalidInput(text) if text == "private input")
+        );
+    }
+
+    #[test]
+    fn search_read_hides_raw_content_and_untrusted_retry_fields() {
+        fn receipt() -> RuntimeError {
+            RuntimeError::RefusedWithReceipt(Box::new(crate::error::ReceiptRefusal {
+                code: "ordinary-code-canary",
+                message: "ordinary-message-canary".into(),
+                receipt_id: "ordinary-receipt-canary".into(),
+                reason: "ordinary-reason-canary".into(),
+                detail: serde_json::json!({"detail": "ordinary-detail-canary", "kind": "spoofed-kind", "domain_disposition": "committed", "retryable": {"ordinary": "ordinary-retry-canary"}}),
+            }))
+        }
+        let raw =
+            crate::error_projection::runtime_error_value(receipt(), DomainDisposition::Unknown);
+        assert_eq!(raw["kind"], "runtime_error");
+        assert_eq!(raw["domain_disposition"], "not_committed");
+        let raw_text = raw.to_string();
+        let wrapped = search_context(receipt());
+        let RuntimeError::SearchRead { context } = &wrapped else {
+            panic!("typed context missing")
+        };
+        let RuntimeError::RefusedWithReceipt(source) = context.source() else {
+            panic!("original source missing")
+        };
+        assert_eq!(source.code, "ordinary-code-canary");
+        assert_eq!(source.message, "ordinary-message-canary");
+        assert_eq!(source.receipt_id, "ordinary-receipt-canary");
+        assert_eq!(source.reason, "ordinary-reason-canary");
+        assert_eq!(source.detail["detail"], "ordinary-detail-canary");
+        assert_eq!(
+            source.detail["retryable"]["ordinary"],
+            "ordinary-retry-canary"
+        );
+        let display = wrapped.to_string();
+        let value =
+            crate::error_projection::runtime_error_value(wrapped, DomainDisposition::Unknown);
+        for canary in [
+            "ordinary-code-canary",
+            "ordinary-message-canary",
+            "ordinary-receipt-canary",
+            "ordinary-reason-canary",
+            "ordinary-detail-canary",
+            "ordinary-retry-canary",
+        ] {
+            assert!(
+                raw_text.contains(canary),
+                "raw projection must expose this witness"
+            );
+            assert!(!display.contains(canary));
+            assert!(!value.to_string().contains(canary));
+        }
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "runtime_error", "code": "search_read_failed",
+                "message": "search metadata read failed on backend archive (note)",
+                "cause_class": "policy_refusal", "domain_disposition": "not_committed",
+                "search_context": {"backend": "archive", "substrate": "note"},
+            })
+        );
+        fn detail() -> RuntimeError {
+            khive_types::KhiveError::invalid_input("ordinary-khive-message")
+                .with_details(khive_types::Details::new([(
+                    "private",
+                    "ordinary-khive-detail",
+                )]))
+                .into()
+        }
+        fn driver() -> RuntimeError {
+            StorageError::driver(
+                khive_storage::StorageCapability::Sql,
+                "ordinary-driver-operation",
+                std::io::Error::other("ordinary-driver-body"),
+            )
+            .into()
+        }
+        for (factory, canaries) in [
+            (
+                detail as fn() -> RuntimeError,
+                ["ordinary-khive-message", "ordinary-khive-detail"],
+            ),
+            (
+                driver as fn() -> RuntimeError,
+                ["ordinary-driver-operation", "ordinary-driver-body"],
+            ),
+        ] {
+            let raw =
+                crate::error_projection::runtime_error_value(factory(), DomainDisposition::Unknown)
+                    .to_string();
+            let wrapped = search_context(factory());
+            let display = wrapped.to_string();
+            assert_eq!(wrapped.refusal_source().to_string(), factory().to_string());
+            match wrapped.refusal_source() {
+                RuntimeError::Khive(source) => assert_eq!(
+                    source.details().unwrap().get("private"),
+                    Some("ordinary-khive-detail")
+                ),
+                RuntimeError::Storage(StorageError::Driver {
+                    operation, source, ..
+                }) => {
+                    assert_eq!(operation.as_ref(), "ordinary-driver-operation");
+                    assert_eq!(
+                        source.downcast_ref::<std::io::Error>().unwrap().to_string(),
+                        "ordinary-driver-body"
+                    );
+                }
+                _ => panic!("private typed source changed"),
+            }
+            let safe =
+                crate::error_projection::runtime_error_value(wrapped, DomainDisposition::Unknown)
+                    .to_string();
+            for canary in canaries {
+                assert!(raw.contains(canary));
+                assert!(!display.contains(canary));
+                assert!(!safe.contains(canary));
+            }
+        }
+    }
+    #[test]
+    fn search_read_preserves_nested_lint_retry_refusal() {
+        fn retryable() -> RuntimeError {
+            StorageError::AdmissionTimeout {
+                operation: "metadata".into(),
+                timeout_ms: 7,
+                pool_identity: None,
+            }
+            .into()
+        }
+        fn lint(source: RuntimeError) -> RuntimeError {
+            use crate::graph_lint::{
+                ActionIdentity, FixAction, LintFixFailureDetail, LintFixOutcome, LintReport,
+            };
+            RuntimeError::LintFix {
+                source: Box::new(source),
+                detail: Box::new(LintFixFailureDetail {
+                    outcome: LintFixOutcome::Unknown,
+                    failed_action: ActionIdentity {
+                        violation_index: 0,
+                        action: FixAction::SoftDeleteEdge,
+                    },
+                    confirmed_receipts: vec![],
+                    report: LintReport {
+                        violations: vec![],
+                        summary: Default::default(),
+                        stats: Default::default(),
+                    },
+                }),
+            }
+        }
+        assert!(retryable().retryable_failure_context().is_some());
+        for error in [
+            search_context(lint(retryable())),
+            lint(search_context(retryable())),
+        ] {
+            assert!(error.retryable_failure_context().is_none());
+            assert!(matches!(
+                error.refusal_source(),
+                RuntimeError::Storage(StorageError::AdmissionTimeout { .. })
+            ));
+            assert_eq!(
+                error.audit_error_class(),
+                AuditErrorClass::AdmissionExhausted
+            );
+        }
+        let value = crate::error_projection::runtime_error_value(
+            search_context(lint(retryable().before_requested_write())),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(value["kind"], "unavailable");
+        assert_eq!(value["domain_disposition"], "unknown");
+        assert!(value.get("retryable").is_none());
     }
 }

@@ -133,3 +133,19 @@ fn snapshot_id_serde_accepts_valid_prefixed() {
     let id: SnapshotId = serde_json::from_str(&raw).unwrap();
     assert_eq!(id.hex(), hex);
 }
+
+#[test]
+fn snapshot_id_serde_uppercase_hex_error_message_is_exact() {
+    let prefixed = format!("sha256:{}", "A".repeat(64));
+    let error = serde_json::from_value::<SnapshotId>(serde_json::Value::String(prefixed))
+        .expect_err("uppercase prefixed hex must be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "invalid SnapshotId: hex must be lower-case with no whitespace in \"sha256:",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+        ),
+    );
+}

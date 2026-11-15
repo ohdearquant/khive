@@ -1220,7 +1220,9 @@ async fn carried_reserved_property_cannot_be_laundered_by_an_admitted_update() {
 #[cfg(unix)]
 #[tokio::test]
 async fn events_split_reads_the_success_audit_committed_on_the_main_unit() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry = crate::events_split::TestRegistryGuard::new(directory.path());
     let namespace = Namespace::parse(&format!("manifest-{}", Uuid::new_v4())).unwrap();
     let runtime = KhiveRuntime::new_for_test(RuntimeConfig {

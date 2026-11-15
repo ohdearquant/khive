@@ -36,10 +36,9 @@ fn validate_list_filter_scope(
             "entity_kind" | "entity_type" => {
                 (matches!(spec, KindSpec::Entity { .. }), "entity lists")
             }
-            "note_kind" | "key_prefix" | "after_key" | "created_after" | "updated_after"
-            | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read" | "delivered" => {
-                (matches!(spec, KindSpec::Note { .. }), "note lists")
-            }
+            "note_kind" | "note_status" | "key_prefix" | "after_key" | "created_after"
+            | "updated_after" | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read"
+            | "delivered" => (matches!(spec, KindSpec::Note { .. }), "note lists"),
             "created_by_actor" => (
                 matches!(spec, KindSpec::Note { .. }),
                 "scheduled_event note lists",
@@ -384,6 +383,22 @@ async fn edge_page_after(
     Ok((kept, next_after))
 }
 
+fn note_list_endpoint<'a>(note: &'a Note, field: &str, actor_field: &str) -> &'a str {
+    let text = |key| {
+        note.properties
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    let legacy = text(field);
+    if note.kind == "message" {
+        text(actor_field).or(legacy)
+    } else {
+        legacy
+    }
+    .unwrap_or("")
+}
+
 pub(super) fn note_matches_list_filters(
     note: &Note,
     params: &ListParams,
@@ -445,19 +460,13 @@ pub(super) fn note_matches_list_filters(
         }
     }
     if let Some(wanted) = params.from.as_deref() {
-        let stored = properties
-            .and_then(|value| value.get("from"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let stored = note_list_endpoint(note, "from", "from_actor");
         if stored != wanted {
             return false;
         }
     }
     if let Some(wanted) = params.to.as_deref() {
-        let stored = properties
-            .and_then(|value| value.get("to"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let stored = note_list_endpoint(note, "to", "to_actor");
         if stored != wanted {
             return false;
         }

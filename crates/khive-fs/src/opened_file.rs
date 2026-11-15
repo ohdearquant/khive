@@ -30,6 +30,21 @@ pub enum ContainedOpenError {
     },
 }
 
+/// Open a path read-only without following a final-component symlink on Unix.
+///
+/// Earlier components resolve normally. The returned file is non-blocking and close-on-exec;
+/// no metadata, regular-file or containment check is performed. Native open errors are returned
+/// unchanged, with the standard library's interrupted-open retry.
+#[cfg(unix)]
+pub fn open_readonly_file_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
 /// Open a regular file read-only without following a final-component symlink on Unix.
 ///
 /// Earlier symlinks resolve normally; this does not enforce containment or ancestor trust.
@@ -38,13 +53,7 @@ pub enum ContainedOpenError {
 /// The returned file is close-on-exec. Open and metadata failures retain their raw errors.
 #[cfg(unix)]
 pub fn open_regular_file_nofollow(path: &Path) -> Result<File, ContainedOpenError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(ContainedOpenError::Open)?;
+    let file = open_readonly_file_nofollow(path).map_err(ContainedOpenError::Open)?;
     let metadata = file.metadata().map_err(ContainedOpenError::Metadata)?;
     if !metadata.is_file() {
         return Err(ContainedOpenError::NotRegular);

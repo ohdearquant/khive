@@ -17,7 +17,7 @@ pub(crate) fn rollback_proves_autocommit(conn: &Connection) -> bool {
 /// refuse every later write on that database and may release its lease, and the
 /// host decides whether the process exits.
 pub(crate) fn close_retired_connection(
-    original: Connection,
+    mut original: Connection,
     database_path: &str,
     volume_key: &str,
 ) -> Result<(), SqliteError> {

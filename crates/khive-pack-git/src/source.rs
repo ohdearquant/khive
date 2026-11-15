@@ -99,13 +99,11 @@ fn is_scp_shorthand(s: &str) -> bool {
 
 /// Split `[user@]host:path` shorthand into `(host, path)`, or `None` when
 /// `s` doesn't have that shape. A bracketed IPv6 host (`git@[::1]:path` or
-/// the bare `[::1]:path`) is handled by locating the `[...]` span and
-/// requiring the very next character to be `:` -- naively taking the first
-/// `:` in the string (as the plain-host branch below does) would land on a
-/// colon INSIDE the address instead of the host/path separator, which is
-/// what let a bracketed-IPv6 SCP origin fall through to `local:<path>`
-/// instead of converging with its remote slug (ADR-088 Amendment 2
-/// round-2 finding). For a plain (non-bracketed) host, the segment
+/// the bare `[::1]:path`) uses the colon immediately after the `[...]` span
+/// as its host/path separator. Colons inside the address are not separators,
+/// so bracketed-IPv6 SCP origins converge with their remote slug rather
+/// than a local-path identity (ADR-088 Amendment 2).
+/// For a plain (non-bracketed) host, the segment
 /// (whatever precedes the first `:`, minus any `user@` prefix) must
 /// contain no `/` -- this is what keeps a local path with an embedded
 /// colon, e.g. `local/path:with-colon`, from being misparsed as SCP

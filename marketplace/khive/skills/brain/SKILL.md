@@ -45,7 +45,7 @@ judgment. Omit `signal` to abstain without emitting a feedback event. For direct
 `implicit_negative`, `correction`. Batch across multiple results in one call:
 
 ```
-request(ops="[brain.feedback(target_id=\"<uuid-1>\", signal=\"useful\"), brain.feedback(target_id=\"<uuid-2>\", signal=\"not_useful\")]")
+request(ops="[brain.feedback(id=\"<uuid-1>\", signal=\"useful\"), brain.feedback(id=\"<uuid-2>\", signal=\"not_useful\")]")
 ```
 
 ### 3. Manage lifecycle when behavior drifts
@@ -97,8 +97,8 @@ wildcard, and finally global wildcard. `NotFound` means no binding covers that c
 
 ## Anti-patterns
 
-- **Short UUID in `brain.feedback`.** `target_id` requires the full UUID from the recall result.
-  Short prefix IDs are rejected without a helpful error.
+- **Ambiguous prefix in `brain.feedback`.** `id` accepts a full UUID or a globally unique
+  hex prefix of at least eight characters; prefer the full UUID from recall when available.
 - **Archiving the only active profile.** If `balanced-recall-v1` is the sole active binding for
   `recall`, archiving it makes `brain.resolve(consumer_kind="recall")` return `NotFound` for all
   callers until a replacement is bound and activated.

@@ -47,6 +47,15 @@ pub struct DaemonRequestFrame {
     /// `namespace=` operations remain scoped to exactly that namespace.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
+    /// Namespaces the client declared it owns (`[actor] owned_namespaces`,
+    /// ADR-021 Delta 1), carried with the caller's identity so the warm daemon
+    /// checks old-row namespaces against the caller's declaration rather than its
+    /// own. Omitted from the wire when empty. A daemon that predates the field
+    /// ignores it, so an owned row is refused there as `old-namespace`: a missing
+    /// declaration produces a refusal, never an admission. Purely additive:
+    /// `#[serde(default)]` with no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_namespaces: Vec<String>,
     /// Fingerprint of the client's engine-coherence config: packs, db target,
     /// embedders, backend routing, and construction-baked outbound policy.
     /// Identity fields are carried separately in this frame. The daemon rejects
@@ -123,7 +132,8 @@ pub struct DaemonDispatchError {
 /// Per-field container limit, asserted equal to the request parser's bound by MCP.
 pub const ERROR_DETAIL_NESTING_DEPTH_LIMIT: usize = 64;
 
-fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
+/// Whether a JSON value fits the shared per-field container nesting limit.
+pub fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
     let mut pending = vec![(value, 0_usize)];
     while let Some((value, depth)) = pending.pop() {
         match value {
@@ -140,7 +150,8 @@ fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
     true
 }
 
-fn drop_error_detail_iteratively(value: serde_json::Value) {
+/// Discard an owned JSON value without recursing through nested containers.
+pub fn drop_error_detail_iteratively(value: serde_json::Value) {
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {

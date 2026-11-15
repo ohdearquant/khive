@@ -400,6 +400,20 @@ pub fn list_names_bounded(directory: &File, max: usize) -> Result<Vec<String>, L
         .collect())
 }
 
+/// List a bounded UTF-8 prefix in native directory order, without sorting.
+///
+/// Every non-dot entry counts before conversion, including hidden names, links and
+/// non-UTF-8 names. The result may therefore contain fewer than `max` strings.
+/// `true` requires an actual extra non-dot entry, which is not included; an exact
+/// cap at EOF is not truncated. Zero distinguishes an empty from a nonempty directory.
+/// The listing uses an independent open of the held directory's `.` and leaves the
+/// caller's position unchanged. Native I/O errors are returned without context.
+pub fn list_names_prefix_bounded(directory: &File, max: usize) -> io::Result<(Vec<String>, bool)> {
+    let collected = read_directory_names(directory, |next| collect_names(next, Some(max)))?
+        .map_err(|error| error.source)?;
+    Ok(collected.into_prefix())
+}
+
 pub(crate) fn list_names_raw_bounded(
     directory: &File,
     max: usize,
@@ -431,69 +445,119 @@ pub(crate) fn read_names_detailed(
     directory: &File,
     max: Option<usize>,
 ) -> Result<Vec<OsString>, DetailedListError> {
-    let setup_error = |source| DetailedListError {
-        observed: 0,
-        kind: DetailedListErrorKind::Io(source),
-    };
-    let fd = open_at(directory, OsStr::new("."), true)
-        .map_err(setup_error)?
-        .into_raw_fd();
+    read_directory_names(directory, |next| collect_names_detailed(next, max)).map_err(|source| {
+        DetailedListError {
+            observed: 0,
+            kind: DetailedListErrorKind::Io(source),
+        }
+    })?
+}
+
+fn read_directory_names<T>(
+    directory: &File,
+    collect: impl FnOnce(&mut dyn FnMut() -> io::Result<Option<OsString>>) -> T,
+) -> io::Result<T> {
+    let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
     // SAFETY: `fd` is uniquely owned and `fdopendir` takes ownership of it on success.
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
         // SAFETY: `fdopendir` failed, so ownership of `fd` remains here.
         unsafe { libc::close(fd) };
-        return Err(setup_error(error));
+        return Err(error);
     }
     let stream = DirStream(stream);
-    collect_names_detailed(
-        || {
-            clear_errno();
-            // SAFETY: `stream` holds a live `DIR*` until collection returns.
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                return if error.raw_os_error() != Some(0) {
-                    Err(error)
-                } else {
-                    Ok(None)
-                };
-            }
-            // SAFETY: `d_name` is NUL-terminated and copied before the next readdir.
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            Ok(Some(OsString::from_vec(name.to_vec())))
-        },
-        max,
-    )
+    let mut next = || {
+        clear_errno();
+        // SAFETY: `stream` holds a live `DIR*` until collection returns.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() != Some(0) {
+                Err(error)
+            } else {
+                Ok(None)
+            };
+        }
+        // SAFETY: `d_name` is NUL-terminated and copied before the next readdir.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        Ok(Some(OsString::from_vec(name.to_vec())))
+    };
+    Ok(collect(&mut next))
 }
 
 // Keep accounting on the production collection path. A supplied next observation also
 // lets tests deterministically cover a read error after progress, without a second reader.
 fn collect_names_detailed(
-    mut next: impl FnMut() -> io::Result<Option<OsString>>,
+    next: impl FnMut() -> io::Result<Option<OsString>>,
     max: Option<usize>,
 ) -> Result<Vec<OsString>, DetailedListError> {
-    let mut result = Vec::new();
-    while let Some(name) = next().map_err(|source| DetailedListError {
-        observed: result.len(),
-        kind: DetailedListErrorKind::Io(source),
+    let collected = collect_names(next, max).map_err(|error| DetailedListError {
+        observed: error.observed,
+        kind: DetailedListErrorKind::Io(error.source),
+    })?;
+    if let Some(excess) = collected.excess {
+        return Err(DetailedListError {
+            observed: collected.names.len().saturating_add(1),
+            kind: DetailedListErrorKind::LimitExceeded {
+                max: max.expect("an excess witness requires a bound"),
+                excess,
+            },
+        });
+    }
+    let mut names = collected.names;
+    names.sort();
+    Ok(names)
+}
+
+#[derive(Debug)]
+struct CollectedNames {
+    names: Vec<OsString>,
+    excess: Option<OsString>,
+}
+
+impl CollectedNames {
+    fn into_prefix(self) -> (Vec<String>, bool) {
+        let truncated = self.excess.is_some();
+        let names = self
+            .names
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .collect();
+        (names, truncated)
+    }
+}
+
+#[derive(Debug)]
+struct NameReadError {
+    observed: usize,
+    source: io::Error,
+}
+
+fn collect_names(
+    mut next: impl FnMut() -> io::Result<Option<OsString>>,
+    max: Option<usize>,
+) -> Result<CollectedNames, NameReadError> {
+    let mut names = Vec::new();
+    while let Some(name) = next().map_err(|source| NameReadError {
+        observed: names.len(),
+        source,
     })? {
         if name == OsStr::new(".") || name == OsStr::new("..") {
             continue;
         }
-        if let Some(max) = max {
-            if result.len() == max {
-                return Err(DetailedListError {
-                    observed: result.len().saturating_add(1),
-                    kind: DetailedListErrorKind::LimitExceeded { max, excess: name },
-                });
-            }
+        if max.is_some_and(|max| names.len() == max) {
+            return Ok(CollectedNames {
+                names,
+                excess: Some(name),
+            });
         }
-        result.push(name);
+        names.push(name);
     }
-    result.sort();
-    Ok(result)
+    Ok(CollectedNames {
+        names,
+        excess: None,
+    })
 }
 
 #[cfg(test)]
@@ -544,5 +608,87 @@ mod detailed_listing_tests {
         assert!(collect_names_detailed(|| Ok(None), Some(0))
             .unwrap()
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prefix_listing_tests {
+    use super::*;
+
+    #[test]
+    fn native_prefix_keeps_order_and_stops_at_the_first_real_excess() {
+        let mut observations = ["z", "a", "excess", "must-not-read"].into_iter();
+        let collected =
+            collect_names(|| Ok(observations.next().map(OsString::from)), Some(2)).unwrap();
+        assert_eq!(collected.names, [OsString::from("z"), OsString::from("a")]);
+        assert_eq!(collected.excess.as_deref(), Some(OsStr::new("excess")));
+        assert_eq!(
+            collected.into_prefix(),
+            (vec!["z".to_string(), "a".to_string()], true)
+        );
+        assert_eq!(observations.next(), Some("must-not-read"));
+    }
+
+    #[test]
+    fn native_prefix_counts_non_utf8_before_converting_the_result() {
+        let mut observations = [
+            OsString::from_vec(b"raw-\xff".to_vec()),
+            OsString::from("z"),
+            OsString::from("excess"),
+            OsString::from("must-not-read"),
+        ]
+        .into_iter();
+        let collected = collect_names(|| Ok(observations.next()), Some(2)).unwrap();
+        assert_eq!(collected.names.len(), 2);
+        assert_eq!(collected.into_prefix(), (vec!["z".to_string()], true));
+        assert_eq!(observations.next(), Some(OsString::from("must-not-read")));
+    }
+
+    #[test]
+    fn native_prefix_distinguishes_zero_exact_cap_and_overflow() {
+        let mut dots = [".", ".."].into_iter();
+        assert_eq!(
+            collect_names(|| Ok(dots.next().map(OsString::from)), Some(0))
+                .unwrap()
+                .into_prefix(),
+            (Vec::<String>::new(), false)
+        );
+        let mut nonempty = [".", "first", "must-not-read"].into_iter();
+        assert_eq!(
+            collect_names(|| Ok(nonempty.next().map(OsString::from)), Some(0))
+                .unwrap()
+                .into_prefix(),
+            (Vec::<String>::new(), true)
+        );
+        assert_eq!(nonempty.next(), Some("must-not-read"));
+        let mut exact = ["z", ".", "..", "a"].into_iter();
+        assert_eq!(
+            collect_names(|| Ok(exact.next().map(OsString::from)), Some(2))
+                .unwrap()
+                .into_prefix(),
+            (vec!["z".to_string(), "a".to_string()], false)
+        );
+    }
+
+    #[test]
+    fn native_prefix_preserves_read_errors_even_after_the_cap_is_filled() {
+        let first =
+            collect_names(|| Err(io::Error::from_raw_os_error(libc::EACCES)), Some(0)).unwrap_err();
+        assert_eq!(first.observed, 0);
+        assert_eq!(first.source.raw_os_error(), Some(libc::EACCES));
+        let mut observations = [
+            Ok(OsString::from("z")),
+            Ok(OsString::from("a")),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            Ok(OsString::from("must-not-read")),
+        ]
+        .into_iter();
+        let error = collect_names(|| observations.next().transpose(), Some(2)).unwrap_err();
+        assert_eq!(error.observed, 2);
+        assert_eq!(error.source.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            observations.next().unwrap().unwrap(),
+            OsStr::new("must-not-read")
+        );
     }
 }

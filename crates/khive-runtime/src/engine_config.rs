@@ -39,6 +39,9 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
+    #[error("channel.node: {reason}")]
+    InvalidNodeConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -219,6 +222,9 @@ pub enum ConfigError {
     #[error("[web] {key}: {reason}")]
     InvalidWebConfig { key: String, reason: String },
 
+    #[error("[runtime] {key}: {reason}")]
+    InvalidRuntimeConfig { key: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -253,6 +259,23 @@ pub enum ConfigError {
         #[source]
         source: Box<ConfigError>,
     },
+
+    /// A discovery-tier file the loader does not use failed to load while it
+    /// was read only for `[actor] require_attributed`, which is ORed across
+    /// every tier. Still a refusal: the key could not be read from the file.
+    #[error(
+        "config file {} is not the file in use (in use: {}); it was read only to look for \
+         `[actor] require_attributed`, which could not be read from it: {source}",
+        path.display(),
+        in_use.as_deref().map_or_else(|| "none".to_string(), |used| used.display().to_string())
+    )]
+    ShadowedTier {
+        path: PathBuf,
+        /// The discovery-tier file the loader uses, if any exists.
+        in_use: Option<PathBuf>,
+        #[source]
+        source: Box<ConfigError>,
+    },
 }
 
 impl ConfigError {
@@ -284,9 +307,10 @@ impl ConfigError {
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:leo"                          # attribution identity (required)
+/// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
+/// require_attributed = true                       # refuse comm without an actor (optional)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -345,6 +369,33 @@ pub struct ActorConfig {
     /// for any actor that does not add this field.
     #[serde(default)]
     pub allowed_outbound_namespaces: Vec<String>,
+
+    /// Namespaces whose rows this actor may rewrite through `memory.apply_batch`
+    /// (ADR-021 Delta 1). Empty by default. Ownership is declared by name and
+    /// never inferred: `visible_namespaces` grants read access only, and a
+    /// namespace that shares this actor's id as a prefix is not owned unless it
+    /// is listed here. Each entry must be a valid `Namespace` other than `local`
+    /// and this actor's own `id`; entries must be unique, and a nonempty list
+    /// requires an explicit `id`. Validated at config-load time. The list is
+    /// read by the apply-batch old-row namespace check alone: it grants no write
+    /// into an owned namespace and widens no read.
+    #[serde(default)]
+    pub owned_namespaces: Vec<String>,
+
+    /// Strict attributed-actor mode while the `comm` pack is loaded, exactly as
+    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`; either one turns it on and neither can
+    /// turn the other off. An actor is unattributed when it is absent, empty or
+    /// `local`. A server refuses to start and `kkernel exec` refuses to run when
+    /// its own actor is unattributed, and a daemon refuses each request whose
+    /// frame carries an unattributed actor, before anything dispatches.
+    /// Every other key comes from the first config file found; this one is ORed
+    /// across the database-anchored file and every existing discovery tier (cwd
+    /// `khive.toml`, cwd `.khive/config.toml`, `~/.khive/config.toml`), so a
+    /// project file without it cannot shadow a home file that sets it. An
+    /// explicit `--config`/`KHIVE_CONFIG` file is hermetic and is the only one
+    /// read. Valid without `id`. Defaults to `false`.
+    #[serde(default)]
+    pub require_attributed: bool,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -1418,6 +1469,11 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
+    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
+    /// config file keeps loading; its contents are not interpreted.
+    #[serde(default)]
+    pub channel: crate::node_config::ChannelSectionConfig,
+
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -1532,6 +1588,16 @@ pub struct KhiveConfig {
 /// absent.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
+    /// Maximum simultaneous background warm jobs in one serving host.
+    /// Absent preserves the resolved base; zero and unsupported capacities fail.
+    #[serde(default)]
+    pub warm_concurrency: Option<usize>,
+
+    /// Maximum simultaneous background maintenance jobs in one serving host.
+    /// Interactive dispatch does not use this admission limit.
+    #[serde(default)]
+    pub maintenance_concurrency: Option<usize>,
+
     /// Packs to load when neither `--pack` nor `KHIVE_PACKS` selects them.
     /// An absent or empty list preserves the built-in production default.
     #[serde(default)]
@@ -1794,6 +1860,63 @@ impl KhiveConfig {
         Ok(None)
     }
 
+    /// Whether `[actor].require_attributed` is set in the explicit file, or with
+    /// none, in any existing discovery tier, the database-anchored one included.
+    /// A file that fails to load is an error, never a silent `false`.
+    pub fn require_attributed_in_any_tier(
+        path: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        if let Some(p) = path {
+            if !p.exists() {
+                return Err(ConfigError::ExplicitConfigMissing {
+                    path: p.to_path_buf(),
+                });
+            }
+            return Ok(Self::load(Some(p))?.is_some_and(|cfg| cfg.actor.require_attributed));
+        }
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home_root = std::env::var_os("HOME").map(PathBuf::from);
+        Self::require_attributed_in_tiers(&project_root, home_root.as_deref(), db_path)
+    }
+
+    /// Every file the loader's tiers 2-4 may read (`load_with_roots_and_source`), plus the
+    /// cwd `.khive/config.toml`, which tier 3 reads when no database path is given.
+    pub(crate) fn require_attributed_in_tiers(
+        project_root: &Path,
+        home_root: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        let mut files = vec![
+            project_root.join("khive.toml"),
+            Self::project_config_anchor_dir(db_path, project_root).join("config.toml"),
+            project_root.join(".khive/config.toml"),
+        ];
+        let home_file = home_root.map(|home| home.join(".khive/config.toml"));
+        // The file `load_with_roots_and_source` reads: the first existing of tiers 2-4.
+        let in_use = [Some(&files[0]), Some(&files[1]), home_file.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|file| file.exists())
+            .cloned();
+        files.extend(home_file);
+        files.dedup();
+        for file in files.iter().filter(|file| file.exists()) {
+            let loaded = Self::load(Some(file)).map_err(|source| match &in_use {
+                Some(used) if used == file => source,
+                _ => ConfigError::ShadowedTier {
+                    path: Self::diagnostic_config_path(file),
+                    in_use: in_use.as_deref().map(Self::diagnostic_config_path),
+                    source: Box::new(source),
+                },
+            })?;
+            if loaded.is_some_and(|cfg| cfg.actor.require_attributed) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn diagnostic_config_path(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
@@ -1856,6 +1979,34 @@ impl KhiveConfig {
             return Err(ConfigError::BlobS3FeatureDisabled);
         }
 
+        let warm = self
+            .runtime
+            .warm_concurrency
+            .unwrap_or(crate::config::DEFAULT_WARM_CONCURRENCY);
+        let maintenance = self
+            .runtime
+            .maintenance_concurrency
+            .unwrap_or(crate::config::DEFAULT_MAINTENANCE_CONCURRENCY);
+        crate::resource_admission::WorkClassLimits::validate(warm, maintenance).map_err(
+            |error| {
+                let key = match &error {
+                    crate::resource_admission::ResourceError::InvalidLimit {
+                        class: crate::resource_admission::WorkClass::Warm,
+                        ..
+                    } => "warm_concurrency",
+                    crate::resource_admission::ResourceError::InvalidLimit {
+                        class: crate::resource_admission::WorkClass::Maintenance,
+                        ..
+                    } => "maintenance_concurrency",
+                    _ => "background_concurrency",
+                };
+                ConfigError::InvalidRuntimeConfig {
+                    key: key.to_owned(),
+                    reason: error.to_string(),
+                }
+            },
+        )?;
+
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
@@ -1864,6 +2015,7 @@ impl KhiveConfig {
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;
         }
+        self.channel.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
@@ -1978,6 +2130,50 @@ impl KhiveConfig {
                     id: ns_str.clone(),
                     reason: format!("invalid visible namespace: {e}"),
                 })?;
+            }
+        }
+
+        // Validate actor.owned_namespaces (fail-closed at startup). Ownership is
+        // declared by name, so every entry is checked exactly: it must parse, must
+        // not be the shared namespace or the actor's own id, and must be unique.
+        if !self.actor.owned_namespaces.is_empty() {
+            let Some(actor_id) = self.actor.id.as_deref() else {
+                return Err(ConfigError::InvalidActorId {
+                    id: String::new(),
+                    reason: "owned_namespaces requires an explicit [actor] id".to_string(),
+                });
+            };
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for ns_str in &self.actor.owned_namespaces {
+                if ns_str.is_empty() {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces entries must not be empty".to_string(),
+                    });
+                }
+                let parsed = Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
+                    id: ns_str.clone(),
+                    reason: format!("invalid owned namespace: {e}"),
+                })?;
+                if parsed.as_str() == Namespace::LOCAL {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces must not list the shared namespace `local`"
+                            .to_string(),
+                    });
+                }
+                if parsed.as_str() == actor_id {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces must not list the actor's own id".to_string(),
+                    });
+                }
+                if !seen.insert(parsed.as_str().to_string()) {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "owned_namespaces entries must be unique".to_string(),
+                    });
+                }
             }
         }
 
@@ -2249,3 +2445,78 @@ mod schema_tests;
 #[cfg(test)]
 #[path = "engine_config_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_limit_tests {
+    use super::*;
+
+    #[test]
+    fn optional_background_limits_parse_and_validate() {
+        let config: KhiveConfig =
+            toml::from_str("[runtime]\nwarm_concurrency = 3\nmaintenance_concurrency = 2\n")
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.runtime.warm_concurrency, Some(3));
+        assert_eq!(config.runtime.maintenance_concurrency, Some(2));
+    }
+
+    #[test]
+    fn zero_and_overflow_limits_report_the_actual_runtime_key() {
+        for key in ["warm_concurrency", "maintenance_concurrency"] {
+            for value in [0, tokio::sync::Semaphore::MAX_PERMITS + 1] {
+                let mut config: KhiveConfig = toml::from_str("").unwrap();
+                if key == "warm_concurrency" {
+                    config.runtime.warm_concurrency = Some(value);
+                } else {
+                    config.runtime.maintenance_concurrency = Some(value);
+                }
+                assert!(matches!(config.validate(),
+                    Err(ConfigError::InvalidRuntimeConfig { key: found, .. }) if found == key
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn negative_toml_background_limits_are_not_deserialized() {
+        for key in ["warm_concurrency", "maintenance_concurrency"] {
+            let text = format!("[runtime]\n{key} = -1\n");
+            assert!(toml::from_str::<KhiveConfig>(&text).is_err());
+        }
+    }
+
+    #[test]
+    fn limits_keep_base_and_override_values_on_both_mapping_branches() {
+        for engines_declared in [false, true] {
+            let mut config: KhiveConfig =
+                toml::from_str("[runtime]\nwarm_concurrency = 5\n").unwrap();
+            config.engines_declared = engines_declared;
+            let base = crate::RuntimeConfig {
+                warm_concurrency: 3,
+                maintenance_concurrency: 2,
+                ..crate::RuntimeConfig::no_embeddings()
+            };
+            let mapped = crate::config::runtime_config_from_khive_config(&config, base);
+            assert_eq!(mapped.warm_concurrency, 5);
+            assert_eq!(mapped.maintenance_concurrency, 2);
+        }
+    }
+
+    #[test]
+    fn defaults_use_the_named_validated_background_constants() {
+        let config = crate::RuntimeConfig::default();
+        assert_eq!(
+            config.warm_concurrency,
+            crate::config::DEFAULT_WARM_CONCURRENCY
+        );
+        assert_eq!(
+            config.maintenance_concurrency,
+            crate::config::DEFAULT_MAINTENANCE_CONCURRENCY
+        );
+        crate::resource_admission::WorkClassLimits::validate(
+            config.warm_concurrency,
+            config.maintenance_concurrency,
+        )
+        .unwrap();
+    }
+}

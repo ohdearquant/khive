@@ -1400,7 +1400,6 @@ impl EventStore for SqlEventStore {
     }
 
     async fn get_event(&self, id: Uuid) -> Result<Option<Event>, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = id.to_string();
 
         self.with_reader("get_event", move |conn| {
@@ -1408,9 +1407,9 @@ impl EventStore for SqlEventStore {
                 "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
                         payload_schema_version, profile_state_version, duration_us, target_id, \
                         session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
-                 FROM events WHERE namespace = ?1 AND id = ?2",
+                 FROM events WHERE id = ?1",
             )?;
-            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_event(row)?)),
                 None => Ok(None),

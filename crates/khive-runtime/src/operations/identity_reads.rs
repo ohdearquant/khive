@@ -379,3 +379,7 @@ impl KhiveRuntime {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+#[path = "identity_reads/event_lookup_tests.rs"]
+mod event_lookup_tests;

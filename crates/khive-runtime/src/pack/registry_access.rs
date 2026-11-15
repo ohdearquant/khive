@@ -20,6 +20,82 @@ use super::{
 use super::{PackRegistry, RequestIdentity, VerbCategory, VerbRegistryBuilder};
 
 impl VerbRegistry {
+    /// Intercept registered search with the ordinary registry's read projection.
+    ///
+    /// The existing intercept owns authorization and audit exactly once. Its
+    /// coordinator read projection remains unchanged; this callback preserves
+    /// the ordinary registry's local primary and implicit actor visibility.
+    /// Missing or disabled owners fall through to ordinary dispatch unchanged.
+    pub async fn dispatch_search_with_registry_scope<'a, M, F, Fut>(
+        &'a self,
+        params: &serde_json::Value,
+        identity: Option<&crate::RequestIdentity>,
+        dispatch: F,
+    ) -> Option<Result<crate::InterceptedDispatchResult<M>, crate::DispatchError>>
+    where
+        F: FnOnce(&'a dyn crate::PackRuntime, crate::NamespaceToken) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<crate::InterceptedDispatchResult<M>, crate::RuntimeError>,
+        >,
+    {
+        if self.is_verb_disabled("search") {
+            return None;
+        }
+        let owner: &'a dyn crate::PackRuntime = self
+            .packs
+            .iter()
+            .find(|pack| {
+                pack.handlers()
+                    .iter()
+                    .any(|handler| handler.name == "search")
+            })?
+            .as_ref();
+        Some(
+            self.dispatch_intercepted_with_token_and_disposition(
+                "search",
+                params,
+                identity,
+                move |gate_token| async move {
+                    let token = if gate_token.gate_explicit_namespace().is_some() {
+                        gate_token
+                    } else {
+                        let mut visible = match identity {
+                            Some(identity) => identity
+                                .visible_namespaces
+                                .iter()
+                                .filter_map(|namespace| Namespace::parse(namespace).ok())
+                                .collect(),
+                            None => self.visible_namespaces.clone(),
+                        };
+                        if let Some(namespace) = gate_token
+                            .actor()
+                            .binding_id()
+                            .filter(|id| *id != Namespace::LOCAL)
+                            .and_then(|id| Namespace::parse(id).ok())
+                        {
+                            visible.push(namespace);
+                        }
+                        visible.push(Namespace::local());
+                        NamespaceToken::mint_with_visibility(
+                            Namespace::local(),
+                            visible,
+                            gate_token.actor().clone(),
+                        )
+                        .with_gate_namespace(gate_token.gate_namespace().clone())
+                        .with_gate_explicit_namespace(
+                            gate_token.gate_explicit_namespace().map(str::to_owned),
+                        )
+                        .with_request_id(gate_token.request_id())
+                        .with_owned_namespaces(gate_token.owned_namespaces().to_vec())
+                        .with_process_ref(gate_token.process_ref().map(str::to_owned))
+                    };
+                    dispatch(owner, token).await
+                },
+            )
+            .await,
+        )
+    }
+
     /// Select the owning pack's backend for a note-kind KG read. The caller
     /// keeps its already-authorized token; this only selects storage.
     pub fn kg_note_read_runtime_for_kind<'a>(
@@ -298,6 +374,14 @@ impl VerbRegistry {
         &self.visible_namespaces
     }
 
+    /// This registry's construction-baked `[actor] owned_namespaces`
+    /// (ADR-021 Delta 1), used absent a per-request [`RequestIdentity`]
+    /// override. Declared by the caller, never inferred; read only by the
+    /// `memory.apply_batch` old-row namespace check.
+    pub fn owned_namespaces(&self) -> &[Namespace] {
+        &self.owned_namespaces
+    }
+
     /// This registry's configured audit `EventStore`, if any (ADR-094).
     ///
     /// Lets background tasks that hold a `VerbRegistry` but do not go through
@@ -345,6 +429,9 @@ impl VerbRegistry {
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
                 admission_unresolved_obligations_last_at_ms:
                     audit_admission_unresolved_obligation_last_at_ms(),
+                audit_success_rows_omitted: self.audit_success_rows_omitted_counts(),
+                audit_success_rows_sampled_out: self.audit_success_rows_sampled_out_counts(),
+                audit_success_rows_forced: self.audit_success_rows_forced_counts(),
             }
         })
     }
@@ -496,6 +583,7 @@ impl VerbRegistry {
         ("comm", "comm.probe"),
         // gtd
         ("gtd", "gtd.census"),
+        ("gtd", "gtd.counts"),
         ("gtd", "gtd.next"),
         ("gtd", "gtd.tasks"),
         // kg

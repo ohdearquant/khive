@@ -101,7 +101,7 @@ impl NoteSearchAnnProvider for MemoryNoteSearchAnnProvider {
         let mut fetch = (top_k as usize)
             .saturating_mul(4)
             .max((top_k as usize).saturating_add(32));
-        let rounds = crate::handlers::ann_overfetch_max_rounds().max(1);
+        let rounds = crate::handlers::ann_overfetch_max_rounds(&self.runtime).max(1);
         for round in 0..rounds {
             let Some((candidates, watermark)) = ann::search_loaded_with_seq_route(
                 &self.ann,

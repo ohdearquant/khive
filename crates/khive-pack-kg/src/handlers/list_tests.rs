@@ -215,3 +215,136 @@ async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_
         assert_eq!(rows.len(), expected_rows, "{case} namespace scope");
     }
 }
+
+async fn archive_list_fixture() -> (
+    khive_runtime::KhiveRuntime,
+    khive_runtime::NamespaceToken,
+    [uuid::Uuid; 4],
+) {
+    let runtime = khive_runtime::KhiveRuntime::memory().unwrap();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let mut ids = Vec::new();
+    for (index, status) in ["archived", "active", "archived", "active"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut note =
+            khive_storage::note::Note::new("local", "observation", "archive selector fixture");
+        note.status = status.into();
+        note.created_at = 40 - index as i64 * 10;
+        note.updated_at = note.created_at;
+        note.key = Some(format!("archive-probe/{index}"));
+        note.properties = Some(
+            serde_json::json!({"status": if status == "active" { "archived" } else { "active" }}),
+        );
+        ids.push(note.id);
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(note)
+            .await
+            .unwrap();
+    }
+    (runtime, token, ids.try_into().unwrap())
+}
+
+fn archive_list_rows(response: &serde_json::Value) -> &[serde_json::Value] {
+    response
+        .get("items")
+        .or_else(|| response.get("notes"))
+        .unwrap()
+        .as_array()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn kg_note_status_defaults_and_explicit_selectors_cover_all_list_routes() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (runtime, token, ids) = archive_list_fixture().await;
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(crate::KgPack::new(runtime.clone()));
+        let registry = builder.build().unwrap();
+        let pack = crate::KgPack::new(runtime.clone());
+        for mode in [serde_json::json!({}), serde_json::json!({"after": ""}), serde_json::json!({"key_prefix": "archive-probe/"})] {
+            for (selector, expected_first, expected_count) in [(None, ids[1], 2), (Some("archived"), ids[0], 2), (Some("any"), ids[0], 4)] {
+                let mut params = serde_json::json!({"kind": "note", "limit": 1});
+                params.as_object_mut().unwrap().extend(mode.as_object().unwrap().clone());
+                if let Some(selector) = selector { params["note_status"] = selector.into(); }
+                let result = pack.handle_list(&token, params.clone(), &registry).await.unwrap();
+                let rows = archive_list_rows(&result);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["id"], expected_first.to_string(), "default must select the active column before pagination: {params}");
+                params["limit"] = 10.into();
+                let result = pack.handle_list(&token, params, &registry).await.unwrap();
+                assert_eq!(archive_list_rows(&result).len(), expected_count);
+            }
+        }
+        let result = pack.handle_list(&token, serde_json::json!({
+            "kind": "note", "key_prefix": "archive-probe/", "after_key": "archive-probe/0", "limit": 1,
+        }), &registry).await.unwrap();
+        assert_eq!(archive_list_rows(&result)[0]["id"], ids[1].to_string(),
+            "an archived after_key stays a valid explicit cursor boundary");
+    }).await.expect("bounded actual KG list regression");
+}
+
+#[tokio::test]
+async fn note_status_is_note_only_even_when_null() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let runtime = khive_runtime::KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(khive_runtime::Namespace::local()).unwrap();
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(crate::KgPack::new(runtime.clone()));
+        let registry = builder.build().unwrap();
+        let pack = crate::KgPack::new(runtime);
+        for kind in ["entity", "edge", "event", "proposal"] {
+            for selector in [serde_json::Value::Null, serde_json::json!("any")] {
+                let error = pack.handle_list(&token, serde_json::json!({"kind": kind, "note_status": selector}), &registry).await.unwrap_err();
+                assert!(matches!(error, khive_runtime::RuntimeError::InvalidInput(ref message) if message.contains("note_status") && message.contains("note lists")));
+            }
+        }
+    }).await.expect("bounded note-only selector scope regression");
+}
+
+#[test]
+fn note_status_parser_and_workflow_status_are_distinct() {
+    use khive_storage::note::NoteStatusSelector;
+    for (wire, expected) in [
+        ("active", NoteStatusSelector::Active),
+        ("archived", NoteStatusSelector::Archived),
+        ("any", NoteStatusSelector::Any),
+    ] {
+        let params: ListParams =
+            serde_json::from_value(serde_json::json!({"kind": "note", "note_status": wire}))
+                .unwrap();
+        assert_eq!(params.note_status, Some(expected));
+    }
+    for invalid in [
+        serde_json::json!("deleted"),
+        serde_json::json!("Active"),
+        serde_json::json!("pending"),
+        serde_json::json!(1),
+    ] {
+        assert!(serde_json::from_value::<ListParams>(
+            serde_json::json!({"kind": "note", "note_status": invalid})
+        )
+        .is_err());
+    }
+    let params: ListParams = serde_json::from_value(
+        serde_json::json!({"kind": "note", "note_status": "archived", "status": "pending"}),
+    )
+    .unwrap();
+    let filter = crate::handlers::note_list::note_filter(&params, Some("scheduled_event")).unwrap();
+    assert_eq!(filter.note_status, Some(NoteStatusSelector::Archived));
+    assert!(filter.property_filters.iter().any(|predicate| predicate.json_path == "$.status"
+        && matches!(&predicate.value, khive_storage::SqlValue::Text(value) if value == "pending")));
+    let params: ListParams =
+        serde_json::from_value(serde_json::json!({"kind": "note", "note_status": null})).unwrap();
+    assert_eq!(
+        crate::handlers::note_list::note_filter(&params, None)
+            .unwrap()
+            .note_status,
+        Some(NoteStatusSelector::Active)
+    );
+}

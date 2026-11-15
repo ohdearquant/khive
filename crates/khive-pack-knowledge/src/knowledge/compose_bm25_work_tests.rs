@@ -364,3 +364,62 @@ fn compose_result_metadata_bits_and_order_match_original_scorer() {
         );
     }
 }
+
+#[test]
+fn shared_bm25_tf_cap_cannot_preserve_compose_scores() {
+    let above_cap = "needle ".repeat(256);
+    let at_cap = format!("{}padding", "needle ".repeat(255));
+    let documents = [("", above_cap.as_str()), ("", at_cap.as_str())];
+    let query = tokenize_checked("needle").unwrap();
+    let local = compute_bm25_scores(&query, &documents).unwrap();
+    assert_eq!(local.len(), 2);
+    assert!(local.iter().all(|score| score.is_finite() && *score > 0.0));
+    assert!(
+        local[0] > local[1],
+        "compose must distinguish the uncapped term frequencies"
+    );
+
+    let mut shared =
+        khive_retrieval::Bm25Index::try_new(khive_retrieval::Bm25Config::new(1.5, 0.75)).unwrap();
+    for (id, text, expected_needle_count) in [
+        ("above_cap", above_cap.as_str(), 256usize),
+        ("at_cap", at_cap.as_str(), 255usize),
+    ] {
+        let tokens = shared.tokenizer().tokenize(text);
+        assert_eq!(tokens.len(), 256);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.as_str() == "needle")
+                .count(),
+            expected_needle_count
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.as_str() == "padding")
+                .count(),
+            256 - expected_needle_count
+        );
+        shared.index_document(id, text).unwrap();
+    }
+    assert_eq!(shared.doc_count(), 2);
+    assert_eq!(shared.avg_doc_length(), 256.0);
+    let results = shared.search("needle", 2);
+    assert_eq!(results.len(), 2);
+    let raw_score = |id: &str| {
+        results
+            .iter()
+            .find(|(result_id, _)| result_id.as_ref() == id)
+            .expect("both fixture IDs must be present")
+            .1
+            .to_raw()
+    };
+    let above_raw = raw_score("above_cap");
+    let at_raw = raw_score("at_cap");
+    assert!(above_raw > 0 && at_raw > 0);
+    assert_eq!(
+        above_raw, at_raw,
+        "shared compact TF storage makes these distinct compose scores tie"
+    );
+}

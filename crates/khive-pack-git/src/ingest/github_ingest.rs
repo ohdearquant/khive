@@ -135,6 +135,9 @@ pub(super) async fn ingest_prs(
             }
         };
 
+    let mut annotation_replays =
+        project_annotation_census::ReplayAnnotationChecks::new(&checkpoint);
+
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
     // in this pass's warnings), but `checkpoint.floor` no longer advances past the
@@ -200,6 +203,24 @@ pub(super) async fn ingest_prs(
                 if let Some(oid) = masked.merge_commit_oid.as_ref() {
                     merge_sha_to_pr.insert(oid.clone(), existing);
                 }
+                if annotation_replays.reserve(
+                    "prs",
+                    masked.number,
+                    masked.updated_at.as_deref(),
+                    existing,
+                    report,
+                ) {
+                    project_annotation_census::append_existing_note_warning(
+                        runtime,
+                        token,
+                        project_id,
+                        "pull_request",
+                        masked.number,
+                        existing,
+                        report,
+                    )
+                    .await;
+                }
                 continue;
             }
             if !budget.try_consume() {
@@ -215,6 +236,16 @@ pub(super) async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
+                project_annotation_census::append_existing_note_warning(
+                    runtime,
+                    token,
+                    project_id,
+                    "pull_request",
+                    masked.number,
+                    existing,
+                    report,
+                )
+                .await;
                 if !cursor_stalled
                     && !checkpoint.acknowledge(
                         masked.number,
@@ -259,10 +290,13 @@ pub(super) async fn ingest_prs(
                 NAME_MAX_CHARS,
             );
 
-            let result = match crate::dispatch_from_token(
+            let created = match create_github_record(
                 registry,
                 token,
-                "create",
+                report,
+                "pull_request",
+                masked.number,
+                project_id,
                 json!({
                         "kind": "pull_request",
                         "name": name,
@@ -273,19 +307,14 @@ pub(super) async fn ingest_prs(
             )
             .await
             {
-                Ok(v) => v,
-                Err(e) => {
-                    record_write_failure(
-                        report,
-                        "create",
-                        "pull_request",
-                        format!("#{}", masked.number),
-                        e,
-                    );
+                Some(created) => created,
+                None => {
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
+            let result = created.response;
+            let stored_content = created.content;
 
             let id = result
                 .get("id")
@@ -298,7 +327,7 @@ pub(super) async fn ingest_prs(
                 }
                 new_records.push(NewRecordForRef {
                     id,
-                    text: content.clone(),
+                    text: stored_content.clone(),
                 });
             }
             report.prs_ingested += 1;
@@ -418,6 +447,9 @@ pub(super) async fn ingest_issues(
         }
     };
 
+    let mut annotation_replays =
+        project_annotation_census::ReplayAnnotationChecks::new(&checkpoint);
+
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
     // pass are still attempted, but `checkpoint.floor` freezes at the stall point
@@ -479,10 +511,27 @@ pub(super) async fn ingest_issues(
             .retain(|number, _| undated.contains(number));
 
         for masked in masked_page {
-            if checkpoint
-                .acknowledged(masked.number, masked.updated_at.as_deref())
-                .is_some()
+            if let Some(existing) =
+                checkpoint.acknowledged(masked.number, masked.updated_at.as_deref())
             {
+                if annotation_replays.reserve(
+                    "issues",
+                    masked.number,
+                    masked.updated_at.as_deref(),
+                    existing,
+                    report,
+                ) {
+                    project_annotation_census::append_existing_note_warning(
+                        runtime,
+                        token,
+                        project_id,
+                        "issue",
+                        masked.number,
+                        existing,
+                        report,
+                    )
+                    .await;
+                }
                 continue;
             }
             if !budget.try_consume() {
@@ -494,6 +543,16 @@ pub(super) async fn ingest_issues(
                 find_by_number(runtime, token, "issue", project_id, masked.number).await?
             {
                 report.issues_skipped_existing += 1;
+                project_annotation_census::append_existing_note_warning(
+                    runtime,
+                    token,
+                    project_id,
+                    "issue",
+                    masked.number,
+                    existing,
+                    report,
+                )
+                .await;
                 if !cursor_stalled
                     && !checkpoint.acknowledge(
                         masked.number,
@@ -550,10 +609,13 @@ pub(super) async fn ingest_issues(
             }
             let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
-            let result = match crate::dispatch_from_token(
+            let created = match create_github_record(
                 registry,
                 token,
-                "create",
+                report,
+                "issue",
+                number,
+                project_id,
                 json!({
                         "kind": "issue",
                         "name": name,
@@ -564,13 +626,14 @@ pub(super) async fn ingest_issues(
             )
             .await
             {
-                Ok(v) => v,
-                Err(e) => {
-                    record_write_failure(report, "create", "issue", format!("#{number}"), e);
+                Some(created) => created,
+                None => {
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
+            let result = created.response;
+            let stored_content = created.content;
             let id = result
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -578,7 +641,7 @@ pub(super) async fn ingest_issues(
             if let Some(id) = id {
                 new_records.push(NewRecordForRef {
                     id,
-                    text: content.clone(),
+                    text: stored_content.clone(),
                 });
             }
 

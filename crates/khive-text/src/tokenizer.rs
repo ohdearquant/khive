@@ -32,27 +32,25 @@ pub struct CjkCharTokenizer;
 impl Tokenizer for CjkCharTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
         let mut tokens = Vec::new();
-        let mut latin_buf = String::new();
+        let mut non_cjk_start = 0;
 
-        let flush = |buf: &mut String, out: &mut Vec<String>| {
-            for part in buf.split_whitespace() {
+        let flush = |span: &str, out: &mut Vec<String>| {
+            for part in span.split_whitespace() {
                 let p = part.trim_matches(|c: char| c.is_ascii_punctuation());
                 if !p.is_empty() {
                     out.push(p.to_string());
                 }
             }
-            buf.clear();
         };
 
-        for ch in text.chars() {
+        for (index, ch) in text.char_indices() {
             if is_cjk_char(ch) {
-                flush(&mut latin_buf, &mut tokens);
+                flush(&text[non_cjk_start..index], &mut tokens);
                 tokens.push(ch.to_string());
-            } else {
-                latin_buf.push(ch);
+                non_cjk_start = index + ch.len_utf8();
             }
         }
-        flush(&mut latin_buf, &mut tokens);
+        flush(&text[non_cjk_start..], &mut tokens);
         tokens
     }
 }

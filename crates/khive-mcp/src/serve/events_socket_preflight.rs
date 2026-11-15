@@ -5,6 +5,23 @@ use khive_runtime::{BackendConfig, BackendId, BackendKind, RuntimeConfig};
 
 use super::{prepare_daemon_store_plan, DaemonStorePlan};
 
+/// Resolve and validate daemon launch arguments without opening or claiming
+/// stores, constructing providers, or contacting an incumbent daemon.
+pub fn preflight_daemon_configuration(args: &crate::args::Args) -> anyhow::Result<()> {
+    anyhow::ensure!(args.daemon, "daemon preflight requires --daemon");
+    let (explicit, namespace) =
+        crate::args::resolve_cli_namespace(args).map_err(anyhow::Error::msg)?;
+    let mut prepared = super::prepare_server_boot(args, namespace, explicit, explicit)?;
+    khive_runtime::PackRegistry::validate_pack_selection(&prepared.config.packs)?;
+    prepare_preflighted_daemon_store_plan(
+        &mut prepared.config,
+        &mut prepared.db_anchor,
+        &mut prepared.khive_cfg.backends,
+        args.db.as_deref() == Some(":memory:"),
+    )?;
+    Ok(())
+}
+
 /// Validate the socket that the resolved boot topology will actually use.
 /// Daemon hosts call this after freezing backend paths but before binding any
 /// store files; the public builders repeat it before opening their backends.

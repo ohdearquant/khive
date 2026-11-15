@@ -6,33 +6,83 @@ Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do 
 
 Reference baselines for `khive-query`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
 
-| Benchmark                                        | Reference median | A/A ratio | Baseline commit                            | Commit date |
-| ------------------------------------------------ | ---------------- | --------- | ------------------------------------------ | ----------- |
-| `gql/gql/node_with_limit`                        | 457.744 ns       | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql/gql/simple_node`                            | 434.744 ns       | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql/gql/two_node_edge`                          | 706.192 ns       | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/node_multi_property_map`        | 922.358 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/three_node_chain`               | 1.048 µs         | 1.020     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/three_node_mixed_direction`     | 1.118 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/undirected_edge`                | 743.697 ns       | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/variable_length_multi_rel`      | 861.763 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_complex/gql/variable_length_with_where`     | 985.223 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/node_with_properties`            | 684.617 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/where_and`                       | 1.107 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/where_and_or`                    | 1.235 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/where_eq_string`                 | 998.720 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/where_or`                        | 1.041 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `gql_medium/gql/where_with_edge_var`             | 973.680 ns       | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `parse_auto/auto/gql_dispatch`                   | 732.759 ns       | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `parse_auto/auto/gql_with_leading_whitespace`    | 518.975 ns       | 1.028     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `parse_auto/auto/sparql_dispatch`                | 1.402 µs         | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `parse_auto/auto/sparql_with_leading_whitespace` | 1.060 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql/sparql/explicit_range`                   | 1.070 µs         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql/sparql/two_node`                         | 1.395 µs         | 1.022     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql/sparql/variable_length_plus`             | 1.424 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql_medium/sparql/kind_and_property_filter`  | 1.830 µs         | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql_medium/sparql/three_node_chain`          | 1.807 µs         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
-| `sparql_medium/sparql/with_property_filter`      | 1.725 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                                                                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-query:parse_bench/gql/gql/node_with_limit/median_ns`                                                     | 449.837 ns       | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql/gql/simple_node/median_ns`                                                         | 415.598 ns       | 1.008     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql/gql/two_node_edge/median_ns`                                                       | 709.910 ns       | 1.023     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/node_multi_property_map/median_ns`                                     | 932.250 ns       | 1.022     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/three_node_chain/median_ns`                                            | 1.027 µs         | 1.015     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/three_node_mixed_direction/median_ns`                                  | 1.110 µs         | 1.019     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/undirected_edge/median_ns`                                             | 724.750 ns       | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/variable_length_multi_rel/median_ns`                                   | 892.228 ns       | 1.035     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_complex/gql/variable_length_with_where/median_ns`                                  | 1.011 µs         | 1.009     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/node_with_properties/median_ns`                                         | 644.221 ns       | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/where_and/median_ns`                                                    | 1.112 µs         | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/where_and_or/median_ns`                                                 | 1.266 µs         | 1.017     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/where_eq_string/median_ns`                                              | 998.115 ns       | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/where_or/median_ns`                                                     | 1.042 µs         | 1.009     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/gql_medium/gql/where_with_edge_var/median_ns`                                          | 980.276 ns       | 1.009     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/parse_auto/auto/gql_dispatch/median_ns`                                                | 741.229 ns       | 1.019     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/parse_auto/auto/gql_with_leading_whitespace/median_ns`                                 | 511.780 ns       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/parse_auto/auto/sparql_dispatch/median_ns`                                             | 1.364 µs         | 1.005     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/parse_auto/auto/sparql_with_leading_whitespace/median_ns`                              | 1.079 µs         | 1.011     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql/sparql/explicit_range/median_ns`                                                | 1.099 µs         | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql/sparql/two_node/median_ns`                                                      | 1.392 µs         | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql/sparql/variable_length_plus/median_ns`                                          | 1.422 µs         | 1.010     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql_medium/sparql/kind_and_property_filter/median_ns`                               | 1.821 µs         | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql_medium/sparql/three_node_chain/median_ns`                                       | 1.815 µs         | 1.032     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:parse_bench/sparql_medium/sparql/with_property_filter/median_ns`                                   | 1.760 µs         | 1.033     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/node_multi_property_map/median_ns`                   | 6.390 µs         | 1.015     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/three_node_chain/median_ns`                          | 9.914 µs         | 1.023     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/three_node_mixed_direction/median_ns`                | 12.262 µs        | 1.014     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/undirected_edge/median_ns`                           | 8.380 µs         | 1.022     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/variable_length_multi_rel/median_ns`                 | 5.292 µs         | 1.107     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/complex/variable_length_with_where/median_ns`                | 5.355 µs         | 1.082     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/node_with_properties/median_ns`                       | 3.477 µs         | 1.032     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/where_and/median_ns`                                  | 8.611 µs         | 1.011     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/where_and_or/median_ns`                               | 7.276 µs         | 1.016     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/where_eq_string/median_ns`                            | 6.487 µs         | 1.039     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/where_or/median_ns`                                   | 6.678 µs         | 1.038     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/medium/where_with_edge_var/median_ns`                        | 9.436 µs         | 1.064     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/simple/node_with_limit/median_ns`                            | 3.493 µs         | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/simple/simple_node/median_ns`                                | 3.419 µs         | 1.036     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/compile/simple/two_node_edge/median_ns`                              | 8.173 µs         | 1.017     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/large/parse_10_nodes_20_properties/median_ns`                        | 7.125 µs         | 1.018     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/large/parse_compile_10_nodes_20_properties/median_ns`                | 40.670 µs        | 1.005     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/sparql_complex/four_edges_six_triples_bounded_paths/median_ns`       | 3.625 µs         | 1.024     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/node_multi_property_map/median_ns`                  | 188.648 ns       | 1.007     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/three_node_chain/median_ns`                         | 259.413 ns       | 1.007     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/three_node_mixed_direction/median_ns`               | 420.954 ns       | 1.008     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/undirected_edge/median_ns`                          | 266.319 ns       | 1.014     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/variable_length_multi_rel/median_ns`                | 242.553 ns       | 1.020     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/complex/variable_length_with_where/median_ns`               | 191.998 ns       | 1.012     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/node_with_properties/median_ns`                      | 110.181 ns       | 1.018     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/where_and/median_ns`                                 | 291.484 ns       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/where_and_or/median_ns`                              | 312.341 ns       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/where_eq_string/median_ns`                           | 269.070 ns       | 1.008     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/where_or/median_ns`                                  | 292.109 ns       | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/medium/where_with_edge_var/median_ns`                       | 278.475 ns       | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/simple/node_with_limit/median_ns`                           | 110.082 ns       | 1.021     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/simple/simple_node/median_ns`                               | 109.179 ns       | 1.005     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate/simple/two_node_edge/median_ns`                             | 257.092 ns       | 1.018     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/node_multi_property_map/median_ns`    | 197.801 ns       | 1.130     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/three_node_chain/median_ns`           | 260.353 ns       | 1.009     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/three_node_mixed_direction/median_ns` | 431.376 ns       | 1.067     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/undirected_edge/median_ns`            | 271.429 ns       | 1.109     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/variable_length_multi_rel/median_ns`  | 236.320 ns       | 1.080     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/complex/variable_length_with_where/median_ns` | 200.407 ns       | 1.109     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/node_with_properties/median_ns`        | 112.445 ns       | 1.026     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/where_and/median_ns`                   | 285.833 ns       | 1.000     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/where_and_or/median_ns`                | 314.855 ns       | 1.052     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/where_eq_string/median_ns`             | 267.086 ns       | 1.003     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/where_or/median_ns`                    | 286.595 ns       | 1.002     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/medium/where_with_edge_var/median_ns`         | 273.819 ns       | 1.006     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/simple/node_with_limit/median_ns`             | 109.600 ns       | 1.015     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/simple/simple_node/median_ns`                 | 110.279 ns       | 1.016     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
+| `khive-query:pipeline_bench/query_pipeline/validate_with_warnings/simple/two_node_edge/median_ns`               | 250.018 ns       | 1.004     | `46b7d9c5f8dd0b019a0af0ab2410aa0242b4122d` | 2026-10-24  |
 
 <!-- bench-reference:end -->
 
@@ -168,19 +218,19 @@ cargo bench -p khive-query --bench pipeline_bench -- --quick --noplot
 cargo bench -p khive-query --benches -- --quick --noplot
 ```
 
-The owning benchmark component is `ann-query`. New baselines are **pending** a
-qualified-host run of that component, which records the commit, toolchain,
-machine, flags, command, and sample report with the measurements. Historical
-values above remain observations from their recorded release.
+The owning benchmark component is `ann-query`. Its qualified-host baselines are in
+the reference block at the top of this file, which names the baseline commit and the
+comparison class (compiler, profile and machine). Historical values above remain
+observations from their recorded release.
 
-| Group            | Scenario names                                             | Measurement                                                                   | Input sizes                                                                                          | Baseline |
-| ---------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- |
-| `query_pipeline` | `compile/{simple,medium,complex}/{fixture}`                | Public `compile` on a parsed AST, including its internal clone and validation | All 15 existing GQL strings; one namespace; `max_limit=500`                                          | pending  |
-| `query_pipeline` | `validate/{simple,medium,complex}/{fixture}`               | Public in-place `validate` on a fresh AST                                     | Same 15 strings                                                                                      | pending  |
-| `query_pipeline` | `validate_with_warnings/{simple,medium,complex}/{fixture}` | Public validation and warning collection on a fresh AST                       | Same 15 strings; these valid fixtures return no warnings                                             | pending  |
-| `query_pipeline` | `large/parse_10_nodes_20_properties`                       | GQL parsing                                                                   | Generated 10-node, nine-edge chain; 20 string-valued properties on its first node                    | pending  |
-| `query_pipeline` | `large/parse_compile_10_nodes_20_properties`               | One parse followed by public compile                                          | Same generated chain; one namespace; `max_limit=500`                                                 | pending  |
-| `query_pipeline` | `sparql_complex/four_edges_six_triples_bounded_paths`      | SPARQL parsing                                                                | Five-node chain; four relation triples, one kind triple, one property triple; `{1,3}` and `+` bounds | pending  |
+| Group            | Scenario names                                             | Measurement                                                                   | Input sizes                                                                                          | Baseline        |
+| ---------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------- |
+| `query_pipeline` | `compile/{simple,medium,complex}/{fixture}`                | Public `compile` on a parsed AST, including its internal clone and validation | All 15 existing GQL strings; one namespace; `max_limit=500`                                          | reference block |
+| `query_pipeline` | `validate/{simple,medium,complex}/{fixture}`               | Public in-place `validate` on a fresh AST                                     | Same 15 strings                                                                                      | reference block |
+| `query_pipeline` | `validate_with_warnings/{simple,medium,complex}/{fixture}` | Public validation and warning collection on a fresh AST                       | Same 15 strings; these valid fixtures return no warnings                                             | reference block |
+| `query_pipeline` | `large/parse_10_nodes_20_properties`                       | GQL parsing                                                                   | Generated 10-node, nine-edge chain; 20 string-valued properties on its first node                    | reference block |
+| `query_pipeline` | `large/parse_compile_10_nodes_20_properties`               | One parse followed by public compile                                          | Same generated chain; one namespace; `max_limit=500`                                                 | reference block |
+| `query_pipeline` | `sparql_complex/four_edges_six_triples_bounded_paths`      | SPARQL parsing                                                                | Five-node chain; four relation triples, one kind triple, one property triple; `{1,3}` and `+` bounds | reference block |
 
 The 15 GQL fixture suffixes exactly reuse the existing inputs:
 
@@ -237,13 +287,13 @@ compiler. No grammar or compiler behavior is changed for these benchmarks.
 All rows are advisory latency trends. No fixed timing threshold, allocation
 promise, or new deterministic count gate is introduced. Existing historical
 values are not current measurements or guarantees. Baselines for the new harness
-remain pending the `ann-query` qualified-host run.
+are in the reference block at the top of this file.
 
 | Operation                    | Input                          | Metric         | Bound                                        | Baseline             |
 | ---------------------------- | ------------------------------ | -------------- | -------------------------------------------- | -------------------- |
 | GQL parse (simple_node)      | inline simple node             | latency median | Advisory trend; last ledger value 497.1 ns   | historical: 497.1 ns |
 | GQL parse (three_node_chain) | complex 3-node chain           | latency median | Advisory trend; last ledger value 1.150 µs   | historical: 1.150 µs |
 | SPARQL parse (two_node)      | 2-node SPARQL                  | latency median | Advisory trend; last ledger value 1.406 µs   | historical: 1.406 µs |
-| compile (simple GQL)         | simple_node AST                | latency median | Advisory trend against the recorded baseline | pending              |
-| validate (medium GQL)        | where_and AST                  | latency median | Advisory trend against the recorded baseline | pending              |
-| parse + compile (large)      | 10-node chain, 20-property map | latency median | Advisory trend against the recorded baseline | pending              |
+| compile (simple GQL)         | simple_node AST                | latency median | Advisory trend against the recorded baseline | reference block      |
+| validate (medium GQL)        | where_and AST                  | latency median | Advisory trend against the recorded baseline | reference block      |
+| parse + compile (large)      | 10-node chain, 20-property map | latency median | Advisory trend against the recorded baseline | reference block      |

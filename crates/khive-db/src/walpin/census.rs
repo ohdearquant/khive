@@ -47,7 +47,7 @@ pub(super) fn census_visible_self_pid() -> Option<u32> {
         .ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn census_visible_self_pid() -> Option<u32> {
     Some(std::process::id())
 }
@@ -76,6 +76,7 @@ impl CensusResult {
         self.apply_self_canary_for(census_visible_self_pid());
     }
 
+    #[cfg(any(unix, test))]
     pub(super) fn apply_self_canary_for(&mut self, expected_self: Option<u32>) {
         if expected_self.is_none_or(|pid| !self.holders.contains(&pid)) {
             self.truncated = true;

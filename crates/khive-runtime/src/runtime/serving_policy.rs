@@ -12,7 +12,7 @@ impl KhiveRuntime {
 
     /// Install before registering or cloning serving handles; no request-time mutation.
     pub fn with_outbound_email_policy(mut self, policy: crate::OutboundEmailPolicy) -> Self {
-        self.outbound_email_policy = policy;
+        self.outbound_email_policy = std::sync::Arc::new(policy);
         self
     }
 

@@ -6,7 +6,7 @@ fn variable_length_or_across_endpoints_rejected() {
     let result = compile(&q, &opts());
     assert!(
         matches!(result, Err(QueryError::Unsupported(_))),
-        "MAJ-1: OR spanning both endpoints must return Unsupported; got {result:?}"
+        "OR spanning both endpoints must return Unsupported; got {result:?}"
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -203,6 +203,7 @@ fn variable_length_recursive_member_namespace_scopes_intermediates() {
 fn compile_malformed_ast_returns_error_not_panic() {
     use crate::ast::{EdgeDirection, EdgePattern, GqlQuery, MatchPattern, PatternElement};
     let q = GqlQuery {
+        order_by: Vec::new(),
         pattern: MatchPattern {
             elements: vec![PatternElement::Edge(EdgePattern {
                 variable: None,

@@ -1,7 +1,7 @@
 use crate::{RuntimeError, RuntimeResult};
 
 pub(crate) fn validate_key(key: &str, refusal: &str) -> RuntimeResult<()> {
-    if key.len() > 512 || key.contains('\0') {
+    if !khive_storage::note::note_key_is_valid(key) {
         return Err(RuntimeError::InvalidInput(refusal.into()));
     }
     Ok(())

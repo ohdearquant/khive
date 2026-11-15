@@ -21,6 +21,7 @@ pub use dispatch_trait::*;
 
 #[cfg(all(unix, feature = "fault-injection"))]
 pub use connection::handle_conn_for_test;
+#[cfg(unix)]
 use connection::*;
 
 #[cfg(unix)]
@@ -33,8 +34,8 @@ pub use boot_guard::*;
 use locks::open_lock_file;
 #[cfg(unix)]
 pub use locks::{
-    acquire_daemon_boot_guard, acquire_recovery_lock, try_acquire_daemon_boot_guard_until,
-    try_acquire_recoverer_lock_until, DaemonBootGuard,
+    acquire_daemon_boot_guard, acquire_recovery_lock, open_mutating_daemon_lock,
+    try_acquire_daemon_boot_guard_until, try_acquire_recoverer_lock_until, DaemonBootGuard,
 };
 #[cfg(unix)]
 pub(crate) use locks::{peer_uid, uid_is_permitted};
@@ -153,17 +154,19 @@ mod config_id;
 use config_id::parse_config_id;
 pub use config_id::{
     config_id_extra_embedder_exclusions, config_ids_compatible, first_config_mismatch_field,
+    no_receipt_ring_fingerprint, visibility_receipt_policy_fingerprint,
 };
 
 mod wire_frames;
+pub use wire_frames::{
+    drop_error_detail_iteratively, error_detail_value_within_limit, CheckpointStoreMetrics,
+    DaemonDispatchError, DaemonRequestFrame, DaemonResponseFrame, MetricsSnapshot,
+    ERROR_DETAIL_NESTING_DEPTH_LIMIT,
+};
 #[cfg(unix)]
 pub use wire_frames::{read_frame, write_frame};
 #[cfg(unix)]
 use wire_frames::{read_initial_frame, take_daemon_lexical_timeout_marker};
-pub use wire_frames::{
-    CheckpointStoreMetrics, DaemonDispatchError, DaemonRequestFrame, DaemonResponseFrame,
-    MetricsSnapshot, ERROR_DETAIL_NESTING_DEPTH_LIMIT,
-};
 
 /// Returns `true` for non-empty env values that are not `"0"` or `"false"`.
 #[cfg(unix)]

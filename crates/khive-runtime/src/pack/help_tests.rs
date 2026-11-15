@@ -87,7 +87,7 @@ struct HelpPack {
 
 impl Pack for HelpPack {
     const NAME: &'static str = "helptest";
-    const NOTE_KINDS: &'static [&'static str] = &[];
+    const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
         HandlerDef {

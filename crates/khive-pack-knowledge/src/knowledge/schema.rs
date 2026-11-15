@@ -135,6 +135,17 @@ pub(crate) struct UpsertAtomsParams {
     pub chunk_size: Option<usize>,
 }
 
+/// Public-upsert admission decodes each item independently, retaining its index.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpsertAtomsAdmissionParams {
+    pub atoms: Vec<Value>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub chunk_size: Option<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) enum AtomWrite {
     Upsert(AtomInput),

@@ -72,6 +72,37 @@ async fn atom_rows(runtime: &KhiveRuntime) -> Value {
     serde_json::to_value(rows).expect("snapshot JSON")
 }
 
+async fn domain_rows(runtime: &KhiveRuntime) -> Value {
+    let mut reader = runtime.sql().reader().await.expect("fixture domain reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT * FROM knowledge_domains ORDER BY id".into(),
+            params: vec![],
+            label: Some("test.refusal_events.domain_snapshot".into()),
+        })
+        .await
+        .expect("all domain columns");
+    serde_json::to_value(rows).expect("domain snapshot JSON")
+}
+
+async fn domain_row(runtime: &KhiveRuntime, id: &str) -> Value {
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .expect("fixture domain row reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT * FROM knowledge_domains WHERE id = ?1".into(),
+            params: vec![SqlValue::Text(id.into())],
+            label: Some("test.refusal_events.allowed_prefix_row".into()),
+        })
+        .await
+        .expect("prefix row query")
+        .expect("real committed prefix row");
+    serde_json::to_value(row).expect("prefix row JSON")
+}
+
 async fn events(fixture: &Fixture, target: Option<&str>) -> Vec<Value> {
     let mut params = json!({
         "kind": "event", "event_kind": "refusal", "verb": "knowledge.upsert_atoms",
@@ -100,6 +131,7 @@ fn secret_projection(error: RuntimeError, location: &str) -> Value {
     assert_eq!(value["code"], "secret_detected");
     assert_eq!(value["message"], message);
     assert_eq!(value["location"], location);
+    assert_eq!(value["domain_disposition"], "not_committed");
     value
 }
 
@@ -226,6 +258,12 @@ async fn refusal_events_validation_refusal_keeps_original_error_and_old_row() {
     let message = error.to_string();
     let projection = runtime_error_value(error, DomainDisposition::Unknown);
     assert_eq!(projection["message"], message);
+    assert_eq!(projection["domain_disposition"], "not_committed");
+    assert_eq!(projection["validation_complete"], true);
+    assert_eq!(
+        projection["refused"],
+        json!([{ "index": 0, "field": "content", "reason": "invalid_input" }])
+    );
     assert_eq!(projection["refusal_recorded"], true);
     let rows = events(&fixture, old["id"].as_str()).await;
     assert_eq!(rows.len(), 1);
@@ -387,4 +425,263 @@ async fn refusal_events_deleted_and_domain_targets_do_not_acquire_atom_traces() 
         assert!(events(&fixture, None).await.is_empty());
         assert_eq!(atom_rows(&runtime).await, before);
     }
+}
+
+async fn projected_prewrite(fixture: &Fixture, verb: &str, params: Value) -> Value {
+    let error = fixture
+        .registry
+        .dispatch_with_disposition(verb, params, None)
+        .await
+        .expect_err("real handler refusal");
+    let borrowed = error.disposition();
+    assert_eq!(borrowed, DomainDisposition::NotCommitted);
+    assert_eq!(error.source().batch_write_disposition(), Some(borrowed));
+    let (source, disposition) = error.into_parts();
+    assert_eq!(
+        disposition, borrowed,
+        "owned and borrowed dispatch proof agree"
+    );
+    let value = runtime_error_value(source, disposition);
+    assert_eq!(value["domain_disposition"], disposition.as_str());
+    value
+}
+
+#[tokio::test]
+async fn atomic_parse_refusals_project_known_non_commit() {
+    let (runtime, fixture) = fixture();
+    seed(&fixture, "parse-bystander").await;
+    let before = atom_rows(&runtime).await;
+    for (verb, params) in [
+        (
+            "knowledge.upsert_atoms",
+            json!({"atoms":[{"slug":"missing-name"}]}),
+        ),
+        (
+            "knowledge.upsert_domains",
+            json!({"domains":[{"name":"missing slug"}]}),
+        ),
+    ] {
+        let value = projected_prewrite(&fixture, verb, params).await;
+        assert!(value["message"].as_str().unwrap().contains("bad params"));
+        assert_eq!(atom_rows(&runtime).await, before);
+    }
+}
+
+#[tokio::test]
+async fn atomic_input_validation_refusals_preserve_carrier_parity() {
+    let (runtime, fixture) = fixture();
+    let before = atom_rows(&runtime).await;
+    let value = projected_prewrite(
+        &fixture,
+        "knowledge.upsert_atoms",
+        json!({"atoms":[candidate("invalid-content", "too short")]}),
+    )
+    .await;
+    assert_eq!(value["validation_complete"], true);
+    assert_eq!(
+        value["refused"],
+        json!([{ "index":0, "field":"content", "reason":"invalid_input" }])
+    );
+    assert_eq!(value["details"]["index"], "0");
+    assert_eq!(value["details"]["field"], "content");
+    assert_eq!(atom_rows(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn atomic_scanner_refusals_preserve_carrier_parity_without_echo() {
+    let (runtime, fixture) = fixture();
+    let before = atom_rows(&runtime).await;
+    let secret = credential('0');
+    let value = projected_prewrite(
+        &fixture,
+        "knowledge.upsert_atoms",
+        json!({"atoms":[candidate(&secret, CONTENT)]}),
+    )
+    .await;
+    assert_eq!(value["code"], "secret_detected");
+    assert_eq!(value["location"], "atoms[0].slug");
+    assert_eq!(
+        value["refused"],
+        json!([{ "index":0, "field":"slug", "reason":"secret_detected" }])
+    );
+    assert!(!value.to_string().contains(&secret));
+    assert!(!value
+        .to_string()
+        .contains("FakeGitHubToken000000000000000000"));
+    assert_eq!(atom_rows(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn atomic_mixed_shape_submission_and_target_refusals_are_complete() {
+    let (runtime, fixture) = fixture();
+    seed(&fixture, "mixed-bystander").await;
+    fixture
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains":[{"slug":"mixed-domain","name":"Domain","description":CONTENT}]}),
+        )
+        .await
+        .unwrap();
+    let before = atom_rows(&runtime).await;
+    let secret = credential('0');
+    let mut atoms = vec![
+        candidate("same-refused", "short"),
+        candidate("mixed-bystander", &format!("{CONTENT} safe revision")),
+        json!({"id":"14c4ea78-773f-4ae1-8eca-57a3d5433b7d", "properties":{}}),
+        json!({"id":"not-a-uuid", "properties":{}}),
+        candidate(&secret, CONTENT),
+        candidate("mixed-domain", CONTENT),
+        candidate("same-refused", "short again"),
+    ];
+    for index in 7..13 {
+        atoms.push(candidate(&format!("short-{index}"), "short"));
+    }
+    let value =
+        projected_prewrite(&fixture, "knowledge.upsert_atoms", json!({"atoms":atoms})).await;
+    assert_eq!(value["validation_complete"], true);
+    let mut expected = vec![
+        json!({"index":0,"field":"content","reason":"invalid_input"}),
+        json!({"index":2,"field":"id","reason":"not_found"}),
+        json!({"index":3,"field":"item","reason":"invalid_input"}),
+        json!({"index":4,"field":"slug","reason":"secret_detected"}),
+        json!({"index":5,"field":"slug","reason":"invalid_input"}),
+        json!({"index":6,"field":"content","reason":"invalid_input"}),
+    ];
+    for index in 7..13 {
+        expected.push(json!({"index":index,"field":"content","reason":"invalid_input"}));
+    }
+    assert_eq!(value["refused"], Value::Array(expected));
+    assert_eq!(value["details"]["index"], "0");
+    assert!(!value.to_string().contains(&secret));
+    assert_eq!(atom_rows(&runtime).await, before);
+    let traces = events(&fixture, None).await;
+    assert_eq!(
+        traces.len(),
+        1,
+        "passing existing bystander trace is independent of refusal indices"
+    );
+    assert_eq!(traces[0]["payload"]["reason"], "batch_refused");
+}
+
+#[tokio::test]
+async fn domain_target_refusal_proves_only_the_unwritten_prefix() {
+    let (runtime, fixture) = fixture();
+    seed(&fixture, "domain-target-collision").await;
+    fixture
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains":[{
+                "slug":"domain-untouched-baseline","name":"Untouched baseline","description":CONTENT
+            }]}),
+        )
+        .await
+        .expect("healthy pre-existing domain and mirror");
+    let before = atom_rows(&runtime).await;
+    let before_domains = domain_rows(&runtime).await;
+    let rejected =
+        json!({"slug":"domain-target-collision","name":"Collision","description":CONTENT});
+    let value = projected_prewrite(
+        &fixture,
+        "knowledge.upsert_domains",
+        json!({"domains":[rejected.clone()]}),
+    )
+    .await;
+    assert!(value["message"]
+        .as_str()
+        .unwrap()
+        .contains("collides with an existing atom"));
+    assert_eq!(atom_rows(&runtime).await, before);
+    assert_eq!(
+        domain_rows(&runtime).await,
+        before_domains,
+        "no domain-only write can hide behind unchanged mirrors"
+    );
+    let error = fixture
+        .registry
+        .dispatch_with_disposition(
+            "knowledge.upsert_domains",
+            json!({"domains":[
+                {"slug":"domain-prefix-committed","name":"Prefix","description":CONTENT}, rejected
+            ]}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        DomainDisposition::Unknown,
+        "existing per-record domain commits are not relabeled atomic"
+    );
+    assert_eq!(error.source().batch_write_disposition(), None);
+    let (source, disposition) = error.into_parts();
+    assert_eq!(
+        runtime_error_value(source, disposition)["domain_disposition"],
+        "unknown"
+    );
+    let prefix = fixture
+        .dispatch("knowledge.get", json!({"id":"domain-prefix-committed"}))
+        .await
+        .expect("real earlier domain committed");
+    let after_domains = domain_rows(&runtime).await;
+    let allowed_prefix = domain_row(&runtime, prefix["id"].as_str().expect("prefix id")).await;
+    let mut retained = after_domains.as_array().expect("domain rows").clone();
+    assert_eq!(retained.len(), before_domains.as_array().unwrap().len() + 1);
+    let index = retained
+        .iter()
+        .position(|row| row == &allowed_prefix)
+        .expect("exact allowed new prefix row");
+    retained.remove(index);
+    assert_eq!(
+        Value::Array(retained),
+        before_domains,
+        "all baseline domain rows and fields remain unchanged"
+    );
+    assert_eq!(
+        atom_rows(&runtime).await.as_array().unwrap().len(),
+        before.as_array().unwrap().len() + 1,
+        "earlier mirror also committed"
+    );
+}
+
+#[tokio::test]
+async fn domain_tombstone_target_refusal_is_known_prewrite() {
+    let (runtime, fixture) = fixture();
+    let domain = json!({"slug":"domain-target-tombstone","name":"Tombstone","description":CONTENT});
+    fixture
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains":[domain.clone()]}),
+        )
+        .await
+        .unwrap();
+    {
+        // Deliberately construct a legacy tombstoned target in this private DB.
+        let mut writer = runtime.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_domains SET deleted_at = 1 WHERE slug = ?1".into(),
+                params: vec![SqlValue::Text("domain-target-tombstone".into())],
+                label: Some("test.atomic_refusal.tombstone_target".into()),
+            })
+            .await
+            .unwrap();
+    }
+    let before = atom_rows(&runtime).await;
+    let before_domains = domain_rows(&runtime).await;
+    let value = projected_prewrite(
+        &fixture,
+        "knowledge.upsert_domains",
+        json!({"domains":[domain]}),
+    )
+    .await;
+    assert!(value["message"]
+        .as_str()
+        .unwrap()
+        .contains("previously deleted"));
+    assert_eq!(atom_rows(&runtime).await, before);
+    assert_eq!(
+        domain_rows(&runtime).await,
+        before_domains,
+        "tombstoned domain row itself is unchanged"
+    );
 }

@@ -1575,8 +1575,8 @@ impl KhiveRuntime {
         properties_filter: Option<&serde_json::Value>,
         text_mode: TextQueryMode,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
-        let (hits, _vector_error) = self
-            .search_notes_inner(
+        let (hits, _note_status_dropped) = self
+            .search_notes_with_text_mode_and_status(
                 token,
                 query_text,
                 query_vector,
@@ -1586,7 +1586,8 @@ impl KhiveRuntime {
                 tags_any,
                 properties_filter,
                 text_mode,
-                false,
+                khive_storage::note::NoteStatusSelector::Active,
+                None,
             )
             .await?;
         Ok(hits)
@@ -1635,21 +1636,21 @@ impl KhiveRuntime {
         properties_filter: Option<&serde_json::Value>,
         text_mode: TextQueryMode,
     ) -> RuntimeResult<NoteSearchOutcome> {
-        let (hits, vector_error) = self
-            .search_notes_inner(
+        let (outcome, _note_status_dropped) = self
+            .search_notes_outcome_with_text_mode_and_status(
                 token,
                 query_text,
-                None,
                 limit,
                 note_kind,
                 include_superseded,
                 tags_any,
                 properties_filter,
                 text_mode,
-                true,
+                khive_storage::note::NoteStatusSelector::Active,
+                None,
             )
             .await?;
-        Ok(NoteSearchOutcome { hits, vector_error })
+        Ok(outcome)
     }
 
     /// Restore a note tombstone owned by the caller's primary namespace.

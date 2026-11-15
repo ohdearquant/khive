@@ -269,7 +269,10 @@ impl KgPack {
                 result,
             });
         }
-        assemble_backend_diagnostics(results, complete)
+        let mut report = assemble_backend_diagnostics(results, complete)?;
+        report["audit_success_rows_mode"] =
+            Value::from(registry.audit_success_rows_mode().as_str());
+        Ok(report)
     }
 }
 

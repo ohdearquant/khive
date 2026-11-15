@@ -10,6 +10,8 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[path = "operations/tests/claim_entity_reservation.rs"]
+mod claim_entity_reservation;
 #[path = "operations/tests/embed_failure_latency.rs"]
 mod embed_failure_latency;
 #[path = "operations/tests/entity_list_pages.rs"]
@@ -10759,20 +10761,28 @@ async fn update_note_fans_out_to_all_registered_models() {
 #[tokio::test]
 async fn get_entity_cross_namespace_succeeds() {
     let rt = rt();
-    // Create under "lambda:leo".
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    // Create under "lambda:alice".
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
-        .create_entity(&leo_tok, "concept", None, "Peer-Entity", None, None, vec![])
+        .create_entity(
+            &alice_tok,
+            "concept",
+            None,
+            "Peer-Entity",
+            None,
+            None,
+            vec![],
+        )
         .await
         .unwrap();
-    assert_eq!(entity.namespace, "lambda:leo");
+    assert_eq!(entity.namespace, "lambda:alice");
 
     // Read from "local" — must succeed (no namespace gate on by-ID get).
     let local_tok = NamespaceToken::local();
     let fetched = rt.get_entity(&local_tok, entity.id).await;
     assert!(
         fetched.is_ok(),
-        "get_entity from local token must find lambda:leo entity; got {:?}",
+        "get_entity from local token must find lambda:alice entity; got {:?}",
         fetched
     );
     assert_eq!(fetched.unwrap().id, entity.id);
@@ -10781,10 +10791,10 @@ async fn get_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn update_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Update",
@@ -10804,7 +10814,7 @@ async fn update_entity_cross_namespace_succeeds() {
     let result = rt.update_entity(&local_tok, entity.id, patch).await;
     assert!(
         result.is_ok(),
-        "update_entity from local token must succeed on lambda:leo entity; got {:?}",
+        "update_entity from local token must succeed on lambda:alice entity; got {:?}",
         result
     );
     assert_eq!(result.unwrap().name, "Peer-Entity-Updated");
@@ -10813,10 +10823,10 @@ async fn update_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn delete_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Delete",
@@ -10832,7 +10842,7 @@ async fn delete_entity_cross_namespace_succeeds() {
     let deleted = rt.delete_entity(&local_tok, entity.id, false).await;
     assert!(
         deleted.is_ok(),
-        "delete_entity from local token must succeed on lambda:leo entity; got {:?}",
+        "delete_entity from local token must succeed on lambda:alice entity; got {:?}",
         deleted
     );
     assert!(
@@ -10844,10 +10854,10 @@ async fn delete_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn namespace_preserved_on_entity_after_cross_namespace_get() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "NS-Preserved",
@@ -10858,11 +10868,11 @@ async fn namespace_preserved_on_entity_after_cross_namespace_get() {
         .await
         .unwrap();
 
-    // The namespace column on the fetched record must still say "lambda:leo".
+    // The namespace column on the fetched record must still say "lambda:alice".
     let local_tok = NamespaceToken::local();
     let fetched = rt.get_entity(&local_tok, entity.id).await.unwrap();
     assert_eq!(
-        fetched.namespace, "lambda:leo",
+        fetched.namespace, "lambda:alice",
         "namespace column must be preserved; not overwritten with caller's namespace"
     );
 }

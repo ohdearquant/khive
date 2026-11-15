@@ -32,6 +32,10 @@ MAX_VERB_COUNT = 1_000_000
 MCP_PROTOCOL_VERSION = "2024-11-05"
 HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+# The isolated probe config declares every setting a requested pack refuses to
+# register without. The telemetry pack has no default carrier, and the probe
+# runs on an in-memory store, so it declares the non-durable one.
+PROBE_CONFIG = '[telemetry]\ndefault_carrier = "ephemeral"\n'
 
 
 class VerificationError(RuntimeError):
@@ -486,15 +490,19 @@ def run_mcp_probe(
             except subprocess.TimeoutExpired as error:
                 raise _probe_timeout(timeout_seconds) from error
             if process.returncode != 0:
-                raise VerificationError(
-                    f"artifact probe exited {process.returncode}: "
-                    f"{_diagnostic_tail(diagnostic)}"
-                )
+                raise VerificationError(f"artifact probe exited {process.returncode}")
             if (bytes(buffered) + stdout_tail).strip():
                 raise VerificationError(
                     "artifact probe returned unexpected output after tools/call"
                 )
             return payload
+        except VerificationError as error:
+            # A probe that refuses at startup closes stdout before it answers,
+            # and its reason is only on stderr, so every failure carries it.
+            _stop_probe(process)
+            raise VerificationError(
+                f"{error}; artifact stderr: {_diagnostic_tail(diagnostic)}"
+            ) from error
         except BaseException:
             _stop_probe(process)
             raise
@@ -636,7 +644,7 @@ def verify(args: argparse.Namespace) -> tuple[Path, str, int, int]:
     with tempfile.TemporaryDirectory(prefix="khive-build-verify-") as temporary_dir:
         isolated_root = Path(temporary_dir)
         config = isolated_root / "khive.toml"
-        config.write_text("", encoding="utf-8")
+        config.write_text(PROBE_CONFIG, encoding="utf-8")
         environment = {
             key: value
             for key, value in os.environ.items()

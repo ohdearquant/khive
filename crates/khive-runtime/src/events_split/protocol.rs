@@ -1,4 +1,11 @@
-use super::*;
+use super::events_count_read_budget::WireReadFailure;
+use khive_storage::event::{
+    EventGroupBy, EventPageQuery, EventPageWindow, IdempotentEventBatchResult,
+};
+use khive_storage::{BatchWriteSummary, Event, EventFilter, Page, PageRequest};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use uuid::Uuid;
 
 /// Request frame sent from a domain process to the events daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +58,7 @@ pub enum EventsRequest {
     },
 }
 
+#[cfg(unix)]
 impl EventsRequest {
     pub(super) fn protocol_version(&self) -> u32 {
         match self {
@@ -76,6 +84,16 @@ impl EventsRequest {
                 protocol_version, ..
             } => *protocol_version,
         }
+    }
+
+    pub(super) fn disconnect_cancellable(&self) -> bool {
+        matches!(
+            self,
+            Self::CountEvents { .. }
+                | Self::CountEventsGrouped { .. }
+                | Self::QueryEvents { .. }
+                | Self::QueryEventPage { .. }
+        )
     }
 
     pub(super) fn count_budget_secs(&self) -> Option<Option<u64>> {

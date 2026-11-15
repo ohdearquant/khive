@@ -21,8 +21,8 @@ fn remote_url_to_slug_normalization_table() {
         // ssh:// with a port -- the port is not part of the identity.
         "ssh://git@github.com:2222/org/repo.git",
         "ssh://github.com:2222/org/repo",
-        // https/http/git:// with an authority port -- likewise not part
-        // of the identity (round-2 finding: only ssh:// was covered).
+        // Authority ports do not change repository identity for
+        // https, http, or git URLs.
         "https://github.com:8443/org/repo",
         "https://github.com:8443/org/repo.git",
         "http://github.com:8080/org/repo",

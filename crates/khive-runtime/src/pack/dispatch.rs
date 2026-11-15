@@ -414,6 +414,10 @@ impl VerbRegistry {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
+        let success_row = self.audit_success_row_action(verb, result.ok());
+        if success_row.is_skipped() {
+            return Ok(());
+        }
         let mut event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
                 let resource = crate::cost_unit::resource_payload(
@@ -454,13 +458,13 @@ impl VerbRegistry {
                 gate_req,
                 &audit,
                 EventOutcome::Success,
-                Some(crate::cost_unit::resource_payload(
+                Some(success_row.resource(crate::cost_unit::resource_payload(
                     verb,
                     &gate_req.args,
                     value,
                     || 0,
                     request_id,
-                )),
+                ))),
             )
             .with_duration_us(duration_us),
             Err(_) => build_audit_storage_event(
@@ -512,6 +516,21 @@ impl VerbRegistry {
             .is_ok_and(|decision| decision.is_allow())
     }
 
+    /// The caller's declared owned namespaces for one dispatch: the per-request
+    /// identity's list when an identity is supplied, else the registry's baked
+    /// list. Entries that fail `Namespace::parse` are dropped, so a malformed
+    /// declaration can only shrink what the caller owns, never widen it.
+    fn owned_namespaces_for(&self, identity: Option<&RequestIdentity>) -> Vec<Namespace> {
+        match identity {
+            Some(identity) => identity
+                .owned_namespaces
+                .iter()
+                .filter_map(|namespace| Namespace::parse(namespace).ok())
+                .collect(),
+            None => self.owned_namespaces.clone(),
+        }
+    }
+
     fn mint_intercepted_read_token(
         &self,
         gate_req: &GateRequest,
@@ -547,6 +566,7 @@ impl VerbRegistry {
                 .map(str::to_owned),
         )
         .with_request_id(identity.and_then(|identity| identity.request_id))
+        .with_owned_namespaces(self.owned_namespaces_for(identity))
         .with_process_ref(match identity {
             Some(identity) => identity.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
@@ -730,46 +750,33 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // Drain any process-lifetime `OnceLock` config locks queued
-                // since the last dispatch and persist them as `ConfigLocked`
-                // events, riding this same audit-persistence gate. The
-                // namespace/actor stamped on these rows are whichever
-                // dispatch happens to observe the queue non-empty first:
-                // an accepted provenance quirk, preferred over threading an
-                // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site. The verb column is NOT
-                // inherited from that bystander dispatch: a config-lock row
-                // wearing an operation verb pollutes verb-filtered queries
-                // (e.g. per-verb receipt counts), so these rows carry their
-                // own `config.lock` pseudo-verb and remain discoverable by
-                // `EventKind::ConfigLocked`.
-                if let Some(store) = &self.event_store {
-                    if crate::config_ledger::PENDING
-                        .swap(false, std::sync::atomic::Ordering::AcqRel)
-                    {
-                        for (key, value) in crate::config_ledger::drain_config_locked() {
-                            let payload = serde_json::json!({ "key": key, "value": value });
-                            let storage_event = Event::new(
-                                gate_req.namespace.as_str(),
-                                "config.lock",
-                                EventKind::ConfigLocked,
-                                SubstrateKind::Event,
-                                format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
-                            )
-                            .with_payload(payload);
-                            // ConfigLocked is pure observability: the helper
-                            // never returns `Err` for it, so there is
-                            // nothing to fold.
-                            let _ = append_audit_event_best_effort(
-                                self.audit_batch.as_ref(),
-                                store,
-                                storage_event,
-                                "config.lock",
-                                crate::audit_batch::AuditProducer::ConfigLocked,
-                                false,
-                            )
-                            .await;
-                        }
+                // Drain only the runtime retained with this audit sink. The
+                // owned batch has released its ledger guard before any append.
+                // Namespace/actor and the best-effort audit path stay unchanged.
+                if let (Some(store), Some(runtime)) = (&self.event_store, &self.config_lock_runtime)
+                {
+                    for (key, value) in runtime.drain_config_locked() {
+                        let payload = serde_json::json!({ "key": key, "value": value });
+                        let storage_event = Event::new(
+                            gate_req.namespace.as_str(),
+                            "config.lock",
+                            EventKind::ConfigLocked,
+                            SubstrateKind::Event,
+                            format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+                        )
+                        .with_payload(payload);
+                        // ConfigLocked is pure observability: the helper
+                        // never returns `Err` for it, so there is
+                        // nothing to fold.
+                        let _ = append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            storage_event,
+                            "config.lock",
+                            crate::audit_batch::AuditProducer::ConfigLocked,
+                            false,
+                        )
+                        .await;
                     }
                 }
 
@@ -920,6 +927,7 @@ impl VerbRegistry {
                 .map(str::to_owned),
         )
         .with_request_id(request_id)
+        .with_owned_namespaces(self.owned_namespaces_for(identity.as_ref()))
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
@@ -964,7 +972,7 @@ impl VerbRegistry {
                                 .get("properties")
                                 .is_some_and(|properties| properties.get("namespace").is_some())
                         });
-                let params = if !handler_accepts_namespace {
+                let mut params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
                         Value::Object(map)
@@ -974,6 +982,9 @@ impl VerbRegistry {
                 } else {
                     params
                 };
+                if let Some(handler) = handler_def {
+                    crate::params::integer_params_from_whole_floats(&mut params, handler.params);
+                }
                 let dispatch_start = Instant::now();
                 let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
                     serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
@@ -1037,6 +1048,7 @@ impl VerbRegistry {
                     || git_digest_receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected);
                 if let (true, Some(audit)) = (needs_generic_audit, deferred_audit.take()) {
                     if let Some(store) = &self.event_store {
+                        let success_row = self.audit_success_row_action(verb, result.as_ref().ok());
                         let is_link_singleton =
                             verb == "link" && gate_req.args.get("links").is_none();
                         // Read-only pass over `result` first: every arm below
@@ -1044,6 +1056,7 @@ impl VerbRegistry {
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
                         let audit_outcome: Result<(), AuditObligationFailure> = match &result {
+                            _ if success_row.is_skipped() => Ok(()),
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -1137,12 +1150,17 @@ impl VerbRegistry {
                                 let (outcome, resource) = match &result {
                                     Ok(ok_val) => (
                                         EventOutcome::Success,
-                                        Some(crate::cost_unit::resource_payload(
-                                            verb,
-                                            &gate_req.args,
-                                            ok_val,
-                                            || pack.registered_embedding_model_names().len() as i64,
-                                            request_id,
+                                        Some(success_row.resource(
+                                            crate::cost_unit::resource_payload(
+                                                verb,
+                                                &gate_req.args,
+                                                ok_val,
+                                                || {
+                                                    pack.registered_embedding_model_names().len()
+                                                        as i64
+                                                },
+                                                request_id,
+                                            ),
                                         )),
                                     ),
                                     Err(_) => (
@@ -1369,6 +1387,11 @@ impl VerbRegistry {
             actor_id: Some(verified_actor.into_inner()),
             visible_namespaces: self
                 .visible_namespaces
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            owned_namespaces: self
+                .owned_namespaces
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),

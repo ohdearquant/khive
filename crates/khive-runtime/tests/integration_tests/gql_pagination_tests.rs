@@ -450,3 +450,333 @@ async fn gql_query_limit_is_a_total_bound_across_skip_pages() {
     assert!(!well_past_limit.has_more);
     assert_eq!(well_past_limit.next_offset, None);
 }
+
+/// Put values in accepted edge-ID order, independently of random UUID allocation.
+async fn gql_metadata_star(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    values: Vec<serde_json::Value>,
+) -> (Uuid, Vec<khive_storage::Edge>) {
+    let source = gql_metadata_entity(runtime, token, "ordered source").await;
+    let mut edges = Vec::new();
+    for index in 0..values.len() {
+        let target = gql_metadata_entity(runtime, token, &format!("ordered target {index}")).await;
+        edges.push(
+            runtime
+                .link(token, source, target, EdgeRelation::VariantOf, 1.0, None)
+                .await
+                .unwrap(),
+        );
+    }
+    edges.sort_by_key(|edge| edge.id.to_string());
+    for (edge, metadata) in edges.iter_mut().zip(values) {
+        let accepted = runtime
+            .link(
+                token,
+                source,
+                edge.target_id,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(metadata),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.id, edge.id,
+            "replacement retains the accepted natural-key identity"
+        );
+        *edge = accepted;
+    }
+    (source, edges)
+}
+
+#[tokio::test]
+async fn gql_metadata_order_preserves_sqlite_types_and_identity_ties() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let values = vec![
+        serde_json::json!({"sort": {"x": 1}}),
+        serde_json::json!({"sort": "a"}),
+        serde_json::json!({"sort": [1]}),
+        serde_json::json!({"sort": "A"}),
+        serde_json::json!({"sort": "2"}),
+        serde_json::json!({"sort": "10"}),
+        serde_json::json!({"sort": 10}),
+        serde_json::json!({"sort": 2}),
+        serde_json::json!({"sort": 1.5}),
+        serde_json::json!({"sort": true}),
+        serde_json::json!({"sort": 1}),
+        serde_json::json!({"sort": false}),
+        serde_json::json!({"sort": 0}),
+        serde_json::json!({"sort": null}),
+        serde_json::json!({}),
+    ];
+    let (source, edges) = gql_metadata_star(&runtime, &token, values).await;
+    // SQL NULL, numeric values, then BINARY text. JSON arrays/objects are text;
+    // booleans are integers and tie with the matching numeric value.
+    let groups = vec![
+        vec![13, 14],
+        vec![11, 12],
+        vec![9, 10],
+        vec![8],
+        vec![7],
+        vec![6],
+        vec![5],
+        vec![4],
+        vec![3],
+        vec![2],
+        vec![1],
+        vec![0],
+    ];
+    for descending in [false, true] {
+        let mut ordered_groups = groups.clone();
+        if descending {
+            ordered_groups.reverse();
+        }
+        let expected = ordered_groups
+            .iter()
+            .flatten()
+            .map(|index| edges[*index].id.to_string())
+            .collect::<Vec<_>>();
+        let direction = if descending { "DESC" } else { "ASC" };
+        let rows = runtime.query(&token, &format!(
+            "MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' RETURN e.id, e.metadata ORDER BY e.metadata.sort {direction}"
+        )).await.unwrap();
+        assert_eq!(gql_metadata_ids(&rows), expected, "{direction}");
+        for row in &rows {
+            assert_eq!(
+                row.columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["e_id", "e_metadata"]
+            );
+        }
+    }
+    let mut descending = groups;
+    descending.reverse();
+    for group in &mut descending {
+        group.reverse();
+    }
+    let expected = descending
+        .iter()
+        .flatten()
+        .map(|index| edges[*index].id.to_string())
+        .collect::<Vec<_>>();
+    let rows = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' RETURN e.id ORDER BY e.metadata.sort DESC, e.id DESC"
+    )).await.unwrap();
+    assert_eq!(
+        gql_metadata_ids(&rows),
+        expected,
+        "second requested term precedes the identity suffix"
+    );
+}
+
+#[tokio::test]
+async fn gql_metadata_order_pages_preserve_visibility_sentinels_and_total_limits() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let (source, edges) = gql_metadata_star(
+        &runtime,
+        &token,
+        [6, 5, 4, 3, 2, 1, 1]
+            .into_iter()
+            .map(|order| serde_json::json!({"order": order, "selected": true}))
+            .collect(),
+    )
+    .await;
+    let mut excluded = Vec::new();
+    for (name, order) in [
+        ("deleted edge", -30),
+        ("deleted endpoint", 30),
+        ("predicate excluded", -20),
+    ] {
+        let target = gql_metadata_entity(&runtime, &token, name).await;
+        excluded.push(runtime.link(&token, source, target, EdgeRelation::VariantOf, 1.0,
+            Some(serde_json::json!({"order": order, "selected": name != "predicate excluded"}))).await.unwrap());
+    }
+    assert!(runtime
+        .delete_edge(&token, excluded[0].id.into(), false)
+        .await
+        .unwrap());
+    assert!(runtime
+        .delete_entity(&token, excluded[1].target_id, false)
+        .await
+        .unwrap());
+    let hidden_token = runtime
+        .authorize(Namespace::parse("metadata-hidden").unwrap())
+        .unwrap();
+    let hidden_target = gql_metadata_entity(&runtime, &hidden_token, "hidden endpoint").await;
+    let hidden = runtime
+        .link(
+            &hidden_token,
+            source,
+            hidden_target,
+            EdgeRelation::VariantOf,
+            1.0,
+            Some(serde_json::json!({"order": -100, "selected": true})),
+        )
+        .await
+        .unwrap();
+    let expected = [5, 6, 4, 3, 2, 1, 0]
+        .map(|index| edges[index].id.to_string())
+        .to_vec();
+    let base = format!("MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' AND e.metadata.selected = true RETURN e.id, e.metadata ORDER BY e.metadata.order");
+    let before = gql_metadata_snapshot(&runtime).await;
+    let whole = gql_page(&runtime, &token, &base, 20).await;
+    assert_eq!(gql_metadata_ids(&whole.rows), expected);
+    let first = gql_page(&runtime, &token, &base, 2).await;
+    let repeat = gql_page(&runtime, &token, &base, 2).await;
+    assert_eq!(gql_metadata_ids(&first.rows), expected[..2]);
+    assert_eq!(gql_metadata_ids(&repeat.rows), expected[..2]);
+    let mut collected = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = gql_page(&runtime, &token, &format!("{base} SKIP {offset}"), 2).await;
+        assert_eq!((page.offset, page.page_size), (offset, 2));
+        assert_eq!(page.has_more, page.truncated);
+        assert!(page.rows.len() <= 2, "sentinel must not escape");
+        collected.extend(gql_metadata_ids(&page.rows));
+        match page.next_offset {
+            Some(next) => {
+                assert!(page.has_more);
+                assert_eq!(next, offset + page.rows.len());
+                assert!(page
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(&format!("SKIP {next}"))));
+                offset = next;
+            }
+            None => {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+        assert!(offset < 10, "bounded continuation");
+    }
+    assert_eq!(collected, expected);
+    assert_eq!(
+        collected.iter().collect::<BTreeSet<_>>().len(),
+        expected.len()
+    );
+    let limited_first = gql_page(&runtime, &token, &format!("{base} LIMIT 3"), 2).await;
+    assert_eq!(gql_metadata_ids(&limited_first.rows), expected[..2]);
+    assert_eq!(limited_first.next_offset, Some(2));
+    let limited_last = gql_page(&runtime, &token, &format!("{base} SKIP 2 LIMIT 3"), 2).await;
+    assert_eq!(gql_metadata_ids(&limited_last.rows), expected[2..3]);
+    assert!(!limited_last.has_more && !limited_last.truncated);
+    assert_eq!(limited_last.next_offset, None);
+    let exhausted = gql_page(&runtime, &token, &format!("{base} SKIP 3 LIMIT 3"), 2).await;
+    assert!(exhausted.rows.is_empty());
+    assert!(!exhausted.has_more && !exhausted.truncated);
+    assert_eq!(exhausted.next_offset, None);
+    let wider = runtime
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse("metadata-hidden").unwrap()],
+        )
+        .unwrap();
+    let visible = gql_page(&runtime, &wider, &base, 20).await;
+    let mut with_hidden = vec![hidden.id.to_string()];
+    with_hidden.extend(expected);
+    assert_eq!(gql_metadata_ids(&visible.rows), with_hidden);
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_recursive_metadata_order_pages_preserve_distinct_rows() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let root = gql_metadata_entity(&runtime, &token, "diamond root").await;
+    let left = gql_metadata_entity(&runtime, &token, "diamond left").await;
+    let right = gql_metadata_entity(&runtime, &token, "diamond right").await;
+    let joint = gql_metadata_entity(&runtime, &token, "diamond joint").await;
+    for (from, to) in [(root, left), (root, right), (left, joint), (right, joint)] {
+        runtime
+            .link(
+                &token,
+                from,
+                to,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(serde_json::json!({"order": 90})),
+            )
+            .await
+            .unwrap();
+    }
+    for (index, order) in [7, 3, 7, 5].into_iter().enumerate() {
+        let end = gql_metadata_entity(&runtime, &token, &format!("diamond end {index}")).await;
+        runtime
+            .link(
+                &token,
+                joint,
+                end,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(serde_json::json!({"order": order, "final": true})),
+            )
+            .await
+            .unwrap();
+    }
+    let base = format!("MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' AND e.metadata.final = true RETURN e.metadata ORDER BY e.metadata.order");
+    let mut values = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = gql_page(&runtime, &token, &format!("{base} SKIP {offset}"), 1).await;
+        assert_eq!(page.rows.len(), 1);
+        let row = &page.rows[0];
+        assert_eq!(
+            row.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["e_metadata", "_depth", "_total_weight"]
+        );
+        assert!(matches!(
+            row.get("_depth"),
+            Some(khive_storage::SqlValue::Integer(3))
+        ));
+        assert!(
+            matches!(row.get("_total_weight"), Some(khive_storage::SqlValue::Float(weight)) if *weight == 3.0)
+        );
+        values.push(
+            serde_json::from_str::<serde_json::Value>(row.text("e_metadata").unwrap()).unwrap(),
+        );
+        match page.next_offset {
+            Some(next) => {
+                assert!(page.has_more && page.truncated);
+                assert_eq!(next, offset + 1);
+                offset = next;
+            }
+            None => {
+                assert!(!page.has_more && !page.truncated);
+                break;
+            }
+        }
+        assert!(
+            offset < 4,
+            "DISTINCT must collapse both paths and identical projected final edges"
+        );
+    }
+    assert_eq!(
+        values,
+        [3, 5, 7].map(|order| serde_json::json!({"order": order, "final": true}))
+    );
+    let start = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' AND e.metadata.final = true RETURN a.id, a.name, e.metadata ORDER BY a.name DESC, e.metadata.order"
+    )).await.unwrap();
+    assert_eq!(start.len(), 3);
+    for row in &start {
+        assert_eq!(row.text("a_id").unwrap(), root.to_string());
+        assert_eq!(row.text("a_name").unwrap(), "diamond root");
+    }
+    let error = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' RETURN e.metadata ORDER BY e.weight"
+    )).await.unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Unsupported(message)) if message.contains("variable-length ORDER BY must be derived from RETURN projections")),
+        "{error}"
+    );
+}

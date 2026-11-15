@@ -541,7 +541,7 @@ After persisting a reminder, the other three schedule verbs do not require `comm
         # ci-docs-only.sh asks this predicate about one changed path; the scan walks the
         # tree with the same globs. Paths the globs treat differently are all present.
         paths = {
-            "README.md", "CONTRIBUTING.md", "npm/README.md", "npm/CHANGES.md",
+            "README.md", "CONTRIBUTING.md", "other/README.md", "other/CHANGES.md",
             "docs/guide.md", "docs/guide/deep/counts.md", "docs/adr/ADR-001-x.md",
             "docs/adrx/notes.md", "marketplace/a/b/skill.md", "scripts/notes.md",
             "crates/README.md", "crates/khive-db/README.md", "crates/khive-db/docs/a/b.md",

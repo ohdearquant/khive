@@ -205,7 +205,7 @@ impl DaemonChild {
 
 #[test]
 fn the_exit_record_names_the_signal_and_its_sender_and_the_next_boot_reports_it() {
-    let dir = tempfile::Builder::new()
+    let dir = crate::test_process::private_tempdir_builder()
         .prefix("kh-exit-")
         .tempdir_in("/tmp")
         .expect("isolated short socket directory");

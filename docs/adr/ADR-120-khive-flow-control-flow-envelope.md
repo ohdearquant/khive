@@ -1,6 +1,6 @@
 # ADR-120: Khive Flow — A Bounded Control-Flow Envelope in the Request DSL
 
-**Status**: proposed\
+**Status**: withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.\
 **Date**: 2026-07-21\
 **Scope**: authorization-gated, anonymous, read-only control flow over existing verbs; the
 semantic scalar primitive that flow (and, later, an optional GQL adapter) may branch on\
