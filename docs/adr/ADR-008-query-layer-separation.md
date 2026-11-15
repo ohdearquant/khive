@@ -321,8 +321,8 @@ See [Amendment 1][A1], which supersedes this ordering deferral.
 
 - `crates/khive-query/src/parsers/gql.rs`: GQL parser.
 - `crates/khive-query/src/parsers/sparql.rs`: SPARQL parser.
-- `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type` and
-  `GqlQuery.offset` fields.
+- `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type`,
+  `GqlQuery.offset`, and `GqlQuery.order_by` fields.
 - `crates/khive-query/src/validate.rs`: AST validation (relation via `EdgeRelation::from_str`,
   depth limits).
 - `crates/khive-query/src/compilers/sql.rs`: AST → SQL compilation. `entity_type` maps to
@@ -334,7 +334,7 @@ See [Amendment 1][A1], which supersedes this ordering deferral.
 
 ## Amendment 1: Edge metadata and bounded GQL ordering (2026-11-14)
 
-**Amendment status**: Proposed
+**Amendment status**: Accepted 2026-11-14 (#6634)
 
 Issue #6594 requires qualified relations to be read in their stored order without fetching
 each edge separately. This amendment supersedes the caller-ordering deferral in Bounded GQL
@@ -468,3 +468,178 @@ not merely fail to compile or time out.
 Comma-separated `MATCH` patterns remain unsupported under this amendment. Their separate
 design and implementation follow the primary metadata/ordering change; #6594 remains open
 until both parts are delivered.
+
+## Amendment 2: Connected comma-separated MATCH patterns (2026-11-14)
+
+**Amendment status**: Proposed
+
+This amendment completes the comma-separated `MATCH` portion of #6594 with connected,
+fixed-length canonical graph patterns. It replaces Amendment 1's comma-pattern deferral
+only for the form defined here. Single-pattern recursive and synthetic traversal retains
+its existing contract; this amendment does not add general Cypher compatibility.
+
+### Grammar and supported shape
+
+```text
+MATCH path ("," path)* [WHERE ...] RETURN ... [ORDER BY ...] [SKIP ...] [LIMIT ...]
+```
+
+There is one global `WHERE`, `RETURN`, `ORDER BY`, `SKIP`, and `LIMIT` tail. With more than
+one path, every edge must be canonical and fixed at one hop (`min_hops == max_hops == 1`).
+A path may contain several such edges: the restriction is on each edge's hop range, not
+on the number of edges in a path. Empty or trailing comma components are parse errors.
+Directions and canonical relation alternatives retain their existing meanings.
+
+All paths together must form one connected set through shared named node variables.
+Connectivity is checked over the complete set, so a later path may bridge two earlier
+paths. Anonymous node occurrences are fresh and cannot connect paths. A singleton node
+path is permitted when its name connects it to the other paths and adds constraints;
+a disconnected singleton is refused.
+
+Disconnected patterns, recursive multi-pattern matches, and multi-pattern matches using
+synthetic `observed_as_*` relations return an explicit `QueryError::Unsupported`. A second
+`MATCH` keyword, `OPTIONAL MATCH`, `UNION`, projection aliases, aggregates, and new `DISTINCT`
+syntax remain unsupported. Existing single-path recursive, synthetic, and SPARQL queries
+retain their current behavior; SPARQL branching remains unsupported.
+
+For example, this star has one shared center and independently bound edges and endpoints:
+
+```gql
+MATCH (a:concept)-[e:extends]->(b:concept),
+      (a)-[f:variant_of]->(c:concept)
+WHERE e.metadata.order >= 0 AND f.metadata.enabled = true
+RETURN a.id, b.id, c.id, e.id, f.id, e.metadata, f.metadata
+ORDER BY e.metadata.order ASC, f.metadata.order DESC
+```
+
+### Shared identities, constraints, and multiplicity
+
+A named node repeated across paths denotes the same typed identity: both its substrate
+kind and UUID must agree. UUID equality alone does not identify an entity with a note.
+Variable names remain case-sensitive. Every occurrence's kind, subtype, and inline-property
+constraints is conjunctive. A later occurrence cannot replace an earlier constraint;
+contradictory constraints produce an empty match set. Ordinary field and property
+comparison and missing-value semantics are unchanged.
+
+The existing refusal of a repeated node variable within one path remains. Repeating an
+edge variable anywhere in the query is refused, as is using the same name for a node and
+an edge. Different variable names do not require different records. In particular, two
+edge variables may select the same edge; no implicit edge inequality is introduced.
+Cross-path cycles through shared named nodes are permitted without adding within-path
+cycle syntax.
+
+Each path contributes a conjunctive match, and results retain bag multiplicity. A shared
+center with two matches on one branch and three on another yields six binding tuples.
+Repeated path shapes remain independent matches; neither paths, edge identities, nor
+equal projected rows are deduplicated.
+
+A legal multiplicity witness uses the same two concept endpoints joined by two distinct
+natural keys: edge `E` with relation `extends` and edge `V` with relation `variant_of`.
+
+```gql
+MATCH (a)-[e1:extends|variant_of]->(b),
+      (a)-[e2:extends|variant_of]->(b)
+RETURN e1.id, e2.id
+```
+
+The result contains exactly `(E,E)`, `(E,V)`, `(V,E)`, and `(V,V)`. Returning only the shared
+node identity instead still returns four equal projected rows. This does not require
+duplicate stored edge natural keys. Reusing `e1` as the second edge variable is refused.
+
+### References, filters, and visibility
+
+The global `WHERE`, `RETURN`, and `ORDER BY` clauses can reference bindings from any path.
+A shared node reference resolves through its first occurrence, while constraints from
+every occurrence remain active. The original global `AND`/`OR` expression tree is retained;
+the compiler must not prune or distribute it into separate per-path expressions. This
+amendment adds no parenthesized predicate grammar.
+
+Amendment 1's metadata and ordering rules apply to every canonical edge binding, including
+later paths: raw whole-metadata JSON text, bound metadata predicate paths, typed ordering,
+and binary string comparison remain unchanged. `RETURN e` still does not implicitly add
+metadata. Properties and metadata namespace values remain data, not authorization inputs.
+
+Every node and edge occurrence uses the existing filtered node and edge sources. Caller
+namespace visibility, live-row filtering, and mailbox visibility apply before matching,
+ordering, and page selection, including on later branches. The caller scope is bound once
+and reused by all paths. Hidden endpoints or edges cannot consume a visible result's page
+slot or sentinel. The query remains a read within one selected backend.
+
+### Ordering, continuation, and cost
+
+Caller ordering terms precede a deterministic identity suffix covering every occurrence
+in textual path and element order. A node contributes its substrate kind before its UUID;
+an edge contributes its UUID. Shared-node occurrences may contribute redundant identities.
+Requested `DESC` directions do not reverse this identity suffix.
+
+The existing `SKIP`, sentinel, total query `LIMIT`, and `next_offset` contract is unchanged.
+The total query limit spans pages rather than restarting at each offset. Zero limits and
+offsets beyond the result return no rows. Paging remains deterministic only while the
+matching data is unchanged; it is not a snapshot shared across requests.
+
+Connectedness does not bound intermediate fanout. Match combinations and sorting work can
+greatly exceed the returned page size. Amendment 1's cost and cancellation qualifications
+continue to apply: page bounds do not bound the matched set, and deep ordered pages can
+repeat evaluation and sorting of the full visible matching set. This amendment introduces
+no additional hard bound on matched rows, elapsed time, CPU, or memory, and no universal
+interrupt guarantee for custom backends.
+
+### AST and compatibility
+
+`GqlQuery.pattern` remains the required first `MatchPattern`. The AST adds
+`additional_patterns: Vec<MatchPattern>` plus ordered `patterns()` and `patterns_mut()`
+iterators over the first and additional paths. An empty additional vector represents the
+existing single-path query. Empty additional paths are refused, and the existing refusal
+of an empty primary pattern remains.
+
+Adding this public field intentionally breaks direct Rust `GqlQuery` struct literals:
+callers must initialize `additional_patterns`. The GQL parser, SPARQL parser, and malformed
+AST tests must be adapted; SPARQL constructs an empty additional vector. Parsed single-path
+queries require no syntax change. Directly constructed ASTs receive the same connectivity,
+variable-kind, metadata-path, namespace, and supported-shape checks as parsed queries.
+
+The fixed-pattern compiler uses globally unique SQL aliases and resets only the predecessor
+at each path boundary. Later path roots use the existing filtered node source, with typed
+shared-identity predicates joining the component matches. References retain the first
+alias; all occurrence constraints survive. Existing parameterization rules remain in force.
+
+With no additional paths, generated SQL and parameters remain byte-identical for existing
+fixed, recursive, synthetic, and SPARQL queries, including Amendment 1's metadata and order
+behavior. Runtime execution remains one compiled SQL read with the existing sentinel
+handling. Static endpoint warnings inspect every path using the existing warning rules;
+they add no new satisfiability inference. No schema, storage, gate, dependency, or taxonomy
+change is required.
+
+### Validation requirements
+
+1. Execute the star query through the runtime and the actual KG registry. Require exactly
+   six tuples, exclude wrong-center decoys, and prove a nonempty narrowed `WHERE` result,
+   raw metadata projection, and unchanged populated domain rows.
+2. Prove typed shared identity with a trusted-store fixture containing an entity and a
+   note with the same UUID. This fixture does not claim public create permits the collision.
+   Cover equal, complementary, and contradictory occurrence constraints; shared starts and
+   ends; case-sensitive and anonymous names; reversed component order; and a later bridge.
+3. Execute the two-relation multiplicity witness above, asserting all four exact edge-ID
+   pairs and all four equal node projections. Cover directions, relation alternatives,
+   anonymous endpoints, later inline filters, global `AND`/`OR`, and later-path scalar and
+   metadata references.
+4. Place requested metadata order opposite UUID order, include tied groups, and verify
+   both directions and the fixed identity suffix. Reconstruct all tuples with page size
+   two, enforce total query limit five, and check zero limits, exhausted offsets, sentinel
+   removal, and `next_offset`.
+5. Through actual KG and Comm packs, place hidden mailbox rows on a later branch and keep
+   a visible positive. Reverse branch order and independently cover deleted or hidden
+   edges and endpoints ahead of visible matches. Retain the existing mailbox regressions.
+6. Test parser and direct-AST refusals for disconnected, recursive, synthetic, empty,
+   repeated-edge, node/edge-collision, forbidden-namespace, unknown-variable, and malformed
+   metadata-path cases. Keep real single-path recursive and synthetic positive controls.
+7. Preserve exact single-path SQL and parameters, recursive `DISTINCT` constraints, SPARQL
+   behavior, and later-path static endpoint warnings. Compare domain snapshots separately
+   from any permitted read-audit events.
+
+Behavioral negative controls must independently omit shared identity, omit its substrate
+component, drop a later occurrence's inline predicate, deduplicate tuples, ignore requested
+ordering, reverse the identity suffix, remove later-path mailbox filtering from both node
+and edge sources, and bypass direct-AST connectivity validation. Each control must reach
+its intended result or refusal assertion; compilation failures, empty test selections,
+fixture failures, and timeouts do not establish the behavior.
