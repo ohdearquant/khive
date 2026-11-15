@@ -265,8 +265,9 @@ The existing identifier grammar applies first, without case folding, automatic
 prefixing or new length restrictions.
 
 - A bare name requires the owner label to be exactly `kg` and membership in the kg
-  bare allowlist. `KG_SUBSTRATE_VERBS` in the contract test is the authoritative set;
-  the runtime check uses the same set, and a test fails if the two differ.
+  bare allowlist. `KG_SUBSTRATE_VERBS` in the contract test is the authoritative set.
+  The runtime check keeps its own copy of that set, and a test fails if the two
+  copies differ.
 - The kg pack may also declare `stream.<identifier>`, with exactly one dot and a
   suffix accepted by the existing grammar, under
   [ADR-174](ADR-174-ordered-streams-append.md). No other dotted public name is
@@ -274,7 +275,8 @@ prefixing or new length restrictions.
   `Subhandler` under §2, not a public exception.
 - A public name under any other owner must contain exactly one dot, with its
   prefix equal to `PackRuntime::name()` byte-for-byte.
-- The owner label `stream` is reserved: a pack that reports it is refused, because `stream.*` names belong to kg under ADR-174 and verb
+- The label `stream` is reserved: a pack that reports it, or a mounted
+  registration that uses it as its namespace, is refused, because `stream.*` names belong to kg under ADR-174 and verb
   classification is keyed on the name.
 
 A violation must refuse registry construction with `InvalidInput` identifying the
@@ -285,7 +287,9 @@ is an intentional compatibility change.
 The owner is the label reported by `PackRuntime::name()`, not authentication of the
 pack implementation. A pack that reports `kg` is held to the kg rules above whatever
 its implementation; because a registry refuses two packs with the same label
-(`PackRedeclared`), a second pack cannot report `kg` beside the real one. Ownership validation does not grant registration trust or
+(`PackRedeclared`), a second pack cannot report `kg` beside the real one. When the
+real kg pack is not loaded, a pack reporting `kg` is the only owner of those names;
+choosing which packs to load remains the embedder's trust decision. Ownership validation does not grant registration trust or
 change the distinction between `register` and `register_trusted`; neither route
 bypasses the public naming rule. Mounted registrations retain their separate
 policy. Internal `Visibility::Subhandler` admission, collision and visibility
