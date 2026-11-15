@@ -210,7 +210,8 @@ async fn commit_redaction_drops_encoded_author_properties_and_advances_cursor() 
     )
     .await;
     let synthetic = ["AK", "IA", "QWERTYUIOPASDFGH"].concat();
-    let encoded_email = format!(r#""\u0041{}"@example.invalid"#, &synthetic[1..]);
+    // Git trims leading quotes and backslashes from identity fields.
+    let encoded_email = format!(r#"x"\u0041{}"@example.invalid"#, &synthetic[1..]);
     assert_eq!(
         mask_for_redaction_surface(RedactionSurface::GitIngest, &encoded_email),
         encoded_email,
