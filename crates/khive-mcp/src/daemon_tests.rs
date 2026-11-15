@@ -2659,8 +2659,10 @@ impl RespawnDisclosureFixture {
             "caller must receive the stable respawn_failed code: {caller_output}"
         );
         assert!(
-            caller_output.contains("make local"),
-            "caller must receive safe remediation text: {caller_output}"
+            caller_output.contains(
+                "check daemon configuration and the installed kkernel version, then retry"
+            ),
+            "caller must receive release-appropriate remediation text: {caller_output}"
         );
     }
 }
@@ -2753,7 +2755,9 @@ async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_non_st
                      fallback: {message}"
             );
             assert!(
-                message.contains("make local"),
+                message.contains(
+                    "check daemon configuration and the installed kkernel version, then retry"
+                ),
                 "must point the operator at the fix: {message}"
             );
         }
@@ -7102,4 +7106,183 @@ fn fire_pending_self_heal_takes_the_armed_action_exactly_once() {
         1,
         "must fire exactly once even if fire_pending_self_heal is called again"
     );
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn public_client_refuses_missing_pack_dependency_before_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Duration;
+
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
+    fn files(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, directory: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    out.push((path.strip_prefix(root).unwrap().to_owned(), None));
+                    visit(root, &path, out);
+                } else {
+                    assert!(kind.is_file(), "unexpected fixture entry: {path:?}");
+                    out.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        Some(std::fs::read(path).unwrap()),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    fn no_lifecycle_or_fallback() {
+        assert_eq!(SPAWN_COUNT.load(SeqCst), 0, "actual launch entry count");
+        assert_eq!(KILL_COUNT.load(SeqCst), 0);
+        assert_eq!(SIGTERM_COUNT.load(SeqCst), 0);
+        assert_eq!(fallback_total(), 0);
+        assert_eq!(fallback_strict_violations(), 0);
+    }
+
+    clear_daemon_env();
+    reset_counters();
+    reset_fallback_counters();
+    let _cleanup = RecoveryTestGuard::new();
+    for key in [
+        "KHIVE_PACKS",
+        "KHIVE_CONFIG",
+        "KHIVE_DB",
+        "KHIVE_NAMESPACE",
+        "KHIVE_NO_EMBED",
+    ] {
+        std::env::remove_var(key);
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pack-preflight-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = root.join("khive.toml");
+    let socket = root.join("daemon.sock");
+    let marker = root.join("daemon.supervisor");
+    std::fs::write(&config, format!(
+        "engines = []\n[runtime]\npacks = [\"tool\"]\n[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = {:?}\n",
+        root.join("main.db")
+    )).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The earlier caller deadline keeps a missing-preflight regression out of
+    // the actual launcher: the supervisor's grace is thirty seconds.
+    std::fs::write(&marker, "pack-preflight-fixture\n0\n10\n").unwrap();
+    for (key, path) in [
+        ("KHIVE_SOCKET", socket.clone()),
+        ("KHIVE_PID", root.join("daemon.pid")),
+        ("KHIVE_LOCK", root.join("recovery.lock")),
+        ("KHIVE_RECOVERER_LOCK", root.join("recoverer.lock")),
+        ("KHIVE_SUPERVISOR_MARKER", marker),
+    ] {
+        std::env::set_var(key, path);
+    }
+    let supervisor = read_supervisor_marker().expect("private supervisor safety marker");
+    assert_eq!(supervisor.pid, 0);
+    assert_eq!(supervisor.restart_interval, Duration::from_secs(10));
+    let frame = unreachable_daemon_frame("pack-preflight-fixture");
+    let before = files(&root);
+    for strict in ["0", "1"] {
+        std::env::set_var("KHIVE_DAEMON_STRICT", strict);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            khive_storage::scope_request_read_deadline(
+                Duration::from_millis(250),
+                forward_or_spawn_with_config_and_packs(&frame, Some(&config), None, None),
+            ),
+        )
+        .await
+        .expect("preflight refusal must settle without a launch");
+        let error = result
+            .expect("dependency refusal must not fall back")
+            .unwrap_err();
+        assert!(
+            error.message.contains("pack \"tool\" requires \"kg\""),
+            "{error:?}"
+        );
+        assert!(
+            error.message.contains("add --pack kg before --pack tool"),
+            "{error:?}"
+        );
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let data = error.data.as_ref().expect("preflight error data");
+        assert_eq!(data["reason"], "daemon_launch_preflight");
+        assert_eq!(data["domain_disposition"], "not_committed");
+        assert_eq!(tokio::time::Instant::now(), started, "no recovery wait");
+        no_lifecycle_or_fallback();
+        assert_eq!(files(&root), before);
+    }
+
+    let valid_packs = vec!["kg".to_owned(), "tool".to_owned()];
+    super::launch::preflight_daemon_launch(Some(&config), None, Some(&valid_packs))
+        .expect("explicit valid pack selection must pass the real launch preflight");
+    assert_eq!(files(&root), before, "preflight must not open stores");
+    no_lifecycle_or_fallback();
+
+    tokio::time::resume();
+    for strict in ["0", "1"] {
+        std::env::set_var("KHIVE_DAEMON_STRICT", strict);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: DaemonRequestFrame =
+                serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+            let response = DaemonResponseFrame {
+                ok: true,
+                result: Some("live-peer-with-invalid-launch-selection".into()),
+                error: None,
+                error_detail: None,
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(request.config_id),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: request.request_id,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                forward_or_spawn_with_config_and_packs(&frame, Some(&config), None, None),
+                peer,
+            )
+        })
+        .await
+        .expect("live peer and forwarding must both settle");
+        assert_eq!(
+            result.unwrap().unwrap(),
+            "live-peer-with-invalid-launch-selection"
+        );
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        no_lifecycle_or_fallback();
+        assert_eq!(files(&root), before);
+    }
+
+    std::env::set_var("KHIVE_NO_DAEMON", "1");
+    assert!(
+        forward_or_spawn_with_config_and_packs(&frame, Some(&config), None, None)
+            .await
+            .is_none()
+    );
+    no_lifecycle_or_fallback();
+    assert_eq!(files(&root), before);
 }
