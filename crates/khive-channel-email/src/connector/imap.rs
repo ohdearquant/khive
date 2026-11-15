@@ -1911,6 +1911,12 @@ mod tests {
             .map_err(|(e, _)| ChannelError::Auth(format!("test LOGIN: {e}")))
     }
 
+    type WireResult<T> = (
+        Option<Result<T, ChannelError>>,
+        Option<Result<(), String>>,
+        Vec<String>,
+    );
+
     struct WireRun<'a, T> {
         client: std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ChannelError>> + 'a>>,
         peer: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>>,
@@ -1990,13 +1996,7 @@ mod tests {
             self.pump().await;
         }
 
-        fn finish(
-            self,
-        ) -> (
-            Option<Result<T, ChannelError>>,
-            Option<Result<(), String>>,
-            Vec<String>,
-        ) {
+        fn finish(self) -> WireResult<T> {
             let Self {
                 client,
                 peer,
