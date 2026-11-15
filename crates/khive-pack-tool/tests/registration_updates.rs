@@ -188,6 +188,7 @@ async fn register_equal_and_omitted_fields_preserve_the_stored_row() {
         json!(["tool-registry", "plugin", "retained", "added"])
     );
     let after_tags = f.row(&first["tool"]["full_id"]).await;
+    assert_eq!(after_tags.version, before.version + 1);
     assert_eq!(
         RegistryPin::from_entity(&after_tags).unwrap(),
         RegistryPin::from_entity(&before).unwrap()
