@@ -1,4 +1,4 @@
-use super::{build_multi_backend_server_with_coordinator_and_pool_size, Args, Command};
+use super::{prepare_multi_backend_mcp_command, Args, Command};
 use clap::Parser;
 use khive_mcp::{serve, server::KhiveMcpServer};
 use khive_runtime::KhiveConfig;
@@ -152,7 +152,7 @@ async fn parsed_kkernel_multi_backend_catalog_verbosity_reaches_tools_list() {
             panic!("expected MCP subcommand");
         };
         let hint = serve::config_discovery_db_anchor(args.db.as_deref());
-        let (khive_cfg, source) = KhiveConfig::load_with_home_fallback_and_source(
+        let (khive_cfg, _) = KhiveConfig::load_with_home_fallback_and_source(
             args.config.as_deref(),
             hint.as_deref(),
         )
@@ -161,49 +161,19 @@ async fn parsed_kkernel_multi_backend_catalog_verbosity_reaches_tools_list() {
         assert_eq!(khive_cfg.backends.len(), 2);
         assert_eq!(khive_cfg.backends[0].path.as_ref(), Some(&main));
         assert_eq!(khive_cfg.backends[1].path.as_ref(), Some(&tasks));
-        serve::reject_conflicting_db_override_with_source(
-            args.db.as_deref(),
-            &khive_cfg.backends,
-            Some(source.as_path()),
-        )
-        .unwrap();
-        let (explicit, namespace) = khive_mcp::args::resolve_cli_namespace(&args).unwrap();
-        let (base_cfg, anchor) =
-            serve::resolve_runtime_config_with_db_anchor(serve::RuntimeConfigInputs {
-                db: args.db.as_deref(),
-                config: args.config.as_deref(),
-                namespace,
-                namespace_explicit: explicit,
-                actor_explicit: explicit,
-                no_embed: args.no_embed,
-                packs: if args.pack.is_empty() {
-                    None
-                } else {
-                    Some(args.pack.clone())
-                },
-                brain_profile: args.brain_profile.clone(),
-            })
-            .unwrap();
-        let max_readers = serve::mcp_max_readers(&args, &base_cfg, &khive_cfg.backends, None);
-        let (server, schedule) = build_multi_backend_server_with_coordinator_and_pool_size(
-            base_cfg,
-            &khive_cfg,
-            args.db.as_deref(),
-            anchor.as_deref(),
-            max_readers,
-            None,
-            args.catalog_verbosity,
-        )
-        .await
-        .expect("actual kkernel coordinator host");
-        assert!(schedule.is_none());
+        let host = prepare_multi_backend_mcp_command(&args)
+            .await
+            .expect("actual parsed MCP preparation")
+            .expect("actual kkernel coordinator host");
+        assert!(host.schedule_rt.is_none());
         assert!(main.is_file());
         assert!(tasks.is_file());
-        let identity = server.config_id().to_owned();
-        let (listed, verbs) = observe_catalog(server)
+        let identity = host.server.config_id().to_owned();
+        let (listed, verbs) = observe_catalog(host.server.clone())
             .await
             .expect("settled RMCP exchange");
         observations.push((identity, listed, verbs_result(&verbs)));
+        drop(host);
     }
     drop(restore);
     assert_eq!(std::env::current_dir().unwrap(), original_directory);
@@ -271,4 +241,282 @@ async fn parsed_kkernel_multi_backend_catalog_verbosity_reaches_tools_list() {
             .unwrap();
         assert!(line.contains(&format!("[{pack}] ")), "{line}");
     }
+}
+
+fn parsed_mcp_args(config: &std::path::Path, extra: &[&str]) -> khive_mcp::args::Args {
+    let mut argv = vec![
+        "kkernel",
+        "mcp",
+        "--config",
+        config.to_str().unwrap(),
+        "--no-embed",
+        "--actor",
+        "catalog-test",
+    ];
+    argv.extend_from_slice(extra);
+    let parsed = Args::try_parse_from(argv).expect("actual kkernel arguments");
+    let Command::Mcp(args) = parsed.command.expect("MCP command") else {
+        panic!("expected MCP subcommand");
+    };
+    args
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn parsed_mcp_preparation_refuses_invalid_inputs_before_opening_backends() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let main = root.join("main.db");
+    let tasks = root.join("tasks.db");
+    let override_path = root.join("override.db");
+    let missing = root.join("missing.toml");
+    let malformed = root.join("malformed.toml");
+    std::fs::write(&malformed, "[runtime\npacks = [").unwrap();
+    for config in [&missing, &malformed] {
+        let args = parsed_mcp_args(config, &[]);
+        let result = tokio::time::timeout(WAIT, prepare_multi_backend_mcp_command(&args))
+            .await
+            .expect("bounded explicit-config refusal");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("invalid explicit config must refuse"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "failed to load the explicitly selected config file"
+        );
+        assert!(!main.exists());
+        assert!(!tasks.exists());
+        assert!(!override_path.exists());
+    }
+    let config = root.join("multi.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[runtime]\npacks = ['kg', 'gtd']\n\
+             [packs.kg]\nbackend = 'main'\nengines = []\n\
+             [packs.gtd]\nbackend = 'tasks'\nengines = []\n\
+             [[backends]]\nname = 'main'\npath = {main:?}\n\
+             [[backends]]\nname = 'tasks'\npath = {tasks:?}\n"
+        ),
+    )
+    .unwrap();
+    let args = parsed_mcp_args(&config, &["--db", override_path.to_str().unwrap()]);
+    let result = tokio::time::timeout(WAIT, prepare_multi_backend_mcp_command(&args))
+        .await
+        .expect("bounded database-override refusal");
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("conflicting database override must refuse"),
+    };
+    let envelope = serve::db_override_refusal_envelope(&error)
+        .expect("existing typed database-override refusal");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["invocation"]["started"], false);
+    assert_eq!(envelope["error"]["code"], serve::DB_OVERRIDE_CONFLICT_CODE);
+    assert_eq!(
+        envelope["error"]["db_override"],
+        override_path.to_str().unwrap()
+    );
+    assert_eq!(envelope["error"]["declared_backends"], 2);
+    assert!(!main.exists());
+    assert!(!tasks.exists());
+    assert!(!override_path.exists());
+
+    let single = root.join("single.toml");
+    std::fs::write(
+        &single,
+        format!(
+            "[runtime]\npacks = ['kg']\n\
+             [packs.kg]\nbackend = 'main'\nengines = []\n\
+             [[backends]]\nname = 'main'\npath = {main:?}\n"
+        ),
+    )
+    .unwrap();
+    let args = parsed_mcp_args(&single, &[]);
+    let host = tokio::time::timeout(WAIT, prepare_multi_backend_mcp_command(&args))
+        .await
+        .expect("bounded single-backend classification")
+        .expect("valid single-backend configuration");
+    assert!(host.is_none());
+    assert!(!main.exists());
+    assert!(!tasks.exists());
+    assert!(!override_path.exists());
+}
+
+#[cfg(unix)]
+const STORE_CLAIM_TEST: &str =
+    "cli::catalog_verbosity_tests::prepared_mcp_host_retains_daemon_store_claims_until_drop";
+#[cfg(unix)]
+const STORE_CLAIM_MODE: &str = "KKERNEL_CATALOG_STORE_CLAIM_MODE";
+#[cfg(unix)]
+const STORE_CLAIM_PATH: &str = "KKERNEL_CATALOG_STORE_CLAIM_PATH";
+
+#[cfg(unix)]
+fn run_store_claim_probe_child() -> bool {
+    let mode = std::env::var_os(STORE_CLAIM_MODE);
+    let path = std::env::var_os(STORE_CLAIM_PATH);
+    if mode.is_none() && path.is_none() {
+        return false;
+    }
+    assert_eq!(
+        mode.as_deref(),
+        Some(std::ffi::OsStr::new("claim-stores-v1"))
+    );
+    let path = PathBuf::from(path.expect("store-claim probe path"));
+    assert!(path.is_absolute());
+    assert_eq!(
+        std::env::args().skip(1).collect::<Vec<_>>(),
+        [
+            "--exact",
+            STORE_CLAIM_TEST,
+            "--nocapture",
+            "--test-threads=1"
+        ]
+    );
+    assert_eq!(std::thread::current().name(), Some(STORE_CLAIM_TEST));
+    match khive_runtime::daemon::claim_stores(std::slice::from_ref(&path), &[]) {
+        Ok(guards) => {
+            assert_eq!(guards.len(), 1);
+            drop(guards);
+            println!("KKERNEL_STORE_CLAIM=ACQUIRED");
+        }
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.starts_with("refusing to start: khived is already running as ")
+                    && message.contains(&format!("for database {};", path.display()))
+                    && message.contains("daemon store lock ")
+                    && message.ends_with(" is held"),
+                "unexpected store-claim failure: {error:#}"
+            );
+            println!("KKERNEL_STORE_CLAIM=HELD");
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn probe_store_claim(path: &std::path::Path) -> Result<String, String> {
+    let stdout = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stderr = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let mut child =
+        std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+            .args([
+                "--exact",
+                STORE_CLAIM_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STORE_CLAIM_MODE, "claim-stores-v1")
+            .env(STORE_CLAIM_PATH, path)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.reopen().map_err(|error| error.to_string())?)
+            .stderr(stderr.reopen().map_err(|error| error.to_string())?)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + WAIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => break Err("store-claim probe deadline".to_owned()),
+            Err(error) => break Err(format!("store-claim probe wait: {error}")),
+        }
+    };
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let output = std::fs::read_to_string(stdout.path()).map_err(|error| error.to_string())?;
+    let errors = std::fs::read_to_string(stderr.path()).map_err(|error| error.to_string())?;
+    let status = status.map_err(|error| format!("{error}\nstdout: {output}\nstderr: {errors}"))?;
+    if !status.success() || !output.contains("test result: ok. 1 passed; 0 failed;") {
+        return Err(format!(
+            "store-claim probe failed: {status}\nstdout: {output}\nstderr: {errors}"
+        ));
+    }
+    let observations = output
+        .lines()
+        .filter_map(|line| {
+            line.split_once("KKERNEL_STORE_CLAIM=")
+                .map(|(_, value)| value)
+        })
+        .collect::<Vec<_>>();
+    match observations.as_slice() {
+        ["HELD"] => Ok("HELD".to_owned()),
+        ["ACQUIRED"] => Ok("ACQUIRED".to_owned()),
+        _ => Err(format!(
+            "expected exactly one store-claim observation: {output}"
+        )),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+#[serial_test::serial(config_ledger)]
+fn prepared_mcp_host_retains_daemon_store_claims_until_drop() {
+    if run_store_claim_probe_child() || crate::test_process::run_in_child() {
+        return;
+    }
+    // SAFETY: this exact isolated child has not opened SQLite or built a runtime yet.
+    unsafe { khive_db::pool::initialize_claimed_file_observer().unwrap() };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let config = root.join("daemon.toml");
+        let tasks = root.join("tasks.db");
+        std::fs::write(
+            &config,
+            format!(
+                "[runtime]\npacks = ['kg', 'gtd']\n\
+                 [packs.kg]\nbackend = 'main'\nengines = []\n\
+                 [packs.gtd]\nbackend = 'tasks'\nengines = []\n\
+                 [[backends]]\nname = 'main'\nkind = 'memory'\n\
+                 [[backends]]\nname = 'tasks'\npath = {tasks:?}\n"
+            ),
+        )
+        .unwrap();
+        let args = parsed_mcp_args(&config, &["--daemon", "--catalog-verbosity", "compact"]);
+        let host = tokio::time::timeout(WAIT, prepare_multi_backend_mcp_command(&args))
+            .await
+            .expect("bounded actual daemon preparation")
+            .expect("actual daemon preparation")
+            .expect("actual multi-backend host");
+        assert!(tasks.is_file());
+        let tasks = tasks.canonicalize().unwrap();
+        let socket = PathBuf::from(std::env::var_os("KHIVE_SOCKET").unwrap());
+        let socket_before = socket.exists();
+        let held_host = probe_store_claim(&tasks);
+        let retained = host.store_guards.as_ref().map_or(0, Vec::len);
+        let schedule_absent = host.schedule_rt.is_none();
+        let boot_retained = host.boot_guard.is_some();
+        let drained = tokio::time::timeout(WAIT, host.server.shutdown_audit_batch()).await;
+        let transports = khive_mcp::transport::TransportRegistry::with_builtins();
+        let serving = host.serve(&args, &transports);
+        let held_unpolled = probe_store_claim(&tasks);
+        drop(serving);
+        let acquired = probe_store_claim(&tasks);
+
+        assert_eq!(held_host.expect("first held-host probe"), "HELD");
+        assert_eq!(retained, 1);
+        assert!(schedule_absent);
+        assert!(boot_retained);
+        drained
+            .expect("bounded audit drain")
+            .expect("audit drained");
+        assert_eq!(held_unpolled.expect("held unpolled-future probe"), "HELD");
+        assert_eq!(acquired.expect("released-host probe"), "ACQUIRED");
+        assert!(!socket_before);
+        assert!(!socket.exists());
+    });
 }

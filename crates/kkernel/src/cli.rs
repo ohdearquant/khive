@@ -656,184 +656,9 @@ pub async fn cli_main() -> Result<()> {
             }
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
-            // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
-            //
-            // Resolve the tier-3 discovery anchor with the SAME
-            // `config_discovery_db_anchor` semantics `resolve_runtime_config`
-            // below uses (explicit `--db`/`KHIVE_DB` -> that path; unset ->
-            // `None`, falling through to cwd-anchored discovery) so this early
-            // multi-backend classification sees the identical config file the
-            // per-request `config_id` path resolves further down (#689: using
-            // `resolve_db_anchor`'s materialized `$HOME/.khive/khive.db`
-            // default here anchored classification to the home directory
-            // instead of the project, silently skipping a project-local
-            // `.khive/config.toml`).
-            let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
-            // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
-            // malformed file OR a missing one — must fail loud: silently
-            // defaulting would boot against a config the operator did not
-            // select (ADR-035). The loader itself enforces the explicit tier
-            // (`load_with_home_fallback_and_source` returns
-            // `ConfigError::ExplicitConfigMissing` for a missing explicit
-            // path), so every entry point inherits the refusal; the
-            // automatic-discovery tiers keep the historical tolerant
-            // default: the CLI-level topology check is advisory, and a
-            // malformed discovered file is still reported by the builder's
-            // own load further down.
-            let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
-                a.config.as_deref(),
-                db_path_hint.as_deref(),
-            ) {
-                Ok(loaded) => loaded,
-                Err(load_error) => {
-                    if a.config.is_some() {
-                        return Err(load_error)
-                            .context("failed to load the explicitly selected config file");
-                    }
-                    None
-                }
-            };
-            let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
-            let mut khive_cfg = loaded_config
-                .as_ref()
-                .map(|(config, _)| config.clone())
-                .unwrap_or_default();
-
-            if !khive_cfg.backends.is_empty() {
-                khive_mcp::serve::reject_conflicting_db_override_with_source(
-                    a.db.as_deref(),
-                    &khive_cfg.backends,
-                    config_source,
-                )?;
-            }
-
-            if khive_cfg.backends.len() <= 1 {
-                // Single-backend: zero-change path — no coordinator.
-                khive_mcp::serve::run(a, &transport_registry).await
-            } else {
-                // Multi-backend: build registry, attach the SubstrateCoordinator,
-                // and finish server assembly through the shared #603 constructor
-                // (`build_multi_backend_server_with_coordinator`) — this branch
-                // contains no server-assembly logic of its own beyond building
-                // the coordinator's BackendRegistry and attaching it.
-                let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                let (base_cfg, mut db_anchor) =
-                    khive_mcp::serve::resolve_runtime_config_with_db_anchor(
-                        khive_mcp::serve::RuntimeConfigInputs {
-                            db: a.db.as_deref(),
-                            config: a.config.as_deref(),
-                            namespace: cli_ns,
-                            namespace_explicit: cli_ns_explicit,
-                            actor_explicit: cli_ns_explicit,
-                            no_embed: a.no_embed,
-                            packs: if a.pack.is_empty() {
-                                None
-                            } else {
-                                Some(a.pack.clone())
-                            },
-                            brain_profile: a.brain_profile.clone(),
-                        },
-                    )?;
-                // ADR-170: this arm is a resident daemon host when `--daemon`
-                // is set — it supervises an events daemon at the derived
-                // socket (`start_daemon_components_if_daemon`), so upgrade
-                // the resolved event plane from direct mode to forwarding.
-                let mut base_cfg = {
-                    let mut base_cfg = base_cfg;
-                    if a.daemon {
-                        khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
-                    }
-                    base_cfg
-                };
-
-                let max_readers =
-                    khive_mcp::serve::mcp_max_readers(&a, &base_cfg, &khive_cfg.backends, None);
-
-                #[cfg(unix)]
-                let store_plan = if a.daemon {
-                    Some(khive_mcp::serve::prepare_preflighted_daemon_store_plan(
-                        &mut base_cfg,
-                        &mut db_anchor,
-                        &mut khive_cfg.backends,
-                        a.db.as_deref() == Some(":memory:"),
-                    )?)
-                } else {
-                    None
-                };
-
-                // #667: acquire the boot/recovery lock before building the
-                // coordinator server — that construction runs migrations and
-                // applies pack schema plans (FTS DDL included) — and hold it
-                // through `serve_server`'s daemon bind+pid-write, so a second
-                // concurrently-booting process cannot run schema DDL against
-                // the same database file at the same time. In daemon mode,
-                // failing to acquire the lock here must abort before that
-                // unguarded construction runs, rather than silently
-                // proceeding with `boot_guard = None`.
-                khive_mcp::serve::mark_mcp_host_role(&a);
-                #[cfg(unix)]
-                let boot_guard = if a.daemon {
-                    Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
-                } else {
-                    khive_runtime::daemon::acquire_recovery_lock()
-                };
-                // Claim every physical SQLite backend before the coordinator
-                // opens stores. The binding remains live through serve_server
-                // so a daemon under another HOME cannot serve an overlapping
-                // backend set while this daemon owns it (#3069).
-                #[cfg(unix)]
-                if a.daemon {
-                    khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
-                }
-                #[cfg(unix)]
-                let store_guards = if let Some(plan) = store_plan {
-                    let mut guards =
-                        khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
-                    plan.assert_aliases_unchanged()?;
-                    khive_runtime::daemon::bind_daemon_store_files(
-                        &mut guards,
-                        &plan.read_only_paths,
-                    )?;
-                    // Check the binding now; each pool also verifies the held
-                    // file identity before identity initialization and WAL setup.
-                    khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
-                    Some(guards)
-                } else {
-                    None
-                };
-                #[cfg(not(unix))]
-                let boot_guard: Option<std::fs::File> = None;
-
-                #[cfg(unix)]
-                let daemon_claims = store_guards.as_deref();
-                #[cfg(not(unix))]
-                let daemon_claims = None;
-                let (server, schedule_rt) =
-                    build_multi_backend_server_with_coordinator_and_pool_size(
-                        base_cfg,
-                        &khive_cfg,
-                        a.db.as_deref(),
-                        db_anchor.as_deref(),
-                        max_readers,
-                        daemon_claims,
-                        a.catalog_verbosity,
-                    )
-                    .await?;
-                #[cfg(unix)]
-                if let Some(guards) = store_guards.as_deref() {
-                    khive_runtime::daemon::assert_daemon_store_identities(guards)?;
-                }
-
-                khive_mcp::serve::serve_server(
-                    server,
-                    &a,
-                    &transport_registry,
-                    boot_guard,
-                    schedule_rt,
-                )
-                .await
+            match prepare_multi_backend_mcp_command(&a).await? {
+                Some(host) => host.serve(&a, &transport_registry).await,
+                None => khive_mcp::serve::run(a, &transport_registry).await,
             }
         }
         Command::Backend(b) => cmd_backend(b),
@@ -895,6 +720,211 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
             )
             .exit(),
     }
+}
+
+// Fields drop in this order before serving: runtimes, store claims, then boot lock.
+struct PreparedMultiBackendMcpHost {
+    schedule_rt: Option<KhiveRuntime>,
+    server: khive_mcp::server::KhiveMcpServer,
+    #[cfg(unix)]
+    store_guards: Option<Vec<khive_runtime::daemon::DaemonStoreGuard>>,
+    boot_guard: Option<std::fs::File>,
+}
+
+impl PreparedMultiBackendMcpHost {
+    async fn serve(
+        self,
+        args: &khive_mcp::args::Args,
+        registry: &khive_mcp::transport::TransportRegistry,
+    ) -> Result<()> {
+        let result = {
+            let serving = khive_mcp::serve::serve_server(
+                self.server,
+                args,
+                registry,
+                self.boot_guard,
+                self.schedule_rt,
+            );
+            serving.await
+        };
+        #[cfg(unix)]
+        drop(self.store_guards);
+        result
+    }
+}
+
+async fn prepare_multi_backend_mcp_command(
+    a: &khive_mcp::args::Args,
+) -> Result<Option<PreparedMultiBackendMcpHost>> {
+    // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
+    //
+    // Resolve the tier-3 discovery anchor with the SAME
+    // `config_discovery_db_anchor` semantics `resolve_runtime_config`
+    // below uses (explicit `--db`/`KHIVE_DB` -> that path; unset ->
+    // `None`, falling through to cwd-anchored discovery) so this early
+    // multi-backend classification sees the identical config file the
+    // per-request `config_id` path resolves further down (#689: using
+    // `resolve_db_anchor`'s materialized `$HOME/.khive/khive.db`
+    // default here anchored classification to the home directory
+    // instead of the project, silently skipping a project-local
+    // `.khive/config.toml`).
+    let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
+    // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
+    // malformed file OR a missing one — must fail loud: silently
+    // defaulting would boot against a config the operator did not
+    // select (ADR-035). The loader itself enforces the explicit tier
+    // (`load_with_home_fallback_and_source` returns
+    // `ConfigError::ExplicitConfigMissing` for a missing explicit
+    // path), so every entry point inherits the refusal; the
+    // automatic-discovery tiers keep the historical tolerant
+    // default: the CLI-level topology check is advisory, and a
+    // malformed discovered file is still reported by the builder's
+    // own load further down.
+    let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
+        a.config.as_deref(),
+        db_path_hint.as_deref(),
+    ) {
+        Ok(loaded) => loaded,
+        Err(load_error) => {
+            if a.config.is_some() {
+                return Err(load_error)
+                    .context("failed to load the explicitly selected config file");
+            }
+            None
+        }
+    };
+    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+    let mut khive_cfg = loaded_config
+        .as_ref()
+        .map(|(config, _)| config.clone())
+        .unwrap_or_default();
+
+    if !khive_cfg.backends.is_empty() {
+        khive_mcp::serve::reject_conflicting_db_override_with_source(
+            a.db.as_deref(),
+            &khive_cfg.backends,
+            config_source,
+        )?;
+    }
+
+    if khive_cfg.backends.len() <= 1 {
+        return Ok(None);
+    }
+    // Multi-backend: build registry, attach the SubstrateCoordinator,
+    // and finish server assembly through the shared #603 constructor
+    // (`build_multi_backend_server_with_coordinator`) — this branch
+    // contains no server-assembly logic of its own beyond building
+    // the coordinator's BackendRegistry and attaching it.
+    let (cli_ns_explicit, cli_ns) =
+        khive_mcp::args::resolve_cli_namespace(a).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (base_cfg, mut db_anchor) = khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+        khive_mcp::serve::RuntimeConfigInputs {
+            db: a.db.as_deref(),
+            config: a.config.as_deref(),
+            namespace: cli_ns,
+            namespace_explicit: cli_ns_explicit,
+            actor_explicit: cli_ns_explicit,
+            no_embed: a.no_embed,
+            packs: if a.pack.is_empty() {
+                None
+            } else {
+                Some(a.pack.clone())
+            },
+            brain_profile: a.brain_profile.clone(),
+        },
+    )?;
+    // ADR-170: this arm is a resident daemon host when `--daemon`
+    // is set — it supervises an events daemon at the derived
+    // socket (`start_daemon_components_if_daemon`), so upgrade
+    // the resolved event plane from direct mode to forwarding.
+    let mut base_cfg = {
+        let mut base_cfg = base_cfg;
+        if a.daemon {
+            khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
+        }
+        base_cfg
+    };
+
+    let max_readers = khive_mcp::serve::mcp_max_readers(a, &base_cfg, &khive_cfg.backends, None);
+
+    #[cfg(unix)]
+    let store_plan = if a.daemon {
+        Some(khive_mcp::serve::prepare_preflighted_daemon_store_plan(
+            &mut base_cfg,
+            &mut db_anchor,
+            &mut khive_cfg.backends,
+            a.db.as_deref() == Some(":memory:"),
+        )?)
+    } else {
+        None
+    };
+
+    // #667: acquire the boot/recovery lock before building the
+    // coordinator server — that construction runs migrations and
+    // applies pack schema plans (FTS DDL included) — and hold it
+    // through `serve_server`'s daemon bind+pid-write, so a second
+    // concurrently-booting process cannot run schema DDL against
+    // the same database file at the same time. In daemon mode,
+    // failing to acquire the lock here must abort before that
+    // unguarded construction runs, rather than silently
+    // proceeding with `boot_guard = None`.
+    khive_mcp::serve::mark_mcp_host_role(a);
+    #[cfg(unix)]
+    let boot_guard = if a.daemon {
+        Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
+    } else {
+        khive_runtime::daemon::acquire_recovery_lock()
+    };
+    // Claim every physical SQLite backend before the coordinator
+    // opens stores. The binding remains live through serve_server
+    // so a daemon under another HOME cannot serve an overlapping
+    // backend set while this daemon owns it (#3069).
+    #[cfg(unix)]
+    if a.daemon {
+        khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
+    }
+    #[cfg(unix)]
+    let store_guards = if let Some(plan) = store_plan {
+        let mut guards = khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
+        plan.assert_aliases_unchanged()?;
+        khive_runtime::daemon::bind_daemon_store_files(&mut guards, &plan.read_only_paths)?;
+        // Check the binding now; each pool also verifies the held
+        // file identity before identity initialization and WAL setup.
+        khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
+        Some(guards)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let boot_guard: Option<std::fs::File> = None;
+
+    #[cfg(unix)]
+    let daemon_claims = store_guards.as_deref();
+    #[cfg(not(unix))]
+    let daemon_claims = None;
+    let (server, schedule_rt) = build_multi_backend_server_with_coordinator_and_pool_size(
+        base_cfg,
+        &khive_cfg,
+        a.db.as_deref(),
+        db_anchor.as_deref(),
+        max_readers,
+        daemon_claims,
+        a.catalog_verbosity,
+    )
+    .await?;
+    #[cfg(unix)]
+    if let Some(guards) = store_guards.as_deref() {
+        khive_runtime::daemon::assert_daemon_store_identities(guards)?;
+    }
+
+    Ok(Some(PreparedMultiBackendMcpHost {
+        schedule_rt,
+        server,
+        #[cfg(unix)]
+        store_guards,
+        boot_guard,
+    }))
 }
 
 /// Build the coordinator-attached multi-backend server for `kkernel mcp` (the
@@ -968,12 +998,12 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
 
     let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
-    let server = khive_mcp::serve::build_server_from_multi_backend_registry(
+    let server = khive_mcp::serve::build_server_from_multi_backend_registry_with_catalog_verbosity(
         multi,
         khive_cfg,
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
-    )
-    .with_catalog_verbosity(catalog_verbosity);
+        catalog_verbosity,
+    );
     Ok((server, schedule_rt))
 }
 
