@@ -9,28 +9,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `search` accepts `created_after` and `created_before` for entities and notes: inclusive RFC3339
+  instants on `created_at`, combined with the kind, tag and entity-type filters. The bounds apply to
+  the ranked candidates each backend returns (limit × 50, at most 500), so a narrow window can
+  return fewer results than the limit; this is not an exhaustive time-range scan.
+- GQL returns edge metadata and orders results: `RETURN e.id, e.metadata ORDER BY e.metadata.order`.
+  Metadata paths work in the existing scalar predicates, and an optional `ORDER BY` precedes
+  `SKIP`/`LIMIT`, with the existing deterministic tie order appended.
+- `kkernel mcp --catalog-verbosity compact` shortens each verb's line in the request tool
+  description to its first-line summary (at most 160 characters), keeping every callable verb, its
+  contributor labels and the full-help pointer. `full` stays the default and its text is unchanged.
+- Channel health reports the undelivered rows waiting in retry backoff (count, earliest retry,
+  oldest creation time, highest attempt count, total backlog), and inbound health reports the time
+  since the last successful poll while a channel is in backoff.
+- `brain.profile` lists the visible bindings that still resolve to an inactive profile and reports
+  `serving_through_visible_binding_while_inactive`.
+- Opt-in native cross-encoder reranking of entities through `lattice-inference` 0.15. Scores are
+  sigmoid probabilities; the inference dependency stays disabled by default.
 - `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
   `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
   `legacy_preference_model_count`. An embedding host can bring a pre-V21 database forward without
   depending on `khive-mcp`. `RuntimeError` gains `AttachmentCutoverRequired`.
+- `khive_db::migrations::attachment_cutover_would_defer` answers, read-only, whether a store would
+  stop at the V21 attachment cutover.
 
 ### Changed
 
-- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when more
-  matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)` that
-  works on a short queue fails with `substitution_error` once the queue passes the limit: read the
-  object's `tasks`, or read the page first and pass the id in a separate call.
+- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when
+  more matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)`
+  that works on a short queue fails with `substitution_error` once the queue passes the limit: read
+  the object's `tasks`, or read the page first and pass the id in a separate call.
 - `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
   `RuntimeError::AttachmentCutoverRequired`, whose message names
-  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
-  `khive-mcp` boot.
+  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed
+  at `khive-mcp` boot.
+- Short-token keyword signals count a one- or two-character word only when it carries a digit (`2`,
+  `v2`) or is two uppercase letters (`KV`), so function words such as `a`, `in` and `of` no longer
+  change the keyword order of a natural-language query.
+- `knowledge.eval_retrieval` reports a query set that does not parse by line and column only, and a
+  path it cannot open as `cannot open query set <path>`, so no file content or OS error reaches the
+  caller.
+- Migration V66 rebuilds the outbox due index without delivered rows, so due-page and backlog reads
+  no longer revisit delivered history.
+
+### Fixed
+
+- `propose` refuses a `supersede_entity` whose operands are not both live entities, naming the
+  operand, and apply checks the operands again, so an approved proposal whose operand was deleted or
+  merged since is refused instead of applied.
+- A search stopped by cancellation returns the typed request-stop error from every phase instead of
+  a short page or partial metadata, and its MCP error carries `domain_disposition: "not_committed"`
+  and `retryable: true`.
+- `comm.send` refusing a non-local self recipient and `memory.remember` refusing its parameters
+  report `domain_disposition: "not_committed"`.
+- A daemon client refuses an oversized socket path (primary or events) before connecting, recovering
+  or spawning a daemon, naming the path, its byte length and the platform limit.
+- A channel heartbeat persists again after its `channel_health` note was soft-deleted.
+- An events-prune backup receipt authorizes deletion only from the store it copied: the receipt's
+  source and the apply target must resolve to the same canonical path.
+- `memory.remember` names the parameter or operation to use when it refuses a reserved property.
+- `git.digest` reports, in its warnings, an existing issue or pull-request note whose project
+  annotation is missing.
+- Compact verb catalogs log the same duplicate-contribution warning as full catalogs.
+- Brain event-count and event-page refusals mask credentials in an invalid event kind.
+- The content secret gate decodes an escaped JSON fragment that follows a stray backslash in prose.
+- A server or daemon that never polls external email boots without the comm pack when external email
+  is configured; a polling host without comm is still refused.
+- KG validation annotations in GitHub format name the NDJSON file that produced each finding.
+- A chained `$prev` error after an array result suggests `$prev[0]` and `$prev[0].id`.
+- Empty text tables record their FTS rowid-map backfill and sparse schema checks are cached, so
+  those reads no longer take the writer on every fetch.
 
 ### Breaking (Rust crates)
 
-- `khive_query::GqlQuery` adds `order_by: Vec<OrderItem>`, so direct Rust constructors must
-  initialize it; exhaustive `PropertyRef` matches must handle the new `MetadataPath` variant.
-- `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
-  `RuntimeError` needs an arm for it.
+- Public structs gained fields, so direct struct literals must set them: `khive_mcp::args::Args`
+  adds `catalog_verbosity`, `khive_query::GqlQuery` adds `order_by` (a `Vec` of
+  `khive_query::ast::OrderItem`), and `khive_rule_evaluator::Violation` adds `source` (an
+  `Option<NdjsonSource>`, not serialized).
+- Enum variants gained fields: `khive_db::SqliteError::Migration` keeps the failed migration's cause
+  as `source`, and `khive_pack_comm::OutboxScanOutcome::Success` adds `backlog`, so patterns and
+  constructors naming every field must include them.
+- Enums gained variants, so an exhaustive match must handle them: `khive_query::ast::PropertyRef`
+  adds `MetadataPath`, and `khive_runtime::RuntimeError` adds `AttachmentCutoverRequired`.
+- Coordinated search returns its stop error instead of a partial result:
+  `khive_mcp::coordinator::CoordinatorService::fan_out_search` and `fan_out_search_scoped` return
+  `Result<CoordSearchResult, RuntimeError>`, and `kkernel::coordinator::SubstrateCoordinator`'s
+  `fan_out_search`, `fan_out_search_with_visibility`, `fan_out_search_with_token` and
+  `fan_out_search_with_token_and_count` return `RuntimeResult<...>`. An implementation of
+  `CoordinatorService` must change its signatures to match.
 
 ## [0.19.0] - 2026-11-11
 
