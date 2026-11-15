@@ -1046,8 +1046,11 @@ old existing-name contract are listed at the end with what happens to each.
    is registered under a new name, for the reason in item 4. Schema replacement
    is whole-object, including nested members; `{}` stores an empty object.
    Omitted and null fields preserve stored values. Incoming field validation
-   remains in force, and creation retains its current defaults. Extra tags
-   and capability links remain additive. No removal operation is introduced.
+   remains in force, and creation retains its current defaults. Tags are
+   part of the row: a supplied tag the row does not carry is added, no stored
+   tag is removed, and a call whose supplied tags are all stored leaves them
+   as they are. Capability links are not part of the row and are only added.
+   No removal operation is introduced.
    A stored schema or description therefore cannot be cleared: a correction
    can replace the schema with `{}`, a description must be a nonempty string,
    and omitting either field or passing null keeps the stored value.
@@ -1056,9 +1059,12 @@ old existing-name contract are listed at the end with what happens to each.
    `updated:false`, `unchanged:false`. An existing row correction returns
    `created:false`, `updated:true`, `unchanged:false`. An equal row returns
    `created:false`, `updated:false`, `unchanged:true` without advancing its
-   revision or update timestamp. These flags concern the registry entity only:
-   a call can still add capability links or repair indexes when its row is
-   unchanged. The existing `tool` and `capabilities` fields remain.
+   revision or update timestamp. A call that adds a tag and changes nothing
+   else is a correction: it returns `updated:true` and advances the revision.
+   These flags concern the registry entity only: a call can still add
+   capability links or repair indexes when its row is unchanged, so a call
+   that adds only capability links returns `unchanged:true`. The existing
+   `tool` and `capabilities` fields remain.
 
 3. **Updates retain the registration and grant safeguards.** The same update
    rule applies after a concurrent first-registration claim loses. Existing
