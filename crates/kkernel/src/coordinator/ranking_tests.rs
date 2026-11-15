@@ -152,7 +152,8 @@ async fn backend_registration_order_does_not_change_tied_evidence() {
             let request = request(serde_json::json!({"kind":kind,"query":"candidate","limit":10}));
             let (entities, notes, per_backend) = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             assert_eq!(
                 per_backend
                     .iter()
@@ -197,7 +198,8 @@ async fn multiple_selected_backends_keep_outer_rrf_when_only_one_contributes() {
             let request = request(serde_json::json!({"kind":kind,"query":"candidate","limit":10}));
             let (entities, notes, per_backend) = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             assert_eq!(per_backend.len(), 2);
             assert_eq!(per_backend[1].error.is_some(), failed);
             assert!(per_backend[1].hits.is_empty());
@@ -232,7 +234,8 @@ async fn finalization_preserves_backend_rank_kind_and_signals() {
     let request = request(serde_json::json!({"kind":"entity","query":"candidate","limit":10}));
     coordinator
         .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(entities.len(), 1);
     assert_eq!(notes.len(), 1);
     assert_entity_eq(&entities[0], &entity);
@@ -293,7 +296,8 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
         .unwrap();
     let (entities, _, backends) = coordinator
         .fan_out_search(&entity_request, &namespace)
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0].backend_id.as_str(), "entities");
     assert!(backends[0].error.is_none());
@@ -315,7 +319,10 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
         )
         .await
         .unwrap();
-    let (_, notes, backends) = coordinator.fan_out_search(&note_request, &namespace).await;
+    let (_, notes, backends) = coordinator
+        .fan_out_search(&note_request, &namespace)
+        .await
+        .expect("active search succeeds");
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0].backend_id.as_str(), "notes");
     assert!(backends[0].error.is_none());
@@ -342,7 +349,8 @@ async fn finalization_quantizes_floor_once_and_keeps_equality() {
     );
     coordinator
         .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(
         entities
             .iter()
@@ -430,7 +438,8 @@ async fn coordinator_time_order_applies_floor_before_limit_for_both_substrates()
             );
             let result = service
                 .fan_out_search(&request, &Namespace::local(), &[])
-                .await;
+                .await
+                .expect("active search succeeds");
             assert!(!result.partial);
             assert_eq!(result.per_backend.len(), 2);
             assert!(result.per_backend.iter().all(|row| row.error.is_none()));
@@ -502,7 +511,8 @@ async fn time_order_preserves_rank_and_uuid_ties_and_places_missing_last() {
         );
         coordinator
             .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-            .await;
+            .await
+            .expect("active search succeeds");
         assert_eq!(
             entities.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
             [1, 2, 3].map(Uuid::from_u128)
@@ -621,7 +631,8 @@ async fn created_range_filters_real_one_and_two_backend_search_before_limit() {
                 serde_json::json!({"kind":substrate,"query":"createdrangefixture","limit":50});
             let baseline = service
                 .fan_out_search(&request(base.clone()), &Namespace::local(), &[])
-                .await;
+                .await
+                .expect("active search succeeds");
             assert!(!baseline.partial);
             let ids: Vec<_> = if substrate == "entity" {
                 baseline
@@ -649,7 +660,8 @@ async fn created_range_filters_real_one_and_two_backend_search_before_limit() {
                 ranged["order_by"] = serde_json::json!(order);
                 let found = service
                     .fan_out_search(&request(ranged.clone()), &Namespace::local(), &[])
-                    .await;
+                    .await
+                    .expect("active search succeeds");
                 assert!(!found.partial);
                 assert_eq!(found.per_backend.len(), backend_count as usize);
                 if substrate == "entity" {
@@ -709,7 +721,8 @@ async fn created_range_filters_real_one_and_two_backend_search_before_limit() {
                 ranged["order_by"] = serde_json::json!(order);
                 let found = service
                     .fan_out_search(&request(ranged.clone()), &Namespace::local(), &[])
-                    .await;
+                    .await
+                    .expect("active search succeeds");
                 assert!(!found.partial);
                 if substrate == "entity" {
                     assert_eq!(
@@ -774,7 +787,8 @@ async fn created_range_excludes_missing_metadata_without_changing_unfiltered_sco
                 &request(args),
                 &Namespace::local(),
             )
-            .await;
+            .await
+            .expect("active search succeeds");
         assert_eq!(
             entities[0].entity_id,
             Uuid::from_u128(if ranged { 1 } else { 2 })
