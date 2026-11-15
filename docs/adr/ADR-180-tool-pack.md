@@ -1029,7 +1029,7 @@ new meaning. Program rows stay refused until ADR-181 Amendment 14's staging is i
 
 ## Amendment 10 (2026-11-14): correcting an existing registration
 
-**Status: Proposed.** Refs #6597. This qualifies the Decision's existing-name
+**Status: Accepted 2026-11-14 (#6616).** Refs #6597. This qualifies the Decision's existing-name
 behavior and Amendment 5 item 2 for `tool.register`. It leaves `tool.ingest` and
 the grant pin predicate unchanged. The network, executable and program
 declaration rules keep their content and their governing amendments' status;
