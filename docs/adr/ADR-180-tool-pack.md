@@ -1114,7 +1114,10 @@ such as a single call.
    null or greater than zero. So `decide`, the by-actor lookup and the by-id entry agree on whether a counted grant
    is live, and the by-id entry keeps its signature. A call decided `allow` from a counted grant consumes one use
    before dispatch, in one writer unit that calls the by-id entry on the writer it was handed and, when the entry
-   answers `true`, decrements `uses_left` in the same unit. When it answers `false` (another call spent the last
+   answers `true`, decrements `uses_left` in the same unit. The unit passes the grant id the decision cited, the
+   registration pin the step 2 decision was evaluated against (the registry row's id and definition digest that
+   `tool` resolved to, never `None` for a resolved row, since a `None` pin makes a pinned grant read as not live),
+   and `now` sampled once inside the unit after it is admitted to the writer. When it answers `false` (another call spent the last
    use, or the grant was revoked or expired after the decision), the call is refused with `grant_spent`, naming the
    grant id. Nothing is dispatched and the decision is not recomputed, so the call leaves exactly one decision
    event. A retry decides again, without that grant. A use spent on a call that then fails is not returned. A spent
@@ -1122,7 +1125,9 @@ such as a single call.
 
    This unit is a new `atomic_unit` caller, and the implementation adds it to ADR-091's write-transaction audit
    table. `exec.run` also runs on a decision, so it consumes a use from a counted grant the same way before it
-   starts the sandbox; without that, a grant of one use would allow any number of runs. `tool.check` reports
+   starts the sandbox; without that, a grant of one use would allow any number of runs. It consumes after its
+   pre-launch checks pass (the policy decision, Amendment 8 item 4's program checks and ADR-181's other preflight
+   checks), so a run refused before launch spends no use, and a run that starts and then fails does not return it. `tool.check` reports
    `uses_left` for a counted grant and consumes nothing. Argument-bound grants, the other form #6606 names, are not
    part of this amendment: they need the grant predicate and `tool.check` to take the call's arguments, and a
    counted grant already lets an approver allow a single call.
@@ -1140,18 +1145,22 @@ such as a single call.
 
 9. **Record.** Each call that is allowed at step 2 appends one `tool_called` event to the caller's namespace event
    log: `{actor, tool, registry_id, source, target_verb, decision_source, decision_id, uses_left, outcome,
-   error_class, error_reason}`. `outcome` is `ok`, `refused` (steps 3 and 4, the gate and the pin check), `failed`
-   or `unknown` (item 10). The event carries neither the arguments nor the result. It is written through the same
+   error_class, error_reason}`. `outcome` is `ok`, `refused` (a refusal at step 3 or 4, or at step 5 by the gate or the
+   pin check), `failed` or `unknown` (item 10). The event carries neither the arguments nor the result. It is written through the same
    event store as `tool_check_decided`, its `actor` and `tool` strings pass the same secret check as Amendment 6
    applies, and it takes the same ADR-168 class, `age_archivable`. A refusal at step 1 records nothing, and a
    refusal at step 2 leaves only the decision event.
 
-10. **Ambiguous outcome.** Once a mutating mounted call has been sent, `tool_timeout` is an ambiguous outcome: the
-    server may have applied it before the deadline (docs/packs/mounts.md). The use is spent. The caller gets the
-    mount's `tool_timeout` error with `outcome: "unknown"`, and, when a counted grant allowed the call, the grant id
-    and `uses_left` in its details. The `tool_called` event records `unknown`. `tool.call` never retries, and a
-    retry by the caller is a new call that needs a live grant or another decision. A timeout on a tool whose effect
-    is `read` records `failed`.
+10. **Ambiguous outcome.** A mounted call is sent once its request has been written to the server. A mutating
+    call that ends after that point may have been applied (docs/packs/mounts.md), so its outcome is `unknown` when
+    it ends in `tool_timeout`, in `transport_closed` (the server's output closed before the reply), or in
+    `invalid_response` or `response_too_large` (a reply that is oversized or does not parse). An end before the
+    send records `failed`: `mount_down`, a timeout that expired while the call was still queued, and
+    `request_too_large`. The use is spent either way. For `unknown`, the caller gets the mount's error with
+    `outcome: "unknown"`, and, when a counted grant allowed the call, the grant id and `uses_left` in its details,
+    and the `tool_called` event records `unknown`. `tool.call` never retries, and a retry by the caller is a new
+    call that needs a live grant or another decision. Any of these ends on a tool whose effect is `read` records
+    `failed`.
 
 **Decision line: khive holds no sign-in for an `mcp:` source.** An `mcp:` tool runs only through a
 deployment-configured mount. A mount's credential is the name of an environment variable, resolved in the daemon's
@@ -1210,7 +1219,11 @@ no dry run; `tool.check` is the answer before a call. Acceptance item 12 names t
     over 4 MiB with reason `request_too_large` and the same `limit_bytes`.
 11. A mutating mounted tool that is still running at the mount's timeout, called on a grant with `uses=1`, gives
     `tool_timeout` with `outcome: "unknown"`, the grant id and `uses_left` 0, and its `tool_called` event records
-    `unknown`.
+    `unknown`. The same holds, each in its own arm, for a server that closes its output after reading the request
+    (`transport_closed`), one that replies with an unparsable line (`invalid_response`) and one that replies with
+    more than 4 MiB (`response_too_large`). Controls that record `failed`: a call on a mount that is down
+    (`mount_down`), a call whose timeout expires while it is still queued behind another, and a `read` tool that
+    times out after the send.
 12. `tool_call_never_emits_the_mount_credential_value`: a mount whose credential variable holds a sentinel value.
     Across a successful call, a `deny`, a `mount_down`, a timeout and a `tool.check`, no event payload, no gate or
     mount audit row, no error body and no `tool.check` answer contains the sentinel.
