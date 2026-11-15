@@ -1520,6 +1520,7 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
                 && warning.as_str().unwrap().contains("2000")),
         "unrelated clamping warning must survive the detail cap"
     );
+    let undated_issue = [(14, issues[13])];
     for (source, ids) in [(true, &prs[..]), (false, &issues[..13])] {
         let pairs = ids
             .iter()
@@ -1533,7 +1534,7 @@ async fn existing_annotation_warning_details_are_report_wide_and_count_all_outco
             source,
             Some(ANNOTATION_ENCOUNTER_TIME),
             &pairs,
-            if source { &[] } else { &[(14, issues[13])] },
+            if source { &[] } else { &undated_issue },
         )
         .await;
     }
