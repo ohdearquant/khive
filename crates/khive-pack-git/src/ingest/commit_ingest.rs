@@ -528,19 +528,49 @@ pub(super) async fn ingest_commits(
             create_request["embedding_content"] = json!(head);
         }
 
+        let mut redacted_refusal = None;
+        let mut stored_content = content.as_str();
+        let mut embedding_truncated = embedding_head.is_some();
+        let created_response =
+            crate::dispatch_from_token(registry, token, "create", create_request).await;
+        let created_response = match created_response {
+            Err(error) if matches!(error.refusal_source(), RuntimeError::SecretDetected(_)) => {
+                let refusal = report.write_refusals.len();
+                record_write_failure(report, "create", "commit", c.sha.clone(), error);
+                report.write_refusals[refusal].redacted = Some(false);
+                redacted_refusal = Some(refusal);
+                // Masking can miss encoded credentials in author or path text.
+                // Drop those properties along with the message; retain only
+                // Git-generated IDs/date and submit the replacement to the gate.
+                crate::dispatch_from_token(
+                    registry,
+                    token,
+                    "create",
+                    json!({
+                        "kind": "commit",
+                        "key": format!("git.commit:{}", c.sha),
+                        "name": format!("{} [redacted]", masked.short_sha),
+                        "content": REDACTED_COMMIT_MESSAGE,
+                        "properties": {
+                            "sha": masked.sha,
+                            "short_sha": masked.short_sha,
+                            "committed_at": masked.committed_at,
+                            "parents": masked.parents,
+                        },
+                        "annotates": annotates.iter().cloned().collect::<Vec<_>>(),
+                    }),
+                )
+                .await
+            }
+            result => result,
+        };
+
         // The keyed note path finishes embedding and annotations before its
         // single publication transaction. A competing pass may win the key
         // after our initial SHA lookup; both exact replay and key conflict
         // then reuse only the committed winner, including this project's
         // missing annotations, before acknowledging the checkpoint.
-        let (id, created) = match crate::dispatch_from_token(
-            registry,
-            token,
-            "create",
-            create_request,
-        )
-        .await
-        {
+        let (id, created) = match created_response {
             Ok(v) => {
                 let Some(id) = v
                     .get("id")
@@ -570,6 +600,11 @@ pub(super) async fn ingest_commits(
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
                 };
+                if let Some(refusal) = redacted_refusal {
+                    report.write_refusals[refusal].redacted = Some(true);
+                    stored_content = REDACTED_COMMIT_MESSAGE;
+                    embedding_truncated = false;
+                }
                 (id, created)
             }
             Err(error) if is_note_key_conflict(&error) => {
@@ -619,13 +654,13 @@ pub(super) async fn ingest_commits(
             report.commits_skipped_existing += 1;
         } else {
             report.commits_ingested += 1;
-            if embedding_head.is_some() {
+            if embedding_truncated {
                 report.commit_embeddings_truncated += 1;
             }
             local_sha_to_id.insert(c.sha.clone(), id);
             new_records.push(NewRecordForRef {
                 id,
-                text: content.clone(),
+                text: stored_content.to_owned(),
             });
             // Parent -> child `precedes` edges are best-effort enrichment.
             for parent_sha in &c.parents {

@@ -1437,7 +1437,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

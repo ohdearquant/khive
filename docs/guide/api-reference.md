@@ -31,7 +31,7 @@ An always-machine-readable copy of this page is at
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
-| `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `tool`      | 15    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
@@ -1050,14 +1050,14 @@ Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. Th
 field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
 operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                           |
-| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                          |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                     |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                               |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                     |
-| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                    |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                                                                                                                 |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                                                                                                            |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`; one step only for now, and a compound with more than one step at any depth is refused). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                                                                                                                      |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                                                                                                            |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                                                                                                           |
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -1523,19 +1523,41 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 
 ### `gtd.tasks` — Assertive
 
-List tasks filtered by status, assignee, priority.
+List tasks filtered by status, assignee, priority, tags, context and duplicate reference.
+With neither `status` nor `duplicate_of`, the default selects open statuses and the
+legacy missing/non-text `inbox` fallback, excluding terminal and unrecognized statuses.
 
 Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
 and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
 `soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
-| Param      | Type    | Required | Notes                                                                                              |
-| ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `status`   | string  | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`). |
-| `assignee` | string  | no       | Filter by assignee.                                                                                |
-| `priority` | string  | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                            |
-| `limit`    | integer | no       | Default 20.                                                                                        |
-| `offset`   | integer | no       | Default 0.                                                                                         |
+| Param               | Type            | Required | Notes                                                                                                                                          |
+| ------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`            | string          | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`).                                             |
+| `assignee`          | string          | no       | Filter by assignee.                                                                                                                            |
+| `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                                                                        |
+| `tags`              | array\<string\> | no       | SQLite `NOCASE` membership (ASCII case-insensitive). Omitted, null or empty adds no restriction.                                               |
+| `tag_mode`          | string          | no       | `any` (default, including null) or `all`; with no tags, either adds no restriction.                                                            |
+| `context_entity_id` | uuid            | no       | Full UUID only; compares its canonical spelling with the stored context reference, without an entity lookup. Omitted/null adds no restriction. |
+| `duplicate_of`      | uuid            | no       | Kept task UUID or unique 8+ hex prefix. Defaults to `status="cancelled"` when status is omitted; an explicit status overrides that default.    |
+| `limit`             | integer         | no       | Default 50; clamped to 1–200. A requested zero selects one row without an upper-limit clamp report.                                            |
+| `offset`            | integer         | no       | Default 0. Advance by the number of returned tasks, keeping the same filters.                                                                  |
+
+Filters apply before pagination in stable `created_at DESC, id ASC` order. See
+[task-query.md](../../crates/khive-pack-gtd/docs/api/task-query.md) for filter,
+namespace, retained-reference and dependency semantics.
+
+An incomplete page returns `{tasks: [...], has_more: true}`. An exhausted ordinary
+page returns an array, even when it is exactly full. A limit above 200 produces an
+object with `tasks`, `requested_limit`, `effective_limit` and `limit_clamped: true`;
+it includes `has_more: true` only if another matching row exists. An empty default
+page may instead include `filter_excluded` and `hint` when a matching task was
+excluded by status. No `has_more: false` field is added.
+
+Accept either a bare array or an object's `tasks` array, and continue when
+`has_more` is true. An object or a full page alone does not establish continuation.
+Successive offset pages use separate snapshots; concurrent changes can shift later
+pages. Blocked and broken tasks remain in the page with their diagnostics.
 
 ```
 request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
@@ -3652,7 +3674,7 @@ request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
 
-## `tool` pack — 14 verbs
+## `tool` pack — 15 verbs
 
 Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
 `tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges

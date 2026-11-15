@@ -649,11 +649,73 @@ impl std::error::Error for ResolutionFailureContext {
     }
 }
 
+/// The substrate whose required search metadata could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadSubstrate {
+    Entity,
+    Note,
+}
+
+impl SearchReadSubstrate {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Search context with an intact typed cause that is never rendered publicly.
+#[derive(Debug)]
+pub struct SearchReadContext {
+    backend: crate::BackendId,
+    substrate: SearchReadSubstrate,
+    source: Box<RuntimeError>,
+}
+
+impl SearchReadContext {
+    pub fn backend(&self) -> &crate::BackendId {
+        &self.backend
+    }
+
+    pub fn substrate(&self) -> SearchReadSubstrate {
+        self.substrate
+    }
+
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> RuntimeError {
+        *self.source
+    }
+}
+
+impl fmt::Display for SearchReadContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "search metadata read failed on backend {} ({})",
+            self.backend,
+            self.substrate.as_str()
+        )
+    }
+}
+
+impl std::error::Error for SearchReadContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A required search read failed; public context excludes source contents.
+    #[error(transparent)]
+    SearchRead { context: SearchReadContext },
     /// A decoded canonical operation has no live apply implementation.
     #[error(
         "canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"
@@ -977,6 +1039,21 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Attach the owning backend and substrate without exposing the cause text.
+    pub fn with_search_read_context(
+        self,
+        backend: crate::BackendId,
+        substrate: SearchReadSubstrate,
+    ) -> Self {
+        Self::SearchRead {
+            context: SearchReadContext {
+                backend,
+                substrate,
+                source: Box::new(self),
+            },
+        }
+    }
+
     /// Certify that this operation refused before attempting requested data writes.
     pub fn before_requested_write(self) -> Self {
         Self::BatchWrite {
@@ -1028,6 +1105,7 @@ impl RuntimeError {
         match self {
             Self::BatchWrite { context } => Some(context.disposition),
             Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
+            Self::SearchRead { context } => context.source.batch_write_disposition(),
             _ => None,
         }
     }
@@ -1071,6 +1149,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => &context.source,
                 Self::BatchWrite { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
+                Self::SearchRead { context } => context.source.as_ref(),
                 Self::LintFix { source, .. } => source.as_ref(),
                 Self::CanonicalAdmission { source, .. } => source.as_ref(),
                 _ => return error,
@@ -1170,6 +1249,7 @@ impl RuntimeError {
             Self::RefusedWithEvents { context } => context.source.variant_name(),
             Self::BatchWrite { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
+            Self::SearchRead { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
             Self::CanonicalAdmission { source, .. } => source.variant_name(),
             Self::CanonicalUnsupportedOperation { .. } => "CanonicalUnsupportedOperation",
@@ -1292,6 +1372,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => enclosing = &context.source,
                 Self::BatchWrite { context } => enclosing = &context.source,
                 Self::WithResolution { context } => enclosing = &context.source,
+                Self::SearchRead { context } => enclosing = &context.source,
                 _ => break,
             }
         }
