@@ -20,6 +20,7 @@ use khive_runtime::{BackendId, NamespaceToken, NoteSearchHit, RuntimeError, Sear
 use khive_storage::EdgeRelation;
 
 use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
+use super::ensure_search_active;
 use super::search_profile;
 
 type ScopedSearchFuture<'a> =
@@ -55,12 +56,13 @@ impl SubstrateCoordinatorService {
         request: &'a ValidatedSearchRequest,
         namespace: &'a Namespace,
         extra_visible: &'a [Namespace],
-    ) -> Pin<Box<dyn Future<Output = CoordSearchResult> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CoordSearchResult, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
+            ensure_search_active()?;
             let (entity_hits, note_hits, per_backend) = self
                 .inner
                 .fan_out_search_with_visibility(request, namespace, extra_visible)
-                .await;
+                .await?;
 
             let started = search_profile::start();
             let result = self
@@ -79,10 +81,11 @@ impl SubstrateCoordinatorService {
         extra_visible: &'a [Namespace],
     ) -> ScopedSearchFuture<'a> {
         Box::pin(async move {
+            ensure_search_active()?;
             if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
                 return Ok((
                     self.fan_out_search(request, token.gate_namespace(), extra_visible)
-                        .await,
+                        .await?,
                     0,
                 ));
             }
@@ -97,7 +100,7 @@ impl SubstrateCoordinatorService {
             let (entity_hits, note_hits, per_backend, dropped) = self
                 .inner
                 .fan_out_search_with_token_and_count(request, token, args, extra_visible)
-                .await;
+                .await?;
             let started = search_profile::start();
             let result = self
                 .hydrate_search_result(
@@ -108,7 +111,7 @@ impl SubstrateCoordinatorService {
                     Some(token),
                     mailbox,
                 )
-                .await;
+                .await?;
             search_profile::stage("hydrate", started, &[]);
             Ok((result, dropped))
         })
@@ -122,7 +125,8 @@ impl SubstrateCoordinatorService {
         per_backend: Vec<super::dispatch::BackendSearchResult>,
         caller: Option<&NamespaceToken>,
         mailbox: Option<khive_runtime::MailboxView>,
-    ) -> CoordSearchResult {
+    ) -> Result<CoordSearchResult, RuntimeError> {
+        ensure_search_active()?;
         let partial = per_backend.iter().any(|r| r.error.is_some());
 
         // Batch-fetch entity kind + created_at for each merged entity hit.
@@ -135,20 +139,28 @@ impl SubstrateCoordinatorService {
         let mut entity_updated_at: HashMap<Uuid, i64> = HashMap::new();
         let mut entity_versions: HashMap<Uuid, i64> = HashMap::new();
         for hit in &entity_hits {
-            if khive_storage::request_read_is_cancelled() {
-                break;
-            }
+            ensure_search_active()?;
             let backend_id = self.inner.locate(hit.entity_id, namespace).await;
+            ensure_search_active()?;
             if let Some(bid) = backend_id {
                 if let Some(entry) = self.inner.registry().get(&bid) {
                     let rt = &entry.runtime;
                     if let Ok(authorized) = rt.authorize(namespace.clone()) {
                         let token = caller.cloned().unwrap_or(authorized);
-                        if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
+                        let entity = rt.get_entity(&token, hit.entity_id).await;
+                        ensure_search_active()?;
+                        if let Ok(entity) = entity {
                             entity_created_at.insert(hit.entity_id, entity.created_at);
                             entity_updated_at.insert(hit.entity_id, entity.updated_at);
                             entity_versions.insert(hit.entity_id, entity.version);
                             entity_kinds.insert(hit.entity_id, entity.kind);
+                            #[cfg(test)]
+                            super::notify_search_metadata_read(
+                                super::SearchMetadataPhase::Hydrate,
+                                khive_pack_kg::handlers::SearchSubstrate::Entity,
+                                hit.entity_id,
+                            );
+                            ensure_search_active()?;
                         }
                     }
                 }
@@ -162,17 +174,18 @@ impl SubstrateCoordinatorService {
         let mut note_versions: HashMap<Uuid, i64> = HashMap::new();
         let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
         for hit in &note_hits {
-            if khive_storage::request_read_is_cancelled() {
-                break;
-            }
+            ensure_search_active()?;
             let backend_id = self.inner.locate(hit.note_id, namespace).await;
+            ensure_search_active()?;
             if let Some(bid) = backend_id {
                 if let Some(entry) = self.inner.registry().get(&bid) {
                     let rt = &entry.runtime;
                     if let Ok(authorized) = rt.authorize(namespace.clone()) {
                         let token = caller.cloned().unwrap_or(authorized);
                         if let Ok(store) = rt.notes(&token) {
-                            if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                            let note = store.get_note(hit.note_id).await;
+                            ensure_search_active()?;
+                            if let Ok(Some(note)) = note {
                                 if let Some(view) = mailbox.as_ref() {
                                     if !view.permits_message_note(&token, &note) {
                                         continue;
@@ -183,6 +196,13 @@ impl SubstrateCoordinatorService {
                                 note_updated_at.insert(hit.note_id, note.updated_at);
                                 note_names.insert(hit.note_id, note.name.clone());
                                 note_kinds.insert(hit.note_id, note.kind);
+                                #[cfg(test)]
+                                super::notify_search_metadata_read(
+                                    super::SearchMetadataPhase::Hydrate,
+                                    khive_pack_kg::handlers::SearchSubstrate::Note,
+                                    hit.note_id,
+                                );
+                                ensure_search_active()?;
                             }
                         }
                     }
@@ -190,6 +210,7 @@ impl SubstrateCoordinatorService {
             }
         }
 
+        ensure_search_active()?;
         if mailbox.is_some() {
             note_hits.retain(|hit| note_versions.contains_key(&hit.note_id));
         }
@@ -220,7 +241,8 @@ impl SubstrateCoordinatorService {
             })
             .collect();
 
-        CoordSearchResult {
+        ensure_search_active()?;
+        Ok(CoordSearchResult {
             entity_hits,
             note_hits,
             per_backend: coord_per_backend,
@@ -234,7 +256,7 @@ impl SubstrateCoordinatorService {
             note_updated_at,
             note_versions,
             note_names,
-        }
+        })
     }
 }
 
@@ -307,7 +329,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult {
+    ) -> Result<CoordSearchResult, RuntimeError> {
         search_profile::profiled(self.search_unscoped(request, namespace, extra_visible)).await
     }
 
@@ -339,6 +361,210 @@ impl CoordinatorService for SubstrateCoordinatorService {
 
     fn is_single_backend(&self) -> bool {
         self.inner.is_single_backend()
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use khive_pack_kg::handlers::SearchSubstrate;
+
+    use crate::coordinator::search_cancellation_tests::{
+        assert_reads, assert_stopped, observe, SearchFixture,
+    };
+    use crate::coordinator::SearchMetadataPhase;
+
+    async fn bounded(future: impl Future<Output = ()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), future)
+            .await
+            .expect("private hydration test settles");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn private_hydration_refuses_after_first_and_last_real_read() {
+        bounded(async {
+            let fixture = SearchFixture::new().await;
+            let service = fixture.service();
+            for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
+                let ids: Vec<_> = match substrate {
+                    SearchSubstrate::Entity => fixture
+                        .entity_hits
+                        .iter()
+                        .map(|hit| hit.entity_id)
+                        .collect(),
+                    SearchSubstrate::Note => {
+                        fixture.note_hits.iter().map(|hit| hit.note_id).collect()
+                    }
+                };
+                assert_eq!(ids.len(), 2, "first and final reads must be distinct");
+                for scoped in [false, true] {
+                    for stop_index in [0, 1] {
+                        let (entities, notes) = match substrate {
+                            SearchSubstrate::Entity => (fixture.entity_hits.clone(), vec![]),
+                            SearchSubstrate::Note => (vec![], fixture.note_hits.clone()),
+                        };
+                        let (result, reads) = observe(
+                            SearchMetadataPhase::Hydrate,
+                            substrate,
+                            Some(ids[stop_index]),
+                            service.hydrate_search_result(
+                                &fixture.namespace,
+                                entities,
+                                notes,
+                                vec![],
+                                scoped.then_some(&fixture.token),
+                                None,
+                            ),
+                        )
+                        .await;
+                        assert_stopped(result);
+                        assert_reads(
+                            &reads,
+                            SearchMetadataPhase::Hydrate,
+                            substrate,
+                            &ids[..=stop_index],
+                        );
+                        fixture.assert_unchanged().await;
+                    }
+                }
+            }
+            fixture.close().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn private_hydration_refuses_stopped_empty_requests() {
+        bounded(async {
+            let fixture = SearchFixture::new().await;
+            let service = fixture.service();
+            let (sender, receiver) = tokio::sync::watch::channel(true);
+            let result = khive_storage::scope_request_read_cancellation(
+                receiver,
+                service.hydrate_search_result(
+                    &fixture.namespace,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            assert_stopped(result);
+            drop(sender);
+            let result = khive_storage::scope_request_read_deadline(
+                std::time::Duration::ZERO,
+                service.hydrate_search_result(
+                    &fixture.namespace,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            assert_stopped(result);
+            fixture.assert_unchanged().await;
+            fixture.close().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn private_hydration_keeps_complete_metadata_and_missing_hit_tolerance() {
+        bounded(async {
+            let fixture = SearchFixture::new().await;
+            let service = fixture.service();
+            let missing_entity = Uuid::from_u128(901);
+            let missing_note = Uuid::from_u128(902);
+            let mut entities = fixture.entity_hits.clone();
+            let mut notes = fixture.note_hits.clone();
+            let mut absent_entity = entities[0].clone();
+            absent_entity.entity_id = missing_entity;
+            entities.push(absent_entity);
+            let mut absent_note = notes[0].clone();
+            absent_note.note_id = missing_note;
+            notes.push(absent_note);
+            let result = service
+                .hydrate_search_result(
+                    &fixture.namespace,
+                    entities.clone(),
+                    notes.clone(),
+                    vec![],
+                    Some(&fixture.token),
+                    None,
+                )
+                .await
+                .expect("missing rows remain tolerated while the request is active");
+            assert_eq!(result.entity_hits.len(), entities.len());
+            assert_eq!(result.note_hits.len(), notes.len());
+            for (actual, expected) in result.entity_hits.iter().zip(&entities) {
+                assert_eq!(actual.entity_id, expected.entity_id);
+                assert_eq!(actual.score, expected.score);
+                assert_eq!(actual.rank_score_kind, expected.rank_score_kind);
+                assert_eq!(actual.signals, expected.signals);
+                assert_eq!(actual.source, expected.source);
+                assert_eq!(actual.title, expected.title);
+                assert_eq!(actual.snippet, expected.snippet);
+            }
+            for (actual, expected) in result.note_hits.iter().zip(&notes) {
+                assert_eq!(actual.note_id, expected.note_id);
+                assert_eq!(actual.score, expected.score);
+                assert_eq!(actual.rank_score_kind, expected.rank_score_kind);
+                assert_eq!(actual.signals, expected.signals);
+                assert_eq!(actual.source, expected.source);
+                assert_eq!(actual.title, expected.title);
+                assert_eq!(actual.snippet, expected.snippet);
+            }
+            for entity in &fixture.entities {
+                assert_eq!(result.entity_kinds.get(&entity.id), Some(&entity.kind));
+                assert_eq!(
+                    result.entity_created_at.get(&entity.id),
+                    Some(&entity.created_at)
+                );
+                assert_eq!(
+                    result.entity_updated_at.get(&entity.id),
+                    Some(&entity.updated_at)
+                );
+                assert_eq!(
+                    result.entity_versions.get(&entity.id),
+                    Some(&entity.version)
+                );
+            }
+            for note in &fixture.notes {
+                assert_eq!(result.note_kinds.get(&note.id), Some(&note.kind));
+                assert_eq!(result.note_created_at.get(&note.id), Some(&note.created_at));
+                assert_eq!(result.note_updated_at.get(&note.id), Some(&note.updated_at));
+                assert_eq!(result.note_versions.get(&note.id), Some(&note.version));
+                assert_eq!(result.note_names.get(&note.id), Some(&note.name));
+            }
+            for size in [
+                result.entity_kinds.len(),
+                result.entity_created_at.len(),
+                result.entity_updated_at.len(),
+                result.entity_versions.len(),
+                result.note_kinds.len(),
+                result.note_created_at.len(),
+                result.note_updated_at.len(),
+                result.note_versions.len(),
+                result.note_names.len(),
+            ] {
+                assert_eq!(size, 2, "only actual stored rows receive metadata");
+            }
+            assert!(!result.entity_kinds.contains_key(&missing_entity));
+            assert!(!result.note_kinds.contains_key(&missing_note));
+            assert!(!result.partial);
+            assert!(result.per_backend.is_empty());
+            assert!(khive_storage::ensure_request_read_active("search").is_ok());
+            fixture.assert_unchanged().await;
+            fixture.close().await;
+        })
+        .await;
     }
 }
 

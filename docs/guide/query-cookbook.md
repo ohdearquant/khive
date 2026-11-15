@@ -7,7 +7,7 @@ and it is read-only: mutations always go through `create`, `update`, `link`,
 `merge`, and `delete`.
 
 This guide has two parts: a catalogue of question classes mapped to the right
-verb (query, or something else), and a cookbook of verified idioms with
+verb (query, or something else), and a cookbook of supported idioms with
 copy-paste syntax and known gaps.
 
 ## Routing: query vs. search vs. neighbors vs. traverse vs. context
@@ -35,8 +35,9 @@ can name the relation(s) and shape of the pattern you're matching.
 ## Question-class catalogue
 
 Verdicts derived from the shipped parsers, AST validation, SQL compiler, the
-KG verb handlers, [ADR-008](../adr/ADR-008-query-layer-separation.md), and
-live read-only checks against a production knowledge graph.
+KG verb handlers, and [ADR-008](../adr/ADR-008-query-layer-separation.md).
+Historical live observations are recorded in the Verified GQL idioms and
+Rejected forms sections below.
 
 | Question class            | Example question                                                    | Verdict                      | Idiom or boundary                                                                                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -57,10 +58,10 @@ live read-only checks against a production knowledge graph.
 | Deduplication candidates  | Which pairs share a name or a similar description?                  | PARTIAL                      | A literal-name lookup works. Variable-to-variable comparison, grouping, and similarity scoring do not — use `search` to surface candidates instead.                                                                                                                                                  |
 | Orphan detection          | Which records have no graph edges?                                  | NO                           | No negative pattern, `NOT EXISTS`, optional match, or anti-join exists. Approximate outside `query` with `list` plus `neighbors`.                                                                                                                                                                    |
 | Edge-density audit        | Which entities have fewer than four edges?                          | PARTIAL                      | `stats()` gives global `edges_by_relation` and `edges_by_endpoint_base` breakdowns and `query` lists rows, but `COUNT`, `GROUP BY`, `HAVING`, and degree projection are all absent. For a graph-wide density figure use `edges_structural`, not `edges`: the flat total counts provenance edges too. |
-| Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing and GQL `SKIP` paging work. Aggregate functions, grouping, distinct projection, and caller-defined ordering are absent.                                                                                                                                                         |
+| Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing, `ORDER BY`, and GQL `SKIP` paging work. Aggregate functions, grouping, and explicit distinct projection are absent.                                                                                                                                                            |
 | Cycle / self-reachability | Which entities are in an `extends` cycle?                           | NO                           | Repeated node-variable bindings are rejected, so cycles and self-reachability cannot be expressed.                                                                                                                                                                                                   |
 | Branching join            | Which parent has both an `extends` child and an `implements` child? | NO                           | GQL supports one alternating path; SPARQL rejects branched or disconnected `WHERE` blocks.                                                                                                                                                                                                           |
-| Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace is a runtime `CompileOptions` input, not query text — a query that references `namespace` in its body is rejected.                                                                                                                                                                         |
+| Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace visibility is supplied by runtime `CompileOptions`. Direct namespace predicates and order fields are rejected; returned namespace fields and a metadata key named namespace do not override scope.                                                                                         |
 | Mutation via query        | Create, update, link, merge, or delete through GQL/SPARQL.          | NO (by design)               | Write-shaped input is rejected outright. Use the corresponding KG verb.                                                                                                                                                                                                                              |
 
 The relation-alternatives idiom, copy-paste form (alternation is a bare pipe
@@ -117,24 +118,64 @@ query(query="MATCH (a)-[r:depends_on]->(b) RETURN a.id, r.id, b.id SKIP 500", pa
 ```
 
 `next_offset` advances by the number of rows actually emitted. It is omitted
-when `has_more` is false. The compiler orders fixed matches by their complete bound
+when `has_more` is false. After any requested `ORDER BY` terms, the compiler orders fixed matches by their complete bound
 identities (including synthetic observation primary keys); recursive `DISTINCT` rows
-are ordered by depth, weight, and their complete projected value tuple. Repeated reads
+use depth, weight, and their complete projected value tuple as ties. Repeated reads
 of unchanged data are therefore stable. This is offset paging, not a cross-call database
 snapshot: inserts or deletes that match the query can shift later pages.
 
 ## Ordering and counts
 
-GQL has no caller-defined `ORDER BY` and no `count()` or other aggregate. Its row
-order is the compiler's identity order described above, which keeps paging stable
-but carries no meaning such as recency. Both omissions are deliberate; see
-[ADR-008](../adr/ADR-008-query-layer-separation.md#why-bounded-skip-instead-of-an-opaque-cursor-or-aggregates)
-for the reasoning. Use these instead:
+GQL accepts `ORDER BY` between `RETURN` and `SKIP`/`LIMIT`. Terms are supported
+scalar fields or named paths below node `properties` or canonical edge `metadata`;
+each takes optional `ASC` (the default) or `DESC`. The compiler retains its identity
+tie order for stable continuation. There is no `count()` or other aggregate; use
+the following verbs for counts and relevance-oriented or type-inventory reads:
 
 | You want                         | Use                                                                                                                                                                                                                                                                                                                                                                                                             |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The newest records about a topic | `search(kind="note", query="...", order_by="created_at")`, or `order_by="updated_at"`. Results sort newest first within the bounded candidate window, so this ranks recent matches but is not a full sort.                                                                                                                                                                                                      |
+| The newest records of a type     | `list(kind="entity", entity_type="...", limit=1)`, or `list(kind="note", note_kind="...")`. Offset pages sort newest first by `created_at` over the whole filtered set; see [`list`](api-reference.md#list--assertive) for the tie order.                                                                                                                                                                       |
 | How many entities of a type      | `stats()` returns `entities_by_type`: one row per stored `entity_type` across entity kinds, counted over caller-visible namespaces and live rows (its `count_scope`). The first row counts entities with no type; in Agent presentation it carries only `count`, because null fields are dropped. For a count under other filters, such as kind or tags, page `list(..., after="")` until `next_after` is null. |
+
+### Ordered qualified relations
+
+To retrieve canonical relations with their qualification data in order:
+
+```text
+MATCH (a)-[e:depends_on]->(b)
+WHERE e.metadata.order IS NOT NULL
+RETURN a.id, e.id, e.metadata, b.id
+ORDER BY e.metadata.order ASC, e.weight DESC
+LIMIT 100
+```
+
+`e_metadata` contains the stored JSON text, or SQL null when metadata is absent.
+Returning only `e` preserves the existing edge fields without metadata: five for
+this fixed-length pattern, or final-edge id/relation/weight for a recursive pattern.
+Metadata paths also support nested identifiers, comparisons and literal string
+filters; use `e.metadata.label CONTAINS "draft_1"` to match the underscore literally.
+Node metadata and edge properties are unsupported. Synthetic `observed_as_*`
+edges do not carry canonical metadata.
+
+Ordering preserves SQLite types: null sorts first ascending and last descending,
+numbers sort numerically, and text sorts with BINARY collation. JSON booleans act
+as integers; object/array leaves sort as their extracted JSON text. Text equality
+and LIKE-family predicates remain case-insensitive, so their matching rule differs from text ordering. Bare
+metadata/properties containers, namespace fields, functions, aliases and `NULLS`
+clauses are not order terms.
+
+For a variable-length path, metadata belongs to its final edge. Recursive order
+terms must be derivable from the actual returned fields: `RETURN e.metadata
+ORDER BY e.metadata.order` is valid, but `RETURN e ORDER BY e.metadata.order`
+is rejected because whole-edge projections omit metadata. This preserves the
+compiler's recursive `DISTINCT` behavior without hidden sort columns.
+
+For multiple pages, retain the same order terms and page size and advance `SKIP`
+using `next_offset`. The query-text `LIMIT` remains the total bound across pages;
+omit it for an exhaustive read. Visibility filtering precedes sorting and paging.
+See [ADR-008 Amendment 1](../adr/ADR-008-query-layer-separation.md#amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14)
+for the ordering and recursive contracts.
 
 ## Verified GQL idioms
 
@@ -206,8 +247,8 @@ returns rows on the live MCP tool.
   unaliased projections; group returned rows client-side where needed.
 - Mixed fixed-plus-variable-length paths are rejected; split the query into
   separate calls instead.
-- No anti-join, optional match, aggregate, `GROUP BY`, `DISTINCT`, or
-  caller-defined ordering exists. GQL uses `SKIP` rather than an `OFFSET`
+- No anti-join, optional match, aggregate, `GROUP BY`, or explicit `DISTINCT`
+  exists. GQL uses `SKIP` rather than an `OFFSET`
   keyword; SPARQL `OFFSET` remains unsupported. Orphan-detection and
   edge-density questions cannot be expressed in a single query.
   [Ordering and counts](#ordering-and-counts) names the verbs to use instead.

@@ -14,12 +14,13 @@ use khive_retrieval::hybrid::{combine_best_ranked_evidence, fuse_labelled, HitLa
 use khive_retrieval::DEFAULT_RRF_K;
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
-    RuntimeError, SearchHit, SearchSource,
+    RuntimeError, RuntimeResult, SearchHit, SearchSource,
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::{namespace::Namespace, SubstrateKind};
 
+use super::ensure_search_active;
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
 use super::search_profile;
@@ -725,6 +726,7 @@ impl SubstrateCoordinator {
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
+    /// A stopped caller request returns its typed error instead of a partial page.
     ///
     /// Authorizes each backend token against `namespace` alone (visible set
     /// `[namespace]`) — see [`Self::fan_out_search_with_visibility`] for the
@@ -733,7 +735,7 @@ impl SubstrateCoordinator {
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
         self.fan_out_search_with_visibility(request, namespace, &[])
             .await
     }
@@ -756,17 +758,19 @@ impl SubstrateCoordinator {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
+        ensure_search_active()?;
         let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(request, namespace, extra_visible, None)
             .await;
+        ensure_search_active()?;
         search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
         let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
-            .await;
+            .await?;
         search_profile::stage("finalize", started, &[]);
-        (entity_hits, note_hits, per_backend)
+        Ok((entity_hits, note_hits, per_backend))
     }
 
     /// Coordinated search keeps the sealed actor and read scope from dispatch
@@ -777,7 +781,8 @@ impl SubstrateCoordinator {
         token: &NamespaceToken,
         args: &serde_json::Value,
         extra_visible: &[Namespace],
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
+        ensure_search_active()?;
         if request.substrate() == SearchSubstrate::Entity {
             return self
                 .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
@@ -792,12 +797,13 @@ impl SubstrateCoordinator {
                 Some((token, args)),
             )
             .await;
+        ensure_search_active()?;
         search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
         let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
-            .await;
+            .await?;
         search_profile::stage("finalize", started, &[]);
-        (entity_hits, note_hits, per_backend)
+        Ok((entity_hits, note_hits, per_backend))
     }
 
     async fn fan_out_search_candidates_with_visibility(
@@ -821,17 +827,18 @@ impl SubstrateCoordinator {
         token: &NamespaceToken,
         args: &serde_json::Value,
         extra_visible: &[Namespace],
-    ) -> (
+    ) -> RuntimeResult<(
         Vec<SearchHit>,
         Vec<NoteSearchHit>,
         Vec<BackendSearchResult>,
         u64,
-    ) {
+    )> {
+        ensure_search_active()?;
         if request.substrate() == SearchSubstrate::Entity {
             let (entities, notes, backends) = self
                 .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
-                .await;
-            return (entities, notes, backends, 0);
+                .await?;
+            return Ok((entities, notes, backends, 0));
         }
         let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend, dropped) = self
@@ -842,12 +849,13 @@ impl SubstrateCoordinator {
                 Some((token, args)),
             )
             .await;
+        ensure_search_active()?;
         search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
         let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
-            .await;
+            .await?;
         search_profile::stage("finalize", started, &[]);
-        (entity_hits, note_hits, per_backend, dropped)
+        Ok((entity_hits, note_hits, per_backend, dropped))
     }
 
     async fn fan_out_search_candidates_with_count(
@@ -1851,10 +1859,12 @@ mod search_phase_trace_tests {
     async fn timeout_profile_correlates_the_held_backend_and_preserves_its_sibling() {
         let coordinator = multi_backend_coordinator(Some(SearchPhase::VectorEmbedding));
         let request = search_request("profile held embedding");
-        let ((_, _, per_backend), lines) = search_profile::capture(search_profile::profiled(
+        let (result, lines) = search_profile::capture(search_profile::profiled(
             coordinator.fan_out_search(&request, &Namespace::local()),
         ))
         .await;
+        let (_, _, per_backend) = result.expect("backend timeout preserves active parent search");
+        assert!(khive_storage::ensure_request_read_active("search").is_ok());
         let records = profile_records(&lines);
         assert_deadline_correlation(&records, "held");
         let deadlines: Vec<_> = records
@@ -1903,10 +1913,13 @@ mod search_phase_trace_tests {
             let coordinator = SubstrateCoordinator::single(runtime())
                 .with_phase_deadline_error_backend("main", phase);
             let request = search_request_of_kind(kind, "profile late admission");
-            let ((hits, notes, per_backend), lines) = search_profile::capture(
-                search_profile::profiled(coordinator.fan_out_search(&request, &Namespace::local())),
-            )
+            let (result, lines) = search_profile::capture(search_profile::profiled(
+                coordinator.fan_out_search(&request, &Namespace::local()),
+            ))
             .await;
+            let (hits, notes, per_backend) =
+                result.expect("backend deadline remains a partial result");
+            assert!(khive_storage::ensure_request_read_active("search").is_ok());
             let records = profile_records(&lines);
             assert_deadline_correlation(&records, "main");
             let deadlines: Vec<_> = records
@@ -1929,10 +1942,12 @@ mod search_phase_trace_tests {
         for kind in ["entity", "note"] {
             let coordinator = SubstrateCoordinator::single(runtime()).with_hanging_backend("main");
             let request = search_request_of_kind(kind, "profile unentered timeout");
-            let (_, lines) = search_profile::capture(search_profile::profiled(
+            let (result, lines) = search_profile::capture(search_profile::profiled(
                 coordinator.fan_out_search(&request, &Namespace::local()),
             ))
             .await;
+            result.expect("backend timeout remains a partial result");
+            assert!(khive_storage::ensure_request_read_active("search").is_ok());
             let records = profile_records(&lines);
             assert_deadline_correlation(&records, "main");
             let deadline = records
@@ -1974,10 +1989,13 @@ mod search_phase_trace_tests {
             Vec::new(),
         )]));
         let request = search_request("profile late fanout");
-        let ((hits, notes, per_backend), lines) = search_profile::capture(
-            search_profile::profiled(coordinator.fan_out_search(&request, &Namespace::local())),
-        )
+        let (result, lines) = search_profile::capture(search_profile::profiled(
+            coordinator.fan_out_search(&request, &Namespace::local()),
+        ))
         .await;
+        let (hits, notes, per_backend) =
+            result.expect("late backends preserve active parent search");
+        assert!(khive_storage::ensure_request_read_active("search").is_ok());
         let records = profile_records(&lines);
         assert_deadline_correlation(&records, late);
         let deadline = records
@@ -2043,7 +2061,8 @@ mod search_phase_trace_tests {
             let request = search_request("phase trace timeout");
             let _ = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             drop(guard);
             let logs = capture.contents();
 
@@ -2064,7 +2083,8 @@ mod search_phase_trace_tests {
         let request = search_request("no search phase entered");
         let _ = coordinator
             .fan_out_search(&request, &Namespace::local())
-            .await;
+            .await
+            .expect("active search succeeds");
         drop(guard);
         let logs = capture.contents();
 
@@ -2099,7 +2119,8 @@ mod search_phase_trace_tests {
             let request = search_request_of_kind(kind, "single backend deadline");
             let _ = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             drop(guard);
             let logs = capture.contents();
 
@@ -2165,7 +2186,10 @@ mod search_phase_trace_tests {
             self::runtime(),
         );
         let coordinator = SubstrateCoordinator::new(registry);
-        let (hits, _, per_backend) = coordinator.fan_out_search(&request, &namespace).await;
+        let (hits, _, per_backend) = coordinator
+            .fan_out_search(&request, &namespace)
+            .await
+            .expect("active search succeeds");
         drop(guard);
         let logs = capture.contents();
 

@@ -42,7 +42,10 @@ async fn intercepted_fanout_records_empty_text_execution_and_empty_backend_set()
         let request = ValidatedSearchRequest::from_value(args.clone(), &registry).unwrap();
         registry
             .dispatch_intercepted_with_identity("search", &args, None, |ns| async move {
-                let (entities, notes, _) = coordinator.fan_out_search(&request, &ns).await;
+                let (entities, notes, _) = coordinator
+                    .fan_out_search(&request, &ns)
+                    .await
+                    .expect("active search succeeds");
                 assert!(entities.is_empty() && notes.is_empty());
                 Ok(json!([]))
             })
