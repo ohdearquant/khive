@@ -873,7 +873,7 @@ fn install_read_fault(
     substrate: SearchSubstrate,
     denials: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    use khive_db::TestHooks;
+    use khive_db::test_hooks::TestHooks;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use std::sync::atomic::Ordering;
     assert_eq!(
@@ -904,7 +904,7 @@ fn install_read_fault(
 }
 
 fn remove_read_fault(runtime: &KhiveRuntime) {
-    use khive_db::TestHooks;
+    use khive_db::test_hooks::TestHooks;
     use rusqlite::hooks::{AuthContext, Authorization};
     runtime
         .backend()
