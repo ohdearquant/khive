@@ -235,7 +235,7 @@ places `search` limit metadata on successful MCP operation wrappers beside
 retain their exact array contract. This does not introduce a uniform metadata
 object into every pack handler's return value.
 
-Every other pack prefixes its public verbs with the pack name and a single dot:
+Every other pack prefixes its verbs, public and internal, with the pack name and a single dot:
 
 ```
 memory.remember, memory.recall, memory.recall_candidates, memory.recall_score
@@ -283,7 +283,9 @@ Rejecting previously admitted third-party declarations that violate this contrac
 is an intentional compatibility change.
 
 The owner is the label reported by `PackRuntime::name()`, not authentication of the
-pack implementation. Ownership validation does not grant registration trust or
+pack implementation. A pack that reports `kg` is held to the kg rules above whatever
+its implementation; because a registry refuses two packs with the same label
+(`PackRedeclared`), a second pack cannot report `kg` beside the real one. Ownership validation does not grant registration trust or
 change the distinction between `register` and `register_trusted`; neither route
 bypasses the public naming rule. Mounted registrations retain their separate
 policy. Internal `Visibility::Subhandler` admission, collision and visibility
