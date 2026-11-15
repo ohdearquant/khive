@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RequestIdentity,
-    RuntimeError, VerbRegistry,
+    micros_to_iso, operations::EntityClaimSpec, EntityPatch, KhiveRuntime, NamespaceToken,
+    RequestIdentity, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::Direction;
 use khive_storage::{
@@ -31,6 +31,15 @@ pub(crate) use unregister::unregister;
 #[cfg(test)]
 tokio::task_local! {
     static BEFORE_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+    static AFTER_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+    static BEFORE_REGISTRATION_UPDATE: (
+        std::sync::Arc<tokio::sync::Barrier>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
+    static BEFORE_REGISTRATION_REINDEX: (
+        std::sync::Arc<tokio::sync::Barrier>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
 }
 
 #[cfg(test)]
@@ -430,17 +439,206 @@ struct RegisterSpec {
     tags: Vec<String>,
 }
 
+fn registration_changed_event(
+    token: &NamespaceToken,
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<Option<khive_storage::Event>, RuntimeError> {
+    let before = RegistryPin::from_entity(existing)?;
+    let mut inputs = crate::pin::registry_policy_inputs(existing);
+    for key in ["source", "side_effect", "trust", "schema"] {
+        if let Some(value) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+        {
+            inputs[key] = value.clone();
+        }
+    }
+    let bytes = khive_types::canonical_json_bytes(&inputs)
+        .map_err(|error| RuntimeError::InvalidInput(format!("tool definition: {error}")))?;
+    let after = RegistryPin::from_canonical_bytes(existing.id, bytes);
+    if before.canonical_bytes() == after.canonical_bytes() {
+        return Ok(None);
+    }
+    let event = khive_runtime::EventAttribution::from_token(token).stamp(
+        khive_storage::Event::new(
+            token.namespace().as_str(),
+            "tool.register",
+            khive_types::EventKind::ToolRegistrationChanged,
+            khive_types::SubstrateKind::Event,
+            "",
+        )
+        .with_target(existing.id),
+    );
+    khive_runtime::secret_gate::check_at(&event.actor, "tool.register", "actor")?;
+    let payload = khive_types::ToolRegistrationChangedPayload {
+        actor: event.actor.clone(),
+        id: existing.id.to_string(),
+        digest_before: before.definition_digest().to_string(),
+        digest_after: after.definition_digest().to_string(),
+    };
+    Ok(Some(event.with_payload(json!(payload))))
+}
+
+fn validate_registration_correction(
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<(), RuntimeError> {
+    let mut corrected = existing
+        .properties
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(Value::Object(properties)) = &patch.properties {
+        for (key, value) in properties {
+            corrected.insert(key.clone(), value.clone());
+        }
+    }
+    let stored = |key| {
+        existing
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+    };
+    let source_changed = corrected.get("source") != stored("source");
+    let kind_changed = patch
+        .entity_type
+        .as_ref()
+        .is_some_and(|kind| kind != &existing.entity_type);
+    if source_changed || kind_changed {
+        let changed = match (source_changed, kind_changed) {
+            (true, true) => "source and kind",
+            (true, false) => "source",
+            _ => "kind",
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "cannot change {changed} on an existing registration; register a different source or kind under a new name"
+        )));
+    }
+    for (field, order) in [("side_effect", SIDE_EFFECTS), ("trust", TRUST_ORIGINS)] {
+        let Some(passed) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(field))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let previous = stored(field);
+        if let (Some(before), Some(after)) = (
+            previous
+                .and_then(Value::as_str)
+                .and_then(|previous| order.iter().position(|value| *value == previous)),
+            order.iter().position(|value| *value == passed),
+        ) {
+            if after < before {
+                let previous = order[before];
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cannot loosen {field}: stored {previous:?}, passed {passed:?}"
+                )));
+            }
+        } else if (field == "side_effect" && passed == "read")
+            || (field == "trust" && passed != "external")
+        {
+            let state = match previous {
+                None => "absent",
+                Some(Value::Null) => "null",
+                Some(Value::String(_)) => "unrecognized",
+                Some(_) => "non-string",
+            };
+            let remedy = if field == "side_effect" {
+                "use write, egress or irreversible"
+            } else {
+                "use external"
+            };
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot set {field} to {passed:?}: stored {field} is {state}; {remedy}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn registration_patch(existing: &Entity, spec: &RegisterSpec, supplied: &Value) -> EntityPatch {
+    let present = |field| supplied.get(field).is_some_and(|value| !value.is_null());
+    let mut patch = EntityPatch::default();
+    if present("description") && existing.description != spec.description {
+        patch.description = Some(spec.description.clone());
+    }
+    let kind_changed =
+        present("kind") && existing.entity_type.as_deref() != Some(spec.kind.as_str());
+    if kind_changed {
+        patch.entity_type = Some(Some(spec.kind.clone()));
+    }
+    let mut properties = serde_json::Map::new();
+    for (key, value) in [
+        ("schema", spec.schema.clone()),
+        ("source", spec.source.as_ref().map(|value| json!(value))),
+        ("side_effect", Some(json!(spec.side_effect))),
+        ("trust", Some(json!(spec.trust))),
+    ] {
+        if present(key) {
+            if let Some(value) = value {
+                if existing
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get(key))
+                    != Some(&value)
+                {
+                    properties.insert(key.into(), value);
+                }
+            }
+        }
+    }
+    if !properties.is_empty() {
+        patch.properties = Some(Value::Object(properties));
+    }
+    let mut tags = existing.tags.clone();
+    for tag in &spec.tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if kind_changed {
+        tags.retain(|tag| !KINDS.contains(&tag.as_str()) || tag == &spec.kind);
+        if !tags.contains(&spec.kind) {
+            tags.push(spec.kind.clone());
+        }
+    }
+    if tags != existing.tags {
+        patch.tags = Some(tags);
+    }
+    patch
+}
+
 async fn register_one(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     spec: RegisterSpec,
 ) -> Result<(Entity, bool, Vec<Value>), RuntimeError> {
+    let (entity, created, _, capabilities) = register_with_updates(rt, token, spec, None).await?;
+    Ok((entity, created, capabilities))
+}
+
+async fn register_with_updates(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: RegisterSpec,
+    supplied: Option<&Value>,
+) -> Result<(Entity, bool, bool, Vec<Value>), RuntimeError> {
     one_of(&spec.kind, KINDS, "kind")?;
     one_of(&spec.side_effect, SIDE_EFFECTS, "side_effect")?;
     one_of(&spec.trust, TRUST_ORIGINS, "trust")?;
 
-    let (entity, created) = match find_by_name(rt, token, &spec.name).await? {
+    let (mut entity, created) = match find_by_name(rt, token, &spec.name).await? {
         Some(existing) => {
+            #[cfg(test)]
+            if let Ok((ready, resume)) = BEFORE_REGISTRATION_REINDEX.try_with(Clone::clone) {
+                ready.wait().await;
+                resume.notified().await;
+            }
             rt.ensure_claimed_entity_create_event(token, &existing)
                 .await?;
             rt.reindex_claimed_entity(token, &existing).await?;
@@ -496,9 +694,50 @@ async fn register_one(
                     },
                 )
                 .await?;
+            #[cfg(test)]
+            if let Ok(barrier) = AFTER_CLAIM.try_with(std::sync::Arc::clone) {
+                barrier.wait().await;
+            }
             (entity, created)
         }
     };
+
+    let mut updated = false;
+    if !created {
+        if let Some(supplied) = supplied {
+            let patch = registration_patch(&entity, &spec, supplied);
+            if patch.description.is_some()
+                || patch.entity_type.is_some()
+                || patch.properties.is_some()
+                || patch.tags.is_some()
+            {
+                validate_registration_correction(&entity, &patch)?;
+                let required_event = registration_changed_event(token, &entity, &patch)?;
+                #[cfg(test)]
+                if let Ok((ready, resume)) = BEFORE_REGISTRATION_UPDATE.try_with(Clone::clone) {
+                    ready.wait().await;
+                    resume.notified().await;
+                }
+                entity = match required_event {
+                    Some(event) => {
+                        rt.update_entity_if_unchanged_with_required_event(
+                            token,
+                            &entity,
+                            patch,
+                            &[],
+                            event,
+                        )
+                        .await?
+                    }
+                    None => {
+                        rt.update_entity_if_unchanged(token, &entity, patch, &[])
+                            .await?
+                    }
+                };
+                updated = true;
+            }
+        }
+    }
 
     let tool_id = entity_uuid(&entity);
     let mut caps = Vec::new();
@@ -508,7 +747,7 @@ async fn register_one(
         link_implements(rt, token, tool_id, cap_id).await?;
         caps.push(json!({ "id": cap_id.to_string(), "name": cap.name }));
     }
-    Ok((entity, created, caps))
+    Ok((entity, created, updated, caps))
 }
 
 pub(crate) async fn register(
@@ -536,10 +775,13 @@ pub(crate) async fn register(
         capabilities: opt_str_list(&params, "capabilities")?,
         tags: opt_str_list(&params, "tags")?,
     };
-    let (entity, created, capabilities) = register_one(rt, token, spec).await?;
+    let (entity, created, updated, capabilities) =
+        register_with_updates(rt, token, spec, Some(&params)).await?;
     Ok(json!({
         "ok": true,
         "created": created,
+        "updated": updated,
+        "unchanged": !created && !updated,
         "tool": summary(&entity),
         "capabilities": capabilities,
     }))

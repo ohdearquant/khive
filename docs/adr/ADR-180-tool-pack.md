@@ -902,7 +902,7 @@ making it binding would change what rows already granted allow. This amendment a
    over those inputs (Amendment 1 items 1 and 2).
 
 3. **A revised program is a new registration.** Re-registering an existing name returns the stored row unchanged
-   (Decision, `tool.register`), so editing a script cannot update its approval in place. A revised script, constraint
+   (Decision, `tool.register`; test `re_registration_updates_definition_and_invalidates_only_mismatched_grants`), so editing a script cannot update its approval in place. A revised script, constraint
    or interpreter is registered under a new name and granted again, as ADR-181 Amendment 14 already rules for an
    upgraded executable. `tool.register` on an existing name with a passed `program` that differs from the stored one
    is refused, on both paths that return an existing row (the name lookup and the losing side of a concurrent claim),
