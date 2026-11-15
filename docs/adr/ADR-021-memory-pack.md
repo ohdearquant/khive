@@ -1156,16 +1156,20 @@ recalled from another unless the bound admits it.
 
 **Problem.** Decision 5, as Delta 1 states it, decides which old rows `memory.apply_batch` may supersede: a row in the
 caller's namespace, a row in the shared `local` namespace, or a row in a namespace the caller lists in
-`owned_namespaces`. Any other row is refused as `old-namespace`. The same supersede can be written three other ways,
+`owned_namespaces`. Any other row is refused as `old-namespace`. The same supersede can be written in other ways,
 and none of them applies that rule:
 
 - `link(relation="supersedes")`. Delta 3 checks only the source row's namespace, and only when both endpoints are memory
   rows. A source that is not a memory row skips the check entirely.
-- A `link` op in `apply_changeset`, with the same gap at preparation.
+- A `link` op in `apply_changeset`, with the same gap at preparation, and the legacy `AddEdge` proposal change-set,
+  which an approved proposal applies through the same `link` preparation.
+- `update` of an existing edge, directly or as an edge update in a change-set, that changes its `relation` to
+  `supersedes`. It runs the same endpoint check as `link` and nothing else, so an edge stored with another relation
+  can become a supersede.
 - `update` of a memory row whose `properties` carry `supersedes`. Delta 2 made `memory.remember` refuse that key, but
   `update` still writes it.
 
-Recall honors each of the three exactly as it honors a batch supersede (Delta 2). A write in one namespace therefore
+Recall honors each of these exactly as it honors a batch supersede (Delta 2). A write in one namespace therefore
 hides a row in another namespace that `memory.apply_batch` would have refused to supersede. The hiding applies to
 every reader whose visible set covers both namespaces. A reader scoped to the target row's own namespace is not
 affected, because the edge or property sits outside its visible set.
@@ -1179,23 +1183,27 @@ affected, because the edge or property sits outside its visible set.
    - a namespace in the caller's `owned_namespaces`.
 
    The namespace the supersede is written in is, for `link`, the request's write namespace, the one the gate checked:
-   the explicit `namespace` argument when the call carries one, and otherwise the registry's write namespace, which
-   ADR-007 Rule 0 sets to `local` (Delta 3, Problem). For a change-set link op it is the op's own `namespace` field; for
-   `restore` of an edge it is the edge's stored namespace; for the property, on `update` and on `restore`, it is the
-   namespace of the row that carries the property. So a `link` with no `namespace` argument can supersede only rows in `local` (or an owned namespace), and a
-   caller superseding a row in its own actor namespace passes `namespace=<that namespace>`, which Delta 3 already
-   requires when the source is a memory row in that namespace.
+   the explicit `namespace` argument when the call carries one, and otherwise the registry's write namespace: the
+   namespace the deployment resolved, an explicit `--namespace` or `KHIVE_NAMESPACE`, else `local` (ADR-007 Rule 0;
+   Delta 3, Problem). For a change-set link op it is the op's own `namespace` field, and for the legacy `AddEdge`
+   change-set, which carries none, it is the write namespace of the request that approves it. For `update` of an edge
+   and for `restore` of an edge it is the edge's stored namespace; an edge update changes neither endpoint nor the
+   edge's namespace. For the property, on `update` and on `restore`, it is the namespace of the row that carries the
+   property. So on a deployment that resolves no namespace, a `link` with no `namespace` argument can supersede only
+   rows in `local` (or an owned namespace), and a caller superseding a row in its own actor namespace passes
+   `namespace=<that namespace>`, which Delta 3 already requires when the source is a memory row in that namespace.
 
    Anything else is refused before anything is written. The refusal names the row's namespace only when the caller can
    read it, the same split as Delta 3 rule 1, and it never redirects the write.
 2. **Which writes.** The rule applies to these writes, whatever kind of row the source is:
    - `link` with `relation="supersedes"` onto a memory row;
    - a `link` op with that relation in a change-set, at preparation, whether it arrives through `apply_changeset` or
-     through an approved `propose` (ADR-046), which applies through the same preparation. An approved proposal is
-     checked with an empty `owned_namespaces` list. It is applied under the apply worker's system identity, from which
-     ADR-046 infers no authority, and `owned_namespaces` is a claim carried on a caller's own request, which no stored
-     proposal records. Neither the proposer's list nor the reviewer's applies, so the target must be in the op's own
-     namespace or in `local`;
+     through an approved `propose` (ADR-046), which applies through the same preparation;
+   - the legacy `AddEdge` proposal change-set with `relation="supersedes"` onto a memory row, at preparation when an
+     approved proposal is applied;
+   - `update` of an edge, and an edge update in a change-set, when the patch sets `relation` to `supersedes` and the
+     edge's target is a memory row, checked against the edge's stored namespace. A patch that leaves the relation
+     unchanged, or changes it away from `supersedes`, is not checked;
    - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace. The
      target is looked up among stored memory rows, live or soft-deleted, and checked by rule 1 against its stored
      namespace, for the reason given for `restore` below: a soft-deleted target can become live after the edge is
@@ -1207,10 +1215,19 @@ affected, because the edge or property sits outside its visible set.
 
    On `update` and on a change-set note update, a new value must be a complete UUID naming a live memory row, and that
    row is checked by rule 1. Any other new value is refused, naming `memory.apply_batch` and
-   `link(relation="supersedes")`. A `link`, and a change-set link op, cannot target a soft-deleted row: endpoint
-   resolution reads live rows only and refuses any other id, so neither write can store a supersede onto a row that
-   becomes live later. A patch that leaves the stored value unchanged is not checked. A patch that removes
-   the key or sets it to null is admitted and not checked: it can only stop a row from being hidden.
+   `link(relation="supersedes")`. On every edge write in the list (a `link`, a change-set link op, the legacy
+   `AddEdge` change-set and an edge relation update), the target is looked up among stored memory rows, live or
+   soft-deleted, and checked by rule 1 against its stored namespace, as on `restore` below. The check does not rely on
+   any path's endpoint resolution refusing a soft-deleted target, so a supersede cannot be stored onto a row in a
+   refused namespace that becomes live later. A patch that leaves the stored value unchanged is not checked. A patch
+   that removes the key or sets it to null is admitted and not checked: it can only stop a row from being hidden.
+
+   **Approved proposals.** An approved proposal's change-set is applied with the approving reviewer's request token
+   (ADR-046 `review`), and that token carries the reviewer's own `owned_namespaces` declaration. A stored proposal
+   records no declaration, and the reviewer's declaration is a claim about the reviewer's writes, not about the
+   proposal's content. So the apply of an approved proposal clears the token's `owned_namespaces` list before
+   preparation, and every supersede in it is checked by rule 1 with an empty list: the target must be in the
+   supersede's own namespace or in `local`. Neither the proposer's list nor the reviewer's applies.
 
    On `restore`, the stored value is not rewritten and is checked as recall would honor it, now and after any later
    write. A row the value names can become live after the carrier is restored: by-id `restore` is open to that row's
@@ -1296,10 +1313,15 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
 - `link` of a `supersedes` edge from a caller's memory onto a memory row in another, not owned, namespace is refused,
   with no edge stored. Control: the same link between two of the caller's own rows, with `namespace=<own>`, succeeds.
 - The same `link` from a non-memory note in the caller's namespace is refused. Control: the same note superseding one
-  of the caller's own memory rows with `namespace=<own>` succeeds. With no `namespace` argument the same control is
-  refused, because the write namespace is then `local`.
+  of the caller's own memory rows with `namespace=<own>` succeeds. With no `namespace` argument, on a deployment that
+  resolves no namespace, the same control is refused, because the write namespace is then `local`.
 - `apply_changeset` refuses the same link op at preparation. Control: an op linking the caller's own two rows
   prepares.
+- `update` of an edge from the caller's memory row onto another, not owned, namespace's memory row, changing its
+  relation from `annotates` to `supersedes`, is refused, the edge keeps `annotates`, and the target stays in a
+  two-namespace reader's recall. The same patch as an edge update in `apply_changeset` is refused at preparation.
+  Control: the same relation change on an edge between two of the caller's own rows, stored in the caller's
+  namespace, is admitted and hides the target; a weight-only patch on the refused edge is admitted unchecked.
 - `update` setting `properties.supersedes` to another namespace's memory row is refused, and that row stays in a
   two-namespace reader's recall. Control: the same update naming the caller's own row hides that row.
 - `update` removing `properties.supersedes`, and one setting it to null, are admitted on a row whose stored value names
@@ -1329,9 +1351,13 @@ bounds what these verbs agree to supersede. It protects no row from a caller tha
   own rows.
 - A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
   approved proposal is applied, and no edge is stored. Control: the same op between the caller's own rows applies.
+- A legacy `AddEdge` proposal with `relation="supersedes"` onto another namespace's memory row is refused when the
+  approved proposal is applied, and no edge is stored. Control: the same `AddEdge` onto a memory row in the approving
+  request's write namespace applies.
 - A link op with `relation="supersedes"` onto a row in namespace `V`, in a proposal whose proposer and reviewer both
-  list `V` in `owned_namespaces`, is refused when the approved proposal is applied, and no edge is stored. Control: the
-  same op through `apply_changeset` by the proposer applies.
+  list `V` in `owned_namespaces`, is refused when the approved proposal is applied, and no edge is stored. This holds
+  although the apply runs with the reviewer's request token, which carries the reviewer's list. Control: the same op
+  through `apply_changeset` by the proposer applies.
 - A note merge whose merged-away note is the target of a `supersedes` edge stored in another namespace leaves that
   edge, with its stored namespace, on the survivor; the dry run lists it before and after the merge.
 - The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows,
