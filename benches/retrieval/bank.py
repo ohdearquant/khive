@@ -72,8 +72,11 @@ each round separately and must hold in both:
     own-namespace bank   MRR@10 with the candidate is at least MRR@10 with no profile
     shared-pool bank     MRR@10 falls by at most 0.04 (exact arithmetic, so exactly 0.04 passes) and at most one
                          question is lost: in the no-profile top ten and outside the candidate's top ten
-Nothing runs when the runtime has a brain_profile (config, environment or command line), when a recall binding resolves
-for the caller, or when the two arms' caller, primary namespace or readable namespaces differ. A hit whose attribution is
+Both arms of a bank share one server process and its credentials, so they have the same caller, primary namespace and
+readable namespaces by construction. The scope comparison remains a defensive guard for a future separate-process
+implementation; the readable-set check independently refuses a set that is not the bank's expected read set.
+Nothing runs when the runtime has a brain_profile (config, environment or command line), or when a recall binding resolves
+for the caller. A hit whose attribution is
 not its arm's (`unspecified` with no served_by_profile_id for no profile; `profile` and the candidate's id for the
 candidate) stops the run. A degraded recall, or a no-profile recall with no hits, voids its round, which runs again in
 fresh processes; a question that voids three runs in a row stops the gate and is named. Exit status: 0 pass, 10 fail,
@@ -962,12 +965,14 @@ def start(args, run_id: str, scratch: Path):
     return banks, br, base, {**ready, **staged}
 
 
-def scratch_dir(args, run_id: str) -> Path:
+def scratch_dir(args, run_id: str, *, bank_paths: list[str] | None = None) -> Path:
+    """Validate banks before creating scratch; rebind-gate supplies its two paths explicitly."""
     if os.environ.get("KHIVE_DB"):
         raise BankError("refusing to run with KHIVE_DB set in the caller's environment; unset it")
-    if args.bank:
-        for bank in args.bank:
-            load_bank(Path(bank))
+    if bank_paths is None:
+        bank_paths = args.bank
+    for bank in bank_paths or []:
+        load_bank(Path(bank))
     if args.staged_home:
         if args.remove_scratch:
             raise BankError("--remove-scratch does not apply to --staged-home: the runner did not make that copy")
@@ -1342,10 +1347,11 @@ def scope_of(who) -> dict:
 
 
 def require_same_scope(scopes: dict, read_set: list[str]) -> None:
-    """Both arms run as the same caller with the same primary and readable namespaces, and the readable set is the
-    bank's read set plus the two namespaces the runtime adds to every caller's: the primary namespace, and the
-    caller's own actor namespace (its actor id, unless that is `local`), which the runtime folds into the configured
-    visible namespaces."""
+    """Check the readable set and retain a defensive arm-scope comparison. Today's arms share one server process and
+    credentials, so their same-caller and namespace scope holds by construction; the comparison guards a future
+    separate-process implementation. Synthetic mismatch checks exercise this helper, not today's process arrangement.
+    The readable set must be the bank's read set plus the two namespaces the runtime adds to every caller's: the primary
+    namespace and the caller's own actor namespace (its actor id, unless that is `local`)."""
     none, cand = scopes["none"], scopes["candidate"]
     if none != cand:
         raise GateRefused(f"the arms' caller or namespace scope differ: no profile {json.dumps(none)}, candidate "
@@ -1681,9 +1687,10 @@ def render_summary(report: dict, banks: dict, candidate_line: str) -> str:
 
 
 def gate_preflight(br, role: str, bank: dict, cand: str, args, state: dict, proc: dict) -> None:
-    """Runs in each bank's server process right after the handshake, before its first recall. Records the caller's
-    scope per arm and refuses arms that differ or a readable set that is not the bank's, reads the caller's recall
-    bindings and refuses when one resolves, reads the candidate, and (once) reads the token-budget cap."""
+    """Runs in each bank's shared server process right after the handshake, before its first recall. Both scope reads
+    use that process and its credentials; same-caller scope holds by construction. Retain the comparison for a future
+    separate-process implementation and independently refuse a readable set that is not the bank's. Read the caller's
+    recall bindings and refuse when one resolves, read the candidate, and (once) read the token-budget cap."""
     scopes = {arm: scope_of(br.one(op("whoami"))) for arm in GATE_ARMS}
     proc["scopes"] = scopes
     require_same_scope(scopes, bank["visible"])
@@ -1878,12 +1885,11 @@ def run_rebind_gate(args) -> int:
              "shared": {"meta": shared_meta, "cases": shared_cases, "visible": visible[shared_meta["bank_id"]],
                         "namespaces": namespace_counts(shared_cases)}}
     read_engines(args)
-    args.bank = [args.own_bank, args.shared_bank]
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%Sz")
     out = Path(args.out)
     if out.exists():
         raise BankError(f"refusing to overwrite {out}")
-    scratch = scratch_dir(args, run_id)
+    scratch = scratch_dir(args, run_id, bank_paths=[args.own_bank, args.shared_bank])
     out.mkdir(parents=True)
     record = {"status": "incomplete", "profile": args.profile, "recall_shape": {
         "top_k": GATE_TOP_K, "include_breakdown": True, "include_timings": True, "created_before": "each case's T"},
@@ -2094,7 +2100,7 @@ def gate_self_checks(arm, with_patches) -> None:
                 and stops(lambda: require_same_scope(same, ["team-b"]), GateRefused)
                 and stops(lambda: scope_of({"namespace": "local"}), GateRefused))
 
-    arm("rebind-gate: arms whose caller or namespace sets differ, or a readable set that is not the bank's, are refused",
+    arm("rebind-gate: synthetic scope mismatches and a readable set that is not the bank's are refused",
         scope_refused)
 
     def actor_namespace_counted():

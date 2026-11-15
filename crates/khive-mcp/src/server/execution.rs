@@ -8,6 +8,7 @@ use khive_runtime::{DomainDisposition, PresentationMode, VerbPresentationPolicy}
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 
+use crate::args::CatalogVerbosity;
 use crate::coordinator::CoordinatorService;
 
 use super::batch_types::{
@@ -32,6 +33,54 @@ use super::{
     parse_content_requested, present_ok_envelope_or_depth_error, stamp_usage,
     substitution_error_payload, KhiveMcpServer, BATCH_RESPONSE_BUDGET_BYTES,
 };
+
+const COMPACT_CATALOG_HEADER: &str = "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.";
+const COMPACT_SUMMARY_LIMIT: usize = 160;
+
+fn compact_verb_summary(description: &str) -> String {
+    let summary = description
+        .split(['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'])
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| "Help available".to_owned());
+    if summary.chars().count() <= COMPACT_SUMMARY_LIMIT {
+        summary
+    } else {
+        let mut shortened: String = summary.chars().take(COMPACT_SUMMARY_LIMIT - 1).collect();
+        shortened.push('…');
+        shortened
+    }
+}
+
+fn build_compact_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>) -> String {
+    let mut by_verb: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (pack, name, description) in verbs {
+        by_verb
+            .entry(name)
+            .or_default()
+            .push((pack, compact_verb_summary(&description)));
+    }
+    let mut out = String::from(COMPACT_CATALOG_HEADER);
+    out.push('\n');
+    for (name, contributions) in by_verb {
+        out.push_str(&name);
+        out.push_str(": ");
+        for (index, (pack, summary)) in contributions.into_iter().enumerate() {
+            if index > 0 {
+                out.push_str(" | ");
+            }
+            out.push('[');
+            out.push_str(&pack);
+            out.push_str("] ");
+            out.push_str(&summary);
+        }
+        out.push_str(" — ");
+        out.push_str(&name);
+        out.push_str("(help=true)\n");
+    }
+    out
+}
 
 impl KhiveMcpServer {
     /// Serve over stdio (blocks until the connection closes).
@@ -156,7 +205,10 @@ impl KhiveMcpServer {
                     verb["description"].as_str().unwrap_or_default().to_owned(),
                 )
             });
-        build_verb_catalog(verbs.chain(mounted))
+        match self.catalog_verbosity {
+            CatalogVerbosity::Full => build_verb_catalog(verbs.chain(mounted)),
+            CatalogVerbosity::Compact => build_compact_verb_catalog(verbs.chain(mounted)),
+        }
     }
 
     /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
@@ -234,9 +286,9 @@ impl KhiveMcpServer {
                                     "kind": "substitution_error",
                                     "reason": "bare_ref_ambiguous",
                                     "message": format!(
-                                        "argument {name:?}: $prev requires a dotted path \
-                                         (e.g. $prev.0) when the prior result is an array. \
-                                         Use $prev.N to select a specific element."
+                                        "argument {name:?}: $prev requires an array index \
+                                         (e.g. `$prev[0]`) when the prior result is an array. \
+                                         Use `$prev[0].id` to select a field from an element."
                                     ),
                                 }),
                             ));
@@ -1070,5 +1122,75 @@ impl KhiveMcpServer {
             "status": batch_status(failed, aborted),
         });
         (response, content_updates)
+    }
+}
+
+#[cfg(test)]
+mod compact_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn compact_summary_normalizes_the_first_nonempty_logical_line() {
+        for separator in ['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let description =
+                format!(" \t{separator}  First\tline\u{00a0}summary  {separator}later text");
+            assert_eq!(compact_verb_summary(&description), "First line summary");
+        }
+        assert_eq!(compact_verb_summary("\r\n\t\u{2028}   "), "Help available");
+        assert_eq!(compact_verb_summary(""), "Help available");
+        assert_eq!(compact_verb_summary(" First \r\nsecond"), "First");
+        assert_eq!(
+            compact_verb_summary("first\u{000b}second\u{000c}third"),
+            "first second third"
+        );
+    }
+
+    #[test]
+    fn compact_summary_caps_unicode_scalars_including_ellipsis() {
+        for scalar in ['a', '界', '🦀'] {
+            for count in [159, 160] {
+                let description = scalar.to_string().repeat(count);
+                assert_eq!(compact_verb_summary(&description), description);
+            }
+            let description = scalar.to_string().repeat(161);
+            let summary = compact_verb_summary(&description);
+            assert_eq!(summary, format!("{}…", scalar.to_string().repeat(159)));
+            assert_eq!(summary.chars().count(), 160);
+        }
+        let combining = "e\u{0301}".repeat(80);
+        assert_eq!(compact_verb_summary(&combining), combining);
+        assert_eq!(
+            compact_verb_summary(&(combining.clone() + "x")),
+            format!("{}…", combining.chars().take(159).collect::<String>())
+        );
+    }
+
+    #[test]
+    fn compact_catalog_sorts_names_and_preserves_every_contributor_on_one_row() {
+        let entries = [
+            ("mounted", "zeta.run", " Last\nnot advertised"),
+            ("native-a", "alpha", " First\r\ncontinuation"),
+            (
+                "native-b",
+                "alpha",
+                "\u{2028}  Second\tcontributor\u{2029}hidden tail",
+            ),
+            ("empty", "beta", " \t"),
+        ]
+        .map(|(pack, name, description)| {
+            (pack.to_owned(), name.to_owned(), description.to_owned())
+        });
+        let catalog = build_compact_verb_catalog(entries);
+        assert_eq!(catalog, concat!(
+            "Compact catalog: each entry shows the first nonempty line of its description, shortened to at most 160 characters where marked with …; verb(help=true) returns the full text.\n",
+            "alpha: [native-a] First | [native-b] Second contributor — alpha(help=true)\n",
+            "beta: [empty] Help available — beta(help=true)\n",
+            "zeta.run: [mounted] Last — zeta.run(help=true)\n",
+        ));
+        assert_eq!(catalog.lines().count(), 4);
+        assert_eq!(
+            build_compact_verb_catalog([]),
+            format!("{COMPACT_CATALOG_HEADER}\n")
+        );
     }
 }

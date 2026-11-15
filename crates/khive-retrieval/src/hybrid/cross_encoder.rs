@@ -1,10 +1,11 @@
-//! Native cross-encoder reranking via `khive-inference`.
+//! Native cross-encoder reranking via `lattice-inference`.
 //!
 //! Provides `NativeCrossEncoderReranker<Id, R, S>` which implements `Reranker<Id>`.
 //! Document texts are fetched by `RerankDocumentResolver<Id>` so the existing
 //! `Reranker` trait (which only carries IDs and scores) does not need to change.
 
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +13,9 @@ use khive_score::DeterministicScore;
 
 use crate::error::{Result, RetrievalError};
 use crate::hybrid::searcher::Reranker;
+
+/// Native BERT cross-encoder returning sigmoid probabilities, not raw logits.
+pub use lattice_inference::CrossEncoderModel as NativeCrossEncoderModel;
 
 /// Resolve document texts for a set of candidate IDs.
 ///
@@ -26,24 +30,31 @@ where
     /// Fetch document bodies for `ids` in input order.
     ///
     /// The returned `Vec` must be the same length as `ids`. A missing document
-    /// is represented as `None`; the reranker will return an error in that case.
+    /// is represented as `None`; the reranker drops that candidate while keeping
+    /// every retained ID aligned with its document and score. An all-missing
+    /// batch returns empty without scoring. Resolver errors still fail the call.
     async fn resolve_documents(&self, ids: &[Id]) -> Result<Vec<Option<String>>>;
 }
 
 /// Synchronous cross-encoder scorer abstraction (for testability).
 pub trait CrossEncoderScorer: Send + Sync {
-    /// Score a query against a batch of documents; returns one value per document.
+    /// Score a query against a batch of documents in input order.
+    /// The native model returns sigmoid probabilities in `[0, 1]`. Finite
+    /// precision and saturation can introduce ties even for distinct logits.
     fn score_batch(&self, query: &str, documents: &[&str]) -> Vec<f32>;
 }
 
-// TODO(port-rerank): khive-inference not ported yet; CrossEncoderModel impl disabled.
-// impl CrossEncoderScorer for khive_inference::CrossEncoderModel { ... }
+impl CrossEncoderScorer for NativeCrossEncoderModel {
+    fn score_batch(&self, query: &str, documents: &[&str]) -> Vec<f32> {
+        NativeCrossEncoderModel::score_batch(self, query, documents)
+    }
+}
 
 /// Reranker that scores candidates with a native cross-encoder model.
 ///
-/// The generic parameter `S` is the scorer implementation (defaults to no external dep
-/// in this OSS build; use a concrete scorer by passing one explicitly).
-/// Tests substitute a lightweight fake scorer.
+/// Missing documents are dropped before applying `top_k`. Equal model scores
+/// retain input order. The scorer is generic so callers may also supply another
+/// implementation of [`CrossEncoderScorer`].
 pub struct NativeCrossEncoderReranker<Id, R, S>
 where
     Id: Clone + Send + Sync + 'static,
@@ -71,9 +82,19 @@ where
     }
 }
 
-// TODO(port-rerank): from_directory constructor requires khive-inference::CrossEncoderModel.
-// Re-enable once khive-inference is ported.
-// impl<Id, R> NativeCrossEncoderReranker<Id, R, khive_inference::CrossEncoderModel> { ... }
+impl<Id, R> NativeCrossEncoderReranker<Id, R, NativeCrossEncoderModel>
+where
+    Id: Clone + Send + Sync + 'static,
+    R: RerankDocumentResolver<Id>,
+{
+    /// Load a local BERT classification checkpoint and bind its document resolver.
+    pub fn from_directory(path: &Path, resolver: Arc<R>) -> Result<Self> {
+        let model = NativeCrossEncoderModel::from_directory(path).map_err(|error| {
+            RetrievalError::rerank(format!("cross-encoder model load failed: {error}"))
+        })?;
+        Ok(Self::new(Arc::new(model), resolver))
+    }
+}
 
 #[async_trait]
 impl<Id, R, S> Reranker<Id> for NativeCrossEncoderReranker<Id, R, S>
@@ -102,31 +123,32 @@ where
             )));
         }
 
-        let mut documents: Vec<String> = Vec::with_capacity(resolved.len());
-        for (idx, opt) in resolved.into_iter().enumerate() {
-            let text = opt.ok_or_else(|| {
-                RetrievalError::rerank(format!(
-                    "missing document text for rerank candidate at index {idx}"
-                ))
-            })?;
-            documents.push(text);
+        let retained: Vec<_> = results
+            .into_iter()
+            .zip(resolved)
+            .enumerate()
+            .filter_map(|(position, ((id, _), document))| {
+                document.map(|document| (position, id, document))
+            })
+            .collect();
+        if retained.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
+        let document_refs: Vec<&str> = retained.iter().map(|(_, _, text)| text.as_str()).collect();
         let scores = self.model.score_batch(query, &document_refs);
-        if scores.len() != results.len() {
+        if scores.len() != retained.len() {
             return Err(RetrievalError::rerank(format!(
                 "model returned {} scores for {} candidates",
                 scores.len(),
-                results.len()
+                retained.len()
             )));
         }
 
-        let mut scored: Vec<(usize, Id, f32)> = results
+        let mut scored: Vec<(usize, Id, f32)> = retained
             .into_iter()
             .zip(scores)
-            .enumerate()
-            .map(|(idx, ((id, _), score))| (idx, id, score))
+            .map(|((position, id, _), score)| (position, id, score))
             .collect();
 
         scored.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));

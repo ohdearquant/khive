@@ -348,15 +348,15 @@ impl Parser {
         }
     }
 
-    fn parse_property_ref(&mut self) -> Result<PropertyRef, QueryError> {
+    fn parse_property_ref(&mut self, clause: &str) -> Result<PropertyRef, QueryError> {
         let root = self.parse_ident()?;
         self.skip_whitespace();
         if self.peek() != Some('.') {
             return Ok(PropertyRef::Field(root));
         }
-        if root != "properties" {
+        if root != "properties" && root != "metadata" {
             return Err(self.err(format!(
-                "invalid WHERE property path root '{root}'; nested paths must start with 'properties'"
+                "invalid {clause} property path root '{root}'; nested paths must start with 'properties' or 'metadata'"
             )));
         }
 
@@ -366,14 +366,18 @@ impl Parser {
             path.push(self.parse_ident()?);
             self.skip_whitespace();
         }
-        Ok(PropertyRef::JsonPath(path))
+        Ok(if root == "metadata" {
+            PropertyRef::MetadataPath(path)
+        } else {
+            PropertyRef::JsonPath(path)
+        })
     }
 
     fn parse_condition(&mut self) -> Result<Condition, QueryError> {
         self.skip_whitespace();
         let variable = self.parse_ident()?;
         self.expect_char('.')?;
-        let property = self.parse_property_ref()?;
+        let property = self.parse_property_ref("WHERE")?;
         let op = self.parse_compare_op()?;
         let value = match op {
             CompareOp::In => ConditionValue::List(self.parse_list_literal()?),
@@ -458,6 +462,32 @@ impl Parser {
         }
     }
 
+    fn parse_order_items(&mut self) -> Result<Vec<OrderItem>, QueryError> {
+        let mut items = Vec::new();
+        loop {
+            let variable = self.parse_ident()?;
+            self.expect_char('.')?;
+            let property = self.parse_property_ref("ORDER BY")?;
+            let direction = if self.try_keyword("DESC") {
+                OrderDirection::Desc
+            } else {
+                self.try_keyword("ASC");
+                OrderDirection::Asc
+            };
+            items.push(OrderItem {
+                variable,
+                property,
+                direction,
+            });
+            self.skip_whitespace();
+            if self.peek() != Some(',') {
+                break;
+            }
+            self.advance();
+        }
+        Ok(items)
+    }
+
     fn parse_query(&mut self) -> Result<GqlQuery, QueryError> {
         self.expect_keyword("MATCH")?;
         let pattern = self.parse_pattern()?;
@@ -480,6 +510,13 @@ impl Parser {
         self.expect_keyword("RETURN")?;
         let return_items = self.parse_return_items()?;
 
+        let order_by = if self.try_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            self.parse_order_items()?
+        } else {
+            Vec::new()
+        };
+
         let offset = if self.try_keyword("SKIP") {
             self.parse_number()?
         } else {
@@ -494,6 +531,7 @@ impl Parser {
             pattern,
             where_clause,
             return_items,
+            order_by,
             offset,
             limit,
         })

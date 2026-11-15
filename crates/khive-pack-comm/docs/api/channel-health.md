@@ -258,6 +258,13 @@ delayed sweep. ADR-119's component supervisor remains authoritative for hung
 task detection and restart. All channel projections use the same captured
 `as_of`, so a multi-channel response has one consistent comparison instant.
 
+`no_success_age_secs` reports whole seconds since a valid `last_success_at`,
+even while failures put the channel in backoff. A channel with 79 consecutive
+failures and a success ten hours before `as_of` reports 36000. Missing,
+malformed or future success timestamps produce null, including channels that
+have never reported success, outbox-only rows and quarantine-only entries.
+The reader does not substitute its own process start time or send notices.
+
 ### Outbox scan observations
 
 Issue #5213 adds `outbox` beside the inbound poll fields. It is `null` when
@@ -266,7 +273,7 @@ An outbox-only channel has null inbound poll facts; an outbox report never
 establishes an inbound poll or resets its failures.
 
 The email and Telegram delivery paths record the result immediately after the
-pending-row query completes, before attempting any delivery. Empty successful
+due-page and backlog queries complete, before attempting any delivery. Empty successful
 scans still update `last_scan_completed_at` and `last_success_at`. The nested
 object contains:
 
@@ -291,6 +298,31 @@ object contains:
   have unknown age. The queue may change after the scan, and an older row may
   lie beyond the newest-first page, so this is not the oldest row of the whole
   queue. `last_success_at` dates the observation, including after a scan error.
+- `undelivered_rows`: all eligible due and future-retry rows, without the
+  delivery page's bound. `backoff_rows` counts the subset whose valid retry
+  timestamp is in the future. Missing or malformed retry timestamps remain
+  due, matching delivery's strict RFC 3339 rules and microsecond boundary.
+- `earliest_backoff_next_attempt_at`, `oldest_backoff_created_at` and
+  `max_backoff_delivery_attempts`: the earliest retry instant, earliest
+  creation time and greatest unsigned retry count among the backoff rows.
+  These are null when that subset is empty; absent or invalid attempt
+  counters contribute zero.
+- `oldest_undelivered_created_at` and `oldest_undelivered_age_secs`: the
+  earliest creation time across the entire eligible backlog and its age at
+  `as_of`, covering both due and backoff rows. Empty backlogs have null
+  timestamps and ages; malformed or future creation timestamps have unknown age.
+- `backlog_observed_at`: the backlog query's observation time. The due page
+  and backlog are separate reads, so concurrent queue changes can make their
+  counts differ. Both observations retain their dates and values after a
+  failed query; they are not a live count at the health response's `as_of`.
+
+The aggregate reads metadata on the same comm backend and namespace as delivery.
+It excludes terminal, delivered and held rows, unrelated recipients and other
+channel slugs. Missing slugs are eligible only with one configured adapter of
+that kind; null and blank slugs are not missing. It returns scalar observations
+without loading message bodies, but still reads the matching backlog metadata.
+Older heartbeat rows have null aggregate fields until a successful new scan.
+No age threshold, outage notification or retry-policy change is implied.
 
 Agent presentation, the MCP default, keeps a null `outbox` and every null field
 inside it, so a channel with no recorded scan, a scan that has not yet

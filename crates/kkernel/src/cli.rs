@@ -818,6 +818,7 @@ pub async fn cli_main() -> Result<()> {
                         db_anchor.as_deref(),
                         max_readers,
                         daemon_claims,
+                        a.catalog_verbosity,
                     )
                     .await?;
                 #[cfg(unix)]
@@ -934,6 +935,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         db_anchor,
         None,
         None,
+        khive_mcp::args::CatalogVerbosity::Full,
     )
     .await
 }
@@ -945,6 +947,7 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
     db_anchor: Option<&std::path::Path>,
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
+    catalog_verbosity: khive_mcp::args::CatalogVerbosity,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
     let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
         base_cfg,
@@ -969,7 +972,8 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
         multi,
         khive_cfg,
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
-    );
+    )
+    .with_catalog_verbosity(catalog_verbosity);
     Ok((server, schedule_rt))
 }
 
@@ -1521,6 +1525,10 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
 mod events_wal_policy_tests;
 
 #[cfg(test)]
+#[path = "cli_catalog_verbosity_tests.rs"]
+mod catalog_verbosity_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn events_daemon_disk_policy_round_trips_and_rejects_partial_or_invalid_input() {
@@ -1974,6 +1982,7 @@ mod tests {
             namespace: None,
             no_embed: true,
             pack: Vec::new(),
+            catalog_verbosity: khive_mcp::args::CatalogVerbosity::Full,
             config: Some(config_path.clone()),
             daemon: false,
             lifetime: None,
@@ -2917,7 +2926,8 @@ no_embed = true
 
         let (_, control_hits, _) = SubstrateCoordinator::single(Arc::clone(no_embed))
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(
             control_hits.is_empty(),
             "text-only handle cannot find a vector-only match"
@@ -2936,7 +2946,8 @@ no_embed = true
         let registry = coordinator_backend_registry(&multi.per_pack_runtimes, &khive_cfg).unwrap();
         let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(outcomes
             .iter()
             .all(|outcome| outcome.error.is_none() && outcome.vector_error.is_none()));

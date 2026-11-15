@@ -15,6 +15,7 @@ The unified guard recognizes GQL/Cypher mutations and SPARQL Update forms, inclu
 ```text
 query       = "MATCH" path ["WHERE" where_expr]
               "RETURN" return_item ("," return_item)*
+              ["ORDER BY" order_item ("," order_item)*]
               ["SKIP" integer] ["LIMIT" integer]
 path        = node (edge node)*
 node        = "(" [identifier] [":" identifier] [property_map] ")"
@@ -25,11 +26,17 @@ edge        = "-[" edge_body "]->" | "<-[" edge_body "]-"
 edge_body   = [identifier] [":" identifier ("|" identifier)*] [hop_range]
 hop_range   = "*" | "*" integer | "*" integer ".." integer
 return_item = identifier ["." identifier]
+order_item  = reference ["ASC" | "DESC"]
+reference   = identifier "." identifier
+            | identifier ".properties." identifier ("." identifier)*
+            | identifier ".metadata." identifier ("." identifier)*
 ```
 
 The four edge spellings represent outgoing, incoming, and the two accepted undirected forms. An omitted relation matches any supported edge relation. A bare `*` means one through five hops; explicit ranges are inclusive and validation caps the maximum at ten. `SKIP` and `LIMIT` take non-negative integers; when both are present, `SKIP` precedes `LIMIT`.
 
-Only unaliased variables and `variable.property` projections are supported. `AS`, expressions, aggregates, `DISTINCT`, caller-defined ordering, and `OFFSET` are outside this dialect. The compiler supplies a deterministic identity order so `SKIP` pages do not overlap while the matched data is unchanged. Result column names are derived from their variables, such as `a_id` and `e_relation`.
+Only unaliased variables and `variable.property` projections are supported. `AS`, expressions, aggregates, `DISTINCT`, and `OFFSET` are outside this dialect. `ORDER BY` accepts supported scalar fields and explicit JSON paths, with `ASC` as the default direction. It rejects bare containers, namespace fields, aliases, functions, and `NULLS` clauses. The compiler appends its deterministic tie order so `SKIP` pages do not overlap while the matched data is unchanged. Without `ORDER BY`, the previous compiler order is unchanged. Result column names are derived from their variables, such as `a_id` and `e_relation`.
+
+`RETURN e.metadata` on a canonical edge projects its stored JSON text or SQL null as `e_metadata`. Returning the whole edge variable still expands to its existing fields without metadata: five for fixed-length matches and three for recursive matches. Dotted metadata leaves are predicate/order references, not new RETURN expressions. Synthetic observation edges have no canonical metadata and reject all three metadata operations.
 
 ### One-path boundary and parallel-edge alternative
 
@@ -62,7 +69,9 @@ and_expr   = condition ("AND" condition)*
 
 Conditions support `=`, `!=`, `>`, `<`, `>=`, `<=`, `LIKE`, `CONTAINS`, `STARTS WITH`, `IN [...]`, and `IS NOT NULL`. `CONTAINS` and `STARTS WITH` treat `%`, `_`, and `\` literally; the compiler escapes them before adding its own wildcard.
 
-A condition references either a dedicated field (`n.name`) or an explicit JSON-property path (`n.properties.finding.severity`). JSON paths require one or more identifier segments after `properties`; another dotted root such as `n.finding.severity` is a parse error. A single unknown field such as `n.severity` parses as a field reference and is rejected during substrate-aware compilation with the valid direct fields and the `properties.<path>` guidance.
+A condition references a dedicated field (`n.name`), an explicit node JSON-property path (`n.properties.finding.severity`), or a canonical-edge metadata path (`e.metadata.order`). JSON paths require one or more identifier segments after their root; another dotted root such as `n.finding.severity` is a parse error. A single unknown field such as `n.severity` parses as a field reference and is rejected during substrate-aware compilation with the valid direct fields and JSON-path guidance. Node metadata, edge properties, and bare metadata/property containers in predicates are unsupported. A metadata key named `namespace` is ordinary data; direct namespace fields remain forbidden.
+
+Ordering uses SQLite's typed values and BINARY text collation, whereas text equality predicates retain their case-insensitive behavior. On a variable-length path, edge metadata refers to the final traversed edge. A recursive order term must be derivable from returned projections: `RETURN e.metadata ORDER BY e.metadata.order` succeeds, while `RETURN e ORDER BY e.metadata.order` returns an unsupported-feature error because whole-edge projections omit metadata. An `OR` combining start-node and final-row predicates is unsupported; final-edge and end-node predicates can share an `OR`.
 
 ### Literal grammar
 
@@ -79,7 +88,7 @@ Digits are required on both sides of a float's decimal point, so `.5`, `1.`, and
 
 ## SPARQL parser
 
-`parsers::sparql::parse` accepts the crate's SPARQL-inspired `SELECT ... WHERE { ... } LIMIT ...` subset and converts triples into the same alternating path AST. Predicate paths support one hop, `+`, and explicit inclusive ranges. SPARQL `OFFSET` remains unsupported; its shared AST offset is always zero. Issue #1601 intentionally adds paging only to the GQL surface.
+`parsers::sparql::parse` accepts the crate's SPARQL-inspired `SELECT ... WHERE { ... } LIMIT ...` subset and converts triples into the same alternating path AST. Predicate paths support one hop, `+`, and explicit inclusive ranges. SPARQL `OFFSET` remains unsupported; its shared AST offset is always zero and its order list is empty. GQL ordering keywords do not change SPARQL identifiers named `order`, `by`, `asc`, or `desc`. Issue #1601 intentionally adds paging only to the GQL surface.
 
 A numeric predicate condition targets a JSON property explicitly, even when its predicate name matches a dedicated field. This matches string-valued predicate properties and removes the prior value-type-dependent field ambiguity.
 
