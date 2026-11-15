@@ -337,6 +337,13 @@ pub struct IngestReport {
     pub project_annotation_census_complete: bool,
     /// Notes classified in the census snapshot, at most 1000; zero if unavailable.
     pub project_annotation_notes_scanned: u64,
+    /// Missing or unavailable existing-note annotation checks observed this pass,
+    /// across fresh lookups and eligible acknowledged replays for issues and PRs.
+    /// Only the first 20 corresponding details are retained in `warnings`; a
+    /// count greater than the number of retained existing-note details means
+    /// details were omitted. Unrelated warnings and replay-budget exhaustion
+    /// are excluded. Always serialized, including zero; not a corpus-wide total.
+    pub existing_project_annotation_warning_count: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
     /// `Some(false)` when the source-bound `gh repo view` probe ran but could

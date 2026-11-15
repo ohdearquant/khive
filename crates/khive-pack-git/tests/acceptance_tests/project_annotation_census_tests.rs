@@ -262,6 +262,7 @@ async fn annotation_encounter_seed(
 ) -> Vec<Uuid> {
     assert!(linked <= total);
     let kind = if prs { "pull_request" } else { "issue" };
+    let prefix = if prs { "6349" } else { "6348" };
     let mut notes = Vec::new();
     let mut edges = Vec::new();
     let mut ids = Vec::new();
@@ -269,7 +270,7 @@ async fn annotation_encounter_seed(
         .unwrap()
         .with_timezone(&chrono::Utc);
     for number in 1..=total {
-        let id = Uuid::parse_str(&format!("63480000-0000-4000-8000-{number:012x}")).unwrap();
+        let id = Uuid::parse_str(&format!("{prefix}0000-0000-4000-8000-{number:012x}")).unwrap();
         let mut note =
             khive_storage::Note::new(token.namespace().as_str(), kind, "stored original");
         note.id = id;
@@ -286,7 +287,7 @@ async fn annotation_encounter_seed(
         ids.push(id);
         if number <= linked {
             edges.push(khive_storage::types::Edge {
-                id: Uuid::parse_str(&format!("63480001-0000-4000-8000-{number:012x}"))
+                id: Uuid::parse_str(&format!("{prefix}0001-0000-4000-8000-{number:012x}"))
                     .unwrap()
                     .into(),
                 namespace: token.namespace().as_str().to_owned(),
@@ -419,7 +420,7 @@ fn annotation_encounter_warnings(report: &Value) -> Vec<&str> {
         .collect()
 }
 
-async fn annotation_encounter_receipt(registry: &VerbRegistry, report: &Value) {
+async fn annotation_encounter_receipt(registry: &VerbRegistry, report: &Value) -> Value {
     let receipt_id = report["receipt_id"]
         .as_str()
         .expect("durable digest receipt");
@@ -430,6 +431,7 @@ async fn annotation_encounter_receipt(registry: &VerbRegistry, report: &Value) {
         .unwrap();
     assert_eq!(event["kind"], "event");
     assert_eq!(&event["payload"]["result"], report);
+    event
 }
 
 fn annotation_encounter_state(report: &Value, prs: bool, skipped: u64, done: bool) {
@@ -517,10 +519,87 @@ async fn annotation_encounter_above_prefix(prs: bool) {
     assert_eq!(report["missing_project_annotation_count"], 0);
     assert_eq!(report["missing_project_annotation_note_ids"], json!([]));
     assert_eq!(report["project_annotation_census_complete"], false);
-    annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await;
-    annotation_encounter_receipt(&registry, &report).await;
+    assert_eq!(report["existing_project_annotation_warning_count"], 1);
+    let checkpoint =
+        annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await;
+    let mut receipts = vec![annotation_encounter_receipt(&registry, &report).await];
     assert_eq!(annotation_encounter_rows(&runtime).await, before);
-    annotation_encounter_fetches(&logs, prs, &[10]);
+    for _ in 0..2 {
+        let replay = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 10),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&replay, prs, 0, true);
+        assert_eq!(replay["existing_project_annotation_warning_count"], 1);
+        assert_eq!(
+            annotation_encounter_warnings(&replay),
+            vec![annotation_encounter_missing(prs, 1002, target, project)]
+        );
+        assert_eq!(
+            annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)])
+                .await,
+            checkpoint
+        );
+        receipts.push(annotation_encounter_receipt(&registry, &replay).await);
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+    }
+    // The acknowledgement is unchanged: only the actual edge changes whether
+    // the next read warns. Each deliberate fixture mutation precedes its baseline.
+    for deleted in [false, true] {
+        annotation_replay_link(&runtime, &token, project, &[target], deleted).await;
+        let current = annotation_encounter_rows(&runtime).await;
+        let replay = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 10),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&replay, prs, 0, true);
+        assert_eq!(
+            replay["existing_project_annotation_warning_count"],
+            u64::from(deleted)
+        );
+        let expected = if deleted {
+            vec![annotation_encounter_missing(prs, 1002, target, project)]
+        } else {
+            vec![]
+        };
+        assert_eq!(annotation_encounter_warnings(&replay), expected);
+        assert_eq!(
+            annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)])
+                .await,
+            checkpoint
+        );
+        receipts.push(annotation_encounter_receipt(&registry, &replay).await);
+        assert_eq!(annotation_encounter_rows(&runtime).await, current);
+    }
+    registry
+        .dispatch("delete", json!({"id":target.to_string()}))
+        .await
+        .unwrap();
+    let current = annotation_encounter_rows(&runtime).await;
+    let unavailable = registry
+        .dispatch(
+            "git.digest",
+            annotation_encounter_params(&repo, project, prs, 10),
+        )
+        .await
+        .unwrap();
+    annotation_encounter_state(&unavailable, prs, 0, true);
+    assert_eq!(unavailable["existing_project_annotation_warning_count"], 1);
+    assert_eq!(annotation_encounter_warnings(&unavailable),vec![format!("existing {} #1002 note {target} project annotation check unavailable: existing note changed",if prs {"pull_request"} else {"issue"})]);
+    assert_eq!(
+        annotation_encounter_checkpoint(&runtime, &token, project, prs, &[(1002, target)]).await,
+        checkpoint
+    );
+    receipts.push(annotation_encounter_receipt(&registry, &unavailable).await);
+    assert_eq!(annotation_encounter_rows(&runtime).await, current);
+    annotation_replay_receipts_unchanged(&registry, &receipts).await;
+    annotation_encounter_fetches(&logs, prs, &[10, 11, 11, 11, 11, 11]);
     registry.shutdown_audit_batch().await.unwrap();
 }
 
@@ -562,6 +641,7 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
         assert_eq!(before.1.as_array().unwrap().len(), 0);
         let (_dir, repo, logs, _path) = annotation_encounter_remote(prs, &[1, 2]);
         let mut completed_checkpoint = None;
+        let mut receipts = Vec::new();
         for pass in 0..3 {
             let report = registry
                 .dispatch(
@@ -571,20 +651,19 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
                 .await
                 .expect("budgeted existing-note digest");
             annotation_encounter_state(&report, prs, u64::from(pass < 2), pass == 2);
-            let expected = if pass < 2 {
-                vec![annotation_encounter_missing(
-                    prs,
-                    pass as u64 + 1,
-                    ids[pass],
-                    project,
-                )]
-            } else {
-                vec![]
-            };
+            let expected = (0..if pass == 0 { 1 } else { 2 })
+                .map(|index| {
+                    annotation_encounter_missing(prs, index as u64 + 1, ids[index], project)
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
                 annotation_encounter_warnings(&report),
                 expected,
-                "only fresh lookup hits warn"
+                "fresh hits and initially acknowledged observations both warn"
+            );
+            assert_eq!(
+                report["existing_project_annotation_warning_count"],
+                expected.len()
             );
             let acknowledgments = if pass == 0 {
                 vec![(1, ids[0])]
@@ -600,7 +679,8 @@ async fn existing_annotation_warning_preserves_budget_and_acknowledgment_semanti
             if pass == 2 {
                 assert_eq!(Some(checkpoint), completed_checkpoint);
             }
-            annotation_encounter_receipt(&registry, &report).await;
+            receipts.push(annotation_encounter_receipt(&registry, &report).await);
+            annotation_replay_receipts_unchanged(&registry, &receipts).await;
             assert_eq!(annotation_encounter_rows(&runtime).await, before);
         }
         annotation_encounter_fetches(&logs, prs, &[1, 2, 3]);
@@ -672,6 +752,7 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
         .unwrap();
     assert_eq!(denied_graph_reads.load(Ordering::SeqCst), 1);
     let report = outcome.expect("annotation read failure remains an explicit warning");
+    assert_eq!(report["existing_project_annotation_warning_count"], 1);
     annotation_encounter_state(&report, false, 1, false);
     let warnings = annotation_encounter_warnings(&report);
     assert_eq!(warnings.len(), 1);
@@ -710,6 +791,7 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
         .unwrap();
     annotation_encounter_state(&retry, false, 1, true);
     assert!(annotation_encounter_warnings(&retry).is_empty());
+    assert_eq!(retry["existing_project_annotation_warning_count"], 0);
     assert_eq!(retry["missing_project_annotation_count"], 0);
     assert_eq!(retry["project_annotation_notes_scanned"], 2);
     assert_eq!(retry["project_annotation_census_complete"], true);
@@ -724,5 +806,815 @@ async fn existing_annotation_warning_reports_unavailable_graph_reads() {
     annotation_encounter_receipt(&registry, &retry).await;
     assert_eq!(annotation_encounter_rows(&runtime).await, before);
     annotation_encounter_fetches(&logs, false, &[1, 11]);
+    registry.shutdown_audit_batch().await.unwrap();
+}
+
+// Select each page from its actual inclusive search floor, rather than from a
+// fixture call counter. Undated observations remain visible on later pages.
+fn annotation_replay_remote() -> (tempfile::TempDir, PathBuf, PathBuf, PathGuard) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let bin = dir.path().join("bin");
+    let logs = dir.path().join("logs");
+    for path in [&repo, &bin, &logs] {
+        std::fs::create_dir(path).unwrap();
+    }
+    init_repo(&repo);
+    write_fake_gh(&repo, &bin, &logs, "[]", "[]");
+    for source in ["pr", "issue"] {
+        std::fs::write(logs.join(format!("{source}.tsv")), "").unwrap();
+    }
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {args_log}
+if [ "$1" = repo ]; then
+  [ "$2" = view ] && [ "$3" = fixture/repository ] || exit 2
+  printf '%s\n' '{{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}}'
+  exit 0
+fi
+source="$1"
+case "$source" in pr|issue) ;; *) exit 3 ;; esac
+[ "$2" = list ] || exit 4
+search= repo= limit=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --search) search="$2"; shift ;;
+    --repo) repo="$2"; shift ;;
+    --limit) limit="$2"; shift ;;
+  esac
+  shift
+done
+[ "$repo" = fixture/repository ] || exit 5
+[ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || exit 6
+case "$search" in
+  'sort:updated-asc') floor= ;;
+  'sort:updated-asc updated:>='*) floor="${{search#sort:updated-asc updated:>=}}" ;;
+  *) exit 7 ;;
+esac
+printf '%s\t%s\t%s\n' "$source" "$search" "$limit" >> {pages_log}
+printf '['
+awk -F '\t' -v floor="$floor" -v limit="$limit" \
+  '($1 == "-" || floor == "" || $1 >= floor) && n++ < limit {{ print $2 }}' \
+  {logs}/"$source.tsv" | paste -sd, -
+printf ']\n'
+"#,
+        args_log = annotation_encounter_quote(logs.join("args.log").to_str().unwrap()),
+        pages_log = annotation_encounter_quote(logs.join("pages.log").to_str().unwrap()),
+        logs = annotation_encounter_quote(logs.to_str().unwrap()),
+    );
+    std::fs::write(bin.join("gh"), script).unwrap();
+    let path = PathGuard::install(&bin);
+    (dir, repo, logs, path)
+}
+
+fn annotation_replay_remote_rows(logs: &Path, prs: bool, rows: &[(u64, Option<String>)]) {
+    let make = if prs { pr_fixture } else { issue_fixture };
+    let mut sorted = rows.to_vec();
+    sorted.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+    let mut text = String::new();
+    for (number, updated_at) in sorted {
+        let mut value = make(number, "existing note", ANNOTATION_ENCOUNTER_TIME);
+        value["updatedAt"] = json!(updated_at);
+        text.push_str(updated_at.as_deref().unwrap_or("-"));
+        text.push('\t');
+        text.push_str(&value.to_string());
+        text.push('\n');
+    }
+    std::fs::write(logs.join(if prs { "pr.tsv" } else { "issue.tsv" }), text).unwrap();
+}
+
+fn annotation_replay_pages(logs: &Path, expected: &[(bool, Option<&str>, u64)]) {
+    let expected = expected
+        .iter()
+        .map(|(prs, floor, limit)| {
+            let source = if *prs { "pr" } else { "issue" };
+            let search = floor.map_or_else(
+                || "sort:updated-asc".to_owned(),
+                |floor| format!("sort:updated-asc updated:>={floor}"),
+            );
+            format!("{source}\t{search}\t{limit}")
+        })
+        .collect::<Vec<_>>();
+    let actual = std::fs::read_to_string(logs.join("pages.log")).unwrap();
+    assert_eq!(actual.lines().collect::<Vec<_>>(), expected);
+    let argv = std::fs::read_to_string(logs.join("args.log")).unwrap();
+    let fetches = argv
+        .lines()
+        .filter(|line| line.starts_with("pr list ") || line.starts_with("issue list "))
+        .collect::<Vec<_>>();
+    assert_eq!(fetches.len(), expected.len());
+    for line in fetches {
+        assert_eq!(repo_flag_value(line), Some("fixture/repository"));
+    }
+}
+
+fn annotation_replay_time(index: u64) -> String {
+    let start = chrono::DateTime::parse_from_rfc3339(ANNOTATION_ENCOUNTER_TIME).unwrap();
+    (start + chrono::Duration::seconds(index as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+async fn annotation_replay_checkpoint(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project: Uuid,
+    prs: bool,
+    floor: Option<&str>,
+    at_floor: &[(u64, Uuid)],
+    undated: &[(u64, Uuid)],
+) -> Value {
+    let source = if prs { "prs" } else { "issues" };
+    let sql = runtime.sql();
+    let row = sql
+        .reader()
+        .await
+        .unwrap()
+        .query_row(SqlStatement::new(
+            include_str!("../../sql/page_checkpoint_select.sql"),
+            vec![
+                SqlValue::Text(project.to_string()),
+                SqlValue::Text(source.into()),
+                SqlValue::Text(format!("{source}_checkpoint")),
+            ],
+        ))
+        .await
+        .unwrap()
+        .expect("actual digest checkpoint");
+    match (floor, row.get("floor")) {
+        (Some(expected), Some(SqlValue::Text(actual))) => assert_eq!(actual, expected),
+        (None, Some(SqlValue::Null)) => {}
+        other => panic!("unexpected checkpoint floor: {other:?}"),
+    }
+    let Some(SqlValue::Text(raw)) = row.get("progress") else {
+        panic!("missing persisted progress")
+    };
+    let map = |pairs: &[(u64, Uuid)]| {
+        pairs
+            .iter()
+            .map(|(number, id)| (number.to_string(), json!(id.to_string())))
+            .collect::<serde_json::Map<_, _>>()
+    };
+    let progress: Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        progress,
+        json!({"version":1, "namespace":token.namespace().as_str(),
+            "floor":floor, "at_floor":map(at_floor), "undated":map(undated)})
+    );
+    progress
+}
+
+async fn annotation_replay_link(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project: Uuid,
+    ids: &[Uuid],
+    deleted: bool,
+) {
+    if deleted {
+        let graph = runtime.graph(token).unwrap();
+        for id in ids {
+            let edge_id = Uuid::from_u128(id.as_u128() ^ (2_u128 << 96)).into();
+            let before = graph
+                .get_edge(edge_id)
+                .await
+                .unwrap()
+                .expect("the annotation edge must be live before deletion");
+            assert_eq!(before.id, edge_id);
+            assert_eq!(before.namespace, token.namespace().as_str());
+            assert_eq!(before.source_id, *id);
+            assert_eq!(before.target_id, project);
+            assert_eq!(before.relation, khive_types::EdgeRelation::Annotates);
+            assert!(before.deleted_at.is_none());
+            let by_key = graph
+                .get_edge_by_natural_key_including_deleted(
+                    token.namespace().as_str(),
+                    *id,
+                    project,
+                    khive_types::EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .expect("the live natural key must select the same annotation");
+            assert_eq!(
+                serde_json::to_value(by_key).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert!(graph
+                .delete_edge(edge_id, khive_storage::DeleteMode::Soft)
+                .await
+                .unwrap());
+            assert!(graph.get_edge(edge_id).await.unwrap().is_none());
+            let after = graph
+                .get_edge_including_deleted(edge_id)
+                .await
+                .unwrap()
+                .expect("soft deletion must retain the annotation row");
+            assert_eq!(after.id, edge_id);
+            assert!(after.deleted_at.is_some());
+            assert_eq!(after.deleted_at, Some(after.updated_at));
+            let mut expected = before;
+            expected.updated_at = after.updated_at;
+            expected.deleted_at = after.deleted_at;
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let by_key = graph
+                .get_edge_by_natural_key_including_deleted(
+                    token.namespace().as_str(),
+                    *id,
+                    project,
+                    khive_types::EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .expect("the tombstone must retain the same natural key");
+            assert_eq!(
+                serde_json::to_value(by_key).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+        return;
+    }
+    let at = chrono::DateTime::parse_from_rfc3339(ANNOTATION_ENCOUNTER_TIME)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let edges = ids
+        .iter()
+        .map(|id| khive_storage::types::Edge {
+            id: Uuid::from_u128(id.as_u128() ^ (2_u128 << 96)).into(),
+            namespace: token.namespace().as_str().into(),
+            source_id: *id,
+            target_id: project,
+            relation: khive_types::EdgeRelation::Annotates,
+            weight: 1.0,
+            created_at: at,
+            updated_at: at + chrono::Duration::seconds(1),
+            deleted_at: deleted.then_some(at + chrono::Duration::seconds(1)),
+            metadata: Some(json!({"fixture":"replay annotation"})),
+            target_backend: None,
+        })
+        .collect::<Vec<_>>();
+    let summary = runtime
+        .graph(token)
+        .unwrap()
+        .upsert_edges(edges)
+        .await
+        .unwrap();
+    assert_eq!(summary.attempted, ids.len() as u64);
+    assert_eq!(summary.affected, ids.len() as u64);
+    assert_eq!(summary.failed, 0, "{}", summary.first_error);
+}
+
+fn annotation_replay_exhaustions(report: &Value) -> Vec<&str> {
+    report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .filter(|warning| warning.contains("project annotation replay check limit"))
+        .collect()
+}
+
+fn annotation_replay_limit_warning(prs: bool) -> String {
+    format!(
+        "{}: project annotation replay check limit of 128 reached; additional acknowledged records were not checked",
+        if prs { "prs" } else { "issues" }
+    )
+}
+
+async fn annotation_replay_receipts_unchanged(registry: &VerbRegistry, receipts: &[Value]) {
+    for receipt in receipts {
+        let reread = registry
+            .dispatch(
+                "get",
+                json!({"id":receipt["payload"]["result"]["receipt_id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&reread, receipt, "earlier complete receipt is immutable");
+    }
+}
+
+fn annotation_replay_deny_first_graph_read(runtime: &KhiveRuntime) -> Arc<AtomicUsize> {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    assert_eq!(runtime.backend().pool().max_readers(), 0);
+    let denied = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&denied);
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|conn| {
+            conn.test_authorizer(Some(move |context: AuthContext<'_>| match context.action {
+                AuthAction::Read { table_name, .. }
+                    if table_name == "graph_edges"
+                        && count
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok() =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }))
+        })
+        .unwrap();
+    denied
+}
+
+fn annotation_replay_clear_graph_fault(runtime: &KhiveRuntime) {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthContext, Authorization};
+
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|conn| {
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_attempt_limit_counts_healthy_and_unavailable_reads() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        for mode in ["missing", "healthy", "unavailable"] {
+            let (runtime, token, registry) = fixture().await;
+            let project = create(
+                &registry,
+                json!({"kind":"project","name":"replay attempt limit"}),
+            )
+            .await;
+            let ids = annotation_encounter_seed(
+                &runtime,
+                &token,
+                project,
+                prs,
+                129,
+                if mode == "missing" { 0 } else { 128 },
+            )
+            .await;
+            let before = annotation_encounter_rows(&runtime).await;
+            let (_dir, repo, logs, _path) =
+                annotation_encounter_remote(prs, &(1..=129).collect::<Vec<_>>());
+            let first = registry
+                .dispatch(
+                    "git.digest",
+                    annotation_encounter_params(&repo, project, prs, 2000),
+                )
+                .await
+                .unwrap();
+            annotation_encounter_state(&first, prs, 129, true);
+            assert_eq!(
+                first["existing_project_annotation_warning_count"],
+                if mode == "missing" { 129 } else { 1 }
+            );
+            assert!(
+                annotation_replay_exhaustions(&first).is_empty(),
+                "fresh hits do not use replay allowance"
+            );
+            let acknowledgments = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (index as u64 + 1, *id))
+                .collect::<Vec<_>>();
+            let checkpoint =
+                annotation_encounter_checkpoint(&runtime, &token, project, prs, &acknowledgments)
+                    .await;
+            let mut receipts = vec![annotation_encounter_receipt(&registry, &first).await];
+            for _ in 0..2 {
+                let denied = (mode == "unavailable")
+                    .then(|| annotation_replay_deny_first_graph_read(&runtime));
+                let outcome = registry
+                    .dispatch(
+                        "git.digest",
+                        annotation_encounter_params(&repo, project, prs, 1),
+                    )
+                    .await;
+                if let Some(denied) = denied {
+                    annotation_replay_clear_graph_fault(&runtime);
+                    assert_eq!(denied.load(Ordering::SeqCst), 1);
+                }
+                let report = outcome.expect("bounded replay remains a successful digest");
+                annotation_encounter_state(&report, prs, 0, true);
+                assert_eq!(
+                    annotation_replay_exhaustions(&report),
+                    vec![annotation_replay_limit_warning(prs)]
+                );
+                let warnings = annotation_encounter_warnings(&report);
+                match mode {
+                    "missing" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 128);
+                        assert_eq!(
+                            warnings,
+                            (0..20)
+                                .map(|index| annotation_encounter_missing(
+                                    prs,
+                                    index as u64 + 1,
+                                    ids[index],
+                                    project
+                                ))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    "healthy" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 0);
+                        assert!(
+                            warnings.is_empty(),
+                            "the unchecked missing 129th row is not an observed warning"
+                        );
+                    }
+                    "unavailable" => {
+                        assert_eq!(report["existing_project_annotation_warning_count"], 1);
+                        assert_eq!(warnings.len(), 1);
+                        assert!(warnings[0].starts_with(&format!(
+                            "existing {} #1 note {} project annotation check unavailable: ",
+                            if prs { "pull_request" } else { "issue" },
+                            ids[0]
+                        )));
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    annotation_encounter_checkpoint(
+                        &runtime,
+                        &token,
+                        project,
+                        prs,
+                        &acknowledgments
+                    )
+                    .await,
+                    checkpoint
+                );
+                receipts.push(annotation_encounter_receipt(&registry, &report).await);
+                annotation_replay_receipts_unchanged(&registry, &receipts).await;
+                assert_eq!(annotation_encounter_rows(&runtime).await, before);
+            }
+            annotation_encounter_fetches(&logs, prs, &[1000, 130, 130]);
+            registry.shutdown_audit_batch().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_limit_survives_real_page_transitions() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        let (runtime, token, registry) = fixture().await;
+        let project = create(
+            &registry,
+            json!({"kind":"project","name":"replay page boundary"}),
+        )
+        .await;
+        let ids = annotation_encounter_seed(&runtime, &token, project, prs, 1000, 0).await;
+        annotation_replay_link(&runtime, &token, project, &ids[129..], false).await;
+        let before = annotation_encounter_rows(&runtime).await;
+        let (_dir, repo, logs, _path) = annotation_replay_remote();
+        let undated = (1..=129).map(|number| (number, None)).collect::<Vec<_>>();
+        annotation_replay_remote_rows(&logs, prs, &undated);
+        let first = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&first, prs, 129, true);
+        assert_eq!(first["existing_project_annotation_warning_count"], 129);
+        let acknowledgments = ids[..129]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u64 + 1, *id))
+            .collect::<Vec<_>>();
+        annotation_replay_checkpoint(&runtime, &token, project, prs, None, &[], &acknowledgments)
+            .await;
+        let first_receipt = annotation_encounter_receipt(&registry, &first).await;
+        let mut rows = undated;
+        rows.extend(
+            (130..=1000).map(|number| (number, Some(annotation_replay_time(number - 129)))),
+        );
+        annotation_replay_remote_rows(&logs, prs, &rows);
+        let report = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&report, prs, 871, true);
+        assert_eq!(
+            report["existing_project_annotation_warning_count"], 128,
+            "page two must not reset replay attempts"
+        );
+        assert_eq!(
+            annotation_encounter_warnings(&report),
+            (0..20)
+                .map(|index| annotation_encounter_missing(
+                    prs,
+                    index as u64 + 1,
+                    ids[index],
+                    project
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            annotation_replay_exhaustions(&report),
+            vec![annotation_replay_limit_warning(prs)]
+        );
+        let last = annotation_replay_time(871);
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            Some(&last),
+            &[(1000, ids[999])],
+            &acknowledgments,
+        )
+        .await;
+        annotation_replay_pages(
+            &logs,
+            &[
+                (prs, None, 1000),
+                (prs, None, 1000),
+                (prs, Some(&last), 1000),
+            ],
+        );
+        let receipt = annotation_encounter_receipt(&registry, &report).await;
+        annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+        registry.shutdown_audit_batch().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_replay_uses_initial_observations_across_real_pages() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        let (runtime, token, registry) = fixture().await;
+        let project = create(
+            &registry,
+            json!({"kind":"project","name":"initial replay observation"}),
+        )
+        .await;
+        let ids = annotation_encounter_seed(&runtime, &token, project, prs, 1000, 0).await;
+        annotation_replay_link(&runtime, &token, project, &ids[2..], false).await;
+        let before = annotation_encounter_rows(&runtime).await;
+        let (_dir, repo, logs, _path) = annotation_replay_remote();
+        annotation_replay_remote_rows(&logs, prs, &[(1, None), (2, None)]);
+        let first = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&first, prs, 2, true);
+        assert_eq!(first["existing_project_annotation_warning_count"], 2);
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            None,
+            &[],
+            &[(1, ids[0]), (2, ids[1])],
+        )
+        .await;
+        let first_receipt = annotation_encounter_receipt(&registry, &first).await;
+        let last = annotation_replay_time(999);
+        let mut rows = vec![(1, None), (2, Some(last.clone()))];
+        rows.extend((3..=1000).map(|number| (number, Some(annotation_replay_time(number - 2)))));
+        annotation_replay_remote_rows(&logs, prs, &rows);
+        let report = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&report, prs, 999, true);
+        assert_eq!(
+            report["existing_project_annotation_warning_count"], 2,
+            "the changed observation is fresh once, not an initial replay on page two"
+        );
+        assert_eq!(
+            annotation_encounter_warnings(&report),
+            vec![
+                annotation_encounter_missing(prs, 1, ids[0], project),
+                annotation_encounter_missing(prs, 2, ids[1], project)
+            ]
+        );
+        assert!(annotation_replay_exhaustions(&report).is_empty());
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            prs,
+            Some(&last),
+            &[(2, ids[1])],
+            &[(1, ids[0])],
+        )
+        .await;
+        annotation_replay_pages(
+            &logs,
+            &[
+                (prs, None, 1000),
+                (prs, None, 1000),
+                (prs, Some(&last), 1000),
+            ],
+        );
+        let receipt = annotation_encounter_receipt(&registry, &report).await;
+        annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+        registry.shutdown_audit_batch().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn existing_annotation_warning_details_are_report_wide_and_count_all_outcomes() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let _lock = ENV_MUTEX.lock().await;
+    for prs in [false, true] {
+        let (runtime, token, registry) = fixture().await;
+        let project = create(
+            &registry,
+            json!({"kind":"project","name":"fresh warning details"}),
+        )
+        .await;
+        let ids = annotation_encounter_seed(&runtime, &token, project, prs, 25, 0).await;
+        let before = annotation_encounter_rows(&runtime).await;
+        let (_dir, repo, logs, _path) =
+            annotation_encounter_remote(prs, &(1..=25).collect::<Vec<_>>());
+        let report = registry
+            .dispatch(
+                "git.digest",
+                annotation_encounter_params(&repo, project, prs, 2000),
+            )
+            .await
+            .unwrap();
+        annotation_encounter_state(&report, prs, 25, true);
+        assert_eq!(report["existing_project_annotation_warning_count"], 25);
+        assert_eq!(
+            annotation_encounter_warnings(&report),
+            (0..20)
+                .map(|index| annotation_encounter_missing(
+                    prs,
+                    index as u64 + 1,
+                    ids[index],
+                    project
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(annotation_replay_exhaustions(&report).is_empty());
+        let acknowledgments = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u64 + 1, *id))
+            .collect::<Vec<_>>();
+        annotation_encounter_checkpoint(&runtime, &token, project, prs, &acknowledgments).await;
+        annotation_encounter_receipt(&registry, &report).await;
+        assert_eq!(annotation_encounter_rows(&runtime).await, before);
+        annotation_encounter_fetches(&logs, prs, &[1000]);
+        registry.shutdown_audit_batch().await.unwrap();
+    }
+    let (runtime, token, registry) = fixture().await;
+    let project = create(
+        &registry,
+        json!({"kind":"project","name":"combined warning details"}),
+    )
+    .await;
+    let prs = annotation_encounter_seed(&runtime, &token, project, true, 13, 0).await;
+    let issues = annotation_encounter_seed(&runtime, &token, project, false, 14, 0).await;
+    annotation_replay_link(&runtime, &token, project, &[prs[12], issues[13]], false).await;
+    let before = annotation_encounter_rows(&runtime).await;
+    let (_dir, repo, logs, _path) = annotation_replay_remote();
+    let at = Some(ANNOTATION_ENCOUNTER_TIME.to_owned());
+    for source in [true, false] {
+        annotation_replay_remote_rows(&logs, source, &[(1, at.clone())]);
+    }
+    let params = json!({"source":repo.to_str().unwrap(),"project":project.to_string(),"include":["pull_requests","issues"],"max_items":2001});
+    let first = registry
+        .dispatch("git.digest", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["existing_project_annotation_warning_count"], 2);
+    let first_receipt = annotation_encounter_receipt(&registry, &first).await;
+    for source in [true, false] {
+        let mut rows = (1..=13)
+            .map(|number| (number, at.clone()))
+            .collect::<Vec<_>>();
+        if !source {
+            // Canonicalization emits this unrelated warning before any issue
+            // point check, unlike the handler's later max_items warning.
+            rows.push((14, Some("invalid-timestamp".to_owned())));
+        }
+        annotation_replay_remote_rows(&logs, source, &rows);
+    }
+    let denied = annotation_replay_deny_first_graph_read(&runtime);
+    let outcome = registry.dispatch("git.digest", params).await;
+    annotation_replay_clear_graph_fault(&runtime);
+    assert_eq!(denied.load(Ordering::SeqCst), 1);
+    let report = outcome.expect("mixed fresh/replay diagnostics preserve digest completion");
+    assert_eq!(report["prs_ingested"], 0);
+    assert_eq!(report["issues_ingested"], 0);
+    assert_eq!(report["commits_ingested"], 0);
+    assert_eq!(report["prs_skipped_existing"], 12);
+    assert_eq!(report["issues_skipped_existing"], 13);
+    assert_eq!(report["done"], true);
+    assert_eq!(report["history_exhausted"], true);
+    assert_eq!(report["cursor_stalled"], false);
+    for source in ["pull_requests", "issues"] {
+        assert_eq!(report["sources"][source]["state"], "completed");
+    }
+    assert_eq!(report["existing_project_annotation_warning_count"], 25);
+    let warnings = annotation_encounter_warnings(&report);
+    assert_eq!(warnings.len(), 20);
+    assert!(warnings[0].starts_with(&format!(
+        "existing pull_request #1 note {} project annotation check unavailable: ",
+        prs[0]
+    )));
+    let mut expected = (2..=12)
+        .map(|number| annotation_encounter_missing(true, number, prs[number as usize - 1], project))
+        .collect::<Vec<_>>();
+    expected.extend((1..=8).map(|number| {
+        annotation_encounter_missing(false, number, issues[number as usize - 1], project)
+    }));
+    assert_eq!(&warnings[1..], expected);
+    assert!(annotation_replay_exhaustions(&report).is_empty());
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                let warning = warning.as_str().unwrap();
+                warning.contains("issue #14")
+                    && warning.contains("updatedAt")
+                    && warning.contains("not a valid")
+            }),
+        "earlier timestamp warning must survive the detail cap"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("max_items")
+                && warning.as_str().unwrap().contains("2000")),
+        "unrelated clamping warning must survive the detail cap"
+    );
+    let undated_issue = [(14, issues[13])];
+    for (source, ids) in [(true, &prs[..]), (false, &issues[..13])] {
+        let pairs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u64 + 1, *id))
+            .collect::<Vec<_>>();
+        annotation_replay_checkpoint(
+            &runtime,
+            &token,
+            project,
+            source,
+            Some(ANNOTATION_ENCOUNTER_TIME),
+            &pairs,
+            if source { &[] } else { &undated_issue },
+        )
+        .await;
+    }
+    annotation_replay_pages(
+        &logs,
+        &[
+            (true, None, 1000),
+            (false, None, 1000),
+            (true, Some(ANNOTATION_ENCOUNTER_TIME), 1000),
+            (false, Some(ANNOTATION_ENCOUNTER_TIME), 1000),
+        ],
+    );
+    let receipt = annotation_encounter_receipt(&registry, &report).await;
+    annotation_replay_receipts_unchanged(&registry, &[first_receipt, receipt]).await;
+    assert_eq!(annotation_encounter_rows(&runtime).await, before);
     registry.shutdown_audit_batch().await.unwrap();
 }
