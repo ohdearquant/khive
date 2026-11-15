@@ -517,3 +517,57 @@ fn many_invalid_spans_are_processed_once() {
         assert_eq!(work.tokens, 2 * repetitions);
     }
 }
+
+#[test]
+fn escaped_quote_pairs_preserve_credential_refusal() {
+    for (name, plain, escaped) in cases() {
+        let Err(RuntimeError::SecretDetected(expected)) = check(&plain) else {
+            panic!("{name}: plain credential control must refuse");
+        };
+        for (content, decoded) in [
+            (
+                format!(r#"we saw \"{escaped}\" in the log"#),
+                format!("{plain}\" in the log"),
+            ),
+            (
+                format!(r#"payload {{\"v\": \"{escaped}\"}} sent"#),
+                format!("v\": \"{plain}\"}} sent"),
+            ),
+        ] {
+            assert!(scan(&content).is_none(), "{name}: raw encoded control");
+            let Err(RuntimeError::SecretDetected(actual)) = check(&content) else {
+                panic!("{name}: credential between escaped quotes must refuse: {content}");
+            };
+            assert_eq!(actual.detector, expected.detector, "{name}: {content}");
+            let Err(RuntimeError::SecretDetected(located)) =
+                check_note_fields_at(&content, None, None, "note")
+            else {
+                panic!("{name}: escaped-pair note content must refuse");
+            };
+            assert_eq!(located.detector, expected.detector);
+            assert_eq!(located.location.as_deref(), Some("note.content"));
+            let (views, work) = super::escaped_json::escaped_strings_with_work(&content, 0);
+            assert_eq!(views, vec![decoded]);
+            assert_eq!(work.passes, 0, "valid suffix uses the EOF decoder");
+            assert_eq!(work.tokens, 0, "no malformed-span recovery is needed");
+        }
+    }
+    for (content, decoded) in [
+        (
+            r#"we saw \"docs\/guide.md\" in the log"#,
+            "docs/guide.md\" in the log",
+        ),
+        (
+            r#"payload {\"v\": \"line\none and \u00e9\"} sent"#,
+            "v\": \"line\none and é\"} sent",
+        ),
+    ] {
+        assert!(scan(content).is_none(), "benign raw control");
+        assert!(check(content).is_ok(), "benign escaped-pair content");
+        assert!(check_note_fields_at(content, None, None, "note").is_ok());
+        let (views, work) = super::escaped_json::escaped_strings_with_work(content, 0);
+        assert_eq!(views, vec![decoded]);
+        assert_eq!(work.passes, 0);
+        assert_eq!(work.tokens, 0);
+    }
+}
