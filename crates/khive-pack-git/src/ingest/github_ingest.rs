@@ -135,6 +135,9 @@ pub(super) async fn ingest_prs(
             }
         };
 
+    let mut annotation_replays =
+        project_annotation_census::ReplayAnnotationChecks::new(&checkpoint);
+
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
     // in this pass's warnings), but `checkpoint.floor` no longer advances past the
@@ -199,6 +202,24 @@ pub(super) async fn ingest_prs(
                 number_to_pr.insert(masked.number, existing);
                 if let Some(oid) = masked.merge_commit_oid.as_ref() {
                     merge_sha_to_pr.insert(oid.clone(), existing);
+                }
+                if annotation_replays.reserve(
+                    "prs",
+                    masked.number,
+                    masked.updated_at.as_deref(),
+                    existing,
+                    report,
+                ) {
+                    project_annotation_census::append_existing_note_warning(
+                        runtime,
+                        token,
+                        project_id,
+                        "pull_request",
+                        masked.number,
+                        existing,
+                        report,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -426,6 +447,9 @@ pub(super) async fn ingest_issues(
         }
     };
 
+    let mut annotation_replays =
+        project_annotation_census::ReplayAnnotationChecks::new(&checkpoint);
+
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
     // pass are still attempted, but `checkpoint.floor` freezes at the stall point
@@ -487,10 +511,27 @@ pub(super) async fn ingest_issues(
             .retain(|number, _| undated.contains(number));
 
         for masked in masked_page {
-            if checkpoint
-                .acknowledged(masked.number, masked.updated_at.as_deref())
-                .is_some()
+            if let Some(existing) =
+                checkpoint.acknowledged(masked.number, masked.updated_at.as_deref())
             {
+                if annotation_replays.reserve(
+                    "issues",
+                    masked.number,
+                    masked.updated_at.as_deref(),
+                    existing,
+                    report,
+                ) {
+                    project_annotation_census::append_existing_note_warning(
+                        runtime,
+                        token,
+                        project_id,
+                        "issue",
+                        masked.number,
+                        existing,
+                        report,
+                    )
+                    .await;
+                }
                 continue;
             }
             if !budget.try_consume() {

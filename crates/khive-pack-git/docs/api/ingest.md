@@ -72,20 +72,58 @@ kind, number, project and live state in the same read snapshot as the edge check
 If that note no longer matches, or the read fails, a distinct annotation-check
 unavailable warning is emitted; storage details use the ingest secret masker.
 
-These warnings cover actual lookup hits, not every fetched record. An exact
-checkpoint acknowledgment still replays without lookup, annotation check or visit
-budget consumption. Notes outside the fetched window and acknowledged replays
-retain only the separate historical census coverage: the lowest 1,000 live
-project issue/PR note IDs, with at most 20 missing IDs displayed. Lookup warnings
-do not change that census's count, sample, completeness or scanned count and are
-not a global unique-note count.
+An exact checkpoint acknowledgment still skips the by-number lookup and consumes
+no fresh visit. When encountered by the existing traversal, it can now receive a
+point check of its saved note UUID. Eligibility comes from the validated checkpoint
+at invocation start: its `acknowledged(number, observed_updated_at)` must return
+that same UUID. A newly acknowledged observation is not eligible until a later
+invocation, including an initially undated record that acquires a timestamp during
+this pass. The check never resolves a replacement note by number. A deleted,
+changed or foreign saved note therefore reports unavailable evidence.
 
-The point checks fit within the existing fresh-visit budget; an administrative
-call with `max_items=None` remains unbounded. Skipped-existing counts, checkpoint
-advancement, source status and completion semantics are unchanged. In particular,
-`done=true` can coexist with a missing or unavailable annotation warning: it
-describes the ingest walk, not graph integrity. The complete warnings array is
-also preserved in the durable `git.digest` receipt's result.
+Replay checks have a separate allowance of **128 attempted reads per source per
+invocation**: up to 128 issues and 128 PRs when both sources run. Each eligible
+`(number, note UUID)` is reserved before its read, including reads that fail or
+find an invalid saved note, and is attempted at most once. One state per source
+spans all fetched pages; at most 128 attempted identities and one exhaustion flag
+are retained. The initial eligibility snapshot retains the existing bounded
+checkpoint maps and their dated floor. The first additional eligible identity
+emits one exhaustion warning for that source; later such identities neither read
+nor add warnings. No skipped-identity collection, additional history fetch, or
+historical-note sweep is introduced. A new invocation starts a new allowance.
+
+`existing_project_annotation_warning_count` counts observed missing or unavailable
+checks from fresh lookup hits and eligible replay checks, across both sources.
+Only the first **20 corresponding detail strings**, in encounter order, are
+retained in `warnings`. The count continues after that cap and is always
+serialized, including zero. A count greater than the number of retained
+existing-note details means details were omitted; compare against this category's
+details, not the length of the heterogeneous `warnings` array. Successful live-edge
+checks contribute neither a detail nor a count. The separate once-per-source
+exhaustion warning is outside both the count and detail cap. Unrelated warnings
+remain unchanged, so the cap bounds these details, not every warning or the whole
+receipt size. The count is neither a unique-note count nor an estimate of
+uninspected annotations.
+
+The historical census remains separate: it inspects the lowest 1,000 live project
+issue/PR note IDs and displays at most 20 missing IDs. Fresh and replay diagnostics
+do not change its count, sample, completeness or scanned count. Notes outside the
+fetched window have only this bounded census coverage.
+
+Fresh point checks remain within the fresh-visit budget. Public `git.digest`
+defaults an omitted `max_items` to 500 and caps explicit values at 2,000; only an
+administrative `run_ingest` call with `max_items=None` has an unbounded fresh
+budget. Replay checks do not consume it. Skipped-existing counts, PR linking maps,
+checkpoint advancement, source status and completion semantics are unchanged.
+`done=true` and `history_exhausted=true` can coexist with missing or unavailable
+annotations or an exhausted replay allowance: remote traversal completion does
+not establish complete annotation reporting.
+
+The complete returned report, including the count, retained details and any
+exhaustion warning, is preserved in the new durable `git.digest` receipt. Replaying
+a digest observes current edges and creates a new report and receipt; reading an
+older receipt still returns its original result. Existing receipts are never
+rewritten to add the new field or reflect later graph changes.
 
 ## Secret-gate refusal accounting
 
