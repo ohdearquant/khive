@@ -1342,7 +1342,9 @@ rows changed by this transaction, not all rules that might still affect the name
 
 A recognized tombstone returns `retired:false`, zero counts and no cleanup attempt. In particular,
 it does not change policies or requests created after the original retirement. An unknown target
-refuses. Registration and ingest retain their refusal to revive a retired name. Surviving broad
+refuses. Registration and ingest retain their refusal to revive a retired name, and the generic
+`restore` refuses a registry row as the other generic mutations do, so no verb restores a retired
+registration and the policies and grants its retirement changed stay retired. Surviving broad
 policies or later requests can still decide an unregistered name under the ordinary policy rules.
 
 ### Acceptance for Amendment 11
