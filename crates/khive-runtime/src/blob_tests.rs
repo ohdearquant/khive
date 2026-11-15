@@ -305,6 +305,11 @@ async fn hydrator_rejects_an_invalid_maximum_before_admission_or_backend_work() 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn zero_maximum_and_idle_portable_maximum_are_both_admissible() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let empty_store = HydrationReadStore::immediate(Vec::new());
     let empty_hydrator = BlobHydrator::new(
@@ -339,6 +344,11 @@ async fn zero_maximum_and_idle_portable_maximum_are_both_admissible() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn cancelling_a_waiter_retains_admission_until_backend_completion() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let (store, first_started, first_release) = HydrationReadStore::blocking_first(b"x".to_vec());
     let hydrator = Arc::new(
@@ -390,6 +400,11 @@ async fn cancelling_a_waiter_retains_admission_until_backend_completion() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn verified_blob_retains_its_weighted_lease_until_drop() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = Arc::new(
@@ -432,6 +447,11 @@ async fn verified_blob_retains_its_weighted_lease_until_drop() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = BlobHydrator::new(
@@ -483,6 +503,11 @@ async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn cancelling_while_queued_starts_no_backend_work() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = Arc::new(
@@ -577,6 +602,11 @@ async fn caller_deadline_drops_only_the_waiter_until_backend_completion() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn distinct_hydrators_have_independent_admission_budgets() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let (blocked_store, started, release) = HydrationReadStore::blocking_first(b"one".to_vec());
     let independent_store = HydrationReadStore::immediate(b"two".to_vec());
@@ -618,6 +648,11 @@ async fn distinct_hydrators_have_independent_admission_budgets() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn typed_backend_failure_holds_then_releases_admission() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let (store, started, release) = HydrationReadStore::blocking_first_error(b"recovered".to_vec());
     let hydrator = Arc::new(
@@ -661,6 +696,11 @@ async fn typed_backend_failure_holds_then_releases_admission() {
 #[tokio::test]
 #[serial(background_tasks)]
 async fn backend_panic_closes_the_reply_and_restores_admission() {
+    // The count is process-wide, so this test body runs alone in a child.
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let before = crate::background_task_count();
     let (store, started, release) = HydrationReadStore::blocking_first_panic(b"recovered".to_vec());
     let hydrator = Arc::new(
