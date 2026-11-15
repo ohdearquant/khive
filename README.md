@@ -41,6 +41,8 @@ Or, to make it available in every project with Claude Code:
 claude mcp add khive --scope user -- kkernel mcp
 ```
 
+A user-scope registration gives every project the full default pack set, including the `exec` verbs and the git write verbs (for example `git.commit`, `git.push` and `git.pr_merge`). For less exposure, register per project, or pick packs with `--pack` (repeatable, for example `kkernel mcp --pack kg --pack memory`) or `KHIVE_PACKS`.
+
 Check the binary:
 
 ```bash
@@ -299,7 +301,7 @@ cargo install --path crates/kkernel --locked
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
 
-For every project with Claude Code, use `claude mcp add khive --scope user -- kkernel mcp` instead.
+For every project with Claude Code, use `claude mcp add khive --scope user -- kkernel mcp` instead. That gives every project the full default pack set, including `exec` and the git write verbs; narrow it with `--pack` or `KHIVE_PACKS`.
 
 **Verify:**
 
