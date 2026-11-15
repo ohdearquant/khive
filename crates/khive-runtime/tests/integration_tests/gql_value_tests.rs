@@ -911,7 +911,6 @@ async fn gql_comma_connectivity_is_global_and_directions_preserve_bindings() {
         "(a)-[e:extends]->(b), (c)-[f:variant_of]->(d), (b)-[g:extends]->(c)",
         "(b)<-[e:extends]-(a), (d)<-[f:variant_of]-(c), (c)<-[g:extends]-(b)",
         "(c)-[f:variant_of]->(d), (a)-[e:extends]->(b), (b)-[g:extends]->(c)",
-        "(a)-[e:extends]-(b), (c)-[f:variant_of]-(d), (b)-[g:extends]-(c)",
         "(a)-[e:extends]->(b)-[g:extends]->(c), (c)-[f:variant_of]->(d)",
     ] {
         let rows = runtime
@@ -928,6 +927,46 @@ async fn gql_comma_connectivity_is_global_and_directions_preserve_bindings() {
         assert_eq!(rows[0].text("f_id").unwrap(), cd.id.to_string());
         assert_eq!(rows[0].text("g_id").unwrap(), bc.id.to_string());
     }
+    let undirected = runtime
+        .query(
+            &token,
+            &format!(
+                "MATCH (a)-[e:extends]-(b), (c)-[f:variant_of]-(d), (b)-[g:extends]-(c) WHERE a.id = '{a}' AND d.id = '{d}' RETURN a.id, b.id, c.id, d.id, e.id, f.id, g.id"
+            ),
+        )
+        .await
+        .unwrap();
+    let mut undirected_bindings = undirected
+        .iter()
+        .map(|row| {
+            ["a_id", "b_id", "c_id", "d_id", "e_id", "f_id", "g_id"]
+                .map(|column| row.text(column).unwrap().to_string())
+        })
+        .collect::<Vec<_>>();
+    undirected_bindings.sort();
+    // Different variables may reuse one edge or node when direction permits it.
+    let mut expected_undirected_bindings = vec![
+        [
+            a.to_string(),
+            b.to_string(),
+            c.to_string(),
+            d.to_string(),
+            ab.id.to_string(),
+            cd.id.to_string(),
+            bc.id.to_string(),
+        ],
+        [
+            a.to_string(),
+            b.to_string(),
+            a.to_string(),
+            d.to_string(),
+            ab.id.to_string(),
+            da.id.to_string(),
+            ab.id.to_string(),
+        ],
+    ];
+    expected_undirected_bindings.sort();
+    assert_eq!(undirected_bindings, expected_undirected_bindings);
     let cycle = runtime.query(&token, &format!("MATCH (a)-[e:extends]->(b)-[g:extends]->(c), (c)-[f:variant_of]->(d)-[h:variant_of]->(a) WHERE a.id = '{a}' RETURN h.id")).await.unwrap();
     assert_eq!(cycle.len(), 1);
     assert_eq!(cycle[0].text("h_id").unwrap(), da.id.to_string());

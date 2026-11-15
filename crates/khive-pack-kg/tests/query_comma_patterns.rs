@@ -287,9 +287,17 @@ async fn inbound_message(
     key: &str,
     content: &str,
 ) -> Uuid {
-    let sent = registry.dispatch_as("comm.send", json!({
-        "to": recipient, "content": content, "subject": "Comma query scope", "idempotency_key": key,
-    }), VerifiedActor::new("sender").unwrap()).await.unwrap();
+    // Canonical graph nodes expose a message subject as name.
+    let sent = registry
+        .dispatch_as(
+            "comm.send",
+            json!({
+                "to": recipient, "content": content, "subject": content, "idempotency_key": key,
+            }),
+            VerifiedActor::new("sender").unwrap(),
+        )
+        .await
+        .unwrap();
     let outbound = runtime
         .notes(token)
         .unwrap()
@@ -371,12 +379,12 @@ async fn query_comma_patterns_keep_later_message_branches_private() {
     let history = event_snapshot(&runtime).await;
     // This actual caller can read the foreign candidate: the hidden row is not absent setup.
     let foreign_positive = query_as(&registry, "other", &format!(
-        "MATCH (m:message)-[f:supports]->(a:observation) WHERE f.id = '{}' RETURN m.id, m.content, f.id",
-        hidden.id), 1).await;
+        "MATCH (m:message)-[f:supports]->(a:observation) WHERE m.id = '{}' AND a.id = '{}' RETURN m.id, m.name, f.id",
+        hidden_id, center), 1).await;
     assert_page(
         &foreign_positive,
         &[
-            json!({"m_id": hidden_id.to_string(), "m_content": "Foreign candidate body", "f_id": hidden.id.to_string()}),
+            json!({"m_id": hidden_id.to_string(), "m_name": "Foreign candidate body", "f_id": hidden.id.to_string()}),
         ],
         0,
         1,
@@ -386,17 +394,17 @@ async fn query_comma_patterns_keep_later_message_branches_private() {
         "(anchor:message)-[e:supports]->(a:observation), (m:message)-[f:supports]->(a)",
         "(m:message)-[f:supports]->(a:observation), (anchor:message)-[e:supports]->(a)",
     ] {
-        for with_content in [false, true] {
-            let projection = if with_content {
-                "RETURN a.id, e.id, f.id, m.id, m.content"
+        for with_name in [false, true] {
+            let projection = if with_name {
+                "RETURN a.id, e.id, f.id, m.id, m.name"
             } else {
                 "RETURN a.id, e.id, f.id"
             };
-            let source = format!("MATCH {paths} WHERE e.id = '{}' AND f.metadata.branch = 'candidate' {projection} ORDER BY f.metadata.order", anchor.id);
+            let source = format!("MATCH {paths} WHERE anchor.id = '{}' AND a.id = '{}' AND f.metadata.branch = 'candidate' {projection} ORDER BY f.metadata.order", anchor_id, center);
             let mut expected = json!({"a_id": center.to_string(), "e_id": anchor.id.to_string(), "f_id": visible.id.to_string()});
-            if with_content {
+            if with_name {
                 expected["m_id"] = json!(visible_id.to_string());
-                expected["m_content"] = json!("Visible candidate");
+                expected["m_name"] = json!("Visible candidate");
             }
             let page = query_as(&registry, "reader", &source, 1).await;
             assert_page(&page, &[expected], 0, 1, false);
