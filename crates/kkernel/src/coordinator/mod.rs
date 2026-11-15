@@ -76,3 +76,45 @@ mod search_audit_tests;
 
 #[cfg(test)]
 mod search_cancellation_tests;
+
+// This separate hook pauses before the actual read without holding a store
+// connection. The existing observer records only completed metadata reads.
+#[cfg(test)]
+type SearchMetadataHook = std::sync::Arc<
+    dyn Fn(SearchMetadataRead) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static SEARCH_METADATA_BEFORE: SearchMetadataHook;
+}
+
+#[cfg(test)]
+async fn scope_before_search_metadata<F: std::future::Future>(
+    hook: SearchMetadataHook,
+    future: F,
+) -> F::Output {
+    SEARCH_METADATA_BEFORE.scope(hook, future).await
+}
+
+#[cfg(test)]
+async fn before_search_metadata_read(
+    phase: SearchMetadataPhase,
+    substrate: khive_pack_kg::handlers::SearchSubstrate,
+    id: uuid::Uuid,
+) {
+    let paused = SEARCH_METADATA_BEFORE
+        .try_with(|hook| {
+            hook(SearchMetadataRead {
+                phase,
+                substrate,
+                id,
+            })
+        })
+        .ok();
+    if let Some(paused) = paused {
+        paused.await;
+    }
+}
