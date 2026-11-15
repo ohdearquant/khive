@@ -13835,6 +13835,7 @@ mod telegram_heartbeat_tests {
     use chrono::DateTime;
     use khive_channel::ChannelError;
     use khive_channel_telegram::test_support::{TelegramPollStep, TelegramScriptedFixture};
+    use serde_json::json;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
