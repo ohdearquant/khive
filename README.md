@@ -13,8 +13,8 @@ contradictions, gaps. khive gives your research agent a typed, queryable graph t
 works. Read a paper and entities and edges fall out. Make a connection and it's traversable
 immediately. Come back next session and the graph remembers what you built.
 
-There's no Neo4j to run and no separate SPARQL endpoint to deploy. It's SQLite on disk, MCP over
-stdio, and `cargo test` finishes in 4 seconds.
+There's no Neo4j to run and no separate SPARQL endpoint to deploy. It's SQLite on disk and MCP over
+stdio.
 
 khive also runs hosted, as memory and a knowledge graph your agents reach over MCP:
 https://khive.ai/?utm_source=github&utm_campaign=khive-readme
@@ -29,10 +29,16 @@ cargo install kkernel --locked
 
 The first build compiles about 330 crates, so expect it to take several minutes.
 
-Add khive to your MCP client config (`.mcp.json` in your project, or `~/.claude/mcp.json` for global):
+Add khive to `.mcp.json` in your project:
 
 ```json
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
+```
+
+Or, to make it available in every project with Claude Code:
+
+```bash
+claude mcp add khive --scope user -- kkernel mcp
 ```
 
 Check the binary:
@@ -287,12 +293,13 @@ cargo install --path crates/kkernel --locked
 
 `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
 
-**Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
-global):
+**Add to your MCP config** (`.mcp.json` in your project):
 
 ```json
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
+
+For every project with Claude Code, use `claude mcp add khive --scope user -- kkernel mcp` instead.
 
 **Verify:**
 
