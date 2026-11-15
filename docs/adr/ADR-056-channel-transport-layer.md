@@ -44,7 +44,7 @@ topmost-trust amendment)
 
 ## Amendment 2026-11-15 -- Telegram inbound poll heartbeat
 
-**Status**: Proposed 2026-11-15.
+**Status**: Accepted 2026-11-15 (#6670). Refs #6534.
 
 **Trigger.** #6534: Telegram's inbound loop has no persisted poll-success
 observation, although `comm.health` already projects elapsed no-success age.
@@ -95,6 +95,13 @@ not adopt the proposed operator notices or email lifecycle events.
    unexpired rows and other identities untouched. Cleanup failure retains the
    existing hold/retry rule without inventing a poll outcome. No manual
    maintenance step is required.
+7. The slug change has two one-time effects at upgrade, accepted here. Inbound
+   deduplication is keyed on the exact slug, so an update stored under
+   `telegram` and redelivered after the restart under the configured slug is
+   stored again. Offsets are held in memory, so this is bounded to updates not
+   yet confirmed by a later poll when the old process stopped. The outbox
+   heartbeat row recorded under `telegram` also stops updating and keeps aging
+   in `comm.health` beside the live row under the configured slug.
 
 **Acceptance.** Recording fake transport through the actual Telegram adapter and
 real comm storage must demonstrate success/failure/held/canceled outcomes,
