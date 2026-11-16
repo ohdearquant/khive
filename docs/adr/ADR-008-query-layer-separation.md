@@ -643,3 +643,200 @@ ordering, reverse the identity suffix, remove later-path mailbox filtering from 
 and edge sources, and bypass direct-AST connectivity validation. Each control must reach
 its intended result or refusal assertion; compilation failures, empty test selections,
 fixture failures, and timeouts do not establish the behavior.
+
+## Amendment 3: GQL pages, projections, aggregation and bounded path composition (2026-11-15)
+
+**Amendment status**: Accepted 2026-11-16 (#6723)
+
+GQL must support complete paged answers, scalar property projections, counts, distinct
+results, absence queries, and paths that combine bounded traversal with fixed steps. This
+amendment defines those forms for issues #6691, #6690, #6689, #6687, #6688 and #6686.
+
+It supersedes the total-query `LIMIT` statements in Amendments 1 and 2, and their deferrals
+of the specific projection, aggregation and path forms defined below. Their remaining
+contracts and recorded statuses are unchanged. Read-only execution, one selected backend,
+caller visibility, live-row filtering, mailbox restrictions and bounded response pages
+continue to apply.
+
+### Page size after SKIP
+
+`SKIP n LIMIT m` skips the first `n` ordered result rows and then returns at most `m` rows.
+The offset is not subtracted from `LIMIT`. `LIMIT 0` and offsets beyond the result return
+no rows. The server's `page_size` still caps the payload, so the emitted bound is the
+smaller of the explicit limit and the server page size.
+
+When the server page size is the binding bound, one internal continuation row determines
+`has_more`; that row is not returned. `next_offset` advances by the number of emitted rows.
+An explicit limit at or below `page_size` remains a terminal caller-selected page: no
+continuation is advertised beyond that limit. `has_more: false` in this case does not claim
+that the underlying match set is exhausted. `truncated` retains its compatibility meaning.
+Following `next_offset` applies the same `LIMIT` after the new offset; there is no separate
+cumulative query limit across requests.
+
+For twenty ordered rows numbered 1 through 20, `SKIP 10 LIMIT 3` returns 11, 12 and 13.
+With `LIMIT 5` and `page_size: 2`, offsets 0, 2 and 4 each return two rows and advance to
+2, 4 and 6 while another row exists. Offset pages remain repeatable only while the matching
+data is unchanged; they do not share a snapshot across requests.
+
+### Zero-hop traversal
+
+A supported variable-length segment accepts a minimum of zero, including `*0..0` and
+`*0..1`. At depth zero its start and end denote the same typed node identity, its accumulated
+weight is zero, and its final-edge binding is null. Every final-edge projection, including
+ID and metadata paths, is therefore null. The row does not borrow an incident edge.
+Start and end constraints both apply, together with the ordinary visibility and deletion
+checks. An isolated node can match a zero-hop segment; a minimum of one excludes that row.
+
+The existing maximum depth, inverted-range refusals and cycle restrictions remain. Zero-hop
+semantics also apply to equivalent explicit ranges already expressible through the shared
+SPARQL path representation; this adds no SPARQL paging or new SPARQL syntax.
+
+### JSON path projections and result column names
+
+`RETURN` accepts the same typed paths as scalar predicates:
+
+```text
+variable.properties.identifier[.identifier ...]
+edge.metadata.identifier[.identifier ...]
+```
+
+The first form requires a node binding; metadata requires a canonical edge binding. Each
+path segment is validated, and the complete JSON path is a bound value. Unknown bindings,
+invalid path segments, node metadata and synthetic-edge metadata are refused before
+execution. Whole-object projections retain their existing result shape and stored JSON text.
+
+Path results retain the existing JSON extraction types: integers and finite numbers remain
+numeric, strings remain text, booleans are 0 or 1, and JSON null or a missing leaf becomes
+null. An array or object at the selected leaf is JSON text. A variable segment's edge path
+reads its final edge, including the null final edge at zero hops.
+
+Column names are deterministic: `f.properties.status` becomes `f_properties_status`, and
+`e.metadata.rank.order` becomes `e_metadata_rank_order`. Segments are joined with underscores
+without case folding. Different expressions that produce the same column name are refused;
+for example, `n.properties.a_b` and `n.properties.a.b` cannot both be returned under
+`n_properties_a_b`. Existing direct-field and whole-binding column names remain unchanged.
+These generated names are output labels; this amendment does not introduce `AS` or
+`ORDER BY` references to output aliases.
+
+### DISTINCT, count and grouping
+
+The supported additions are `RETURN DISTINCT ...` and `count(variable)`. The count operand
+must be a bound node or edge, not a property expression. Other returned expressions form
+the implicit grouping keys; their returned values, rather than unreturned record identities,
+define the groups. With only counts, an empty match set returns one row containing zero
+for each count. With grouping keys, an empty match set returns no rows. `count(x)` is named
+`count_x`, subject to the same output-column collision check.
+
+Counts operate on matched binding rows before the ordinary recursive projection's existing
+deduplication. Repeated occurrences of one node or edge in different matching paths count
+separately. A null edge binding at zero hops contributes zero to `count(edge)`; the bound
+node contributes one to `count(node)`. Synthetic edge bindings use their existing composite
+identity and do not require a canonical edge ID. This adds neither `count(*)`,
+`count(DISTINCT ...)` nor other aggregate functions.
+
+Filtering and complete path matching precede projection and grouping. Explicit `DISTINCT`
+applies to the requested result values after any grouping, before ordering, `SKIP`, payload
+limits and continuation detection. Grouped and explicit-distinct results omit the implicit
+`_depth` and `_total_weight` columns. Those metrics must not secretly split a group or defeat
+deduplication. Ordinary recursive results retain their existing implicit metrics and
+projection-deduplication behavior.
+
+Existing typed extraction and ordering comparisons apply. Missing and JSON-null values form
+one null group; text uses binary comparison, while numeric values retain numeric comparison.
+Requested ordering on distinct or grouped output must be derivable from its actual returned
+values. Hidden sort expressions remain refused. Deterministic ties use the returned result
+values, without adding unreturned binding identities to grouping or deduplication.
+
+For two distinct matching paths to one endpoint, `RETURN DISTINCT b.id` returns that endpoint
+once; `RETURN count(b)` returns 2. At an isolated root, a zero-hop query returning
+`count(a), count(e)` returns 1 and 0.
+
+### Correlated absence predicates
+
+GQL supports one absence form:
+
+```gql
+MATCH (r:concept)
+WHERE r.name STARTS WITH "requirement:"
+  AND NOT EXISTS { (f:concept)-[:supports]->(r) }
+RETURN r.name
+```
+
+A `NOT EXISTS` block contains one canonical fixed-length path and references at least one
+outer node binding. It may contain multiple fixed steps and ordinary inline constraints.
+A reused outer node name correlates both substrate and UUID; it does not introduce a new
+node or compare UUID alone. Additional inner names are local to the block and cannot be
+returned or referenced outside it. Node/edge name conflicts and attempts to correlate an
+outer edge as a node are refused. Ordinary fixed-pattern variable rules still apply.
+An inner edge variable that is already bound as an outer edge is refused at compile time,
+with an error naming the variable and stating that edge variables are not correlated into
+`NOT EXISTS`; the name cannot shadow the outer binding.
+
+The predicate is true exactly when no caller-visible inner binding satisfies the path.
+Inner nodes and edges use the same namespace, live-row and mailbox restrictions as the
+outer query. Hidden, deleted, out-of-scope or malformed-mailbox support cannot suppress a
+visible outer result. The block is one predicate atom under the existing `AND`/`OR` rules;
+it can correlate to the endpoint of an outer variable-length path. Absence filtering occurs
+before grouping, ordering and pagination.
+
+This form does not add `OPTIONAL MATCH`, null-extended outer rows, inner query clauses,
+nested absence blocks, recursive inner paths or synthetic inner edges. Unsupported forms
+receive explicit refusals rather than a partial interpretation.
+
+### Mixed fixed and variable-length paths
+
+One canonical path may alternate fixed steps and bounded variable-length segments:
+
+```gql
+MATCH (a:document)-[:depends_on*0..4]->(b:document)-[:derived_from]->(s:document)
+WHERE a.name = "x"
+RETURN s.name
+```
+
+All intermediate nodes, directions, relation alternatives and constraints participate in
+the match. A zero-hop segment joins its start node directly to the following step, so the
+example includes documents attached to the root itself. Each variable segment's edge
+binding identifies that segment's final edge; a later fixed edge does not replace it.
+
+Mixed paths evaluate the full `WHERE` Boolean expression on the complete joined row before grouping and paging, including `OR` across fixed-step and variable-segment bindings; the existing single-segment cross-phase `OR` refusal is unchanged.
+
+For ordinary recursive output, `_depth` sums the actual hops of the variable-length
+segments and `_total_weight` sums the weights traversed within those segments. Fixed steps
+contribute to neither metric. Zero-hop segments contribute zero to both. Cycle avoidance
+continues within each variable segment; it does not introduce a new global path-uniqueness
+rule across segments.
+
+The sum of the maximum hop bounds of all variable-length segments in one path must not
+exceed the existing maximum traversal depth of 10. Fixed steps remain finite joins. The
+bound is validated before execution, including directly constructed queries. Connected
+comma-separated matches retain Amendment 2's fixed-length canonical restriction; this
+amendment does not add recursive or synthetic comma-separated matches.
+
+### Compatibility and acceptance
+
+The new `LIMIT` meaning intentionally changes callers that treated it as a cumulative
+budget. Zero-hop ranges and the specified syntax become accepted; unrelated unsupported
+forms remain refused. Ordinary recursive output retains its legacy shape, while callers
+requesting distinct or aggregate output receive only their requested columns. Public query
+representations must validate the same rules whether parsed or constructed directly.
+There is no storage migration or additional query frontend.
+
+Acceptance requires actual stored-result and public query-dispatch witnesses:
+
+1. Prove post-offset limits, zero and exhausted pages, sentinel removal and continuation
+   with hidden rows ahead of visible rows, including connected comma matches.
+2. Prove isolated and connected zero-hop roots, both endpoint constraints, null final-edge
+   values, directions, cycles and equivalent existing SPARQL ranges.
+3. Return nested numeric, text, boolean, missing and null JSON leaves; retain whole-object
+   projections; refuse unsafe paths and ambiguous output labels.
+4. Prove grouped counts, count-only and grouped empty inputs, repeated path bindings,
+   zero-hop edge exclusion, and distinct/grouped pagination independent of hidden metrics.
+5. Prove visible support suppresses an absence result while hidden, deleted and inaccessible
+   support does not; cover typed correlation, local-variable refusal and boolean composition.
+6. Prove fixed-prefix, fixed-suffix and multiple-variable chains, root-following fixed steps,
+   each segment's final-edge metadata, intermediate visibility and cumulative-depth refusal.
+
+Result bounds do not bound intermediate fanout, sorting work, CPU or memory. Existing
+cancellation qualifications and offset-paging costs remain. Acceptance also preserves the
+read-only boundary and existing successful fixed, recursive, synthetic and SPARQL cases;
+behavioral controls must fail their intended result or refusal assertions.
