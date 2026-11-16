@@ -449,3 +449,42 @@ async fn normal_exit_receipt_ends_original_group_grandchild_liveness() {
 async fn timeout_receipt_ends_original_group_grandchild_liveness() {
     original_group_run_receipt(false).await;
 }
+
+#[tokio::test]
+async fn run_without_descendants_preserves_nonzero_exit_status() {
+    let fixture = Fixture::new();
+    let tree = fixture.ready_tree().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.call(
+            "exec.run",
+            json!({
+                "tree": tree,
+                "tool": "sh",
+                "args": ["-c", "exit 23"],
+                "actor": "local",
+                "timeout_s": 3.0
+            }),
+        ),
+    )
+    .await
+    .expect("no-descendant exec run did not finish within its outer bound");
+    let receipt = &result["receipt"];
+    assert_eq!(
+        receipt["exit_code"], 23,
+        "normal leader status was lost: {receipt}"
+    );
+    assert!(receipt["exit_signal"].is_null(), "{receipt}");
+    assert_eq!(receipt["timed_out"], false, "{receipt}");
+    assert_eq!(
+        receipt["success"], false,
+        "exit 23 is unsuccessful: {receipt}"
+    );
+    assert!(
+        !receipt["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("process group cleanup failed"),
+        "no-descendant normal exit must not invent cleanup failure: {receipt}"
+    );
+}

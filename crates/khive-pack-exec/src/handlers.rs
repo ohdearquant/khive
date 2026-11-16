@@ -1585,25 +1585,23 @@ async fn execute(
             false
         }
     };
-    let status = match child.finish().await {
-        Ok(status) if observed_exit => {
-            use std::os::unix::process::ExitStatusExt;
-            // Only the delivered signal for a configured limit is observable
-            // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
-            // resource evidence; timeout keeps the initial explicit null.
-            receipt.limiting_resource = match status.signal() {
-                Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
-                Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
-                _ => None,
-            };
-            Some(status)
-        }
-        Ok(_) => None,
-        Err(error) => {
-            append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
-            None
-        }
-    };
+    let finished = child.finish().await;
+    let (status, cleanup_error) =
+        finished_child_outcome(observed_exit, finished, child.exit_status());
+    if let Some(error) = cleanup_error {
+        append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
+    }
+    if let Some(status) = status {
+        use std::os::unix::process::ExitStatusExt;
+        // Only the delivered signal for a configured limit is observable
+        // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
+        // resource evidence; timeout keeps the initial explicit null.
+        receipt.limiting_resource = match status.signal() {
+            Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
+            Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
+            _ => None,
+        };
+    }
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
     if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
@@ -1994,6 +1992,19 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     }
 }
 
+#[cfg(unix)]
+fn finished_child_outcome(
+    observed_exit: bool,
+    finished: std::io::Result<std::process::ExitStatus>,
+    reaped_status: Option<std::process::ExitStatus>,
+) -> (Option<std::process::ExitStatus>, Option<std::io::Error>) {
+    let (status, error) = match finished {
+        Ok(status) => (Some(status), None),
+        Err(error) => (reaped_status, Some(error)),
+    };
+    (if observed_exit { status } else { None }, error)
+}
+
 #[cfg(test)]
 #[path = "parameter_helpers_tests.rs"]
 mod parameter_helpers_tests;
@@ -2001,6 +2012,47 @@ mod parameter_helpers_tests;
 #[cfg(test)]
 #[path = "process_cleanup_tests.rs"]
 mod process_cleanup_tests;
+
+#[cfg(all(test, unix))]
+mod finish_outcome_tests {
+    use super::finished_child_outcome;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn cleanup_error_preserves_observed_status_without_exposing_timeout_status() {
+        for observed_exit in [true, false] {
+            let (status, error) = finished_child_outcome(
+                observed_exit,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Some(ExitStatus::from_raw(23 << 8)),
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                observed_exit.then_some(23),
+                "cleanup failure must retain observed status and keep timeout status private"
+            );
+            assert_eq!(
+                error
+                    .expect("cleanup failure must remain visible")
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_without_reaped_status_stays_unknown() {
+        let (status, error) =
+            finished_child_outcome(true, Err(io::Error::from_raw_os_error(libc::EPERM)), None);
+        assert!(
+            status.is_none(),
+            "failed cleanup must not invent exit status"
+        );
+        assert_eq!(error.unwrap().raw_os_error(), Some(libc::EPERM));
+    }
+}
 
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]

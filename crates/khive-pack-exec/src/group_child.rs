@@ -11,6 +11,7 @@ const OBSERVE_POLL_BUDGET: usize = 64;
 trait GroupBackend {
     fn poll_observe_unreaped(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
     fn signal_group(&mut self) -> io::Result<()>;
+    fn start_kill_leader(&mut self) -> io::Result<()>;
     fn poll_reap(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ExitStatus>>;
 }
 
@@ -25,7 +26,10 @@ enum GroupState {
 struct GroupLifecycle<B: GroupBackend> {
     backend: B,
     state: GroupState,
+    observed_exited: bool,
     exit_status: Option<ExitStatus>,
+    cleanup_error: Option<io::Error>,
+    reap_error: Option<io::Error>,
 }
 
 impl<B: GroupBackend> GroupLifecycle<B> {
@@ -33,7 +37,10 @@ impl<B: GroupBackend> GroupLifecycle<B> {
         Self {
             backend,
             state: GroupState::Held,
+            observed_exited: false,
             exit_status: None,
+            cleanup_error: None,
+            reap_error: None,
         }
     }
 
@@ -50,8 +57,13 @@ impl<B: GroupBackend> GroupLifecycle<B> {
                     Poll::Ready(Err(error)) => {
                         if error.raw_os_error() == Some(libc::ECHILD) {
                             self.state = GroupState::Lost;
+                            self.observed_exited = false;
                         }
                         return Poll::Ready(Err(error));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        self.observed_exited = true;
+                        return Poll::Ready(Ok(()));
                     }
                     result => return result,
                 }
@@ -63,8 +75,8 @@ impl<B: GroupBackend> GroupLifecycle<B> {
     }
 
     async fn finish(&mut self) -> io::Result<ExitStatus> {
-        if let Some(status) = self.exit_status {
-            return Ok(status);
+        if self.exit_status.is_some() || self.reap_error.is_some() {
+            return self.completed_result();
         }
         if self.state == GroupState::Lost {
             return Err(io::Error::from_raw_os_error(libc::ECHILD));
@@ -72,17 +84,71 @@ impl<B: GroupBackend> GroupLifecycle<B> {
         if self.state == GroupState::Held {
             match self.backend.signal_group() {
                 Ok(()) => {}
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                Err(error) => return Err(error),
+                Err(error) if self.benign_group_error(&error) => {}
+                Err(error) => {
+                    let cleanup_error = self.cleanup_error.get_or_insert(error);
+                    if !self.observed_exited {
+                        if let Err(leader_error) = self.backend.start_kill_leader() {
+                            // Neither signal was accepted. Waiting on a live
+                            // leader here could block forever; Drop can retry
+                            // only while the original identity is still held.
+                            return Err(io::Error::new(
+                                cleanup_error.kind(),
+                                format!(
+                                    "group signal failed: {cleanup_error}; direct child signal failed: {leader_error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
             // Reaping releases the numeric identity, even when this future is
             // cancelled after its first poll. Never re-arm after entering wait.
+            // An accepted leader signal does not certify descendant cleanup;
+            // the original group failure remains separate from exit status.
             self.state = GroupState::GroupSignaled;
         }
-        let status = poll_fn(|cx| self.backend.poll_reap(cx)).await?;
-        self.state = GroupState::Reaped;
-        self.exit_status = Some(status);
-        Ok(status)
+        match poll_fn(|cx| self.backend.poll_reap(cx)).await {
+            Ok(status) => {
+                self.state = GroupState::Reaped;
+                self.exit_status = Some(status);
+            }
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.state = GroupState::Lost;
+                    self.observed_exited = false;
+                }
+                self.reap_error = Some(error);
+            }
+        }
+        self.completed_result()
+    }
+
+    fn benign_group_error(&self, error: &io::Error) -> bool {
+        error.raw_os_error() == Some(libc::ESRCH)
+            // macOS can report EPERM when only the exited, unreaped leader
+            // remains. An errno alone never proves that a live leader exited.
+            || (self.observed_exited && error.raw_os_error() == Some(libc::EPERM))
+    }
+
+    fn completed_result(&self) -> io::Result<ExitStatus> {
+        match (&self.cleanup_error, &self.reap_error) {
+            (Some(cleanup), Some(reap)) => Err(io::Error::new(
+                reap.kind(),
+                format!("group signal failed: {cleanup}; child reap failed: {reap}"),
+            )),
+            (Some(error), None) | (None, Some(error)) => Err(copy_io_error(error)),
+            (None, None) => self
+                .exit_status
+                .ok_or_else(|| io::Error::other("child has no reaped exit status")),
+        }
+    }
+}
+
+fn copy_io_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(error.kind(), error.to_string()),
     }
 }
 
@@ -90,7 +156,11 @@ impl<B: GroupBackend> Drop for GroupLifecycle<B> {
     fn drop(&mut self) {
         if self.state == GroupState::Held {
             // This runs before the backend's Child drop can reap the leader.
-            let _ = self.backend.signal_group();
+            if let Err(error) = self.backend.signal_group() {
+                if !self.benign_group_error(&error) {
+                    let _ = self.backend.start_kill_leader();
+                }
+            }
         }
     }
 }
@@ -109,6 +179,10 @@ impl GroupBackend for OsBackend {
 
     fn signal_group(&mut self) -> io::Result<()> {
         khive_runtime::process_group::signal_process_group(self.pgid, libc::SIGKILL)
+    }
+
+    fn start_kill_leader(&mut self) -> io::Result<()> {
+        self.child.start_kill()
     }
 
     fn poll_reap(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ExitStatus>> {
@@ -206,6 +280,10 @@ impl GroupChild {
 
     pub(crate) async fn finish(&mut self) -> io::Result<ExitStatus> {
         self.lifecycle.finish().await
+    }
+
+    pub(crate) fn exit_status(&self) -> Option<ExitStatus> {
+        self.lifecycle.exit_status
     }
 }
 

@@ -20,6 +20,7 @@ enum Generation {
 enum Event {
     Observe,
     Signal(Generation, Option<i32>),
+    LeaderKill(Generation, Option<i32>),
     Reap(Generation),
     BackendDrop(Generation),
 }
@@ -44,6 +45,7 @@ struct Model {
     observations: VecDeque<Observation>,
     default_observation: Observation,
     signals: VecDeque<Option<i32>>,
+    leader_kills: VecDeque<Option<i32>>,
     reap: Reap,
 }
 
@@ -74,6 +76,14 @@ impl GroupBackend for FakeBackend {
         let error = model.signals.pop_front().unwrap_or(None);
         let generation = model.generation;
         model.events.push(Event::Signal(generation, error));
+        error.map_or(Ok(()), |code| Err(io::Error::from_raw_os_error(code)))
+    }
+
+    fn start_kill_leader(&mut self) -> io::Result<()> {
+        let mut model = self.0.borrow_mut();
+        let error = model.leader_kills.pop_front().unwrap_or(None);
+        let generation = model.generation;
+        model.events.push(Event::LeaderKill(generation, error));
         error.map_or(Ok(()), |code| Err(io::Error::from_raw_os_error(code)))
     }
 
@@ -108,6 +118,7 @@ fn model_group() -> (GroupLifecycle<FakeBackend>, Rc<RefCell<Model>>) {
         observations: VecDeque::new(),
         default_observation: Observation::Exited,
         signals: VecDeque::new(),
+        leader_kills: VecDeque::new(),
         reap: Reap::Exited,
     }));
     (GroupLifecycle::new(FakeBackend(model.clone())), model)
@@ -230,25 +241,33 @@ fn group_lifecycle_drop_cleans_before_backend_drop() {
 
 #[test]
 fn group_lifecycle_lost_identity_never_signals_or_reaps_replacement() {
-    let (mut group, model) = model_group();
-    model.borrow_mut().default_observation = Observation::Error(libc::ECHILD);
-    assert_eq!(
-        ready(group.wait_unreaped()).unwrap_err().raw_os_error(),
-        Some(libc::ECHILD)
-    );
-    assert_eq!(model.borrow().generation, Generation::Foreign);
-    assert_eq!(
-        ready(group.finish())
-            .expect_err("lost identity must refuse cleanup")
-            .raw_os_error(),
-        Some(libc::ECHILD)
-    );
-    drop(group);
-    assert_eq!(
-        model.borrow().events,
-        vec![Event::Observe, Event::BackendDrop(Generation::Foreign)],
-        "known identity loss must not authorize any numeric signal/reap"
-    );
+    for previously_observed in [false, true] {
+        let (mut group, model) = model_group();
+        let mut expected = Vec::new();
+        if previously_observed {
+            ready(group.wait_unreaped()).unwrap();
+            expected.push(Event::Observe);
+        }
+        model.borrow_mut().default_observation = Observation::Error(libc::ECHILD);
+        assert_eq!(
+            ready(group.wait_unreaped()).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(model.borrow().generation, Generation::Foreign);
+        assert_eq!(
+            ready(group.finish())
+                .expect_err("lost identity must refuse cleanup")
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        drop(group);
+        expected.extend([Event::Observe, Event::BackendDrop(Generation::Foreign)]);
+        assert_eq!(
+            model.borrow().events,
+            expected,
+            "known identity loss must not authorize any numeric signal/reap"
+        );
+    }
 }
 
 #[test]
@@ -283,30 +302,260 @@ fn group_lifecycle_signal_failure_retains_anchor_until_safe_retry() {
         for retry_finish in [false, true] {
             let (mut group, model) = model_group();
             model.borrow_mut().signals.push_back(Some(code));
+            model.borrow_mut().leader_kills.push_back(Some(code));
             assert_eq!(
                 ready(group.finish())
                     .expect_err("failed group signal must not report successful finish")
-                    .raw_os_error(),
+                    .kind(),
+                io::Error::from_raw_os_error(code).kind()
+            );
+            assert_eq!(
+                group.cleanup_error.as_ref().unwrap().raw_os_error(),
                 Some(code)
             );
             assert_eq!(model.borrow().generation, Generation::Original);
             assert_eq!(
                 model.borrow().events,
-                vec![Event::Signal(Generation::Original, Some(code))],
-                "signal failure must return before consuming the anchor"
-            );
-            if retry_finish {
-                assert_eq!(ready(group.finish()).unwrap().code(), Some(23));
-            }
-            drop(group);
-            assert_eq!(
-                signal_events(&model),
                 vec![
                     Event::Signal(Generation::Original, Some(code)),
-                    Event::Signal(Generation::Original, None),
-                ]
+                    Event::LeaderKill(Generation::Original, Some(code)),
+                ],
+                "signal failure must return before consuming the anchor"
             );
+            let mut expected = model.borrow().events.clone();
+            if retry_finish {
+                assert_eq!(
+                    ready(group.finish()).unwrap_err().raw_os_error(),
+                    Some(code),
+                    "successful retry must not erase the original cleanup failure"
+                );
+                assert_eq!(group.exit_status.and_then(|status| status.code()), Some(23));
+                expected.extend([
+                    Event::Signal(Generation::Original, None),
+                    Event::Reap(Generation::Original),
+                    Event::BackendDrop(Generation::Foreign),
+                ]);
+            } else {
+                expected.extend([
+                    Event::Signal(Generation::Original, None),
+                    Event::BackendDrop(Generation::Original),
+                ]);
+            }
+            drop(group);
+            assert_eq!(model.borrow().events, expected);
         }
+    }
+}
+
+#[test]
+fn group_lifecycle_observed_eperm_reaps_and_keeps_status() {
+    let (mut group, model) = model_group();
+    ready(group.wait_unreaped()).unwrap();
+    model.borrow_mut().signals.push_back(Some(libc::EPERM));
+    assert_eq!(
+        ready(group.finish())
+            .expect("observed-exit EPERM must not turn normal exit into cleanup failure")
+            .code(),
+        Some(23)
+    );
+    assert_eq!(group.exit_status.and_then(|status| status.code()), Some(23));
+    assert!(group.cleanup_error.is_none());
+    let before = model.borrow().events.clone();
+    assert_eq!(ready(group.finish()).unwrap().code(), Some(23));
+    assert_eq!(
+        model.borrow().events,
+        before,
+        "completed finish must not poll again"
+    );
+    drop(group);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Observe,
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::Reap(Generation::Original),
+            Event::BackendDrop(Generation::Foreign),
+        ]
+    );
+}
+
+#[test]
+fn group_lifecycle_observed_cleanup_error_keeps_status_and_error() {
+    let (mut group, model) = model_group();
+    ready(group.wait_unreaped()).unwrap();
+    model.borrow_mut().signals.push_back(Some(libc::EIO));
+    assert_eq!(
+        ready(group.finish()).unwrap_err().raw_os_error(),
+        Some(libc::EIO)
+    );
+    assert_eq!(
+        group.exit_status.and_then(|status| status.code()),
+        Some(23),
+        "observed leader must be reaped despite a cleanup error"
+    );
+    let before = model.borrow().events.clone();
+    assert_eq!(
+        ready(group.finish()).unwrap_err().raw_os_error(),
+        Some(libc::EIO)
+    );
+    assert_eq!(
+        model.borrow().events,
+        before,
+        "cached error/status must not trigger cleanup again"
+    );
+    drop(group);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Observe,
+            Event::Signal(Generation::Original, Some(libc::EIO)),
+            Event::Reap(Generation::Original),
+            Event::BackendDrop(Generation::Foreign),
+        ]
+    );
+}
+
+#[test]
+fn group_lifecycle_unobserved_eperm_falls_back_without_hiding_error() {
+    let (mut group, model) = model_group();
+    model.borrow_mut().default_observation = Observation::Pending;
+    model.borrow_mut().signals.push_back(Some(libc::EPERM));
+    assert_eq!(
+        ready(group.finish()).unwrap_err().raw_os_error(),
+        Some(libc::EPERM),
+        "unobserved EPERM must remain an error after safe leader cleanup"
+    );
+    assert_eq!(group.exit_status.and_then(|status| status.code()), Some(23));
+    let before = model.borrow().events.clone();
+    assert_eq!(
+        ready(group.finish()).unwrap_err().raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert_eq!(
+        model.borrow().events,
+        before,
+        "repeated finish must retain error and status"
+    );
+    drop(group);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::LeaderKill(Generation::Original, None),
+            Event::Reap(Generation::Original),
+            Event::BackendDrop(Generation::Foreign),
+        ],
+        "fallback must signal the owned leader before its identity is consumed"
+    );
+}
+
+#[test]
+fn group_lifecycle_failed_observation_does_not_make_eperm_benign() {
+    let (mut group, model) = model_group();
+    model.borrow_mut().default_observation = Observation::Error(libc::EIO);
+    assert_eq!(
+        ready(group.wait_unreaped()).unwrap_err().raw_os_error(),
+        Some(libc::EIO)
+    );
+    model.borrow_mut().signals.push_back(Some(libc::EPERM));
+    assert_eq!(
+        ready(group.finish()).unwrap_err().raw_os_error(),
+        Some(libc::EPERM),
+        "failed observation must not authorize benign EPERM"
+    );
+    assert_eq!(group.exit_status.and_then(|status| status.code()), Some(23));
+    drop(group);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Observe,
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::LeaderKill(Generation::Original, None),
+            Event::Reap(Generation::Original),
+            Event::BackendDrop(Generation::Foreign),
+        ]
+    );
+}
+
+#[test]
+fn group_lifecycle_both_signals_denied_returns_without_reap() {
+    let (mut group, model) = model_group();
+    model.borrow_mut().default_observation = Observation::Pending;
+    model.borrow_mut().signals.extend([Some(libc::EPERM); 2]);
+    model.borrow_mut().leader_kills.push_back(Some(libc::EPERM));
+    let error = ready(group.finish()).expect_err("dual denial must return without waiting");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        group.exit_status.is_none(),
+        "dual denial must not invent a reaped status"
+    );
+    assert_eq!(model.borrow().generation, Generation::Original);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::LeaderKill(Generation::Original, Some(libc::EPERM)),
+        ],
+        "dual denial must never poll reap on a possibly live leader"
+    );
+    assert!(error.to_string().contains("direct child signal failed"));
+    drop(group);
+    assert_eq!(
+        model.borrow().events,
+        vec![
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::LeaderKill(Generation::Original, Some(libc::EPERM)),
+            Event::Signal(Generation::Original, Some(libc::EPERM)),
+            Event::LeaderKill(Generation::Original, None),
+            Event::BackendDrop(Generation::Original),
+        ],
+        "Drop may retry only while the original identity remains held"
+    );
+}
+
+#[test]
+fn group_lifecycle_fallback_reap_cancellation_never_signals_reused_identity() {
+    for reap in [Reap::PendingAndReuse, Reap::ErrorAndReuse(libc::EIO)] {
+        let (mut group, model) = model_group();
+        model.borrow_mut().signals.push_back(Some(libc::EPERM));
+        model.borrow_mut().reap = reap;
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut cx = Context::from_waker(&waker);
+        let mut finishing = Box::pin(group.finish());
+        match (reap, finishing.as_mut().poll(&mut cx)) {
+            (Reap::PendingAndReuse, Poll::Pending) => {}
+            (Reap::ErrorAndReuse(_), Poll::Ready(Err(error))) => {
+                assert!(error.to_string().contains("group signal failed"));
+                assert!(error.to_string().contains("child reap failed"));
+            }
+            _ => panic!("fallback reap did not preserve the scripted pending/error outcome"),
+        }
+        drop(finishing);
+        assert_eq!(
+            group.cleanup_error.as_ref().unwrap().raw_os_error(),
+            Some(libc::EPERM),
+            "cancellation must retain the original cleanup error"
+        );
+        assert!(group.exit_status.is_none());
+        assert_eq!(model.borrow().generation, Generation::Foreign);
+        if matches!(reap, Reap::ErrorAndReuse(_)) {
+            let before = model.borrow().events.clone();
+            let error = ready(group.finish()).unwrap_err();
+            assert!(error.to_string().contains("group signal failed"));
+            assert!(error.to_string().contains("child reap failed"));
+            assert_eq!(model.borrow().events, before, "reap failure must be cached");
+        }
+        drop(group);
+        assert_eq!(
+            model.borrow().events,
+            vec![
+                Event::Signal(Generation::Original, Some(libc::EPERM)),
+                Event::LeaderKill(Generation::Original, None),
+                Event::Reap(Generation::Original),
+                Event::BackendDrop(Generation::Foreign),
+            ],
+            "fallback cancellation must not signal a foreign group or leader"
+        );
     }
 }
 
@@ -346,22 +595,34 @@ fn group_lifecycle_esrch_disarms_and_reaps_once() {
 
 #[test]
 fn group_lifecycle_reap_error_never_rearms_numeric_signals() {
-    let (mut group, model) = model_group();
-    model.borrow_mut().reap = Reap::ErrorAndReuse(libc::EIO);
-    assert_eq!(
-        ready(group.finish()).unwrap_err().raw_os_error(),
-        Some(libc::EIO)
-    );
-    drop(group);
-    assert_eq!(
-        model.borrow().events,
-        vec![
-            Event::Signal(Generation::Original, None),
-            Event::Reap(Generation::Original),
-            Event::BackendDrop(Generation::Foreign),
-        ],
-        "reap error must never rearm group signaling"
-    );
+    for code in [libc::EIO, libc::ECHILD] {
+        let (mut group, model) = model_group();
+        model.borrow_mut().reap = Reap::ErrorAndReuse(code);
+        assert_eq!(
+            ready(group.finish()).unwrap_err().raw_os_error(),
+            Some(code)
+        );
+        let before = model.borrow().events.clone();
+        assert_eq!(
+            ready(group.finish()).unwrap_err().raw_os_error(),
+            Some(code)
+        );
+        assert_eq!(
+            model.borrow().events,
+            before,
+            "repeated finish must not reap a replacement"
+        );
+        drop(group);
+        assert_eq!(
+            model.borrow().events,
+            vec![
+                Event::Signal(Generation::Original, None),
+                Event::Reap(Generation::Original),
+                Event::BackendDrop(Generation::Foreign),
+            ],
+            "reap error must never rearm group signaling"
+        );
+    }
 }
 
 #[test]
@@ -748,4 +1009,28 @@ async fn group_spawn_disables_tokio_pid_kill_on_drop() {
         "GroupChild must own cleanup without Tokio's independent numeric-PID drop kill"
     );
     assert_eq!(group.finish().await.unwrap().signal(), Some(libc::SIGKILL));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread")]
+async fn macos_exited_leader_without_descendants_keeps_status() {
+    let mut group = GroupChild::spawn(&mut isolated_command("exit 23"))
+        .expect("spawn isolated no-descendant fixture");
+    tokio::time::timeout(Duration::from_secs(2), group.wait_unreaped())
+        .await
+        .expect("no-descendant leader did not exit")
+        .expect("observe no-descendant exit without consuming its status");
+    let finished = tokio::time::timeout(Duration::from_secs(2), group.finish())
+        .await
+        .expect("exited leader cleanup did not finish");
+    assert!(
+        finished.is_ok(),
+        "macOS exited-only group EPERM must preserve successful finish: {finished:?}"
+    );
+    assert_eq!(finished.unwrap().code(), Some(23));
+    assert_eq!(
+        group.exit_status().and_then(|status| status.code()),
+        Some(23)
+    );
+    assert_eq!(group.finish().await.unwrap().code(), Some(23));
 }
