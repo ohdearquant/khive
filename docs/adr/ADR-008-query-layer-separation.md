@@ -471,7 +471,7 @@ until both parts are delivered.
 
 ## Amendment 2: Connected comma-separated MATCH patterns (2026-11-14)
 
-**Amendment status**: Proposed
+**Amendment status**: Accepted 2026-11-15 (#6654)
 
 This amendment completes the comma-separated `MATCH` portion of #6594 with connected,
 fixed-length canonical graph patterns. It replaces Amendment 1's comma-pattern deferral
