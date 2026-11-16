@@ -96,7 +96,7 @@ fn isolated(name: &str, body: impl Future<Output = ()>) {
 struct CatalogPack;
 
 impl Pack for CatalogPack {
-    const NAME: &'static str = "catalog-fixture";
+    const NAME: &'static str = "catalog";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -530,7 +530,7 @@ operation in the request; `bridge.diagnostics(help=true)` describes its schema."
                 let owner = match *name {
                     "verbs" => "kg",
                     "mounted.old" => "mounted",
-                    _ => "catalog-fixture",
+                    _ => "catalog",
                 };
                 assert!(row.starts_with(&format!("[{owner}] ")), "{row}");
                 assert_eq!(row.matches(&format!("[{owner}] ")).count(), 1);
@@ -538,7 +538,7 @@ operation in the request; `bridge.diagnostics(help=true)` describes its schema."
             }
             let unicode = rows[1]
                 .1
-                .strip_prefix("[catalog-fixture] ")
+                .strip_prefix("[catalog] ")
                 .unwrap()
                 .strip_suffix(" — catalog.unicode(help=true)")
                 .unwrap();

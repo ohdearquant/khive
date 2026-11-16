@@ -309,3 +309,16 @@ fn foreign_pack_cannot_borrow_kg_bare_or_another_pack_prefix() {
         );
     }
 }
+
+#[test]
+fn runtime_kg_bare_allowlist_matches_namespace_contract() {
+    let mut runtime = VerbRegistryBuilder::kg_substrate_verbs_for_test().to_vec();
+    let mut contract = KG_SUBSTRATE_VERBS.to_vec();
+    runtime.sort_unstable();
+    contract.sort_unstable();
+    // Compare vectors so duplicate entries cannot disappear in a set conversion.
+    assert_eq!(
+        runtime, contract,
+        "runtime public ownership and the authoritative kg bare allowlist must agree"
+    );
+}
