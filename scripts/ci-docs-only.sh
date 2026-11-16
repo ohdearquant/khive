@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# ci-docs-only.sh <base> <head>
+# ci-docs-only.sh <base> <head> [<path>...]
 #
 # Prints "true" when the change from <base> to <head> may run CI's documentation lane only, and "false"
-# when it needs the full suite. The reasons go to stderr.
+# when it needs the full suite. The reasons go to stderr. Given paths, it judges only those, and each must be
+# a path the change touches: scripts/ci-test-scope.py admits the Markdown files of a mixed change this way, so
+# the two classifiers share one rule.
 #
 # The documentation lane is allowed when every path that differs is a Markdown file, no non-Markdown file
 # at <head> names that file's base name on any line, except listed inert documentation data, and the file is not one whose verb and pack count
@@ -43,12 +45,13 @@ full() {
     exit 0
 }
 
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 <base> <head>" >&2
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 <base> <head> [<path>...]" >&2
     exit 2
 fi
 base=$1
 head=$2
+shift 2
 scanner=$(cd "$(dirname "$0")/.." && pwd)/tests/documented_verb_counts.py || full "cannot resolve the repository root"
 
 list=$(mktemp) || full "mktemp failed"
@@ -110,9 +113,17 @@ name_paths=(':(exclude)*.md')
 # reference lint (scripts/ci.sh adr-lint, the Docs lint job; it also writes fixtures at docs/adr/README.md) and
 # the count scanner's own test, which names docs/adr/README.md only to assert the file is tracked. The scanner's
 # verdict on each changed path is asked below.
-for reader in scripts/lint-adr-refs.sh tests/test_documented_verb_counts.py; do
+# The classifier itself names paths only in its comments and reads none of them, and a change to it already runs
+# the full suite.
+for reader in scripts/lint-adr-refs.sh tests/test_documented_verb_counts.py scripts/ci-docs-only.sh; do
     name_paths+=(":(top,exclude,literal)$reader")
 done
+# Files that name one Markdown path only as a fixture they write inside a temporary repository and never read the
+# tracked file. Each "reader:path" pair exempts that reader for that one path; it still counts for every other path.
+fixture_pairs=(
+    # The classifier's own tests build an ADR index in each fixture repository.
+    "scripts/tests/test_ci_workflows.py:docs/adr/README.md"
+)
 while IFS= read -r -d '' inert_path; do
     name_paths+=(":(top,exclude,literal)$inert_path")
 done < "$inert"
@@ -121,6 +132,18 @@ paths=()
 while IFS= read -r -d '' path; do
     paths+=("$path")
 done < "$list"
+if [ "$#" -gt 0 ]; then
+    selected=()
+    for wanted in "$@"; do
+        found=no
+        for path in "${paths[@]}"; do
+            [ "$path" = "$wanted" ] && found=yes
+        done
+        [ "$found" = yes ] || full "$wanted is not a path changed between $base and $head"
+        selected+=("$wanted")
+    done
+    paths=("${selected[@]}")
+fi
 
 count=0
 for path in "${paths[@]}"; do
@@ -129,6 +152,10 @@ for path in "${paths[@]}"; do
         *.md) ;;
         *) full "not Markdown: $path" ;;
     esac
+    grep_paths=("${name_paths[@]}")
+    for pair in "${fixture_pairs[@]}"; do
+        [ "${pair#*:}" = "$path" ] && grep_paths+=(":(top,exclude,literal)${pair%%:*}")
+    done
     name=${path##*/}
     dir=""
     case $path in */*) dir=${path%/*} ;; esac
@@ -140,7 +167,7 @@ for path in "${paths[@]}"; do
     if [ -z "$dir" ] || [ "$others" -eq 0 ]; then
         # git grep's own status, not a pipe: under pipefail an early-exiting reader would fail its writer and
         # read as "not named", the unsafe direction.
-        git grep -q -F -e "$name" "$head" -- "${name_paths[@]}"
+        git grep -q -F -e "$name" "$head" -- "${grep_paths[@]}"
         rc=$?
         case $rc in
             0) full "$path is named by a non-Markdown file" ;;
@@ -159,21 +186,21 @@ for path in "${paths[@]}"; do
         # Regular-expression forms of the two names, for the joined-path search.
         parent_re=$(printf '%s' "$parent" | sed 's/[][\\.*^$+?(){}|/]/\\&/g')
         name_re=$(printf '%s' "$name" | sed 's/[][\\.*^$+?(){}|/]/\\&/g')
-        git grep -q -F -e "$parent/$name" "$head" -- "${name_paths[@]}"
+        git grep -q -F -e "$parent/$name" "$head" -- "${grep_paths[@]}"
         rc=$?
         case $rc in
             0) full "$path is named as $parent/$name by a non-Markdown file" ;;
             1) ;;
             *) full "git grep for $parent/$name failed (rc $rc)" ;;
         esac
-        git grep -q -E -e "[\"']${parent_re}[\"'].*[\"'/]${name_re}[\"']" "$head" -- "${name_paths[@]}"
+        git grep -q -E -e "[\"']${parent_re}[\"'].*[\"'/]${name_re}[\"']" "$head" -- "${grep_paths[@]}"
         rc=$?
         case $rc in
             0) full "$path is named as a joined $parent and $name by a non-Markdown file" ;;
             1) ;;
             *) full "git grep for a joined $parent and $name failed (rc $rc)" ;;
         esac
-        git grep -q -F -e "$name" "$head" -- ":(top,literal)$dir/" "${name_paths[@]}"
+        git grep -q -F -e "$name" "$head" -- ":(top,literal)$dir/" "${grep_paths[@]}"
         rc=$?
         case $rc in
             0) full "$path is named by a non-Markdown file in $dir" ;;
