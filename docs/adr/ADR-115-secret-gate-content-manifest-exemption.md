@@ -2208,12 +2208,11 @@ stays visible. This is bounded diagnostic hygiene, not detection of every secret
 
 ## Amendment 9 (2026-11-16): contextual property scanning and note-key write admission
 
-**Status**: Proposed; approval pending.
+**Status**: Accepted 2026-11-16 (#6725).
 
 Originating issues: [#6562](https://github.com/ohdearquant/khive/issues/6562) and
 [#6273](https://github.com/ohdearquant/khive/issues/6273).
 
-The amendment number is provisional until reconciled with intervening amendments.
 This amendment must be accepted before dependent implementation merges. It does not
 change the status of the base ADR or earlier amendments.
 
