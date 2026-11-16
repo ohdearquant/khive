@@ -1838,7 +1838,7 @@ The implementation carries, besides tests for each rule above:
 
 ## Amendment (2026-11-16): single-message fetch without marking read
 
-**Status:** Proposed.
+**Status:** Accepted 2026-11-16 (#6721).
 
 `comm.read` gains an optional boolean `mark`, defaulting to true. Omission and
 `mark=true` retain the existing single and bulk mark-read behavior, including
