@@ -646,7 +646,7 @@ fixture failures, and timeouts do not establish the behavior.
 
 ## Amendment 3: GQL pages, projections, aggregation and bounded path composition (2026-11-15)
 
-**Amendment status**: Proposed
+**Amendment status**: Accepted 2026-11-16 (#6723)
 
 GQL must support complete paged answers, scalar property projections, counts, distinct
 results, absence queries, and paths that combine bounded traversal with fixed steps. This
