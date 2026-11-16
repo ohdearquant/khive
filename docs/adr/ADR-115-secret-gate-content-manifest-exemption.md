@@ -2213,6 +2213,11 @@ stays visible. This is bounded diagnostic hygiene, not detection of every secret
 Originating issues: [#6562](https://github.com/ohdearquant/khive/issues/6562) and
 [#6273](https://github.com/ohdearquant/khive/issues/6273).
 
+Amendment 8 is proposed separately in
+[#6261](https://github.com/ohdearquant/khive/pull/6261). This amendment does not
+depend on it, and the gap between Amendments 7 and 9 is intended whether Amendment 8
+lands later or not at all.
+
 This amendment must be accepted before dependent implementation merges. It does not
 change the status of the base ADR or earlier amendments.
 
@@ -2531,7 +2536,10 @@ snapshots where writes are reachable.
    spans, outer credential with benign inner key, and benign outer key with an
    inner credential. Dropping origin propagation, resetting distance and dropping
    the inherited label are distinct controls. Mapping/setup failures are not
-   semantic evidence.
+   semantic evidence. Include one sorted-sibling pair: a long sibling key that sorts
+   between a credential container key and its nested value moves that value beyond
+   120 canonical bytes, so the existing radius limit is recorded as applying in the
+   canonical key order.
 3. **Every consumer.** Exercise basic property checks and the finalizer's actual
    property and final-candidate paths with empty and valid test-only nonempty
    snapshots. Changing only one walker must fail another consumer's assertion.
@@ -2558,6 +2566,10 @@ snapshots where writes are reachable.
    enclosing rollback. Separately bypass the direct-store guard, pre-replay guard
    and atomic preparation guard; no one route substitutes for another. Lawful
    high-entropy ordinary keys must not be rejected through fabricated label text.
+   Inventory every in-repo producer of note keys. One key of each generated grammar,
+   including `git.commit:<40-hex commit sha>`, is a must-admit witness through the
+   direct store path and through its runtime route; a grammar the detector refuses
+   is resolved in the same change.
 8. **Compatibility.** Verify read/fence shape behavior and legacy-key access without
    rewriting data. Verify the new typed conversion and an ordinary non-secret
    storage error whose `Error::source()` identifies the underlying `StorageError`;
