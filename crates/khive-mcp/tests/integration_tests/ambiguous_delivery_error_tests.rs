@@ -12,11 +12,11 @@
 struct AmbiguousDeliveryPack;
 
 impl khive_types::Pack for AmbiguousDeliveryPack {
-    const NAME: &'static str = "ambiguous-delivery-inject";
+    const NAME: &'static str = "ambiguous_delivery";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "always_ambiguous",
+        name: "ambiguous_delivery.always_ambiguous",
         description: "always returns the comm dual-write ambiguous-delivery error shape",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -27,7 +27,7 @@ impl khive_types::Pack for AmbiguousDeliveryPack {
 #[async_trait]
 impl PackRuntime for AmbiguousDeliveryPack {
     fn name(&self) -> &str {
-        "ambiguous-delivery-inject"
+        "ambiguous_delivery"
     }
 
     fn note_kinds(&self) -> &'static [&'static str] {
@@ -92,7 +92,7 @@ async fn comm_ambiguous_delivery_error_carries_structured_outbound_id() -> anyho
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "always_ambiguous()"}),
+        serde_json::json!({"ops": "ambiguous_delivery.always_ambiguous()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;

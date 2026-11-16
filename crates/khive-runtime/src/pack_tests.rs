@@ -78,7 +78,7 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
     assert_eq!(host.load(Ordering::SeqCst), 1);
     assert!(registry.pack_host_state::<String>("host_state").is_none());
     assert!(registry.pack_host_state::<AtomicUsize>("missing").is_none());
-    assert!(registry.pack_host_state::<AtomicUsize>("alpha").is_none());
+    assert!(registry.pack_host_state::<AtomicUsize>("kg").is_none());
 }
 
 /// Verbs known, by cross-pack source review (#2147/#2217), to have
@@ -909,6 +909,18 @@ fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
             } else {
                 builder.register(pack);
             }
+            if name != owner {
+                let error = builder
+                    .build()
+                    .err()
+                    .expect("foreign public owner must fail");
+                assert!(
+                    matches!(&error, RuntimeError::InvalidInput(message)
+                        if message.contains(name) && message.contains(handlers[0].name)),
+                    "expected ownership refusal for {name}, got {error:?}"
+                );
+                continue;
+            }
             let registry = builder.build().expect("replay fixture registry");
             for handler in handlers {
                 assert_eq!(
@@ -946,7 +958,7 @@ fn read_replay_excludes_reads_with_fresh_persisted_serve_or_search_rows() {
 
 #[test]
 fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
-    static HANDLERS: [HandlerDef; 3] = [
+    static HANDLERS: [HandlerDef; 2] = [
         HandlerDef {
             name: "stats",
             description: "category cannot override the reviewed operation effects",
@@ -961,13 +973,6 @@ fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
             category: VerbCategory::Assertive,
             params: &[],
         },
-        HandlerDef {
-            name: "unclassified_read",
-            description: "an unknown operation remains ineligible",
-            visibility: Visibility::Verb,
-            category: VerbCategory::Assertive,
-            params: &[],
-        },
     ];
     let mut builder = VerbRegistryBuilder::new();
     builder.register_trusted(CountingHandlersPack {
@@ -975,10 +980,24 @@ fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
         handlers: &HANDLERS,
         calls: Arc::new(AtomicUsize::new(0)),
     });
+    static UNCLASSIFIED_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+        name: "probe.unclassified_read",
+        description: "an unknown operation remains ineligible",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    }];
+    builder.register_trusted(CountingHandlersPack {
+        name: "probe",
+        handlers: &UNCLASSIFIED_HANDLERS,
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
     let registry = builder.build().expect("mutating fixture registry");
     assert!(registry.is_read_replay_safe("stats"));
     assert!(!registry.is_read_replay_safe("create"));
-    assert!(!registry.is_read_replay_safe("unclassified_read"));
+    assert!(registry.has_verb("probe.unclassified_read"));
+    assert_eq!(crate::classify_operation("probe.unclassified_read"), None);
+    assert!(!registry.is_read_replay_safe("probe.unclassified_read"));
 }
 
 /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
@@ -1202,7 +1221,7 @@ fn from_token_preserves_process_ref() {
 struct AlphaPack;
 
 impl Pack for AlphaPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
     const ENTITY_KINDS: &'static [&'static str] = &["widget"];
     const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["recall", "search"];
@@ -1262,7 +1281,7 @@ impl Pack for GateErrorTrackingPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "guarded",
+        name: "gate_error_tracking.guarded",
         description: "track whether gate-error dispatch reaches the handler",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -1310,7 +1329,7 @@ impl Pack for SleepingPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "slow_op",
+        name: "sleeping.slow_op",
         description: "sleeps before returning",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -1353,7 +1372,7 @@ impl Pack for BetaPack {
     const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["search", "knowledge_compose"];
     const HANDLERS: &'static [HandlerDef] = &[
         HandlerDef {
-            name: "notify",
+            name: "beta.notify",
             description: "send alert",
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
@@ -1429,7 +1448,7 @@ impl PackRuntime for CollidingPack {
 struct ReservedEnvelopeParamPack;
 
 impl Pack for ReservedEnvelopeParamPack {
-    const NAME: &'static str = "reserved-envelope-param";
+    const NAME: &'static str = "broken";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -1507,7 +1526,7 @@ async fn dispatch_routes_to_correct_pack() {
     let res = reg.dispatch("list", Value::Null).await.unwrap();
     assert_eq!(res["pack"], "alpha");
 
-    let res = reg.dispatch("notify", Value::Null).await.unwrap();
+    let res = reg.dispatch("beta.notify", Value::Null).await.unwrap();
     assert_eq!(res["pack"], "beta");
 }
 
@@ -1533,7 +1552,7 @@ fn verb_collision_is_boot_time_error() {
         "error must name the colliding verb: {msg}"
     );
     assert!(
-        msg.contains("alpha") || msg.contains("colliding"),
+        msg.contains("kg") || msg.contains("colliding"),
         "error must name one of the conflicting packs: {msg}"
     );
 }
@@ -1553,7 +1572,7 @@ fn reserved_request_envelope_param_is_boot_time_error() {
                 ref pack,
                 ref verb,
                 ref param,
-            } if pack == "reserved-envelope-param"
+            } if pack == "broken"
                 && verb == "broken.serve"
                 && param == "presentation"
         ),
@@ -1791,7 +1810,7 @@ fn note_kind_duplicate_rejected_at_build_time() {
         "error must name the duplicate kind: {msg}"
     );
     assert!(
-        msg.contains("alpha") && msg.contains("dup"),
+        msg.contains("kg") && msg.contains("dup"),
         "error must name both conflicting packs: {msg}"
     );
 }
@@ -2604,7 +2623,7 @@ struct TokenCapturingPack {
 }
 
 impl Pack for TokenCapturingPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
@@ -2682,7 +2701,7 @@ struct VisibilityCapturingPack {
 }
 
 impl Pack for VisibilityCapturingPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
@@ -3384,7 +3403,7 @@ impl PackRuntime for GitDigestResultPack {
 struct MalformedGitDigestResultPack;
 
 impl Pack for MalformedGitDigestResultPack {
-    const NAME: &'static str = "malformed-git";
+    const NAME: &'static str = "git";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -4962,7 +4981,7 @@ async fn deny_gate_returns_permission_denied_pack_never_invoked() {
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-            name: "guarded",
+            name: "tracked.guarded",
             description: "a guarded verb",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
@@ -5004,10 +5023,13 @@ async fn deny_gate_returns_permission_denied_pack_never_invoked() {
     builder.with_gate(Arc::new(AlwaysDenyGate));
     let reg = builder.build().expect("registry builds");
 
-    let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
+    let err = reg
+        .dispatch("tracked.guarded", Value::Null)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "guarded" && reason.contains("always deny")),
-        "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
+        matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "tracked.guarded" && reason.contains("always deny")),
+        "expected PermissionDenied with verb=tracked.guarded and reason, got: {err:?}"
     );
     assert_eq!(
         invoked.load(Ordering::SeqCst),
@@ -5036,7 +5058,7 @@ async fn update_denial_precedes_id_existence_resolution() {
     }
 
     impl khive_types::Pack for ExistenceOracleUpdatePack {
-        const NAME: &'static str = "existence_oracle";
+        const NAME: &'static str = "kg";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -5484,7 +5506,7 @@ async fn obligation_failure_reports_a_write_that_already_committed() {
     }
 
     impl Pack for RecordingWritePack {
-        const NAME: &'static str = "recording_write";
+        const NAME: &'static str = "knowledge";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         // `knowledge.index` rather than `create`, and the choice is
@@ -5904,7 +5926,7 @@ async fn audit_event_duration_us_reflects_measured_dispatch_time() {
     builder.with_event_store(store.clone());
     let reg = builder.build().expect("registry builds");
 
-    reg.dispatch("slow_op", serde_json::json!({}))
+    reg.dispatch("sleeping.slow_op", serde_json::json!({}))
         .await
         .unwrap();
 
@@ -6014,7 +6036,7 @@ struct MailboxTrackingPack {
 }
 
 impl Pack for MailboxTrackingPack {
-    const NAME: &'static str = "mailbox_tracking";
+    const NAME: &'static str = "comm";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -6038,7 +6060,7 @@ impl Pack for MailboxTrackingPack {
 #[async_trait]
 impl PackRuntime for MailboxTrackingPack {
     fn name(&self) -> &str {
-        "mailbox_tracking"
+        "comm"
     }
     fn note_kinds(&self) -> &'static [&'static str] {
         &[]
@@ -6281,13 +6303,13 @@ async fn gate_error_returns_typed_refusal_without_invoking_pack() {
     let reg = builder.build().expect("registry builds");
 
     let err = reg
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse normal dispatch");
     assert!(matches!(
         err,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate backend unavailable"
                 && !reason.contains("gate broken")
     ));
@@ -6310,7 +6332,7 @@ async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         .await
         .unwrap();
     let event = &page.items[0];
-    assert_eq!(event.verb, "guarded");
+    assert_eq!(event.verb, "gate_error_tracking.guarded");
     assert_eq!(event.outcome, EventOutcome::Error);
     assert_eq!(event.payload["decision"], "gate_unavailable");
     assert!(event.payload.get("deny_reason").is_none());
@@ -6345,14 +6367,14 @@ async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error(
     let registry = builder.build().expect("registry builds");
 
     let error = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("audit persistence failure must not reopen dispatch");
 
     assert!(matches!(
         error,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate backend unavailable"
                 && !reason.contains("gate still broken")
     ));
@@ -6391,7 +6413,7 @@ async fn gate_unavailable_reason_never_carries_backend_error_text() {
     let registry = builder.build().expect("registry builds");
 
     let err = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse dispatch");
 
@@ -6441,14 +6463,14 @@ async fn gate_policy_error_classifies_distinctly_from_backend_unavailable() {
     let registry = builder.build().expect("registry builds");
 
     let err = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse dispatch");
 
     assert!(matches!(
         err,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate policy evaluation failed"
                 && !reason.contains("rule set has no allow clause")
     ));
@@ -7088,7 +7110,7 @@ struct EmbeddingAwarePack {
 }
 
 impl khive_types::Pack for EmbeddingAwarePack {
-    const NAME: &'static str = "embedding_aware";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &["widget"];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -7137,7 +7159,7 @@ impl khive_types::Pack for FailingProbePack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "probe",
+        name: "failing_probe.probe",
         description: "always fails",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -7270,7 +7292,7 @@ async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_erro
     let reg = builder.build().expect("registry builds");
 
     let err = reg
-        .dispatch("probe", serde_json::json!({}))
+        .dispatch("failing_probe.probe", serde_json::json!({}))
         .await
         .unwrap_err();
     assert!(matches!(err, RuntimeError::InvalidInput(_)));
@@ -7916,7 +7938,7 @@ async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
 
     let err = reg
         .dispatch_with_identity(
-            "probe",
+            "failing_probe.probe",
             serde_json::json!({"namespace": "test-ns"}),
             Some(RequestIdentity {
                 request_id: Some(102),
