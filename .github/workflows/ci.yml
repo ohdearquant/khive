@@ -611,6 +611,14 @@ jobs:
         if: steps.model-cache.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # The lint phase on shard 1 runs the ADR anchor lint under deno and the contract harness self-test
+      # under uv.
+      - uses: denoland/setup-deno@v2
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        with:
+          deno-version: v2.x
+      - uses: astral-sh/setup-uv@v5
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
       # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
       # phase so no PR-controlled build script or proc-macro executes before the
       # guard; it reads the pristine checkout. Keep this step ahead of every cargo
