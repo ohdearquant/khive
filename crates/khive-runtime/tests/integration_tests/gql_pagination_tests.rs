@@ -780,3 +780,155 @@ async fn gql_recursive_metadata_order_pages_preserve_distinct_rows() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn gql_comma_order_and_paging_preserve_every_tuple() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let before = gql_metadata_snapshot(&runtime).await;
+    for (direction, left_order, right_order) in
+        [("ASC", [1, 0], [1, 2, 0]), ("DESC", [0, 1], [0, 1, 2])]
+    {
+        let expected = left_order
+            .into_iter()
+            .flat_map(|left| right_order.into_iter().map(move |right| (left, right)))
+            .map(|(left, right)| {
+                (
+                    fixture.left[left].id.to_string(),
+                    fixture.right[right].id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if direction == "ASC" {
+            assert_ne!(
+                expected,
+                fixture.pairs(),
+                "fixture must distinguish requested order from identity order"
+            );
+        }
+        let base = format!("{} RETURN e.id, f.id ORDER BY e.metadata.order {direction}, f.metadata.order {direction}", fixture.pattern());
+        let whole = gql_page(&runtime, &token, &base, 20).await;
+        assert_eq!(gql_comma_pairs(&whole.rows), expected, "{direction}");
+        assert!(!whole.has_more && !whole.truncated);
+        assert_eq!(whole.next_offset, None);
+        let repeat = gql_page(&runtime, &token, &base, 2).await;
+        assert_eq!(gql_comma_pairs(&repeat.rows), expected[..2]);
+        let mut collected = Vec::new();
+        for offset in [0, 2, 4] {
+            let page = gql_page(&runtime, &token, &format!("{base} SKIP {offset}"), 2).await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(page.rows.len(), 2, "sentinel removed");
+            assert_eq!(page.has_more, offset < 4);
+            assert_eq!(page.truncated, page.has_more);
+            assert_eq!(page.next_offset, (offset < 4).then_some(offset + 2));
+            collected.extend(gql_comma_pairs(&page.rows));
+        }
+        assert_eq!(collected, expected);
+        assert_eq!(collected.iter().collect::<BTreeSet<_>>().len(), 6);
+        let mut limited = Vec::new();
+        for (offset, count, next) in [(0, 2, Some(2)), (2, 2, Some(4)), (4, 1, None)] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT 5"),
+                2,
+            )
+            .await;
+            assert_eq!(page.rows.len(), count);
+            assert_eq!(page.next_offset, next);
+            assert_eq!(page.has_more, next.is_some());
+            assert_eq!(page.truncated, next.is_some());
+            limited.extend(gql_comma_pairs(&page.rows));
+        }
+        assert_eq!(limited, expected[..5], "query LIMIT is total across pages");
+        for tail in ["LIMIT 0", "SKIP 5 LIMIT 5", "SKIP 99"] {
+            let page = gql_page(&runtime, &token, &format!("{base} {tail}"), 2).await;
+            assert!(page.rows.is_empty(), "{tail}");
+            assert!(!page.has_more && !page.truncated);
+            assert_eq!(page.next_offset, None);
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_multiplicity_preserves_equal_pairs_and_projection_duplicates() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let a = gql_metadata_entity(&runtime, &token, "bag source").await;
+    let b = gql_metadata_entity(&runtime, &token, "bag target").await;
+    let mut edges = Vec::new();
+    for relation in [EdgeRelation::Extends, EdgeRelation::VariantOf] {
+        edges.push(
+            runtime
+                .link(
+                    &token,
+                    a,
+                    b,
+                    relation,
+                    1.0,
+                    Some(serde_json::json!({"order": 1})),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    assert_ne!(
+        edges[0].relation, edges[1].relation,
+        "two legal natural keys"
+    );
+    edges.sort_by_key(|edge| edge.id.to_string());
+    let lo = edges[0].id.to_string();
+    let hi = edges[1].id.to_string();
+    let expected = vec![
+        (lo.clone(), lo.clone()),
+        (lo.clone(), hi.clone()),
+        (hi.clone(), lo.clone()),
+        (hi.clone(), hi.clone()),
+    ];
+    let pattern = format!("MATCH (a)-[e:extends|variant_of]->(b), (a)-[f:extends|variant_of]->(b) WHERE a.id = '{a}' AND b.id = '{b}'");
+    let before = gql_metadata_snapshot(&runtime).await;
+    for suffix in ["", " ORDER BY e.metadata.order ASC, f.metadata.order DESC"] {
+        let rows = runtime
+            .query(&token, &format!("{pattern} RETURN e.id, f.id{suffix}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            gql_comma_pairs(&rows),
+            expected,
+            "all requested values and earlier node identities tie before edge IDs"
+        );
+    }
+    let projection = runtime
+        .query(&token, &format!("{pattern} RETURN a.id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        projection.len(),
+        4,
+        "bag projection retains four equal rows"
+    );
+    assert!(projection
+        .iter()
+        .all(|row| row.text("a_id").unwrap() == a.to_string()));
+    let first = gql_page(&runtime, &token, &format!("{pattern} RETURN a.id"), 2).await;
+    let second = gql_page(
+        &runtime,
+        &token,
+        &format!("{pattern} RETURN a.id SKIP 2"),
+        2,
+    )
+    .await;
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.next_offset, Some(2));
+    assert_eq!(second.rows.len(), 2);
+    assert!(!second.has_more);
+    assert_eq!(second.next_offset, None);
+    let error = runtime.query(&token, &format!("MATCH (a)-[e:extends|variant_of]->(b), (a)-[e:extends|variant_of]->(b) WHERE a.id = '{a}' RETURN a.id")).await.unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Unsupported(message)) if message == "repeated edge variable 'e' not supported")
+    );
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}

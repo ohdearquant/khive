@@ -491,14 +491,12 @@ impl Parser {
     fn parse_query(&mut self) -> Result<GqlQuery, QueryError> {
         self.expect_keyword("MATCH")?;
         let pattern = self.parse_pattern()?;
+        let mut additional_patterns = Vec::new();
         self.skip_whitespace();
-        if self.peek() == Some(',') {
-            return Err(QueryError::Unsupported(
-                "comma-separated MATCH patterns are not supported; use one alternating path per \
-                 query; for parallel-edge audits, return a.id, e.id, e.relation, b.id and group \
-                 by endpoint IDs client-side"
-                    .into(),
-            ));
+        while self.peek() == Some(',') {
+            self.advance();
+            additional_patterns.push(self.parse_pattern()?);
+            self.skip_whitespace();
         }
 
         let where_clause = if self.try_keyword("WHERE") {
@@ -529,6 +527,7 @@ impl Parser {
 
         Ok(GqlQuery {
             pattern,
+            additional_patterns,
             where_clause,
             return_items,
             order_by,

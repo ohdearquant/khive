@@ -69,46 +69,13 @@ pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryEr
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
 
-    validate_pattern_shape(&query.pattern.elements)?;
+    validate_bindings_and_connectivity(query)?;
+    let multiple_patterns = !query.additional_patterns.is_empty();
 
-    // Repeated bindings require alias-equality SQL that is not yet representable.
-    let mut seen_node_vars: HashSet<&str> = HashSet::new();
-    let mut seen_edge_vars: HashSet<&str> = HashSet::new();
-    for element in &query.pattern.elements {
-        match element {
-            PatternElement::Node(node) => {
-                if let Some(var) = node.variable.as_deref() {
-                    if seen_edge_vars.contains(var) {
-                        return Err(QueryError::Validation(format!(
-                            "variable '{var}' cannot bind both a node and an edge"
-                        )));
-                    }
-                    if !seen_node_vars.insert(var) {
-                        return Err(QueryError::Unsupported(format!(
-                            "repeated node variable '{var}' (cycle / self-reachability \
-                             requires alias-equality predicates not yet implemented)"
-                        )));
-                    }
-                }
-            }
-            PatternElement::Edge(edge) => {
-                if let Some(var) = edge.variable.as_deref() {
-                    if seen_node_vars.contains(var) {
-                        return Err(QueryError::Validation(format!(
-                            "variable '{var}' cannot bind both a node and an edge"
-                        )));
-                    }
-                    if !seen_edge_vars.insert(var) {
-                        return Err(QueryError::Unsupported(format!(
-                            "repeated edge variable '{var}' not supported"
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    for element in &mut query.pattern.elements {
+    for element in query
+        .patterns_mut()
+        .flat_map(|pattern| &mut pattern.elements)
+    {
         match element {
             PatternElement::Node(node) => {
                 if node.properties.contains_key("namespace") {
@@ -159,17 +126,30 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                         edge.max_hops, MAX_DEPTH
                     )));
                 }
+                if multiple_patterns
+                    && (edge.min_hops != 1
+                        || edge.max_hops != 1
+                        || edge
+                            .relations
+                            .iter()
+                            .any(|r| SYNTHETIC_RELATIONS.contains(&r.as_str())))
+                {
+                    return Err(QueryError::Unsupported(
+                        "comma-separated MATCH requires canonical fixed one-hop edges".into(),
+                    ));
+                }
             }
         }
     }
 
     // Taxonomy-sensitive property names apply only to their matching binding kind.
-    let mut var_kinds: std::collections::HashMap<&str, VarKind> = std::collections::HashMap::new();
-    for element in &query.pattern.elements {
+    let mut var_kinds: std::collections::HashMap<String, VarKind> =
+        std::collections::HashMap::new();
+    for element in query.patterns().flat_map(|pattern| &pattern.elements) {
         match element {
             PatternElement::Node(n) => {
                 if let Some(v) = n.variable.as_deref() {
-                    var_kinds.insert(v, VarKind::Node);
+                    var_kinds.insert(v.to_owned(), VarKind::Node);
                 }
             }
             PatternElement::Edge(e) => {
@@ -183,7 +163,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                     } else {
                         VarKind::Edge
                     };
-                    var_kinds.insert(v, kind);
+                    var_kinds.insert(v.to_owned(), kind);
                 }
             }
         }
@@ -240,6 +220,84 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
     }
 
     Ok(warnings)
+}
+
+/// Preserve within-path binding rules and connect all comma components by named nodes.
+fn validate_bindings_and_connectivity(query: &GqlQuery) -> Result<(), QueryError> {
+    let mut seen_node_vars: HashSet<&str> = HashSet::new();
+    let mut seen_edge_vars: HashSet<&str> = HashSet::new();
+    let mut path_vars = Vec::new();
+    for (path_index, pattern) in query.patterns().enumerate() {
+        if path_index > 0 && pattern.elements.is_empty() {
+            return Err(QueryError::Validation(
+                "empty additional MATCH pattern".into(),
+            ));
+        }
+        validate_pattern_shape(&pattern.elements)?;
+        let mut local_node_vars = HashSet::new();
+        for element in &pattern.elements {
+            match element {
+                PatternElement::Node(node) => {
+                    if let Some(var) = node.variable.as_deref() {
+                        if seen_edge_vars.contains(var) {
+                            return Err(QueryError::Validation(format!(
+                                "variable '{var}' cannot bind both a node and an edge"
+                            )));
+                        }
+                        if !local_node_vars.insert(var) {
+                            return Err(QueryError::Unsupported(format!(
+                                "repeated node variable '{var}' (cycle / self-reachability \
+                                 requires alias-equality predicates not yet implemented)"
+                            )));
+                        }
+                        seen_node_vars.insert(var);
+                    }
+                }
+                PatternElement::Edge(edge) => {
+                    if let Some(var) = edge.variable.as_deref() {
+                        if seen_node_vars.contains(var) {
+                            return Err(QueryError::Validation(format!(
+                                "variable '{var}' cannot bind both a node and an edge"
+                            )));
+                        }
+                        if !seen_edge_vars.insert(var) {
+                            return Err(QueryError::Unsupported(format!(
+                                "repeated edge variable '{var}' not supported"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        path_vars.push(local_node_vars);
+    }
+
+    if path_vars.len() > 1 {
+        // A later path can bridge earlier components; textual adjacency is not required.
+        let mut reached = vec![false; path_vars.len()];
+        reached[0] = true;
+        let mut names = path_vars[0].clone();
+        loop {
+            let mut changed = false;
+            for (index, vars) in path_vars.iter().enumerate() {
+                if !reached[index] && !names.is_disjoint(vars) {
+                    reached[index] = true;
+                    names.extend(vars.iter().copied());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if reached.iter().any(|connected| !connected) {
+            return Err(QueryError::Unsupported(
+                "comma-separated MATCH patterns must be connected through shared named nodes"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -10,10 +10,10 @@ The unified guard recognizes GQL/Cypher mutations and SPARQL Update forms, inclu
 
 ## GQL parser
 
-`parsers::gql::parse` implements the following read-only dialect. Keywords are case-insensitive; the grammar accepts exactly one connected, alternating path after `MATCH`.
+`parsers::gql::parse` implements the following read-only dialect. Keywords are case-insensitive; comma-separated alternating paths share one global tail. Validation requires multiple paths to be connected and each edge to be canonical and fixed at one hop.
 
 ```text
-query       = "MATCH" path ["WHERE" where_expr]
+query       = "MATCH" path ("," path)* ["WHERE" where_expr]
               "RETURN" return_item ("," return_item)*
               ["ORDER BY" order_item ("," order_item)*]
               ["SKIP" integer] ["LIMIT" integer]
@@ -38,21 +38,25 @@ Only unaliased variables and `variable.property` projections are supported. `AS`
 
 `RETURN e.metadata` on a canonical edge projects its stored JSON text or SQL null as `e_metadata`. Returning the whole edge variable still expands to its existing fields without metadata: five for fixed-length matches and three for recursive matches. Dotted metadata leaves are predicate/order references, not new RETURN expressions. Synthetic observation edges have no canonical metadata and reject all three metadata operations.
 
-### One-path boundary and parallel-edge alternative
+### Connected paths and edge identity
 
-Comma-separated `MATCH` patterns are not supported. This form returns an unsupported-feature error that names the construct:
+Comma-separated paths share named node identities. This form matches two independently bound edges around the same typed endpoints:
 
 ```text
 MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b
 ```
 
-To audit parallel edges, list edge records with one unlabeled-edge path instead:
+The shared nodes must agree on substrate and UUID. Every occurrence's kind, subtype and inline-property constraints applies; references use the first occurrence. Edge binding names must be distinct, but their selected records need not be: two matching edges produce four edge pairs, including the two same-edge pairs. Equal projected rows retain their multiplicity. Repeated node names within one path and node/edge name collisions remain refused.
+
+All components must connect through shared named nodes. A later component may bridge earlier components; anonymous occurrences cannot connect them. Multiple fixed one-hop edges within a component are supported. Disconnected components, recursive or synthetic multi-pattern matches return `QueryError::Unsupported` during validation/compilation. Empty or trailing comma components are parse errors.
+
+To enumerate edge records rather than combinations of edges, use one unlabeled-edge path:
 
 ```text
 MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id
 ```
 
-Group rows by `a_id` and `b_id` client-side, while retaining `e_id` and `e_relation` so endpoint grouping does not erase edge identity. This enumerates edge records; it does not add a self-join or grouping operation to the query language.
+Group rows by `a_id` and `b_id` client-side, while retaining `e_id` and `e_relation` so endpoint grouping does not erase edge identity. This enumerates edge records without multiplying matches across paths; grouping remains a caller operation.
 
 Return aliases are likewise recognized and rejected with an unsupported-feature error that names `AS`:
 
@@ -92,7 +96,7 @@ Digits are required on both sides of a float's decimal point, so `.5`, `1.`, and
 
 A numeric predicate condition targets a JSON property explicitly, even when its predicate name matches a dedicated field. This matches string-valued predicate properties and removes the prior value-type-dependent field ambiguity.
 
-The AST currently represents one connected, non-branching path. Disconnected or branched edge triples, and kind/property constraints on variables outside that path, are rejected so no conjunct is silently discarded. Triple conditions are folded into a left-associative `AND` tree.
+The SPARQL parser still produces one connected, non-branching path with an empty additional-pattern vector. Disconnected or branched edge triples, and kind/property constraints on variables outside that path, are rejected so no conjunct is silently discarded. Triple conditions are folded into a left-associative `AND` tree.
 Repeated kind triples may pair one substrate label (`entity`, `note`, `event`, or `edge`) with
 one granular kind label; both constrain the same node regardless of triple order. Different
 labels within either class are parse errors. Repeated string-property triples are accepted as one
@@ -110,4 +114,4 @@ SPARQL `*` is rejected: it means zero-or-more, while the recursive SQL seed begi
 
 ## Parse errors and unsupported forms
 
-Malformed tokens, unterminated strings, trailing input, invalid numeric forms, and grammar mismatches return `QueryError::Parse`. Recognized unsupported semantics—including comma-separated GQL `MATCH` patterns, GQL `AS` aliases, writes, and SPARQL zero-hop paths—return `QueryError::Unsupported`. Neither parser executes SQL or mutates an input AST.
+Malformed tokens, unterminated strings, trailing input, invalid numeric forms, and grammar mismatches return `QueryError::Parse`. Recognized unsupported syntax—including GQL `AS` aliases, writes, and SPARQL zero-hop paths—returns `QueryError::Unsupported`. GQL comma paths are parsed before their connectedness and fixed canonical shape are checked by validation/compilation. Neither parser executes SQL or mutates an input AST.
