@@ -2790,6 +2790,72 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
         self.assertIn("docs/adr/README.md is named by a symlink in docs/adr", reasons)
 
+    def test_the_classifier_naming_a_path_in_its_comments_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        comment = '# the parent directory and the name as one path ("adr/README.md")\n'
+        self.write("scripts/ci-docs-only.sh", comment)
+        with_classifier = self.commit("classifier")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-004\n")
+        verdict, reasons = self.classify(with_classifier, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same line in any other script still names the index.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/other.sh", comment)
+        with_other = self.commit("other script")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-005\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_a_fixture_pair_exempts_its_reader_for_that_one_path_only(self):
+        base = self.shared_readme_base()
+        self.write("scripts/tests/test_ci_workflows.py",
+                   'self.write("docs/adr/README.md", "# ADR index\\n")\nself.write("notes/guide.md", "# Guide\\n")\n')
+        with_tests = self.commit("fixture tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-006\n")
+        verdict, reasons = self.classify(with_tests, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same file naming a path outside its pair still runs the full suite.
+        self.git("checkout", "-q", "--detach", with_tests)
+        self.write("notes/guide.md", "# Guide\n\nChanged.\n")
+        verdict, reasons = self.classify(with_tests, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+        # CONTROL: the same fixture line in another test file is not exempt.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/tests/test_other.py", 'self.write("docs/adr/README.md", "# ADR index\\n")\n')
+        with_other = self.commit("other tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-007\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_named_paths_are_judged_alone(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.write("notes/wire.md", "# Wire\n\nChanged.\n")
+        head = self.commit("guide and wire")
+        def judge(*paths):
+            completed = subprocess.run(
+                ["bash", str(self.CLASSIFIER), self.base, head, *paths], cwd=self.repo, env=self.env,
+                text=True, capture_output=True, timeout=30, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip(), completed.stderr
+        verdict, reasons = judge("notes/guide.md")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertNotIn("notes/wire.md", reasons)
+        # CONTROL: the whole change, and the code-named file alone, still run the full suite.
+        self.assertEqual(judge()[0], "false")
+        verdict, reasons = judge("notes/wire.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/wire.md is named by a non-Markdown file", reasons)
+        # A path the change does not touch is refused rather than judged.
+        verdict, reasons = judge("docs/guide/counts.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/guide/counts.md is not a path changed between", reasons)
+
     def test_a_failing_count_scanner_runs_the_full_suite(self):
         # A copy of the classifier beside no scanner: the question cannot be answered, so the
         # change takes the full suite rather than the documentation lane.
@@ -3532,6 +3598,9 @@ class ScopeFixture(unittest.TestCase):
         for path, text in self.TREE.items():
             self.write(path, text)
         shutil.copy(REPO_ROOT / "scripts" / "ci-test-scope.py", self.repo / "scripts" / "ci-test-scope.py")
+        # The scope classifier admits Markdown by running the documentation-lane classifier on it.
+        for script in ("ci-docs-only.sh", "ci-inert-docs-data.txt"):
+            shutil.copy(REPO_ROOT / "scripts" / script, self.repo / "scripts" / script)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
         self.base = self.commit("base")
@@ -3642,6 +3711,35 @@ class TestScopeClassifierTests(ScopeFixture):
         verdict, reasons = self.scope(named, self.commit("notes and source"))
         self.assertEqual(verdict, "full")
         self.assertIn("notes/k-notes.md is named by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_follows_the_documentation_lane_rule(self):
+        # An ADR index shares its base name with a crate readme, and the copied documentation-lane classifier names
+        # "adr/README.md" in its comments. The scope step applies that classifier's own rule, so the index is admitted
+        # beside crate source, as it would be on its own.
+        self.write("docs/adr/README.md", "# ADR index\n")
+        with_index = self.commit("adr index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(with_index, self.commit("index and source"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: a script that names the index by path still puts the run on the full suite.
+        self.git("checkout", "-q", "--detach", with_index)
+        self.write("scripts/index.py", 'INDEX = "docs/adr/README.md"\n')
+        named = self.commit("name the index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("index and source"))
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_runs_full_when_the_documentation_rule_cannot_run(self):
+        (self.repo / "scripts" / "ci-docs-only.sh").unlink()
+        without_rule = self.commit("drop the documentation-lane classifier")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(without_rule, self.commit("notes and source"))
+        self.assertEqual(verdict, "full", reasons)
 
     def test_the_map_is_read_across_pages(self):
         self.set_graph({**self.GRAPH, "pages": [["k"], ["j", "ksub"], ["m"]]})
