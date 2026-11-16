@@ -15,6 +15,7 @@ use khive_mcp::coordinator::{
     CoordError, CoordLinkResult, CoordSearchResult, CoordinatorService,
 };
 use khive_pack_kg::handlers::ValidatedSearchRequest;
+use khive_runtime::error::SearchReadSubstrate;
 use khive_runtime::Namespace;
 use khive_runtime::{BackendId, NamespaceToken, NoteSearchHit, RuntimeError, SearchHit};
 use khive_storage::EdgeRelation;
@@ -140,16 +141,30 @@ impl SubstrateCoordinatorService {
         let mut entity_versions: HashMap<Uuid, i64> = HashMap::new();
         for hit in &entity_hits {
             ensure_search_active()?;
-            let backend_id = self.inner.locate(hit.entity_id, namespace).await;
+            let backend_id = self
+                .inner
+                .locate_for_search(hit.entity_id, namespace, SearchReadSubstrate::Entity)
+                .await;
             ensure_search_active()?;
-            if let Some(bid) = backend_id {
+            if let Some(bid) = backend_id? {
                 if let Some(entry) = self.inner.registry().get(&bid) {
                     let rt = &entry.runtime;
-                    if let Ok(authorized) = rt.authorize(namespace.clone()) {
-                        let token = caller.cloned().unwrap_or(authorized);
-                        let entity = rt.get_entity(&token, hit.entity_id).await;
-                        ensure_search_active()?;
-                        if let Ok(entity) = entity {
+                    let contextualize = |error: RuntimeError| {
+                        error.with_search_read_context(bid.clone(), SearchReadSubstrate::Entity)
+                    };
+                    let authorized = rt.authorize(namespace.clone()).map_err(contextualize)?;
+                    let token = caller.cloned().unwrap_or(authorized);
+                    #[cfg(test)]
+                    super::before_search_metadata_read(
+                        super::SearchMetadataPhase::Hydrate,
+                        khive_pack_kg::handlers::SearchSubstrate::Entity,
+                        hit.entity_id,
+                    )
+                    .await;
+                    let entity = rt.get_entity(&token, hit.entity_id).await;
+                    ensure_search_active()?;
+                    match entity {
+                        Ok(entity) => {
                             entity_created_at.insert(hit.entity_id, entity.created_at);
                             entity_updated_at.insert(hit.entity_id, entity.updated_at);
                             entity_versions.insert(hit.entity_id, entity.version);
@@ -162,6 +177,8 @@ impl SubstrateCoordinatorService {
                             );
                             ensure_search_active()?;
                         }
+                        Err(RuntimeError::NotFound(_)) => {}
+                        Err(error) => return Err(contextualize(error)),
                     }
                 }
             }
@@ -175,36 +192,47 @@ impl SubstrateCoordinatorService {
         let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
         for hit in &note_hits {
             ensure_search_active()?;
-            let backend_id = self.inner.locate(hit.note_id, namespace).await;
+            let backend_id = self
+                .inner
+                .locate_for_search(hit.note_id, namespace, SearchReadSubstrate::Note)
+                .await;
             ensure_search_active()?;
-            if let Some(bid) = backend_id {
+            if let Some(bid) = backend_id? {
                 if let Some(entry) = self.inner.registry().get(&bid) {
                     let rt = &entry.runtime;
-                    if let Ok(authorized) = rt.authorize(namespace.clone()) {
-                        let token = caller.cloned().unwrap_or(authorized);
-                        if let Ok(store) = rt.notes(&token) {
-                            let note = store.get_note(hit.note_id).await;
-                            ensure_search_active()?;
-                            if let Ok(Some(note)) = note {
-                                if let Some(view) = mailbox.as_ref() {
-                                    if !view.permits_message_note(&token, &note) {
-                                        continue;
-                                    }
-                                }
-                                note_versions.insert(hit.note_id, note.version);
-                                note_created_at.insert(hit.note_id, note.created_at);
-                                note_updated_at.insert(hit.note_id, note.updated_at);
-                                note_names.insert(hit.note_id, note.name.clone());
-                                note_kinds.insert(hit.note_id, note.kind);
-                                #[cfg(test)]
-                                super::notify_search_metadata_read(
-                                    super::SearchMetadataPhase::Hydrate,
-                                    khive_pack_kg::handlers::SearchSubstrate::Note,
-                                    hit.note_id,
-                                );
-                                ensure_search_active()?;
+                    let contextualize = |error: RuntimeError| {
+                        error.with_search_read_context(bid.clone(), SearchReadSubstrate::Note)
+                    };
+                    let authorized = rt.authorize(namespace.clone()).map_err(contextualize)?;
+                    let token = caller.cloned().unwrap_or(authorized);
+                    let store = rt.notes(&token).map_err(contextualize)?;
+                    #[cfg(test)]
+                    super::before_search_metadata_read(
+                        super::SearchMetadataPhase::Hydrate,
+                        khive_pack_kg::handlers::SearchSubstrate::Note,
+                        hit.note_id,
+                    )
+                    .await;
+                    let note = store.get_note(hit.note_id).await;
+                    ensure_search_active()?;
+                    if let Some(note) = note.map_err(|error| contextualize(error.into()))? {
+                        if let Some(view) = mailbox.as_ref() {
+                            if !view.permits_message_note(&token, &note) {
+                                continue;
                             }
                         }
+                        note_versions.insert(hit.note_id, note.version);
+                        note_created_at.insert(hit.note_id, note.created_at);
+                        note_updated_at.insert(hit.note_id, note.updated_at);
+                        note_names.insert(hit.note_id, note.name.clone());
+                        note_kinds.insert(hit.note_id, note.kind);
+                        #[cfg(test)]
+                        super::notify_search_metadata_read(
+                            super::SearchMetadataPhase::Hydrate,
+                            khive_pack_kg::handlers::SearchSubstrate::Note,
+                            hit.note_id,
+                        );
+                        ensure_search_active()?;
                     }
                 }
             }

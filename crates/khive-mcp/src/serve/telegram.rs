@@ -7,8 +7,49 @@ use super::{
     cleanup_expired_channel_quarantine, default_inbound_actor_from_env,
     ensure_channel_quarantine_storage, handle_channel_ingest_failure,
     log_inbound_refused_for_read_only_blob, nonblank_env_or, outbox, run_if_authorized, Arc, Args,
-    KhiveMcpServer, OUTBOUND_RETRY_BASE,
+    ChannelIngestFailureOutcome, KhiveMcpServer, OUTBOUND_RETRY_BASE,
 };
+
+#[cfg(all(test, feature = "test-channel-timing"))]
+pub(super) mod heartbeat_test_seam {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    tokio::task_local! {
+        pub static COMPLETED: Arc<AtomicUsize>;
+    }
+
+    pub fn completed() {
+        let _ = COMPLETED.try_with(|count| count.fetch_add(1, Ordering::SeqCst));
+    }
+
+    thread_local! {
+        static CONSTRUCTIONS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+    }
+
+    pub fn observe_construction() -> bool {
+        CONSTRUCTIONS.with(|slot| {
+            if let Some(count) = slot.borrow().as_ref() {
+                count.fetch_add(1, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn with_constructor_probe<T>(count: Arc<AtomicUsize>, action: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<AtomicUsize>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CONSTRUCTIONS.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(CONSTRUCTIONS.with(|slot| slot.replace(Some(count))));
+        action()
+    }
+}
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
 /// both Telegram polling and outbound delivery follow the comm runtime, which
@@ -56,6 +97,10 @@ fn spawn_telegram_channel_loops(
     use khive_channel_telegram::TelegramChannel;
     use std::sync::Arc;
 
+    #[cfg(all(test, feature = "test-channel-timing"))]
+    if heartbeat_test_seam::observe_construction() {
+        return;
+    }
     match TelegramChannel::from_env() {
         Ok(tg_ch) => {
             let tg_ch = Arc::new(tg_ch);
@@ -151,8 +196,90 @@ fn telegram_ingest_namespace_from_env() -> String {
     nonblank_env_or("KHIVE_TELEGRAM_INGEST_NAMESPACE", "local")
 }
 
-// Keep the offset acknowledgement coupled to the polled channel. This
-// private seam lets the daemon loop be tested with a parked transport.
+// Keep the ordinary configured and slugless passes, then age out the named
+// kind-only partition written by older Telegram adapters. The exact extra
+// selector retains the handler's existing live/expiry/128-row bound.
+async fn cleanup_telegram_quarantine(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    kind: &str,
+    slug: &str,
+) -> Result<(), khive_runtime::RuntimeError> {
+    cleanup_expired_channel_quarantine(registry, ingest_namespace, kind, slug).await?;
+    if slug != kind {
+        registry
+            .dispatch(
+                "comm.cleanup_expired_quarantine",
+                serde_json::json!({
+                    "namespace": ingest_namespace,
+                    "channel_kind": kind,
+                    "channel_slug": kind,
+                }),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+enum TelegramHeartbeatOutcome<'a> {
+    Success {
+        held_messages: u64,
+        quarantined_after_hold: u64,
+    },
+    Failure(&'a khive_channel::ChannelError),
+}
+
+/// Persist only the completed poll observation. This does not govern delivery,
+/// offset acknowledgement, retry timing or channel lifecycle events.
+async fn record_telegram_heartbeat(
+    registry: &khive_runtime::VerbRegistry,
+    kind: &str,
+    slug: &str,
+    observed_at: &chrono::DateTime<chrono::Utc>,
+    outcome: TelegramHeartbeatOutcome<'_>,
+) {
+    use khive_channel::ChannelError;
+    use serde_json::json;
+
+    let mut params = json!({
+        "namespace": khive_pack_comm::CHANNEL_HEALTH_NAMESPACE,
+        "channel_kind": kind,
+        "channel_slug": slug,
+        "at": observed_at.to_rfc3339(),
+    });
+    match outcome {
+        TelegramHeartbeatOutcome::Success {
+            held_messages,
+            quarantined_after_hold,
+        } => {
+            params["outcome"] = json!("success");
+            params["held_messages"] = json!(held_messages);
+            params["quarantined_after_hold"] = json!(quarantined_after_hold);
+        }
+        TelegramHeartbeatOutcome::Failure(error) => {
+            let class = match error {
+                ChannelError::Auth(_) | ChannelError::RetryableAuth(_) => "auth",
+                ChannelError::Transport(_)
+                | ChannelError::RateLimited { .. }
+                | ChannelError::PermanentTransport(_) => "transport",
+                ChannelError::Config(_)
+                | ChannelError::UnauthorizedSender(_)
+                | ChannelError::InvalidEnvelope(_) => "config",
+            };
+            params["outcome"] = json!("failure");
+            params["error_class"] = json!(class);
+            params["error_message"] = json!("Telegram poll failed");
+        }
+    }
+    // A long poll has no nominal success cadence. In particular, the five-second
+    // error retry is not a poll_interval_secs observation.
+    if let Err(error) = registry.dispatch("comm.heartbeat", params).await {
+        tracing::warn!(target: "khive_mcp::serve", channel = kind, slug, error = %error,
+            "telegram heartbeat could not be persisted");
+    }
+}
+
+// Keep offset acknowledgement coupled to the polled channel.
 #[cfg(feature = "channel-telegram")]
 pub(super) trait TelegramPollChannel: khive_channel::Channel {
     fn commit_offset(&self);
@@ -166,8 +293,9 @@ impl TelegramPollChannel for khive_channel_telegram::TelegramChannel {
 }
 
 /// Background task that polls the Telegram channel via `getUpdates` long
-/// polling and ingests new inbound messages via `comm.ingest`. No
-/// backoff/heartbeat/lifecycle-event surface — see
+/// polling and ingests new inbound messages via `comm.ingest`. Completed
+/// outcomes report a best-effort heartbeat, without escalating retries or
+/// lifecycle events — see
 /// [`spawn_telegram_channel_loops`]'s doc comment for why this is a
 /// deliberately smaller loop than `channel_poll_loop`.
 ///
@@ -205,7 +333,7 @@ pub(super) async fn telegram_poll_loop(
         let kind = telegram_channel.kind();
         let slug = telegram_channel.slug();
         if let Err(error) =
-            cleanup_expired_channel_quarantine(&registry, &ingest_namespace, kind, &slug).await
+            cleanup_telegram_quarantine(&registry, &ingest_namespace, kind, &slug).await
         {
             tracing::warn!(target: "khive_mcp::serve",channel = kind, slug, error = %error,
                 "quarantine retention cleanup failed; holding telegram poll");
@@ -226,6 +354,7 @@ pub(super) async fn telegram_poll_loop(
             }
             result = telegram_channel.poll(Utc::now()) => result,
         };
+        let observed_at = Utc::now();
         match polled {
             Ok(envelopes) => {
                 let batch_attempt_keys: Vec<String> = envelopes
@@ -233,6 +362,8 @@ pub(super) async fn telegram_poll_loop(
                     .filter_map(|env| channel_ingest_attempt_key(kind, env.external_id.as_deref()))
                     .collect();
                 let mut all_ingested = true;
+                let mut held_messages = 0;
+                let mut quarantined_after_hold = 0;
                 for env in envelopes {
                     let params = json!({
                         "namespace": ingest_namespace,
@@ -260,9 +391,25 @@ pub(super) async fn telegram_poll_loop(
                         .await;
                         if !outcome.released() {
                             all_ingested = false;
+                            held_messages += 1;
+                        }
+                        if outcome == ChannelIngestFailureOutcome::QuarantinedAfterHold {
+                            quarantined_after_hold += 1;
                         }
                     }
                 }
+
+                record_telegram_heartbeat(
+                    &registry,
+                    kind,
+                    &slug,
+                    &observed_at,
+                    TelegramHeartbeatOutcome::Success {
+                        held_messages,
+                        quarantined_after_hold,
+                    },
+                )
+                .await;
 
                 if all_ingested {
                     #[cfg(all(test, feature = "test-channel-timing"))]
@@ -278,12 +425,24 @@ pub(super) async fn telegram_poll_loop(
                          failed comm.ingest; the whole batch will be retried next poll"
                     );
                 }
+                #[cfg(all(test, feature = "test-channel-timing"))]
+                heartbeat_test_seam::completed();
             }
             Err(e) => {
+                record_telegram_heartbeat(
+                    &registry,
+                    kind,
+                    &slug,
+                    &observed_at,
+                    TelegramHeartbeatOutcome::Failure(&e),
+                )
+                .await;
                 tracing::warn!(target: "khive_mcp::serve",
                     channel = telegram_channel.kind(),
                     "telegram channel poll failed: {e}"
                 );
+                #[cfg(all(test, feature = "test-channel-timing"))]
+                heartbeat_test_seam::completed();
                 if !channel_cycle_wait(ERROR_BACKOFF, &shutdown).await {
                     tracing::info!(target: "khive_mcp::serve",
                         "telegram channel polling loop: daemon shutdown observed, stopping"

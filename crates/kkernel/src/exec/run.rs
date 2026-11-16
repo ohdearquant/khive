@@ -544,43 +544,136 @@ mod read_only_policy_tests {
             "zero_declared_backends_reads_explicit_existing_file_without_changing_store_tree",
         ) {
             let cwd = &fixture.root;
+            let seed_stores = cwd.join("seed-stores");
+            std::fs::create_dir(&seed_stores).unwrap();
+            let name = "read-only-explicit-database-row";
+            let id = seed_file(&seed_stores.join("selected.db"), name, &["kg"]).await;
+            let seed_snapshot = store_snapshot(&seed_stores);
             let stores = cwd.join("stores");
             std::fs::create_dir(&stores).unwrap();
+            for (relative, bytes) in &seed_snapshot {
+                let target = stores.join(relative);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, bytes).unwrap();
+            }
             let db = stores.join("selected.db");
-            let name = "read-only-explicit-database-row";
-            let id = seed_file(&db, name, &["kg"]).await;
             let config = cwd.join("inspection.toml");
             std::fs::write(&config, "engines = []\n").unwrap();
-            let output = cwd.join("explicit-read.jsonl");
             let before = store_snapshot(&stores);
-            record_store_baseline(&fixture, before, &id);
+            assert!(
+                before == seed_snapshot,
+                "copied store differs from settled seed"
+            );
+            drop(seed_snapshot);
+            record_store_baseline(&fixture, before.clone(), &id);
             // The explicit database holds a distinct actual record; the HOME
             // default database does not exist and must remain absent.
-            let invocation = super::ExecArgs::try_parse_from([
-                "exec",
-                &format!("get(id={})", json!(id)),
-                "--read-only",
-                "--db",
-                db.to_str().unwrap(),
-                "--config",
-                config.to_str().unwrap(),
-                "--save-file",
-                output.to_str().unwrap(),
-                "--actor",
-                "actor:read-only-policy-test",
-            ])
-            .unwrap();
-            super::run_exec(invocation)
-                .await
-                .expect("readonly explicit-database get");
-            let rows = std::fs::read_to_string(output).expect("saved get result");
-            let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
-            assert_eq!(row["ok"], true, "{row}");
-            let record = row["result"].to_string();
-            assert!(
-                record.contains(&id) && record.contains(name),
-                "wrong store: {row}"
-            );
+            let mut read_results = serde_json::Map::new();
+            for (verb, ops) in [
+                ("whoami", "whoami()".to_string()),
+                ("get", format!("get(id={})", json!(id))),
+                ("list", "list(kind=\"concept\")".to_string()),
+            ] {
+                let output = cwd.join(format!("explicit-{verb}.jsonl"));
+                let invocation = super::ExecArgs::try_parse_from([
+                    "exec",
+                    &ops,
+                    "--read-only",
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--save-file",
+                    output.to_str().unwrap(),
+                    "--output-format",
+                    "json",
+                    "--actor",
+                    "actor:read-only-policy-test",
+                ])
+                .unwrap();
+                super::run_exec(invocation)
+                    .await
+                    .unwrap_or_else(|error| panic!("readonly copied-store {verb}: {error}"));
+                let rows = std::fs::read_to_string(output).expect("saved read result");
+                let mut lines = rows.lines();
+                let row: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+                assert!(lines.next().is_none(), "one result row per read invocation");
+                assert_eq!(row["ok"], true, "{verb}: {row}");
+                match verb {
+                    "whoami" => {
+                        assert_eq!(row["result"]["actor_id"], "actor:read-only-policy-test");
+                        assert_eq!(row["result"]["actor_kind"], "actor");
+                        assert_eq!(row["result"]["unattributed"], false);
+                    }
+                    "get" => {
+                        assert_eq!(row["result"]["id"].as_str(), Some(id.as_str()), "{row}");
+                        assert_eq!(row["result"]["name"], name, "{row}");
+                    }
+                    "list" => {
+                        let hits = row["result"]["items"].as_array().expect("listed items");
+                        assert!(
+                            hits.iter().any(|hit| {
+                                hit["id"].as_str() == Some(id.as_str()) && hit["name"] == name
+                            }),
+                            "list did not return the copied record: {row}"
+                        );
+                    }
+                    _ => unreachable!("closed read fixture cases"),
+                }
+                read_results.insert(
+                    verb.to_string(),
+                    json!({
+                        "result_verified": true,
+                        "store_tree_unchanged": before == store_snapshot(&stores),
+                    }),
+                );
+            }
+
+            // Search is an assertion with a telemetry write, so the current
+            // read-only contract refuses it as well as declared writes.
+            let mut refused_results = serde_json::Map::new();
+            for (verb, ops) in [
+                (
+                    "search",
+                    format!(
+                        "search(query={}, kind=\"concept\", source=\"text\")",
+                        json!(name)
+                    ),
+                ),
+                (
+                    "create",
+                    "create(kind=\"concept\", name=\"read-only-copied-store-write-probe\")"
+                        .to_string(),
+                ),
+            ] {
+                let invocation = super::ExecArgs::try_parse_from([
+                    "exec",
+                    &ops,
+                    "--read-only",
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--actor",
+                    "actor:read-only-policy-test",
+                ])
+                .unwrap();
+                let refusal = super::run_exec(invocation)
+                    .await
+                    .expect_err("readonly operation must refuse before dispatch")
+                    .to_string();
+                assert!(
+                    refusal.contains(&format!("--read-only refuses operation {verb:?}")),
+                    "wrong {verb} refusal: {refusal}"
+                );
+                refused_results.insert(
+                    verb.to_string(),
+                    json!({
+                        "declaration_refused": true,
+                        "store_tree_unchanged": before == store_snapshot(&stores),
+                    }),
+                );
+            }
             assert!(
                 !cwd.join(".khive/khive.db").exists(),
                 "created HOME default db"
@@ -592,6 +685,9 @@ mod read_only_policy_tests {
                 &fixture,
                 json!({
                     "explicit_database_actual_record": true,
+                    "copied_store_verified": true,
+                    "read_results": read_results,
+                    "refused_results": refused_results,
                     "home_default_absent": true,
                     "id": id,
                 }),
@@ -607,6 +703,29 @@ mod read_only_policy_tests {
             receipt["explicit_database_actual_record"], true,
             "{receipt}"
         );
+        assert_eq!(receipt["copied_store_verified"], true, "{receipt}");
+        assert_eq!(receipt["read_results"].as_object().unwrap().len(), 3);
+        for verb in ["whoami", "get", "list"] {
+            assert_eq!(
+                receipt["read_results"][verb]["result_verified"], true,
+                "{receipt}"
+            );
+            assert_eq!(
+                receipt["read_results"][verb]["store_tree_unchanged"], true,
+                "readonly {verb} changed store bytes: {receipt}"
+            );
+        }
+        assert_eq!(receipt["refused_results"].as_object().unwrap().len(), 2);
+        for verb in ["search", "create"] {
+            assert_eq!(
+                receipt["refused_results"][verb]["declaration_refused"], true,
+                "{receipt}"
+            );
+            assert_eq!(
+                receipt["refused_results"][verb]["store_tree_unchanged"], true,
+                "refused {verb} changed store bytes: {receipt}"
+            );
+        }
         assert_eq!(
             receipt["selected_store_tree_unchanged"], true,
             "readonly store bytes changed: {receipt}"

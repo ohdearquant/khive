@@ -50,7 +50,53 @@ identical string `"khive:channel_health:a:b:c:d"` under the old scheme.
 quoted and internal quotes/backslashes are escaped — so distinct triples
 always serialize to distinct byte sequences.
 
+### Telegram poll observations
+
+The Telegram daemon loop dispatches `comm.heartbeat` through the same registry
+and uses `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` explicitly. Its rows land on
+the backend assigned to comm, independently of `KHIVE_TELEGRAM_INGEST_NAMESPACE`.
+The kind and configured slug keep channel observations separate.
+
+A completed `Ok` poll reports success even when its page is empty, all updates
+are filtered, or ingestion holds an envelope. The writer supplies the captured
+poll-completion `at` plus actual `held_messages` and `quarantined_after_hold`
+counts after handling the batch. These observations do not change the rule for
+acknowledging the Telegram offset. A transport error reports a safe error class
+and fixed message, retains the last success and hold facts, and keeps the
+existing five-second retry. A canceled pending poll produces no observation.
+Heartbeat persistence is best effort and does not hold a released batch.
+
+Telegram omits `poll_interval_secs`; an error retry or long-poll timeout is not
+a nominal success cadence. Newly written Telegram rows have no cadence, so
+`stalled` stays null by design and `no_success_age_secs` is the elapsed-time
+signal. As for other writers, an omitted field preserves a previously explicit
+cadence on an existing row. Missing success remains null rather than being
+replaced with process start time. The reader stays read-only. This writer adds
+no notices or channel lifecycle events and leaves email behavior unchanged.
+
 <a id="handlersrshandle_heartbeat"></a>
+
+### Configured identity and historical quarantine rows
+
+The real Telegram adapter uses its configured `maintainer_slug` consistently for
+inbound deduplication, quarantine, heartbeat and registered outbox routing.
+`from_env` defaults a missing, empty, whitespace-only or non-Unicode slug to
+`maintainer`. A manually constructed empty or whitespace-only slug instead falls
+back to the channel kind, `telegram`; nonblank configured values are preserved.
+An existing outbound message without a `channel_slug` still routes through the
+sole configured Telegram adapter. Normal comm producers do not stamp the old
+kind-only `telegram` slug; manually written backend rows are outside that
+producer guarantee.
+
+Normal polling also ages out expired quarantine rows explicitly named
+`telegram` from before the configured-slug upgrade. In the original ingest
+namespace, each poll retains the configured-slug and historical slugless cleanup
+passes, then selects the exact old kind-only slug when it differs from the
+configured slug. Each selector keeps the existing maximum of 128 rows and its
+expiry rules; the additional named selector removes only expired live rows.
+Unexpired rows, named rows without an expiry, other namespaced rows and unrelated
+slugs are untouched. A cleanup error holds the poll with the existing retry and
+records no completed-poll heartbeat. No manual maintenance step is required.
 
 ## `handlers/quarantine_heartbeat.rs::handle_heartbeat`
 
@@ -73,7 +119,7 @@ Read-modify-write against the existing row (if any) so that:
   read from the prior row rather than any in-process counter, so it is
   correct even across a daemon restart.
 - `poll_interval_secs`, when supplied, records the writer's positive nominal
-  cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
+  cadence. The shipped email loop supplies `5` on every heartbeat. Omission
   remains accepted for a mixed-version internal writer and preserves any
   previously recorded cadence on that row.
 - `held_messages` and `quarantined_after_hold` are accepted only with a
