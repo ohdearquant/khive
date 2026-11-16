@@ -407,202 +407,220 @@ fn compile_fixed_length(
     let mut node_idx = 0usize;
     let mut edge_idx = 0usize;
 
-    for element in &query.pattern.elements {
-        match element {
-            PatternElement::Node(np) => {
-                let alias = format!("n{node_idx}");
-                node_aliases.push(alias.clone());
+    for pattern in query.patterns() {
+        let path_start_node_idx = node_idx;
+        for element in &pattern.elements {
+            match element {
+                PatternElement::Node(np) => {
+                    let alias = format!("n{node_idx}");
+                    node_aliases.push(alias.clone());
 
-                let is_event_source = event_source_indices.contains(&node_idx);
-                let is_observation_target = observation_target_indices.contains(&node_idx);
+                    let is_event_source = event_source_indices.contains(&node_idx);
+                    let is_observation_target = observation_target_indices.contains(&node_idx);
 
-                // Paging requires a total order over match identities, not caller
-                // projections. UUIDs can overlap across unioned substrates, so keep
-                // each union's discriminator ahead of its ID.
-                if is_event_source {
-                    order_parts.push(format!("{alias}.id"));
-                } else if is_observation_target {
-                    order_parts.push(format!("{alias}.referent_kind"));
-                    order_parts.push(format!("{alias}.id"));
-                } else {
-                    order_parts.push(format!("{alias}.substrate_kind"));
-                    order_parts.push(format!("{alias}.id"));
-                }
-
-                if node_idx == 0 {
+                    // Paging requires a total order over match identities, not caller
+                    // projections. UUIDs can overlap across unioned substrates, so keep
+                    // each union's discriminator ahead of its ID.
                     if is_event_source {
-                        from_parts.push(format!("events {alias}"));
-                    } else if !is_observation_target {
-                        from_parts.push(primary_node_source(&alias, mailbox));
+                        order_parts.push(format!("{alias}.id"));
+                    } else if is_observation_target {
+                        order_parts.push(format!("{alias}.referent_kind"));
+                        order_parts.push(format!("{alias}.id"));
+                    } else {
+                        order_parts.push(format!("{alias}.substrate_kind"));
+                        order_parts.push(format!("{alias}.id"));
                     }
-                }
 
-                if is_event_source {
-                    // Events have no `deleted_at`; namespace is filtered directly.
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    if node_idx == 0 {
+                        if is_event_source {
+                            from_parts.push(format!("events {alias}"));
+                        } else if !is_observation_target {
+                            from_parts.push(primary_node_source(&alias, mailbox));
+                        }
+                    } else if node_idx == path_start_node_idx {
+                        // Validation permits only canonical comma components. Keep the
+                        // same filtered source on each root before the global identity join.
+                        join_parts.push(format!(
+                            "CROSS JOIN {}",
+                            primary_node_source(&alias, mailbox)
+                        ));
                     }
-                    // Bare `event` needs no kind predicate on an event-only source.
-                    if let Some(ref kind) = np.kind {
-                        if kind != "event" {
-                            params.push(QueryValue::Text(kind.clone()));
-                            where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+
+                    if is_event_source {
+                        // Events have no `deleted_at`; namespace is filtered directly.
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+                        // Bare `event` needs no kind predicate on an event-only source.
+                        if let Some(ref kind) = np.kind {
+                            if kind != "event" {
+                                params.push(QueryValue::Text(kind.clone()));
+                                where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                            }
+                        }
+                        if np.entity_type.is_some() {
+                            return Err(QueryError::Compile(
+                                "event nodes do not have an entity_type column".into(),
+                            ));
+                        }
+                        if !np.properties.is_empty() {
+                            return Err(QueryError::Compile(
+                                "event nodes do not support inline property filters; \
+                             use a WHERE clause on verb, outcome, or payload fields"
+                                    .into(),
+                            ));
+                        }
+                    } else if is_observation_target {
+                        where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        if let Some(ref kind) = np.kind {
+                            where_parts.push(observation_kind_filter_predicate(
+                                &alias,
+                                kind,
+                                &mut params,
+                            ));
+                        }
+
+                        if let Some(ref et) = np.entity_type {
+                            params.push(QueryValue::Text(et.clone()));
+                            where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                        }
+
+                        let mut props: Vec<_> = np.properties.iter().collect();
+                        props.sort_by_key(|(k, _)| k.as_str());
+                        for (key, val) in props {
+                            let text_column = if key == "name" || key == "content" {
+                                Some(key.as_str())
+                            } else {
+                                None
+                            };
+                            where_parts.push(compile_property_equality(
+                                &alias,
+                                key,
+                                val,
+                                text_column,
+                                &mut params,
+                            )?);
+                        }
+                    } else {
+                        where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        if let Some(ref kind) = np.kind {
+                            where_parts.push(kind_filter_predicate(&alias, kind, &mut params));
+                        }
+
+                        if let Some(ref et) = np.entity_type {
+                            params.push(QueryValue::Text(et.clone()));
+                            where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                        }
+
+                        let mut props: Vec<_> = np.properties.iter().collect();
+                        props.sort_by_key(|(k, _)| k.as_str());
+                        for (key, val) in props {
+                            let text_column = if key == "name" { Some("name") } else { None };
+                            where_parts.push(compile_property_equality(
+                                &alias,
+                                key,
+                                val,
+                                text_column,
+                                &mut params,
+                            )?);
                         }
                     }
-                    if np.entity_type.is_some() {
-                        return Err(QueryError::Compile(
-                            "event nodes do not have an entity_type column".into(),
-                        ));
-                    }
-                    if !np.properties.is_empty() {
-                        return Err(QueryError::Compile(
-                            "event nodes do not support inline property filters; \
-                             use a WHERE clause on verb, outcome, or payload fields"
-                                .into(),
-                        ));
-                    }
-                } else if is_observation_target {
-                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
 
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
-                    }
-
-                    if let Some(ref kind) = np.kind {
-                        where_parts.push(observation_kind_filter_predicate(
-                            &alias,
-                            kind,
-                            &mut params,
-                        ));
-                    }
-
-                    if let Some(ref et) = np.entity_type {
-                        params.push(QueryValue::Text(et.clone()));
-                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                    }
-
-                    let mut props: Vec<_> = np.properties.iter().collect();
-                    props.sort_by_key(|(k, _)| k.as_str());
-                    for (key, val) in props {
-                        let text_column = if key == "name" || key == "content" {
-                            Some(key.as_str())
+                    if let Some(ref var) = np.variable {
+                        let kind = if is_event_source {
+                            VarKind::EventNode
+                        } else if is_observation_target {
+                            VarKind::ObservationTargetNode
                         } else {
-                            None
+                            VarKind::Node
                         };
-                        where_parts.push(compile_property_equality(
-                            &alias,
-                            key,
-                            val,
-                            text_column,
-                            &mut params,
-                        )?);
-                    }
-                } else {
-                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
-
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        if let Some((first_alias, _)) = var_to_alias.get(var) {
+                            // A repeated name across paths denotes a typed record identity.
+                            // Retain the first alias for projections and every occurrence's filters.
+                            where_parts.push(format!(
+                                "{alias}.substrate_kind = {first_alias}.substrate_kind"
+                            ));
+                            where_parts.push(format!("{alias}.id = {first_alias}.id"));
+                        } else {
+                            var_to_alias.insert(var.clone(), (alias.clone(), kind));
+                        }
                     }
 
-                    if let Some(ref kind) = np.kind {
-                        where_parts.push(kind_filter_predicate(&alias, kind, &mut params));
-                    }
-
-                    if let Some(ref et) = np.entity_type {
-                        params.push(QueryValue::Text(et.clone()));
-                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                    }
-
-                    let mut props: Vec<_> = np.properties.iter().collect();
-                    props.sort_by_key(|(k, _)| k.as_str());
-                    for (key, val) in props {
-                        let text_column = if key == "name" { Some("name") } else { None };
-                        where_parts.push(compile_property_equality(
-                            &alias,
-                            key,
-                            val,
-                            text_column,
-                            &mut params,
-                        )?);
-                    }
+                    node_idx += 1;
                 }
+                PatternElement::Edge(ep) => {
+                    let e_alias = format!("e{edge_idx}");
+                    let prev_node = &node_aliases[node_aliases.len() - 1];
+                    let next_alias = format!("n{}", node_idx);
 
-                if let Some(ref var) = np.variable {
-                    let kind = if is_event_source {
-                        VarKind::EventNode
-                    } else if is_observation_target {
-                        VarKind::ObservationTargetNode
-                    } else {
-                        VarKind::Node
-                    };
-                    var_to_alias.insert(var.clone(), (alias.clone(), kind));
-                }
-
-                node_idx += 1;
-            }
-            PatternElement::Edge(ep) => {
-                let e_alias = format!("e{edge_idx}");
-                let prev_node = &node_aliases[node_aliases.len() - 1];
-                let next_alias = format!("n{}", node_idx);
-
-                // The synthetic and canonical backing tables have no meaningful shared join key.
-                let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
-                let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
-                if has_synthetic && has_canonical {
-                    return Err(QueryError::Compile(
+                    // The synthetic and canonical backing tables have no meaningful shared join key.
+                    let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
+                    let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
+                    if has_synthetic && has_canonical {
+                        return Err(QueryError::Compile(
                         "cannot mix synthetic observed_as_* relations with canonical edge relations \
                          in a single edge pattern"
                             .into(),
                     ));
-                }
+                    }
 
-                if has_synthetic {
-                    // `(event_id, role, position)` is the observation primary key.
-                    order_parts.push(format!("{e_alias}.event_id"));
-                    order_parts.push(format!("{e_alias}.role"));
-                    order_parts.push(format!("{e_alias}.position"));
-                    // Synthetic projections are always event-to-referent.
-                    if !matches!(ep.direction, EdgeDirection::Out) {
-                        return Err(QueryError::Compile(
+                    if has_synthetic {
+                        // `(event_id, role, position)` is the observation primary key.
+                        order_parts.push(format!("{e_alias}.event_id"));
+                        order_parts.push(format!("{e_alias}.role"));
+                        order_parts.push(format!("{e_alias}.position"));
+                        // Synthetic projections are always event-to-referent.
+                        if !matches!(ep.direction, EdgeDirection::Out) {
+                            return Err(QueryError::Compile(
                             "synthetic observed_as_* edges are always event → entity (outbound only)".into(),
                         ));
-                    }
-                    join_parts.push(format!(
+                        }
+                        join_parts.push(format!(
                         "JOIN event_observations {e_alias} ON {e_alias}.event_id = {prev_node}.id"
                     ));
-                    let roles: Vec<&'static str> = ep
-                        .relations
-                        .iter()
-                        .filter_map(|r| synthetic_role(r))
-                        .collect();
-                    if roles.len() == 1 {
-                        params.push(QueryValue::Text(roles[0].to_string()));
-                        where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
-                    } else if roles.len() > 1 {
-                        let placeholders = in_placeholders(roles.iter().map(|r| {
-                            params.push(QueryValue::Text(r.to_string()));
-                            params.len()
-                        }));
-                        where_parts.push(format!("{e_alias}.role IN ({})", placeholders));
-                    }
-                    // `referent_kind` prevents equal IDs on different substrates from colliding.
-                    join_parts.push(format!(
-                        "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
+                        let roles: Vec<&'static str> = ep
+                            .relations
+                            .iter()
+                            .filter_map(|r| synthetic_role(r))
+                            .collect();
+                        if roles.len() == 1 {
+                            params.push(QueryValue::Text(roles[0].to_string()));
+                            where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
+                        } else if roles.len() > 1 {
+                            let placeholders = in_placeholders(roles.iter().map(|r| {
+                                params.push(QueryValue::Text(r.to_string()));
+                                params.len()
+                            }));
+                            where_parts.push(format!("{e_alias}.role IN ({})", placeholders));
+                        }
+                        // `referent_kind` prevents equal IDs on different substrates from colliding.
+                        join_parts.push(format!(
+                            "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
                          AND {next_alias}.referent_kind = {e_alias}.referent_kind",
-                        observation_target_source(&next_alias, mailbox)
-                    ));
-                    // Enforce the ADR-041 role/substrate matrix.
-                    where_parts.push(format!(
+                            observation_target_source(&next_alias, mailbox)
+                        ));
+                        // Enforce the ADR-041 role/substrate matrix.
+                        where_parts.push(format!(
                         "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
-                } else {
-                    order_parts.push(format!("{e_alias}.id"));
-                    let (source_join, target_join) = match ep.direction {
+                    } else {
+                        order_parts.push(format!("{e_alias}.id"));
+                        let (source_join, target_join) = match ep.direction {
                         EdgeDirection::Out => (
                             format!("{e_alias}.source_id = {prev_node}.id"),
                             "target_id",
@@ -619,53 +637,55 @@ fn compile_fixed_length(
                         ),
                     };
 
-                    let next_join_col = if target_join == "CASE_BOTH" {
-                        format!(
+                        let next_join_col = if target_join == "CASE_BOTH" {
+                            format!(
                             "CASE WHEN {e_alias}.source_id = {prev_node}.id THEN {e_alias}.target_id ELSE {e_alias}.source_id END"
                         )
-                    } else {
-                        format!("{e_alias}.{target_join}")
-                    };
-
-                    join_parts.push(format!(
-                        "JOIN {} ON {source_join} AND {e_alias}.deleted_at IS NULL",
-                        edge_source(&e_alias, mailbox)
-                    ));
-
-                    let ens_filter = namespace_filter(&e_alias, opts, &mut params);
-                    if !ens_filter.is_empty() {
-                        where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
-                    }
-
-                    join_parts.push(format!(
-                        "JOIN {} ON {next_alias}.id = {next_join_col}",
-                        primary_node_source(&next_alias, mailbox)
-                    ));
-
-                    if !ep.relations.is_empty() {
-                        if ep.relations.len() == 1 {
-                            params.push(QueryValue::Text(ep.relations[0].clone()));
-                            where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
                         } else {
-                            let placeholders = in_placeholders(ep.relations.iter().map(|r| {
-                                params.push(QueryValue::Text(r.clone()));
-                                params.len()
-                            }));
-                            where_parts.push(format!("{e_alias}.relation IN ({})", placeholders));
+                            format!("{e_alias}.{target_join}")
+                        };
+
+                        join_parts.push(format!(
+                            "JOIN {} ON {source_join} AND {e_alias}.deleted_at IS NULL",
+                            edge_source(&e_alias, mailbox)
+                        ));
+
+                        let ens_filter = namespace_filter(&e_alias, opts, &mut params);
+                        if !ens_filter.is_empty() {
+                            where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        join_parts.push(format!(
+                            "JOIN {} ON {next_alias}.id = {next_join_col}",
+                            primary_node_source(&next_alias, mailbox)
+                        ));
+
+                        if !ep.relations.is_empty() {
+                            if ep.relations.len() == 1 {
+                                params.push(QueryValue::Text(ep.relations[0].clone()));
+                                where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
+                            } else {
+                                let placeholders = in_placeholders(ep.relations.iter().map(|r| {
+                                    params.push(QueryValue::Text(r.clone()));
+                                    params.len()
+                                }));
+                                where_parts
+                                    .push(format!("{e_alias}.relation IN ({})", placeholders));
+                            }
                         }
                     }
-                }
 
-                if let Some(ref var) = ep.variable {
-                    let kind = if has_synthetic {
-                        VarKind::SyntheticEdge
-                    } else {
-                        VarKind::Edge
-                    };
-                    var_to_alias.insert(var.clone(), (e_alias.clone(), kind));
-                }
+                    if let Some(ref var) = ep.variable {
+                        let kind = if has_synthetic {
+                            VarKind::SyntheticEdge
+                        } else {
+                            VarKind::Edge
+                        };
+                        var_to_alias.insert(var.clone(), (e_alias.clone(), kind));
+                    }
 
-                edge_idx += 1;
+                    edge_idx += 1;
+                }
             }
         }
     }

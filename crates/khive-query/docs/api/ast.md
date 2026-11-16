@@ -4,11 +4,15 @@ The query AST is the shared contract between the GQL and SPARQL parsers, validat
 
 ## `GqlQuery`
 
-`GqlQuery` contains one alternating `MatchPattern`, a `WhereExpr`, ordered `ReturnItem` projections, `order_by: Vec<OrderItem>`, a non-negative row `offset`, and an optional row limit. GQL `SKIP` populates `offset`; the SPARQL parser leaves it at zero because its `OFFSET` form is not supported. SPARQL also initializes an empty order list. Parsers produce this form; callers that construct it directly must still pass it through `validate` or `compile`, which repeats the structural validation.
+`GqlQuery` contains a required first `pattern: MatchPattern`, `additional_patterns: Vec<MatchPattern>`, a `WhereExpr`, ordered `ReturnItem` projections, `order_by: Vec<OrderItem>`, a non-negative row `offset`, and an optional row limit. The `patterns()` and `patterns_mut()` iterators visit the first path and additional paths in textual order. An empty additional vector represents the existing single-path query.
+
+All paths share the same WHERE, projection, ordering and paging tail. GQL `SKIP` populates `offset`; SPARQL leaves it at zero because its `OFFSET` form is not supported, and initializes empty order and additional-pattern vectors. Parsers produce this form; direct Rust constructors must initialize `additional_patterns` and still pass the AST through `validate` or `compile`, which repeats the structural and connectivity checks. This field addition is a Rust source compatibility break; parsed single-path syntax is unchanged.
 
 ## `MatchPattern` and `PatternElement`
 
-`MatchPattern.elements` must be `Node, Edge, Node, ...`, begin and end with a node, and contain no repeated binding names. `nodes()` and `edges()` expose typed iterators without allocating, while `has_variable_length()` is true when any edge has `max_hops > 1`.
+`MatchPattern.elements` must be `Node, Edge, Node, ...`, begin and end with a node, and contain no repeated node binding within that path. Edge names are unique across the entire query, and no name can bind both a node and an edge. `nodes()` and `edges()` expose typed iterators without allocating, while `has_variable_length()` is true when any edge has `max_hops > 1`.
+
+With multiple paths, every edge is canonical and fixed at one hop; a path may contain several such edges. Paths must connect through shared named nodes, including when a later path bridges earlier ones. A repeated node across paths denotes the same substrate and UUID, with every occurrence constraint retained. Anonymous occurrences are fresh. A connected singleton node path adds constraints; an empty additional path or disconnected component is refused.
 
 `NodePattern` carries an optional variable, a pack-owned kind string, an optional governed `entity_type`, and inline property equalities. `entity_type` maps to its dedicated SQL column rather than `json_extract`.
 

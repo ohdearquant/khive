@@ -59,8 +59,8 @@ Rejected forms sections below.
 | Orphan detection          | Which records have no graph edges?                                  | NO                           | No negative pattern, `NOT EXISTS`, optional match, or anti-join exists. Approximate outside `query` with `list` plus `neighbors`.                                                                                                                                                                    |
 | Edge-density audit        | Which entities have fewer than four edges?                          | PARTIAL                      | `stats()` gives global `edges_by_relation` and `edges_by_endpoint_base` breakdowns and `query` lists rows, but `COUNT`, `GROUP BY`, `HAVING`, and degree projection are all absent. For a graph-wide density figure use `edges_structural`, not `edges`: the flat total counts provenance edges too. |
 | Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing, `ORDER BY`, and GQL `SKIP` paging work. Aggregate functions, grouping, and explicit distinct projection are absent.                                                                                                                                                            |
-| Cycle / self-reachability | Which entities are in an `extends` cycle?                           | NO                           | Repeated node-variable bindings are rejected, so cycles and self-reachability cannot be expressed.                                                                                                                                                                                                   |
-| Branching join            | Which parent has both an `extends` child and an `implements` child? | NO                           | GQL supports one alternating path; SPARQL rejects branched or disconnected `WHERE` blocks.                                                                                                                                                                                                           |
+| Cycle / self-reachability | Which entities are in an `extends` cycle?                           | PARTIAL                      | Fixed canonical cycles can join shared nodes across comma paths. A repeated node within one path and recursive multi-pattern cycles remain unsupported.                                                                                                                                              |
+| Branching join            | Which parent has both an `extends` child and an `implements` child? | YES via GQL                  | Connected comma paths share named nodes and retain tuple multiplicity; see the star recipe below. SPARQL still rejects branching.                                                                                                                                                                    |
 | Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace visibility is supplied by runtime `CompileOptions`. Direct namespace predicates and order fields are rejected; returned namespace fields and a metadata key named namespace do not override scope.                                                                                         |
 | Mutation via query        | Create, update, link, merge, or delete through GQL/SPARQL.          | NO (by design)               | Write-shaped input is rejected outright. Use the corresponding KG verb.                                                                                                                                                                                                                              |
 
@@ -73,14 +73,15 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
 
 ## Operational limits
 
-- GQL accepts one connected, alternating path after `MATCH`. It does not
-  accept comma-separated patterns or branching self-joins. For a parallel-edge
-  audit, return `a.id, e.id, e.relation, b.id` from one unlabeled-edge path and
-  group endpoint IDs client-side without discarding the edge ID.
+- GQL accepts connected comma-separated paths after `MATCH`, with one global
+  WHERE, RETURN, ORDER BY, SKIP and LIMIT tail. Every edge in a multi-pattern
+  query must be canonical and fixed at one hop; a component can contain several
+  such edges. Shared named nodes connect components; anonymous nodes do not.
+  SPARQL remains single-path only.
 - `RETURN` accepts comma-separated variables or `variable.property` items,
   but not `AS` aliases. Output names remain variable-prefixed, such as `a_id`.
-- GQL supports either a chain of fixed-relation hops or exactly one
-  variable-length edge per query — never both mixed in the same pattern.
+- A single GQL path supports either a chain of fixed-relation hops or exactly
+  one variable-length edge — never both mixed in the same pattern.
   Minimum hop count is 1; maximum is 10. A bare `*` (no bounds) means 1
   through 5 hops, not zero-or-more.
 - A query that mixes a fixed hop with a variable-length hop in the same chain
@@ -177,6 +178,50 @@ omit it for an exhaustive read. Visibility filtering precedes sorting and paging
 See [ADR-008 Amendment 1](../adr/ADR-008-query-layer-separation.md#amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14)
 for the ordering and recursive contracts.
 
+## Connected branches around one node
+
+Read two kinds of neighbour around the same concept in one query:
+
+```text
+MATCH (a:concept)-[e:extends]->(b:concept),
+      (a)-[f:variant_of]->(c:concept)
+WHERE e.metadata.order >= 0 AND f.metadata.enabled = true
+RETURN a.id, b.id, c.id, e.id, f.id, e.metadata, f.metadata
+ORDER BY e.metadata.order ASC, f.metadata.order DESC
+```
+
+Both occurrences of `a` identify the same substrate and UUID. Their kind, subtype
+and inline-property constraints all apply. A center with two matching `extends`
+edges and three matching `variant_of` edges produces six tuples. Returning only
+`a.id` still returns six rows; equal projections are not deduplicated. Different
+edge variables can select the same edge when both patterns match it.
+
+Every component must connect through shared named nodes. A later path can bridge
+earlier components, and a shared singleton node path can add constraints. Repeating
+a node within one path, repeating an edge variable anywhere, or using one name for
+both a node and an edge remains unsupported. Recursive and synthetic observation
+paths retain their single-path behavior and cannot join a comma-pattern query.
+
+The WHERE tree and all projections and order terms can refer to any component.
+Each occurrence retains namespace, deletion and mailbox filtering before paging.
+Requested order is followed by the full occurrence-identity suffix in textual
+path order; DESC does not reverse those ties. Continue with `next_offset` as in
+[Paging broad GQL results](#paging-broad-gql-results), retaining any total query
+LIMIT. Offset pages are stable only for unchanged data, and page size does not
+bound the combinations matched or sorted.
+
+For a simple inventory of edge records, one path avoids multiplying combinations:
+
+```text
+MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id
+```
+
+Group endpoint IDs client-side while retaining each edge ID and relation when an
+edge inventory, rather than joined tuples, answers the question.
+
+See [ADR-008 Amendment 2](../adr/ADR-008-query-layer-separation.md#amendment-2-connected-comma-separated-match-patterns-2026-11-14)
+for the connected-pattern contract.
+
 ## Verified GQL idioms
 
 Each row was issued as `query(query="...")` through the `request` tool
@@ -201,15 +246,15 @@ counts only — no graph content is reproduced here.
 | 14 | `WHERE ... OR ...`                    | `MATCH (n) WHERE n.kind = "concept" OR n.kind = "project" RETURN n.name, n.kind LIMIT 2` | 2 rows; `n_kind, n_name`. `AND` binds tighter than `OR`; parentheses are not available to force grouping.                                                              |
 | 15 | Page size vs. query `LIMIT`           | `query(query="MATCH (n) RETURN n.name LIMIT 5", page_size=2)`                            | 2 rows plus `has_more: true` and `next_offset: 2`; query `LIMIT` exceeds the effective page size, so the +1 sentinel detects another page.                             |
 
-## Parser-diagnosed dialect boundaries
+## Dialect boundaries
 
-These unsupported constructs receive specific parser errors rather than
-generic grammar or trailing-input failures:
+Disconnected comma paths are refused during validation/compilation; return aliases
+receive a specific parser error:
 
-| Form                       | Query string                                                     | Contract and alternative                                                                                                                                                                                             |
-| -------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Comma-separated patterns   | `MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b`                 | `QueryError::Unsupported` names comma-separated `MATCH` patterns. For parallel-edge audits, use one path returning `a.id, e.id, e.relation, b.id`, then group endpoint IDs client-side while retaining each edge ID. |
-| `RETURN` aliases with `AS` | `MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5` | `QueryError::Unsupported` names `AS`. Use unaliased `variable` or `variable.property` projections; result names remain variable-prefixed.                                                                            |
+| Form                       | Query string                                                     | Contract and alternative                                                                                                                  |
+| -------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Disconnected comma paths   | `MATCH (a), (b) RETURN a, b`                                     | `QueryError::Unsupported` requires components connected through shared named nodes. A star with shared bindings is supported.             |
+| `RETURN` aliases with `AS` | `MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5` | `QueryError::Unsupported` names `AS`. Use unaliased `variable` or `variable.property` projections; result names remain variable-prefixed. |
 
 ## Rejected forms (live-checked)
 
@@ -242,9 +287,10 @@ returns rows on the live MCP tool.
 
 ## Gaps
 
-- Comma-separated GQL `MATCH` patterns and `RETURN ... AS ...` aliases are
-  rejected with named unsupported-feature errors. Use one alternating path and
-  unaliased projections; group returned rows client-side where needed.
+- Disconnected, recursive or synthetic multi-pattern GQL matches remain
+  unsupported. Connected canonical paths with fixed one-hop edges are supported.
+  `RETURN ... AS ...` aliases still return a named unsupported-feature error;
+  use unaliased projections.
 - Mixed fixed-plus-variable-length paths are rejected; split the query into
   separate calls instead.
 - No anti-join, optional match, aggregate, `GROUP BY`, or explicit `DISTINCT`
@@ -252,8 +298,9 @@ returns rows on the live MCP tool.
   keyword; SPARQL `OFFSET` remains unsupported. Orphan-detection and
   edge-density questions cannot be expressed in a single query.
   [Ordering and counts](#ordering-and-counts) names the verbs to use instead.
-- A repeated node-variable binding is rejected, which blocks cycle and
-  self-reachability queries.
+- A repeated node-variable binding within one path remains rejected. Fixed
+  cycles across separate connected canonical paths can reuse node bindings;
+  this does not add general recursive cycle or self-reachability syntax.
 - SPARQL is single-path only; a branched `WHERE` block is rejected.
 
 ## See also
