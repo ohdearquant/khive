@@ -203,6 +203,7 @@ fn variable_length_recursive_member_namespace_scopes_intermediates() {
 fn compile_malformed_ast_returns_error_not_panic() {
     use crate::ast::{EdgeDirection, EdgePattern, GqlQuery, MatchPattern, PatternElement};
     let q = GqlQuery {
+        additional_patterns: Vec::new(),
         order_by: Vec::new(),
         pattern: MatchPattern {
             elements: vec![PatternElement::Edge(EdgePattern {
