@@ -1572,7 +1572,7 @@ policies or later requests can still decide an unregistered name under the ordin
 
 ## Amendment 12 (2026-11-14): tool policy matching uses the registry's name folding
 
-**Status: Proposed.** This amendment requires sign-off before the dependent implementation merges.
+**Status: Accepted 2026-11-15 (#6648).**
 Amendments 10 and 11 precede this amendment; their registration and retirement rules remain in force.
 
 1. **Tool matching folds ASCII case.** Policy and grant tool patterns use the registry's name fold
