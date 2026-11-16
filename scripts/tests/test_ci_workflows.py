@@ -545,6 +545,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         "dependency-review", "coverage-measurement", "coverage-ratchet",
         "wasm-parity", "vamana-portability", "minio-blob-compat",
         "msrv-check", "core-only", "release-checks", "channel-tests", "s3-blob-tests",
+        "clippy-checks",
     }
     # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
     # save the runner, like the gated lane jobs.
@@ -2294,6 +2295,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "release-checks": "Release build and release checks (${{ matrix.os }})",
         "channel-tests": "Channel feature tests (${{ matrix.os }})",
         "s3-blob-tests": "S3 blob store library tests",
+        "clippy-checks": "Clippy and forward-deployed checks (${{ matrix.os }})",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
         "changed-paths": "Classify changed paths",
