@@ -7,38 +7,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-16
 ### Added
 
-- GQL accepts connected comma-separated `MATCH` paths with one global filter, projection, ordering
-  and paging tail. Shared nodes retain all occurrence constraints; matches preserve tuple
-  multiplicity. Each edge must be canonical and fixed at one hop.
+- `search` accepts `created_after` and `created_before` for entities and notes: inclusive RFC3339
+  instants on `created_at`, combined with the kind, tag and entity-type filters. The bounds apply to
+  the ranked candidates each backend returns (limit × 50, at most 500), so a narrow window can
+  return fewer results than the limit; this is not an exhaustive time-range scan.
+- GQL returns edge metadata and orders results: `RETURN e.id, e.metadata ORDER BY e.metadata.order`.
+  Metadata paths work in the existing scalar predicates, and an optional `ORDER BY` precedes
+  `SKIP`/`LIMIT`, with the existing deterministic tie order appended.
+- `kkernel mcp --catalog-verbosity compact` shortens each verb's line in the request tool
+  description to its first-line summary (at most 160 characters), keeping every callable verb, its
+  contributor labels and the full-help pointer. `full` stays the default and its text is unchanged.
+- Channel health reports the undelivered rows waiting in retry backoff (count, earliest retry,
+  oldest creation time, highest attempt count, total backlog), and inbound health reports the time
+  since the last successful poll while a channel is in backoff.
+- `brain.profile` lists the visible bindings that still resolve to an inactive profile and reports
+  `serving_through_visible_binding_while_inactive`.
+- Opt-in native cross-encoder reranking of entities through `lattice-inference` 0.15. Scores are
+  sigmoid probabilities; the inference dependency stays disabled by default.
 - `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
   `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
   `legacy_preference_model_count`. An embedding host can bring a V20 database to V21 without
   depending on `khive-mcp`, provided that, when the database holds legacy moodboard preference
   models, it passes a legacy-preference verifier and a blob hydrator; without them the call fails
   closed. `RuntimeError` gains `AttachmentCutoverRequired`.
+- `khive_db::migrations::attachment_cutover_would_defer` answers, read-only, whether a store would
+  stop at the V21 attachment cutover.
+- GQL accepts connected comma-separated `MATCH` paths with one global filter, projection, ordering
+  and paging tail. Shared nodes retain all occurrence constraints; matches preserve tuple
+  multiplicity. Each edge must be canonical and fixed at one hop.
+- `tool.unregister` retires an owned tool registration with its exact namespace-local policies and
+  grants in one transaction. Shared pattern rules and other namespaces' pins stay stored, and those
+  pins stop matching once the registration is retired. A retired registration is not restored.
+- Telegram records each completed poll in channel health, including empty, filtered and held
+  pages, and a failed poll keeps the last success time, so `no_success_age_secs` stays available.
 
 ### Changed
 
-- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when more
-  matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)` that
-  works on a short queue fails with `substitution_error` once the queue passes the limit: read the
-  object's `tasks`, or read the page first and pass the id in a separate call.
+- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when
+  more matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)`
+  that works on a short queue fails with `substitution_error` once the queue passes the limit: read
+  the object's `tasks`, or read the page first and pass the id in a separate call.
 - `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
   `RuntimeError::AttachmentCutoverRequired`, whose message names
-  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed at
-  `khive-mcp` boot.
+  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed
+  at `khive-mcp` boot.
+- Short-token keyword signals count a one- or two-character word only when it carries a digit (`2`,
+  `v2`) or is two uppercase letters (`KV`), so function words such as `a`, `in` and `of` no longer
+  change the keyword order of a natural-language query.
+- `knowledge.eval_retrieval` reports a query set that does not parse by line and column only, and a
+  path it cannot open as `cannot open query set <path>`, so no file content or OS error reaches the
+  caller.
+- Migration V66 rebuilds the outbox due index without delivered rows, so due-page and backlog reads
+  no longer revisit delivered history.
+- `tool.register` on an existing name corrects it in place and keeps its identity, source and kind:
+  a different source or kind is refused, so register it under a new name. Description and schema
+  corrections are accepted, and a schema replaces the whole object. Side-effect and trust
+  corrections can only move to a stricter class. The result says whether the row was created,
+  updated or unchanged, and an admitted definition change appends one `tool_registration_changed`
+  event.
+- Tool policy and grant matching folds ASCII case the same way registry identity does, so a policy
+  or grant written with another spelling matches the stored tool name.
+- Registry construction refuses a public verb whose name belongs to another pack: a bare name only
+  from `kg` and only on its allowlist, a dotted name only under the declaring pack's own prefix, and
+  `stream.<name>` only from `kg`. No pack may be named `stream`, and a mounted tool source cannot
+  register under `stream.`.
+- `kkernel` does not load the per-user `.env` file in the khive home directory when an agent actor
+  (`agent:` prefix) is named by `KHIVE_ACTOR`, `KHIVE_NAMESPACE`, `--actor` or `--namespace`, or when
+  `KHIVE_LOAD_DOTENV` is `0`, `false`, `no` or `off`. An unrecognized value also skips the file. The
+  check runs before configuration is read, so an agent named only in a config file needs
+  `KHIVE_LOAD_DOTENV=0`.
+- SMTP sends try each resolved relay address with a 10-second limit on connect, greeting, EHLO and
+  TLS, inside a 120-second limit for the whole transaction. A permanent refusal stops the address
+  walk and is reported as permanent.
+- Commit ingestion retries a commit whose message the secret gate refuses once, as a replacement
+  that keeps only the Git-generated fields (sha, commit date, parents), so the cursor advances past
+  it.
+- With `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` enabled, email-channel startup states its preconditions:
+  the mailbox is hosted by Exchange Online, and its receiving boundary strips sender-supplied
+  `X-MS-Exchange-Organization-AuthAs` headers.
+- GitHub ingest keeps the first 20 annotation warning details per item with a total count, and
+  re-checks the annotation of an item it has already ingested, at most 128 per source per run.
+- A failed daemon respawn advises checking the daemon configuration and the installed `kkernel`
+  version before retrying.
+
+### Fixed
+
+- `propose` refuses a `supersede_entity` whose operands are not both live entities, naming the
+  operand, and apply checks the operands again, so an approved proposal whose operand was deleted or
+  merged since is refused instead of applied.
+- A search stopped by cancellation returns the typed request-stop error from every phase instead of
+  a short page or partial metadata, and its MCP error carries `domain_disposition: "not_committed"`
+  and `retryable: true`.
+- `comm.send` refusing a non-local self recipient and `memory.remember` refusing its parameters
+  report `domain_disposition: "not_committed"`.
+- A daemon client refuses an oversized socket path (primary or events) before connecting, recovering
+  or spawning a daemon, naming the path, its byte length and the platform limit.
+- A channel heartbeat persists again after its `channel_health` note was soft-deleted.
+- An events-prune backup receipt authorizes deletion only from the store it copied: the receipt's
+  source and the apply target must resolve to the same canonical path.
+- `memory.remember` names the parameter or operation to use when it refuses a reserved property.
+- `git.digest` reports, in its warnings, an existing issue or pull-request note whose project
+  annotation is missing.
+- Compact verb catalogs log the same duplicate-contribution warning as full catalogs.
+- Brain event-count and event-page refusals mask credentials in an invalid event kind.
+- The content secret gate decodes an escaped JSON fragment that follows a stray backslash in prose.
+- A server or daemon that never polls external email boots without the comm pack when external email
+  is configured; a polling host without comm is still refused.
+- KG validation annotations in GitHub format name the NDJSON file that produced each finding.
+- A chained `$prev` error after an array result suggests `$prev[0]` and `$prev[0].id`.
+- Empty text tables record their FTS rowid-map backfill and sparse schema checks are cached, so
+  those reads no longer take the writer on every fetch.
+- A search whose required record or metadata read fails returns the error instead of a successful
+  page with missing metadata.
+- `kkernel mcp --catalog-verbosity compact` is kept when the server is assembled over several
+  backends; it came back as `full`.
+- Message sender and recipient list filters match stored actor names, so a query by actor finds
+  messages sent through comm.
+- The secret gate scans an escaped credential at the end of a field whose closing quote is missing,
+  and keeps valid escaped spans on either side of a malformed escape.
+- A GitHub issue or pull-request number held by more than one note resolves to the same note every
+  time (lowest stored id), with one warning.
+- A read on a pooled SQLite connection stays cancellable after a progress callback panics; the
+  progress handler is reinstalled on unwind.
 
 ### Breaking (Rust crates)
 
+- Public structs gained fields, so direct struct literals must set them: `khive_mcp::args::Args`
+  adds `catalog_verbosity`, `khive_query::GqlQuery` adds `order_by` (a `Vec` of
+  `khive_query::ast::OrderItem`), `khive_rule_evaluator::Violation` adds `source` (an
+  `Option<NdjsonSource>`, not serialized), and `khive_pack_git::ingest::IngestReport` adds
+  `existing_project_annotation_warning_count` (a `u64`).
+- Enum variants gained fields: `khive_db::SqliteError::Migration` keeps the failed migration's cause
+  as `source`, and `khive_pack_comm::OutboxScanOutcome::Success` adds `backlog`, so patterns and
+  constructors naming every field must include them.
+- Enums gained variants, so an exhaustive match must handle them: `khive_query::ast::PropertyRef`
+  adds `MetadataPath`, `khive_runtime::RuntimeError` adds `AttachmentCutoverRequired` and
+  `SearchRead`, and `khive_types::event::EventKind` and `khive_types::event::EventPayload` add
+  `ToolRegistrationChanged`.
+- `EventKind::ToolRegistrationChanged` is declared before `LinkCreated`, so every later variant's
+  implicit discriminant, from `LinkCreated` through `GrantChange`, rises by one. Code that casts an
+  `EventKind` to an integer gets new values; the event names (`EventKind::name` and its `FromStr`)
+  are unchanged.
+- `khive_db::ProgressConn` is now hidden from the documentation. It stays exported for use inside
+  the workspace and is no longer part of the documented API.
+- Coordinated search returns its stop error instead of a partial result:
+  `khive_mcp::coordinator::CoordinatorService::fan_out_search` and `fan_out_search_scoped` return
+  `Result<CoordSearchResult, RuntimeError>`, and `kkernel::coordinator::SubstrateCoordinator`'s
+  `fan_out_search`, `fan_out_search_with_visibility`, `fan_out_search_with_token` and
+  `fan_out_search_with_token_and_count` return `RuntimeResult<...>`. An implementation of
+  `CoordinatorService` must change its signatures to match.
 - `khive_query::GqlQuery` adds `additional_patterns: Vec<MatchPattern>`; direct Rust constructors
   must initialize it, using an empty vector for a single path. `patterns()` and `patterns_mut()`
   iterate the required first path and the additional paths in textual order.
-- `khive_query::GqlQuery` adds `order_by: Vec<OrderItem>`, so direct Rust constructors must
-  initialize it; exhaustive `PropertyRef` matches must handle the new `MetadataPath` variant.
-- `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
-  `RuntimeError` needs an arm for it.
 
 ## [0.19.0] - 2026-11-11
 
