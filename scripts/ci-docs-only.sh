@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# ci-docs-only.sh <base> <head>
+# ci-docs-only.sh <base> <head> [<path>...]
 #
 # Prints "true" when the change from <base> to <head> may run CI's documentation lane only, and "false"
-# when it needs the full suite. The reasons go to stderr.
+# when it needs the full suite. The reasons go to stderr. Given paths, it judges only those, and each must be
+# a path the change touches: scripts/ci-test-scope.py admits the Markdown files of a mixed change this way, so
+# the two classifiers share one rule.
 #
 # The documentation lane is allowed when every path that differs is a Markdown file, no non-Markdown file
 # at <head> names that file's base name on any line, except listed inert documentation data, and the file is not one whose verb and pack count
@@ -43,12 +45,13 @@ full() {
     exit 0
 }
 
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 <base> <head>" >&2
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 <base> <head> [<path>...]" >&2
     exit 2
 fi
 base=$1
 head=$2
+shift 2
 scanner=$(cd "$(dirname "$0")/.." && pwd)/tests/documented_verb_counts.py || full "cannot resolve the repository root"
 
 list=$(mktemp) || full "mktemp failed"
@@ -129,6 +132,18 @@ paths=()
 while IFS= read -r -d '' path; do
     paths+=("$path")
 done < "$list"
+if [ "$#" -gt 0 ]; then
+    selected=()
+    for wanted in "$@"; do
+        found=no
+        for path in "${paths[@]}"; do
+            [ "$path" = "$wanted" ] && found=yes
+        done
+        [ "$found" = yes ] || full "$wanted is not a path changed between $base and $head"
+        selected+=("$wanted")
+    done
+    paths=("${selected[@]}")
+fi
 
 count=0
 for path in "${paths[@]}"; do
