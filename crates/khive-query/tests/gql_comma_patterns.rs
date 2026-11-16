@@ -79,9 +79,7 @@ fn comma_patterns_parse_one_global_tail_and_ordered_iterators() {
         "MATCH ,(a) RETURN a",
         "MATCH (a) MATCH (a) RETURN a",
         "MATCH (a), (a) RETURN a AS x",
-        "MATCH (a), (a) RETURN DISTINCT a",
         "MATCH (a), (a) OPTIONAL MATCH (b) RETURN a",
-        "MATCH (a), (a) RETURN count(a)",
     ] {
         assert!(parse(QueryLanguage::Gql, malformed).is_err(), "{malformed}");
     }
@@ -267,7 +265,7 @@ fn comma_compilation_keeps_first_alias_all_filters_and_bound_metadata() {
             "text:last",
             "text:$.order",
             "integer:2",
-            "integer:3"
+            "integer:5"
         ]
     );
     assert!(!compiled.sql.contains("SELECT DISTINCT"));
@@ -351,3 +349,30 @@ const LEGACY_RECURSIVE_SQL: &str = r#"WITH RECURSIVE primary_nodes AS (SELECT id
 const PRIMARY_NODES: &str = r#"SELECT id, namespace, kind, entity_type, name, description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, properties, created_at, updated_at, deleted_at, 'entity' AS substrate_kind FROM entities UNION ALL SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, content, status, salience, decay_factor, properties, created_at, updated_at, deleted_at, 'note' AS substrate_kind FROM notes UNION ALL SELECT id, namespace, kind, NULL AS entity_type, verb AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, payload AS properties, created_at, created_at AS updated_at, NULL AS deleted_at, 'event' AS substrate_kind FROM events UNION ALL SELECT id, namespace, relation AS kind, NULL AS entity_type, NULL AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, metadata AS properties, created_at, updated_at, deleted_at, 'edge' AS substrate_kind FROM graph_edges"#;
 
 const OBSERVATION_TARGETS: &str = r#"SELECT id, namespace, kind, entity_type, name, description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, properties, created_at, updated_at, deleted_at, 'entity' AS referent_kind FROM entities UNION ALL SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, content, status, salience, decay_factor, properties, created_at, updated_at, deleted_at, 'note' AS referent_kind FROM notes"#;
+
+#[test]
+fn comma_distinct_and_counts_keep_existing_shape_guards() {
+    for tail in [
+        "DISTINCT a.id",
+        "count(a), count(e), count(f)",
+        "e.metadata.group, count(f)",
+    ] {
+        let query = gql(&format!(
+            "MATCH (a)-[e:extends]->(b), (a)-[f:variant_of]->(c) RETURN {tail}"
+        ));
+        compile(&query, &CompileOptions::default()).unwrap();
+    }
+    for source in [
+        "MATCH (a), (b) RETURN count(a)",
+        "MATCH (a)-[:extends*0..2]->(b), (a)-[:variant_of]->(c) RETURN DISTINCT b.id",
+        "MATCH (a)-[:extends]->(b), (a)-[:observed_as_target]->(c) RETURN count(c)",
+    ] {
+        assert!(
+            matches!(
+                compile(&gql(source), &CompileOptions::default()),
+                Err(QueryError::Unsupported(_))
+            ),
+            "{source}"
+        );
+    }
+}

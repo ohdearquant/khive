@@ -5,7 +5,10 @@ use std::str::FromStr;
 
 use khive_types::EdgeRelation;
 
-use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement, PropertyRef};
+use crate::ast::{
+    CompareOp, Condition, ConditionValue, GqlQuery, MatchPattern, PatternElement, PropertyRef,
+    WhereExpr,
+};
 use crate::error::QueryError;
 
 /// Closed synthetic relation set handled outside the canonical edge enum.
@@ -100,13 +103,6 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                         .map_err(|err| QueryError::Validation(err.to_string()))?;
                     *relation = parsed.as_str().to_string();
                 }
-                if edge.min_hops == 0 {
-                    return Err(QueryError::Unsupported(
-                        "zero-hop ranges (min_hops = 0) not yet supported; \
-                         use a minimum of 1 hop"
-                            .into(),
-                    ));
-                }
                 // Never rewrite inverted ranges; doing so changes query semantics.
                 if edge.min_hops > edge.max_hops {
                     return Err(QueryError::Validation(format!(
@@ -142,6 +138,36 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         }
     }
 
+    // Check the sum only after every edge's existing range/taxonomy checks, so
+    // their established diagnostics retain precedence. Normalized 1..1 is fixed.
+    let variable_maximum = query
+        .pattern
+        .edges()
+        .filter(|edge| edge.min_hops != 1 || edge.max_hops != 1)
+        .try_fold(0usize, |total, edge| total.checked_add(edge.max_hops))
+        .ok_or_else(|| {
+            QueryError::InvalidInput(format!(
+                "sum of variable-segment maximum hops exceeds the depth cap of {MAX_DEPTH}"
+            ))
+        })?;
+    if variable_maximum > MAX_DEPTH {
+        return Err(QueryError::InvalidInput(format!(
+            "sum of variable-segment maximum hops {variable_maximum} exceeds the depth cap of {MAX_DEPTH}; fixed steps do not count toward this sum"
+        )));
+    }
+    if query.pattern.has_variable_length()
+        && query.pattern.edges().count() > 1
+        && query.pattern.edges().any(|edge| {
+            edge.relations
+                .iter()
+                .any(|relation| SYNTHETIC_RELATIONS.contains(&relation.as_str()))
+        })
+    {
+        return Err(QueryError::Unsupported(
+            "mixed variable-length paths require canonical edges; synthetic observed_as_* edges are not supported".into(),
+        ));
+    }
+
     // Taxonomy-sensitive property names apply only to their matching binding kind.
     let mut var_kinds: std::collections::HashMap<String, VarKind> =
         std::collections::HashMap::new();
@@ -168,6 +194,8 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
         }
     }
+
+    validate_absence_expr(&mut query.where_clause, &var_kinds)?;
 
     let mut validate_err: Option<QueryError> = None;
     query.where_clause.for_each_condition_mut(&mut |cond| {
@@ -220,6 +248,107 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
     }
 
     Ok(warnings)
+}
+
+/// Validate local path bindings without exposing them to the outer scalar walkers.
+fn validate_absence_expr(
+    expr: &mut WhereExpr,
+    outer: &std::collections::HashMap<String, VarKind>,
+) -> Result<(), QueryError> {
+    match expr {
+        WhereExpr::NotExists(pattern) => validate_absence_pattern(pattern, outer),
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            validate_absence_expr(left, outer)?;
+            validate_absence_expr(right, outer)
+        }
+        WhereExpr::True | WhereExpr::Condition(_) => Ok(()),
+    }
+}
+
+fn validate_absence_pattern(
+    pattern: &mut MatchPattern,
+    outer: &std::collections::HashMap<String, VarKind>,
+) -> Result<(), QueryError> {
+    if pattern.elements.is_empty() {
+        return Err(QueryError::Validation(
+            "NOT EXISTS requires a nonempty path".into(),
+        ));
+    }
+    validate_pattern_shape(&pattern.elements)?;
+    let mut nodes = HashSet::new();
+    let mut edges = HashSet::new();
+    let mut correlated = false;
+    for element in &mut pattern.elements {
+        match element {
+            PatternElement::Node(node) => {
+                if node.properties.contains_key("namespace") {
+                    return Err(QueryError::Validation(
+                        "namespace is set by CompileOptions, not query text".into(),
+                    ));
+                }
+                if let Some(var) = node.variable.as_deref() {
+                    if edges.contains(var)
+                        || outer.get(var).is_some_and(|kind| *kind != VarKind::Node)
+                    {
+                        return Err(QueryError::Validation(format!(
+                            "variable '{var}' cannot bind both a node and an edge in NOT EXISTS"
+                        )));
+                    }
+                    if !nodes.insert(var.to_owned()) {
+                        return Err(QueryError::Unsupported(format!(
+                            "repeated node variable '{var}' in NOT EXISTS is not supported"
+                        )));
+                    }
+                    correlated |= outer.get(var) == Some(&VarKind::Node);
+                }
+            }
+            PatternElement::Edge(edge) => {
+                if let Some(var) = edge.variable.as_deref() {
+                    if let Some(kind) = outer.get(var) {
+                        if *kind != VarKind::Node {
+                            return Err(QueryError::Validation(format!(
+                                "edge variable '{var}' is already bound outside; edge variables are not correlated into NOT EXISTS"
+                            )));
+                        }
+                        return Err(QueryError::Validation(format!(
+                            "variable '{var}' cannot bind both a node and an edge in NOT EXISTS"
+                        )));
+                    }
+                    if nodes.contains(var) {
+                        return Err(QueryError::Validation(format!(
+                            "variable '{var}' cannot bind both a node and an edge in NOT EXISTS"
+                        )));
+                    }
+                    if !edges.insert(var.to_owned()) {
+                        return Err(QueryError::Unsupported(format!(
+                            "repeated edge variable '{var}' in NOT EXISTS is not supported"
+                        )));
+                    }
+                }
+                if edge.min_hops != 1 || edge.max_hops != 1 {
+                    return Err(QueryError::Unsupported(
+                        "NOT EXISTS requires canonical fixed one-hop edges".into(),
+                    ));
+                }
+                for relation in &mut edge.relations {
+                    if relation.starts_with("observed_as_") {
+                        return Err(QueryError::Unsupported(
+                            "synthetic edges are not supported inside NOT EXISTS".into(),
+                        ));
+                    }
+                    let parsed = EdgeRelation::from_str(relation)
+                        .map_err(|err| QueryError::Validation(err.to_string()))?;
+                    *relation = parsed.as_str().to_owned();
+                }
+            }
+        }
+    }
+    if !correlated {
+        return Err(QueryError::Validation(
+            "NOT EXISTS requires a correlated outer node variable".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Preserve within-path binding rules and connect all comma components by named nodes.

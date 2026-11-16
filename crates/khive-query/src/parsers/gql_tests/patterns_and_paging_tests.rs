@@ -78,3 +78,51 @@ fn sql_offset_keyword_remains_outside_gql() {
         "GQL paging uses SKIP rather than OFFSET, got {err:?}"
     );
 }
+
+#[test]
+fn distinct_and_binding_counts_parse_without_reserving_count_names() {
+    let q = parse(
+        "MATCH (n)-[e:extends]->(m) RETURN DISTINCT n.name, count(n), count(e) SKIP 2 LIMIT 3",
+    )
+    .unwrap();
+    assert!(q.distinct);
+    assert_eq!(
+        q.return_items,
+        vec![
+            ReturnItem::Property("n".into(), "name".into()),
+            ReturnItem::Count("n".into()),
+            ReturnItem::Count("e".into())
+        ]
+    );
+    assert_eq!((q.offset, q.limit), (2, Some(3)));
+    for source in [
+        "MATCH (count) RETURN count",
+        "MATCH (count) RETURN count.id",
+        "MATCH (count) RETURN count(count)",
+    ] {
+        let q = parse(source).unwrap();
+        assert!(!q.distinct);
+        assert_eq!(q.return_items[0].variable(), "count");
+    }
+}
+
+#[test]
+fn unsupported_aggregate_and_alias_grammar_remains_refused() {
+    for tail in [
+        "count(*)",
+        "count(DISTINCT n)",
+        "count(n.name)",
+        "count()",
+        "count(n, n)",
+        "sum(n)",
+        "avg(n)",
+        "count(n) AS total",
+        "n.name AS label",
+        "count(n) ORDER BY count(n)",
+        "count(n) ORDER BY count_n",
+        "DISTINCT",
+    ] {
+        let source = format!("MATCH (n) RETURN {tail}");
+        assert!(parse(&source).is_err(), "{source}");
+    }
+}
