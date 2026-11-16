@@ -25,11 +25,11 @@ struct OpsFileConcurrencyProbePack {
 }
 
 impl khive_types::Pack for OpsFileConcurrencyProbePack {
-    const NAME: &'static str = "ops-file-concurrency-probe";
+    const NAME: &'static str = "ops_file_concurrency_probe";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
-        name: "reader_probe",
+        name: "ops_file_concurrency_probe.reader_probe",
         description: "records test-only handler concurrency",
         visibility: khive_runtime::Visibility::Verb,
         category: khive_runtime::VerbCategory::Assertive,
@@ -123,7 +123,7 @@ fn concurrency_probe_server(
 fn reader_probe_ops(count: usize) -> Vec<OpsFileEntry> {
     (0..count)
         .map(|sequence| OpsFileEntry {
-            tool: "reader_probe".to_string(),
+            tool: "ops_file_concurrency_probe.reader_probe".to_string(),
             args: serde_json::json!({"sequence": sequence}),
         })
         .collect()
