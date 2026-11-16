@@ -2786,6 +2786,48 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
         self.assertIn("docs/adr/README.md is named by a symlink in docs/adr", reasons)
 
+    def test_the_classifier_naming_a_path_in_its_comments_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        comment = '# the parent directory and the name as one path ("adr/README.md")\n'
+        self.write("scripts/ci-docs-only.sh", comment)
+        with_classifier = self.commit("classifier")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-004\n")
+        verdict, reasons = self.classify(with_classifier, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same line in any other script still names the index.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/other.sh", comment)
+        with_other = self.commit("other script")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-005\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_a_fixture_pair_exempts_its_reader_for_that_one_path_only(self):
+        base = self.shared_readme_base()
+        self.write("scripts/tests/test_ci_workflows.py",
+                   'self.write("docs/adr/README.md", "# ADR index\\n")\nself.write("notes/guide.md", "# Guide\\n")\n')
+        with_tests = self.commit("fixture tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-006\n")
+        verdict, reasons = self.classify(with_tests, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same file naming a path outside its pair still runs the full suite.
+        self.git("checkout", "-q", "--detach", with_tests)
+        self.write("notes/guide.md", "# Guide\n\nChanged.\n")
+        verdict, reasons = self.classify(with_tests, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+        # CONTROL: the same fixture line in another test file is not exempt.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/tests/test_other.py", 'self.write("docs/adr/README.md", "# ADR index\\n")\n')
+        with_other = self.commit("other tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-007\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
     def test_a_failing_count_scanner_runs_the_full_suite(self):
         # A copy of the classifier beside no scanner: the question cannot be answered, so the
         # change takes the full suite rather than the documentation lane.
