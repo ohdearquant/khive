@@ -544,7 +544,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
         "wasm-parity", "vamana-portability", "minio-blob-compat",
-        "msrv-check", "core-only",
+        "msrv-check", "core-only", "release-checks", "channel-tests", "s3-blob-tests",
     }
     # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
     # save the runner, like the gated lane jobs.
@@ -2103,8 +2103,9 @@ class DocsFormatPhaseTests(unittest.TestCase):
     def test_ripgrep_install_has_one_copy(self):
         workflow = workflow_text("ci.yml")
         self.assertNotIn("apt-get install", workflow)
-        ci_job = indented_block(workflow, "ci", 2)
-        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", ci_job)
+        # khive-contract, the one phase that needs rg, runs in the release-checks job.
+        release_job = indented_block(workflow, "release-checks", 2)
+        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", release_job)
         script = (REPO_ROOT / "scripts" / "ci-install-ripgrep.sh").read_text()
         self.assertIn("apt-get install --yes ripgrep", script)
         self.assertIn("set -euo pipefail", script)
@@ -2290,6 +2291,9 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
         "core-only": "Core-only feature set build and tests",
+        "release-checks": "Release build and release checks (${{ matrix.os }})",
+        "channel-tests": "Channel feature tests (${{ matrix.os }})",
+        "s3-blob-tests": "S3 blob store library tests",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
         "changed-paths": "Classify changed paths",
