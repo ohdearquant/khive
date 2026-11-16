@@ -137,13 +137,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Public structs gained fields, so direct struct literals must set them: `khive_mcp::args::Args`
   adds `catalog_verbosity`, `khive_query::GqlQuery` adds `order_by` (a `Vec` of
-  `khive_query::ast::OrderItem`), and `khive_rule_evaluator::Violation` adds `source` (an
-  `Option<NdjsonSource>`, not serialized).
+  `khive_query::ast::OrderItem`), `khive_rule_evaluator::Violation` adds `source` (an
+  `Option<NdjsonSource>`, not serialized), and `khive_pack_git::ingest::IngestReport` adds
+  `existing_project_annotation_warning_count` (a `u64`).
 - Enum variants gained fields: `khive_db::SqliteError::Migration` keeps the failed migration's cause
   as `source`, and `khive_pack_comm::OutboxScanOutcome::Success` adds `backlog`, so patterns and
   constructors naming every field must include them.
 - Enums gained variants, so an exhaustive match must handle them: `khive_query::ast::PropertyRef`
-  adds `MetadataPath`, and `khive_runtime::RuntimeError` adds `AttachmentCutoverRequired`.
+  adds `MetadataPath`, `khive_runtime::RuntimeError` adds `AttachmentCutoverRequired` and
+  `SearchRead`, and `khive_types::event::EventKind` and `khive_types::event::EventPayload` add
+  `ToolRegistrationChanged`.
+- `EventKind::ToolRegistrationChanged` is declared before `LinkCreated`, so every later variant's
+  implicit discriminant, from `LinkCreated` through `GrantChange`, rises by one. Code that casts an
+  `EventKind` to an integer gets new values; the event names (`EventKind::name` and its `FromStr`)
+  are unchanged.
+- `khive_db::ProgressConn` is now hidden from the documentation. It stays exported for use inside
+  the workspace and is no longer part of the documented API.
 - Coordinated search returns its stop error instead of a partial result:
   `khive_mcp::coordinator::CoordinatorService::fan_out_search` and `fan_out_search_scoped` return
   `Result<CoordSearchResult, RuntimeError>`, and `kkernel::coordinator::SubstrateCoordinator`'s
