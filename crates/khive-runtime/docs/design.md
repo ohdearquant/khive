@@ -56,7 +56,10 @@
 - Hard entity/note deletion removes attachment rows in the same transaction;
   soft deletion retains them as recoverable liveness anchors
 - Direct `KhiveRuntime::new` may finish an empty V21 migration, but refuses a
-  legacy application-assisted cutover. Production hosts use
+  legacy application-assisted cutover; an embedding host completes it with the
+  public `coordinate_attachment_cutover` and constructs again (with a
+  legacy-preference verifier and a blob hydrator when the database holds legacy
+  moodboard preference models; without them the call fails closed). Production hosts use
   `from_prepared_backend` only after the async boot coordinator has authenticated
   legacy pack evidence and completed V21
 

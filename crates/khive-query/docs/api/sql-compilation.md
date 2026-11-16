@@ -88,6 +88,14 @@ Canonical edges bind through `graph_edges`, while endpoint nodes bind through a 
 
 The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and resolves WHERE predicates and RETURN projections against the bound variable's substrate. Fixed-length results append every bound node and edge identity after any requested ordering terms, before applying `LIMIT`/`OFFSET`; substrate discriminators precede UUIDs so equal IDs in different union members remain distinct, and synthetic observations use their `(event_id, role, position)` primary key.
 
+### Connected comma-separated paths
+
+The fixed compiler walks all paths in textual order with globally unique node and edge aliases. Each later root adds a `CROSS JOIN` of the same filtered node source, followed by its ordinary edge/node joins. Shared node variables add both substrate and UUID equality predicates; disconnected components are refused before lowering. References retain the first alias, and every occurrence keeps its own filters. Namespace, deletion and mailbox predicates apply to every occurrence before matching and paging, with the caller actor parameter bound once and reused.
+
+The result is the conjunction of path matches with bag multiplicity. Two matches on one branch and three on another yield six tuples. Distinct edge variables may select the same edge; neither paths nor equal projected rows are deduplicated. There is one global WHERE tree, projection, order and paging tail. The identity suffix covers every occurrence in textual path/element order, with substrate before node UUID and edge UUID at each edge occurrence. Requested DESC terms do not reverse that suffix.
+
+An empty additional-pattern vector preserves existing fixed, recursive, synthetic and SPARQL SQL and parameter bytes. Multi-pattern queries execute as one compiled read; no Rust-side joining or per-path paging is introduced. Connectedness does not bound intermediate fanout or sorting work. Page bounds remain result bounds, and cancellation and unchanged-data continuation qualifications from [ADR-008 Amendment 1](../../../../docs/adr/ADR-008-query-layer-separation.md#amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14) continue to apply.
+
 ## Caller ordering and continuation
 
 `ORDER BY` resolves validated scalar fields or named node-properties/canonical-edge-metadata paths. It emits no extra result columns. Bare containers and namespace fields are rejected; direction is a typed `Asc` or `Desc`, never caller-supplied SQL. Queries using neither metadata nor ordering retain unchanged SQL and parameters.
@@ -127,4 +135,4 @@ The end-node union is always joined because end filters apply even when the end 
 
 Whole-variable projections expand to the allowed columns for their substrate. Property projections are checked against node, event, observation-target, or edge whitelists; unknown columns return `QueryError::Compile`. Fixed-length `RETURN e` retains `id`, `source_id`, `target_id`, `relation`, and `weight`; recursive `RETURN e` retains the final edge's `id`, `relation`, and `weight`. Metadata requires explicit `RETURN e.metadata`. Edge predicates accept direct `relation`/`weight` or explicit metadata paths. Synthetic observation edges reject metadata projection, predicates and ordering.
 
-Common unsupported cases include repeated variables, zero-hop paths, mixed fixed/variable chains, SPARQL `*`, variable-length synthetic edges, and `OR` spanning both variable-length endpoints. Limits or depths that cannot fit the SQL parameter type return `InvalidInput` rather than wrapping.
+Common unsupported cases include repeated node variables within a path, repeated edge bindings, disconnected comma components, recursive or synthetic multi-pattern matches, zero-hop paths, mixed fixed/variable chains, SPARQL `*`, variable-length synthetic edges, and `OR` spanning both variable-length endpoints. Limits or depths that cannot fit the SQL parameter type return `InvalidInput` rather than wrapping.

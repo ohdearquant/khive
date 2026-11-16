@@ -57,7 +57,7 @@ To build from a source checkout instead, see [Quick start](#quick-start).
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **162 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **163 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 20 closed relations in 10 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic, ownership)          |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -95,7 +95,7 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **162 verbs** out of the box (updated from the
+All 14 packs load by default, giving **163 verbs** out of the box (updated from the
 current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
@@ -109,7 +109,7 @@ before editing this table):
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                                                                                                           |
 | **knowledge** | `knowledge.` | 21    | Atom-based KB with embedding rerank search                                                                                                                                       |
 | **session**   | `session.`   | 7     | Session records, dependency-gated mirror search, store stats, and compaction (store/list/resume/export/search/stats/vacuum)                                                      |
-| **tool**      | `tool.`      | 14    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                      |
+| **tool**      | `tool.`      | 15    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                      |
 | **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                                                     |
 | **git**       | `git.`       | 17    | Provenance ingest, branch/commit/update_ref/push writes (ADR-108), dev-loop verbs: checkout, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge (ADR-182) |
 | **code**      | `code.`      | 4     | Source ingest and registered-map list, search, dependency reads (ADR-085, ADR-139)                                                                                               |
@@ -187,7 +187,7 @@ records what's connected, in which direction, and why.
 │  khive-pack-blob:      content-addressed object storage       │
 │                        (9 verbs)                              │
 │  khive-pack-tool:      tool/skill/plugin registry, capability │
-│                        discovery, use policy (14 verbs)       │
+│                        discovery, use policy (15 verbs)       │
 │  khive-pack-exec:      sandboxed run over a materialized tree │
 │                        (9 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
@@ -310,7 +310,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 162-verb catalog.
+MCP client discovers the `request` tool with the full 163-verb catalog.
 
 ### Usage
 
@@ -419,7 +419,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-162 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
+163 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

@@ -135,6 +135,14 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    fn slug(&self) -> String {
+        if self.config.maintainer_slug.trim().is_empty() {
+            self.kind().to_string()
+        } else {
+            self.config.maintainer_slug.clone()
+        }
+    }
+
     fn is_configured(&self) -> bool {
         !self.config.bot_token.is_empty()
     }

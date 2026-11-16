@@ -549,6 +549,79 @@ impl SubstrateCoordinator {
         }
     }
 
+    /// Search requires an owner read to distinguish absence from a failed probe.
+    /// Generic by-ID lookup retains its existing optional-result contract.
+    pub(super) async fn locate_for_search(
+        &self,
+        id: Uuid,
+        namespace: &Namespace,
+        substrate: khive_runtime::error::SearchReadSubstrate,
+    ) -> khive_runtime::RuntimeResult<Option<BackendId>> {
+        if let Some(backend_id) = self.locator.get(id) {
+            let Some(entry) = self.registry.get(&backend_id) else {
+                return Ok(None);
+            };
+            return Self::probe_search_owner(&entry.runtime, namespace, id)
+                .await
+                .map(|found| found.then_some(backend_id.clone()))
+                .map_err(|error| error.with_search_read_context(backend_id, substrate));
+        }
+
+        let mut handles = Vec::with_capacity(self.registry.len());
+        for entry in self.registry.iter() {
+            let backend_id = entry.id.clone();
+            let runtime = Arc::clone(&entry.runtime);
+            let namespace = namespace.clone();
+            let locator = Arc::clone(&self.locator);
+            let task_backend = backend_id.clone();
+            let handle = tokio::spawn(khive_storage::inherit_request_read_context(async move {
+                let found = Self::probe_search_owner(&runtime, &namespace, id).await?;
+                if found {
+                    locator.insert(id, task_backend);
+                }
+                Ok::<_, RuntimeError>(found)
+            }));
+            handles.push((backend_id, handle));
+        }
+        // Settle every probe, preserving registry order rather than task finish
+        // order. A healthy owner wins over an unrelated failed candidate.
+        let mut owner = None;
+        let mut first_error = None;
+        for (backend_id, handle) in handles {
+            let result = match handle.await {
+                Ok(result) => result,
+                Err(_) => Err(RuntimeError::Internal(
+                    "search owner probe task failed".into(),
+                )),
+            };
+            match result {
+                Ok(true) if owner.is_none() => owner = Some(backend_id),
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error.with_search_read_context(backend_id, substrate));
+                }
+                _ => {}
+            }
+        }
+        match (owner, first_error) {
+            (Some(owner), _) => Ok(Some(owner)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
+    }
+
+    async fn probe_search_owner(
+        runtime: &Arc<KhiveRuntime>,
+        namespace: &Namespace,
+        id: Uuid,
+    ) -> khive_runtime::RuntimeResult<bool> {
+        let token = runtime.authorize(namespace.clone())?;
+        match runtime.resolve_edge_endpoint(&token, id).await? {
+            Some(Resolved::Entity(_) | Resolved::Note(_) | Resolved::Event(_)) => return Ok(true),
+            Some(Resolved::PackRecord { .. }) | None => {}
+        }
+        Ok(runtime.get_edge(&token, id).await?.is_some())
+    }
+
     /// Prewarm the locator cache after a successful create.
     ///
     /// Called by the `SubstrateCoordinatorService` so that the first `locate()`

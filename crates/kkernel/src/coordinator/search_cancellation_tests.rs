@@ -740,39 +740,49 @@ async fn backend_failure_remains_partial_success_while_parent_read_is_active() {
         let fixture = SearchFixture::new().await;
         let coordinator = fixture.coordinator().with_failing_backend("beta");
         for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
-            let (request, _) = fixture.request(substrate, "score", false);
-            let service = SubstrateCoordinatorService::new(
-                fixture.coordinator().with_failing_backend("beta"),
-            );
-            let result = service
-                .fan_out_search(&request, &fixture.namespace, &[])
-                .await
-                .unwrap_or_else(|error| panic!("ordinary backend failure escaped: {error}"));
-            assert_eq!(
-                hit_ids(&result.entity_hits, &result.note_hits, substrate),
-                fixture.ids(substrate)
-            );
-            assert!(result.partial);
-            assert_eq!(result.per_backend.len(), 2);
-            let failed = result
-                .per_backend
-                .iter()
-                .find(|row| row.backend_id.as_str() == "beta")
-                .unwrap();
-            assert_eq!(
-                failed.error.as_ref().unwrap().kind,
-                khive_mcp::coordinator::BackendSearchFailureKind::BackendError
-            );
-            let (entities, notes, _) = coordinator
-                .fan_out_search(&request, &fixture.namespace)
-                .await
-                .unwrap();
-            assert_eq!(
-                hit_ids(&entities, &notes, substrate),
-                fixture.ids(substrate)
-            );
-            khive_storage::ensure_request_read_active("search")
-                .expect("backend failure did not stop parent request");
+            let (sender, receiver) = watch::channel(false);
+            khive_storage::scope_request_read_cancellation(receiver, async {
+                let (request, _) = fixture.request(substrate, "score", false);
+                let service = SubstrateCoordinatorService::new(
+                    fixture.coordinator().with_failing_backend("beta"),
+                );
+                let result = service
+                    .fan_out_search(&request, &fixture.namespace, &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("ordinary backend failure escaped: {error}"));
+                assert_eq!(
+                    hit_ids(&result.entity_hits, &result.note_hits, substrate),
+                    fixture.ids(substrate)
+                );
+                assert!(result.partial);
+                assert_eq!(result.per_backend.len(), 2);
+                let failed = result
+                    .per_backend
+                    .iter()
+                    .find(|row| row.backend_id.as_str() == "beta")
+                    .unwrap();
+                assert_eq!(
+                    failed.error.as_ref().unwrap().kind,
+                    khive_mcp::coordinator::BackendSearchFailureKind::BackendError
+                );
+                let (entities, notes, _) = coordinator
+                    .fan_out_search(&request, &fixture.namespace)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    hit_ids(&entities, &notes, substrate),
+                    fixture.ids(substrate)
+                );
+                khive_storage::ensure_request_read_active("search")
+                    .expect("backend failure did not stop parent request");
+                sender.send(true).expect("request scope remains installed");
+                let error = khive_storage::ensure_request_read_active("search")
+                    .expect_err("explicit stop must be visible in the parent request");
+                assert!(
+                    matches!(error, StorageError::Timeout { operation } if operation == "search")
+                );
+            })
+            .await;
         }
         fixture.assert_unchanged().await;
         fixture.close().await;
@@ -849,4 +859,523 @@ async fn actual_coordinator_metadata_stop_has_no_mcp_page_and_preserves_proof() 
         fixture.close().await;
     })
     .await;
+}
+
+fn read_substrate(substrate: SearchSubstrate) -> khive_runtime::error::SearchReadSubstrate {
+    match substrate {
+        SearchSubstrate::Entity => khive_runtime::error::SearchReadSubstrate::Entity,
+        SearchSubstrate::Note => khive_runtime::error::SearchReadSubstrate::Note,
+    }
+}
+
+fn install_read_fault(
+    runtime: &KhiveRuntime,
+    substrate: SearchSubstrate,
+    denials: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::Ordering;
+    assert_eq!(
+        runtime.backend().pool().max_readers(),
+        0,
+        "private memory reads share the writer connection"
+    );
+    let table = match substrate {
+        SearchSubstrate::Entity => "entities",
+        SearchSubstrate::Note => "notes",
+    };
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|connection| {
+            connection.test_authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Read { table_name, .. } if table_name == table)
+                && denials.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        })
+        .unwrap();
+}
+
+fn remove_read_fault(runtime: &KhiveRuntime) {
+    use khive_db::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthContext, Authorization};
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .autocommit_sqlite(|connection| {
+            connection.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        })
+        .unwrap();
+}
+
+fn assert_read_failure<T>(result: RuntimeResult<T>, backend: &str, substrate: SearchSubstrate) {
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("required search read returned success"),
+    };
+    let RuntimeError::SearchRead { context } = &error else {
+        panic!("missing typed search context: {error}")
+    };
+    assert_eq!(context.backend().as_str(), backend);
+    assert_eq!(context.substrate(), read_substrate(substrate));
+    assert!(
+        matches!(
+            context.source(),
+            RuntimeError::Storage(StorageError::Driver { .. })
+        ),
+        "actual database denial must be the cause: {error:?}"
+    );
+    let value = khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Runtime {
+        error,
+        boundary: DomainDisposition::Unknown,
+    })
+    .into_error();
+    assert_eq!(value["code"], "search_read_failed");
+    assert_eq!(value["cause_class"], "storage");
+    assert_eq!(
+        value["search_context"],
+        json!({"backend": backend, "substrate": read_substrate(substrate).as_str()})
+    );
+}
+
+async fn fault_metadata<T>(
+    fixture: &SearchFixture,
+    phase: SearchMetadataPhase,
+    substrate: SearchSubstrate,
+    target: Uuid,
+    future: impl Future<Output = RuntimeResult<T>>,
+) -> (RuntimeResult<T>, Vec<SearchMetadataRead>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    let (resume_sender, resume_receiver) = oneshot::channel();
+    let ready = Arc::new(Mutex::new(Some(ready_sender)));
+    let resume = Arc::new(Mutex::new(Some(resume_receiver)));
+    let hook: super::SearchMetadataHook = Arc::new(move |read| {
+        let selected = read.phase == phase && read.substrate == substrate && read.id == target;
+        let paused = if selected {
+            Some((
+                ready.lock().unwrap().take().expect("one selected read"),
+                resume.lock().unwrap().take().expect("one resume"),
+            ))
+        } else {
+            None
+        };
+        Box::pin(async move {
+            if let Some((ready, resume)) = paused {
+                ready.send(read).expect("controller alive");
+                resume.await.expect("controller releases read");
+            }
+        })
+    });
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&log);
+    let observer: Arc<dyn Fn(SearchMetadataRead) + Send + Sync> =
+        Arc::new(move |read| recorded.lock().unwrap().push(read));
+    let denials = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = watch::channel(false);
+    let search = khive_storage::scope_request_read_cancellation(receiver, async {
+        let result = super::scope_before_search_metadata(
+            hook,
+            scope_search_metadata_observer(observer, future),
+        )
+        .await;
+        let active = khive_storage::ensure_request_read_active("search");
+        (result, active)
+    });
+    let controller = async {
+        let read = ready_receiver.await.expect("metadata hook reached");
+        install_read_fault(&fixture.runtime, substrate, Arc::clone(&denials));
+        resume_sender.send(()).expect("paused read still alive");
+        read
+    };
+    let joined = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(search, controller)
+    })
+    .await;
+    // The joined futures hold no connection here, including on timeout.
+    remove_read_fault(&fixture.runtime);
+    let ((result, active), read) = joined.expect("fault controller and search settle");
+    assert_eq!(
+        read,
+        SearchMetadataRead {
+            phase,
+            substrate,
+            id: target
+        }
+    );
+    assert_eq!(
+        denials.load(Ordering::SeqCst),
+        1,
+        "exactly one actual read denied"
+    );
+    assert!(
+        !*sender.borrow(),
+        "no cancellation substitutes for the read fault"
+    );
+    active.expect("parent remains active after the read failure");
+    let reads = std::mem::take(&mut *log.lock().unwrap());
+    (result, reads)
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn required_metadata_errors_refuse_first_and_later_reads() {
+    bounded(async {
+        let fixture = SearchFixture::new().await;
+        for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
+            let ids = fixture.ids(substrate);
+            for (phase, order, range) in [
+                (SearchMetadataPhase::Finalize, "score", true),
+                (SearchMetadataPhase::Finalize, "created_at", false),
+                (SearchMetadataPhase::Finalize, "updated_at", false),
+                (SearchMetadataPhase::Hydrate, "score", false),
+            ] {
+                let (request, _) = fixture.request(substrate, order, range);
+                for index in 0..2 {
+                    let coordinator = fixture.coordinator();
+                    let service = fixture.service();
+                    let (mut entities, mut notes) = fixture.hits(substrate);
+                    let future = async {
+                        match phase {
+                            SearchMetadataPhase::Finalize => {
+                                coordinator
+                                    .finalize_search_hits(
+                                        &mut entities,
+                                        &mut notes,
+                                        &request,
+                                        &fixture.namespace,
+                                    )
+                                    .await
+                            }
+                            SearchMetadataPhase::Hydrate => service
+                                .fan_out_search(&request, &fixture.namespace, &[])
+                                .await
+                                .map(|_| ()),
+                        }
+                    };
+                    let (result, reads) =
+                        fault_metadata(&fixture, phase, substrate, ids[index], future).await;
+                    assert_reads(&reads, phase, substrate, &ids[..index]);
+                    assert_read_failure(result, "alpha", substrate);
+                    fixture.assert_unchanged().await;
+                }
+                let healthy = fixture
+                    .service()
+                    .fan_out_search(&request, &fixture.namespace, &[])
+                    .await
+                    .unwrap();
+                assert_eq!(healthy.entity_kinds.len() + healthy.note_kinds.len(), 2);
+                assert_eq!(
+                    healthy.entity_versions.len() + healthy.note_versions.len(),
+                    2
+                );
+                assert!(!healthy.partial);
+            }
+        }
+        fixture.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn selected_owner_read_errors_are_not_missing_hits() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    bounded(async {
+        let fixture = SearchFixture::new().await;
+        for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
+            for (order, range) in [("score", false), ("created_at", false), ("score", true)] {
+                let (request, _) = fixture.request(substrate, order, range);
+                let service = fixture.service();
+                let denials = Arc::new(AtomicUsize::new(0));
+                install_read_fault(&fixture.runtime, substrate, Arc::clone(&denials));
+                let (sender, receiver) = watch::channel(false);
+                let result = khive_storage::scope_request_read_cancellation(receiver, async {
+                    let result = service
+                        .fan_out_search(&request, &fixture.namespace, &[])
+                        .await;
+                    (result, khive_storage::ensure_request_read_active("search"))
+                })
+                .await;
+                remove_read_fault(&fixture.runtime);
+                assert_eq!(denials.load(Ordering::SeqCst), 1);
+                assert!(!*sender.borrow());
+                result.1.expect("parent stays active");
+                assert_read_failure(result.0, "alpha", substrate);
+            }
+        }
+        fixture.assert_unchanged().await;
+        fixture.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn cold_search_owner_distinguishes_misses_failures_and_surviving_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    bounded(async {
+        let fixture = SearchFixture::new().await;
+        for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
+            let empty = SubstrateCoordinator::new(BackendRegistry::new());
+            assert!(empty
+                .locate_for_search(
+                    Uuid::from_u128(999),
+                    &fixture.namespace,
+                    read_substrate(substrate)
+                )
+                .await
+                .unwrap()
+                .is_none());
+            let mut backends = BackendRegistry::new();
+            backends.register(
+                BackendId::parse("alpha").unwrap(),
+                Arc::clone(&fixture.empty),
+            );
+            backends.register(
+                BackendId::parse("beta").unwrap(),
+                Arc::clone(&fixture.runtime),
+            );
+            let coordinator = SubstrateCoordinator::new(backends);
+            let missing = Uuid::from_u128(999);
+            assert!(coordinator
+                .locate_for_search(missing, &fixture.namespace, read_substrate(substrate))
+                .await
+                .unwrap()
+                .is_none());
+            for (id, found) in [(missing, false), (fixture.ids(substrate)[0], true)] {
+                let denials = Arc::new(AtomicUsize::new(0));
+                install_read_fault(&fixture.empty, substrate, Arc::clone(&denials));
+                let result = coordinator
+                    .locate_for_search(id, &fixture.namespace, read_substrate(substrate))
+                    .await;
+                remove_read_fault(&fixture.empty);
+                assert_eq!(denials.load(Ordering::SeqCst), 1);
+                if found {
+                    assert_eq!(result.unwrap().unwrap().as_str(), "beta");
+                } else {
+                    assert_read_failure(result, "alpha", substrate);
+                }
+            }
+            // A cached owner that confirms absence retains the optional result.
+            coordinator.record_created(missing, BackendId::parse("alpha").unwrap());
+            assert!(coordinator
+                .locate_for_search(missing, &fixture.namespace, read_substrate(substrate))
+                .await
+                .unwrap()
+                .is_none());
+            coordinator.record_created(missing, BackendId::parse("removed").unwrap());
+            assert!(coordinator
+                .locate_for_search(missing, &fixture.namespace, read_substrate(substrate))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        fixture.assert_unchanged().await;
+        fixture.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn metadata_rows_disappearing_after_lookup_remain_true_misses() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    bounded(async {
+        for substrate in [SearchSubstrate::Entity, SearchSubstrate::Note] {
+            for phase in [SearchMetadataPhase::Finalize, SearchMetadataPhase::Hydrate] {
+                let fixture = SearchFixture::new().await;
+                let id = fixture.ids(substrate)[0];
+                let runtime = Arc::clone(&fixture.runtime);
+                let token = fixture.token.clone();
+                let mut entity = fixture.entities[0].clone();
+                let mut note = fixture.notes[0].clone();
+                entity.deleted_at = Some(9_000_000);
+                note.deleted_at = Some(9_000_000);
+                let reached = Arc::new(AtomicUsize::new(0));
+                let count = Arc::clone(&reached);
+                let hook: super::SearchMetadataHook = Arc::new(move |read| {
+                    let runtime = Arc::clone(&runtime);
+                    let token = token.clone();
+                    let entity = entity.clone();
+                    let note = note.clone();
+                    let count = Arc::clone(&count);
+                    Box::pin(async move {
+                        if read
+                            == (SearchMetadataRead {
+                                phase,
+                                substrate,
+                                id,
+                            })
+                        {
+                            assert_eq!(count.fetch_add(1, Ordering::SeqCst), 0);
+                            match substrate {
+                                SearchSubstrate::Entity => runtime
+                                    .entities(&token)
+                                    .unwrap()
+                                    .upsert_entity(entity)
+                                    .await
+                                    .unwrap(),
+                                SearchSubstrate::Note => runtime
+                                    .notes(&token)
+                                    .unwrap()
+                                    .upsert_note(note)
+                                    .await
+                                    .unwrap(),
+                            }
+                        }
+                    })
+                });
+                let (request, _) =
+                    fixture.request(substrate, "score", phase == SearchMetadataPhase::Finalize);
+                let service = fixture.service();
+                let result = super::scope_before_search_metadata(
+                    hook,
+                    service.fan_out_search(&request, &fixture.namespace, &[]),
+                )
+                .await
+                .expect("genuine disappearance remains tolerated");
+                assert_eq!(reached.load(Ordering::SeqCst), 1);
+                assert!(!result.partial);
+                assert_eq!(result.entity_kinds.len() + result.note_kinds.len(), 1);
+                let expected = if phase == SearchMetadataPhase::Finalize {
+                    vec![fixture.ids(substrate)[1]]
+                } else {
+                    fixture.ids(substrate)
+                };
+                assert_eq!(
+                    hit_ids(&result.entity_hits, &result.note_hits, substrate),
+                    expected
+                );
+                match substrate {
+                    SearchSubstrate::Entity => assert_eq!(
+                        fixture
+                            .runtime
+                            .entities(&fixture.token)
+                            .unwrap()
+                            .get_entity_including_deleted(id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .deleted_at,
+                        Some(9_000_000)
+                    ),
+                    SearchSubstrate::Note => assert_eq!(
+                        fixture
+                            .runtime
+                            .notes(&fixture.token)
+                            .unwrap()
+                            .get_note_including_deleted(id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .deleted_at,
+                        Some(9_000_000)
+                    ),
+                }
+                fixture.close().await;
+            }
+        }
+    })
+    .await;
+}
+
+fn mailbox_registry(runtime: &Arc<KhiveRuntime>, actor: &str) -> VerbRegistry {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(runtime.config().gate.clone());
+    builder.with_default_namespace("local");
+    builder.with_actor_id(Some(actor.into()));
+    builder.with_runtime_event_store(runtime).unwrap();
+    PackRegistry::register_packs(
+        &["kg".into(), "comm".into()],
+        (**runtime).clone(),
+        &mut builder,
+    )
+    .unwrap();
+    let registry = builder.build().unwrap();
+    runtime.install_edge_rules(registry.all_edge_rules());
+    registry
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn mailbox_filtered_hit_never_reads_its_faulted_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    bounded(async {
+        let alpha = memory_runtime();
+        let beta = memory_runtime();
+        let sender_registry = mailbox_registry(&alpha, "sender");
+        let sent = sender_registry.dispatch_with_identity("comm.send", json!({
+            "to": "recipient", "content": "ordinary private mailbox content", "idempotency_key": "search-owner-filter",
+        }), Some(khive_runtime::RequestIdentity { namespace: "local".into(), actor_id: Some("sender".into()), ..Default::default() })).await.unwrap();
+        let id = Uuid::parse_str(sent["full_id"].as_str().unwrap()).unwrap();
+        let alpha_token = alpha.authorize(Namespace::local()).unwrap();
+        let beta_token = beta.authorize(Namespace::local()).unwrap();
+        let outbound = alpha.notes(&alpha_token).unwrap().get_note(id).await.unwrap().unwrap();
+        beta.notes(&beta_token).unwrap().upsert_note(outbound.clone()).await.unwrap();
+        let owner_copy = beta.notes(&beta_token).unwrap().get_note(id).await.unwrap().unwrap();
+        let hit = NoteSearchHit {
+            note_id: id, score: DeterministicScore::from_f64(0.9), rank_score_kind: RankScoreKind::Keyword,
+            signals: SearchSignals { vector_similarity: None, keyword_score: Some(DeterministicScore::from_raw(17)) },
+            source: SearchSource::Text, title: Some("private title".into()), snippet: Some("ordinary private mailbox content".into()),
+        };
+        let mut backends = BackendRegistry::new();
+        backends.register(BackendId::parse("alpha").unwrap(), Arc::clone(&alpha));
+        backends.register(BackendId::parse("beta").unwrap(), Arc::clone(&beta));
+        let coordinator = SubstrateCoordinator::new(backends).with_note_hits_override(HashMap::from([
+            ("alpha".into(), vec![hit]), ("beta".into(), vec![]),
+        ]));
+        coordinator.record_created(id, BackendId::parse("beta").unwrap());
+        let service = Arc::new(SubstrateCoordinatorService::new(coordinator));
+        let hidden_registry = mailbox_registry(&alpha, "unrelated");
+        let permitted_registry = mailbox_registry(&alpha, "sender");
+        let hidden = KhiveMcpServer::from_registry(hidden_registry.clone()).with_coordinator(service.clone());
+        let permitted = KhiveMcpServer::from_registry(permitted_registry.clone()).with_coordinator(service);
+        for order in ["created_at", "score"] {
+            let params = || RequestParams {
+                ops: json!([{"tool": "search", "args": {"kind": "note", "query": "mailbox", "order_by": order, "limit": 10}}]).to_string(),
+                presentation: Some("verbose".into()), format: Some("json".into()), ..Default::default()
+            };
+            // The permitted positive establishes that this real candidate exists.
+            let positive: Value = serde_json::from_str(&permitted.dispatch_request_local(params()).await.unwrap()).unwrap();
+            assert_eq!(positive["results"][0]["ok"], true, "{positive}");
+            assert_eq!(positive["results"][0]["result"].as_array().unwrap().len(), 1);
+            assert_eq!(positive["results"][0]["result"][0]["id"], id.to_string());
+            let denials = Arc::new(AtomicUsize::new(0));
+            install_read_fault(&beta, SearchSubstrate::Note, Arc::clone(&denials));
+            let hidden_response = hidden.dispatch_request_local(params()).await;
+            let hidden_denials = denials.load(Ordering::SeqCst);
+            let permitted_response = permitted.dispatch_request_local(params()).await;
+            remove_read_fault(&beta);
+            let hidden_response: Value = serde_json::from_str(&hidden_response.unwrap()).unwrap();
+            assert_eq!(hidden_response["results"][0]["ok"], true, "{hidden_response}");
+            assert_eq!(hidden_response["results"][0]["result"], json!([]));
+            assert!(!hidden_response.to_string().contains(&id.to_string()));
+            assert!(!hidden_response.to_string().contains("ordinary private mailbox content"));
+            assert_eq!(hidden_denials, 0, "early mailbox filter precedes owner lookup");
+            assert_eq!(denials.load(Ordering::SeqCst), 1, "permitted candidate proves the owner fault was armed");
+            let refused: Value = serde_json::from_str(&permitted_response.unwrap()).unwrap();
+            let entry = &refused["results"][0];
+            assert_eq!(entry["ok"], false, "{entry}");
+            assert!(entry.get("result").is_none());
+            assert_eq!(entry["error"]["code"], "search_read_failed");
+            assert_eq!(entry["error"]["search_context"], json!({"backend": "beta", "substrate": "note"}));
+            assert!(!entry.to_string().contains(&id.to_string()));
+        }
+        assert_eq!(alpha.notes(&alpha_token).unwrap().get_note(id).await.unwrap().unwrap(), outbound);
+        assert_eq!(beta.notes(&beta_token).unwrap().get_note(id).await.unwrap().unwrap(), owner_copy);
+        for registry in [sender_registry, hidden_registry, permitted_registry] {
+            tokio::time::timeout(Duration::from_secs(5), registry.shutdown_audit_batch()).await.unwrap().unwrap();
+        }
+    }).await;
 }
