@@ -5,21 +5,16 @@ include!("gql_tests/patterns_and_paging_tests.rs");
 include!("gql_tests/predicates_and_directions_tests.rs");
 
 #[test]
-fn comma_separated_match_patterns_name_unsupported_construct() {
-    let err = parse("MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b").unwrap_err();
-    assert!(
-        matches!(&err, QueryError::Unsupported(_)),
-        "multiple MATCH patterns must return Unsupported; got {err:?}"
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("comma-separated MATCH patterns"),
-        "error must name the unsupported construct; got: {msg}"
-    );
-    assert!(
-        msg.contains("e.id") && msg.contains("e.relation"),
-        "error must preserve edge identity in its alternative; got: {msg}"
-    );
+fn comma_separated_match_patterns_require_connected_bindings() {
+    let mut query = parse("MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b").unwrap();
+    assert_eq!(query.patterns().count(), 2);
+    crate::validate::validate(&mut query).unwrap();
+    let mut disconnected = parse("MATCH (a), (b) RETURN a, b").unwrap();
+    let error = crate::validate::validate(&mut disconnected).unwrap_err();
+    assert!(matches!(&error, QueryError::Unsupported(_)));
+    assert!(error
+        .to_string()
+        .contains("connected through shared named nodes"));
 }
 
 #[test]
@@ -70,20 +65,14 @@ fn gql_dialect_reference_matches_parser_contract() {
     }
 
     parse(SUPPORTED).expect("documented single-path alternative must parse");
-    for (query, feature) in [
-        (MULTI_PATTERN, "comma-separated MATCH patterns"),
-        (ALIAS, "aliases (`AS`)"),
-    ] {
-        let err = parse(query).unwrap_err();
-        assert!(
-            matches!(&err, QueryError::Unsupported(_)),
-            "documented unsupported form must return Unsupported; got {err:?}"
-        );
-        assert!(
-            err.to_string().contains(feature),
-            "documented error must name {feature:?}; got: {err}"
-        );
-    }
+    let mut multi = parse(MULTI_PATTERN).expect("documented connected paths must parse");
+    crate::validate::validate(&mut multi).expect("documented shared bindings must validate");
+    let err = parse(ALIAS).unwrap_err();
+    assert!(
+        matches!(&err, QueryError::Unsupported(_)),
+        "documented alias must return Unsupported; got {err:?}"
+    );
+    assert!(err.to_string().contains("aliases (`AS`)"));
 }
 
 #[test]
