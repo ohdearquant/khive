@@ -461,10 +461,11 @@ jobs:
       fail-fast: false
       # The workspace test suite is nextest-partitioned 2-way per OS (see the
       # "Workspace tests" step below). Non-partitioned phases run exactly once
-      # per OS: forward-deployed checks, Clippy, and channel feature tests run
-      # on shard 2, while the release build and its dependent checks remain on
-      # shard 1. The split follows measured step durations; dividing the test
-      # count alone leaves the complete jobs badly unbalanced.
+      # per OS: forward-deployed checks and Clippy run on shard 2, the lints
+      # and the no-default-features check on shard 1. The release build with
+      # the checks that run its binary, and the channel feature tests, run in
+      # their own jobs (release-checks, channel-tests) beside the shards, so
+      # neither sits on a shard's critical path.
       #
       # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
       # macos-pr step is gated `matrix.shard == 1`, so there is no second
@@ -568,11 +569,10 @@ jobs:
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
           # Sharded into the key: the shards build different profiles and
-          # features (the release build runs on shard 1; Clippy, the
-          # forward-deployed checks and the channel feature tests run on
-          # shard 2). With one shared key the first shard to finish saved and
-          # the other's artifacts never reached the cache, so the release
-          # build recompiled every dependency on every run.
+          # features (the no-default-features check runs on shard 1; Clippy
+          # and the forward-deployed checks run on shard 2). With one shared
+          # key the first shard to finish saved and the other's artifacts
+          # never reached the cache.
           key: line-tables-shard${{ matrix.shard }}
       # EMBEDDING MODEL CACHE. The embedder fetches its weights from
       # huggingface.co the first time it is built. Fetching per run made this
@@ -611,24 +611,6 @@ jobs:
         if: steps.model-cache.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
-      - uses: denoland/setup-deno@v2
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        with:
-          deno-version: v2.x
-      - uses: astral-sh/setup-uv@v5
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-      # The identifier-ban contract performs a repo-wide ripgrep scan and
-      # fails (rather than skips) when CI lacks rg (#1636). ubuntu-latest does
-      # not include it, so provision the instrument in every full-suite shard
-      # that runs khive-contract.
-      - name: Install khive-contract scan dependency (Linux)
-        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
-        run: ../scripts/ci-install-ripgrep.sh
-      - name: Install khive-contract scan dependency (macOS)
-        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'macOS'
-        run: |
-          brew install ripgrep
-          rg --version
       # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
       # phase so no PR-controlled build script or proc-macro executes before the
       # guard; it reads the pristine checkout. Keep this step ahead of every cargo
@@ -681,9 +663,6 @@ jobs:
       - name: Audit batch with production features
         if: runner.os == 'Linux' && matrix.shard == 2
         run: sh ../scripts/ci-audit-production.sh
-      - name: Channel-email feature tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh channel-email
       # Run this 25-repeat gate once per OS on shard 2. It is independent of
       # the workspace test partition, and its placement contributes to the
       # balance of the two complete jobs.
@@ -707,24 +686,6 @@ jobs:
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features
-      - name: Release build
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh release
-      - name: Contract tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh contract-tests
-      - name: Deno tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh deno-tests
-      - name: Smoke tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh smoke-tests
-      - name: Vector smoke test
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh vector-smoke
-      - name: khive-contract suite
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
-        run: ../scripts/ci.sh contract-suite
       # The pull-request scope step runs this kkernel to ingest the workspace map (ADR-205 D4). It is the
       # debug build the workspace tests just ran, published only by a main push run whose shard 1 passed
       # every step above, with its debug sections stripped.
@@ -742,6 +703,190 @@ jobs:
           path: ${{ runner.temp }}/kkernel-scope/kkernel
           retention-days: 7
           if-no-files-found: error
+
+  # The release build and the checks that run its binary. They ran at the end of shard 1, where the release
+  # build alone took about 8 of the shard's 41 minutes; here they run beside the shards on the same
+  # operating systems, against the same commit, and the gate requires this job like any other.
+  release-checks:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Release build and release checks (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-release
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: astral-sh/setup-uv@v5
+      # The identifier-ban contract performs a repo-wide ripgrep scan and
+      # fails (rather than skips) when CI lacks rg (#1636). ubuntu-latest does
+      # not include it, so provision the instrument before khive-contract runs.
+      - name: Install khive-contract scan dependency (Linux)
+        if: runner.os == 'Linux'
+        run: ../scripts/ci-install-ripgrep.sh
+      - name: Install khive-contract scan dependency (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ripgrep
+          rg --version
+      - name: Release build
+        run: ../scripts/ci.sh release
+      - name: Contract tests
+        run: ../scripts/ci.sh contract-tests
+      - name: Deno tests
+        run: ../scripts/ci.sh deno-tests
+      - name: Smoke tests
+        run: ../scripts/ci.sh smoke-tests
+      - name: Vector smoke test
+        run: ../scripts/ci.sh vector-smoke
+      - name: khive-contract suite
+        run: ../scripts/ci.sh contract-suite
+
+  # The email and Telegram channel and retrieval executor feature tests, moved off shard 2 for the same
+  # reason: about 10 of that shard's 41 minutes.
+  channel-tests:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Channel feature tests (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-channels
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - name: Channel-email feature tests
+        run: ../scripts/ci.sh channel-email
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
@@ -1762,11 +1907,6 @@ jobs:
       # import adapter and repository showcase suites with both features on.
       - name: Run the kg import adapter and repository showcase suites
         run: cargo test -p kkernel --features kg-adapters,repo-showcase --locked --lib --test kg_import_csv --test kg_import_bibtex --test kg_import_schema --test kg_import_conflicts --test repo_showcase_cli
-      # blob-s3 is off by default, so the ci job runs only the refusal side of an S3
-      # store configuration, and the MinIO job runs only the conformance suite. This
-      # step runs the S3 store, configuration and server library tests.
-      - name: Run the S3 blob store library tests
-        run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
       # The install gate probes the operator build with an isolated config, and a pack
       # that refuses to register under that config fails every install. This step
       # builds kkernel with the build-local feature set and runs the same probe on it,
@@ -1792,6 +1932,71 @@ jobs:
             printf '%s: %s (%s seconds)\n' "$feature" "$result" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
           done
           exit "$status"
+
+  # The S3 store library tests, moved out of the core-only job: about 13 of its 40 minutes, compiled under
+  # a feature set no other core-only step uses.
+  s3-blob-tests:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}S3 blob store library tests
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The same embedding model cache the ci job restores, under the same key. With
+      # LATTICE_OFFLINE set above, a library test that needs the model fails naming
+      # the missing directory instead of fetching from huggingface.co.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      # blob-s3 is off by default, so the ci job runs only the refusal side of an S3
+      # store configuration, and the MinIO job runs only the conformance suite. This
+      # step runs the S3 store, configuration and server library tests.
+      - name: Run the S3 blob store library tests
+        run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
 
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
@@ -2148,6 +2353,9 @@ jobs:
       - minio-blob-compat
       - msrv-check
       - core-only
+      - release-checks
+      - channel-tests
+      - s3-blob-tests
     if: always()
     steps:
       # DRAFT. A draft pull request runs the lint and classify jobs only; the heavy jobs skip until it is
@@ -2180,7 +2388,8 @@ jobs:
                then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
-                     "msrv-check", "core-only"]
+                     "msrv-check", "core-only", "release-checks", "channel-tests",
+                     "s3-blob-tests"]
                else [] end) as $docs_lane_skips
             | (.["changed-paths"].outputs.test_scope // "") as $scope
             | (if .["changed-paths"].result == "success"

@@ -544,7 +544,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
         "wasm-parity", "vamana-portability", "minio-blob-compat",
-        "msrv-check", "core-only",
+        "msrv-check", "core-only", "release-checks", "channel-tests", "s3-blob-tests",
     }
     # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
     # save the runner, like the gated lane jobs.
@@ -2290,6 +2290,9 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
         "core-only": "Core-only feature set build and tests",
+        "release-checks": "Release build and release checks (${{ matrix.os }})",
+        "channel-tests": "Channel feature tests (${{ matrix.os }})",
+        "s3-blob-tests": "S3 blob store library tests",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
         "changed-paths": "Classify changed paths",
