@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- GQL canonical paths can combine fixed steps and bounded variable segments. The sum of
+  variable-segment maxima is capped at ten; traversal depth and weight exclude fixed steps.
+  Mixed WHERE expressions run on complete matches, including OR across bindings (#6686).
+- GQL supports typed RETURN paths below node properties and edge metadata, explicit DISTINCT,
+  and binding counts grouped by the other returned values. Grouping and deduplication precede
+  ordering and paging; null zero-hop edges contribute zero to counts (#6687, #6689).
+- GQL supports correlated fixed canonical `NOT EXISTS` paths, including intermediate-node
+  correlations in mixed paths, with visibility filtering before grouping and paging (#6688).
+
+### Changed
+
+- GQL query-text LIMIT applies after SKIP on each page. Existing terminal-page and sentinel
+  rules remain unchanged (#6691).
+- Zero-hop query matches retain the same substrate and UUID at both endpoints, zero traversal
+  metrics and null final-edge fields, including isolated visible nodes (#6690).
+
+### Breaking (Rust crates)
+
+- `khive_query::GqlQuery` adds `distinct: bool`; direct constructors set it to false for legacy
+  behavior. Exhaustive `ReturnItem` matches must handle `Path(String, PropertyRef)` and
+  `Count(String)`. Exhaustive `WhereExpr` matches must handle `NotExists(MatchPattern)`;
+  `conditions()` and `for_each_condition_mut()` continue to visit only outer scalar conditions.
+
 ## [0.20.0] - 2026-11-16
 ### Added
 

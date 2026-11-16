@@ -1008,11 +1008,13 @@ Response shape:
 
 GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL
 INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is
-rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. Queries
-that mix fixed-length and variable-length chains are not compiled in one call; split
-them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
+rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. A single canonical path may combine fixed steps with bounded variable-length segments.
+The sum of variable-segment maximum hop counts must not exceed 10; fixed steps do not
+contribute to that sum or to the returned traversal metrics. GQL string equality uses SQLite `COLLATE NOCASE`,
 so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
-GQL results have a deterministic identity order. When a response has `has_more: true`,
+GQL results have a deterministic order. Ordinary queries retain identity or traversal
+tie-breakers; grouped and `RETURN DISTINCT` results break ties by returned values,
+without hidden identities or traversal metrics. When a response has `has_more: true`,
 repeat the same query with `SKIP` set to its `next_offset`; keep `page_size` unchanged.
 SPARQL `OFFSET` is not part of the supported dialect.
 
@@ -1027,7 +1029,9 @@ request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d
 ```
 
 For an exhaustive audit, omit query-text `LIMIT` so the server can report whether another
-page exists. An explicit `LIMIT` at or below `page_size` is a terminal caller-chosen bound.
+page exists. Query-text `LIMIT` counts rows after `SKIP`: `SKIP 10 LIMIT 3` returns up to
+three rows starting at offset 10. An explicit `LIMIT` at or below `page_size` is a terminal
+caller-chosen bound.
 
 ```text
 request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b\", page_size=500)")

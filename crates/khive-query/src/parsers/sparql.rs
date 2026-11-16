@@ -119,7 +119,8 @@ impl SparqlParser {
                 (1, DEFAULT_HOP_CAP)
             }
             Some('*') => {
-                // The CTE cannot emit depth zero; treating `*` as `+` would lose matches.
+                // Unbounded zero-or-more syntax remains unsupported; explicit
+                // bounded ranges can include zero without silently imposing a cap.
                 return Err(QueryError::Unsupported(
                     "SPARQL '*' (zero-or-more hops) not yet supported; use '+' or '{min,max}'"
                         .into(),
@@ -473,6 +474,7 @@ fn triples_to_ast(
     }
 
     Ok(GqlQuery {
+        distinct: false,
         order_by: Vec::new(),
         pattern: MatchPattern { elements },
         additional_patterns: Vec::new(),

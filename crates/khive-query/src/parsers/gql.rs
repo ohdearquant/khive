@@ -399,16 +399,31 @@ impl Parser {
         })
     }
 
+    /// Parses a scalar condition or one contextual, scoped absence atom.
+    fn parse_where_atom(&mut self) -> Result<WhereExpr, QueryError> {
+        self.skip_whitespace();
+        let start = self.pos;
+        if self.try_keyword("NOT") && self.try_keyword("EXISTS") {
+            self.expect_char('{')?;
+            let pattern = self.parse_pattern()?;
+            self.expect_char('}')?;
+            return Ok(WhereExpr::NotExists(pattern));
+        }
+        // `not.name` and `exists.name` remain ordinary binding references.
+        self.pos = start;
+        Ok(WhereExpr::Condition(self.parse_condition()?))
+    }
+
     /// Parses one AND-chain.
     fn parse_and_expr(&mut self) -> Result<WhereExpr, QueryError> {
-        let first = WhereExpr::Condition(self.parse_condition()?);
+        let first = self.parse_where_atom()?;
         let mut acc = first;
         loop {
             self.skip_whitespace();
             if !self.try_keyword("AND") {
                 break;
             }
-            let rhs = WhereExpr::Condition(self.parse_condition()?);
+            let rhs = self.parse_where_atom()?;
             acc = WhereExpr::And(Box::new(acc), Box::new(rhs));
         }
         Ok(acc)
@@ -453,10 +468,24 @@ impl Parser {
 
     fn parse_return_item(&mut self) -> Result<ReturnItem, QueryError> {
         let ident = self.parse_ident()?;
+        if ident.eq_ignore_ascii_case("count") {
+            let after_ident = self.pos;
+            self.skip_whitespace();
+            if self.peek() == Some('(') {
+                self.advance();
+                let variable = self.parse_ident()?;
+                self.expect_char(')')?;
+                return Ok(ReturnItem::Count(variable));
+            }
+            // Without parentheses, `count` remains an ordinary binding name.
+            self.pos = after_ident;
+        }
         if self.peek() == Some('.') {
             self.advance();
-            let prop = self.parse_ident()?;
-            Ok(ReturnItem::Property(ident, prop))
+            match self.parse_property_ref("RETURN")? {
+                PropertyRef::Field(field) => Ok(ReturnItem::Property(ident, field)),
+                path => Ok(ReturnItem::Path(ident, path)),
+            }
         } else {
             Ok(ReturnItem::Variable(ident))
         }
@@ -506,6 +535,7 @@ impl Parser {
         };
 
         self.expect_keyword("RETURN")?;
+        let distinct = self.try_keyword("DISTINCT");
         let return_items = self.parse_return_items()?;
 
         let order_by = if self.try_keyword("ORDER") {
@@ -530,6 +560,7 @@ impl Parser {
             additional_patterns,
             where_clause,
             return_items,
+            distinct,
             order_by,
             offset,
             limit,

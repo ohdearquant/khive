@@ -39,30 +39,30 @@ KG verb handlers, and [ADR-008](../adr/ADR-008-query-layer-separation.md).
 Historical live observations are recorded in the Verified GQL idioms and
 Rejected forms sections below.
 
-| Question class            | Example question                                                    | Verdict                      | Idiom or boundary                                                                                                                                                                                                                                                                                    |
-| ------------------------- | ------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Exact named-record lookup | Does this canonical name already exist?                             | YES via query                | `MATCH (n) WHERE n.name = "<exact name>" RETURN n.id, n.kind, n.name LIMIT 2`                                                                                                                                                                                                                        |
-| Fuzzy discovery           | What records concern recursive CTE traversal?                       | YES via `search`             | `query` has no full-text or semantic operator; use `search(kind="entity", query="...")`.                                                                                                                                                                                                             |
-| Immediate adjacency       | What directly annotates this known record?                          | YES via `neighbors`          | `neighbors(node_id="<uuid>", direction="incoming", relations=["annotates"])`                                                                                                                                                                                                                         |
-| Targeted relation join    | Which concepts were introduced by which documents?                  | YES via query                | `MATCH (c:concept)-[e:introduced_by]->(d:document) RETURN c.name, d.name, e.weight LIMIT 50`                                                                                                                                                                                                         |
-| Provenance path           | What is the derivation path from an artifact to its source?         | PARTIAL                      | Fixed `derived_from` chains, or a single variable-length edge, both work. A chain that mixes fixed and variable-length hops must be split into separate queries.                                                                                                                                     |
-| Supersession view         | What replaces this concept?                                         | YES via query                | `MATCH (old)-[e:supersedes]->(new) RETURN old.name, new.name, e.weight LIMIT 100`                                                                                                                                                                                                                    |
-| Relation alternatives     | Show records that extend or implement another record.               | YES via query                | Pipe-separated relation alternation inside one edge pattern — see the fenced example below the table (a literal pipe cannot be shown inside this table cell).                                                                                                                                        |
-| Bounded lineage           | What is reachable by one to three `extends` hops?                   | YES via query                | `MATCH (a)-[:extends*1..3]->(b) RETURN a.name, b.name LIMIT 100`                                                                                                                                                                                                                                     |
-| General expansion         | Expand this known entity two hops with context.                     | YES via `traverse`/`context` | `traverse(roots=["<uuid>"], max_depth=2)`, or `context(entity_ids=["<uuid>"], hops=2, budget=N)`.                                                                                                                                                                                                    |
-| Cross-substrate join      | Which notes annotate concepts, documents, or other notes?           | YES via query                | `MATCH (note:note)-[e:annotates]->(target) RETURN note.name, target.kind, target.name LIMIT 100`                                                                                                                                                                                                     |
-| Pack-note inventory       | Which caller-visible comm messages exist?                           | YES via query                | `MATCH (m:message) RETURN m.id, m.kind LIMIT 100`; equivalently, use `MATCH (m:note) WHERE m.kind = "message" RETURN m.id, m.kind LIMIT 100`.                                                                                                                                                        |
-| Kind/type filtering       | Which records use a given entity type?                              | YES via query                | `MATCH (n) WHERE n.entity_type IS NOT NULL RETURN n.entity_type, n.name LIMIT 100`                                                                                                                                                                                                                   |
-| Property filtering        | Which names contain a token, or belong to a set of kinds?           | YES via query                | `WHERE n.name CONTAINS "<text>"`, `STARTS WITH`, or `n.kind IN ["concept", "project"]`.                                                                                                                                                                                                              |
-| Edge-weight filter        | Which `extends` edges have weight at least 0.8?                     | YES via query                | `MATCH (a)-[e:extends]->(b) WHERE e.weight >= 0.8 RETURN a.name, e.weight, b.name LIMIT 100`                                                                                                                                                                                                         |
-| Deduplication candidates  | Which pairs share a name or a similar description?                  | PARTIAL                      | A literal-name lookup works. Variable-to-variable comparison, grouping, and similarity scoring do not — use `search` to surface candidates instead.                                                                                                                                                  |
-| Orphan detection          | Which records have no graph edges?                                  | NO                           | No negative pattern, `NOT EXISTS`, optional match, or anti-join exists. Approximate outside `query` with `list` plus `neighbors`.                                                                                                                                                                    |
-| Edge-density audit        | Which entities have fewer than four edges?                          | PARTIAL                      | `stats()` gives global `edges_by_relation` and `edges_by_endpoint_base` breakdowns and `query` lists rows, but `COUNT`, `GROUP BY`, `HAVING`, and degree projection are all absent. For a graph-wide density figure use `edges_structural`, not `edges`: the flat total counts provenance edges too. |
-| Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing, `ORDER BY`, and GQL `SKIP` paging work. Aggregate functions, grouping, and explicit distinct projection are absent.                                                                                                                                                            |
-| Cycle / self-reachability | Which entities are in an `extends` cycle?                           | PARTIAL                      | Fixed canonical cycles can join shared nodes across comma paths. A repeated node within one path and recursive multi-pattern cycles remain unsupported.                                                                                                                                              |
-| Branching join            | Which parent has both an `extends` child and an `implements` child? | YES via GQL                  | Connected comma paths share named nodes and retain tuple multiplicity; see the star recipe below. SPARQL still rejects branching.                                                                                                                                                                    |
-| Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace visibility is supplied by runtime `CompileOptions`. Direct namespace predicates and order fields are rejected; returned namespace fields and a metadata key named namespace do not override scope.                                                                                         |
-| Mutation via query        | Create, update, link, merge, or delete through GQL/SPARQL.          | NO (by design)               | Write-shaped input is rejected outright. Use the corresponding KG verb.                                                                                                                                                                                                                              |
+| Question class            | Example question                                                    | Verdict                      | Idiom or boundary                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------- | ------------------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact named-record lookup | Does this canonical name already exist?                             | YES via query                | `MATCH (n) WHERE n.name = "<exact name>" RETURN n.id, n.kind, n.name LIMIT 2`                                                                                                                                                                                                                                                                                   |
+| Fuzzy discovery           | What records concern recursive CTE traversal?                       | YES via `search`             | `query` has no full-text or semantic operator; use `search(kind="entity", query="...")`.                                                                                                                                                                                                                                                                        |
+| Immediate adjacency       | What directly annotates this known record?                          | YES via `neighbors`          | `neighbors(node_id="<uuid>", direction="incoming", relations=["annotates"])`                                                                                                                                                                                                                                                                                    |
+| Targeted relation join    | Which concepts were introduced by which documents?                  | YES via query                | `MATCH (c:concept)-[e:introduced_by]->(d:document) RETURN c.name, d.name, e.weight LIMIT 50`                                                                                                                                                                                                                                                                    |
+| Provenance path           | What is the derivation path from an artifact to its source?         | YES via query                | Canonical paths may combine fixed steps and bounded variable segments; their variable maxima sum to at most ten. See mixed canonical paths below.                                                                                                                                                                                                               |
+| Supersession view         | What replaces this concept?                                         | YES via query                | `MATCH (old)-[e:supersedes]->(new) RETURN old.name, new.name, e.weight LIMIT 100`                                                                                                                                                                                                                                                                               |
+| Relation alternatives     | Show records that extend or implement another record.               | YES via query                | Pipe-separated relation alternation inside one edge pattern — see the fenced example below the table (a literal pipe cannot be shown inside this table cell).                                                                                                                                                                                                   |
+| Bounded lineage           | What is reachable by one to three `extends` hops?                   | YES via query                | `MATCH (a)-[:extends*1..3]->(b) RETURN a.name, b.name LIMIT 100`                                                                                                                                                                                                                                                                                                |
+| General expansion         | Expand this known entity two hops with context.                     | YES via `traverse`/`context` | `traverse(roots=["<uuid>"], max_depth=2)`, or `context(entity_ids=["<uuid>"], hops=2, budget=N)`.                                                                                                                                                                                                                                                               |
+| Cross-substrate join      | Which notes annotate concepts, documents, or other notes?           | YES via query                | `MATCH (note:note)-[e:annotates]->(target) RETURN note.name, target.kind, target.name LIMIT 100`                                                                                                                                                                                                                                                                |
+| Pack-note inventory       | Which caller-visible comm messages exist?                           | YES via query                | `MATCH (m:message) RETURN m.id, m.kind LIMIT 100`; equivalently, use `MATCH (m:note) WHERE m.kind = "message" RETURN m.id, m.kind LIMIT 100`.                                                                                                                                                                                                                   |
+| Kind/type filtering       | Which records use a given entity type?                              | YES via query                | `MATCH (n) WHERE n.entity_type IS NOT NULL RETURN n.entity_type, n.name LIMIT 100`                                                                                                                                                                                                                                                                              |
+| Property filtering        | Which names contain a token, or belong to a set of kinds?           | YES via query                | `WHERE n.name CONTAINS "<text>"`, `STARTS WITH`, or `n.kind IN ["concept", "project"]`.                                                                                                                                                                                                                                                                         |
+| Edge-weight filter        | Which `extends` edges have weight at least 0.8?                     | YES via query                | `MATCH (a)-[e:extends]->(b) WHERE e.weight >= 0.8 RETURN a.name, e.weight, b.name LIMIT 100`                                                                                                                                                                                                                                                                    |
+| Deduplication candidates  | Which pairs share a name or a similar description?                  | PARTIAL                      | Literal-name lookup and returned-value grouping with count work. Variable-to-variable comparison and similarity scoring remain unsupported; use `search` to surface candidates.                                                                                                                                                                                 |
+| Orphan detection          | Which records have no visible canonical graph edges?                | YES                          | Correlated `NOT EXISTS { (n)-[]-(other) }` selects records without an accessible canonical edge. Inner paths may have several fixed steps; hidden or deleted support does not suppress a result.                                                                                                                                                                |
+| Edge-density audit        | Which entities have fewer than four edges?                          | PARTIAL                      | `stats()` gives global `edges_by_relation` and `edges_by_endpoint_base` breakdowns and `query` can group matched edge rows with `count(e)`. Explicit `GROUP BY`, `HAVING`, zero-degree outer matches and degree predicates remain unsupported. For a graph-wide density figure use `edges_structural`, not `edges`: the flat total counts provenance edges too. |
+| Aggregate inventory       | How many concepts exist, by type?                                   | YES via query                | Filtered row listing, `ORDER BY`, and GQL `SKIP` paging work. Use `MATCH (n:concept) RETURN n.entity_type, count(n)` for grouped inventory; explicit DISTINCT is also supported.                                                                                                                                                                                |
+| Cycle / self-reachability | Which entities are in an `extends` cycle?                           | PARTIAL                      | Fixed canonical cycles can join shared nodes across comma paths. A repeated node within one path and recursive multi-pattern cycles remain unsupported.                                                                                                                                                                                                         |
+| Branching join            | Which parent has both an `extends` child and an `implements` child? | YES via GQL                  | Connected comma paths share named nodes and retain tuple multiplicity; see the star recipe below. SPARQL still rejects branching.                                                                                                                                                                                                                               |
+| Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace visibility is supplied by runtime `CompileOptions`. Direct namespace predicates and order fields are rejected; returned namespace fields and a metadata key named namespace do not override scope.                                                                                                                                                    |
+| Mutation via query        | Create, update, link, merge, or delete through GQL/SPARQL.          | NO (by design)               | Write-shaped input is rejected outright. Use the corresponding KG verb.                                                                                                                                                                                                                                                                                         |
 
 The relation-alternatives idiom, copy-paste form (alternation is a bare pipe
 between relation identifiers inside one edge pattern):
@@ -78,14 +78,13 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   query must be canonical and fixed at one hop; a component can contain several
   such edges. Shared named nodes connect components; anonymous nodes do not.
   SPARQL remains single-path only.
-- `RETURN` accepts comma-separated variables or `variable.property` items,
-  but not `AS` aliases. Output names remain variable-prefixed, such as `a_id`.
-- A single GQL path supports either a chain of fixed-relation hops or exactly
-  one variable-length edge — never both mixed in the same pattern.
-  Minimum hop count is 1; maximum is 10. A bare `*` (no bounds) means 1
-  through 5 hops, not zero-or-more.
-- A query that mixes a fixed hop with a variable-length hop in the same chain
-  is rejected outright, not silently approximated. Split it into two queries.
+- `RETURN` accepts comma-separated variables, `variable.property` items, and
+  named paths below node `properties` or canonical edge `metadata`, and
+  `count(binding)`. `RETURN DISTINCT` deduplicates returned values; `AS` aliases remain unsupported. Output names remain variable-prefixed, such as `a_id`.
+- A single canonical GQL path supports fixed steps and multiple bounded variable
+  segments. Their maximum hop counts sum to at most 10; fixed steps do not count
+  toward that sum. Explicit ranges may start at zero. A bare `*` means 1 through
+  5 hops; `*1` and `*1..1` are fixed steps.
 - The query verb's `page_size` has minimum 1, defaults to 500, and is clamped
   to a hard cap of 10,000. GQL `SKIP` advances through deterministically ordered matches. Omit
   query-text `LIMIT` for an exhaustive audit; a `LIMIT` at or below `page_size`
@@ -93,9 +92,9 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   a deprecated, mutually exclusive alias for `page_size`.
 - Result columns are projection-derived and variable-prefixed (for example
   `a_name`, `e_relation`). Returning a whole node variable expands it into
-  its supported substrate columns. Variable-length paths add `_depth` and
+  its supported substrate columns. Ordinary variable-length projections add `_depth` and
   `_total_weight` (a running sum of edge weights along the path, not an
-  average).
+  average). Explicit DISTINCT and grouped counts omit these implicit metrics.
 - Pack-registered note kinds use the same GQL `kind` field as base kinds. A granular label
   such as `:message` is shorthand for the stored kind; `:note` selects the note substrate and
   can be combined with `WHERE m.kind = "message"`. `note_kind` belongs to the verb parameter
@@ -103,6 +102,20 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   namespace scopes.
 - SPARQL variables project as whole nodes (full column expansion), unlike
   GQL's dotted per-field projection. SPARQL `OFFSET` is not supported.
+
+## Requirements without visible support
+
+```text
+MATCH (r:concept {role: 'requirement'})
+WHERE NOT EXISTS { (f:concept)-[:supports]->(r) }
+RETURN r.name ORDER BY r.name
+```
+
+The existing outer `r` is correlated by substrate and UUID. The inner `f` is local to this block. Visible support suppresses the requirement; unrelated, hidden, deleted or out-of-scope support does not. Multiple support paths do not duplicate the outer row. To find records with no visible canonical incident edge, use `MATCH (n) WHERE NOT EXISTS { (n)-[]-(other) } RETURN n.id`.
+
+Each block contains one fixed canonical path and at least one outer node name. It may have several steps with ordinary node constraints, or just one correlated node. Local names may be reused in separate blocks but cannot appear in outer RETURN, count, ORDER or scalar predicates. Outer edge names cannot be reused as inner edge names; edge variables are not correlated into NOT EXISTS. Repeated names within a path and node/edge conflicts remain refused.
+
+Absence atoms compose with scalar predicates under AND-before-OR precedence. A recursive outer query can correlate its start, end, or both. Start-only blocks run at the seed; blocks using the end run at the final row. Cross-phase OR remains unsupported. Filtering happens before counts, DISTINCT and paging, so counts cover all surviving matches. This adds no OPTIONAL MATCH, inner query clauses, comma/nested blocks, recursive inner paths or synthetic inner edges.
 
 ## Paging broad GQL results
 
@@ -119,9 +132,10 @@ query(query="MATCH (a)-[r:depends_on]->(b) RETURN a.id, r.id, b.id SKIP 500", pa
 ```
 
 `next_offset` advances by the number of rows actually emitted. It is omitted
-when `has_more` is false. After any requested `ORDER BY` terms, the compiler orders fixed matches by their complete bound
-identities (including synthetic observation primary keys); recursive `DISTINCT` rows
-use depth, weight, and their complete projected value tuple as ties. Repeated reads
+when `has_more` is false. After requested ORDER terms, ordinary fixed results use
+complete bound identities (including synthetic observation primary keys); ordinary
+recursive results use depth, weight and projected values. Explicit DISTINCT and
+grouped results use only returned values as ties. Repeated reads
 of unchanged data are therefore stable. This is offset paging, not a cross-call database
 snapshot: inserts or deletes that match the query can shift later pages.
 
@@ -129,15 +143,42 @@ snapshot: inserts or deletes that match the query can shift later pages.
 
 GQL accepts `ORDER BY` between `RETURN` and `SKIP`/`LIMIT`. Terms are supported
 scalar fields or named paths below node `properties` or canonical edge `metadata`;
-each takes optional `ASC` (the default) or `DESC`. The compiler retains its identity
-tie order for stable continuation. There is no `count()` or other aggregate; use
-the following verbs for counts and relevance-oriented or type-inventory reads:
+each takes optional `ASC` (the default) or `DESC`. Ordinary queries retain identity
+ties for stable continuation; explicit DISTINCT and grouped counts use only returned
+values. In those modes every order term must derive from a returned value. The
+following verbs remain useful for relevance-oriented or type-inventory reads:
 
 | You want                         | Use                                                                                                                                                                                                                                                                                                                                                                                                             |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The newest records about a topic | `search(kind="note", query="...", order_by="created_at")`, or `order_by="updated_at"`. Results sort newest first within the bounded candidate window, so this ranks recent matches but is not a full sort.                                                                                                                                                                                                      |
 | The newest records of a type     | `list(kind="entity", entity_type="...", limit=1)`, or `list(kind="note", note_kind="...")`. Offset pages sort newest first by `created_at` over the whole filtered set; see [`list`](api-reference.md#list--assertive) for the tie order.                                                                                                                                                                       |
 | How many entities of a type      | `stats()` returns `entities_by_type`: one row per stored `entity_type` across entity kinds, counted over caller-visible namespaces and live rows (its `count_scope`). The first row counts entities with no type; in Agent presentation it carries only `count`, because null fields are dropped. For a count under other filters, such as kind or tags, page `list(..., after="")` until `next_after` is null. |
+
+### Distinct values and grouped counts
+
+```text
+MATCH (n:concept) RETURN DISTINCT n.entity_type
+MATCH (n:concept) RETURN n.entity_type, count(n) ORDER BY n.entity_type
+MATCH (a {name: "root"})-[e:extends*0..2]->(b) RETURN count(b), count(e)
+```
+
+The first query returns one row per value; the second groups by returned type and
+names the integer count `count_n`. Counts-only empty input yields one zero row;
+grouped empty input yields none. Missing and JSON-null values share a null group.
+Text grouping is case-sensitive, while numbers retain numeric comparison.
+
+Counts measure matching bindings: repeated node or edge occurrences on different
+paths count separately. A zero-hop node contributes one and its absent final edge
+contributes zero. Synthetic observation edges count their matching rows even when
+the displayed edge ID is null. With counts, every other returned field is a group
+key; returning a whole binding groups by all its expanded fields. Neither grouping
+nor explicit DISTINCT adds hidden IDs, `_depth` or `_total_weight` to the result.
+
+Complete matching and filtering precede grouping and DISTINCT; ordering, SKIP and
+LIMIT/page-size continuation follow them. Each page retains complete group counts.
+A count operand alone does not expose that binding's fields for ORDER BY. The
+supported aggregate is `count(binding)` only: no `count(*)`, `count(DISTINCT ...)`,
+property operands, `AS`, explicit GROUP BY, HAVING or count/alias ORDER syntax.
 
 ### Ordered qualified relations
 
@@ -173,10 +214,38 @@ is rejected because whole-edge projections omit metadata. This preserves the
 compiler's recursive `DISTINCT` behavior without hidden sort columns.
 
 For multiple pages, retain the same order terms and page size and advance `SKIP`
-using `next_offset`. The query-text `LIMIT` remains the total bound across pages;
-omit it for an exhaustive read. Visibility filtering precedes sorting and paging.
+using `next_offset`. The query-text `LIMIT` applies after `SKIP` at each continued
+offset. An explicit limit at or below `page_size` produces a terminal page even
+when more matches exist; omit it for an exhaustive read. Visibility filtering
+precedes sorting and paging.
 See [ADR-008 Amendment 1](../adr/ADR-008-query-layer-separation.md#amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14)
 for the ordering and recursive contracts.
+
+## Return selected JSON values
+
+Return named leaves when the full properties or metadata container is unnecessary:
+
+```text
+MATCH (a:concept)-[e:extends*0..2]->(b:concept)
+RETURN b.properties.status, e.metadata.rank.order
+ORDER BY e.metadata.rank.order
+LIMIT 100
+```
+
+The columns are `b_properties_status` and `e_metadata_rank_order`, plus the usual
+recursive depth and accumulated weight. Numbers stay numeric, strings stay text,
+booleans are `0` or `1`, and a missing or JSON-null leaf is null. Object and array
+leaves are JSON text. The edge value belongs to the final traversed edge and is
+null at zero hops. `RETURN b.properties` and `RETURN e.metadata` still return their
+stored containers; whole-node and whole-edge projections keep their existing shape.
+
+Use explicit `properties` or `metadata` roots and named identifier segments.
+Metadata requires a canonical edge. Different expressions cannot share one exact
+column name: `b.properties.a_b` and `b.properties.a.b` would both be named
+`b_properties_a_b`, so returning both is refused. Output labels preserve case and
+are not `AS` aliases or new ordering references. On a recursive path, order by an
+exactly returned path or a path within a returned whole container; a different
+hidden path remains unsupported.
 
 ## Connected branches around one node
 
@@ -204,10 +273,12 @@ paths retain their single-path behavior and cannot join a comma-pattern query.
 
 The WHERE tree and all projections and order terms can refer to any component.
 Each occurrence retains namespace, deletion and mailbox filtering before paging.
-Requested order is followed by the full occurrence-identity suffix in textual
-path order; DESC does not reverse those ties. Continue with `next_offset` as in
-[Paging broad GQL results](#paging-broad-gql-results), retaining any total query
-LIMIT. Offset pages are stable only for unchanged data, and page size does not
+For ordinary projections, requested order is followed by the full occurrence-identity
+suffix in textual path order; DESC does not reverse those ties. Explicit DISTINCT
+and grouped counts instead use their returned values as ties. Continue with `next_offset` as in
+[Paging broad GQL results](#paging-broad-gql-results), retaining the same query
+LIMIT after each new offset. An explicit limit at or below `page_size` is terminal.
+Offset pages are stable only for unchanged data, and page size does not
 bound the combinations matched or sorted.
 
 For a simple inventory of edge records, one path avoids multiplying combinations:
@@ -221,6 +292,28 @@ edge inventory, rather than joined tuples, answers the question.
 
 See [ADR-008 Amendment 2](../adr/ADR-008-query-layer-separation.md#amendment-2-connected-comma-separated-match-patterns-2026-11-14)
 for the connected-pattern contract.
+
+## Include the starting record in a bounded lineage
+
+Use a zero minimum when the starting record itself should be an answer:
+
+```text
+MATCH (a:concept {name: "root"})-[e:extends*0..2]->(b)
+RETURN a.id, b.id, e.id, e.relation, e.weight, e.metadata
+```
+
+At depth zero, `a` and `b` are the same typed record, `_depth` is `0`, and
+`_total_weight` is `0.0`. All returned edge fields are null. An isolated root can
+match without an incident edge. Constraints on both endpoints still apply, so
+an incompatible end kind or property excludes that zero-hop row. Ordinary
+namespace, deletion and mailbox restrictions apply before the row is returned.
+
+`*0..0` returns only the starting record; `*0..1` also permits one edge. Incoming
+and undirected ranges behave the same way. A positive minimum excludes the
+zero-hop row. The maximum remains 10 and later revisits remain blocked; the
+existing first-step self-loop behavior is retained. Bare GQL `*` still means
+one through five hops. Explicit SPARQL ranges such as `:extends{0,2}` share these
+zero-hop rules; bare SPARQL `*` remains unsupported.
 
 ## Verified GQL idioms
 
@@ -261,18 +354,16 @@ receive a specific parser error:
 Each is a verified read-only check against the running server. Errors are
 verbatim.
 
-| Form                           | Query string                                                      | Observed error                                                                                                                                               |
-| ------------------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| GQL write                      | `CREATE (n:concept)`                                              | `query: unsupported feature: the query verb is read-only; to mutate the graph use: create, update, link, merge, delete`                                      |
-| SPARQL update                  | `INSERT DATA { ?a :extends ?b }`                                  | same read-only rejection as above                                                                                                                            |
-| Mixed fixed and variable chain | `MATCH (a)-[e:extends]->(b)-[f:extends*1..2]->(c) RETURN a, b, c` | `query: unsupported feature: variable-length patterns must be a single start_node -[*N..M]-> end_node (mixed fixed/variable chains are not yet implemented)` |
-| Zero-hop GQL range             | `MATCH (a)-[e:extends*0..2]->(b) RETURN a, b`                     | `query: unsupported feature: zero-hop ranges (min_hops = 0) not yet supported; use a minimum of 1 hop`                                                       |
-| Unknown relation               | `MATCH (a)-[e:bogus]->(b) RETURN a, b`                            | `query: validation error: unknown edge_relation: "bogus"` (lists the 17 valid relations)                                                                     |
-| Repeated binding / cycle       | `MATCH (a)-[e:extends]->(a) RETURN a`                             | `query: unsupported feature: repeated node variable 'a' (cycle / self-reachability requires alias-equality predicates not yet implemented)`                  |
-| Branched SPARQL                | `SELECT ?a ?b ?c WHERE { ?a :extends ?b . ?a :implements ?c . }`  | `query: unsupported feature: SPARQL WHERE block is branched or disconnected; only single-path patterns are supported`                                        |
-| SPARQL zero-or-more            | `SELECT ?a WHERE { ?a :extends* ?b . }`                           | `query: unsupported feature: SPARQL '*' (zero-or-more hops) not yet supported; use '+' or '{min,max}'`                                                       |
-| Namespace from query text      | `MATCH (n) WHERE n.namespace = "local" RETURN n LIMIT 1`          | `query: validation error: namespace is set by CompileOptions, not query text`                                                                                |
-| Incomplete float literal       | `MATCH (n) WHERE n.name = 1. RETURN n LIMIT 1`                    | `query: parse error: float literal must have digits after '.' (e.g. '1.0', not '1.')`                                                                        |
+| Form                      | Query string                                                     | Observed error                                                                                                                              |
+| ------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| GQL write                 | `CREATE (n:concept)`                                             | `query: unsupported feature: the query verb is read-only; to mutate the graph use: create, update, link, merge, delete`                     |
+| SPARQL update             | `INSERT DATA { ?a :extends ?b }`                                 | same read-only rejection as above                                                                                                           |
+| Unknown relation          | `MATCH (a)-[e:bogus]->(b) RETURN a, b`                           | `query: validation error: unknown edge_relation: "bogus"` (lists the 17 valid relations)                                                    |
+| Repeated binding / cycle  | `MATCH (a)-[e:extends]->(a) RETURN a`                            | `query: unsupported feature: repeated node variable 'a' (cycle / self-reachability requires alias-equality predicates not yet implemented)` |
+| Branched SPARQL           | `SELECT ?a ?b ?c WHERE { ?a :extends ?b . ?a :implements ?c . }` | `query: unsupported feature: SPARQL WHERE block is branched or disconnected; only single-path patterns are supported`                       |
+| SPARQL zero-or-more       | `SELECT ?a WHERE { ?a :extends* ?b . }`                          | `query: unsupported feature: SPARQL '*' (zero-or-more hops) not yet supported; use '+' or '{min,max}'`                                      |
+| Namespace from query text | `MATCH (n) WHERE n.namespace = "local" RETURN n LIMIT 1`         | `query: validation error: namespace is set by CompileOptions, not query text`                                                               |
+| Incomplete float literal  | `MATCH (n) WHERE n.name = 1. RETURN n LIMIT 1`                   | `query: parse error: float literal must have digits after '.' (e.g. '1.0', not '1.')`                                                       |
 
 ## SPARQL
 
@@ -285,19 +376,42 @@ returns rows on the live MCP tool.
 | Which concepts have an `introduced_by` source       | `SELECT ?a ?b WHERE { ?a a :concept . ?a :introduced_by ?b . } LIMIT 2` | Typed-node triple pattern (`?a a :concept`) combined with a relation triple.                                                                         |
 | Which endpoints are one or two `extends` hops apart | `SELECT ?a ?b WHERE { ?a :extends{1,2} ?b . } LIMIT 2`                  | Bounded variable-length path using the `{min,max}` form.                                                                                             |
 
+## Mixed canonical paths
+
+These examples describe the new contract; they have not been live-checked. A path
+with variable maxima 4 and 7 exceeds the cumulative cap and returns `InvalidInput`.
+
+```text
+MATCH (root {name: "root"})-[lineage:extends*0..3]->(descendant)-[attachment:contains]->(document)
+RETURN descendant.name, document.name, lineage.metadata.rank, attachment.id
+ORDER BY descendant.name, document.name
+LIMIT 100
+```
+
+The zero-hop match can return the root's own attachments; its `lineage` edge fields
+are null. Each variable segment keeps its own final edge. Ordinary `_depth` and
+`_total_weight` sum variable hops and weights only, excluding fixed steps. Several
+variable segments are allowed when their maximum hop counts sum to at most ten;
+`*1` and `*1..1` are fixed steps. Cycle tracking is local to each variable segment.
+
+Mixed WHERE expressions, including OR across fixed and variable bindings and
+absence correlated to intermediate nodes, filter complete matches before counts,
+DISTINCT or paging. The legacy single-variable-segment cross-phase OR refusal
+remains. Output limits do not cap intermediate fanout.
+
 ## Gaps
 
 - Disconnected, recursive or synthetic multi-pattern GQL matches remain
   unsupported. Connected canonical paths with fixed one-hop edges are supported.
   `RETURN ... AS ...` aliases still return a named unsupported-feature error;
   use unaliased projections.
-- Mixed fixed-plus-variable-length paths are rejected; split the query into
-  separate calls instead.
-- No anti-join, optional match, aggregate, `GROUP BY`, or explicit `DISTINCT`
-  exists. GQL uses `SKIP` rather than an `OFFSET`
-  keyword; SPARQL `OFFSET` remains unsupported. Orphan-detection and
-  edge-density questions cannot be expressed in a single query.
-  [Ordering and counts](#ordering-and-counts) names the verbs to use instead.
+- Recursive comma patterns and synthetic steps within mixed variable paths remain unsupported.
+- Correlated canonical fixed-path `NOT EXISTS` supports absence and orphan detection.
+  Optional matches, explicit `GROUP BY`, `HAVING` and aggregates other than
+  `count(binding)` remain unsupported. GQL supports RETURN DISTINCT and
+  implicit grouping, and uses `SKIP` rather than `OFFSET`; SPARQL OFFSET remains
+  unsupported. Zero-degree count groups still need other reads or separate absence queries.
+  See [ordering and counts](#ordering-and-counts).
 - A repeated node-variable binding within one path remains rejected. Fixed
   cycles across separate connected canonical paths can reuse node bindings;
   this does not add general recursive cycle or self-reachability syntax.

@@ -326,3 +326,123 @@ fn legacy_fixed_and_recursive_sql_and_parameters_remain_exact() {
 const LEGACY_FIXED_SQL: &str = r#"SELECT n0.id AS "a_id" FROM (SELECT id, namespace, kind, entity_type, name, description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, properties, created_at, updated_at, deleted_at, 'entity' AS substrate_kind FROM entities UNION ALL SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, content, status, salience, decay_factor, properties, created_at, updated_at, deleted_at, 'note' AS substrate_kind FROM notes UNION ALL SELECT id, namespace, kind, NULL AS entity_type, verb AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, payload AS properties, created_at, created_at AS updated_at, NULL AS deleted_at, 'event' AS substrate_kind FROM events UNION ALL SELECT id, namespace, relation AS kind, NULL AS entity_type, NULL AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, metadata AS properties, created_at, updated_at, deleted_at, 'edge' AS substrate_kind FROM graph_edges) n0  WHERE n0.deleted_at IS NULL ORDER BY n0.substrate_kind, n0.id LIMIT ?2 OFFSET ?1"#;
 
 const LEGACY_RECURSIVE_SQL: &str = r#"WITH RECURSIVE primary_nodes AS (SELECT id, namespace, kind, entity_type, name, description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, properties, created_at, updated_at, deleted_at, 'entity' AS substrate_kind FROM entities UNION ALL SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, content, status, salience, decay_factor, properties, created_at, updated_at, deleted_at, 'note' AS substrate_kind FROM notes UNION ALL SELECT id, namespace, kind, NULL AS entity_type, verb AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, payload AS properties, created_at, created_at AS updated_at, NULL AS deleted_at, 'event' AS substrate_kind FROM events UNION ALL SELECT id, namespace, relation AS kind, NULL AS entity_type, NULL AS name, NULL AS description, NULL AS content, NULL AS status, NULL AS salience, NULL AS decay_factor, metadata AS properties, created_at, updated_at, deleted_at, 'edge' AS substrate_kind FROM graph_edges), traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (SELECT s.id, e.target_id, 1, s.id || ',' || e.target_id, e.weight, e.id, e.relation, e.weight FROM primary_nodes s JOIN graph_edges e ON e.source_id = s.id AND e.deleted_at IS NULL AND e.relation = ?1 JOIN primary_nodes next_node ON next_node.id = (e.target_id) AND next_node.deleted_at IS NULL WHERE s.deleted_at IS NULL UNION ALL SELECT t.start_id, e.target_id, t.depth + 1, t.path || ',' || e.target_id, t.total_weight + e.weight, e.id, e.relation, e.weight FROM traverse t CROSS JOIN graph_edges e ON e.source_id = t.current_id AND e.deleted_at IS NULL AND e.relation = ?1 JOIN primary_nodes next_node ON next_node.id = (e.target_id) AND next_node.deleted_at IS NULL WHERE t.depth < ?2 AND (',' || t.path || ',') NOT LIKE '%,' || e.target_id || ',%' ) SELECT DISTINCT s.id AS "a_id", t.via_edge AS "e_id", r.id AS "b_id", t.depth AS "_depth", t.total_weight AS "_total_weight" FROM traverse t JOIN primary_nodes s ON s.id = t.start_id JOIN primary_nodes r ON r.id = t.current_id WHERE r.deleted_at IS NULL AND t.depth >= ?3 ORDER BY "_depth", "_total_weight" DESC, "a_id", "e_id", "b_id" LIMIT ?5 OFFSET ?4"#;
+
+#[test]
+fn return_path_alias_collisions_refuse_distinct_expressions() {
+    for range in ["", "*0..2", "*1..2"] {
+        for projection in [
+            "a.properties.a_b, a.properties.a.b",
+            "a.properties.name, a_properties.name",
+            "a.properties.name, a_properties",
+        ] {
+            let input = format!("MATCH (a)-[e:extends{range}]->(a_properties) RETURN {projection}");
+            let error = compile(&gql(&input), &CompileOptions::default()).unwrap_err();
+            assert!(
+                matches!(error, QueryError::Compile(ref message) if message.contains("RETURN projection column name collision")),
+                "{input}: {error:?}"
+            );
+        }
+        for projection in [
+            "a.properties.status, a.properties.status",
+            "e.metadata.rank.order, e.metadata.rank.order",
+            "a, a.id",
+        ] {
+            let input = format!("MATCH (a)-[e:extends{range}]->(b) RETURN {projection}");
+            compile(&gql(&input), &CompileOptions::default()).unwrap_or_else(|error| {
+                panic!("identical expression compatibility: {input}: {error}")
+            });
+        }
+    }
+}
+
+#[test]
+fn return_path_raw_ast_validation_is_shared() {
+    for range in ["", "*0..2", "*1..2"] {
+        let base = gql(&format!("MATCH (a)-[e:extends{range}]->(b) RETURN a.id"));
+        for (binding, property) in [
+            ("a", PropertyRef::JsonPath(vec![])),
+            ("a", PropertyRef::JsonPath(vec!["".into()])),
+            ("a", PropertyRef::JsonPath(vec!["a.b".into()])),
+            ("a", PropertyRef::JsonPath(vec!["bad\0key".into()])),
+            ("a", PropertyRef::JsonPath(vec!["x') OR 1=1 --".into()])),
+            ("e", PropertyRef::MetadataPath(vec![])),
+            ("e", PropertyRef::MetadataPath(vec!["bad/key".into()])),
+            ("e", PropertyRef::MetadataPath(vec!["bad\0key".into()])),
+            ("a", PropertyRef::Field("name".into())),
+            ("a", PropertyRef::MetadataPath(vec!["value".into()])),
+            ("e", PropertyRef::JsonPath(vec!["value".into()])),
+            ("missing", PropertyRef::JsonPath(vec!["value".into()])),
+        ] {
+            let mut query = base.clone();
+            query.return_items = vec![ReturnItem::Path(binding.into(), property.clone())];
+            let error = compile(&query, &CompileOptions::default()).unwrap_err();
+            assert!(
+                matches!(error, QueryError::Compile(_)),
+                "{range} {binding} {property:?}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn recursive_return_paths_order_only_by_returned_values() {
+    for range in ["0..2", "1..2"] {
+        let compiled = sql(&format!("MATCH (a)-[e:extends*{range}]->(b) RETURN a.properties.rank, b.properties.label, e.metadata.rank.order ORDER BY e.metadata.rank.order DESC, a.properties.rank, b.properties.label SKIP 1 LIMIT 2"));
+        assert!(
+            compiled.sql.contains("via_metadata"),
+            "projection alone must carry metadata: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("json_extract(t.via_metadata,"),
+            "{}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("json_extract(s.properties,"),
+            "start path must join the start: {}",
+            compiled.sql
+        );
+        let parameter = |path: &str| {
+            compiled
+                .params
+                .iter()
+                .position(|value| matches!(value, QueryValue::Text(text) if text == path))
+                .unwrap()
+                + 1
+        };
+        assert!(compiled.sql.contains(&format!("ORDER BY json_extract(t.via_metadata, ?{}) COLLATE BINARY DESC, json_extract(s.properties, ?{}) COLLATE BINARY ASC, json_extract(r.properties, ?{}) COLLATE BINARY ASC", parameter("$.rank.order"), parameter("$.rank"), parameter("$.label"))), "{}", compiled.sql);
+        assert!(params(&compiled).contains(&"integer:1".to_owned()));
+        assert_eq!(params(&compiled).last().unwrap(), "integer:2");
+        for input in [
+            format!("MATCH (a)-[e:extends*{range}]->(b) RETURN e.metadata.rank.order ORDER BY e.metadata.rank.other"),
+            format!("MATCH (a)-[e:extends*{range}]->(b) RETURN a.properties.rank ORDER BY a.properties.rank.child"),
+        ] {
+            let error = compile(&gql(&input), &CompileOptions::default()).unwrap_err();
+            assert!(matches!(error, QueryError::Unsupported(_)), "{input}: {error:?}");
+        }
+        sql(&format!("MATCH (a)-[e:extends*{range}]->(b) RETURN e.metadata, a.properties ORDER BY e.metadata.rank.order, a.properties.rank"));
+        assert!(parse(QueryLanguage::Gql, &format!("MATCH (a)-[e:extends*{range}]->(b) RETURN e.metadata.rank.order ORDER BY e_metadata_rank_order")).is_err());
+    }
+}
+
+#[test]
+fn recursive_return_paths_cannot_shadow_implicit_metrics() {
+    for range in ["*0..2", "*1..2"] {
+        for projection in [
+            "_total.weight, b.properties.label",
+            "_total, b.properties.label",
+            "_total.weight",
+        ] {
+            let input = format!("MATCH (a)-[_total:extends{range}]->(b) RETURN {projection}");
+            let error = compile(&gql(&input), &CompileOptions::default()).unwrap_err();
+            assert!(
+                matches!(error, QueryError::Compile(ref message)
+                    if message.contains("RETURN projection column name collision")
+                    && message.contains("_total_weight")),
+                "{input}: {error:?}"
+            );
+        }
+    }
+    sql("MATCH (a)-[_total:extends]->(b) RETURN _total.weight, b.properties.label");
+}

@@ -160,3 +160,50 @@ fn gql_detach_delete_rejected() {
         "error must name the mutation verbs; got: {msg}"
     );
 }
+
+#[test]
+fn return_typed_paths_preserve_direct_properties() {
+    let query = parse("MATCH (A)-[E:extends]->(B) RETURN A, A.name, A.properties, A.properties.Status, A.properties.nested.value, E.metadata, E.metadata.rank.order").unwrap();
+    assert_eq!(
+        query.return_items,
+        vec![
+            ReturnItem::Variable("A".into()),
+            ReturnItem::Property("A".into(), "name".into()),
+            ReturnItem::Property("A".into(), "properties".into()),
+            ReturnItem::Path("A".into(), PropertyRef::JsonPath(vec!["Status".into()])),
+            ReturnItem::Path(
+                "A".into(),
+                PropertyRef::JsonPath(vec!["nested".into(), "value".into()])
+            ),
+            ReturnItem::Property("E".into(), "metadata".into()),
+            ReturnItem::Path(
+                "E".into(),
+                PropertyRef::MetadataPath(vec!["rank".into(), "order".into()])
+            ),
+        ]
+    );
+    for item in &query.return_items {
+        assert!(matches!(item.variable(), "A" | "E"));
+    }
+}
+
+#[test]
+fn return_typed_paths_reject_malformed_roots_and_aliases() {
+    for projection in [
+        "a.other.path",
+        "a.properties.",
+        "a.properties..leaf",
+        "e.metadata.",
+        "e.metadata..leaf",
+        "a..properties",
+        "count(a.properties.value)",
+    ] {
+        let input = format!("MATCH (a)-[e:extends]->(b) RETURN {projection}");
+        assert!(parse(&input).is_err(), "{input}");
+    }
+    let error = parse("MATCH (a) RETURN a.properties.value AS value").unwrap_err();
+    assert!(
+        matches!(error, QueryError::Unsupported(ref message) if message.contains("aliases (`AS`)"))
+    );
+    assert!(parse("MATCH (a) RETURN a.properties.value ORDER BY a_properties_value").is_err());
+}

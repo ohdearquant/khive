@@ -1,3 +1,82 @@
+fn gql_sql_value_equal(left: &khive_storage::SqlValue, right: &khive_storage::SqlValue) -> bool {
+    use khive_storage::SqlValue;
+    match (left, right) {
+        (SqlValue::Null, SqlValue::Null) => true,
+        (SqlValue::Bool(left), SqlValue::Bool(right)) => left == right,
+        (SqlValue::Integer(left), SqlValue::Integer(right)) => left == right,
+        (SqlValue::Float(left), SqlValue::Float(right)) => left == right,
+        (SqlValue::Text(left), SqlValue::Text(right)) => left == right,
+        (SqlValue::Blob(left), SqlValue::Blob(right)) => left == right,
+        (SqlValue::Json(left), SqlValue::Json(right)) => left == right,
+        (SqlValue::Uuid(left), SqlValue::Uuid(right)) => left == right,
+        (SqlValue::Timestamp(left), SqlValue::Timestamp(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn gql_sql_optional_value_equal(
+    left: Option<&khive_storage::SqlValue>,
+    right: Option<&khive_storage::SqlValue>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => gql_sql_value_equal(left, right),
+        _ => false,
+    }
+}
+
+fn gql_sql_rows_equal<const N: usize>(
+    left: &[[khive_storage::SqlValue; N]],
+    right: &[[khive_storage::SqlValue; N]],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.iter()
+                .zip(right)
+                .all(|(left, right)| gql_sql_value_equal(left, right))
+        })
+}
+
+macro_rules! assert_gql_sql_value_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        match (&$left, &$right) {
+            (left, right) => assert!(
+                gql_sql_optional_value_equal(*left, *right),
+                "assertion `left == right` failed\n  left: {left:?}\n right: {right:?}"
+            ),
+        }
+    };
+    ($left:expr, $right:expr, $($message:tt)+) => {
+        match (&$left, &$right) {
+            (left, right) => assert!(
+                gql_sql_optional_value_equal(*left, *right),
+                "{}\n  left: {left:?}\n right: {right:?}",
+                format_args!($($message)+)
+            ),
+        }
+    };
+}
+
+macro_rules! assert_gql_sql_rows_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        match (&$left, &$right) {
+            (left, right) => assert!(
+                gql_sql_rows_equal(left, right),
+                "assertion `left == right` failed\n  left: {left:?}\n right: {right:?}"
+            ),
+        }
+    };
+    ($left:expr, $right:expr, $($message:tt)+) => {
+        match (&$left, &$right) {
+            (left, right) => assert!(
+                gql_sql_rows_equal(left, right),
+                "{}\n  left: {left:?}\n right: {right:?}",
+                format_args!($($message)+)
+            ),
+        }
+    };
+}
+
 // =============================================================================
 // GQL query
 // =============================================================================
@@ -572,6 +651,273 @@ async fn gql_recursive_edge_metadata_uses_the_final_edge() {
     );
 }
 
+#[tokio::test]
+async fn gql_zero_hop_isolated_roots_and_null_final_edges() {
+    use khive_storage::SqlValue;
+
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let root = gql_metadata_entity(&runtime, &token, "isolated zero root").await;
+    for max in [0, 1] {
+        for projection in [
+            "a.id, b.id, e.id, e.relation, e.weight, e.metadata",
+            "a.id, b.id, e, e.metadata",
+        ] {
+            let rows = runtime.query(&token, &format!(
+                "MATCH (a:concept)-[e:variant_of*0..{max}]->(b:concept) WHERE a.id = '{root}' RETURN {projection}"
+            )).await.unwrap();
+            assert_eq!(rows.len(), 1, "isolated 0..{max}: {projection}");
+            let row = &rows[0];
+            assert_eq!(row.text("a_id").unwrap(), root.to_string());
+            assert_eq!(row.text("b_id").unwrap(), root.to_string());
+            assert_eq!(
+                row.columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "a_id",
+                    "b_id",
+                    "e_id",
+                    "e_relation",
+                    "e_weight",
+                    "e_metadata",
+                    "_depth",
+                    "_total_weight"
+                ]
+            );
+            assert!(matches!(row.get("_depth"), Some(SqlValue::Integer(0))));
+            assert!(
+                matches!(row.get("_total_weight"), Some(SqlValue::Float(weight)) if *weight == 0.0)
+            );
+            for column in ["e_id", "e_relation", "e_weight", "e_metadata"] {
+                assert!(
+                    matches!(row.get(column), Some(SqlValue::Null)),
+                    "{column}: {:?}",
+                    row.get(column)
+                );
+            }
+        }
+    }
+    for range in ["1..1", "1..2"] {
+        let rows = runtime
+            .query(
+                &token,
+                &format!(
+            "MATCH (a:concept)-[:variant_of*{range}]->(b:concept) WHERE a.id = '{root}' RETURN b.id"
+        ),
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "isolated {range}");
+    }
+}
+
+#[tokio::test]
+async fn gql_zero_hop_applies_both_endpoint_constraints() {
+    use khive_storage::SqlValue;
+
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let root = gql_metadata_entity(&runtime, &token, "zero root").await;
+    let child = gql_metadata_entity(&runtime, &token, "zero child").await;
+    let incident = runtime
+        .link(
+            &token,
+            root,
+            child,
+            EdgeRelation::VariantOf,
+            0.25,
+            Some(serde_json::json!({"order": 7})),
+        )
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    let zero_only = runtime
+        .query(
+            &token,
+            &format!(
+        "MATCH (a:concept)-[:variant_of*0..0]->(b:concept) WHERE a.id = '{root}' RETURN b.id"
+    ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        zero_only.len(),
+        1,
+        "max zero must not expand the incident edge"
+    );
+    assert_eq!(zero_only[0].text("b_id").unwrap(), root.to_string());
+    for (start, end, predicate, count) in [
+        (
+            "concept {fixture_name: 'zero root'}",
+            "concept {fixture_name: 'zero root'}",
+            "a.entity_type IS NULL AND b.entity_type IS NULL",
+            1,
+        ),
+        ("document", "concept", "b.name = 'zero root'", 0),
+        ("concept", "document", "b.name = 'zero root'", 0),
+        (
+            "concept {fixture_name: 'missing'}",
+            "concept",
+            "b.name = 'zero root'",
+            0,
+        ),
+        (
+            "concept",
+            "concept {fixture_name: 'missing'}",
+            "b.name = 'zero root'",
+            0,
+        ),
+        ("concept", "concept", "a.name = 'missing'", 0),
+        ("concept", "concept", "b.name = 'missing'", 0),
+        ("concept", "concept", "a.entity_type IS NOT NULL", 0),
+        ("concept", "concept", "b.entity_type IS NOT NULL", 0),
+    ] {
+        let query = format!("MATCH (a:{start})-[e:variant_of*0..0]->(b:{end}) WHERE a.id = '{root}' AND {predicate} RETURN a.id");
+        let rows = runtime.query(&token, &query).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            count,
+            "end constraints apply without an end projection: {query}"
+        );
+        if count == 1 {
+            assert_eq!(rows[0].text("a_id").unwrap(), root.to_string());
+        }
+    }
+    for (predicate, expected_id) in [
+        ("e.metadata.order IS NULL", root),
+        ("e.metadata.order IS NOT NULL", child),
+    ] {
+        let rows = runtime.query(&token, &format!(
+            "MATCH (a:concept)-[e:variant_of*0..1]->(b:concept) WHERE a.id = '{root}' AND {predicate} RETURN b.id, e.id, e.relation, e.weight, e.metadata"
+        )).await.unwrap();
+        assert_eq!(rows.len(), 1, "{predicate}");
+        assert_eq!(rows[0].text("b_id").unwrap(), expected_id.to_string());
+        if expected_id == root {
+            for column in ["e_id", "e_relation", "e_weight", "e_metadata"] {
+                assert!(
+                    matches!(rows[0].get(column), Some(SqlValue::Null)),
+                    "zero hop must not borrow the incident edge: {column}"
+                );
+            }
+        } else {
+            assert_eq!(rows[0].text("e_id").unwrap(), incident.id.to_string());
+            assert_eq!(rows[0].text("e_relation").unwrap(), "variant_of");
+            assert!(
+                matches!(rows[0].get("e_weight"), Some(SqlValue::Float(weight)) if *weight == 0.25)
+            );
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_zero_hop_weighted_directions_and_cycle_limits() {
+    use khive_storage::SqlValue;
+
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let root = gql_metadata_entity(&runtime, &token, "weighted root").await;
+    let child = gql_metadata_entity(&runtime, &token, "weighted child").await;
+    let grandchild = gql_metadata_entity(&runtime, &token, "weighted grandchild").await;
+    for (from, to, weight) in [(root, child, 0.25), (child, grandchild, 0.5)] {
+        runtime
+            .link(&token, from, to, EdgeRelation::VariantOf, weight, None)
+            .await
+            .unwrap();
+    }
+    let values = |rows: &[khive_storage::SqlRow]| {
+        rows.iter()
+            .map(|row| {
+                let depth = match row.get("_depth") {
+                    Some(SqlValue::Integer(depth)) => *depth,
+                    other => panic!("integer depth required: {other:?}"),
+                };
+                let weight = match row.get("_total_weight") {
+                    Some(SqlValue::Float(weight)) => *weight,
+                    other => panic!("floating accumulated weight required: {other:?}"),
+                };
+                (row.text("b_id").unwrap().to_owned(), depth, weight)
+            })
+            .collect::<Vec<_>>()
+    };
+    for (direction, start, expected) in [
+        (
+            "out",
+            root,
+            vec![
+                (root.to_string(), 0, 0.0),
+                (child.to_string(), 1, 0.25),
+                (grandchild.to_string(), 2, 0.75),
+            ],
+        ),
+        (
+            "in",
+            grandchild,
+            vec![
+                (grandchild.to_string(), 0, 0.0),
+                (child.to_string(), 1, 0.5),
+                (root.to_string(), 2, 0.75),
+            ],
+        ),
+        (
+            "both",
+            child,
+            vec![
+                (child.to_string(), 0, 0.0),
+                (grandchild.to_string(), 1, 0.5),
+                (root.to_string(), 1, 0.25),
+            ],
+        ),
+    ] {
+        for min in [0, 1] {
+            let segment = match direction {
+                "out" => format!("-[e:variant_of*{min}..2]->"),
+                "in" => format!("<-[e:variant_of*{min}..2]-"),
+                _ => format!("-[e:variant_of*{min}..2]-"),
+            };
+            let rows = runtime
+                .query(
+                    &token,
+                    &format!(
+                        "MATCH (a:concept){segment}(b:concept) WHERE a.id = '{start}' RETURN b.id"
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(values(&rows), expected[min..], "{direction}, min={min}");
+        }
+    }
+    runtime
+        .link(
+            &token,
+            grandchild,
+            root,
+            EdgeRelation::VariantOf,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+    for min in [0, 1] {
+        let rows = runtime.query(&token, &format!(
+            "MATCH (a:concept)-[:variant_of*{min}..4]->(b:concept) WHERE a.id = '{root}' RETURN b.id"
+        )).await.unwrap();
+        let expected = [
+            (root.to_string(), 0, 0.0),
+            (child.to_string(), 1, 0.25),
+            (grandchild.to_string(), 2, 0.75),
+        ];
+        assert_eq!(
+            values(&rows),
+            expected[min..],
+            "a later hop must not revisit the root"
+        );
+    }
+}
+
 struct GqlCommaStar {
     root: Uuid,
     left: Vec<khive_storage::Edge>,
@@ -1010,4 +1356,1313 @@ async fn gql_comma_later_paths_keep_static_endpoint_warnings() {
         .unwrap();
     assert_eq!(healthy.rows.len(), 6);
     assert!(healthy.warnings.is_empty(), "{:?}", healthy.warnings);
+}
+
+async fn gql_return_path_entity(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    name: &str,
+    properties: serde_json::Value,
+) -> Uuid {
+    runtime
+        .create_entity_with_embedding_report(
+            token,
+            "concept",
+            None,
+            name,
+            None,
+            Some(properties),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .0
+        .id
+}
+
+#[tokio::test]
+async fn gql_return_paths_preserve_json_scalar_and_container_types() {
+    use khive_storage::SqlValue;
+
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let values = serde_json::json!({"values": {
+        "integer": 7, "large": 9007199254740993_i64, "float": 1.25,
+        "text": "quoted \"value\"", "yes": true, "no": false, "null": null,
+        "object": {"answer": 42}, "array": [1, false, null]
+    }});
+    let source =
+        gql_return_path_entity(&runtime, &token, "typed path source", values.clone()).await;
+    let target = gql_return_path_entity(
+        &runtime,
+        &token,
+        "typed path target",
+        serde_json::json!({"values":{"integer":-99}}),
+    )
+    .await;
+    runtime
+        .link(
+            &token,
+            source,
+            target,
+            EdgeRelation::VariantOf,
+            1.0,
+            Some(values.clone()),
+        )
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    let expected = [
+        ("integer", SqlValue::Integer(7)),
+        ("large", SqlValue::Integer(9007199254740993_i64)),
+        ("float", SqlValue::Float(1.25)),
+        ("text", SqlValue::Text("quoted \"value\"".into())),
+        ("yes", SqlValue::Integer(1)),
+        ("no", SqlValue::Integer(0)),
+        ("null", SqlValue::Null),
+        ("missing", SqlValue::Null),
+        ("object", SqlValue::Text(r#"{"answer":42}"#.into())),
+        ("array", SqlValue::Text("[1,false,null]".into())),
+    ];
+    for (prefix, alias) in [
+        ("n.properties", "n_properties"),
+        ("e.metadata", "e_metadata"),
+    ] {
+        let projection = expected
+            .iter()
+            .map(|(key, _)| format!("{prefix}.values.{key}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = runtime.query(&token, &format!("MATCH (n:concept)-[e:variant_of]->(b:concept) WHERE n.id = '{source}' RETURN {projection}")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let labels = expected
+            .iter()
+            .map(|(key, _)| format!("{alias}_values_{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[0]
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>(),
+            labels
+        );
+        for ((key, value), label) in expected.iter().zip(&labels) {
+            assert_gql_sql_value_eq!(
+                rows[0].get(label),
+                Some(value),
+                "{prefix}.{key} must preserve SQLite type and value"
+            );
+        }
+    }
+    let whole = runtime.query(&token, &format!("MATCH (n:concept)-[e:variant_of]->(b:concept) WHERE n.id = '{source}' RETURN n.properties, e.metadata")).await.unwrap();
+    assert_eq!(whole.len(), 1);
+    for label in ["n_properties", "e_metadata"] {
+        assert_eq!(
+            whole[0].text(label).unwrap(),
+            serde_json::to_string(&values).unwrap()
+        );
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_recursive_return_paths_use_final_edge_and_zero_null() {
+    use khive_storage::SqlValue;
+
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let mut nodes = Vec::new();
+    for (marker, decoy) in [
+        ("start", -101),
+        ("middle", -202),
+        ("end", -303),
+        ("direct", -404),
+        ("isolated", -505),
+    ] {
+        nodes.push(
+            gql_return_path_entity(
+                &runtime,
+                &token,
+                marker,
+                serde_json::json!({"marker":marker,"rank":{"order":decoy},"phase":"node-decoy"}),
+            )
+            .await,
+        );
+    }
+    let [root, middle, end, direct, isolated] = <[Uuid; 5]>::try_from(nodes).unwrap();
+    for (from, to, order, phase) in [
+        (root, middle, 90, "earlier"),
+        (middle, end, 2, "final"),
+        (root, direct, 1, "direct"),
+    ] {
+        runtime
+            .link(
+                &token,
+                from,
+                to,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(serde_json::json!({"rank":{"order":order},"phase":phase})),
+            )
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    let projection =
+        "a.properties.marker, b.properties.marker, e.metadata.rank.order, e.metadata.phase";
+    let values = |rows: &[khive_storage::SqlRow]| {
+        rows.iter()
+            .map(|row| {
+                [
+                    "a_properties_marker",
+                    "b_properties_marker",
+                    "e_metadata_rank_order",
+                    "e_metadata_phase",
+                ]
+                .map(|label| row.get(label).unwrap().clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        [
+            SqlValue::Text("start".into()),
+            SqlValue::Text("start".into()),
+            SqlValue::Null,
+            SqlValue::Null,
+        ],
+        [
+            SqlValue::Text("start".into()),
+            SqlValue::Text("direct".into()),
+            SqlValue::Integer(1),
+            SqlValue::Text("direct".into()),
+        ],
+        [
+            SqlValue::Text("start".into()),
+            SqlValue::Text("end".into()),
+            SqlValue::Integer(2),
+            SqlValue::Text("final".into()),
+        ],
+        [
+            SqlValue::Text("start".into()),
+            SqlValue::Text("middle".into()),
+            SqlValue::Integer(90),
+            SqlValue::Text("earlier".into()),
+        ],
+    ];
+    let fixed = runtime.query(&token, &format!("MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{root}' RETURN {projection} ORDER BY e.metadata.rank.order")).await.unwrap();
+    assert_gql_sql_rows_eq!(
+        values(&fixed),
+        vec![expected[1].clone(), expected[3].clone()]
+    );
+    for min in [0, 1] {
+        let base = format!("MATCH (a:concept)-[e:variant_of*{min}..2]->(b:concept) WHERE a.id = '{root}' RETURN {projection} ORDER BY e.metadata.rank.order");
+        let rows = runtime.query(&token, &base).await.unwrap();
+        assert_gql_sql_rows_eq!(values(&rows), expected[min..], "min={min}");
+        let depths = [0, 1, 2, 1];
+        for (row, depth) in rows.iter().zip(&depths[min..]) {
+            assert_gql_sql_value_eq!(row.get("_depth"), Some(&SqlValue::Integer(*depth)));
+            assert_gql_sql_value_eq!(
+                row.get("_total_weight"),
+                Some(&SqlValue::Float(*depth as f64))
+            );
+        }
+        let page = runtime
+            .query(&token, &format!("{base} SKIP 1 LIMIT 2"))
+            .await
+            .unwrap();
+        assert_gql_sql_rows_eq!(
+            values(&page),
+            expected[min + 1..min + 3],
+            "post-SKIP LIMIT: min={min}"
+        );
+    }
+    for max in [0, 1] {
+        let rows = runtime.query(&token, &format!("MATCH (a:concept)-[e:variant_of*0..{max}]->(b:concept) WHERE a.id = '{isolated}' RETURN {projection}, e.metadata.rank")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text("a_properties_marker").unwrap(), "isolated");
+        assert_eq!(rows[0].text("b_properties_marker").unwrap(), "isolated");
+        for label in [
+            "e_metadata_rank_order",
+            "e_metadata_phase",
+            "e_metadata_rank",
+        ] {
+            assert_gql_sql_value_eq!(
+                rows[0].get(label),
+                Some(&SqlValue::Null),
+                "isolated0..{max} {label}"
+            );
+        }
+        assert_gql_sql_value_eq!(rows[0].get("_depth"), Some(&SqlValue::Integer(0)));
+        assert_gql_sql_value_eq!(rows[0].get("_total_weight"), Some(&SqlValue::Float(0.0)));
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_return_path_collisions_refuse_before_execution() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let source = gql_return_path_entity(
+        &runtime,
+        &token,
+        "collision source",
+        serde_json::json!({"a_b":1,"a":{"b":2},"name":"property-name"}),
+    )
+    .await;
+    let target = gql_metadata_entity(&runtime, &token, "collision target").await;
+    runtime
+        .link(&token, source, target, EdgeRelation::VariantOf, 1.0, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    for range in ["", "*0..2", "*1..2"] {
+        for projection in [
+            "a.properties.a_b, a.properties.a.b",
+            "a.properties.name, a_properties.name",
+            "a.properties.name, a_properties",
+        ] {
+            let input = format!("MATCH (a:concept)-[e:variant_of{range}]->(a_properties:concept) WHERE a.id = '{source}' RETURN {projection}");
+            let error = runtime.query(&token, &input).await.unwrap_err();
+            assert!(
+                matches!(error.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Compile(message)) if message.contains("RETURN projection column name collision")),
+                "{input}: {error}"
+            );
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_distinct_and_typed_groups_use_only_returned_values() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let mut ids = Vec::new();
+    for properties in [
+        serde_json::json!({"bucket": "A"}),
+        serde_json::json!({"bucket": "a"}),
+        serde_json::json!({"bucket": 1}),
+        serde_json::json!({"bucket": 1.0}),
+        serde_json::json!({"bucket": null}),
+        serde_json::json!({}),
+    ] {
+        ids.push(gql_return_path_entity(&runtime, &token, "grouped", properties).await);
+    }
+    gql_metadata_observation(&runtime, &token).await;
+    runtime
+        .link(&token, ids[0], ids[1], EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    let base = "MATCH (n:concept {name: 'grouped'})";
+    let ordinary = runtime
+        .query(&token, &format!("{base} RETURN n.name"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ordinary.len(),
+        6,
+        "ordinary fixed projection retains bag multiplicity"
+    );
+    let distinct = runtime
+        .query(&token, &format!("{base} RETURN DISTINCT n.name"))
+        .await
+        .unwrap();
+    assert_eq!(distinct.len(), 1);
+    assert_eq!(distinct[0].columns.len(), 1);
+    assert_eq!(distinct[0].text("n_name"), Ok("grouped"));
+    for prefix in ["", "DISTINCT "] {
+        let rows = runtime.query(&token, &format!("{base} RETURN {prefix}n.properties.bucket, count(n) ORDER BY n.properties.bucket")).await.unwrap();
+        assert_eq!(rows.len(), 4, "hidden IDs must not split equal values");
+        assert_gql_sql_value_eq!(rows[0].get("n_properties_bucket"), Some(&SqlValue::Null));
+        assert!(
+            matches!(
+                rows[1].get("n_properties_bucket"),
+                Some(SqlValue::Integer(1))
+            ) || matches!(rows[1].get("n_properties_bucket"), Some(SqlValue::Float(v)) if *v == 1.0)
+        );
+        assert_eq!(rows[2].text("n_properties_bucket"), Ok("A"));
+        assert_eq!(rows[3].text("n_properties_bucket"), Ok("a"));
+        for (row, count) in rows.iter().zip([2, 2, 1, 1]) {
+            assert_eq!(
+                row.columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["n_properties_bucket", "count_n"]
+            );
+            assert_gql_sql_value_eq!(row.get("count_n"), Some(&SqlValue::Integer(count)));
+        }
+    }
+    let whole = runtime
+        .query(&token, &format!("{base} RETURN n, count(n) ORDER BY n.id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        whole.len(),
+        6,
+        "whole binding legitimately includes the ID in grouping"
+    );
+    let whole_ids = whole
+        .iter()
+        .map(|row| {
+            assert_gql_sql_value_eq!(row.get("count_n"), Some(&SqlValue::Integer(1)));
+            row.text("n_id").unwrap().to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        whole_ids,
+        ids.iter().map(ToString::to_string).collect::<BTreeSet<_>>()
+    );
+    for tail in ["count(n)", "DISTINCT count(n)"] {
+        let empty = runtime
+            .query(
+                &token,
+                &format!("MATCH (n:concept {{name: 'absent'}}) RETURN {tail}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].columns.len(), 1);
+        assert_gql_sql_value_eq!(empty[0].get("count_n"), Some(&SqlValue::Integer(0)));
+    }
+    for tail in [
+        "n.name, count(n)",
+        "DISTINCT n.name",
+        "count(n) SKIP 1",
+        "count(n) LIMIT 0",
+    ] {
+        assert!(
+            runtime
+                .query(
+                    &token,
+                    &format!("MATCH (n:concept {{name: 'absent'}}) RETURN {tail}")
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tail}"
+        );
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_recursive_counts_precede_projection_dedup_and_count_repeated_final_edges() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let root = gql_metadata_entity(&runtime, &token, "count root").await;
+    let left = gql_metadata_entity(&runtime, &token, "count left").await;
+    let right = gql_metadata_entity(&runtime, &token, "count right").await;
+    let joint = gql_metadata_entity(&runtime, &token, "count joint").await;
+    let end = gql_metadata_entity(&runtime, &token, "count end").await;
+    for (from, to) in [
+        (root, left),
+        (root, right),
+        (root, joint),
+        (left, joint),
+        (right, joint),
+        (joint, end),
+    ] {
+        runtime
+            .link(&token, from, to, EdgeRelation::Extends, 0.5, None)
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    for min in [0, 1] {
+        let pattern = format!(
+            "MATCH (a)-[e:extends*{min}..2]->(b) WHERE a.id = '{root}' AND b.id = '{joint}'"
+        );
+        let distinct = runtime
+            .query(&token, &format!("{pattern} RETURN DISTINCT b.id"))
+            .await
+            .unwrap();
+        assert_eq!(distinct.len(), 1);
+        assert_eq!(distinct[0].columns.len(), 1, "no implicit depth/weight");
+        assert_eq!(distinct[0].text("b_id"), Ok(joint.to_string().as_str()));
+        let grouped = runtime
+            .query(
+                &token,
+                &format!("{pattern} RETURN b.id, count(a), count(b), count(e)"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].columns.len(), 4);
+        for column in ["count_a", "count_b", "count_e"] {
+            assert_gql_sql_value_eq!(grouped[0].get(column), Some(&SqlValue::Integer(3)));
+        }
+    }
+    let shared_final = runtime.query(&token, &format!("MATCH (a)-[e:extends*3..3]->(b) WHERE a.id = '{root}' AND b.id = '{end}' RETURN count(b), count(e)")).await.unwrap();
+    assert_eq!(shared_final.len(), 1);
+    assert_gql_sql_value_eq!(shared_final[0].get("count_b"), Some(&SqlValue::Integer(2)));
+    assert_gql_sql_value_eq!(
+        shared_final[0].get("count_e"),
+        Some(&SqlValue::Integer(2)),
+        "one final edge occurs on two matching paths"
+    );
+    assert_eq!(shared_final[0].columns.len(), 2);
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_zero_hop_counts_bound_nodes_but_not_null_final_edges() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let root = gql_metadata_entity(&runtime, &token, "zero count root").await;
+    let pattern = format!("MATCH (a)-[e:extends*0..0]->(b) WHERE a.id = '{root}'");
+    let rows = runtime
+        .query(
+            &token,
+            &format!("{pattern} RETURN count(a), count(b), count(e)"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns.len(), 3);
+    for (column, count) in [("count_a", 1), ("count_b", 1), ("count_e", 0)] {
+        assert_gql_sql_value_eq!(rows[0].get(column), Some(&SqlValue::Integer(count)));
+    }
+    let positive_empty = runtime.query(&token, &format!("MATCH (a)-[e:extends*1..2]->(b) WHERE a.id = '{root}' RETURN count(a), count(b), count(e)")).await.unwrap();
+    assert_eq!(positive_empty.len(), 1);
+    assert_eq!(positive_empty[0].columns.len(), 3);
+    for column in ["count_a", "count_b", "count_e"] {
+        assert_gql_sql_value_eq!(positive_empty[0].get(column), Some(&SqlValue::Integer(0)));
+    }
+    let child = gql_metadata_entity(&runtime, &token, "zero count child").await;
+    runtime
+        .link(&token, root, child, EdgeRelation::Extends, 0.5, None)
+        .await
+        .unwrap();
+    for (range, nodes, edges) in [("0..0", 1, 0), ("0..1", 2, 1), ("1..2", 1, 1)] {
+        let rows = runtime.query(&token, &format!("MATCH (a)-[e:extends*{range}]->(b) WHERE a.id = '{root}' RETURN count(b), count(e)")).await.unwrap();
+        assert_gql_sql_value_eq!(
+            rows[0].get("count_b"),
+            Some(&SqlValue::Integer(nodes)),
+            "{range}"
+        );
+        assert_gql_sql_value_eq!(
+            rows[0].get("count_e"),
+            Some(&SqlValue::Integer(edges)),
+            "{range}"
+        );
+        assert_eq!(rows[0].columns.len(), 2);
+    }
+    let groups = runtime.query(&token, &format!("MATCH (a)-[e:extends*0..1]->(b) WHERE a.id = '{root}' RETURN e.id, count(e) ORDER BY e.id")).await.unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_gql_sql_value_eq!(groups[0].get("e_id"), Some(&SqlValue::Null));
+    assert_gql_sql_value_eq!(groups[0].get("count_e"), Some(&SqlValue::Integer(0)));
+    assert_gql_sql_value_eq!(groups[1].get("count_e"), Some(&SqlValue::Integer(1)));
+}
+
+#[tokio::test]
+async fn gql_not_exists_returns_only_requirements_without_visible_support() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let mut requirements = Vec::new();
+    for name in ["absence req 1", "absence req 2", "absence req 3"] {
+        requirements.push(
+            gql_return_path_entity(
+                &runtime,
+                &token,
+                name,
+                serde_json::json!({"role": "requirement"}),
+            )
+            .await,
+        );
+    }
+    let first = gql_return_path_entity(
+        &runtime,
+        &token,
+        "evidence first",
+        serde_json::json!({"reviewed": true}),
+    )
+    .await;
+    let second = gql_return_path_entity(
+        &runtime,
+        &token,
+        "evidence second",
+        serde_json::json!({"reviewed": false}),
+    )
+    .await;
+    let unrelated = gql_metadata_entity(&runtime, &token, "unrelated requirement").await;
+    for (from, to) in [
+        (first, requirements[0]),
+        (second, requirements[0]),
+        (first, unrelated),
+        (first, second),
+    ] {
+        runtime
+            .link(&token, from, to, EdgeRelation::Supports, 0.5, None)
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    for inner in [
+        "(f:concept)-[:supports]->(r)",
+        "(r)<-[:supports]-(f:concept)",
+        "(r)-[:supports]-(f:concept)",
+    ] {
+        let rows = runtime.query(&token, &format!("MATCH (r:concept {{role: 'requirement'}}) WHERE NOT EXISTS {{ {inner} }} RETURN r.name ORDER BY r.name")).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.text("r_name").unwrap())
+                .collect::<Vec<_>>(),
+            ["absence req 2", "absence req 3"],
+            "{inner}"
+        );
+    }
+    for (flag, expected) in [
+        ("false", vec!["absence req 2", "absence req 3"]),
+        (
+            "true",
+            vec!["absence req 1", "absence req 2", "absence req 3"],
+        ),
+    ] {
+        let rows = runtime.query(&token, &format!("MATCH (r:concept {{role: 'requirement'}}) WHERE NOT EXISTS {{ (f:concept)-[:supports]->(m:concept {{reviewed: {flag}}})-[:supports]->(r) }} RETURN r.name ORDER BY r.name")).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.text("r_name").unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "intermediate inline constraint {flag}"
+        );
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_not_exists_preserves_boolean_and_comma_binding_scope() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    runtime
+        .link(
+            &token,
+            fixture.left[0].target_id,
+            fixture.right[0].target_id,
+            EdgeRelation::Supports,
+            0.5,
+            None,
+        )
+        .await
+        .unwrap();
+    let always = gql_return_path_entity(
+        &runtime,
+        &token,
+        "absence always",
+        serde_json::json!({"role": "boolean", "eligible": false}),
+    )
+    .await;
+    let eligible = gql_return_path_entity(
+        &runtime,
+        &token,
+        "absence eligible",
+        serde_json::json!({"role": "boolean", "eligible": true}),
+    )
+    .await;
+    let neither = gql_return_path_entity(
+        &runtime,
+        &token,
+        "absence neither",
+        serde_json::json!({"role": "boolean", "eligible": false}),
+    )
+    .await;
+    runtime
+        .link(&token, neither, always, EdgeRelation::Supports, 0.5, None)
+        .await
+        .unwrap();
+    runtime
+        .link(&token, always, eligible, EdgeRelation::Extends, 0.5, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    let rows = runtime.query(&token, "MATCH (r:concept {role: 'boolean'}) WHERE r.name = 'absence always' OR NOT EXISTS { (x)-[:supports]->(r) } AND r.properties.eligible = true RETURN r.name ORDER BY r.name").await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.text("r_name").unwrap())
+            .collect::<Vec<_>>(),
+        ["absence always", "absence eligible"],
+        "AND precedes OR"
+    );
+    let rows = runtime.query(&token, "MATCH (r:concept {role: 'boolean'}) WHERE NOT EXISTS { (x)-[local:supports]->(r) } AND NOT EXISTS { (x)-[local:extends]->(r) } RETURN r.name").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].text("r_name"),
+        Ok("absence neither"),
+        "independent blocks may reuse local names"
+    );
+    let source = format!(
+        "{} AND NOT EXISTS {{ (b)-[inner:supports]->(c) }}",
+        fixture.pattern()
+    );
+    let rows = runtime
+        .query(&token, &format!("{source} RETURN e.id, f.id"))
+        .await
+        .unwrap();
+    let removed = (
+        fixture.left[0].id.to_string(),
+        fixture.right[0].id.to_string(),
+    );
+    let expected: Vec<_> = fixture
+        .pairs()
+        .into_iter()
+        .filter(|pair| pair != &removed)
+        .collect();
+    assert_eq!(gql_comma_pairs(&rows), expected);
+    let rows = runtime
+        .query(
+            &token,
+            &format!("{source} RETURN count(a), count(e), count(f)"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    for column in ["count_a", "count_e", "count_f"] {
+        assert_gql_sql_value_eq!(rows[0].get(column), Some(&SqlValue::Integer(5)));
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_recursive_not_exists_correlates_start_and_end_before_counts() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let mut ids = Vec::new();
+    for name in [
+        "absence root",
+        "absence left",
+        "absence right",
+        "absence join",
+        "absence tail",
+    ] {
+        ids.push(gql_metadata_entity(&runtime, &token, name).await);
+    }
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 4)] {
+        runtime
+            .link(
+                &token,
+                ids[from],
+                ids[to],
+                EdgeRelation::Extends,
+                0.25,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    runtime
+        .link(&token, ids[0], ids[1], EdgeRelation::Supports, 0.5, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    for min in [0, 1] {
+        for inner in ["(a)-[:supports]->(b)", "(f)-[:supports]->(b)"] {
+            let source = format!("MATCH (a)-[e:extends*{min}..3]->(b) WHERE a.id = '{}' AND NOT EXISTS {{ {inner} }}", ids[0]);
+            let rows = runtime
+                .query(
+                    &token,
+                    &format!("{source} RETURN b.name, count(b), count(e) ORDER BY b.name"),
+                )
+                .await
+                .unwrap();
+            let mut expected = vec![("absence join", 2, 2), ("absence right", 1, 1)];
+            if min == 0 {
+                expected.push(("absence root", 1, 0));
+            }
+            expected.push(("absence tail", 2, 2));
+            assert_eq!(rows.len(), expected.len());
+            for (row, (name, node_count, edge_count)) in rows.iter().zip(expected) {
+                assert_eq!(
+                    row.columns.len(),
+                    3,
+                    "grouped absence adds no hidden metrics"
+                );
+                assert_eq!(row.text("b_name"), Ok(name));
+                assert_gql_sql_value_eq!(row.get("count_b"), Some(&SqlValue::Integer(node_count)));
+                assert_gql_sql_value_eq!(row.get("count_e"), Some(&SqlValue::Integer(edge_count)));
+            }
+            let rows = runtime
+                .query(
+                    &token,
+                    &format!("{source} RETURN DISTINCT b.name ORDER BY b.name"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.text("b_name").unwrap())
+                    .collect::<Vec<_>>(),
+                if min == 0 {
+                    vec![
+                        "absence join",
+                        "absence right",
+                        "absence root",
+                        "absence tail",
+                    ]
+                } else {
+                    vec!["absence join", "absence right", "absence tail"]
+                }
+            );
+            assert!(rows.iter().all(|row| row.columns.len() == 1));
+        }
+    }
+    let source = format!("MATCH (a)-[e:extends*0..0]->(b) WHERE a.id = '{}' AND NOT EXISTS {{ (a)-[:supports]->(b) }}", ids[0]);
+    let rows = runtime
+        .query(&token, &format!("{source} RETURN b.id, e.id, e.metadata"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text("b_id"), Ok(ids[0].to_string().as_str()));
+    for column in ["e_id", "e_metadata"] {
+        assert_gql_sql_value_eq!(rows[0].get(column), Some(&SqlValue::Null));
+    }
+    assert_gql_sql_value_eq!(rows[0].get("_depth"), Some(&SqlValue::Integer(0)));
+    assert_gql_sql_value_eq!(rows[0].get("_total_weight"), Some(&SqlValue::Float(0.0)));
+    let rows = runtime
+        .query(
+            &token,
+            &format!("{source} RETURN count(a), count(b), count(e)"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    for column in ["count_a", "count_b"] {
+        assert_gql_sql_value_eq!(rows[0].get(column), Some(&SqlValue::Integer(1)));
+    }
+    assert_gql_sql_value_eq!(rows[0].get("count_e"), Some(&SqlValue::Integer(0)));
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_segments_preserve_each_final_edge_and_variable_only_metrics() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let mut ids = Vec::new();
+    for name in [
+        "prefix",
+        "first start",
+        "first middle",
+        "bridge",
+        "second start",
+        "second middle",
+        "second end",
+        "attachment 1",
+        "attachment 2",
+    ] {
+        ids.push(
+            gql_return_path_entity(
+                &runtime,
+                &token,
+                name,
+                serde_json::json!({"fixture": "mixed bindings", "large": 9007199254740993_i64}),
+            )
+            .await,
+        );
+    }
+    let mut edges = Vec::new();
+    for (from, to, relation, weight, slot) in [
+        (0, 1, EdgeRelation::Contains, 0.875, "prefix"),
+        (1, 2, EdgeRelation::Extends, 0.125, "first intermediate"),
+        (2, 3, EdgeRelation::VariantOf, 0.25, "first final"),
+        (3, 4, EdgeRelation::Contains, 1.0, "bridge"),
+        (5, 4, EdgeRelation::Extends, 0.0625, "second intermediate"),
+        (6, 5, EdgeRelation::VariantOf, 0.125, "second final"),
+        (6, 7, EdgeRelation::Contains, 0.9375, "attachment 1"),
+        (6, 8, EdgeRelation::Contains, 0.75, "attachment 2"),
+    ] {
+        edges.push(
+            runtime
+                .link(
+                    &token,
+                    ids[from],
+                    ids[to],
+                    relation,
+                    weight,
+                    Some(serde_json::json!({"slot": slot, "large": 9007199254740993_i64})),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let mut docs = Vec::new();
+    for name in [
+        "dependency root",
+        "dependency child",
+        "root source",
+        "child source 1",
+        "child source 2",
+    ] {
+        docs.push(
+            runtime
+                .create_entity_with_embedding_report(
+                    &token,
+                    "document",
+                    Some("paper"),
+                    name,
+                    None,
+                    Some(serde_json::json!({"family": "mixed dependency"})),
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .0
+                .id,
+        );
+    }
+    runtime
+        .link(
+            &token,
+            docs[0],
+            docs[1],
+            EdgeRelation::DependsOn,
+            0.25,
+            None,
+        )
+        .await
+        .unwrap();
+    for (from, to) in [(0, 2), (1, 3), (1, 4)] {
+        runtime
+            .link(
+                &token,
+                docs[from],
+                docs[to],
+                EdgeRelation::DerivedFrom,
+                0.875,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    for (first, second) in [
+        (
+            "-[e:extends|variant_of*2..2]->",
+            "<-[g:extends|variant_of*2..2]-",
+        ),
+        (
+            "-[e:extends|variant_of*2..2]-",
+            "-[g:extends|variant_of*2..2]-",
+        ),
+    ] {
+        let pattern = format!("MATCH (u)-[p:contains]->(a){first}(b:concept {{fixture: 'mixed bindings'}})-[f:contains]->(c){second}(d)-[h:contains]->(z) WHERE u.id = '{}' AND b.id = '{}' AND d.id = '{}' AND b.entity_type IS NULL", ids[0], ids[3], ids[6]);
+        let rows = runtime.query(&token, &format!("{pattern} RETURN b.properties.large, e.id, e.weight, e.metadata.slot, e.metadata.large, f.id, f.metadata.slot, g.id, g.weight, g.metadata.slot, p.id, p.metadata.slot, h.id, h.metadata.slot, z.name ORDER BY z.name")).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, suffix) in rows.iter().zip([6, 7]) {
+            for (column, edge) in [
+                ("p_id", 0),
+                ("e_id", 2),
+                ("f_id", 3),
+                ("g_id", 5),
+                ("h_id", suffix),
+            ] {
+                assert_eq!(
+                    row.text(column).unwrap(),
+                    edges[edge].id.to_string(),
+                    "{column}"
+                );
+            }
+            for (column, value) in [
+                ("p_metadata_slot", "prefix"),
+                ("e_metadata_slot", "first final"),
+                ("f_metadata_slot", "bridge"),
+                ("g_metadata_slot", "second final"),
+            ] {
+                assert_eq!(row.text(column), Ok(value));
+            }
+            let attachment = if suffix == 6 {
+                "attachment 1"
+            } else {
+                "attachment 2"
+            };
+            assert_eq!(row.text("h_metadata_slot"), Ok(attachment));
+            assert_eq!(row.text("z_name"), Ok(attachment));
+            for column in ["b_properties_large", "e_metadata_large"] {
+                assert_gql_sql_value_eq!(
+                    row.get(column),
+                    Some(&SqlValue::Integer(9007199254740993_i64))
+                );
+            }
+            assert_gql_sql_value_eq!(row.get("e_weight"), Some(&SqlValue::Float(0.25)));
+            assert_gql_sql_value_eq!(row.get("g_weight"), Some(&SqlValue::Float(0.125)));
+            assert_gql_sql_value_eq!(row.get("_depth"), Some(&SqlValue::Integer(4)));
+            assert_gql_sql_value_eq!(
+                row.get("_total_weight"),
+                Some(&SqlValue::Float(0.5625)),
+                "fixed weights must not contribute"
+            );
+        }
+        for wrong in [
+            "b:document {fixture: 'mixed bindings'}",
+            "b:concept {fixture: 'missing'}",
+        ] {
+            let query = pattern.replace("b:concept {fixture: 'mixed bindings'}", wrong);
+            assert!(runtime
+                .query(&token, &format!("{query} RETURN z.name"))
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+    let dependencies = format!("MATCH (a:document)-[e:depends_on*0..2]->(b:document {{entity_type: 'paper', family: 'mixed dependency'}})-[f:derived_from]->(s:document) WHERE a.id = '{}' RETURN s.name ORDER BY s.name", docs[0]);
+    let rows = runtime.query(&token, &dependencies).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.text("s_name").unwrap())
+            .collect::<Vec<_>>(),
+        ["child source 1", "child source 2", "root source"]
+    );
+    assert!(runtime
+        .query(
+            &token,
+            &dependencies.replace("entity_type: 'paper'", "entity_type: 'summary'")
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_zero_segments_join_following_fixed_steps_and_count_null_edges() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let root = gql_metadata_entity(&runtime, &token, "mixed zero root").await;
+    let attachment = gql_metadata_entity(&runtime, &token, "mixed zero attachment").await;
+    let fixed = runtime
+        .link(
+            &token,
+            root,
+            attachment,
+            EdgeRelation::Contains,
+            0.875,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut same_uuid_note = khive_storage::Note::new("local", "observation", "typed zero decoy");
+    same_uuid_note.id = root;
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(same_uuid_note)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    let pattern = format!("MATCH (a:entity)-[e:extends*0..0]->(b:concept)-[f:contains]->(c:concept)-[g:variant_of*0..0]->(d:entity) WHERE a.id = '{root}'");
+    let rows = runtime.query(&token, &format!("{pattern} RETURN a.id, b.id, c.id, d.id, e.id, e.relation, e.weight, e.metadata, f.id, g.id, g.relation, g.weight, g.metadata")).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    for column in ["a_id", "b_id"] {
+        assert_eq!(rows[0].text(column).unwrap(), root.to_string());
+    }
+    for column in ["c_id", "d_id"] {
+        assert_eq!(rows[0].text(column).unwrap(), attachment.to_string());
+    }
+    assert_eq!(rows[0].text("f_id").unwrap(), fixed.id.to_string());
+    for column in [
+        "e_id",
+        "e_relation",
+        "e_weight",
+        "e_metadata",
+        "g_id",
+        "g_relation",
+        "g_weight",
+        "g_metadata",
+    ] {
+        assert_gql_sql_value_eq!(rows[0].get(column), Some(&SqlValue::Null), "{column}");
+    }
+    assert_gql_sql_value_eq!(rows[0].get("_depth"), Some(&SqlValue::Integer(0)));
+    assert_gql_sql_value_eq!(rows[0].get("_total_weight"), Some(&SqlValue::Float(0.0)));
+    let counts = runtime.query(&token, &format!("{pattern} RETURN count(a), count(b), count(c), count(d), count(e), count(f), count(g)")).await.unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].columns.len(), 7);
+    for (column, value) in [
+        ("count_a", 1),
+        ("count_b", 1),
+        ("count_c", 1),
+        ("count_d", 1),
+        ("count_e", 0),
+        ("count_f", 1),
+        ("count_g", 0),
+    ] {
+        assert_gql_sql_value_eq!(counts[0].get(column), Some(&SqlValue::Integer(value)));
+    }
+    for (from, to) in [
+        ("a:entity", "a:document"),
+        ("b:concept", "b:note"),
+        ("b:concept", "b:concept {fixture_name: 'missing'}"),
+        ("c:concept", "c:document"),
+        ("d:entity", "d:note"),
+        ("e:extends*0..0", "e:extends*1..2"),
+        ("g:variant_of*0..0", "g:variant_of*1..2"),
+    ] {
+        let source = pattern.replace(from, to);
+        assert!(
+            runtime
+                .query(&token, &format!("{source} RETURN a.id"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{source}"
+        );
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_segment_cycle_state_is_local() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let a = gql_metadata_entity(&runtime, &token, "cycle a").await;
+    let b = gql_metadata_entity(&runtime, &token, "cycle b").await;
+    for (from, to, relation, weight) in [
+        (a, b, EdgeRelation::Extends, 0.5),
+        (b, a, EdgeRelation::Extends, 0.5),
+        (b, a, EdgeRelation::VariantOf, 0.25),
+        (a, b, EdgeRelation::VariantOf, 0.25),
+    ] {
+        runtime
+            .link(&token, from, to, relation, weight, None)
+            .await
+            .unwrap();
+    }
+    let x = gql_metadata_entity(&runtime, &token, "loop x").await;
+    let y = gql_metadata_entity(&runtime, &token, "loop y").await;
+    let unused = gql_metadata_entity(&runtime, &token, "loop fixture donor").await;
+    runtime
+        .link(&token, x, y, EdgeRelation::Contains, 1.0, None)
+        .await
+        .unwrap();
+    // Trusted storage represents existing self-loops; public link refuses new ones.
+    for (node, relation, weight) in [
+        (x, EdgeRelation::Extends, 0.125),
+        (y, EdgeRelation::VariantOf, 0.25),
+    ] {
+        let mut edge = runtime
+            .link(&token, node, unused, relation, weight, None)
+            .await
+            .unwrap();
+        edge.target_id = node;
+        runtime
+            .graph(&token)
+            .unwrap()
+            .upsert_edge(edge)
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    let source = format!("MATCH (a)-[e:extends*1..3]->(b)-[f:variant_of*1..3]->(c) WHERE a.id = '{a}' RETURN a.id, b.id, c.id");
+    let rows = runtime.query(&token, &source).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "neither segment may revisit its own start after the first expansion"
+    );
+    assert_eq!(rows[0].text("a_id").unwrap(), a.to_string());
+    assert_eq!(rows[0].text("b_id").unwrap(), b.to_string());
+    assert_eq!(
+        rows[0].text("c_id").unwrap(),
+        a.to_string(),
+        "a later segment may revisit a node from an earlier segment"
+    );
+    assert_gql_sql_value_eq!(rows[0].get("_depth"), Some(&SqlValue::Integer(2)));
+    assert_gql_sql_value_eq!(rows[0].get("_total_weight"), Some(&SqlValue::Float(0.75)));
+    let loops = runtime.query(&token, &format!("MATCH (a)-[e:extends*1..3]->(b)-[:contains]->(c)-[g:variant_of*1..3]->(d) WHERE a.id = '{x}' RETURN b.id, d.id")).await.unwrap();
+    assert_eq!(
+        loops.len(),
+        1,
+        "first-step loops survive in both segments but cannot recur"
+    );
+    assert_eq!(loops[0].text("b_id").unwrap(), x.to_string());
+    assert_eq!(loops[0].text("d_id").unwrap(), y.to_string());
+    assert_gql_sql_value_eq!(loops[0].get("_depth"), Some(&SqlValue::Integer(2)));
+    assert_gql_sql_value_eq!(loops[0].get("_total_weight"), Some(&SqlValue::Float(0.375)));
+    let refusal = runtime
+        .query(
+            &token,
+            &source
+                .replace("(c)", "(a)")
+                .replace("a.id, b.id, c.id", "a.id"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refusal.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Unsupported(message)) if message.contains("repeated node variable 'a'"))
+    );
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_counts_preserve_path_multiplicity_before_projection_dedup() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let mut ids = Vec::new();
+    for name in ["diamond root", "left", "right", "joint", "end"] {
+        ids.push(gql_metadata_entity(&runtime, &token, name).await);
+    }
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 4)] {
+        runtime
+            .link(
+                &token,
+                ids[from],
+                ids[to],
+                EdgeRelation::Extends,
+                0.125,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let target = gql_return_path_entity(
+            &runtime,
+            &token,
+            "same attachment",
+            serde_json::json!({"bucket": "one"}),
+        )
+        .await;
+        runtime
+            .link(&token, ids[4], target, EdgeRelation::Contains, 0.875, None)
+            .await
+            .unwrap();
+    }
+    let typed_root = gql_metadata_entity(&runtime, &token, "typed mixed root").await;
+    let typed_middle = gql_metadata_entity(&runtime, &token, "typed mixed middle").await;
+    runtime
+        .link(
+            &token,
+            typed_root,
+            typed_middle,
+            EdgeRelation::Contains,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+    for props in [
+        serde_json::json!({"bucket":null}),
+        serde_json::json!({}),
+        serde_json::json!({"bucket":1}),
+        serde_json::json!({"bucket":1.0}),
+        serde_json::json!({"bucket":"1"}),
+        serde_json::json!({"bucket":"A"}),
+        serde_json::json!({"bucket":"a"}),
+    ] {
+        let target = gql_return_path_entity(&runtime, &token, "typed mixed result", props).await;
+        runtime
+            .link(
+                &token,
+                typed_middle,
+                target,
+                EdgeRelation::Extends,
+                0.125,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    let pattern = format!(
+        "MATCH (a)-[e:extends*3..3]->(b)-[f:contains]->(c) WHERE a.id = '{}'",
+        ids[0]
+    );
+    let ordinary = runtime
+        .query(&token, &format!("{pattern} RETURN c.properties.bucket"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ordinary.len(),
+        1,
+        "ordinary projection deduplicates only complete value-plus-metric rows"
+    );
+    assert_eq!(ordinary[0].columns.len(), 3);
+    assert_gql_sql_value_eq!(ordinary[0].get("_depth"), Some(&SqlValue::Integer(3)));
+    assert_gql_sql_value_eq!(
+        ordinary[0].get("_total_weight"),
+        Some(&SqlValue::Float(0.375))
+    );
+    for prefix in ["", "DISTINCT "] {
+        let groups = runtime.query(&token, &format!("{pattern} RETURN {prefix}c.properties.bucket, count(a), count(b), count(c), count(e), count(f)")).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].columns.len(), 6);
+        assert_eq!(groups[0].text("c_properties_bucket"), Ok("one"));
+        for column in ["count_a", "count_b", "count_c", "count_e", "count_f"] {
+            assert_gql_sql_value_eq!(
+                groups[0].get(column),
+                Some(&SqlValue::Integer(4)),
+                "two paths sharing the final edge times two suffix bindings: {column}"
+            );
+        }
+    }
+    let distinct = runtime
+        .query(
+            &token,
+            &format!("{pattern} RETURN DISTINCT c.properties.bucket"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(distinct.len(), 1);
+    assert_eq!(distinct[0].columns.len(), 1);
+    let typed =
+        format!("MATCH (r)-[:contains]->(m)-[e:extends*1..2]->(n) WHERE r.id = '{typed_root}'");
+    let rows = runtime
+        .query(
+            &token,
+            &format!("{typed} RETURN n.properties.bucket, count(n) ORDER BY n.properties.bucket"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_gql_sql_value_eq!(rows[0].get("n_properties_bucket"), Some(&SqlValue::Null));
+    assert!(
+        matches!(
+            rows[1].get("n_properties_bucket"),
+            Some(SqlValue::Integer(1))
+        ) || matches!(rows[1].get("n_properties_bucket"), Some(SqlValue::Float(v)) if *v == 1.0)
+    );
+    for (row, text) in rows[2..].iter().zip(["1", "A", "a"]) {
+        assert_eq!(row.text("n_properties_bucket"), Ok(text));
+    }
+    for (row, count) in rows.iter().zip([2, 2, 1, 1, 1]) {
+        assert_eq!(row.columns.len(), 2);
+        assert_gql_sql_value_eq!(row.get("count_n"), Some(&SqlValue::Integer(count)));
+    }
+    let missing = format!("{typed} AND n.name = 'absent'");
+    for projection in ["count(n)", "DISTINCT count(n)"] {
+        let rows = runtime
+            .query(&token, &format!("{missing} RETURN {projection}"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].columns.len(), 1);
+        assert_gql_sql_value_eq!(rows[0].get("count_n"), Some(&SqlValue::Integer(0)));
+    }
+    for projection in ["n.name, count(n)", "DISTINCT n.name"] {
+        assert!(runtime
+            .query(&token, &format!("{missing} RETURN {projection}"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
 }
