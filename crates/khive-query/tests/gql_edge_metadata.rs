@@ -211,10 +211,18 @@ fn metadata_and_order_reject_invalid_parser_and_raw_ast_inputs() {
         "MATCH (a)-[e:contains]->(b) RETURN e.metadata ORDER BY e.metadata.order,",
         "MATCH (a)-[e:contains]->(b) RETURN e.metadata ORDER BY e.metadata.",
         "MATCH (a)-[e:contains]->(b) RETURN e.metadata ORDER BY e.other.path",
-        "MATCH (a)-[e:contains]->(b), (a)-[x]->(c) RETURN e.metadata",
     ] {
         assert!(parse(QueryLanguage::Gql, input).is_err(), "{input}");
     }
+    let input = "MATCH (a)-[e:contains]->(b), (a)-[x]->(c) RETURN e.metadata";
+    let query = parse(QueryLanguage::Gql, input).expect("connected comma patterns parse");
+    compile(&query, &CompileOptions::default()).expect("connected comma patterns compile");
+    let input = "MATCH (a)-[e:contains]->(b), (c)-[x]->(d) RETURN e.metadata";
+    let query = parse(QueryLanguage::Gql, input).expect("disconnected comma patterns parse");
+    assert!(matches!(
+        compile(&query, &CompileOptions::default()),
+        Err(QueryError::Unsupported(_))
+    ));
     for input in [
         "MATCH (a)-[e:contains]->(b) RETURN e.properties",
         "MATCH (a)-[e:contains]->(b) RETURN e.id ORDER BY e.metadata",

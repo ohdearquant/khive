@@ -17,7 +17,10 @@ pub enum QueryValue {
 /// A parsed query: pattern, predicates, projections, ordering, offset, and optional limit.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
+    /// Required first path; single-path queries leave `additional_patterns` empty.
     pub pattern: MatchPattern,
+    /// Connected canonical paths following commas in GQL's MATCH clause.
+    pub additional_patterns: Vec<MatchPattern>,
     pub where_clause: WhereExpr,
     pub return_items: Vec<ReturnItem>,
     /// Caller ordering followed by the compiler's deterministic tie order.
@@ -29,6 +32,18 @@ pub struct GqlQuery {
     /// GQL supplies this through `SKIP`; SPARQL currently always sets it to zero.
     pub offset: usize,
     pub limit: Option<usize>,
+}
+
+impl GqlQuery {
+    /// Iterate every MATCH path in textual order, including the required first path.
+    pub fn patterns(&self) -> impl Iterator<Item = &MatchPattern> {
+        std::iter::once(&self.pattern).chain(self.additional_patterns.iter())
+    }
+
+    /// Mutably iterate every MATCH path in textual order.
+    pub fn patterns_mut(&mut self) -> impl Iterator<Item = &mut MatchPattern> {
+        std::iter::once(&mut self.pattern).chain(self.additional_patterns.iter_mut())
+    }
 }
 
 /// A WHERE expression tree that preserves AND/OR grouping.

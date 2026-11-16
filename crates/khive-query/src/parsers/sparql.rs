@@ -475,6 +475,7 @@ fn triples_to_ast(
     Ok(GqlQuery {
         order_by: Vec::new(),
         pattern: MatchPattern { elements },
+        additional_patterns: Vec::new(),
         where_clause: where_conditions,
         return_items,
         // SPARQL OFFSET is intentionally outside the current dialect. Issue #1601
