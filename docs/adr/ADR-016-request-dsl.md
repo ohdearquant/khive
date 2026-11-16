@@ -810,7 +810,7 @@ of brackets, and no change to any verb's own per-item limits.
 
 ## Amendment 3 (2026-11-14): optional compact discovery catalog
 
-**Status: Proposed.** Refs #6604. This qualifies the request tool's discovery
+**Status: Accepted 2026-11-14 (#6630).** Refs #6604. This qualifies the request tool's discovery
 catalog presentation; it changes no callable verb or request argument.
 
 `kkernel mcp --catalog-verbosity full|compact` selects the presentation for that
