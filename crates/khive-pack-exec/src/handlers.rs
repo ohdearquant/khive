@@ -31,6 +31,8 @@ use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+#[cfg(unix)]
+use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
@@ -1495,8 +1497,7 @@ async fn execute(
         .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let prepared_limits = PreparedLimits::new(&cfg.limits);
     let (limit_reader, limit_writer) = limit_pipe()?;
     // SAFETY: the forked child uses fixed-size stack storage and only calls
@@ -1526,7 +1527,7 @@ async fn execute(
     let started = Instant::now();
     let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
-    let spawn = command.spawn();
+    let spawn = GroupChild::spawn(&mut command);
     // Parent side of the pipe: close the writer, read the child's report.
     unsafe {
         libc::close(limit_writer);
@@ -1544,7 +1545,7 @@ async fn execute(
         }
     };
     let report_wait = req.timeout.min(Duration::from_secs(1));
-    let pid = child.id().unwrap_or_default() as i32;
+    let pid = child.id() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
         rt,
@@ -1558,8 +1559,8 @@ async fn execute(
         append_failure_reason(receipt, format!("launched event write failed: {error}"));
     }
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.take_stdout().expect("stdout piped");
+    let stderr = child.take_stderr().expect("stderr piped");
     let cap = cfg.max_output_bytes;
     let deadline = wall_started + req.timeout;
     let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
@@ -1569,34 +1570,38 @@ async fn execute(
         wall_started,
         req.timeout,
         collect_limit_report(limit_reader, report_wait),
-        child.wait(),
+        child.wait_unreaped(),
     )
     .await;
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
-    let status = match waited {
-        Ok(Ok(status)) => {
-            use std::os::unix::process::ExitStatusExt;
-            // Only the delivered signal for a configured limit is observable
-            // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
-            // resource evidence; timeout keeps the initial explicit null.
-            receipt.limiting_resource = match status.signal() {
-                Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
-                Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
-                _ => None,
-            };
-            Some(status)
+    let observed_exit = match waited {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            append_failure_reason(receipt, format!("child exit observation failed: {error}"));
+            false
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             receipt.timed_out = true;
-            kill_group(pid);
-            let _ = child.wait().await;
-            None
+            false
         }
     };
-    // Signal any remaining members of the initial group. A descendant that
-    // called setsid is outside this group and can outlive the run.
-    kill_group(pid);
+    let finished = child.finish().await;
+    let (status, cleanup_error) =
+        finished_child_outcome(observed_exit, finished, child.exit_status());
+    if let Some(error) = cleanup_error {
+        append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
+    }
+    if let Some(status) = status {
+        use std::os::unix::process::ExitStatusExt;
+        // Only the delivered signal for a configured limit is observable
+        // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
+        // resource evidence; timeout keeps the initial explicit null.
+        receipt.limiting_resource = match status.signal() {
+            Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
+            Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
+            _ => None,
+        };
+    }
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
     if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
@@ -1856,11 +1861,6 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
 }
 
 #[cfg(unix)]
-fn kill_group(pid: i32) {
-    let _ = khive_runtime::process_group::signal_process_group(pid, libc::SIGKILL);
-}
-
-#[cfg(unix)]
 fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     let mut fds = [0 as libc::c_int; 2];
     #[cfg(any(
@@ -1992,6 +1992,19 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     }
 }
 
+#[cfg(unix)]
+fn finished_child_outcome(
+    observed_exit: bool,
+    finished: std::io::Result<std::process::ExitStatus>,
+    reaped_status: Option<std::process::ExitStatus>,
+) -> (Option<std::process::ExitStatus>, Option<std::io::Error>) {
+    let (status, error) = match finished {
+        Ok(status) => (Some(status), None),
+        Err(error) => (reaped_status, Some(error)),
+    };
+    (if observed_exit { status } else { None }, error)
+}
+
 #[cfg(test)]
 #[path = "parameter_helpers_tests.rs"]
 mod parameter_helpers_tests;
@@ -1999,6 +2012,47 @@ mod parameter_helpers_tests;
 #[cfg(test)]
 #[path = "process_cleanup_tests.rs"]
 mod process_cleanup_tests;
+
+#[cfg(all(test, unix))]
+mod finish_outcome_tests {
+    use super::finished_child_outcome;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn cleanup_error_preserves_observed_status_without_exposing_timeout_status() {
+        for observed_exit in [true, false] {
+            let (status, error) = finished_child_outcome(
+                observed_exit,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Some(ExitStatus::from_raw(23 << 8)),
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                observed_exit.then_some(23),
+                "cleanup failure must retain observed status and keep timeout status private"
+            );
+            assert_eq!(
+                error
+                    .expect("cleanup failure must remain visible")
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_without_reaped_status_stays_unknown() {
+        let (status, error) =
+            finished_child_outcome(true, Err(io::Error::from_raw_os_error(libc::EPERM)), None);
+        assert!(
+            status.is_none(),
+            "failed cleanup must not invent exit status"
+        );
+        assert_eq!(error.unwrap().raw_os_error(), Some(libc::EPERM));
+    }
+}
 
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
