@@ -132,8 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time (lowest stored id), with one warning.
 - A read on a pooled SQLite connection stays cancellable after a progress callback panics; the
   progress handler is reinstalled on unwind.
-- `exec` signals a run's process group only while the group leader is unreaped, so a cleanup signal
-  cannot reach a process group that reused the numeric id.
 
 ### Breaking (Rust crates)
 
