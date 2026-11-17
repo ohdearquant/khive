@@ -83,10 +83,68 @@ impl ForwardingEventStore {
                     None => source,
                 };
                 match writer_task_failure {
-                    Some(WireWriterTaskFailure::RequestFailed { request_state }) => {
-                        StorageError::WriterTaskRequestFailed {
-                            request_state: request_state.into(),
-                            source: Box::new(source),
+                    Some(WireWriterTaskFailure::RequestFailed {
+                        request_state,
+                        evidence,
+                    }) => {
+                        use super::protocol::{
+                            WireWriterFailureEvidence as E, WireWriterOwnerCause as C,
+                            WireWriterTaskState as S,
+                        };
+                        let reconstructed = match evidence {
+                            None => StorageError::WriterTaskRequestFailed {
+                                request_state: request_state.into(),
+                                source: Box::new(source),
+                            },
+                            Some(E::WriteOutcomeUnknown)
+                                if request_state == S::SideEffectsUnknown && !retryable =>
+                            {
+                                StorageError::WriteOutcomeUnknown {
+                                    source: Box::new(source),
+                                }
+                            }
+                            Some(E::OwnerUnavailable {
+                                operation,
+                                cause:
+                                    C::Pool {
+                                        operation: source_operation,
+                                        message,
+                                    },
+                            }) if request_state == S::NotStarted && retryable => {
+                                StorageError::WriterOwnerUnavailable {
+                                    operation: operation.into(),
+                                    source: Box::new(StorageError::Pool {
+                                        operation: source_operation.into(),
+                                        message,
+                                    }),
+                                }
+                            }
+                            Some(E::OwnerUnavailable {
+                                operation,
+                                cause: C::NoRuntime,
+                            }) if request_state == S::NotStarted && !retryable => {
+                                StorageError::WriterOwnerUnavailable {
+                                    operation: operation.into(),
+                                    source: Box::new(StorageError::WriterTaskNoRuntime),
+                                }
+                            }
+                            Some(E::RouteViolation { operation })
+                                if request_state == S::NotStarted && !retryable =>
+                            {
+                                StorageError::WriterRouteViolation {
+                                    operation: operation.into(),
+                                }
+                            }
+                            Some(_) => return StorageError::Serialization {
+                                capability: khive_storage::StorageCapability::Events,
+                                message:
+                                    "events daemon returned contradictory writer failure evidence"
+                                        .into(),
+                            },
+                        };
+                        match sqlite_write_failure {
+                            Some(failure) => reconstructed.with_sqlite_write_failure(failure),
+                            None => reconstructed,
                         }
                     }
                     Some(WireWriterTaskFailure::TaskTerminated {

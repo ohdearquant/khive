@@ -147,6 +147,16 @@ fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition
     });
     let receipt_projection = crate::visibility_receipts::receipt_error_projection(&error);
     let named_disposition = match &error {
+        RuntimeError::Storage(error) if error.is_write_outcome_unknown() => Some("unknown"),
+        RuntimeError::Storage(error)
+            if matches!(
+                error.without_sqlite_write_stage(),
+                StorageError::WriterOwnerUnavailable { .. }
+                    | StorageError::WriterRouteViolation { .. }
+            ) =>
+        {
+            Some("not_committed")
+        }
         _ if receipt_projection.is_some_and(|(_, replay)| replay) => Some("not_committed"),
         // An immutable-stream policy refusal is a definite no-write. It is matched by the
         // shared predicate rather than by a reason string so the two consumers of that
@@ -605,6 +615,7 @@ fn sqlite_capacity_failure_from_storage(error: &StorageError) -> Option<SqliteCa
             })
         }
         StorageError::WriterTaskRequestFailed { source, .. }
+        | StorageError::WriterOwnerUnavailable { source, .. }
         | StorageError::SqliteWrite { source, .. } => sqlite_capacity_failure_from_storage(source),
         StorageError::Driver { source, .. } => {
             if let Some(sqlite) = source.downcast_ref::<khive_db::SqliteError>() {

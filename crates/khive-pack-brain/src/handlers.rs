@@ -7,18 +7,15 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeError, VerbRegistry,
+    DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace, NamespaceToken,
+    RuntimeError, VerbRegistry,
 };
-use khive_storage::event::{Event, EventFilter};
-use khive_storage::types::PageRequest;
+use khive_storage::event::Event;
 use khive_types::{HandlerDef, IdResolutionMode};
 
 mod auto_feedback;
 mod brain_handlers;
-mod event_counts;
 mod event_page;
 #[cfg(feature = "lattice-router")]
 mod router;
@@ -26,15 +23,16 @@ mod router;
 #[cfg(feature = "lattice-router")]
 use router::*;
 
-pub(crate) use event_counts::*;
+#[cfg(test)]
+pub(crate) use khive_runtime::event_plane_read_test_support::{
+    fetch_event_counts_window, fetch_event_counts_window_exhaustive,
+};
 
 #[cfg(test)]
 #[path = "handlers/event_counts_read_budget_tests.rs"]
 mod event_counts_read_budget_tests;
 
 use crate::event::interpret;
-pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
-use crate::event_read_scope::event_actor_read_scope;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]

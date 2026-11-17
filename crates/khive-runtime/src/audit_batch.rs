@@ -571,6 +571,9 @@ enum RetryDecision {
 
 fn classify_store_error(err: &StorageError) -> RetryDecision {
     match err.without_sqlite_write_stage() {
+        // This replay is safe only because the batch append is idempotent.
+        StorageError::WriteOutcomeUnknown { .. } => RetryDecision::Retry,
+        StorageError::WriterOwnerUnavailable { source, .. } => classify_store_error(source),
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
@@ -1427,3 +1430,123 @@ pub use test_internals::*;
 #[cfg(test)]
 #[path = "audit_batch_physical_close_tests.rs"]
 mod physical_close_tests;
+
+#[cfg(test)]
+mod commit_reply_tests {
+    use super::*;
+    use khive_storage::event::IdempotentEventBatchResult;
+    use khive_storage::{BatchWriteSummary, EventFilter, Page, PageRequest, StorageResult};
+    use std::sync::atomic::AtomicUsize;
+
+    struct LostReplyStore {
+        inner: Arc<dyn EventStore>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for LostReplyStore {
+        async fn append_event(&self, event: Event) -> StorageResult<()> {
+            self.inner.append_event(event).await
+        }
+        async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
+            self.inner.get_event(id).await
+        }
+        async fn query_events(
+            &self,
+            filter: EventFilter,
+            page: PageRequest,
+        ) -> StorageResult<Page<Event>> {
+            self.inner.query_events(filter, page).await
+        }
+        async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+            self.inner.count_events(filter).await
+        }
+        fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+            self.inner.preflight_event(event)
+        }
+        fn supports_idempotent_audit_batch(&self) -> bool {
+            true
+        }
+        async fn append_events_idempotent(
+            &self,
+            events: Vec<Event>,
+        ) -> StorageResult<IdempotentEventBatchResult> {
+            let result = self.inner.append_events_idempotent(events).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StorageError::WriteOutcomeUnknown {
+                    source: Box::new(std::io::Error::other("reply lost after stored append")),
+                });
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_commit_reply_reconciles_identical_stored_audit_without_duplicate() {
+        let backend = khive_db::StorageBackend::memory().expect("memory event store");
+        let store = Arc::new(LostReplyStore {
+            inner: backend.events().expect("event capability"),
+            calls: AtomicUsize::new(0),
+        });
+        let event = Event::new(
+            "local",
+            "memory.recall",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "test:lost-reply",
+        );
+        let result = run_generation(
+            store.clone(),
+            vec![event.clone()],
+            Arc::new(AuditBatchConfig {
+                max_commit_attempts: std::num::NonZeroU8::new(2).unwrap(),
+                retry_backoff: Duration::ZERO,
+                ..AuditBatchConfig::default()
+            }),
+        )
+        .await;
+        let GenerationResult::Committed(rows) = result else {
+            panic!("idempotent audit replay must reconcile the lost COMMIT reply");
+        };
+        assert_eq!(rows, vec![EventAppendDisposition::AlreadyPresentIdentical]);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.get_event(event.id).await.unwrap(), Some(event));
+        assert_eq!(
+            store.count_events(EventFilter::default()).await.unwrap(),
+            1,
+            "audit recovery must not duplicate the already stored row"
+        );
+    }
+
+    #[test]
+    fn unavailable_owner_retries_pool_but_not_missing_runtime_or_route_violation() {
+        let unavailable = |source| StorageError::WriterOwnerUnavailable {
+            operation: "audit append".into(),
+            source: Box::new(source),
+        };
+        assert!(matches!(
+            classify_store_error(&unavailable(StorageError::Pool {
+                operation: "owner".into(),
+                message: "stopped".into(),
+            })),
+            RetryDecision::Retry
+        ));
+        for error in [
+            unavailable(StorageError::WriterTaskNoRuntime),
+            StorageError::WriterRouteViolation {
+                operation: "audit append".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    classify_store_error(&error),
+                    RetryDecision::Terminal(AuditTerminalReason::StoreFailure)
+                ),
+                "configuration/routing refusal is not an idempotent replay candidate"
+            );
+        }
+    }
+}

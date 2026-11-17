@@ -117,6 +117,45 @@ whether the writer seam terminated. MCP serializes that context with stable
 `request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
 request-failed versus task-terminated disposition and reconstructs the matching storage variant.
 
+### Lost replies and strict routing (ADR-135 F6)
+
+`WriteOutcomeUnknown { source }` means this request issued COMMIT but lost its
+reply without retaining a known failure. It serializes as `write_outcome_unknown`,
+with `request_state: side_effects_unknown`, `task_terminated: false`, and
+`retryable: false`. The source retains the reply-channel error. A lost reply does
+not establish that the writer stopped, and ordinary callers must not replay a
+write merely because they did not receive its result.
+
+The writer keeps request-local COMMIT and completion evidence. A retained typed
+failure takes precedence over the lost notification, including a proven rollback
+or native SQLite failure. Enqueueing or starting a closure is not evidence that
+COMMIT was issued. Loss without either settlement or COMMIT evidence retains the
+historical conservative `WriterTaskTerminated`/`SideEffectsUnknown` result.
+Top-level VACUUM does not issue the enclosing COMMIT and cannot acquire the new
+classification merely by completing its callback. Native FULL retains
+`sqlite_disk_full` precedence and its exact codes.
+
+Strict routing has two pre-execution refusals:
+
+| Variant                                        | Wire code                  | Retry policy                                                                         |
+| ---------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
+| `WriterOwnerUnavailable { operation, source }` | `writer_owner_unavailable` | The original typed source decides; `Pool` is retryable, `WriterTaskNoRuntime` is not |
+| `WriterRouteViolation { operation }`           | `writer_route_violation`   | Not retryable; the caller must use the authorized writer route                       |
+
+Both report `request_state: not_started`, `task_terminated: false`, and a
+`not_committed` disposition for that operation. They do not change default routing
+or explicit compatibility mode. Closed lifecycle authority and its permitted
+operations are documented in the database pool API; lease classes and operation
+names do not confer that authority.
+
+`writer_request_state()` follows native wrappers while preserving the outer
+request's finality. `is_write_outcome_unknown()` recognizes only the new typed
+lost-reply outcome, including a native wrapper, without relabeling historical
+unknown outcomes. These added public enum variants require downstream exhaustive
+matches to classify them explicitly. Internal audit recovery may replay only
+under its existing idempotent append contract; this does not make ordinary unknown
+writes retryable.
+
 A terminal operation or COMMIT failure caused by native SQLite FULL retains its
 primary and extended codes in `sqlite_full_codes`. Other terminal outcomes carry
 `None`; `StorageError::writer_task_terminated(request_state)` constructs that
