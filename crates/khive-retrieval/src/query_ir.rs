@@ -3,8 +3,12 @@
 //! Composable IR tree representing how sub-queries are structured, filtered, and fused,
 //! separate from the Query struct which captures what to search.
 
+use khive_fusion::{FusionStrategy, FusionStrategyError};
 use khive_score::DeterministicScore;
 use serde::{Deserialize, Serialize};
+
+/// Candidates requested per hybrid search leaf before fusion.
+pub const HYBRID_CANDIDATE_MULTIPLIER: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Core IR node
@@ -101,8 +105,60 @@ pub enum FuseStrategy {
         weights: Vec<f64>,
     },
 
+    /// Weighted Reciprocal Rank Fusion over ordered children, without weight normalization.
+    WeightedRrf {
+        /// Smoothing constant (must be at least one at execution).
+        k: usize,
+        /// One finite, strictly positive weight per ordered child.
+        weights: Vec<f64>,
+    },
+
     /// Union with max-score-per-document semantics.
     Union,
+
+    /// Return only vector results.
+    VectorOnly,
+
+    /// Return only keyword results.
+    KeywordOnly,
+
+    /// A named custom strategy resolved by the executor.
+    Custom {
+        /// Strategy identifier.
+        name: String,
+        /// Opaque parameters preserved for the executor.
+        params: serde_json::Value,
+    },
+}
+
+impl From<FusionStrategy> for FuseStrategy {
+    fn from(strategy: FusionStrategy) -> Self {
+        match strategy {
+            FusionStrategy::Rrf { k } => Self::Rrf { k },
+            FusionStrategy::Weighted { weights } => Self::Weighted { weights },
+            FusionStrategy::WeightedRrf { k, weights } => Self::WeightedRrf { k, weights },
+            FusionStrategy::Union => Self::Union,
+            FusionStrategy::VectorOnly => Self::VectorOnly,
+            FusionStrategy::KeywordOnly => Self::KeywordOnly,
+            FusionStrategy::Custom { name, params } => Self::Custom { name, params },
+        }
+    }
+}
+
+impl TryFrom<FuseStrategy> for FusionStrategy {
+    type Error = FusionStrategyError;
+
+    fn try_from(strategy: FuseStrategy) -> Result<Self, Self::Error> {
+        match strategy {
+            FuseStrategy::Rrf { k } => Self::try_rrf(k),
+            FuseStrategy::Weighted { weights } => Self::try_weighted(weights),
+            FuseStrategy::WeightedRrf { k, weights } => Self::try_weighted_rrf(k, weights),
+            FuseStrategy::Union => Ok(Self::Union),
+            FuseStrategy::VectorOnly => Ok(Self::VectorOnly),
+            FuseStrategy::KeywordOnly => Ok(Self::KeywordOnly),
+            FuseStrategy::Custom { name, params } => Self::try_custom(name, params),
+        }
+    }
 }
 
 /// Predicate for post-retrieval filtering.
@@ -170,9 +226,9 @@ impl QueryNode {
         }
     }
 
-    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 3` candidates each).
+    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 4` candidates each).
     pub fn hybrid(embedding: Vec<f32>, text: impl Into<String>, top_k: usize) -> Self {
-        let candidate_k = top_k.saturating_mul(3);
+        let candidate_k = top_k.saturating_mul(HYBRID_CANDIDATE_MULTIPLIER as usize);
         QueryNode::Fuse {
             children: vec![
                 QueryNode::vector(embedding, candidate_k),

@@ -49,9 +49,9 @@ fn test_hybrid_construction() {
         } => {
             assert_eq!(children.len(), 2);
             assert_eq!(*top_k, 10);
-            // Sub-queries should request 3x candidates.
-            assert_eq!(children[0].top_k(), 30);
-            assert_eq!(children[1].top_k(), 30);
+            // Sub-queries should request 4x candidates.
+            assert_eq!(children[0].top_k(), 40);
+            assert_eq!(children[1].top_k(), 40);
             assert!(matches!(strategy, FuseStrategy::Rrf { k: 60 }));
         }
         other => panic!("expected Fuse, got {:?}", other),
@@ -308,4 +308,253 @@ fn test_serde_roundtrip_compound_predicate() {
     let json = serde_json::to_string(&node).expect("serialize");
     let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.leaf_count(), 1);
+}
+
+#[test]
+fn fusion_strategy_conversion_preserves_all_variants_and_custom_payload() {
+    let strategies = [
+        FusionStrategy::Rrf { k: 17 },
+        FusionStrategy::Weighted {
+            weights: vec![2.0, 0.5],
+        },
+        FusionStrategy::WeightedRrf {
+            k: 31,
+            weights: vec![0.25, 3.0],
+        },
+        FusionStrategy::Union,
+        FusionStrategy::VectorOnly,
+        FusionStrategy::KeywordOnly,
+        FusionStrategy::Custom {
+            name: "nested-custom".into(),
+            params: serde_json::json!({"ordered": [3, null, true, "raw"], "nested": {"weight": 0.25}}),
+        },
+    ];
+    for (index, expected) in strategies.into_iter().enumerate() {
+        let ir = FuseStrategy::from(expected.clone());
+        match (index, &ir) {
+            (0, FuseStrategy::Rrf { k }) => assert_eq!(*k, 17),
+            (1, FuseStrategy::Weighted { weights }) => assert_eq!(weights, &[2.0, 0.5]),
+            (2, FuseStrategy::WeightedRrf { k, weights }) => {
+                assert_eq!(*k, 31);
+                assert_eq!(
+                    weights,
+                    &[0.25, 3.0],
+                    "ordered weighted RRF parameters changed"
+                );
+            }
+            (3, FuseStrategy::Union)
+            | (4, FuseStrategy::VectorOnly)
+            | (5, FuseStrategy::KeywordOnly) => {}
+            (6, FuseStrategy::Custom { name, params }) => {
+                assert_eq!(name, "nested-custom");
+                assert_eq!(
+                    params,
+                    &serde_json::json!({"ordered": [3, null, true, "raw"], "nested": {"weight": 0.25}}),
+                    "opaque custom parameters changed"
+                );
+            }
+            _ => panic!("fusion strategy changed variant at index {index}: {ir:?}"),
+        }
+        assert_eq!(FusionStrategy::try_from(ir), Ok(expected));
+    }
+}
+
+#[test]
+fn fusion_strategy_serde_preserves_legacy_and_new_wire_forms() {
+    let cases = [
+        (
+            FuseStrategy::Rrf { k: 17 },
+            serde_json::json!({"rrf": {"k": 17}}),
+        ),
+        (
+            FuseStrategy::Weighted {
+                weights: vec![2.0, 0.5],
+            },
+            serde_json::json!({"weighted": {"weights": [2.0, 0.5]}}),
+        ),
+        (FuseStrategy::Union, serde_json::json!("union")),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 31,
+                weights: vec![0.25, 3.0],
+            },
+            serde_json::json!({"weighted_rrf": {"k": 31, "weights": [0.25, 3.0]}}),
+        ),
+        (FuseStrategy::VectorOnly, serde_json::json!("vector_only")),
+        (FuseStrategy::KeywordOnly, serde_json::json!("keyword_only")),
+        (
+            FuseStrategy::Custom {
+                name: "nested-custom".into(),
+                params: serde_json::json!({"ordered": [3, null, true, "raw"], "nested": {"weight": 0.25}}),
+            },
+            serde_json::json!({"custom": {"name": "nested-custom", "params": {"ordered": [3, null, true, "raw"], "nested": {"weight": 0.25}}}}),
+        ),
+    ];
+    for (strategy, expected_wire) in cases {
+        assert_eq!(
+            serde_json::to_value(&strategy).expect("serialize strategy"),
+            expected_wire
+        );
+        let decoded: FuseStrategy =
+            serde_json::from_value(expected_wire).expect("deserialize strategy");
+        assert_eq!(
+            FusionStrategy::try_from(decoded),
+            FusionStrategy::try_from(strategy)
+        );
+    }
+}
+
+#[test]
+fn ir_fusion_conversion_rejects_invalid_parameters_without_clamping() {
+    let invalid = [
+        (FuseStrategy::Rrf { k: 0 }, FusionStrategyError::RrfKZero),
+        (
+            FuseStrategy::Weighted {
+                weights: vec![f64::NAN],
+            },
+            FusionStrategyError::WeightNaN,
+        ),
+        (
+            FuseStrategy::Weighted {
+                weights: vec![f64::INFINITY],
+            },
+            FusionStrategyError::WeightInfinite,
+        ),
+        (
+            FuseStrategy::Weighted {
+                weights: vec![f64::NEG_INFINITY],
+            },
+            FusionStrategyError::WeightInfinite,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 0,
+                weights: vec![1.0],
+            },
+            FusionStrategyError::RrfKZero,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 7,
+                weights: vec![f64::NAN],
+            },
+            FusionStrategyError::WeightNaN,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 7,
+                weights: vec![f64::INFINITY],
+            },
+            FusionStrategyError::WeightInfinite,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 7,
+                weights: vec![f64::NEG_INFINITY],
+            },
+            FusionStrategyError::WeightInfinite,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 7,
+                weights: vec![0.0],
+            },
+            FusionStrategyError::WeightNotPositive,
+        ),
+        (
+            FuseStrategy::WeightedRrf {
+                k: 7,
+                weights: vec![-0.5],
+            },
+            FusionStrategyError::WeightNotPositive,
+        ),
+        (
+            FuseStrategy::Custom {
+                name: String::new(),
+                params: serde_json::json!({"keep": true}),
+            },
+            FusionStrategyError::CustomNameEmpty,
+        ),
+    ];
+    for (ir, expected_error) in invalid {
+        let actual = FusionStrategy::try_from(ir);
+        assert_eq!(
+            actual,
+            Err(expected_error),
+            "IR conversion must retain typed parameter refusal"
+        );
+    }
+    assert_eq!(
+        FusionStrategy::try_from(FuseStrategy::Weighted {
+            weights: vec![-1.0, 0.0, 2.0]
+        }),
+        Ok(FusionStrategy::Weighted {
+            weights: vec![-1.0, 0.0, 2.0]
+        })
+    );
+    assert_eq!(
+        FusionStrategy::try_from(FuseStrategy::Weighted { weights: vec![] }),
+        Ok(FusionStrategy::Weighted { weights: vec![] })
+    );
+    assert_eq!(
+        FusionStrategy::try_from(FuseStrategy::WeightedRrf {
+            k: 7,
+            weights: vec![]
+        }),
+        Ok(FusionStrategy::WeightedRrf {
+            k: 7,
+            weights: vec![]
+        })
+    );
+    assert_eq!(
+        FusionStrategy::try_from(FuseStrategy::Custom {
+            name: " ".into(),
+            params: serde_json::json!([null, false])
+        }),
+        Ok(FusionStrategy::Custom {
+            name: " ".into(),
+            params: serde_json::json!([null, false])
+        })
+    );
+}
+
+#[test]
+fn hybrid_candidate_budget_is_literal_four_x_and_saturates() {
+    for (requested, expected_candidates) in [
+        (10, 40),
+        (0, 0),
+        (usize::MAX / 4 + 1, usize::MAX),
+        (usize::MAX, usize::MAX),
+    ] {
+        let node = QueryNode::hybrid(vec![0.25], "literal query", requested);
+        match node {
+            QueryNode::Fuse {
+                children,
+                strategy,
+                top_k,
+            } => {
+                assert_eq!(top_k, requested, "fusion result limit changed");
+                assert!(matches!(strategy, FuseStrategy::Rrf { k: 60 }));
+                assert_eq!(children.len(), 2);
+                assert_eq!(
+                    children[0].top_k(),
+                    expected_candidates,
+                    "vector candidate budget must be literal four-times or saturated"
+                );
+                assert_eq!(
+                    children[1].top_k(),
+                    expected_candidates,
+                    "keyword candidate budget must be literal four-times or saturated"
+                );
+                assert!(
+                    matches!(&children[0], QueryNode::Vector { embedding, min_score: None, .. } if embedding == &[0.25])
+                );
+                assert!(
+                    matches!(&children[1], QueryNode::Keyword { text, min_score: None, .. } if text == "literal query")
+                );
+            }
+            other => panic!("expected hybrid Fuse, got {other:?}"),
+        }
+    }
+    assert_eq!(crate::HYBRID_CANDIDATE_MULTIPLIER, 4);
 }
