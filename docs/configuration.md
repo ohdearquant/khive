@@ -576,9 +576,9 @@ send parameters. The route owns persistence, replay handling, and transport subm
 the core returns its result without adding a message or falling back to another route.
 Built-in transport and local actor address kinds cannot be overridden.
 
-On Unix, a stdio host carrying validators or send routes must run as the daemon or select local
-dispatch with `KHIVE_NO_DAEMON=1`; callbacks cannot be forwarded to another process.
-A custom transport is responsible for dispatching locally. The prebuilt
+On Unix, a host carrying validators or send routes must run as the daemon or select local
+dispatch with `KHIVE_NO_DAEMON=1`, whatever its transport: requests from a non-daemon host are
+forwarded to the daemon, and callbacks cannot be forwarded to another process. The prebuilt
 `serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
 that configures `RuntimeConfig` before constructing its server can pass only its
 channels and residents to that prebuilt entrypoint.

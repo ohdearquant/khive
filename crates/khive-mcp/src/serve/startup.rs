@@ -137,8 +137,9 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 /// Builtin loops retain their own selected channel identities. Registering a channel
 /// does not opt it into email or Telegram polling.
 /// Component validators run before runtime construction, regardless of loaded packs.
-/// On Unix, stdio hosts with validators or send routes must be the daemon or explicitly select
-/// local dispatch with `KHIVE_NO_DAEMON=1`. Custom transports own local dispatch.
+/// On Unix, a host with validators or send routes, over any transport, must be the daemon or
+/// explicitly select local dispatch with `KHIVE_NO_DAEMON=1`; otherwise its requests would be
+/// forwarded to a daemon that has none of its callbacks.
 pub async fn run_with_registrations(
     args: Args,
     registry: &TransportRegistry,

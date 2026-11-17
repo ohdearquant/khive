@@ -72,6 +72,8 @@ async fn registered_config_reaches_real_single_and_multi_server_builds() {
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
+    // A non-daemon host with validators must dispatch locally on any transport.
+    std::env::set_var("KHIVE_NO_DAEMON", "1");
     for multi in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -122,6 +124,8 @@ async fn invalid_registered_config_refuses_without_comm_before_database_or_resid
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
+    // A non-daemon host with validators must dispatch locally on any transport.
+    std::env::set_var("KHIVE_NO_DAEMON", "1");
     for multi in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -330,13 +334,17 @@ async fn prebuilt_server_refuses_validator_bundle_before_validation_or_startup()
 
 #[cfg(unix)]
 #[test]
-fn config_callbacks_require_a_local_stdio_host_without_changing_environment() {
+fn config_callbacks_require_local_dispatch_on_every_transport_without_changing_environment() {
     use clap::Parser;
     let mut registrations = ServeRegistrations::new();
     registrations
         .register_config_validator("stand_in", Arc::new(|_| Ok(())))
         .unwrap();
-    for argv in [vec!["mcp"], vec!["mcp", "--transport", "stdio"]] {
+    for argv in [
+        vec!["mcp"],
+        vec!["mcp", "--transport", "stdio"],
+        vec!["mcp", "--transport", "config-capture"],
+    ] {
         let args = crate::args::Args::parse_from(argv);
         let result = registrations.require_local_dispatch(&args, false);
         assert!(
@@ -344,7 +352,7 @@ fn config_callbacks_require_a_local_stdio_host_without_changing_environment() {
                 .as_ref()
                 .err()
                 .is_some_and(|error| error.to_string().contains("KHIVE_NO_DAEMON=1")),
-            "forwarding stdio cannot carry process-local validators"
+            "forwarding cannot carry process-local validators on any transport"
         );
         assert!(registrations.require_local_dispatch(&args, true).is_ok());
         assert!(
@@ -356,7 +364,7 @@ fn config_callbacks_require_a_local_stdio_host_without_changing_environment() {
     }
     for argv in [
         vec!["mcp", "--daemon"],
-        vec!["mcp", "--transport", "config-capture"],
+        vec!["mcp", "--daemon", "--transport", "config-capture"],
     ] {
         assert!(registrations
             .require_local_dispatch(&crate::args::Args::parse_from(argv), false)

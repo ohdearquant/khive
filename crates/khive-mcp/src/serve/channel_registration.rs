@@ -100,13 +100,15 @@ impl ServeRegistrations {
         args: &crate::args::Args,
         daemon_disabled: bool,
     ) -> anyhow::Result<()> {
+        // Request forwarding does not depend on the transport: a non-daemon
+        // host with a file-backed store forwards to the warm daemon, which has
+        // none of this process's validators or routes.
         if (!self.config_validators.is_empty() || !self.send_routes.is_empty())
             && !args.daemon
-            && args.transport.as_deref().unwrap_or("stdio") == "stdio"
             && !daemon_disabled
         {
             anyhow::bail!(
-                "caller configuration validators and send routes cannot be forwarded over stdio to a daemon; \
+                "caller configuration validators and send routes cannot be forwarded to a daemon; \
                  use a daemon host or set KHIVE_NO_DAEMON=1 for local dispatch"
             );
         }
