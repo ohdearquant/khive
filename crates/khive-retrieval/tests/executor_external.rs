@@ -7,9 +7,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use khive_retrieval::hybrid::executor::{
-    execute_hybrid, execute_memory_hybrid, ArmCompletion, ArmFailure, ArmInput, ArmReport,
-    ArmRequest, ArmRoute, ArmSpec, ArmState, CandidateHydrator, CollectedArms, ExecutorArm,
-    ExecutorError, ExecutorOutcome, ExecutorRequest, FailurePolicy, HydratedHit, PreparedArms,
+    execute_hybrid as execute_plan_hybrid, execute_memory_hybrid as execute_plan_memory_hybrid,
+    ArmCompletion, ArmFailure, ArmInput, ArmReport, ArmRequest, ArmRoute, ArmSpec, ArmState,
+    CandidateHydrator, CollectedArms, ExecutorArm, ExecutorError, ExecutorOutcome, ExecutorRequest,
+    FailurePolicy, HydratedHit, LeafSlot, PlanOperators, PlanProgram, PlanTemplate, PreparedArms,
     PreparedVector, Scored, SearchScope, VectorGroupPreparer, VectorInput, VectorPreparation,
 };
 use khive_retrieval::{
@@ -456,4 +457,155 @@ async fn legacy_traits_and_custom_fallback_helpers_remain_external_apis() {
     let old_rrf = khive_retrieval::hybrid::fuse_labelled_scored(labelled, &rrf, merge).unwrap();
     assert_eq!(old_custom, old_rrf);
     assert_eq!(old_custom[0].2, "vector+text");
+}
+
+struct FixtureOperators<R, F, Fut> {
+    resolve: Mutex<Option<R>>,
+    types: std::marker::PhantomData<fn() -> (F, Fut)>,
+}
+
+#[async_trait]
+impl<R, F, Fut> PlanOperators for FixtureOperators<R, F, Fut>
+where
+    R: FnOnce() -> Result<F, OpaqueError> + Send,
+    F: FnOnce(Vec<Vec<Row>>) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<Row>, OpaqueError>> + Send,
+{
+    type Id = u8;
+    type Label = Label;
+    type Error = OpaqueError;
+    type Fusion = F;
+    type Reranker = ();
+    fn resolve_fusion(&self, strategy: &FusionStrategy) -> Result<F, OpaqueError> {
+        assert!(
+            matches!(strategy, FusionStrategy::Custom { name, params } if name == "external-fixture" && params.is_null())
+        );
+        self.resolve
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one declared fusion resolver")()
+    }
+    fn resolve_rerank(&self, _: &khive_retrieval::RerankMethod) -> Result<(), OpaqueError> {
+        Err(fault(98))
+    }
+    fn metadata_equals(
+        &self,
+        _: &u8,
+        _: &Label,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> Result<bool, OpaqueError> {
+        Err(fault(98))
+    }
+    async fn fuse(
+        &self,
+        resolved: F,
+        streams: Vec<Vec<Row>>,
+        _: usize,
+    ) -> Result<Vec<Row>, OpaqueError> {
+        resolved(streams).await
+    }
+    async fn rerank(
+        &self,
+        _: (),
+        _: &khive_retrieval::RerankMethod,
+        _: Vec<Row>,
+    ) -> Result<Vec<Row>, OpaqueError> {
+        Err(fault(98))
+    }
+}
+
+async fn execute_hybrid<A, H, R, F, Fut>(
+    request: ExecutorRequest<'_, A>,
+    hydrator: &H,
+    resolve: R,
+) -> Result<Outcome, Error>
+where
+    A: ExecutorArm<Id = u8, Label = Label, Evidence = Evidence, Filter = str, Error = OpaqueError>
+        + ?Sized,
+    H: CandidateHydrator<
+            Id = u8,
+            Label = Label,
+            Evidence = Evidence,
+            Filter = str,
+            Item = Item,
+            State = BatchState,
+            Error = OpaqueError,
+        > + ?Sized,
+    R: FnOnce() -> Result<F, OpaqueError> + Send,
+    F: FnOnce(Vec<Vec<Row>>) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<Row>, OpaqueError>> + Send,
+{
+    execute_fixture(request, hydrator, resolve, false).await
+}
+
+async fn execute_memory_hybrid<A, H, R, F, Fut>(
+    request: ExecutorRequest<'_, A>,
+    hydrator: &H,
+    resolve: R,
+) -> Result<Outcome, Error>
+where
+    A: ExecutorArm<Id = u8, Label = Label, Evidence = Evidence, Filter = str, Error = OpaqueError>
+        + ?Sized,
+    H: CandidateHydrator<
+            Id = u8,
+            Label = Label,
+            Evidence = Evidence,
+            Filter = str,
+            Item = Item,
+            State = BatchState,
+            Error = OpaqueError,
+        > + ?Sized,
+    R: FnOnce() -> Result<F, OpaqueError> + Send,
+    F: FnOnce(Vec<Vec<Row>>) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<Row>, OpaqueError>> + Send,
+{
+    execute_fixture(request, hydrator, resolve, true).await
+}
+
+async fn execute_fixture<A, H, R, F, Fut>(
+    request: ExecutorRequest<'_, A>,
+    hydrator: &H,
+    resolve: R,
+    memory: bool,
+) -> Result<Outcome, Error>
+where
+    A: ExecutorArm<Id = u8, Label = Label, Evidence = Evidence, Filter = str, Error = OpaqueError>
+        + ?Sized,
+    H: CandidateHydrator<
+            Id = u8,
+            Label = Label,
+            Evidence = Evidence,
+            Filter = str,
+            Item = Item,
+            State = BatchState,
+            Error = OpaqueError,
+        > + ?Sized,
+    R: FnOnce() -> Result<F, OpaqueError> + Send,
+    F: FnOnce(Vec<Vec<Row>>) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<Row>, OpaqueError>> + Send,
+{
+    let operators = FixtureOperators {
+        resolve: Mutex::new(Some(resolve)),
+        types: std::marker::PhantomData,
+    };
+    let program = PlanProgram {
+        template: PlanTemplate::Fuse {
+            children: (0..request.arms.len())
+                .map(|slot| PlanTemplate::Leaf(LeafSlot(slot)))
+                .collect(),
+            strategy: khive_retrieval::FuseStrategy::Custom {
+                name: "external-fixture".into(),
+                params: serde_json::Value::Null,
+            },
+            top_k: request.max_candidates,
+        },
+        operators: &operators,
+    };
+    if memory {
+        execute_plan_memory_hybrid(request, hydrator, program).await
+    } else {
+        execute_plan_hybrid(request, hydrator, program).await
+    }
 }
