@@ -392,6 +392,11 @@ impl KhiveMcpServer {
     /// Whether a runtime this server dispatches through carries host-installed
     /// configuration validators or `comm.send` routes. Those callbacks exist
     /// only in this process, so its requests must not be forwarded to a daemon.
+    ///
+    /// This reads the default runtime and, with a channel feature, the comm
+    /// outbox runtime. The standard builders derive every pack runtime from the
+    /// same configuration as those. A host that assembles its registry over
+    /// other runtimes carrying callbacks must select local dispatch itself.
     #[cfg(unix)]
     pub(crate) fn carries_process_local_callbacks(&self) -> bool {
         let carries = |runtime: &KhiveRuntime| {

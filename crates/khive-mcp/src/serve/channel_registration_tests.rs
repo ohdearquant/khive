@@ -365,6 +365,31 @@ async fn prebuilt_server_with_runtime_callbacks_requires_local_dispatch() {
         server.carries_process_local_callbacks(),
         "validators installed on RuntimeConfig are process-local callbacks"
     );
+    struct StandInRoute;
+    impl khive_runtime::channel_send::ChannelSendRoute for StandInRoute {
+        fn send<'a>(
+            &'a self,
+            _runtime: &'a khive_runtime::KhiveRuntime,
+            _token: &'a khive_runtime::NamespaceToken,
+            _params: serde_json::Value,
+        ) -> khive_runtime::channel_send::ChannelSendFuture<'a> {
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        }
+    }
+    let mut routed = khive_runtime::RuntimeConfig {
+        db_path: None,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    routed
+        .channel_send_routes
+        .register("stand_in", Arc::new(StandInRoute))
+        .unwrap();
+    assert!(
+        crate::server::KhiveMcpServer::new(khive_runtime::KhiveRuntime::new(routed).unwrap())
+            .unwrap()
+            .carries_process_local_callbacks(),
+        "send routes installed on RuntimeConfig are process-local callbacks"
+    );
     let starts = Arc::new(AtomicUsize::new(0));
     let started = starts.clone();
     let mut registrations = ServeRegistrations::new();
