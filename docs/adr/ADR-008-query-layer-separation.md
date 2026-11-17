@@ -270,7 +270,8 @@ would require a separate expression and grouping model. The compiler-owned ident
 deliberately not caller-configurable: it supplies the stable continuation contract without adding
 the much larger `ORDER BY` surface.
 
-See [Amendment 1][A1], which supersedes this ordering deferral.
+See [Amendment 1][A1], which supersedes this ordering deferral, and [Amendment 3][A3], which adds
+`count(variable)` with implicit grouping and `RETURN DISTINCT` beside `SKIP` paging.
 
 ## Alternatives Considered
 
@@ -283,10 +284,11 @@ See [Amendment 1][A1], which supersedes this ordering deferral.
 | Endpoint validation in query layer   | Semantic validation belongs in runtime (ADR-003). Query compiles patterns; runtime validates semantics.               |
 | Merge khive-query into khive-request | Different grammars, ASTs, and concerns. Coupling creates unnecessary churn.                                           |
 | Opaque result cursor                 | Requires a versioned encoding across fixed and recursive result identities; defer until deep-offset cost is measured. |
-| Aggregation-only completion          | `COUNT` can audit cardinality but cannot retrieve the missing rows and requires a new expression/grouping model.      |
+| Aggregation-only completion          | `COUNT` can audit cardinality but cannot retrieve the missing rows. Counts were later added beside paging. [A3]       |
 | Caller-defined `ORDER BY`            | Expands validation and projection semantics; compiler-owned identity order is sufficient for continuation. [A1]       |
 
 [A1]: #amendment-1-edge-metadata-and-bounded-gql-ordering-2026-11-14
+[A3]: #amendment-3-gql-pages-projections-aggregation-and-bounded-path-composition-2026-11-15
 
 ## Consequences
 
@@ -322,7 +324,8 @@ See [Amendment 1][A1], which supersedes this ordering deferral.
 - `crates/khive-query/src/parsers/gql.rs`: GQL parser.
 - `crates/khive-query/src/parsers/sparql.rs`: SPARQL parser.
 - `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type`,
-  `GqlQuery.offset`, and `GqlQuery.order_by` fields.
+  `GqlQuery.offset`, `GqlQuery.order_by`, `GqlQuery.additional_patterns` and
+  `GqlQuery.distinct` fields.
 - `crates/khive-query/src/validate.rs`: AST validation (relation via `EdgeRelation::from_str`,
   depth limits).
 - `crates/khive-query/src/compilers/sql.rs`: AST → SQL compilation. `entity_type` maps to
@@ -393,7 +396,8 @@ does not reverse the identity suffix. Visibility and deletion filters precede so
 sentinel detection, `LIMIT`, and `OFFSET`. Ordering adds no result columns. Continuation
 uses the same query, ordering and page size with the returned `next_offset`; the explicit
 query `LIMIT` remains the total bound across pages. Offset paging does not provide a
-cross-call snapshot when matching data changes.
+cross-call snapshot when matching data changes. See [Amendment 3][A3], which supersedes the total
+query `LIMIT` with a per-page bound after `SKIP`.
 
 ### Execution cost and cancellation
 
@@ -404,7 +408,8 @@ indexed cursor. `CompileOptions.max_limit` defaults to 500 and caps the returned
 with at most one extra internal continuation row; it does not cap the matched set or the
 sort's work. The public `query` handler accepts a requested page size up to 10,000. A
 query-text `LIMIT` bounds returned results across pages, not the number of matching rows
-SQLite must examine to order them.
+SQLite must examine to order them. Under [Amendment 3][A3] it bounds each page after `SKIP` instead;
+it still does not bound the rows SQLite examines.
 
 Built-in MCP hosts scope reads to the request deadline and cancellation signal. For a
 query-only request, `KHIVE_REQUEST_READ_TIMEOUT_SECS` defaults to 30 seconds and accepts
@@ -459,11 +464,11 @@ When neither metadata nor ordering is requested, compiled SQL, parameter values 
 indices, and outward result shapes remain unchanged. Conditional CTE metadata carriage
 must preserve both old CTE arms exactly. Acceptance requires actual stored-value and
 canonical query-dispatch tests for raw JSON, mixed scalar types, final-edge predicates,
-ascending/descending order, identity ties, multi-page reconstruction, total limits,
-visibility, unchanged domain state, recursive `DISTINCT`, and typed refusals. Compiler
-tests also cover direct-AST injection attempts, old SQL/parameter compatibility and
-unchanged SPARQL identifiers. Mutation controls must fail observable behavior assertions,
-not merely fail to compile or time out.
+ascending/descending order, identity ties, multi-page reconstruction, total limits
+(per-page limits under [Amendment 3][A3]), visibility, unchanged domain state, recursive
+`DISTINCT`, and typed refusals. Compiler tests also cover direct-AST injection attempts,
+old SQL/parameter compatibility and unchanged SPARQL identifiers. Mutation controls must
+fail observable behavior assertions, not merely fail to compile or time out.
 
 Comma-separated `MATCH` patterns remain unsupported under this amendment. Their separate
 design and implementation follow the primary metadata/ordering change; #6594 remains open
@@ -573,7 +578,8 @@ an edge contributes its UUID. Shared-node occurrences may contribute redundant i
 Requested `DESC` directions do not reverse this identity suffix.
 
 The existing `SKIP`, sentinel, total query `LIMIT`, and `next_offset` contract is unchanged.
-The total query limit spans pages rather than restarting at each offset. Zero limits and
+The total query limit spans pages rather than restarting at each offset. See [Amendment 3][A3],
+which replaces the total limit with a per-page `LIMIT` applied after `SKIP`. Zero limits and
 offsets beyond the result return no rows. Paging remains deterministic only while the
 matching data is unchanged; it is not a snapshot shared across requests.
 
@@ -625,8 +631,8 @@ change is required.
    metadata references.
 4. Place requested metadata order opposite UUID order, include tied groups, and verify
    both directions and the fixed identity suffix. Reconstruct all tuples with page size
-   two, enforce total query limit five, and check zero limits, exhausted offsets, sentinel
-   removal, and `next_offset`.
+   two, enforce total query limit five (a per-page limit under [Amendment 3][A3]), and check zero
+   limits, exhausted offsets, sentinel removal, and `next_offset`.
 5. Through actual KG and Comm packs, place hidden mailbox rows on a later branch and keep
    a visible positive. Reverse branch order and independently cover deleted or hidden
    edges and endpoints ahead of visible matches. Retain the existing mailbox regressions.
@@ -764,6 +770,8 @@ RETURN r.name
 
 A `NOT EXISTS` block contains one canonical fixed-length path and references at least one
 outer node binding. It may contain multiple fixed steps and ordinary inline constraints.
+The path may be a single correlated node with no edge, such as `NOT EXISTS { (r:note) }`,
+which keeps outer rows whose binding fails that node's kind or inline constraints.
 A reused outer node name correlates both substrate and UUID; it does not introduce a new
 node or compare UUID alone. Additional inner names are local to the block and cannot be
 returned or referenced outside it. Node/edge name conflicts and attempts to correlate an
@@ -798,7 +806,9 @@ the match. A zero-hop segment joins its start node directly to the following ste
 example includes documents attached to the root itself. Each variable segment's edge
 binding identifies that segment's final edge; a later fixed edge does not replace it.
 
-Mixed paths evaluate the full `WHERE` Boolean expression on the complete joined row before grouping and paging, including `OR` across fixed-step and variable-segment bindings; the existing single-segment cross-phase `OR` refusal is unchanged.
+Mixed paths evaluate the full `WHERE` Boolean expression on the complete joined row before
+grouping and paging, including `OR` across fixed-step and variable-segment bindings; the
+existing single-segment cross-phase `OR` refusal is unchanged.
 
 For ordinary recursive output, `_depth` sums the actual hops of the variable-length
 segments and `_total_weight` sums the weights traversed within those segments. Fixed steps
