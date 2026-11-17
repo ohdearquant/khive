@@ -92,10 +92,30 @@ fn strict_routing_refusals_preserve_owner_source_and_retry_policy() {
             operation: "create".into(),
             source: Box::new(source),
         };
-        let cause = StdError::source(&error)
-            .unwrap()
-            .downcast_ref::<StorageError>()
-            .unwrap();
+        let cause_box = StdError::source(&error)
+            .expect("owner refusal must retain its public source")
+            .downcast_ref::<Box<StorageError>>()
+            .expect("owner refusal source must retain its typed storage box");
+        let cause = cause_box.as_ref();
+        let StorageError::WriterOwnerUnavailable { operation, source } = &error else {
+            unreachable!("fixture constructs an owner-unavailable refusal")
+        };
+        assert_eq!(operation.as_ref(), "create");
+        assert!(
+            std::ptr::eq(cause_box, source),
+            "public source must be the exact stored owner-cause box"
+        );
+        match cause {
+            StorageError::Pool { operation, message } => {
+                assert_eq!(operation.as_ref(), "open");
+                assert_eq!(message, "unavailable");
+            }
+            StorageError::WriterTaskNoRuntime => assert!(
+                matches!(source.as_ref(), StorageError::WriterTaskNoRuntime),
+                "public NoRuntime cause must retain the stored NoRuntime identity"
+            ),
+            other => panic!("unexpected owner cause: {other:?}"),
+        }
         assert_eq!(cause.is_retryable(), retryable);
         assert_eq!(error.is_retryable(), retryable);
         assert_eq!(

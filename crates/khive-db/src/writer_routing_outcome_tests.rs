@@ -641,3 +641,114 @@ fn strict_service_migration_keeps_closed_lifecycle_authority() {
         raw_write_refuses(backend.pool());
     }
 }
+
+async fn assert_labelled_commit_reply_loss(use_statement_labels: bool) {
+    let route = if use_statement_labels {
+        "send_labelled"
+    } else {
+        "send_at"
+    };
+    for strict in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("labelled-outcome.db");
+        let pool = seeded_pool(&path, strict, true);
+        let writer = pool.writer_task_handle().unwrap().unwrap();
+        let probe = writer
+            .send_top_level(|conn| {
+                Ok(conn.test_suppress_commit_reply_after_update("outcome_probe", 1))
+            })
+            .await
+            .unwrap();
+        let write = |conn: &Connection| {
+            conn.execute(
+                "INSERT INTO outcome_probe VALUES(1,'labelled committed')",
+                [],
+            )
+            .map_err(|error| {
+                StorageError::driver(StorageCapability::Sql, "labelled_fixture", error)
+            })?;
+            Ok(())
+        };
+        // The test caller stays alive and awaits the real labelled submit path.
+        let result = if use_statement_labels {
+            writer
+                .send_labelled(write, vec!["labelled_commit_probe".to_owned()])
+                .await
+        } else {
+            writer.send_at(write, "labelled_commit_probe").await
+        };
+        let snapshot = probe.snapshot();
+        assert_eq!(
+            (snapshot.matched_requests, snapshot.reply_suppressed),
+            (1, 1),
+            "{route} must lose only its actual targeted successful reply"
+        );
+        assert!(
+            snapshot.commit_issued && snapshot.commit_succeeded && snapshot.autocommit,
+            "{route} must reach real successful COMMIT and autocommit before reply loss"
+        );
+        let independent = Connection::open(&path).unwrap();
+        let committed: (i64, String) = independent
+            .query_row(
+                "SELECT count(*), (SELECT value FROM outcome_probe WHERE id=1) FROM outcome_probe",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            committed,
+            (1, "labelled committed".into()),
+            "{route} reply loss must leave exactly the literal committed row"
+        );
+        assert!(
+            matches!(result, Err(StorageError::WriteOutcomeUnknown { .. })),
+            "{route} must preserve issued-COMMIT receipt evidence after lost reply: {result:?}"
+        );
+        assert!(
+            !writer.is_closed(),
+            "{route} reply loss must not stop the owner"
+        );
+        let follow_up = |conn: &Connection| {
+            conn.execute("INSERT INTO outcome_probe VALUES(2,'labelled healthy')", [])
+                .map_err(|error| {
+                    StorageError::driver(StorageCapability::Sql, "labelled_follow_up", error)
+                })?;
+            Ok(())
+        };
+        let healthy = if use_statement_labels {
+            writer
+                .send_labelled(follow_up, vec!["labelled_healthy_probe".to_owned()])
+                .await
+        } else {
+            writer.send_at(follow_up, "labelled_healthy_probe").await
+        };
+        assert!(
+            healthy.is_ok(),
+            "{route} must accept a later write: {healthy:?}"
+        );
+        let persisted: (i64, String, String) = independent
+            .query_row(
+                "SELECT count(*), (SELECT value FROM outcome_probe WHERE id=1), \
+                 (SELECT value FROM outcome_probe WHERE id=2) FROM outcome_probe",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (2, "labelled committed".into(), "labelled healthy".into()),
+            "{route} must preserve the first commit and commit the later healthy write"
+        );
+        assert_eq!(probe.snapshot().reply_suppressed, 1);
+    }
+}
+
+#[tokio::test]
+async fn send_at_lost_commit_reply_preserves_receipt_and_writer() {
+    assert_labelled_commit_reply_loss(false).await;
+}
+
+#[tokio::test]
+async fn send_labelled_lost_commit_reply_preserves_receipt_and_writer() {
+    assert_labelled_commit_reply_loss(true).await;
+}

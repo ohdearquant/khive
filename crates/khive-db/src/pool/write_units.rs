@@ -347,7 +347,6 @@ pub(super) enum LogicalWriteOwner {
 /// pool is poisoned so every later write is refused with
 /// [`SqliteError::WriterPoisoned`] before it starts, and the lease is then
 /// released.
-
 pub struct WriterGuard<'pool> {
     pub(super) guard: parking_lot::MutexGuard<'pool, ProgressConn>,
     /// The origin (ADR-091 backend-scoped attribution) of the pool this
