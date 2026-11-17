@@ -276,6 +276,7 @@ pub(super) fn daemon_startup_report(
 #[derive(Default)]
 pub(super) struct PreparedHostBackgroundTasks {
     pub(super) channels: Arc<khive_channel::ChannelRegistry>,
+    pub(super) residents: Vec<crate::components::ResidentComponentRegistration>,
     #[cfg(feature = "channel-email")]
     pub(super) email: Option<PreparedEmailChannelLoops>,
     #[cfg(feature = "channel-telegram")]
@@ -296,6 +297,7 @@ pub(super) async fn prepare_host_background_tasks_with_registrations(
     _server: &KhiveMcpServer,
     registrations: &ServeRegistrations,
 ) -> anyhow::Result<PreparedHostBackgroundTasks> {
+    let residents = registrations.resident_roster()?;
     #[allow(unused_mut)]
     let mut builtin_channels: Vec<Arc<dyn khive_channel::Channel>> = Vec::new();
     #[cfg(feature = "channel-email")]
@@ -319,6 +321,7 @@ pub(super) async fn prepare_host_background_tasks_with_registrations(
     let channels = registrations.merge_channels(builtin_channels)?;
     Ok(PreparedHostBackgroundTasks {
         channels,
+        residents,
         #[cfg(feature = "channel-email")]
         email,
         #[cfg(feature = "channel-telegram")]
@@ -332,9 +335,17 @@ pub(super) fn start_host_background_tasks(
     schedule_rt: Option<KhiveRuntime>,
     prepared: PreparedHostBackgroundTasks,
 ) -> khive_runtime::daemon::DaemonStartupReport {
-    #[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
-    let _ = &prepared.channels;
-    let report = daemon_startup_report(args, server, schedule_rt.is_some());
+    let mut report = daemon_startup_report(args, server, schedule_rt.is_some());
+    let persistent = args.daemon
+        && args.daemon_options().lifetime != khive_runtime::daemon::DaemonLifetime::Demand;
+    if !persistent {
+        report.skipped_components.extend(
+            prepared
+                .residents
+                .iter()
+                .map(|resident| resident.name.to_owned()),
+        );
+    }
     if args.daemon
         && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
     {
@@ -356,8 +367,18 @@ pub(super) fn start_host_background_tasks(
         server,
         args,
         prepared.telegram,
-        prepared.channels,
+        prepared.channels.clone(),
     );
+    // A generic resident may be read-only or capture another authorized runtime.
+    // Its own dispatch/runtime policy remains authoritative; only host lifetime
+    // determines whether this supervisor starts.
+    if persistent {
+        crate::components::start_resident_components(
+            &prepared.residents,
+            prepared.channels,
+            server,
+        );
+    }
     start_daemon_components_if_daemon(args, server, schedule_rt);
     report
 }

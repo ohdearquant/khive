@@ -13,6 +13,7 @@ use khive_channel::{Channel, ChannelRegistry};
 #[derive(Clone, Default)]
 pub struct ServeRegistrations {
     channels: Vec<Arc<dyn Channel>>,
+    residents: Vec<crate::components::ResidentComponentRegistration>,
 }
 
 impl ServeRegistrations {
@@ -39,6 +40,29 @@ impl ServeRegistrations {
         }
         self.channels.push(channel);
         Ok(())
+    }
+
+    /// Register a captured resident for persistent-daemon startup.
+    ///
+    /// Names cannot collide with builtin, linked, or other caller components.
+    /// The trusted resident owns its runtime policy; registration does not infer
+    /// write authority from the host default runtime. Stdio and demand boots skip it.
+    pub fn register_resident(
+        &mut self,
+        resident: crate::components::ResidentComponentRegistration,
+    ) -> anyhow::Result<()> {
+        let mut proposed = self.residents.clone();
+        proposed.push(resident);
+        crate::components::validate_resident_components(&proposed)?;
+        self.residents = proposed;
+        Ok(())
+    }
+
+    pub(super) fn resident_roster(
+        &self,
+    ) -> anyhow::Result<Vec<crate::components::ResidentComponentRegistration>> {
+        crate::components::validate_resident_components(&self.residents)?;
+        Ok(self.residents.clone())
     }
 
     pub(super) fn merge_channels(

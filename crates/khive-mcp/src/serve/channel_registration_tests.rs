@@ -283,3 +283,188 @@ async fn telegram_refuses_same_key_with_a_different_acknowledgement_owner() {
     assert_eq!(typed.polls.load(Ordering::SeqCst), 0);
     assert_eq!(typed.commits.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn public_resident_registration_refuses_names_before_any_factory_runs() {
+    use crate::components::ResidentComponentRegistration;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = calls.clone();
+    let resident = ResidentComponentRegistration::new("registered-resident", move |_, _| {
+        factory_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    });
+    let mut registrations = ServeRegistrations::new();
+    registrations.register_resident(resident.clone()).unwrap();
+    assert!(
+        registrations.register_resident(resident).is_err(),
+        "duplicate public resident must refuse before startup"
+    );
+    let reserved =
+        ResidentComponentRegistration::new("email-outbound", |_, _| Box::pin(async { Ok(()) }));
+    assert!(
+        registrations.register_resident(reserved).is_err(),
+        "caller resident cannot replace a builtin supervisor"
+    );
+    assert_eq!(
+        registrations.resident_roster().unwrap().len(),
+        1,
+        "refused registration leaves the prior roster intact"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "registration must never run the resident factory"
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(any(feature = "channel-email", feature = "channel-telegram"))
+))]
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn real_startup_reports_stdio_and_demand_resident_skips_without_idle_obligations() {
+    use clap::Parser;
+    let runtime = khive_runtime::KhiveRuntime::memory().unwrap();
+    let server = crate::server::KhiveMcpServer::new(runtime).unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let captured = starts.clone();
+    let mut registrations = ServeRegistrations::new();
+    registrations
+        .register_resident(crate::components::ResidentComponentRegistration::new(
+            "skipped-caller-resident",
+            move |_, _| {
+                captured.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            },
+        ))
+        .unwrap();
+    for argv in [vec!["mcp"], vec!["mcp", "--daemon", "--lifetime", "demand"]] {
+        let args = crate::args::Args::parse_from(argv);
+        let prepared = super::startup::prepare_host_background_tasks_with_registrations(
+            &args,
+            &server,
+            &registrations,
+        )
+        .await
+        .unwrap();
+        let before = khive_runtime::background_task_count();
+        let report = super::startup::start_host_background_tasks(&args, &server, None, prepared);
+        assert!(
+            report
+                .skipped_components
+                .iter()
+                .any(|name| name == "skipped-caller-resident"),
+            "real startup must name each skipped caller resident"
+        );
+        assert!(
+            !report
+                .idle_ineligible_reasons
+                .iter()
+                .any(|name| name.contains("skipped-caller-resident")),
+            "a never-started resident must not become an idle-retirement obligation"
+        );
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before,
+            "skipped residents must not spawn a supervisor"
+        );
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn real_persistent_startup_drives_captured_resident_with_shared_channels_and_cancellation() {
+    use clap::Parser;
+    let runtime = khive_runtime::KhiveRuntime::memory().unwrap();
+    let server = crate::server::KhiveMcpServer::new(runtime).unwrap();
+    let channel = ProbeChannel::new("fixture", "resident-owned");
+    let mut registrations = ServeRegistrations::new();
+    registrations.register_channel(channel.clone()).unwrap();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    registrations
+        .register_resident(crate::components::ResidentComponentRegistration::new(
+            "public-startup-resident",
+            move |ctx, channels| {
+                let started = started_tx.clone();
+                let finished = finished_tx.clone();
+                Box::pin(async move {
+                    let selected = channels
+                        .get_by_slug("fixture", "resident-owned")
+                        .ok_or_else(|| {
+                            crate::components::ComponentError::Permanent(
+                                "registered caller channel is missing".into(),
+                            )
+                        })?;
+                    selected
+                        .poll(Utc::now())
+                        .await
+                        .map_err(|e| crate::components::ComponentError::Permanent(e.to_string()))?;
+                    started
+                        .send((channels, ctx.cancellation().clone()))
+                        .unwrap();
+                    ctx.cancellation().cancelled().await;
+                    finished.send(()).unwrap();
+                    Ok(())
+                })
+            },
+        ))
+        .unwrap();
+    let args = crate::args::Args::parse_from(["mcp", "--daemon"]);
+    let prepared = super::startup::prepare_host_background_tasks_with_registrations(
+        &args,
+        &server,
+        &registrations,
+    )
+    .await
+    .unwrap();
+    let expected = prepared.channels.clone();
+    let report = super::startup::start_host_background_tasks(&args, &server, None, prepared);
+    assert!(!report
+        .skipped_components
+        .iter()
+        .any(|name| name == "public-startup-resident"));
+    let started = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv()).await;
+    assert!(
+        matches!(&started, Ok(Some(_))),
+        "real persistent startup must run the registered resident"
+    );
+    let (actual, cancellation) = started.unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&actual, &expected),
+        "resident must consume the host's one shared registry"
+    );
+    assert_eq!(
+        channel.polls.load(Ordering::SeqCst),
+        1,
+        "resident must drive the actual registered channel"
+    );
+    // This is the supervisor's child token; cancelling it leaves the process token intact.
+    cancellation.cancel();
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx.recv()).await,
+            Ok(Some(()))
+        ),
+        "resident must observe the host cancellation context"
+    );
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if crate::components::component_health()
+                .status("public-startup-resident")
+                .is_some_and(|status| status.state == crate::components::ComponentState::Stopped)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "supervisor must join the cancelled resident and record stopped"
+    );
+}
