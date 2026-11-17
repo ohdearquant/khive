@@ -137,6 +137,15 @@ pub enum StorageError {
         message: String,
     },
 
+    /// A write would persist credential-shaped input. The match contains only
+    /// safe detector metadata, never the submitted credential.
+    #[error("write blocked: {matched}")]
+    SecretDetected {
+        capability: StorageCapability,
+        operation: Cow<'static, str>,
+        matched: Box<crate::secret_scan::SecretMatch>,
+    },
+
     #[error("unsupported operation for {capability:?}: {operation} ({message})")]
     Unsupported {
         capability: StorageCapability,
@@ -450,6 +459,7 @@ impl StorageError {
             | Self::AlreadyExists { capability, .. }
             | Self::Conflict { capability, .. }
             | Self::InvalidInput { capability, .. }
+            | Self::SecretDetected { capability, .. }
             | Self::Unsupported { capability, .. }
             | Self::Serialization { capability, .. }
             | Self::IndexMaintenance { capability, .. }

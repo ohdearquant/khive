@@ -104,16 +104,19 @@ pub(super) fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
 }
 
 #[derive(Clone, Copy)]
-struct JsonScalarContext {
-    value_start: usize,
-    end: usize,
-    label: Option<(usize, &'static str)>,
+pub(super) struct JsonScalarContext {
+    pub(super) value_start: usize,
+    pub(super) end: usize,
+    pub(super) label: Option<(usize, &'static str)>,
 }
+
+type OwningScalarContext<'a> = (&'a [std::ops::Range<usize>], (usize, &'static str));
 
 pub(super) struct EntropyScanContext<'a> {
     pub(super) tokens: Vec<(usize, &'a str)>,
     scalars: Vec<JsonScalarContext>,
     path_references: Vec<bool>,
+    owning: Option<OwningScalarContext<'a>>,
 }
 
 impl<'a> EntropyScanContext<'a> {
@@ -143,7 +146,28 @@ impl<'a> EntropyScanContext<'a> {
             tokens,
             scalars,
             path_references,
+            owning: None,
         }
+    }
+
+    pub(super) fn with_owning(
+        text: &'a str,
+        origins: &'a [std::ops::Range<usize>],
+        label: (usize, &'static str),
+    ) -> Self {
+        let mut context = Self::new(text);
+        context.owning = Some((origins, label));
+        context
+    }
+
+    fn owning_trigger(&self, text: &str, value: &str) -> Option<&'static str> {
+        let (origins, (end, trigger)) = self.owning?;
+        let value = wrapper_strip_repeated(value);
+        let offset = value.as_ptr() as usize - text.as_ptr() as usize;
+        origins
+            .get(offset)
+            .filter(|origin| origin.start.saturating_sub(end) <= TRIGGER_WINDOW)
+            .map(|_| trigger)
     }
 
     fn scalar_for(&self, text: &str, value: &str) -> Option<JsonScalarContext> {
@@ -164,7 +188,7 @@ impl<'a> EntropyScanContext<'a> {
 // Validate once before interpreting punctuation as field boundaries. The
 // iterative source walk retains offsets for masking; decoding keys prevents
 // JSON escapes from hiding an owning credential label.
-fn json_scalar_contexts(text: &str) -> Vec<JsonScalarContext> {
+pub(super) fn json_scalar_contexts(text: &str) -> Vec<JsonScalarContext> {
     if !text.trim_start().starts_with(['{', '['])
         || serde_json::from_str::<serde::de::IgnoredAny>(text).is_err()
     {
@@ -626,6 +650,9 @@ pub(super) fn check_entropy_heuristic<'a>(
                     .map(|(_, trigger)| trigger);
                 candidate.inline_trigger = candidate.inline_trigger.or(label);
             }
+            candidate.inline_trigger = candidate
+                .inline_trigger
+                .or_else(|| context.owning_trigger(text, candidate.value));
             let offset = candidate.value.as_ptr() as usize - text.as_ptr() as usize;
             if offset + candidate.value.len() <= from {
                 continue;
@@ -633,6 +660,11 @@ pub(super) fn check_entropy_heuristic<'a>(
             if let Some(found) =
                 check_entropy_candidate(text, from, context, idx, context_offset, candidate)
             {
+                // A run may start after its enclosing token. Only its own mapped
+                // start can borrow the outer property's label.
+                if context.owning.is_some() && context.owning_trigger(text, found.0).is_none() {
+                    continue;
+                }
                 if best
                     .as_ref()
                     .is_none_or(|current| found.0.as_ptr() < current.0.as_ptr())

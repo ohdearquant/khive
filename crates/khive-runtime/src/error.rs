@@ -758,7 +758,7 @@ pub enum RuntimeError {
     },
 
     #[error("storage: {0}")]
-    Storage(#[from] khive_storage::StorageError),
+    Storage(#[source] khive_storage::StorageError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -1031,6 +1031,77 @@ pub enum RuntimeError {
         /// First schema version that includes the attachment cutover.
         required_version: u32,
     },
+}
+
+impl From<khive_storage::StorageError> for RuntimeError {
+    fn from(error: khive_storage::StorageError) -> Self {
+        match error {
+            khive_storage::StorageError::SecretDetected { matched, .. } => {
+                Self::SecretDetected(*matched)
+            }
+            other => Self::Storage(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod secret_storage_conversion_tests {
+    use super::RuntimeError;
+    use khive_storage::{StorageCapability, StorageError};
+    use std::error::Error;
+
+    #[test]
+    fn storage_secret_conversion_preserves_safe_match_and_runtime_refusal() {
+        let key = format!("ghp_{}", "A".repeat(40));
+        let storage =
+            khive_storage::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+                .expect_err("storage must refuse the incoming key");
+        let display = storage.to_string();
+        let runtime: RuntimeError = storage.into();
+        let RuntimeError::SecretDetected(matched) = &runtime else {
+            panic!("typed storage secret must become the existing runtime refusal: {runtime:?}");
+        };
+        assert_eq!(matched.detector, "github-token");
+        assert_eq!(matched.trigger, None);
+        assert_eq!(matched.masked, "ghp_AA...44chars");
+        assert_eq!(matched.location.as_deref(), Some("note.key"));
+        assert_eq!(runtime.to_string(), display);
+        let direct = crate::secret_gate::check_at(&key, "note", "key").unwrap_err();
+        let RuntimeError::SecretDetected(direct_match) = direct else {
+            panic!("runtime scanner must retain its typed refusal");
+        };
+        assert_eq!(matched, &direct_match);
+        assert!(!runtime.to_string().contains(&key));
+        assert!(!format!("{runtime:?}").contains(&key));
+        assert!(runtime.source().is_none());
+    }
+
+    #[test]
+    fn ordinary_storage_conversion_and_direct_wrapper_keep_the_typed_source() {
+        for converted in [false, true] {
+            let storage = StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "source-chain-fixture".into(),
+                message: "ordinary refusal".into(),
+            };
+            let expected = storage.to_string();
+            let runtime = if converted {
+                RuntimeError::from(storage)
+            } else {
+                RuntimeError::Storage(storage)
+            };
+            assert_eq!(runtime.to_string(), format!("storage: {expected}"));
+            let source = runtime
+                .source()
+                .expect("ordinary storage wrapper must retain Error::source");
+            assert!(
+                matches!(source.downcast_ref::<StorageError>(),
+                Some(StorageError::InvalidInput { capability: StorageCapability::Notes, operation, message })
+                    if operation == "source-chain-fixture" && message == "ordinary refusal"),
+                "the source must be the original typed StorageError"
+            );
+        }
+    }
 }
 
 // Compatibility bridge for concrete backend callers while ADR-071's raw-SQL

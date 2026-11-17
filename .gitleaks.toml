@@ -30,6 +30,7 @@ regexes = ['''^(a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4|Xk9mZ2vQpLrT8nJwYuA/HfB
 paths = [
   '''^crates/khive-runtime/src/secret_gate\.rs$''',
   '''^crates/khive-runtime/src/secret_gate_tests\.rs$''',
+  '''^crates/khive-storage/src/secret_scan/tests\.rs$''',
 ]
 
 # The node wire protocol appendix publishes an HPKE test vector, and its shared secret is an

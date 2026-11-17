@@ -22,8 +22,9 @@ CACHE_PATH = "crates/khive-pack-git/src/cache_tests.rs"
 CACHE_PATHS = (CACHE_HISTORY_PATH, CACHE_PATH)
 CACHE_VALUES = ("abcdef0123456789", "fedcba9876543210")
 GATE_HISTORY_PATH = "crates/khive-runtime/src/secret_gate.rs"
-GATE_PATH = "crates/khive-runtime/src/secret_gate_tests.rs"
-GATE_PATHS = (GATE_HISTORY_PATH, GATE_PATH)
+GATE_EXTRACTED_HISTORY_PATH = "crates/khive-runtime/src/secret_gate_tests.rs"
+GATE_PATH = "crates/khive-storage/src/secret_scan/tests.rs"
+GATE_PATHS = (GATE_HISTORY_PATH, GATE_EXTRACTED_HISTORY_PATH, GATE_PATH)
 GATE_VALUES = ("a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4", "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh")
 # A published specification value that stays in history after its fixture left the tree.
 HPKE_VECTOR_PATH = "crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha.json"
@@ -303,7 +304,7 @@ class GitleaksConfigTests(unittest.TestCase):
         self.config.write_text("[extend]\nuseDefault = true\n")
         findings = self.scan(expected_exit=1, history="--all")
         self.assertEqual({row["Commit"] for row in findings}, {first, moved})
-        self.assertEqual({row["File"] for row in findings}, set(GATE_PATHS))
+        self.assertEqual({row["File"] for row in findings}, {GATE_HISTORY_PATH, GATE_PATH})
 
         self.config.write_text(CONFIG.read_text())
         self.assertEqual(self.scan(expected_exit=0, history="--all"), [])

@@ -4,6 +4,36 @@
 storage capability trait. This document covers the classifier predicates whose
 full rationale does not fit inline in the rustdoc contract.
 
+## Incoming note-key refusal (0.21.0)
+
+`SecretDetected { capability, operation, matched }` is a deterministic write
+refusal. Incoming note-key assignment uses `StorageCapability::Notes`, the
+assignment operation name, and the shared safe
+`khive_storage::secret_scan::SecretMatch`, owned through `Box<SecretMatch>` so
+this payload does not enlarge every storage and enclosing runtime error.
+`is_retryable()` returns `false`.
+Display is `write blocked: {matched}`; neither display nor debug carries the
+submitted credential. `note.key` is location metadata, not text prepended to the
+key for detection. The write-only validator scans exact input through the same
+scalar and escaped-string checks used by runtime, before looking up any row.
+
+This is a **breaking Rust API change in 0.21.0** because `StorageError` is public
+and exhaustive. Downstream exhaustive matches must add the new variant. The
+enum remains exhaustive; no wire or stored-schema migration accompanies it.
+
+Runtime retains its existing public secret-detector imports and maps this storage
+variant to `RuntimeError::SecretDetected`, moving the match out of its box and
+preserving the existing runtime payload type, match and refusal text.
+Every ordinary storage error remains wrapped by `RuntimeError::Storage` with its
+typed `Error::source()` chain intact. Direct construction of that wrapper also
+retains the source. The pure scanner now lives in storage; property context,
+exemption authority and record finalization remain runtime responsibilities.
+
+`note_key_is_valid` and read/fence validators remain shape-only. Existing keys
+remain readable and usable as fence selectors without rewriting stored data.
+Incoming keys have no manifest exemption. See
+[ADR-115 Amendment 9](../../../../docs/adr/ADR-115-secret-gate-content-manifest-exemption.md#amendment-9-2026-11-16-contextual-property-scanning-and-note-key-write-admission).
+
 ## Capacity admission
 
 `CapacityFloor` refuses a write that would violate the sampled free-space floor.
