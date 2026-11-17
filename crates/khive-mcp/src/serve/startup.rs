@@ -129,6 +129,18 @@ pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json:
 /// `khive_db::pool::initialize_claimed_file_observer` before any SQLite I/O,
 /// following its unsafe startup contract. The stock `kkernel` binary does so.
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    run_with_registrations(args, registry, ServeRegistrations::default()).await
+}
+
+/// Build and serve with caller-owned channels installed for this boot.
+///
+/// Builtin loops retain their own selected channel identities. Registering a channel
+/// does not opt it into email or Telegram polling.
+pub async fn run_with_registrations(
+    args: Args,
+    registry: &TransportRegistry,
+    registrations: ServeRegistrations,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
     if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
         crate::daemon::capture_bridge_executable();
@@ -194,7 +206,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::assert_daemon_store_identities(guards)?;
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(&args, &server).await?;
+    let prepared_background =
+        prepare_host_background_tasks_with_registrations(&args, &server, &registrations).await?;
 
     #[cfg(unix)]
     if args.daemon {
@@ -262,21 +275,54 @@ pub(super) fn daemon_startup_report(
 
 #[derive(Default)]
 pub(super) struct PreparedHostBackgroundTasks {
+    pub(super) channels: Arc<khive_channel::ChannelRegistry>,
     #[cfg(feature = "channel-email")]
     pub(super) email: Option<PreparedEmailChannelLoops>,
+    #[cfg(feature = "channel-telegram")]
+    pub(super) telegram: Option<Arc<khive_channel_telegram::TelegramChannel>>,
 }
 
+#[cfg(all(test, feature = "channel-email"))]
 pub(super) async fn prepare_host_background_tasks(
+    args: &Args,
+    server: &KhiveMcpServer,
+) -> anyhow::Result<PreparedHostBackgroundTasks> {
+    prepare_host_background_tasks_with_registrations(args, server, &ServeRegistrations::default())
+        .await
+}
+
+pub(super) async fn prepare_host_background_tasks_with_registrations(
     _args: &Args,
     _server: &KhiveMcpServer,
+    registrations: &ServeRegistrations,
 ) -> anyhow::Result<PreparedHostBackgroundTasks> {
+    #[allow(unused_mut)]
+    let mut builtin_channels: Vec<Arc<dyn khive_channel::Channel>> = Vec::new();
+    #[cfg(feature = "channel-email")]
+    let email = prepare_email_channel_loops(
+        _server,
+        _args.daemon
+            && _args.daemon_options().lifetime != khive_runtime::daemon::DaemonLifetime::Demand,
+    )?;
+    #[cfg(feature = "channel-email")]
+    if let Some(prepared) = &email {
+        builtin_channels.push(prepared.registered_channel());
+    }
+    #[cfg(feature = "channel-telegram")]
+    let telegram = prepare_telegram_channel(_server, _args);
+    #[cfg(feature = "channel-telegram")]
+    if let Some(channel) = &telegram {
+        builtin_channels.push(channel.clone());
+    }
+    // This is the only production registry construction. Refuse collisions before
+    // either entrypoint starts any polling, outbox, or supervised component.
+    let channels = registrations.merge_channels(builtin_channels)?;
     Ok(PreparedHostBackgroundTasks {
+        channels,
         #[cfg(feature = "channel-email")]
-        email: prepare_email_channel_loops(
-            _server,
-            _args.daemon
-                && _args.daemon_options().lifetime != khive_runtime::daemon::DaemonLifetime::Demand,
-        )?,
+        email,
+        #[cfg(feature = "channel-telegram")]
+        telegram,
     })
 }
 
@@ -286,8 +332,8 @@ pub(super) fn start_host_background_tasks(
     schedule_rt: Option<KhiveRuntime>,
     prepared: PreparedHostBackgroundTasks,
 ) -> khive_runtime::daemon::DaemonStartupReport {
-    #[cfg(not(feature = "channel-email"))]
-    let _ = prepared;
+    #[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+    let _ = &prepared.channels;
     let report = daemon_startup_report(args, server, schedule_rt.is_some());
     if args.daemon
         && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
@@ -299,9 +345,19 @@ pub(super) fn start_host_background_tasks(
         return report;
     }
     #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(server, args, prepared.email);
+    spawn_email_channel_loops_if_daemon_registered(
+        server,
+        args,
+        prepared.email,
+        prepared.channels.clone(),
+    );
     #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(server, args);
+    spawn_telegram_channel_loops_if_daemon_registered(
+        server,
+        args,
+        prepared.telegram,
+        prepared.channels,
+    );
     start_daemon_components_if_daemon(args, server, schedule_rt);
     report
 }
@@ -496,10 +552,11 @@ pub(super) async fn serve_holding_sweep(
 /// is the intended behavior, not a silent failure; the log line makes it
 /// observable.
 #[cfg(feature = "channel-email")]
-pub(super) fn spawn_email_channel_loops_if_daemon(
+pub(super) fn spawn_email_channel_loops_if_daemon_registered(
     server: &KhiveMcpServer,
     args: &Args,
     prepared: Option<PreparedEmailChannelLoops>,
+    channels: Arc<khive_channel::ChannelRegistry>,
 ) {
     let admission = channel_loop_plan(server, args);
     if !is_daemon_role(args) {
@@ -519,7 +576,7 @@ pub(super) fn spawn_email_channel_loops_if_daemon(
         "email channel loops: applying daemon/runtime admission"
     );
     if let Some(prepared) = prepared {
-        spawn_email_channel_loops(server, admission, prepared);
+        spawn_email_channel_loops_registered(server, admission, prepared, channels);
     }
 }
 
@@ -591,4 +648,21 @@ pub(super) fn start_daemon_components_if_daemon(
 /// pack routed to a read-only secondary.
 pub(super) fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRuntime> {
     runtime.filter(|runtime| !runtime.is_read_only())
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+pub(super) fn spawn_email_channel_loops_if_daemon(
+    server: &KhiveMcpServer,
+    args: &Args,
+    prepared: Option<PreparedEmailChannelLoops>,
+) {
+    let channels = ServeRegistrations::default()
+        .merge_channels(
+            prepared
+                .as_ref()
+                .map(PreparedEmailChannelLoops::registered_channel)
+                .into_iter(),
+        )
+        .expect("isolated email fixture registry");
+    spawn_email_channel_loops_if_daemon_registered(server, args, prepared, channels);
 }

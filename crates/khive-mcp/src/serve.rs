@@ -6,10 +6,18 @@
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[path = "serve/channel_poll.rs"]
 mod channel_poll;
-#[cfg(feature = "channel-email")]
+#[cfg(all(test, feature = "channel-email"))]
 pub(crate) use channel_poll::channel_outbox_loop;
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 use channel_poll::*;
+
+#[path = "serve/channel_registration.rs"]
+mod channel_registration;
+pub use channel_registration::ServeRegistrations;
+
+#[cfg(test)]
+#[path = "serve/channel_registration_tests.rs"]
+mod channel_registration_tests;
 
 #[path = "serve/claimed_backend.rs"]
 mod claimed_backend;
@@ -142,8 +150,8 @@ mod startup;
 
 use startup::*;
 pub use startup::{
-    db_override_refusal_envelope, run, DatabaseOverrideConflict, MultiBackendRegistry,
-    DB_OVERRIDE_CONFLICT_CODE,
+    db_override_refusal_envelope, run, run_with_registrations, DatabaseOverrideConflict,
+    MultiBackendRegistry, DB_OVERRIDE_CONFLICT_CODE,
 };
 
 #[cfg(all(test, unix))]
@@ -204,6 +212,29 @@ pub async fn serve_server(
     boot_guard: Option<std::fs::File>,
     schedule_rt: Option<KhiveRuntime>,
 ) -> anyhow::Result<()> {
+    serve_server_with_registrations(
+        server,
+        args,
+        registry,
+        boot_guard,
+        schedule_rt,
+        ServeRegistrations::default(),
+    )
+    .await
+}
+
+/// Serve a pre-built server with caller-owned channels registered for this boot.
+///
+/// Exact builtin/caller `(kind, slug)` collisions refuse before background tasks start.
+/// Registration does not itself poll a caller channel; its host owns that drive.
+pub async fn serve_server_with_registrations(
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+    boot_guard: Option<std::fs::File>,
+    schedule_rt: Option<KhiveRuntime>,
+    registrations: ServeRegistrations,
+) -> anyhow::Result<()> {
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
@@ -212,7 +243,8 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(args, &server).await?;
+    let prepared_background =
+        prepare_host_background_tasks_with_registrations(args, &server, &registrations).await?;
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(

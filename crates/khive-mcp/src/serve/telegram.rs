@@ -55,7 +55,12 @@ pub(super) mod heartbeat_test_seam {
 /// both Telegram polling and outbound delivery follow the comm runtime, which
 /// holds the message notes and durably marks delivery outcomes.
 #[cfg(feature = "channel-telegram")]
-pub(super) fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+pub(super) fn spawn_telegram_channel_loops_if_daemon_registered(
+    server: &KhiveMcpServer,
+    args: &Args,
+    prepared: Option<Arc<khive_channel_telegram::TelegramChannel>>,
+    channels: Arc<khive_channel::ChannelRegistry>,
+) {
     let admission = channel_loop_plan(server, args);
     if !args.daemon {
         tracing::info!(target: "khive_mcp::serve","telegram channel loops: skipped (client role; daemon owns channel loops)");
@@ -73,14 +78,16 @@ pub(super) fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, ar
         outbound_delivery = admission.outbound_delivery,
         "telegram channel loops: applying daemon/runtime admission"
     );
-    spawn_telegram_channel_loops(server, admission);
+    if let Some(channel) = prepared {
+        spawn_telegram_channel_loops(server, admission, channel, channels);
+    }
 }
 
 /// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
 /// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
 /// a warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
-/// [`spawn_telegram_channel_loops_if_daemon`].
+/// [`spawn_telegram_channel_loops_if_daemon_registered`].
 ///
 /// Unlike the email adapter, Telegram's poll offset is held in memory inside
 /// `TelegramChannel` itself (ADR-056 Amendment 2026-07-05, "Poll offset and
@@ -93,96 +100,78 @@ pub(super) fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, ar
 fn spawn_telegram_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
+    tg_ch: Arc<khive_channel_telegram::TelegramChannel>,
+    channels: Arc<khive_channel::ChannelRegistry>,
 ) {
-    use khive_channel_telegram::TelegramChannel;
-    use std::sync::Arc;
+    let poll_channels = channels.clone();
+    let verb_reg = server.verb_registry_clone();
+    let ingest_ns = telegram_ingest_namespace_from_env();
+    let default_actor =
+        default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
 
-    #[cfg(all(test, feature = "test-channel-timing"))]
-    if heartbeat_test_seam::observe_construction() {
-        return;
-    }
-    match TelegramChannel::from_env() {
-        Ok(tg_ch) => {
-            let tg_ch = Arc::new(tg_ch);
-            let verb_reg = server.verb_registry_clone();
-            let ingest_ns = telegram_ingest_namespace_from_env();
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
+    let verb_reg_poll = verb_reg.clone();
+    let outbox_runtime = server.channel_outbox_runtime_clone();
+    let ingest_ns_poll = ingest_ns.clone();
+    let default_actor_poll = default_actor.clone();
+    let ingest_ns_outbox = ingest_ns.clone();
+    let tg_ch_poll = Arc::clone(&tg_ch);
+    let tg_ch_outbox = Arc::clone(&tg_ch);
 
-            let verb_reg_poll = verb_reg.clone();
-            let outbox_runtime = server.channel_outbox_runtime_clone();
-            let ingest_ns_poll = ingest_ns.clone();
-            let default_actor_poll = default_actor.clone();
-            let ingest_ns_outbox = ingest_ns.clone();
-            let tg_ch_poll = Arc::clone(&tg_ch);
-            let tg_ch_outbox = Arc::clone(&tg_ch);
-
-            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                if admission.inbound_poll {
-                    khive_runtime::track_named_background_task(
-                        "telegram_channel_poll",
-                        async move {
-                            if let Err(error) =
-                                ensure_channel_quarantine_storage(&verb_reg_poll).await
-                            {
-                                tracing::error!(target: "khive_mcp::serve",
-                                    error = %error,
-                                    "telegram polling disabled: quarantine storage readiness check failed"
-                                );
-                                return;
-                            }
-                            telegram_poll_loop(
-                                tg_ch_poll,
-                                verb_reg_poll,
-                                ingest_ns_poll,
-                                default_actor_poll,
-                                khive_runtime::daemon_shutdown_token(),
-                            )
-                            .await;
+    let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+        if admission.inbound_poll {
+            khive_runtime::track_named_background_task("telegram_channel_poll", async move {
+                if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
+                    tracing::error!(target: "khive_mcp::serve",
+                        error = %error,
+                        "telegram polling disabled: quarantine storage readiness check failed"
+                    );
+                    return;
+                }
+                telegram_poll_loop_registered(
+                    tg_ch_poll,
+                    poll_channels,
+                    verb_reg_poll,
+                    ingest_ns_poll,
+                    default_actor_poll,
+                    khive_runtime::daemon_shutdown_token(),
+                )
+                .await;
+            });
+            tracing::info!(target: "khive_mcp::serve","telegram channel polling loop started");
+        }
+        if admission.outbound_delivery {
+            match outbox_runtime {
+                Some(rt) => {
+                    crate::components::start_channel_component(
+                        "telegram-outbound",
+                        server,
+                        move |ctx| {
+                            Box::pin(telegram_outbox_loop_registered(
+                                tg_ch_outbox.clone(),
+                                channels.clone(),
+                                rt.clone(),
+                                ingest_ns_outbox.clone(),
+                                ctx,
+                            ))
                         },
                     );
-                    tracing::info!(target: "khive_mcp::serve","telegram channel polling loop started");
+                    tracing::info!(target: "khive_mcp::serve","telegram channel outbox loop started");
                 }
-                if admission.outbound_delivery {
-                    match outbox_runtime {
-                        Some(rt) => {
-                            crate::components::start_channel_component(
-                                "telegram-outbound",
-                                server,
-                                move |ctx| {
-                                    Box::pin(telegram_outbox_loop(
-                                        tg_ch_outbox.clone(),
-                                        rt.clone(),
-                                        ingest_ns_outbox.clone(),
-                                        ctx,
-                                    ))
-                                },
-                            );
-                            tracing::info!(target: "khive_mcp::serve","telegram channel outbox loop started");
-                        }
-                        None => {
-                            tracing::error!(target: "khive_mcp::serve",
-                                "telegram outbox loop was NOT started: server has no \
-                                 comm-routed runtime handle, which the loop needs to scan and \
-                                 mark outbound notes; outbound telegram will not be sent"
-                            );
-                        }
-                    }
+                None => {
+                    tracing::error!(target: "khive_mcp::serve",
+                        "telegram outbox loop was NOT started: server has no \
+                         comm-routed runtime handle, which the loop needs to scan and \
+                         mark outbound notes; outbound telegram will not be sent"
+                    );
                 }
-            });
-            if !spawned {
-                tracing::error!(target: "khive_mcp::serve",
-                    namespace = %ingest_ns,
-                    "telegram channel loops NOT started: ingest namespace authorization failed (fail-closed)"
-                );
             }
         }
-        Err(e) => {
-            tracing::warn!(target: "khive_mcp::serve",
-                "channel-telegram feature is enabled but configuration is incomplete: {e}; \
-                 telegram polling is disabled"
-            );
-        }
+    });
+    if !spawned {
+        tracing::error!(target: "khive_mcp::serve",
+            namespace = %ingest_ns,
+            "telegram channel loops NOT started: ingest namespace authorization failed (fail-closed)"
+        );
     }
 }
 
@@ -310,8 +299,9 @@ impl TelegramPollChannel for khive_channel_telegram::TelegramChannel {
 /// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
 /// without importing its IMAP-specific machinery (issue #113).
 #[cfg(feature = "channel-telegram")]
-pub(super) async fn telegram_poll_loop(
+pub(super) async fn telegram_poll_loop_registered(
     telegram_channel: std::sync::Arc<impl TelegramPollChannel>,
+    channels: Arc<khive_channel::ChannelRegistry>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
     default_inbound_actor: String,
@@ -320,6 +310,16 @@ pub(super) async fn telegram_poll_loop(
     use chrono::Utc;
     use serde_json::json;
 
+    // Poll the registered object, and retain the typed owner solely for deferred
+    // acknowledgement. Refuse a mismatched object even when its key is identical.
+    let expected: Arc<dyn khive_channel::Channel> = telegram_channel.clone();
+    let selected = match super::channel_registration::selected_channel(&channels, &expected) {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::error!(target: "khive_mcp::serve", %error, "telegram polling disabled");
+            return;
+        }
+    };
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
     let mut failed_polls = std::collections::HashMap::<String, u8>::new();
 
@@ -352,7 +352,7 @@ pub(super) async fn telegram_poll_loop(
                 tracing::info!(target: "khive_mcp::serve","telegram channel polling loop: cancelled in-flight poll");
                 return;
             }
-            result = telegram_channel.poll(Utc::now()) => result,
+            result = selected.poll(Utc::now()) => result,
         };
         let observed_at = Utc::now();
         match polled {
@@ -459,16 +459,16 @@ pub(super) async fn telegram_poll_loop(
 /// note-scan/send/mark-delivered shape without the Message-ID minting logic
 /// (Telegram has no RFC 822 Message-ID concept).
 #[cfg(feature = "channel-telegram")]
-pub(crate) async fn telegram_outbox_loop(
+pub(super) async fn telegram_outbox_loop_registered(
     telegram_channel: Arc<dyn khive_channel::Channel>,
+    channels: Arc<khive_channel::ChannelRegistry>,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
     outbox::validate_loop_channel(telegram_channel.as_ref(), "telegram")?;
     let slug = telegram_channel.slug();
-    let mut channels = khive_channel::ChannelRegistry::new();
-    channels.register(telegram_channel);
+    super::channel_registration::selected_channel(&channels, &telegram_channel)?;
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     let mut pause_until = None;
@@ -509,4 +509,69 @@ pub(super) async fn telegram_outbox_once(
         &mut pause_until,
     )
     .await
+}
+
+/// Resolve the builtin before registry composition, without starting any loop.
+pub(super) fn prepare_telegram_channel(
+    server: &KhiveMcpServer,
+    args: &Args,
+) -> Option<Arc<khive_channel_telegram::TelegramChannel>> {
+    let admission = channel_loop_plan(server, args);
+    if !args.daemon
+        || args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+        || (!admission.inbound_poll && !admission.outbound_delivery)
+    {
+        return None;
+    }
+    #[cfg(all(test, feature = "test-channel-timing"))]
+    if heartbeat_test_seam::observe_construction() {
+        return None;
+    }
+    match khive_channel_telegram::TelegramChannel::from_env() {
+        Ok(channel) => Some(Arc::new(channel)),
+        Err(error) => {
+            tracing::warn!(target: "khive_mcp::serve", %error,
+                "channel-telegram feature is enabled but configuration is incomplete; telegram polling is disabled");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+    let prepared = prepare_telegram_channel(server, args);
+    let builtins: Vec<Arc<dyn khive_channel::Channel>> = prepared
+        .iter()
+        .map(|channel| {
+            let channel: Arc<dyn khive_channel::Channel> = channel.clone();
+            channel
+        })
+        .collect();
+    let channels = super::ServeRegistrations::default()
+        .merge_channels(builtins)
+        .expect("isolated telegram fixture registry");
+    spawn_telegram_channel_loops_if_daemon_registered(server, args, prepared, channels);
+}
+
+#[cfg(test)]
+pub(super) async fn telegram_poll_loop(
+    channel: Arc<impl TelegramPollChannel>,
+    registry: khive_runtime::VerbRegistry,
+    namespace: String,
+    actor: String,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let channels = super::channel_registration::isolated_test_registry(channel.clone());
+    telegram_poll_loop_registered(channel, channels, registry, namespace, actor, shutdown).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn telegram_outbox_loop(
+    channel: Arc<dyn khive_channel::Channel>,
+    runtime: khive_runtime::KhiveRuntime,
+    namespace: String,
+    ctx: crate::components::HostContext,
+) -> Result<(), crate::components::ComponentError> {
+    let channels = super::channel_registration::isolated_test_registry(channel.clone());
+    telegram_outbox_loop_registered(channel, channels, runtime, namespace, ctx).await
 }
