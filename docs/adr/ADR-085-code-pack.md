@@ -2825,6 +2825,11 @@ No configured-root policy or code-pack parameter changes are introduced here.
 
 ### Decision
 
+For this amendment, one admission cycle covers one governed OS open and its
+before/after checks. A constructor or WAL transition can contain several such
+cycles. Each cycle resolves its own production parents; no production-parent pin
+or absent observation is cached across cycles.
+
 1. **Resolve configured production parents per admission.** For every configured
    production main or event path in Amendment 9, resolve its parent directory,
    then pin the resolved directory before sampling any protected leaf beneath it.
@@ -2880,96 +2885,37 @@ No configured-root policy or code-pack parameter changes are introduced here.
    aliases refuse independently of this directory rule, including aliases whose
    direct parent is different.
 
-4. **Open, resample, compare, then admit the initial main.** After the preliminary
-   protected-member and target checks, compare the target leaf's no-follow
-   metadata identity with the unclassified-quarantine identities before any OS
-   open. A matching identity refuses without opening or reserving another
-   descriptor. Otherwise reserve the existing process-wide quarantine capacity,
-   then OS-open or create the exact initial target main handle. Attest its
-   metadata and repeat the unclassified-identity check on that exact handle to
-   catch a target swapped after the pre-open check. Next take the second protected
-   leaf sample through the original production-parent pins and require the
-   existing protected-member equality/readability checks. Only after that sample
-   succeeds, resolve each original configured parent again under Decision 1's
-   rules for the final comparison. The order is mandatory: initial main open,
-   retained-handle checks, second original-pin leaf sample, final configured-parent
-   comparison, then admission to header/content inspection or SQLite use.
-   Metadata-only identity, file-type and link-count attestation
-   through the retained handle is permitted before the comparison; header/content
-   reads, SQLite reads or writes, locking and mapping are not.
+4. **Compare immediately before the OS open.** Resolve and pin the configured
+   production parents, take the first protected-member sample through those pins,
+   and complete the existing target checks, including direct-parent exclusion.
+   Reserve capacity under Amendment 12's existing pre-open rules. Only then
+   resolve each original configured parent again for the final comparison. After
+   that comparison succeeds, the next step is the target OS open or creation;
+   no target open, header/content inspection or SQLite use precedes it.
 
-   Preserve the existing post-open uncertainty refusals: if exact-handle metadata
-   cannot be obtained safely, the second protected sample cannot be completed
-   safely, or that sample differs from the first, refuse before use and retain
-   the exact opened descriptor under its reserved slot. It is an unclassified
-   possible production alias even when no protected identity match was established
-   or its own identity could not be read safely. Descriptor retention does not
-   establish a native identity: the lifetime-match rule below compares safely
-   established identities and must not fabricate a match value for an unreadable
-   one. An unavailable identity is not evidence that the retained descriptor is
-   unrelated to production. Do not close it or proceed to the final-parent
-   comparison after that failure. These retention rules also
-   remain mandatory for later governed opens and their per-open protected samples.
-
-   For a parent initially pinned, compare the final retained-handle identity
-   with the initial pin: disappearance, unsafe resolution or identity read,
+   For a parent initially pinned, compare the final retained-directory identity
+   with the initial pin. Disappearance, unsafe resolution or identity read,
    failure to pin the resolved directory, or unequal identity refuses. Keep the
-   initial pins through the comparison. An unsafe or changed configured parent
-   has its own typed refusal reason, distinct from a target no-follow,
-   direct-parent or protected-member refusal.
+   initial pins through the open and its post-open checks. An unsafe or changed
+   configured parent has its own typed refusal reason, distinct from a target
+   no-follow, direct-parent or protected-member refusal.
 
    For a genuinely absent parent, genuine absence at the final comparison does
-   not itself refuse. A directory that now exists refuses because this admission
-   has no initial pin or protected sample for it. Creating a dangling redirect,
-   or retargeting an allowed redirect to a missing destination, is unsafe and
-   refuses at the final observation too. An initially dangling redirect already
-   refused; it is never an absent-state baseline. Do not skip the final comparison
-   when no initial pin exists. Every later independent admission resolves anew,
-   including after refusal, and pins any parent then present.
+   not itself refuse. A directory that now exists refuses because this cycle has
+   no initial pin or protected sample for it. A dangling or unsupported redirect
+   at either observation refuses as unsafe; an initially dangling redirect never
+   supplies an absent baseline. Do not skip the comparison when no initial pin
+   exists. A refused comparison opens no target descriptor, creates no target
+   file and leaves Amendment 12's quarantine occupancy unchanged; release the
+   unused reservation.
 
-   The initial main is already open when the final comparison runs. On a
-   prior-WAL transition this is the main handle opened for header inspection.
-   Every open after that initial main within the same admission or transition
-   inherits this parent context and performs no new configured-parent comparison.
-   This includes the transition SQLite connection's own main open, later journal
-   and transition-WAL opens, and the rollback main reopen. Those later handles
-   are not present at the initial comparison; each retains Amendment 12's per-open
-   protected-member and retained-handle checks. Decision 6 preserves this rule
-   through the entire transition.
-
-   Every refusal for unsafe exact-handle observation, an unsafe or changed
-   post-open protected sample, or the final comparison retains that exact
-   opened but unadmitted descriptor as an unclassified possible production
-   alias in Amendment 12's bounded, process-lifetime quarantine. This includes
-   a clean target with no sampled protected-identity match: each retained
-   descriptor consumes its reserved slot. An OS creation may therefore already
-   have changed the target pathname; this is not a no-side-effects guarantee.
-   Never close such a descriptor through the ordinary path or a close deferral
-   that knows only guarded-map locks. Existing pre-open reservation and cap rules
-   remain: exhausted capacity refuses before another OS open. A pre-open refusal
-   holding no descriptor consumes no quarantine entry.
-
-   Independently of the ordinary admitted-role ledger, refuse any later target
-   whose native file identity matches an unclassified quarantined descriptor,
-   for the process lifetime. This rule has no same-role exemption and does not
-   depend on the current protected samples or a later assessment that the file
-   is clean. It neither retires nor closes the retained descriptor. The pre-open
-   no-follow metadata comparison is mandatory, so retrying the unchanged refused
-   file does not open or retain another descriptor. The post-open exact-handle
-   comparison is independently mandatory: a swap after the pre-open check can
-   reveal a matching identity only after opening, and that new descriptor is
-   retained under its already reserved slot before any header/content or SQLite
-   use. Do not deduplicate these descriptors by closing one.
-
-   These unclassified descriptors count against Amendment 12's process-wide
-   quarantine cap only; no per-target, pathname or parent/leaf-domain quota is
-   imposed on them. Keep its pre-open reservation and process-restart remedy.
-   Unlinking a refused file does not release its retained descriptor or global
-   charge. A different clean file identity created at the same pathname admits
-   when global capacity remains and all other checks pass; the old pathname
-   carries no residual per-target slot. Ordinary Amendment 12 same-role reuse
-   and Unix admitted-ledger retirement remain unchanged for identities outside
-   this unclassified-quarantine set.
+   After the OS open, perform Amendment 12's exact retained-handle proof and
+   second protected-member sample through this cycle's original pins, preserving
+   its existing identity, readability and member-change checks before use.
+   The final configured-parent comparison is not repeated after opening.
+   Amendment 17 adds no quarantine class, lifetime identity denial or quarantine
+   accounting rule. Amendment 12's stat-to-open-swap quarantine and its capacity,
+   restart-remedy and occupancy requirements remain unchanged.
 
 5. **Keep the target boundary.** An explicit `db` target still receives no
    parent-path canonicalization and every component retains native no-follow
@@ -2978,108 +2924,88 @@ No configured-root policy or code-pack parameter changes are introduced here.
    does not grant permission to canonicalize an explicit target, even when the
    two path spellings share a prefix.
 
-6. **One parent context for a quiescent WAL transition.** The transition retains
-   its initial production-parent pins, absent states and protected-name set as one
-   admission context. OS-open its initial main handle first, then complete the
-   single final original-parent comparison before that handle is admitted to
-   header/content inspection or SQLite use, and therefore before the FULL
-   checkpoint and `PRAGMA journal_mode=DELETE`. The
-   remaining Amendment 12 transition-refusing checks still finish before that
-   PRAGMA. No target already aliased to an unsampled production file may be read
-   or checkpointed while waiting for this final comparison.
+6. **Repeat the cycle for every governed open.** The transition's header main,
+   the transition SQLite connection's main, each journal or transition-WAL open,
+   and the rollback main reopen each run Decisions 1–4, with their own final
+   configured-parent comparison immediately before their OS open. The same rule
+   applies to a later DELETE-mode journal open on an already admitted connection.
+   Earlier successful admission is not permission to skip the later comparison.
+   Pins remain live through that cycle's post-open proof, then are released;
+   the connection does not retain them for its lifetime.
 
-   The header open, later main/WAL attestations, post-checkpoint protected-member
-   recheck, post-switch companion check and rollback reopen all retain that same
-   production-parent context. Refresh protected leaf samples through its original
-   pins and retain the existing member-change checks; do not select a new
-   production directory or silently start another configured-parent resolution
-   during those steps. Sidecar unlink still uses the separately attested target
-   parent, never the production pin. The rollback guard inherits the same
-   production-parent context for its reopen proof rather than resolving the
-   configured names afresh after DELETE.
+   Each cycle compares its second production-member sample with its own first
+   sample, not with the transition's first sample. Metadata-only checks likewise
+   use a fresh before/after sampling pair through the pins for that check. A
+   production member changed between completed cycles is sampled anew in the
+   next cycle; a change within a pair still refuses under Amendment 12. This
+   does not weaken the separate transition-wide attestation of target sidecars.
 
-   A retarget after the final comparison is outside this guarantee, including the
-   intervals before checkpoint, before DELETE, during companion cleanup and
-   before rollback reopen. A configured production parent genuinely absent at
-   both observations that appears after the final comparison is also outside
-   this guarantee throughout those intervals: this context has no pin or sample
-   for it during that transition. The next independent admission or subsequent
-   post-admission per-open refresh samples a parent then present. Later genuine
-   target/companion, locking or reopen failures keep Amendment 12's
-   incomplete-versus-PARTIAL outcomes: in particular,
-   a failure at or after DELETE does not claim intact sidecars or an unchanged
-   target. A later independent admission starts with a fresh parent resolution.
+   A pre-existing prior-WAL SHM name remains unopened during metadata preflight.
+   At initial admission, establish its target-sidecar attestation and check it
+   against every sampled protected production member. Before DELETE and after
+   DELETE before unlink, check it against its earlier target attestation and the
+   refreshed protected set. The initial target main/WAL/SHM attestation remains the
+   baseline for the pre-switch comparison; the pre-switch attestation is the
+   baseline for cleanup after DELETE, including Amendment 12's existing allowance
+   for a WAL created and attested by the guarded VFS. Refresh the protected set
+   for each check; do not substitute a new target-sidecar identity for its earlier
+   attestation.
+   Unix metadata preflight introduces no SHM open. Where existing Windows
+   deletion uses a native delete handle, its open also runs the ordered cycle
+   before that OS open and retains Amendment 12's delete-handle proof.
 
-7. **End the context at admission completion, not connection close.** Retain
-   the production-parent pins through the guarded constructor's admission work,
-   or through the complete transition and rollback reopen, then release that
-   context on success or refusal. The connection does not retain these pins for
-   its lifetime. A later governed open on an already admitted connection,
-   including a rollback journal opened for a later DELETE-mode write transaction,
-   starts a separate per-open sampling cycle: resolve the configured production
-   parents anew under Decision 1, pin those then present, and take the before/after
-   protected-leaf samples through those new pins under Amendment 12. Preserve all
-   its unsafe-resolution, member-change, direct-target, retained-handle identity,
-   quarantine and no-follow protections. This does not rerun the completed
-   initial-main admission or transition or extend its single final comparison
-   over the connection lifetime. The fresh pins last through that per-open
-   sampling and retained-handle check, not indefinitely.
+   Preserve all quiescent-transition, no-follow, identity, EXCLUSIVE-lock,
+   checkpoint, companion and zero-`xShm*` requirements. All pre-DELETE checks
+   still finish before `PRAGMA journal_mode=DELETE`. Sidecar unlink uses the
+   separately attested target parent, not a production pin. Later genuine
+   failures retain Amendment 12's incomplete-versus-PARTIAL distinction: a
+   failure at or after DELETE does not claim intact sidecars or an unchanged
+   target. Rollback reopen is another complete admission cycle before ingest.
 
-   A parent absent during admission that appears afterward is sampled on the
-   next such open, even when the connection itself is unchanged. A retarget after
-   the final comparison remains outside that completed admission's guarantee;
-   a later refresh does not retroactively prove that interval. Per-open snapshots
-   retain Amendment 12's best-effort and production-handle lifetime limitations.
-
-The two configured-parent observations do not detect an unobserved ABA retarget,
-a retarget after the final comparison, or a parent absent at both observations
-that appears afterward. The latter remains unsampled in that context until the
-next independent admission or post-admission per-open refresh. They do not prove
-the identity of production handles whose names moved or changed outside the
-sampled set. The snapshot remains best-effort; #3593's production-handle lifetime gap
-remains open. This change neither replaces the exact retained-handle proof for
-the target nor closes a refused possible production alias held in quarantine.
+The comparison leaves two explicit residuals: a configured production parent can
+be retargeted between the final comparison and the OS open while the target is
+linked to a member of the new directory, including a member created after that
+retarget; and a configured parent absent at the comparison can appear before the
+open. Both require the same control of the configured production-parent location
+as the decoy case, where both observations see a decoy directory while the target
+aliases a real production file elsewhere. These residuals close only with the
+worker-process boundary recorded as F5 or a production-handle identity set
+(#3593); this amendment supplies neither. A12's post-open identity check still
+rejects aliases to sampled members. The samples remain best-effort and do not
+establish the identity of production handles whose names moved or changed outside
+the sampled set.
 
 ### Exact amendments to Amendment 12
 
 On ratification, replace its production-sampling sentence beginning "At each
 admission, obtain a **best-effort path-stat snapshot**" with:
 
-> At each admission, resolve the parent of every configured production main and
-> event path in Amendment 9, pin each existing parent and record only genuine missing ordinary parents
-> as absent, refusing dangling or unsafe redirects under Amendment 17, then obtain a **best-effort path-stat
-> snapshot** of the leaf names beneath the pinned parents and all presently
-> existing `-journal`, `-wal` and `-shm` companions through the retained parent pins using no-follow metadata
-> reads. Refuse a target whose pinned direct-parent identity equals any of these
-> production-parent identities. Check the target leaf's no-follow metadata
-> identity against the unclassified-quarantine set before opening; a match refuses
-> without another descriptor or reservation. Otherwise reserve process-wide
-> quarantine capacity and OS-open or create the initial target main handle.
-> Attest that handle and repeat the unclassified-identity check, then take a
-> second protected-leaf sample through the original production-parent pins and
-> require its member equality/readability checks. Only then resolve each original
-> configured parent again for the final comparison; admit the initial handle
-> only after that comparison succeeds.
-> Metadata-only retained-handle identity, file-type and link-count attestation
-> remains permitted before this comparison; header/content reads, SQLite use,
-> locking and mapping do not. The comparison governs this initial main, including
-> a transition's header-inspection main. Every later main, journal and WAL open
-> within that admission or transition, including the transition SQLite main and
-> rollback reopen, inherits the same parent context and existing per-open checks
-> without a new configured-parent comparison. Refuse
-> if a pinned parent's identity differs or cannot
-> be read safely, or if an initially absent parent now exists or cannot be
-> resolved safely; an initially absent parent that remains genuinely absent does
-> not itself refuse admission. Every unsafe exact-handle observation, unsafe or
-> changed post-open protected sample, and final-parent refusal after the required
-> initial main open retains that descriptor, including a clean target, as an
-> unclassified possible alias in the bounded quarantine specified by Amendment 17.
-> A failed observation or sample refuses before the final comparison and use;
-> failure to establish the opened identity is not permission to close the handle.
+> For each governed OS open, resolve the parent of every configured production
+> main and event path in Amendment 9, pin each present parent, and record only
+> genuine missing ordinary parents as absent under Amendment 17. Obtain a
+> **best-effort path-stat snapshot** of the configured leaf names and all
+> presently existing `-journal`, `-wal` and `-shm` companions through those pins
+> using no-follow metadata. Refuse a target sharing a pinned production direct
+> parent. After the first sample, the existing target checks and Amendment 12's
+> capacity reservation, compare each original configured parent with its initial
+> pinned identity or absent observation under Amendment 17. A refusal holds no
+> target descriptor, creates no target file and consumes no quarantine entry.
+> The target OS open immediately follows a successful comparison. Its exact-handle
+> proof and second protected-member sample retain Amendment 12's existing rules;
+> take the second sample through that cycle's original production-parent pins.
 
-Except for the per-open refresh sentence replaced below, the rest of that
-paragraph, including protected-member-change refusal and its explicit #3593
-limitation, remains unchanged.
+Replace "Refresh the path-stat samples on each new open and after a refusal"
+with:
+
+> Refresh the production-parent resolution and protected-member samples for every
+> governed open, including later journal opens on an admitted connection and all
+> transition main, journal, WAL and rollback-reopen handles. Each open has its own
+> before/after protected-member pair and a final configured-parent comparison
+> immediately before its OS open; no transition-wide production-member baseline
+> or prior cycle's pins replace it. Metadata-only sidecar checks similarly refresh
+> their own protected set while preserving the sidecar's earlier target
+> attestation under Amendment 12. Release each cycle's production-parent pins
+> after its checks; after any refusal, the next cycle starts afresh.
 
 Replace the paragraph beginning "An explicit `db` receives" with:
 
@@ -3089,122 +3015,18 @@ Replace the paragraph beginning "An explicit `db` receives" with:
 > configured parent **once** before creating/opening `<path>/.khive/code-map.db`,
 > for platform aliases such as macOS `/var/folders`; native no-follow traversal
 > and retained-handle proof still follow. Separately, configured production
-> parents are resolved per admission and pinned when present, with the final
-> present/absent and parent-identity comparison required by Amendment 17. These are
-> the only parent-resolution exceptions; neither authorizes canonicalizing an explicit target. Controls must
+> parents are resolved and pinned per governed open, with Amendment 17's final
+> comparison immediately before that open. These are the only parent-resolution
+> exceptions; neither authorizes canonicalizing an explicit target. Controls must
 > fail if the default transform is removed or applied to an explicit `/var/...`
 > path, or if production-parent resolution is removed.
 
-In Amendment 12's quarantine paragraph, replace the sentence beginning "On a
-protected-identity match" with:
-
-> On a protected-identity match, an unsafe exact-handle observation, an unsafe
-> or changed post-open protected sample, or Amendment 17's final configured-parent
-> refusal after opening, the VFS refuses before admitting the handle for use and
-> retains that exact descriptor in the bounded, process-lifetime quarantine
-> rather than closing it. A descriptor refused by an uncertain observation,
-> sample or final-parent comparison is an unclassified possible production alias,
-> even when it is clean, has no sampled identity match, or its identity could not
-> be established safely. Retention does not manufacture that missing identity;
-> lifetime identity comparisons require safely established native identities.
-> Any later target matching such an unclassified retained identity refuses for the process lifetime, irrespective
-> of role or later protected samples; ordinary same-role reuse does not exempt
-> it. Check target-leaf no-follow metadata before the OS open, refusing an
-> unchanged matching file without another descriptor or reservation. Also check
-> the exact opened handle to catch a swap after that pre-open check; a matching
-> opened descriptor is retained under its pre-reserved slot without use or close.
-> These unclassified descriptors charge the existing process-wide quarantine cap
-> only, with no per-target or pathname quota. Unlinking a refused file does not
-> release its charge, but a different clean identity at the same pathname admits
-> with available global capacity and all other checks satisfied. On Unix, ordinary close can release same-process
-> production locks. Descriptor retention is required on Windows too, without
-> assuming that closing an alias releases locks held through another handle.
-
-Replace that paragraph's "This quarantine is solely for the stat-to-open swap"
-sentence with:
-
-> This quarantine covers the protected stat-to-open swap, unsafe exact-handle
-> observations, unsafe or changed post-open protected samples, and Amendment 17's
-> opened-but-unadmitted final-parent refusal, plus opened descriptors refused
-> because their identity matches an unclassified quarantined descriptor. Pre-open
-> companion, identity or resolution refusals and no-follow open failures that
-> hold no descriptor do not consume it.
-
-Replace that paragraph's "Non-adversarial runs must end with quarantine occupancy
-zero" sentence with:
-
-> Runs with no protected stat-to-open swap, unsafe exact-handle observation,
-> unsafe or changed post-open protected sample, post-open final-parent refusal or
-> post-open match to an unclassified quarantined identity must end with quarantine
-> occupancy zero. A clean target refused by the final comparison after the
-> mandatory open intentionally consumes a slot; later reassessment does not free
-> it. The existing reservation limits and restart remedy bound these refusals too.
-
-In Amendment 12's deterministic-barrier acceptance paragraph, replace the
-sentence beginning "Every identity-swap arm that reaches post-open
-protected-handle refusal" with:
-
-> Every arm that opens and then refuses one protected-alias descriptor, one
-> descriptor with an unsafe exact-handle observation or unsafe/changed post-open
-> protected sample, one initial main at the final configured-parent comparison
-> (including a clean target), or one descriptor matching an unclassified quarantined identity
-> retains that exact descriptor and raises process-wide quarantine occupancy by
-> exactly one. An unchanged-identity pre-open match opens no descriptor and
-> leaves occupancy unchanged. On Unix, a same-process production write after
-> refusal and independent native lock observation must prove retained production
-> locks survive. On Windows, require exact-descriptor retention and the existing
-> native lock/alias positives without assuming alias close releases another
-> handle's locks.
-
-In that same paragraph, replace "The entire non-adversarial suite must finish
-with quarantine occupancy zero; any occupant is a finding" with:
-
-> The suite must finish with quarantine occupancy zero unless it deliberately
-> exercised a protected stat-to-open swap, an unsafe exact-handle observation,
-> an unsafe or changed post-open protected sample, a post-open final-parent refusal
-> or a post-open match to an unclassified quarantined identity. In those arms, including
-> a clean final-parent refusal, the exact expected retained-descriptor count must
-> remain until process exit; an extra or missing occupant is a finding. Pre-open
-> identity refusals and open failures holding no descriptor add no occupant.
-
-In the quiescent-transition paragraph, immediately after "Every
-transition-refusing check" through "before `PRAGMA journal_mode=DELETE`", add:
-
-> Amendment 17's configured-parent admission, including its final original-parent
-> comparison, runs after the initial main OS-open, retained-handle metadata
-> checks and second original-pin protected-leaf sample, and finishes before that
-> handle is admitted to header/content inspection or SQLite use, hence before
-> checkpoint or DELETE. Retain that one
-> production-parent context and refresh its protected leaves through the same pins
-> for every later main, journal and WAL open and all later attestations,
-> post-checkpoint and post-switch checks, sidecar cleanup and rollback reopen; those steps do not begin a new configured-parent
-> resolution. A retarget after the final comparison, or a configured production
-> parent absent at both observations that appears afterward, is outside its
-> guarantee throughout that remainder of the transition. Such an appearing
-> parent remains unsampled in that transition context. The next independent
-> admission or post-admission per-open refresh samples it if then present. The
-> existing incomplete/PARTIAL distinction and attested-target-parent unlink
-> boundary remain unchanged.
-
-Replace "Refresh the path-stat samples on each new open and after a refusal"
-with:
-
-> Refresh protected-leaf samples on each new open and after a refusal. Within
-> one admission or transition, use its retained production-parent pins without
-> another configured-parent comparison, including later main opens and rollback
-> reopen. Release that context when the guarded admission or transition ends.
-> Each later governed open on an already admitted connection, including a journal
-> open for a later write transaction, resolves the configured parents afresh and
-> takes Amendment 12's before/after protected samples through new pins retained
-> for that per-open check. It does not retain an earlier absent-parent observation
-> or rerun the completed initial-main admission. All target, member, exact-handle,
-> quarantine and no-follow checks remain; the snapshots retain their best-effort
-> and production-handle lifetime limitations.
-
-All other Amendment 12 text, including its process-wide quarantine bound,
-reservation rules, restart remedy and later partial-transition proofs, remains
-unchanged. The additions above qualify both occupancy-zero sentences and the
-post-open refusal accounting; none changes the historical accepted text in place.
+All other Amendment 12 text remains unchanged. In particular, this amendment
+adds no text to its quarantine paragraph, does not change either occupancy-zero
+requirement, and preserves its post-open proofs, quiescent-transition sidecar
+attestation, capacity and restart rules, and later partial-transition outcomes.
+The replacements above take effect on ratification; the accepted historical text
+is not changed in place.
 
 ### Acceptance and implementation sequence
 
@@ -3244,169 +3066,137 @@ ratification; a documentation commit alone establishes no runtime result.
   each comparison must fail that own assertion, not an unrelated setup assertion.
   Compare protected main and companion
   presence, bytes, size and modification time across refusals.
-- **Pinned sampling and observed changes (W8).** Use two independent
-  pin-addressing arms with a barrier after the initial pin and first protected
-  sample but before the initial target OS-open. The second sample is Decision 4's
-  sample through the original pins after that OS-open and retained-handle checks,
-  before any final configured-parent comparison. For the configured-path arm, D2 initially
-  holds hard links to every existing protected member in D1 except the one that
-  will be replaced; these unchanged members' link counts are already reflected
-  in the first sample. After pinning D1 and taking that sample, create D2's hard
-  link to the member to be replaced, retarget the configured alias to D2, and
-  rename a new file over that member's name in D1. Adding and then removing the
-  old object's link returns its link count to the sampled value. Require D2's
-  complete second observations to equal the first samples for every member:
-  native identity, link count and any other compared fields, including absence.
-  The original pin differs only at the intended replacement and sees its new
-  identity. Require that second sample's typed protected-member-change decision.
-  A mutant that re-resolves the configured path instead sees the unchanged D2
-  observations and must fail that own second-sample assertion.
+- **Pinned sampling and observed changes (W8).** Use two independent native
+  pin-addressing arms. Initially the protected member selected to discriminate
+  addressing is absent in both D1 and D2. If other protected members exist,
+  prepare D2's hard links to them before the first sample, so their identities,
+  link counts and all other compared fields already agree. Pin D1, take the first
+  sample, finish the target checks and capacity reservation, and let the final
+  configured-parent comparison succeed. Pause at a deterministic seam immediately
+  between that comparison and the target OS open.
 
-  For the cached-resolved-pathname arm, prepare a separate replacement directory
-  before the first sample, with hard links to each unchanged protected member
-  but no link to the member to be replaced. After the first sample, rename
-  pinned D1 away and move that replacement directory to D1's old pathname.
-  Add its link to the member to be replaced, then rename a new file over the
-  member in the moved original directory. This balances the replaced object's
-  link count; unchanged members gained their extra links before the sample.
-  Assert complete observation equality at the old pathname for every member,
-  including identity, link count and every other compared field or absence.
-  The retained pin still addresses the moved original directory and differs only
-  at the intended replacement, whereas a cached pathname sees the unchanged
-  observations. A separate cached-pathname mutant must fail this own second-sample
-  assertion. Exercise real native directory rename and file rename-over, not mock
-  identity values. On Windows, a sharing violation is fixture failure, not a
-  member-change refusal.
+  In the configured-path arm, retarget the configured alias to D2 and create the
+  previously absent protected member only in D1. The second sample after the OS
+  open must use the original pin and require the typed protected-member-change
+  decision for absent-to-present. A mutant that re-resolves the configured path
+  instead sees the unchanged observations in D2 and fails that own second-sample
+  assertion. Require complete equality of the mutant-visible observations to
+  the first sample for every member, including absence and every compared field.
 
-  Both pin-addressing arms assert the named production second-sample decision
-  before the final-comparison phase; a later parent-change refusal cannot supply
-  their oracle. Each also requires retention of its exact opened descriptor and
-  exactly one process-wide quarantine charge, despite the final comparison not
-  running. Separate post-open exact-handle-observation failure and protected-sample
-  read-failure arms require the same no-use, exact-retention and one-charge result.
-  Removing retention from any one of these branches must fail its own descriptor
-  and occupancy assertion; a pre-open refusal with no descriptor cannot satisfy
-  that arm. The control removing the member-change check is separate from
-  either addressing substitution. For the final-comparison arm, keep all
-  original-pin members stable and use a clean single-link target outside both
-  directories. Record its OS-open before retargeting the configured alias, then
-  require the typed parent-identity-change reason before any header/content or
-  SQLite use, with that exact descriptor retained and occupancy increased once.
-  No earlier target, member, link-count or direct-parent refusal may mask it.
-  Removing the comparison or placing it before that OS-open must fail the own
-  reason/order assertion.
+  In the cached-resolved-pathname arm, prepare the replacement directory and all
+  unchanged-member hard links before the first sample. After the successful final
+  comparison, rename pinned D1 away and move that prepared directory to D1's old
+  pathname. Create the previously absent protected member only in the moved
+  original directory. The pin must observe the new member, while a cached
+  pathname sees the replacement directory's unchanged samples. The independent
+  cached-pathname mutant fails the same named second-sample decision. These arms
+  change no previously sampled leaf's links, name or contents after its baseline;
+  they do not assume a hard-link/rename-over sequence preserves ctime or Windows
+  ChangeTime. Record actual native directory rename and full leaf observations;
+  a sharing violation or unrelated refusal is fixture failure, not the oracle.
 
-  After refusal, a fresh admission resolves the new parent. A **different clean
-  file identity** admits with available global capacity, including after unlinking
-  the refused file and creating that new identity at the same pathname. Assert
-  that the old descriptor and global charge remain but no per-target slot blocks
-  the new identity. An alias of a newly sampled protected file refuses with its
-  own protected-identity reason. Retrying
-  the previously quarantined clean identity instead requires the distinct
-  unclassified-quarantine-identity refusal, even in the same main role. Removing
-  only that lifetime identity denial must fail this own assertion; retention and
-  ordinary admitted-role checks remain intact. Caching an old parent context
-  across independent admissions separately fails the fresh-parent witness.
-  Unobserved ABA and exact production-handle lifetime guarantees are not asserted.
+  Keep the target clean, single-linked and outside both production directories.
+  Assert the final-comparison, target-open and second-sample event order so an
+  earlier parent, target or sidecar refusal cannot supply the member-change
+  result. Removing the member-change check is a separate control from either
+  addressing substitution. These witnesses add no descriptor-retention or
+  occupancy rule beyond Amendment 12.
+
+  After refusal, a fresh cycle resolves the current parent and admits a clean
+  target when all existing checks pass. An alias to a newly sampled protected
+  member independently refuses with its protected-identity reason. Caching the
+  previous cycle's pins fails the fresh-parent witness.
 - **Missing, dangling and pin-race parents.** Genuine ordinary-path absence at
   both observations admits a clean target; treating it as unsafe fails that
-  admission assertion. Creating that parent between observations instead requires
-  the typed parent-appeared refusal. A dangling configured redirect initially
-  refuses as unsafe; creating a dangling redirect after initial genuine absence,
-  or retargeting an initially present alias to a missing destination, refuses at
-  the final observation. A directory resolved as present but removed before its
-  pin opens requires the typed unsafe-pin refusal and never becomes an absent
-  baseline. Removing these distinctions fails the matching reason assertions.
-  In a separate timeline, record genuine absence at both observations, then
-  create the configured production parent after the final comparison. That
-  appearance is outside this admission's guarantee, including the transition's
-  remainder; do not require it to refuse. A later independent admission must
-  resolve and sample the new parent and enforce its direct-parent/protected-file
-  checks. Also keep a successfully admitted DELETE-mode connection open across
-  that appearance, finish the original admission, and start a later write
-  transaction that opens its journal. Require a new parent resolution and
-  protected-leaf sample on that actual companion-open route. Give the newly
-  appeared parent an independent protected file and keep the journal clean, so
-  the journal open succeeds while recording the exact new parent/member native
-  identities. Reusing the expired admission's absent state or pins must fail that
-  own refresh/identity assertion, even if the journal still opens successfully.
-  Merely completing another independent constructor does not prove this
-  connection-life arm. Existing typed protected-alias refusals remain required;
-  this clean refresh witness does not replace them. The original
-  transition's same-context rule and its excluded post-final interval are not
-  extended by this later observation. Skipping fresh resolution must fail the
-  corresponding later observation/refusal assertion. A pinned existing parent with absent protected leaf names retains
-  the existing absent-leaf rules. On Windows, exercise both allowed directory redirect tags,
-  an unsupported tag and directory rename/removal while the pin is held; require
-  the intended final observation rather than a sharing-violation substitute.
-- **Unclassified-alias retention and Unix lock survival (W9).** Between initial sampling and target
-  open, retarget the configured parent from D1 to D2 and swap a clean main target
-  to a hard link of a production file in D2 whose connection this process already
-  holds open. Repeat with an initially absent configured parent that appears as
-  D2. Initial-pin samples remain unchanged and no earlier refusal may mask the
-  final parent-changed/parent-appeared reason. The exact opened target descriptor
-  is not admitted for header/content inspection or SQLite use and enters
-  quarantine once, even though D2's identity was absent from the initial samples.
-  Metadata-only retained-handle admission attestation remains permitted. On Unix,
-  independent native lock observation and a subsequent same-process production
-  write establish that D2's lock survives; closing that unclassified descriptor
-  instead of retaining it must fail the lock-survival assertion, not setup. On
-  Windows, assert that this exact descriptor is retained and not prematurely
-  closed, alongside the existing native lock/alias positives. The close mutant
-  must fail that retention assertion; do not require loss of a lock held through
-  a different Windows handle. Retain the existing pre-open reservation/cap and
-  no-descriptor/no-quarantine controls. The descriptor present at this final
-  comparison is the initial main, not a journal or WAL opened later. Restore the
-  configured parent to D1 after the first refusal and retry the same hard-linked
-  target in the same main role. Current D1 samples and direct-parent checks do
-  not match it. In the mandatory pre-open arm, no-follow target metadata still
-  names the unchanged quarantined identity: require its typed refusal with no
-  OS-open event, no new reservation and unchanged occupancy across repeated
-  retries. Removing only the pre-open check must fail the no-open/no-new-charge
-  assertion even if the intact post-open check still refuses.
+  admission assertion. Creating that parent between observations requires the
+  typed parent-appeared refusal before the target OS open. A dangling configured
+  redirect initially refuses as unsafe; creating a dangling redirect after
+  initial genuine absence, or retargeting an initially present alias to a missing
+  destination, refuses at the final observation. A directory resolved as present
+  but removed before its pin opens requires the typed unsafe-pin refusal and
+  never becomes an absent baseline. Removing these distinctions fails their
+  respective reason assertions. Each appearing-parent arm uses an independent
+  production file, never a file or identity carried over from another refusal.
 
-  In the separate mandatory post-open arm, present a different clean identity to
-  the pre-open check, then use a deterministic barrier between that check and
-  the OS open to swap in the quarantined identity. Require the exact opened
-  handle's identity refusal, no use or premature close, and exactly one added
-  reserved-slot charge. Removing only the post-open identity check must fail this
-  own refusal/retention assertion; neither a pre-open rejection nor a different
-  protected-member reason supplies it. The original retained descriptor remains
-  held in both arms. Repeat the retention accounting with distinct clean
-  final-parent refusals up to the existing process-wide capacity: the next
-  capacity refusal occurs before OS-open, without an occupancy increment. A control skipping
-  retention only for a clean refusal fails its handle/occupancy assertion.
+  Keep a successfully admitted DELETE-mode connection open, create a production
+  parent that was absent during its earlier open, then start a write transaction
+  that opens a new journal. Require fresh parent resolution and protected-member
+  sampling on that actual companion-open route, with its final comparison before
+  the journal OS open. A clean journal succeeds and records the new parent/member
+  native identities. Reusing the previous open's absent state or pins fails the
+  own refresh/identity assertion. Completing another independent constructor does
+  not prove this connection-life arm. A parent appearing only after a successful
+  final comparison belongs to the explicit residual below, not this refusal arm.
+
+  A pinned existing parent with absent protected leaf names keeps the existing
+  absent-leaf rules. On Windows, exercise both allowed directory redirect tags,
+  an unsupported tag and directory rename/removal while the pin is held; require
+  the intended observation rather than a sharing-violation substitute.
+- **Final-comparison refusal before opening (W9).** Hold every original-pin
+  protected member stable and keep a clean target outside both production
+  directories. Retarget the configured parent between the first sample and the
+  final comparison. Require the typed parent-identity-change refusal, unchanged
+  target OS-open count, no target-file creation, unchanged A12 quarantine
+  occupancy, and release of the unused reservation. Repeat with an initially
+  absent configured parent that appears before the final comparison, using a
+  distinct production file and the typed parent-appeared reason. Neither an
+  earlier no-follow/direct-parent refusal nor a later member check supplies the
+  oracle. Omitting the comparison fails its typed refusal assertion; placing it
+  after opening fails the own no-open/no-creation assertion even if it still
+  refuses. Cover an omitted-`db` default whose main file does not yet exist and
+  a new DELETE-mode journal on an already admitted connection. Previously open
+  connection handles do not count as new opens in the journal arm.
+- **Recorded admission residual.** Use unregistered main-file admission with a
+  pre-existing target whose identity has passed the preliminary checks. After the
+  final comparison succeeds, pause immediately before the target OS open.
+  Retarget the configured parent to D2, then create the new protected-member name
+  in D2 as a hard link to that already-inspected target. Do not replace the target;
+  its native identity remains unchanged through the open. This main-file route
+  permits hard links; registered-main single-link and writable-sidecar gates are
+  not bypassed to construct it. Keep the original pinned directory's samples
+  unchanged and satisfy the other existing target checks. Record the exact opened
+  target identity and D2 member identity.
+  The row's expected result is **ADMITTED** for this one governed main OS-open
+  cycle, including when the D2 member was created only after retarget. It does not
+  assert success for a whole multi-open constructor or transition: a later cycle
+  resolves D2 afresh and may refuse the now-sampled alias. This is not a refusal
+  oracle or evidence of protection against the residual. Perform no writes through the
+  admitted alias. A companion row starts with a genuinely absent configured
+  parent and creates it after the comparison but before the open, using a separate
+  pre-existing target and the same target-to-new-member hard-link direction.
+  It records the same residual admission. These
+  expectations deliberately change when the residual is closed by the separate
+  worker or production-handle identity work; no executed result is claimed here.
 - **Transition and preserved target guarantees (W9).** A deterministic prior-WAL
-  route witness records initial main OS-open, then retargets the configured
-  parent before its final comparison and asserts the typed final-parent refusal,
-  no target header/content inspection or SQLite-use event and no DELETE PRAGMA;
-  metadata-only retained-handle admission attestation remains permitted. The
-  ordered trace must show OS-open, retained-handle metadata checks, the second
-  original-pin protected-leaf sample, final comparison, then admission on success;
-  moving the comparison before open or omitting that sample fails its own order
-  or member-change assertion. A successful transition
-  records exactly one final comparison and the same production pins
-  through header admission, checkpoint recheck, post-switch companion attestation,
-  target-parent unlink and rollback reopen. Starting another configured-parent
-  resolution during those later stages fails that context assertion. Every later
-  main, journal and WAL open within the transition, including SQLite's main open
-  and the rollback main reopen, uses that context and the existing per-open
-  checks, not another final comparison. After the transition/admission completes,
-  later connection-life companion opens instead perform Decision 7's fresh
-  per-open sampling. Preserve both the explicit
-  retarget-after-final and absent-parent-appears-after-final limitations rather
-  than require either excluded race to refuse. Existing genuine post-DELETE
-  failures remain PARTIAL. Explicit
-  target symlinks/reparse redirects still refuse; removing the omitted-default
-  transform and applying it to an explicit target each fail their existing
-  assertion. Preserve protected hard-link/sidecar checks, hot-journal recovery,
-  DELETE concurrency and zero-`xShm*` invariants. Production-parent resolution is
-  neither a default-VFS fallback nor an explicit-target traversal bypass.
+  witness records the complete cycle for the header main, transition SQLite main,
+  each transition WAL/journal handle and rollback main reopen: fresh parent
+  resolution and pin, first protected sample and target checks, capacity
+  reservation, final comparison, target OS open, exact-handle proof and the
+  second sample through that cycle's original pins. Insert parent-change or
+  parent-appearance barriers before the final comparison for each actual open
+  route and require its own typed refusal with no new target descriptor. One
+  comparison for the whole transition cannot satisfy this trace.
+
+  Separately change a production member between completed open cycles and prove
+  the next cycle uses its own new before/after baseline; changing it within a
+  pair still refuses. Assert the unopened prior-WAL SHM's no-follow metadata
+  checks against both its earlier target attestation and the refreshed protected
+  set before and after DELETE. Changing its identity fails the sidecar-attestation
+  assertion even if that replacement is not a protected alias; a protected alias
+  separately fails its own check. No SHM inspection open or `xShm*` call supplies
+  this evidence. Where Windows cleanup uses its existing delete handle, retain
+  that platform's exact-handle proof and the comparison-before-open order.
+
+  Preserve genuine post-DELETE PARTIAL failures, explicit-target symlink/reparse
+  refusals, omitted-default canonicalization and explicit-target no-canonicalization
+  controls, protected hard-link/sidecar checks, hot-journal recovery, DELETE
+  concurrency and zero-`xShm*` invariants. Production-parent resolution is neither
+  a default-VFS fallback nor an explicit-target traversal bypass.
 
 Record Unix and Windows results separately; Windows uses the explicitly allowed
-parent redirect tags and Amendment 12's exact native identity fields. W9's Unix
-close-induced lock-loss control is not a Windows oracle: Windows requires its
-own exact-descriptor retention assertion and native lock/alias positives. Every
+parent redirect tags and Amendment 12's exact native identity fields. Preserve
+Amendment 12's existing native lock/alias and quarantine controls on their
+applicable platforms; A17 adds none. Every
 control must build and reach its own semantic assertion, then pass that same
 assertion after exact restoration. A refusal of another typed reason is not a
 passing refusal oracle. Shared affected suites run before the controls
