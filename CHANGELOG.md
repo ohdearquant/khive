@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `KhiveRuntime::read_brain_events` exposes the existing namespace-scoped recent brain-event
+  reader to embedding hosts (#4554).
+- `KhiveRuntime::read_event_counts` and `read_event_page_response` expose the existing event count and
+  page readers to embedding hosts with their actor scope, read budgets and response contracts (#4554).
 - GQL canonical paths can combine fixed steps and bounded variable segments. The sum of
   variable-segment maxima is capped at ten; traversal depth and weight exclude fixed steps.
   Mixed WHERE expressions run on complete matches, including OR across bindings (#6686).
