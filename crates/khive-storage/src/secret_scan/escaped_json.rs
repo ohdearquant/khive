@@ -17,9 +17,21 @@
 /// passes strict JSON decoding; paths like `C:\Users` do not decode.
 pub(super) fn escaped_strings(text: &str) -> Vec<String> {
     escaped_strings_inner(text, &mut RecoveryWork::default())
+        .into_iter()
+        .map(|view| view.text)
+        .collect()
 }
 
-fn escaped_strings_inner(text: &str, work: &mut RecoveryWork) -> Vec<String> {
+pub(super) struct DecodedSpan {
+    pub(super) text: String,
+    pub(super) source: std::ops::Range<usize>,
+}
+
+pub(super) fn escaped_views(text: &str) -> Vec<DecodedSpan> {
+    escaped_strings_inner(text, &mut RecoveryWork::default())
+}
+
+fn escaped_strings_inner(text: &str, work: &mut RecoveryWork) -> Vec<DecodedSpan> {
     if !text.contains('\\') {
         return Vec::new();
     }
@@ -35,9 +47,12 @@ fn escaped_strings_inner(text: &str, work: &mut RecoveryWork) -> Vec<String> {
                 let literal = &text[start..=i];
                 if literal.contains('\\') {
                     if let Ok(value) = serde_json::from_str::<String>(literal) {
-                        decoded.push(value);
+                        decoded.push(DecodedSpan {
+                            text: value,
+                            source: start + 1..i,
+                        });
                     } else {
-                        recover_valid_spans(&text[start + 1..i], &mut decoded, work);
+                        recover_valid_spans(&text[start + 1..i], start + 1, &mut decoded, work);
                     }
                 }
                 start = i;
@@ -49,7 +64,7 @@ fn escaped_strings_inner(text: &str, work: &mut RecoveryWork) -> Vec<String> {
                 if serde_json::from_str::<String>(&fragment).is_err() {
                     // Include this escaped quote as content before reusing it
                     // as the next candidate's delimiter.
-                    recover_valid_spans(&text[start + 1..=i], &mut decoded, work);
+                    recover_valid_spans(&text[start + 1..=i], start + 1, &mut decoded, work);
                     start = i;
                 }
             }
@@ -63,15 +78,23 @@ fn escaped_strings_inner(text: &str, work: &mut RecoveryWork) -> Vec<String> {
     if tail.contains('\\') {
         let literal = format!("{tail}\"");
         if let Ok(value) = serde_json::from_str::<String>(&literal) {
-            decoded.push(value);
+            decoded.push(DecodedSpan {
+                text: value,
+                source: start + 1..text.len(),
+            });
         } else {
-            recover_valid_spans(&text[start + 1..], &mut decoded, work);
+            recover_valid_spans(&text[start + 1..], start + 1, &mut decoded, work);
         }
     }
     decoded
 }
 
-fn recover_valid_spans(interior: &str, decoded: &mut Vec<String>, work: &mut RecoveryWork) {
+fn recover_valid_spans(
+    interior: &str,
+    base: usize,
+    decoded: &mut Vec<DecodedSpan>,
+    work: &mut RecoveryWork,
+) {
     work.begin_pass();
     let mut cursor = 0;
     let mut start = 0;
@@ -81,20 +104,38 @@ fn recover_valid_spans(interior: &str, decoded: &mut Vec<String>, work: &mut Rec
         if valid {
             escaped |= interior.as_bytes()[cursor] == b'\\';
         } else {
-            emit_span(&interior[start..cursor], escaped, decoded);
+            emit_span(
+                &interior[start..cursor],
+                base + start..base + cursor,
+                escaped,
+                decoded,
+            );
             start = cursor + len;
             escaped = false;
         }
         cursor += len;
     }
-    emit_span(&interior[start..], escaped, decoded);
+    emit_span(
+        &interior[start..],
+        base + start..base + interior.len(),
+        escaped,
+        decoded,
+    );
 }
 
-fn emit_span(span: &str, escaped: bool, decoded: &mut Vec<String>) {
+fn emit_span(
+    span: &str,
+    source: std::ops::Range<usize>,
+    escaped: bool,
+    decoded: &mut Vec<DecodedSpan>,
+) {
     if escaped {
         let literal = format!("\"{span}\"");
         if let Ok(value) = serde_json::from_str::<String>(&literal) {
-            decoded.push(value);
+            decoded.push(DecodedSpan {
+                text: value,
+                source,
+            });
         }
     }
 }
@@ -193,5 +234,9 @@ pub(super) fn escaped_strings_with_work(
         ..RecoveryWork::default()
     };
     let decoded = escaped_strings_inner(text, &mut work);
-    (decoded, work)
+    (decoded.into_iter().map(|view| view.text).collect(), work)
+}
+
+pub(super) fn origin_token(text: &str) -> (usize, bool) {
+    recovery_token(text, &mut RecoveryWork::default())
 }
