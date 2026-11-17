@@ -30,26 +30,28 @@ struct Probe {
 }
 
 fn pool(root: &Path, queued: bool) -> (Arc<ConnectionPool>, Probe) {
-    let mut pool = ConnectionPool::new(PoolConfig {
-        path: Some(root.join("writer-query.db")),
-        volume_lock_dir: Some(root.join("volume-locks")),
-        write_queue_enabled: Some(queued),
-        write_routing_strict: queued,
-        max_readers: 2,
-        ..PoolConfig::for_test()
-    })
-    .unwrap();
-    pool.standalone_transaction(|conn| {
-        conn.execute_batch(
-            "CREATE TABLE writable_query_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+    let path = root.join("writer-query.db");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE writable_query_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
              INSERT INTO writable_query_rows VALUES (1, 10);
              CREATE TABLE writable_query_effects (operation TEXT NOT NULL);
              CREATE TRIGGER writable_query_insert AFTER INSERT ON writable_query_rows
              BEGIN INSERT INTO writable_query_effects VALUES ('insert'); END;
              CREATE TRIGGER writable_query_update AFTER UPDATE ON writable_query_rows
              BEGIN INSERT INTO writable_query_effects VALUES ('update'); END;",
-        )?;
-        Ok(())
+            )
+            .unwrap();
+    }
+    let mut pool = ConnectionPool::new(PoolConfig {
+        path: Some(path),
+        volume_lock_dir: Some(root.join("volume-locks")),
+        write_queue_enabled: Some(queued),
+        write_routing_strict: queued,
+        max_readers: 2,
+        ..PoolConfig::for_test()
     })
     .unwrap();
     let probe = Probe {

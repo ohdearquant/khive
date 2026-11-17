@@ -11,6 +11,7 @@ fn channel_handle(
         WriterTaskHandle {
             tx,
             backend_key: None,
+            strict_routing: false,
             db: "admission-test".into(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_millis(20),

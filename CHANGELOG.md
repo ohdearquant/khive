@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `memory.recall_candidates` returns the executed collection `plan` beside its existing raw
+  arrays; recall ranking, hydration and scoring are unchanged (#6737).
 - GQL query-text LIMIT applies after SKIP on each page. Existing terminal-page and sentinel
   rules remain unchanged (#6691).
 - Zero-hop query matches retain the same substrate and UUID at both endpoints, zero traversal
@@ -43,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Count(String)`. Exhaustive `WhereExpr` matches must handle `NotExists(MatchPattern)`;
   `conditions()` and `for_each_condition_mut()` continue to visit only outer scalar conditions.
 
+- `khive_retrieval::execute_hybrid` and `execute_memory_hybrid` take a `PlanProgram` in place of
+  the opaque fusion closure, and run the `query_ir` plan it names. The executor now resolves and
+  validates the plan before the empty-namespace early return, so a caller with no namespaces
+  and an invalid plan gets an error where it used to get an empty outcome (#6737).
+
+- The exhaustive `khive_storage::StorageError` enum gains `WriteOutcomeUnknown` (COMMIT was
+  issued and the reply was lost; side effects unknown, not retryable), `WriterOwnerUnavailable`
+  (strict routing found no writer owner; not started) and `WriterRouteViolation` (strict routing
+  refused a write that bypassed the owner; not started). Downstream exhaustive matches must
+  handle all three (#6740).
+
 ### Fixed
 
 - Property strings are checked with their owning credential labels, including inherited labels
@@ -51,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Note-key creation, replay admission and direct assignment use the shared secret detector on
   the raw key. Existing keys remain readable, and read/fence selectors retain their shape-only
   validation (#6273).
+- A write whose reply is lost after COMMIT reports `write_outcome_unknown` with
+  `request_state: side_effects_unknown`; a loss before COMMIT stays `writer_task_terminated`. With
+  `write_routing_strict`, a missing or stopped writer owner fails as `writer_owner_unavailable`
+  and a write that bypasses the owner fails as `writer_route_violation`, both before any work
+  runs (#6740).
 
 ## [0.20.0] - 2026-11-16
 

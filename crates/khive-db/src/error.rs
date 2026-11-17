@@ -71,6 +71,9 @@ pub const SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE: &str = "sqlite_wal_capacity_una
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
+    #[error("strict writer routing refused a direct logical write: {operation}")]
+    WriterRouteViolation { operation: &'static str },
+
     #[error("sqlite error: {source}")]
     Write {
         stage: SqliteWriteStage,
@@ -341,6 +344,9 @@ impl SqliteError {
         operation: &'static str,
     ) -> StorageError {
         match self {
+            Self::WriterRouteViolation { operation } => StorageError::WriterRouteViolation {
+                operation: operation.into(),
+            },
             error @ Self::Write { stage, .. } => {
                 with_write_stage(StorageError::driver(capability, operation, error), stage)
             }
