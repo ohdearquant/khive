@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use khive_retrieval::hit::{merge_hit_metadata, SignalMerge};
+use khive_retrieval::HYBRID_CANDIDATE_MULTIPLIER as CANDIDATE_MULTIPLIER;
 use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
@@ -49,8 +50,6 @@ pub trait FusionExecutor: Send + Sync + 'static {
         limit: usize,
     ) -> RuntimeResult<Vec<RankedHit>>;
 }
-
-const CANDIDATE_MULTIPLIER: u32 = 4;
 
 impl KhiveRuntime {
     /// Fuse text and vector hits using the given strategy, returning at most

@@ -87,7 +87,9 @@ pub use persist::{
     ShadowValidationResult,
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
-pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_ir::{
+    FilterPredicate, FuseStrategy, QueryNode, RerankMethod, HYBRID_CANDIDATE_MULTIPLIER,
+};
 pub use query_variants::{
     merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
     QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,
