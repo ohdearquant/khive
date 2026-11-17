@@ -78,6 +78,12 @@ Consequences.
   index rebuilds from them (ADR-079). Backing up the database alone is sufficient; the
   restore procedure includes the rebuild step. Backing up the index files would couple
   the backup to index-format versions for no recovery benefit.
+- **Proposed out-of-scope addition — not yet effective**: governed code-map databases
+  are derived artifacts rebuilt from source repositories by `code.ingest`. The
+  [proposed governed-map amendment](#amendment-2026-11-16-governed-code-map-backup-exclusion)
+  below would exclude them, require a typed refusal when a backup unit for one is
+  configured, and retain coverage for every other configured store. Until that amendment
+  is accepted, this entry does not change the accepted scope above.
 
 ## Options considered
 
@@ -524,3 +530,81 @@ standalone read connections do not set it (it is set only on the read-only write
     identity check, and the substituted file is not removed.
 13. A regular file swapped in before the statement and swapped back before the second
     identity check fails the copy because the held handle is still empty.
+
+## Amendment (2026-11-16): governed code-map backup exclusion
+
+**Status**: Proposed (2026-11-16). Refs #1845.
+
+**Amends**: Scope's documented exclusions and the configuration acceptance for the
+2026-10-24 storage-layer database-copy amendment. The accepted scope and all thirteen
+copy acceptance items remain operative until this amendment is accepted. The proposed
+entry in Scope is a cross-reference, not an early change of status. Implementation of
+#1845 under this revised scope starts only after this amendment has completed
+specification review and received signed acceptance.
+
+### Rationale
+
+A governed code-map database is a code-map target subject to
+[ADR-085 Amendment 12's native opened-handle contract](ADR-085-code-pack.md#amendment-12-2026-09-28-native-opened-handle-proof-for-code-map-databases).
+It is derived from source repositories and can be rebuilt by `code.ingest`, just as the
+ANN index can be rebuilt from persisted vectors. A configured ordinary store does not
+become a governed map merely because it contains code-related records.
+
+Amendment 12 requires code-map connections to use the guarded native VFS; opening the
+source through an unguarded VFS is not an acceptable way to obtain a copy. SQLite's
+`VACUUM INTO` opens its destination through the source connection's VFS, while the
+code-map VFS admits the governed target and its companions rather than an arbitrary
+backup destination. Excluding this rebuildable artifact avoids creating a bypass of
+that guard.
+
+[ADR-085 Amendment 13, W2, configured map backends](ADR-085-code-pack.md#worker-contract)
+also proposes refusing a declared map as a configured backend once its worker
+architecture is implemented and ratified. That amendment is **Proposed**: its future
+backend refusal is supporting design context, not a claim that it is shipped or a
+substitute for the backup registry's own configuration check below.
+
+### Decision upon acceptance
+
+1. Add governed code-map databases to the documented out-of-scope artifacts alongside
+   the ANN index. Recovery for a map is rebuilding it from its source repositories.
+   Every configured khive SQLite store that is not a governed code map remains covered,
+   including the primary, session and graph stores and other configured stores.
+2. The backup registry refuses a backup unit whose target is a governed code-map
+   database with a **typed error at configuration load**. A configuration containing
+   such a unit does not load successfully. The registry must neither silently omit
+   the unit nor defer the refusal until a copy is attempted. The governed-map category
+   is the one defined by ADR-085; this amendment does not invent a new detection
+   mechanism, configuration API or public error schema.
+3. Retain every requirement and all thirteen acceptance items of the 2026-10-24
+   database-copy amendment for the remaining covered stores. This exclusion grants no
+   unguarded map open, VFS bypass or change to the copy connection, destination,
+   deadline, census or cleanup contract. Scheduling, off-host transfer, retention and
+   restore drills remain outside #1845.
+
+### Acceptance and causal controls
+
+The implementing change must exercise the actual backup-configuration load path, not
+only a classification helper. Use a genuine governed-map database fixture and a
+separate ordinary configured-store fixture; an arbitrary file with a suggestive name
+is not a governed-map witness.
+
+1. Loading a configuration that names the governed map as a backup unit returns the
+   typed governed-map refusal at the configuration boundary. Assert that the load
+   itself failed and that no copy attempt was required to obtain the refusal. A later
+   copy error, an empty successful registry, or a warning is not this result.
+2. Loading an otherwise valid configuration with the ordinary store succeeds and
+   retains that backup unit. Loading a configuration containing both that ordinary
+   unit and the governed-map unit fails with the same typed refusal; success with only
+   the ordinary unit retained is a silent skip and fails this acceptance.
+3. Keep all thirteen existing copy acceptance items for the covered stores. Record the
+   governed-map classification and configuration-load witnesses alongside them;
+   excluding maps does not reduce the remaining copy obligations.
+
+Two independent production controls must make the named configuration-load assertion
+fail: remove the governed-map classification/refusal so the forbidden unit is admitted;
+then, in a separate control, replace the refusal with a silent skip of that unit. The
+mixed configuration above distinguishes refusal from a registry that loads only its
+ordinary peer. Each control must reach the actual load assertion after valid fixture
+setup; a build error, setup failure, unselected test or unrelated failure is not
+causal evidence. Restore the production behavior and require the same named test to
+pass again. These are required future validation results, not results of this proposal.
