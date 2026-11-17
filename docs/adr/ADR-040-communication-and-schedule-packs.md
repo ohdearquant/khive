@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24, 2026-09-25 and 2026-10-17)\
-**Date**: 2026-05-23 (last amended 2026-10-17)\
+**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24, 2026-09-25, 2026-10-17 and 2026-11-16)\
+**Date**: 2026-05-23 (last amended 2026-11-16)\
 **Authors**: khive maintainers
 
 **Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
