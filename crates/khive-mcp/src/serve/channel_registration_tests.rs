@@ -72,7 +72,8 @@ async fn registered_config_reaches_real_single_and_multi_server_builds() {
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
-    // A non-daemon host with validators must dispatch locally on any transport.
+    // A non-daemon host with validators must dispatch locally on any transport. This runs
+    // in the private child process started above, so the variable reaches no other test.
     std::env::set_var("KHIVE_NO_DAEMON", "1");
     for multi in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -124,7 +125,8 @@ async fn invalid_registered_config_refuses_without_comm_before_database_or_resid
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
-    // A non-daemon host with validators must dispatch locally on any transport.
+    // A non-daemon host with validators must dispatch locally on any transport. This runs
+    // in the private child process started above, so the variable reaches no other test.
     std::env::set_var("KHIVE_NO_DAEMON", "1");
     for multi in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -330,6 +332,80 @@ async fn prebuilt_server_refuses_validator_bundle_before_validation_or_startup()
     );
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     assert_eq!(channel.polls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn prebuilt_server_with_runtime_callbacks_requires_local_dispatch() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    // This child decides the dispatch mode itself; nothing inherited may select it.
+    std::env::remove_var("KHIVE_NO_DAEMON");
+    use clap::Parser;
+    let plain =
+        crate::server::KhiveMcpServer::new(khive_runtime::KhiveRuntime::memory().unwrap()).unwrap();
+    assert!(
+        !plain.carries_process_local_callbacks(),
+        "a runtime without host callbacks carries none"
+    );
+    let mut config = khive_runtime::RuntimeConfig {
+        db_path: None,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    config
+        .channel_config_validators
+        .register("stand_in", Arc::new(|_| Ok(())))
+        .unwrap();
+    let server =
+        crate::server::KhiveMcpServer::new(khive_runtime::KhiveRuntime::new(config).unwrap())
+            .unwrap();
+    assert!(
+        server.carries_process_local_callbacks(),
+        "validators installed on RuntimeConfig are process-local callbacks"
+    );
+    let starts = Arc::new(AtomicUsize::new(0));
+    let started = starts.clone();
+    let mut registrations = ServeRegistrations::new();
+    registrations
+        .register_resident(crate::components::ResidentComponentRegistration::new(
+            "prebuilt-callback-resident",
+            move |_, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            },
+        ))
+        .unwrap();
+    let channel = ProbeChannel::new("fixture", "prebuilt-callbacks");
+    registrations.register_channel(channel.clone()).unwrap();
+    let args = crate::args::Args::parse_from(["mcp", "--transport", "config-capture"]);
+    let result = super::serve_server_with_registrations(
+        server,
+        &args,
+        &crate::transport::TransportRegistry::new(),
+        None,
+        None,
+        registrations,
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.to_string().contains("KHIVE_NO_DAEMON=1")),
+        "a prebuilt non-daemon host must not forward runtime callbacks: {result:?}"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(channel.polls.load(Ordering::SeqCst), 0);
+    assert!(super::channel_registration::require_local_dispatch_for(true, &args, true).is_ok());
+    assert!(super::channel_registration::require_local_dispatch_for(
+        true,
+        &crate::args::Args::parse_from(["mcp", "--daemon"]),
+        false
+    )
+    .is_ok());
+    assert!(super::channel_registration::require_local_dispatch_for(false, &args, false).is_ok());
 }
 
 #[cfg(unix)]

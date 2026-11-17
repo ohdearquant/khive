@@ -388,4 +388,18 @@ impl KhiveMcpServer {
             .as_ref()
             .map(KhiveRuntime::background_resources_control)
     }
+
+    /// Whether a runtime this server dispatches through carries host-installed
+    /// configuration validators or `comm.send` routes. Those callbacks exist
+    /// only in this process, so its requests must not be forwarded to a daemon.
+    pub(crate) fn carries_process_local_callbacks(&self) -> bool {
+        self.runtime
+            .iter()
+            .chain(self.channel_outbox_runtime.iter())
+            .any(|runtime| {
+                let config = runtime.config();
+                !config.channel_config_validators.is_empty()
+                    || !config.channel_send_routes.is_empty()
+            })
+    }
 }

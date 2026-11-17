@@ -51,6 +51,11 @@ impl fmt::Debug for ChannelSendRoutes {
 }
 
 impl ChannelSendRoutes {
+    /// Whether no route is registered.
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
     /// Register an exact kind without replacing a route, a built-in transport,
     /// or a local actor address kind.
     pub fn register(

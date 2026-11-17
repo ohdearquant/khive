@@ -581,7 +581,8 @@ dispatch with `KHIVE_NO_DAEMON=1`, whatever its transport: requests from a non-d
 forwarded to the daemon, and callbacks cannot be forwarded to another process. The prebuilt
 `serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
 that configures `RuntimeConfig` before constructing its server can pass only its
-channels and residents to that prebuilt entrypoint.
+channels and residents to that prebuilt entrypoint; the same local-dispatch rule applies when
+that server's runtime carries validators or send routes.
 
 ---
 

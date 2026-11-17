@@ -100,19 +100,11 @@ impl ServeRegistrations {
         args: &crate::args::Args,
         daemon_disabled: bool,
     ) -> anyhow::Result<()> {
-        // Request forwarding does not depend on the transport: a non-daemon
-        // host with a file-backed store forwards to the warm daemon, which has
-        // none of this process's validators or routes.
-        if (!self.config_validators.is_empty() || !self.send_routes.is_empty())
-            && !args.daemon
-            && !daemon_disabled
-        {
-            anyhow::bail!(
-                "caller configuration validators and send routes cannot be forwarded to a daemon; \
-                 use a daemon host or set KHIVE_NO_DAEMON=1 for local dispatch"
-            );
-        }
-        Ok(())
+        require_local_dispatch_for(
+            !self.config_validators.is_empty() || !self.send_routes.is_empty(),
+            args,
+            daemon_disabled,
+        )
     }
 
     /// Add one channel, refusing a duplicate caller identity rather than replacing it.
@@ -202,4 +194,25 @@ pub(super) fn isolated_test_registry(channel: Arc<dyn Channel>) -> Arc<ChannelRe
     ServeRegistrations::default()
         .merge_channels([channel])
         .expect("isolated channel fixture registry")
+}
+
+/// The local-dispatch rule shared by both serving entrypoints.
+///
+/// Request forwarding does not depend on the transport or on how the server was
+/// built: a non-daemon host with a file-backed store forwards to the warm daemon,
+/// which has none of this process's validators or routes. A host carrying them
+/// must therefore be the daemon or select local dispatch with `KHIVE_NO_DAEMON=1`.
+#[cfg(unix)]
+pub(super) fn require_local_dispatch_for(
+    carries_callbacks: bool,
+    args: &crate::args::Args,
+    daemon_disabled: bool,
+) -> anyhow::Result<()> {
+    if carries_callbacks && !args.daemon && !daemon_disabled {
+        anyhow::bail!(
+            "caller configuration validators and send routes cannot be forwarded to a daemon; \
+             use a daemon host or set KHIVE_NO_DAEMON=1 for local dispatch"
+        );
+    }
+    Ok(())
 }

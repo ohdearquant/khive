@@ -99,6 +99,11 @@ impl ChannelConfigValidators {
         }
     }
 
+    /// Whether no component validator is registered.
+    pub fn is_empty(&self) -> bool {
+        self.validators.is_empty()
+    }
+
     /// Validate registered components in name order, preserving their typed errors.
     /// Unregistered configuration remains retained and inert.
     pub fn validate(&self, section: &ChannelSectionConfig) -> Result<(), RuntimeError> {

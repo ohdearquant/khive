@@ -229,7 +229,9 @@ pub async fn serve_server(
 /// Registration does not itself poll a caller channel; its host owns that drive.
 /// Bundles with validators or send routes refuse here: use [`run_with_registrations`]
 /// to install them before construction. Independently built hosts may configure `RuntimeConfig`
-/// before building and pass only channels/residents to this entrypoint.
+/// before building and pass only channels/residents to this entrypoint. On Unix, a server whose
+/// runtime carries validators or send routes must be the daemon or select local dispatch with
+/// `KHIVE_NO_DAEMON=1`, as on [`run_with_registrations`].
 pub async fn serve_server_with_registrations(
     server: KhiveMcpServer,
     args: &Args,
@@ -239,6 +241,12 @@ pub async fn serve_server_with_registrations(
     registrations: ServeRegistrations,
 ) -> anyhow::Result<()> {
     registrations.require_prebuilt_compatible()?;
+    #[cfg(unix)]
+    channel_registration::require_local_dispatch_for(
+        server.carries_process_local_callbacks(),
+        args,
+        khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON"),
+    )?;
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
