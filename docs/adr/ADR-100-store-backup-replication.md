@@ -78,12 +78,11 @@ Consequences.
   index rebuilds from them (ADR-079). Backing up the database alone is sufficient; the
   restore procedure includes the rebuild step. Backing up the index files would couple
   the backup to index-format versions for no recovery benefit.
-- **Proposed out-of-scope addition — not yet effective**: governed code-map databases
-  are derived artifacts rebuilt from source repositories by `code.ingest`. The
-  [proposed governed-map amendment](#amendment-2026-11-16-governed-code-map-backup-exclusion)
-  below would exclude them, require a typed refusal when a backup unit for one is
-  configured, and retain coverage for every other configured store. Until that amendment
-  is accepted, this entry does not change the accepted scope above.
+- **Governed code-map databases**: they are derived artifacts rebuilt from source
+  repositories by `code.ingest`. The
+  [governed-map amendment](#amendment-2026-11-16-governed-code-map-backup-exclusion)
+  below excludes them, requires a typed refusal when a backup unit for one is
+  configured, and retains coverage for every other configured store.
 
 ## Options considered
 
@@ -533,14 +532,12 @@ standalone read connections do not set it (it is set only on the read-only write
 
 ## Amendment (2026-11-16): governed code-map backup exclusion
 
-**Status**: Proposed (2026-11-16). Refs #1845.
+**Status**: Accepted 2026-11-16 (#6733). Refs #1845.
 
 **Amends**: Scope's documented exclusions and the configuration acceptance for the
-2026-10-24 storage-layer database-copy amendment. The accepted scope and all thirteen
-copy acceptance items remain operative until this amendment is accepted. The proposed
-entry in Scope is a cross-reference, not an early change of status. Implementation of
-#1845 under this revised scope starts only after this amendment has completed
-specification review and received signed acceptance.
+2026-10-24 storage-layer database-copy amendment. All thirteen copy acceptance items
+remain operative for every covered store. Implementation of #1845 proceeds under this
+revised scope.
 
 ### Rationale
 
@@ -558,12 +555,12 @@ backup destination. Excluding this rebuildable artifact avoids creating a bypass
 that guard.
 
 [ADR-085 Amendment 13, W2, configured map backends](ADR-085-code-pack.md#worker-contract)
-also proposes refusing a declared map as a configured backend once its worker
-architecture is implemented and ratified. That amendment is **Proposed**: its future
+also specifies refusing a declared map as a configured backend once its worker
+architecture is implemented and ratified. That amendment is not ratified: its future
 backend refusal is supporting design context, not a claim that it is shipped or a
 substitute for the backup registry's own configuration check below.
 
-### Decision upon acceptance
+### Decision
 
 1. Add governed code-map databases to the documented out-of-scope artifacts alongside
    the ANN index. Recovery for a map is rebuilding it from its source repositories.
@@ -607,4 +604,4 @@ mixed configuration above distinguishes refusal from a registry that loads only 
 ordinary peer. Each control must reach the actual load assertion after valid fixture
 setup; a build error, setup failure, unselected test or unrelated failure is not
 causal evidence. Restore the production behavior and require the same named test to
-pass again. These are required future validation results, not results of this proposal.
+pass again. These are required validation results for the implementation, not results of this amendment.
