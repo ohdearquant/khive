@@ -2826,13 +2826,16 @@ No configured-root policy or code-pack parameter changes are introduced here.
 ### Decision
 
 1. **Resolve configured production parents per admission.** For every configured
-   production main or event path in Amendment 9, resolve its parent directory and
-   retain a native directory pin before sampling any protected leaf beneath it.
+   production main or event path in Amendment 9, resolve its parent directory and,
+   when it exists, retain a native directory pin before sampling any protected
+   leaf beneath it.
    Resolution may follow a parent symlink or Windows directory reparse redirect.
    Read the pinned directory's identity from its retained handle: device and
-   inode on Unix; volume and file ID on Windows. A parent that cannot be resolved
-   or pinned safely refuses the admission. Keep the original configured-parent
-   spelling for the final comparison; replacing it with the resolved spelling
+   inode on Unix; volume and file ID on Windows. A `NotFound` at first resolution
+   records the parent as absent: no pin, no protected sample and no direct-parent
+   match are possible for that parent. Any other unsafe resolution error, or a
+   failure to pin an existing parent safely, refuses admission. Keep the original
+   configured-parent spelling for the final comparison; replacing it with the resolved spelling
    would miss a retarget of the configured alias.
 
 2. **Sample through the pin.** Inspect the configured main or event name and its
@@ -2858,19 +2861,19 @@ No configured-root policy or code-pack parameter changes are introduced here.
 
 4. **Check the configured parent again before admission completes.** After the
    admission's protected-member checks, resolve each original configured parent
-   again and compare the resulting native directory identity with its pin. A
-   failed resolution, unsafe identity read or unequal identity refuses the
-   admission before its target handle is admitted for use. Keep the pins through
-   this comparison. Every later admission resolves and pins anew, including the
-   first admission after a refusal; it does not reuse an earlier resolved parent
-   as a permanent replacement for the operator's configuration.
+   again. For a parent initially pinned, compare the resulting native directory
+   identity with its pin: failed resolution (including disappearance), an unsafe
+   identity read or unequal identity refuses admission before its target handle
+   is admitted for use. Keep the pins through this comparison.
 
-   **Compatibility consequence for review:** the current empty-sample exception
-   for a missing configured production parent does not satisfy this proposal.
-   Without that directory there is no identity to pin and revalidate, so the
-   proposed behavior refuses that admission, including when the parent is absent
-   at its first resolution. This consequence must be considered in ratification;
-   it is not a claim that the existing missing-parent behavior already refuses.
+   For a parent initially recorded as absent, a second `NotFound` preserves that
+   absent state and does not itself refuse admission. If the parent now exists,
+   or the second resolution fails unsafely for a reason other than `NotFound`,
+   refuse: the admission has no initial pin or protected sample for it. Do not
+   skip the final comparison merely because no pin was created. Every later
+   admission resolves anew, including after a refusal, and pins any parent now
+   present. An earlier resolved parent or absent observation is not a permanent
+   replacement for the operator's configuration.
 
 5. **Keep the target boundary.** An explicit `db` target still receives no
    parent-path canonicalization and every component retains native no-follow
@@ -2891,14 +2894,17 @@ the target nor closes a refused production alias held in quarantine.
 On ratification, replace its production-sampling sentence beginning "At each
 admission, obtain a **best-effort path-stat snapshot**" with:
 
-> At each admission, resolve and pin the parent of every configured production
-> main and event path in Amendment 9, then obtain a **best-effort path-stat
-> snapshot** of those leaf names and all presently existing `-journal`, `-wal`
-> and `-shm` companions through the retained parent pins using no-follow metadata
+> At each admission, resolve the parent of every configured production main and
+> event path in Amendment 9, pin each existing parent and record each `NotFound`
+> parent as absent, then obtain a **best-effort path-stat
+> snapshot** of the leaf names beneath the pinned parents and all presently
+> existing `-journal`, `-wal` and `-shm` companions through the retained parent pins using no-follow metadata
 > reads. Refuse a target whose pinned direct-parent identity equals any of these
 > production-parent identities. Before admission completes, resolve each original
-> configured parent again and refuse if its identity differs from the retained
-> pin or cannot be read safely, as specified by Amendment 17.
+> configured parent again. Refuse if a pinned parent's identity differs or cannot
+> be read safely, or if an initially absent parent now exists or cannot be
+> resolved safely; an initially absent parent that remains absent does not itself
+> refuse admission, as specified by Amendment 17.
 
 The rest of that paragraph, including protected-member-change refusal and its
 explicit #3593 limitation, remains unchanged.
@@ -2911,9 +2917,9 @@ Replace the paragraph beginning "An explicit `db` receives" with:
 > configured parent **once** before creating/opening `<path>/.khive/code-map.db`,
 > for platform aliases such as macOS `/var/folders`; native no-follow traversal
 > and retained-handle proof still follow. Separately, configured production
-> parents are resolved and pinned per admission, with the final parent-identity
-> comparison required by Amendment 17. These are the only parent-resolution
-> exceptions; neither authorizes canonicalizing an explicit target. Controls must
+> parents are resolved per admission and pinned when present, with the final
+> present/absent and parent-identity comparison required by Amendment 17. These are
+> the only parent-resolution exceptions; neither authorizes canonicalizing an explicit target. Controls must
 > fail if the default transform is removed or applied to an explicit `/var/...`
 > path, or if production-parent resolution is removed.
 
@@ -2954,11 +2960,14 @@ ratification; a documentation commit alone establishes no runtime result.
   identity, refresh or refusal assertions. No assertion claims detection of
   unobserved ABA or exact production-handle lifetime coverage.
 - **Missing configured parent.** A configured production parent absent at the
-  first resolution refuses before target use. Removing that refusal and treating
-  the parent as an empty protected sample must fail the refusal assertion. A
-  separate existing, safely pinned parent with absent protected leaf names
-  retains the existing absent-leaf rules; parent absence and leaf absence are
-  distinct cases.
+  first resolution and still absent at the final comparison admits a clean
+  target; treating the first absence as a refusal must fail this admission
+  assertion. In a separate deterministic arm, create the initially absent parent
+  before the final comparison: admission refuses before target use. Skipping the
+  final check for absent parents must fail that refusal assertion. An unsafe
+  resolution error other than `NotFound` still refuses. A separate existing,
+  safely pinned parent with absent protected leaf names retains the existing
+  absent-leaf rules; parent absence and leaf absence are distinct cases.
 - **Preserved target and VFS guarantees (W9).** Explicit target parent
   symlinks/reparse redirects still refuse; removing the omitted-default transform
   and applying it to an explicit target each fail their existing assertion.
