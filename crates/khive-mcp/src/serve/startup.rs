@@ -688,8 +688,7 @@ pub(super) fn spawn_email_channel_loops_if_daemon(
         .merge_channels(
             prepared
                 .as_ref()
-                .map(PreparedEmailChannelLoops::registered_channel)
-                .into_iter(),
+                .map(PreparedEmailChannelLoops::registered_channel),
         )
         .expect("isolated email fixture registry");
     spawn_email_channel_loops_if_daemon_registered(server, args, prepared, channels);
