@@ -27,7 +27,8 @@ pub enum QueryNode {
     Vector {
         /// Pre-computed query embedding.
         embedding: Vec<f32>,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum similarity threshold.
         min_score: Option<DeterministicScore>,
@@ -37,7 +38,8 @@ pub enum QueryNode {
     Keyword {
         /// Query text.
         text: String,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum relevance threshold.
         min_score: Option<DeterministicScore>,
@@ -51,6 +53,14 @@ pub enum QueryNode {
         strategy: FuseStrategy,
         /// Number of results after fusion.
         top_k: usize,
+    },
+
+    /// Collect ordered raw child streams without fusion, ranking or deduplication.
+    ///
+    /// Only valid at the root of an executed collection plan.
+    Collect {
+        /// Independently executed children in declared slot order.
+        children: Vec<QueryNode>,
     },
 
     /// Filter the results of a sub-query.
@@ -276,6 +286,7 @@ impl QueryNode {
             QueryNode::Keyword { top_k: 0, .. } => true,
             QueryNode::Keyword { text, .. } if text.is_empty() => true,
             QueryNode::Fuse { children, .. } if children.is_empty() => true,
+            QueryNode::Collect { children } => children.iter().all(Self::is_empty),
             QueryNode::Filter { child, .. } => child.is_empty(),
             QueryNode::Rerank { child, .. } => child.is_empty(),
             _ => false,
@@ -289,7 +300,9 @@ impl QueryNode {
     pub fn leaf_count(&self) -> usize {
         match self {
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => children.iter().map(|c| c.leaf_count()).sum(),
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
+                children.iter().map(|c| c.leaf_count()).sum()
+            }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => child.leaf_count(),
             QueryNode::Empty => 0,
         }
@@ -304,6 +317,9 @@ impl QueryNode {
             QueryNode::Vector { top_k, .. } => *top_k,
             QueryNode::Keyword { top_k, .. } => *top_k,
             QueryNode::Fuse { top_k, .. } => *top_k,
+            QueryNode::Collect { children } => children
+                .iter()
+                .fold(0usize, |total, child| total.saturating_add(child.top_k())),
             QueryNode::Filter { child, predicate } => match predicate {
                 FilterPredicate::TopK(k) => *k,
                 _ => child.top_k(),
@@ -320,7 +336,7 @@ impl QueryNode {
         match self {
             QueryNode::Empty => 0,
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => {
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
                 1 + children.iter().map(|c| c.depth()).max().unwrap_or(0)
             }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => 1 + child.depth(),

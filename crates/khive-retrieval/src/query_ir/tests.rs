@@ -558,3 +558,28 @@ fn hybrid_candidate_budget_is_literal_four_x_and_saturates() {
     }
     assert_eq!(crate::HYBRID_CANDIDATE_MULTIPLIER, 4);
 }
+
+#[test]
+fn raw_collect_analysis_preserves_structure_and_saturates_without_ranking() {
+    let empty = QueryNode::Collect { children: vec![] };
+    assert!(empty.is_empty());
+    assert_eq!(empty.depth(), 1);
+    assert_eq!(empty.leaf_count(), 0);
+    assert_eq!(empty.top_k(), 0);
+    let plan = QueryNode::Collect {
+        children: vec![
+            QueryNode::keyword("a", usize::MAX),
+            QueryNode::Empty,
+            QueryNode::vector(vec![0.25], 1),
+        ],
+    };
+    assert!(!plan.is_empty());
+    assert_eq!(plan.depth(), 2);
+    assert_eq!(plan.leaf_count(), 2);
+    assert_eq!(plan.top_k(), usize::MAX);
+    let wire = serde_json::to_value(&plan).unwrap();
+    assert_eq!(wire["collect"]["children"][1], serde_json::json!("empty"));
+    let back: QueryNode = serde_json::from_value(wire).unwrap();
+    assert_eq!(back.top_k(), usize::MAX);
+    assert_eq!(back.leaf_count(), 2);
+}
