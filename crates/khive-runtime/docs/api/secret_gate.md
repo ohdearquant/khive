@@ -1,10 +1,15 @@
 # Secret Gate — Credential Detection Algorithm
 
-`secret_gate.rs` scans transcript/audit text for accidentally-embedded credentials (API keys,
+`khive_storage::secret_scan` scans text for accidentally-embedded credentials (API keys,
 tokens, passwords) before it is persisted or logged, and masks any it finds. This document is the
 full algorithm spec: the allowlist layers that suppress false positives, the trigger-word
 matching rules, and the per-function shape criteria used by the detection helpers. The in-source
 module doc-comment carries only a concise summary and points here.
+
+`khive_runtime::secret_gate` preserves its public detector and masking imports while owning
+field attribution, property-context construction and reserved-property policy. Manifest capture
+and exemption eligibility remain runtime responsibilities. The shared storage module has no
+runtime, authorization or database dependency.
 
 ## Note-field scan composition
 
@@ -20,6 +25,79 @@ The helper implements the existing ADR-115 field checks without changing the
 credential detector or admission contract. Each caller still owns its property
 derivation, reserved-key checks, embedding-input checks, and storage operations;
 those steps keep their existing positions relative to the field scan.
+
+## Property context and exemption identity (ADR-115 Amendment 9)
+
+Property checking constructs one immutable context from the actual parsed JSON value. Object
+members are recursively ordered by decoded-key UTF-8 bytes; arrays retain their order. Compact
+string and typed-number serialization follows `serde_json` 1.0.150, so `1` and `1.0` remain
+distinct. Each object key and string value is a separate atom, visited key before value. Its
+original decoded bytes, key/value role and typed object-key/array-index path identify it within
+the complete canonical context. Numbers, booleans and null affect that context without adding
+string-value atoms.
+
+Every atom retains its standalone raw and decoded checks. String values additionally receive
+their owning credential label, inherited through nested objects and arrays under the existing
+structured scalar rule. A benign child key does not cancel an applicable ancestor; siblings
+cannot label each other. Keys are serialized as JSON keys, so a quote or newline in a key cannot
+inject a fabricated label.
+
+The contextual pass carries source intervals through canonical string encoding and every
+escape-decoding layer. A decoded scalar maps to its full contributing canonical interval,
+including both escapes of a surrogate pair. A candidate's earliest contributing byte is compared
+with its owning key's closing-quote position: the label applies at a distance of at most 120
+bytes. Nested decoding and recovered later fragments preserve those coordinates. Invalid
+escapes separate spans; ambiguous mapping refuses without exposing submitted text. Canonical
+serialization does not consume an escaped-string decoding level. Standalone content scans keep
+their original-byte coordinates and existing eight-level limit.
+
+Basic property checks and both the finalizer's preflight and final-candidate checks use this
+same context. A test-only manifest match is tentative for one atom; all its required views and
+all other atoms must still be checked. An exempt key remains label evidence for descendants,
+without exempting them. Multiple views count as one identity, while two distinct active
+identities retain the `MultipleMatches` refusal.
+
+The exact property field scope is `json-properties-context-v2`, within manifest schema 1.
+Its digest binds the complete canonical context, typed path, atom role and original atom bytes
+using the framing and nine literal vectors in
+[ADR-115 Amendment 9](../../../../docs/adr/ADR-115-secret-gate-content-manifest-exemption.md#3-context-bound-property-exemption-identity).
+Legacy `json-properties` entries remain parse-valid but have no property-admission or match-count
+authority, including for keys and unlabelled roots/arrays. Other scopes keep their old identities.
+Ordinary caller fields that look like scopes, digests or IDs confer no authority. Production
+manifests remain absent or exactly empty; this change does not activate nonempty manifests or
+note exemptions, or change the reserved stamp and atomic success-event transaction.
+
+## Incoming note keys and generated-key inventory
+
+Incoming keys are scanned on their exact raw bytes. `note.key` is diagnostic metadata, not
+text prepended to the key. Generic creation scans before holder/replay lookup; atomic preparation
+checks its key option; deferred memory publication and comm's physical-key claim also check
+before removing or separately assigning the key. Direct store assignment uses the shared
+write-only validator before accessing the target, so a configured runtime is unnecessary.
+The existing keyed-memory pre-replay guard remains in place. Keys have no manifest exemption.
+
+Read, lookup and fence selectors remain shape-only, including the existing 512-byte UTF-8 and
+NUL rules. Stored keys are neither rewritten nor deleted. The new typed storage refusal carries
+the same safe detector metadata as the runtime refusal. Ordinary storage errors retain their
+`Error::source()` chain after conversion to `RuntimeError`.
+
+The in-repository generators have four producer families and five forms. Caller-supplied keys
+and historical imports are not an additional generated grammar. The shared integration target
+`note_key_generated_grammars` exercises direct SQL-store assignment and the actual runtime path
+for each form, including persisted key/readback and replay relationships. These witnesses do not
+create prefix exemptions or assert that arbitrary caller-supplied bytes are safe.
+
+| Producer                                                                         | Generated form                                             | Runtime path                                                                         |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [Commit ingestion](../../../khive-pack-git/src/ingest/commit_ingest.rs)          | `git.commit:<40-hex SHA>`                                  | KG `create` with kind `commit`, then keyed note preparation and insert               |
+| [Memory batch create](../../../khive-pack-memory/src/handlers/apply_batch.rs)    | `<batch>:create:<decimal part>`                            | `memory.apply_batch`, then keyed memory and deferred key publication                 |
+| [Memory batch supersede](../../../khive-pack-memory/src/handlers/apply_batch.rs) | `<batch>:<canonical old UUID>:<decimal part>`              | The same memory route, with the `supersedes` edge                                    |
+| [Message identity](../../../khive-pack-comm/src/idempotency.rs)                  | `comm-v1:<compact JSON [namespace, actor, logical key]>`   | `comm.send`/`comm.reply`, paired message preparation and physical-key claim          |
+| [Outbound diagnostic](../../src/curation/outbound_messages.rs)                   | `outbound-email-external-id-unverifiable:<canonical UUID>` | `record_outbound_external_id_diagnostic`, keyed creation and annotation verification |
+
+The comm logical-key limit and its existing JSON wrapping remain distinct; this inventory adds
+no new wrapping-length policy. The Git and outbound diagnostic producers are unchanged consumers
+of the shared admission rule.
 
 ## Module-level detection algorithm
 

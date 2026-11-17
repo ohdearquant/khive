@@ -183,3 +183,30 @@ fn driver_err_sql(operation: &'static str, message: &str) -> StorageError {
 }
 
 include!("error_tests/unique_constraint_classification_tests.rs");
+
+#[test]
+fn secret_key_error_is_typed_notes_metadata_without_retry_or_raw_input() {
+    let key = format!("ghp_{}", "A".repeat(40));
+    let error = crate::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+        .expect_err("a credential key must be refused");
+    assert_eq!(error.capability(), Some(StorageCapability::Notes));
+    assert!(!error.is_retryable(), "secret refusal is not transient");
+    let StorageError::SecretDetected {
+        capability,
+        operation,
+        matched,
+    } = &error
+    else {
+        panic!("expected typed secret refusal, got {error:?}");
+    };
+    assert_eq!(*capability, StorageCapability::Notes);
+    assert_eq!(operation.as_ref(), "assign_note_key_if_unset");
+    assert_eq!(matched.detector, "github-token");
+    assert_eq!(matched.trigger, None);
+    assert_eq!(matched.location.as_deref(), Some("note.key"));
+    assert_eq!(matched.masked, "ghp_AA...44chars");
+    assert_eq!(error.to_string(), format!("write blocked: {matched}"));
+    assert!(!error.to_string().contains(&key));
+    assert!(!format!("{error:?}").contains(&key));
+    assert!(StdError::source(&error).is_none());
+}

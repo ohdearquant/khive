@@ -1074,6 +1074,7 @@ fn variant(error: &StorageError) -> &'static str {
         StorageError::AlreadyExists { .. } => "AlreadyExists",
         StorageError::Conflict { .. } => "Conflict",
         StorageError::InvalidInput { .. } => "InvalidInput",
+        StorageError::SecretDetected { .. } => "SecretDetected",
         StorageError::Unsupported { .. } => "Unsupported",
         StorageError::BlobTooLarge { .. } => "BlobTooLarge",
         StorageError::BlobSizeMismatch { .. } => "BlobSizeMismatch",

@@ -27,12 +27,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- Scheduled for 0.21.0: the exhaustive `khive_storage::StorageError` enum gains
+  `SecretDetected` for credential-shaped note keys. Downstream exhaustive matches must handle
+  the new variant. The shared detector and `SecretMatch` live in
+  `khive_storage::secret_scan`; existing `khive_runtime::secret_gate` imports remain available.
+  Conversion to `RuntimeError` preserves typed secret refusals and the source chain of ordinary
+  storage errors.
+
 - `khive_query::GqlQuery` adds `distinct: bool`; direct constructors set it to false for legacy
   behavior. Exhaustive `ReturnItem` matches must handle `Path(String, PropertyRef)` and
   `Count(String)`. Exhaustive `WhereExpr` matches must handle `NotExists(MatchPattern)`;
   `conditions()` and `for_each_condition_mut()` continue to visit only outer scalar conditions.
 
+### Fixed
+
+- Property strings are checked with their owning credential labels, including inherited labels
+  through nested objects and arrays. Context-bound manifest identities prevent a property
+  exemption from being reused after its context, path or role changes (#6562).
+- Note-key creation, replay admission and direct assignment use the shared secret detector on
+  the raw key. Existing keys remain readable, and read/fence selectors retain their shape-only
+  validation (#6273).
+
 ## [0.20.0] - 2026-11-16
+
 ### Added
 
 - `search` accepts `created_after` and `created_before` for entities and notes: inclusive RFC3339
