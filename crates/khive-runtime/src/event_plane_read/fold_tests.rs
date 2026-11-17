@@ -1,9 +1,9 @@
-use crate::event_counts_group_tests::fold_controls::GeneratedEvents;
-use crate::event_counts_grouping::EventCountGroupBy;
-use crate::handlers::{
+use super::counts::{
     fetch_event_counts_window_exhaustive, fold_event_counts_window_exhaustive,
-    visit_events_cursor_walk, EventCountsAccumulator,
+    visit_events_cursor_walk,
 };
+use super::fold_controls::GeneratedEvents;
+use super::grouping::{EventCountGroupBy, EventCountsAccumulator};
 use khive_storage::EventFilter;
 use serde_json::json;
 use std::sync::atomic::Ordering;
@@ -66,7 +66,7 @@ async fn cursor_fold_and_collecting_facade_keep_tied_id_sequence_and_budgets() {
         if budget == 0 {
             assert!(store.queries().is_empty());
         }
-        let collected = crate::handlers::collect_events_cursor_walk(
+        let collected = super::counts::collect_events_cursor_walk(
             &GeneratedEvents::new(&[9, 8, 8, 8, 5, 4], 6, false),
             &EventFilter::default(),
             2,
@@ -93,7 +93,7 @@ async fn fold_preflight_refusal_and_live_shortfall_keep_exact_semantics() {
             .await
             .unwrap_err();
     assert!(
-        matches!(err, khive_runtime::RuntimeError::InvalidInput(ref message) if message ==
+        matches!(err, crate::RuntimeError::InvalidInput(ref message) if message ==
         "brain.event_counts window exceeds the exhaustive limit of 3 events (4 matched); \
          narrow `since`/`until` or add filters (`actor` or `kind`)")
     );
