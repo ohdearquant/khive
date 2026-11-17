@@ -2788,3 +2788,188 @@ calls.
   each fail their corresponding historical-row assertion.
 - Preserve Amendment 14's committed-fault/cancellation recovery, mixed-stamp
   re-observation, strict marker and completion/FTS durability acceptance.
+
+## Amendment 17 (2026-11-16): configured production parents resolved once per admission
+
+**Status**: Proposed\
+**Amends**: Amendment 12's production-path sampling and parent-resolution rules\
+**Tracking**: #3664\
+**Retains**: Amendment 9's complete configured production set, Amendment 12's
+target no-follow and retained-handle proofs, and the separate #3593 lifetime gap.
+
+### Problem and scope
+
+An operator may configure a production database through a symlinked parent, for
+example a home directory redirected to another volume. Issue #3664 records the
+refusal produced when the target's no-follow traversal is also applied to that
+configured parent, even for a clean map in a separate directory. The configured
+parent identifies the objects being protected; it is not the caller's map target.
+
+At revision `cf9ceab64a1854ad0e2d7540f970b1eb289465b1`, `sample_protected` already
+canonicalizes each configured parent and pins it for one sampling pass
+(`crates/khive-db/src/code_map_vfs/mod.rs`). That pin is not retained across the
+whole admission, and the original configured parent is not compared again at its
+end. Current code also treats a missing configured parent as an empty sample.
+
+This amendment makes the production-parent resolution exception explicit,
+requires the pin across admission and a final comparison, and defines the issue's
+"inside the production directory" refusal by direct-parent identity. Those
+additional guarantees are proposed behavior, not claims about what ships today.
+Amendment 12's accepted text remains in force until this amendment is ratified;
+the replacement text below takes effect on ratification.
+
+This amendment does not choose Amendment 13's worker architecture, change
+quarantine or registration capacity, or resolve #5614's capacity-isolation
+requirement. Amendment 13 remains Proposed with its own sign-off and acceptance.
+No configured-root policy or code-pack parameter changes are introduced here.
+
+### Decision
+
+1. **Resolve configured production parents per admission.** For every configured
+   production main or event path in Amendment 9, resolve its parent directory and
+   retain a native directory pin before sampling any protected leaf beneath it.
+   Resolution may follow a parent symlink or Windows directory reparse redirect.
+   Read the pinned directory's identity from its retained handle: device and
+   inode on Unix; volume and file ID on Windows. A parent that cannot be resolved
+   or pinned safely refuses the admission. Keep the original configured-parent
+   spelling for the final comparison; replacing it with the resolved spelling
+   would miss a retarget of the configured alias.
+
+2. **Sample through the pin.** Inspect the configured main or event name and its
+   presently existing journal, WAL and SHM companions with no-follow metadata
+   operations relative to that pinned directory. All samples for that parent
+   within the admission use that same pin. Do not reopen the original configured
+   pathname to sample a leaf, and do not follow a protected leaf symlink or
+   reparse redirect. Existing protected-member readability, identity and change
+   checks remain mandatory: an unsafe read or an observed protected-member
+   change refuses. Pinning the parent is not permission to accept a changed
+   protected member.
+
+3. **Refuse targets sharing a protected direct parent.** Compare the identity of
+   the target's pinned direct-parent directory with every pinned configured
+   production-parent identity. Equality refuses admission even when the target
+   is an unrelated file with a different file identity. The comparison uses
+   directory identity, not path spelling or a string prefix. It is not an
+   ancestry walk: a distinct subdirectory is not the same direct parent merely
+   because it is beneath a production directory. Such a target still must pass
+   every other target, protected-member and opened-handle check. Protected file
+   aliases refuse independently of this directory rule, including aliases whose
+   direct parent is different.
+
+4. **Check the configured parent again before admission completes.** After the
+   admission's protected-member checks, resolve each original configured parent
+   again and compare the resulting native directory identity with its pin. A
+   failed resolution, unsafe identity read or unequal identity refuses the
+   admission before its target handle is admitted for use. Keep the pins through
+   this comparison. Every later admission resolves and pins anew, including the
+   first admission after a refusal; it does not reuse an earlier resolved parent
+   as a permanent replacement for the operator's configuration.
+
+   **Compatibility consequence for review:** the current empty-sample exception
+   for a missing configured production parent does not satisfy this proposal.
+   Without that directory there is no identity to pin and revalidate, so the
+   proposed behavior refuses that admission, including when the parent is absent
+   at its first resolution. This consequence must be considered in ratification;
+   it is not a claim that the existing missing-parent behavior already refuses.
+
+5. **Keep the target boundary.** An explicit `db` target still receives no
+   parent-path canonicalization and every component retains native no-follow
+   traversal. An omitted-`db` default retains its existing one-time configured
+   parent canonicalization. Permission to resolve a configured production parent
+   does not grant permission to canonicalize an explicit target, even when the
+   two path spellings share a prefix.
+
+The two configured-parent observations do not detect an unobserved ABA retarget,
+nor a retarget occurring after the final comparison. They do not prove the
+identity of production handles whose names moved or changed outside the sampled
+set. The snapshot remains best-effort; #3593's production-handle lifetime gap
+remains open. This change neither replaces the exact retained-handle proof for
+the target nor closes a refused production alias held in quarantine.
+
+### Exact amendments to Amendment 12
+
+On ratification, replace its production-sampling sentence beginning "At each
+admission, obtain a **best-effort path-stat snapshot**" with:
+
+> At each admission, resolve and pin the parent of every configured production
+> main and event path in Amendment 9, then obtain a **best-effort path-stat
+> snapshot** of those leaf names and all presently existing `-journal`, `-wal`
+> and `-shm` companions through the retained parent pins using no-follow metadata
+> reads. Refuse a target whose pinned direct-parent identity equals any of these
+> production-parent identities. Before admission completes, resolve each original
+> configured parent again and refuse if its identity differs from the retained
+> pin or cannot be read safely, as specified by Amendment 17.
+
+The rest of that paragraph, including protected-member-change refusal and its
+explicit #3593 limitation, remains unchanged.
+
+Replace the paragraph beginning "An explicit `db` receives" with:
+
+> An explicit `db` receives **no parent-path canonicalization transform** before
+> the guarded open. Any symlink/reparse component refuses even if a path-level
+> courtesy check would normalize it. An omitted-`db` default may canonicalize its
+> configured parent **once** before creating/opening `<path>/.khive/code-map.db`,
+> for platform aliases such as macOS `/var/folders`; native no-follow traversal
+> and retained-handle proof still follow. Separately, configured production
+> parents are resolved and pinned per admission, with the final parent-identity
+> comparison required by Amendment 17. These are the only parent-resolution
+> exceptions; neither authorizes canonicalizing an explicit target. Controls must
+> fail if the default transform is removed or applied to an explicit `/var/...`
+> path, or if production-parent resolution is removed.
+
+No other Amendment 12 paragraph is replaced. In particular, its process-wide
+capacity and restart rules remain unchanged by this amendment.
+
+### Acceptance and implementation sequence
+
+The implementation and its witnesses belong to `khive-db`'s `code_map_vfs` and
+the guarded `khive-runtime` code-map route tests. The runtime witness constructs
+the guarded runtime directly; it does not require a `khive-pack-code` change.
+The specification must receive sign-off before dependent source work begins.
+Implementation is then reviewed against this complete contract before seeking
+ratification; a documentation commit alone establishes no runtime result.
+
+- **Configured-parent admission (W6).** A configured production parent reached
+  through a symlink admits a clean target in a separate directory through actual
+  guarded runtime admission. Removing only production-parent resolution must
+  fail that clean-target admission assertion, not fixture setup.
+- **Direct-parent boundary and protected alias (W7).** With that same configured
+  alias, an unrelated target directly inside the resolved production directory
+  refuses, and the outside clean target admits. Distinct spellings of the same
+  directory yield the same refusal. A distinct subdirectory is not refused by
+  direct-parent equality alone. A target alias of a protected member in another
+  directory independently refuses. Removing the directory comparison and
+  removing protected-member comparison are separate controls, each failing its
+  own refusal assertion. Compare protected main and companion presence, bytes,
+  size and modification time across refusals.
+- **Pinned sampling and observed changes (W8).** Deterministic barriers retarget
+  a configured parent after its initial pin and demonstrate that leaf lookups
+  still address the original pin, followed by refusal at the final parent
+  comparison. A separate protected-member change under a stable pin refuses.
+  After a retarget refusal, a fresh admission resolves the new parent and uses
+  its protected set; a fresh clean target admits and an alias of the newly
+  sampled protected member refuses. Switching leaf lookups to the configured
+  path, removing member-change refusal, caching the old parent across admissions
+  and removing the final parent comparison are separate controls with their own
+  identity, refresh or refusal assertions. No assertion claims detection of
+  unobserved ABA or exact production-handle lifetime coverage.
+- **Missing configured parent.** A configured production parent absent at the
+  first resolution refuses before target use. Removing that refusal and treating
+  the parent as an empty protected sample must fail the refusal assertion. A
+  separate existing, safely pinned parent with absent protected leaf names
+  retains the existing absent-leaf rules; parent absence and leaf absence are
+  distinct cases.
+- **Preserved target and VFS guarantees (W9).** Explicit target parent
+  symlinks/reparse redirects still refuse; removing the omitted-default transform
+  and applying it to an explicit target each fail their existing assertion.
+  Preserve protected hard-link and sidecar checks, native lock survival,
+  quiescent prior-WAL transition and partial-transition semantics, hot-journal
+  recovery, DELETE-mode concurrency and zero-`xShm*` invariants. Production-parent
+  resolution must not become a default-VFS fallback or a target traversal bypass.
+
+Record Unix and Windows results separately; on Windows use directory reparse
+redirects and native volume/file identities for the corresponding cases. Every
+control must build and reach its own semantic assertion, then pass that same
+assertion after exact restoration. Shared affected suites run before the controls
+and after restoration. Compilation errors, fixture failures and empty selection
+do not establish any acceptance item. This amendment records no executed results.
