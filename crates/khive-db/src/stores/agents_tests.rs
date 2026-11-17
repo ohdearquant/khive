@@ -264,33 +264,46 @@ async fn test_terminate_all_non_terminal_boot_scan() {
 #[test]
 fn agent_write_strict_routing_fails_closed_without_writer_task() {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent-strict-routing.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(AGENTS_DDL)
+        .unwrap();
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("agent-strict-routing.db")),
+            path: Some(path.clone()),
             write_queue_enabled: Some(false),
             write_routing_strict: true,
             ..PoolConfig::for_test()
         })
         .unwrap(),
     );
-    {
-        let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(AGENTS_DDL).unwrap();
-    }
     let store = SqlAgentStore::new(pool, true);
 
     let error = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(store.insert(&make_record("agent-strict", "actor-a")))
         .expect_err("strict routing must refuse the standalone writer fallback");
+    let StorageError::WriterOwnerUnavailable { operation, source } = &error else {
+        panic!("strict routing must return the typed owner refusal, got: {error:?}");
+    };
+    assert_eq!(operation.as_ref(), "agent_insert");
     assert!(
-        matches!(
-            &error,
-            StorageError::Pool { operation, .. } if operation == "agent_insert"
-        ),
-        "strict routing must return the typed operation error, got: {error:?}"
+        matches!(source.as_ref(), StorageError::Pool { operation, message }
+            if operation == "agent_insert" && message.contains("strict")),
+        "owner refusal must retain the typed operation cause: {error:?}"
     );
-    assert!(error.to_string().contains("strict"), "got: {error}");
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(khive_storage::WriterTaskRequestState::NotStarted)
+    );
+    assert!(!error.is_write_outcome_unknown());
+    let stored: i64 = rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, 0, "owner refusal must leave the agent ledger empty");
 }
 
 fn cas_pool(path: &std::path::Path, queued: bool) -> Arc<ConnectionPool> {

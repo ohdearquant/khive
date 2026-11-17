@@ -3,7 +3,10 @@ use super::paths::{
     CONN_IO_TIMEOUT, EVENTS_PROTOCOL_VERSION, MAX_CACHED_NAMESPACE_STORES,
     MAX_QUERY_EVENTS_PAGE_ROWS,
 };
-use super::protocol::{EventsRequest, EventsResponse, WireWriterTaskFailure};
+use super::protocol::{
+    EventsRequest, EventsResponse, WireWriterFailureEvidence, WireWriterOwnerCause,
+    WireWriterTaskFailure, WireWriterTaskState,
+};
 use crate::daemon::write_frame;
 use khive_db::StorageBackend;
 use khive_storage::{EventStore, StorageError};
@@ -376,6 +379,7 @@ pub(super) fn storage_error_response(error: &StorageError) -> EventsResponse {
             source.to_string(),
             Some(WireWriterTaskFailure::RequestFailed {
                 request_state: (*request_state).into(),
+                evidence: None,
             }),
         ),
         StorageError::WriterTaskTerminated {
@@ -386,6 +390,42 @@ pub(super) fn storage_error_response(error: &StorageError) -> EventsResponse {
             Some(WireWriterTaskFailure::TaskTerminated {
                 request_state: (*request_state).into(),
                 sqlite_full_codes: *sqlite_full_codes,
+            }),
+        ),
+        StorageError::WriteOutcomeUnknown { source } => (
+            source.to_string(),
+            Some(WireWriterTaskFailure::RequestFailed {
+                request_state: WireWriterTaskState::SideEffectsUnknown,
+                evidence: Some(WireWriterFailureEvidence::WriteOutcomeUnknown),
+            }),
+        ),
+        StorageError::WriterOwnerUnavailable { operation, source } => {
+            let cause = match source.without_sqlite_write_stage() {
+                StorageError::Pool { operation, message } => Some(WireWriterOwnerCause::Pool {
+                    operation: operation.to_string(),
+                    message: message.clone(),
+                }),
+                StorageError::WriterTaskNoRuntime => Some(WireWriterOwnerCause::NoRuntime),
+                _ => None,
+            };
+            (
+                source.to_string(),
+                Some(WireWriterTaskFailure::RequestFailed {
+                    request_state: WireWriterTaskState::NotStarted,
+                    evidence: cause.map(|cause| WireWriterFailureEvidence::OwnerUnavailable {
+                        operation: operation.to_string(),
+                        cause,
+                    }),
+                }),
+            )
+        }
+        StorageError::WriterRouteViolation { operation } => (
+            error.to_string(),
+            Some(WireWriterTaskFailure::RequestFailed {
+                request_state: WireWriterTaskState::NotStarted,
+                evidence: Some(WireWriterFailureEvidence::RouteViolation {
+                    operation: operation.to_string(),
+                }),
             }),
         ),
         _ => (error.to_string(), None),
