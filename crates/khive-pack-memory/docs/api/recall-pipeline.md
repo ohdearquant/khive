@@ -50,6 +50,41 @@ A writable cold or stale miss registers a tracked detached Warm attempt through 
 
 When no installed graph is available on a path without a degradation reason, the existing sqlite-vec exact query uses namespace predicates in SQL. Readiness expiry, sender loss and received not-ready outcomes instead use the degraded path above and avoid that O(corpus) fallback. ANN post-filtering is repeated after hydration as defense in depth.
 
+## Executed raw collection plan
+
+Candidate collection uses the shared query interpreter's raw `Collect` boundary.
+The keyword slot is declared before its work starts. Model discovery remains in
+the concurrent vector branch; that branch declares its model slots before
+embedding or model retrieval starts. The returned tree orders the keyword slot
+first, then models in their existing registry/request order. Its `Keyword` text
+and `Vector` embeddings are the actual interpreted provider inputs. A disabled
+keyword arm or withheld model embedding contributes `Empty`; a completed model
+that degraded to zero hits still contributes `Vector` and its original evidence.
+
+The tree is not a standalone authorization or model-routing document. Namespace
+tokens, visible namespaces, physical model/engine bindings, session proofs,
+lexical mode, snippet policy, and ANN readiness/widening policy remain explicit
+adapter inputs. Ordinary vector nodes retain the logical candidate limit;
+provider-internal ANN overfetch and fresh-tail merging can return more raw rows.
+Raw collection preserves those rows and records the actual returned count. A
+session exact-read node carries its actual wider `max(k * 4, k + 32)` bound.
+Neither path truncates or deduplicates a provider stream at `Collect`.
+
+The memory scheduler retains its zero-, one-, two-, and more-than-two-model
+branches. One model runs inline; two model searches both settle before their
+results are checked in model order; larger groups spawn all jobs and await them
+in that same order. Request-stop and task-panic sibling cleanup retain their
+existing behavior. The interpreter neither discovers models earlier nor replaces
+these branches with its generic scheduler.
+
+`memory.recall_candidates` adds this executed `plan` beside its existing raw
+arrays. Existing hydration and namespace filters still govern those diagnostic
+arrays, retaining each surviving hit's score, rank, title, and snippet. This
+diagnostic continues to use no session fence. Ordinary serving uses the same
+collector and discards only the plan; fusion, hydration, scoring, projection,
+and telemetry remain downstream. The raw plan contains no invented `Fuse` or
+`Rerank` step.
+
 ## Fusion
 
 Retrieval sources are labeled `text`, `vector`, or `both`. How per-model vector lists reach fusion depends on the configured strategy:

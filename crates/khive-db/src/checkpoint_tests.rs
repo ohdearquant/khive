@@ -2744,84 +2744,46 @@ fn checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held() {
 #[serial(checkpoint_skip_metrics)]
 fn all_checkpoint_metrics_callers_are_serial_tagged() {
     let sources = [
-        include_str!("checkpoint.rs"),
-        include_str!("checkpoint/run_state.rs"),
-        include_str!("checkpoint/walpin_sidecar.rs"),
-        include_str!("checkpoint/walpin_attribution.rs"),
-        include_str!("checkpoint/lifecycle.rs"),
-        include_str!("checkpoint/task_loop.rs"),
-        include_str!("checkpoint/checkpoint_core.rs"),
-        include_str!("checkpoint/backfill_queries.rs"),
-        include_str!("checkpoint_tests.rs"),
-        include_str!("checkpoint/churn_tests.rs"),
-        include_str!("checkpoint_owner_interval_tests.rs"),
-    ]
-    .join("\n");
-    let lines: Vec<&str> = sources.lines().collect();
-
-    let attr_starts: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| {
-            let t = l.trim();
-            t == "#[test]" || t.starts_with("#[tokio::test")
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    let mut offenders = Vec::new();
-
-    for (idx, &start) in attr_starts.iter().enumerate() {
-        let end = attr_starts.get(idx + 1).copied().unwrap_or(lines.len());
-        let span = &lines[start..end];
-
-        let touches_shared_metrics = span.iter().any(|l| {
-            l.contains("checkpoint_once(")
-                || l.contains("checkpoint_once_core(")
-                || l.contains(".run(")
-                || l.contains(".run_core(")
-                || l.contains("run_checkpoint_task(")
-        });
-        if !touches_shared_metrics {
-            continue;
-        }
-
-        // Rustfmt splits long multi-key attributes across lines, so scan
-        // the whole attribute instead of requiring the group on `#[serial(`.
-        let mut in_serial_attr = false;
-        let has_group_tag = span.iter().any(|line| {
-            let trimmed = line.trim();
-            if !in_serial_attr {
-                in_serial_attr = trimmed.starts_with("#[serial(");
-            }
-            if !in_serial_attr {
-                return false;
-            }
-
-            let has_group = trimmed
-                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-                .any(|token| token == "checkpoint_skip_metrics");
-            if trimmed.ends_with(")]") {
-                in_serial_attr = false;
-            }
-            has_group
-        });
-
-        if !has_group_tag {
-            let name = span
-                .iter()
-                .find_map(|l| {
-                    let t = l.trim_start();
-                    let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
-                    let t = t.strip_prefix("pub ").unwrap_or(t);
-                    let t = t.strip_prefix("async ").unwrap_or(t);
-                    t.strip_prefix("fn ")
-                        .map(|rest| rest.split(['(', '<']).next().unwrap_or("").trim())
-                })
-                .unwrap_or("<unknown test>");
-            offenders.push(name.to_string());
-        }
-    }
+        ("checkpoint.rs", include_str!("checkpoint.rs")),
+        (
+            "checkpoint/run_state.rs",
+            include_str!("checkpoint/run_state.rs"),
+        ),
+        (
+            "checkpoint/walpin_sidecar.rs",
+            include_str!("checkpoint/walpin_sidecar.rs"),
+        ),
+        (
+            "checkpoint/walpin_attribution.rs",
+            include_str!("checkpoint/walpin_attribution.rs"),
+        ),
+        (
+            "checkpoint/lifecycle.rs",
+            include_str!("checkpoint/lifecycle.rs"),
+        ),
+        (
+            "checkpoint/task_loop.rs",
+            include_str!("checkpoint/task_loop.rs"),
+        ),
+        (
+            "checkpoint/checkpoint_core.rs",
+            include_str!("checkpoint/checkpoint_core.rs"),
+        ),
+        (
+            "checkpoint/backfill_queries.rs",
+            include_str!("checkpoint/backfill_queries.rs"),
+        ),
+        ("checkpoint_tests.rs", include_str!("checkpoint_tests.rs")),
+        (
+            "checkpoint/churn_tests.rs",
+            include_str!("checkpoint/churn_tests.rs"),
+        ),
+        (
+            "checkpoint_owner_interval_tests.rs",
+            include_str!("checkpoint_owner_interval_tests.rs"),
+        ),
+    ];
+    let offenders = checkpoint_metrics_offenders(&sources).expect("checkpoint census must parse");
 
     assert!(
         offenders.is_empty(),
@@ -2831,6 +2793,209 @@ fn all_checkpoint_metrics_callers_are_serial_tagged() {
              an untagged caller running concurrently on cargo's default test thread pool \
              can clobber those atomics mid-assertion in another test (the #828/#845 race): \
              {offenders:?}"
+    );
+}
+
+fn checkpoint_metrics_offenders(sources: &[(&str, &str)]) -> Result<Vec<String>, String> {
+    use syn::visit::Visit;
+
+    fn direct_call(name: &str) -> bool {
+        matches!(
+            name,
+            "checkpoint_once" | "checkpoint_once_core" | "run_checkpoint_task"
+        )
+    }
+
+    fn macro_calls(tokens: proc_macro2::TokenStream) -> bool {
+        use proc_macro2::{Delimiter, TokenTree};
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        tokens.iter().enumerate().any(|(index, token)| match token {
+            TokenTree::Group(group) => macro_calls(group.stream()),
+            TokenTree::Ident(name) => {
+                let name = name.to_string();
+                let method = index.checked_sub(1).is_some_and(|previous| {
+                    matches!(&tokens[previous], TokenTree::Punct(dot) if dot.as_char() == '.')
+                }) && matches!(name.as_str(), "run" | "run_core");
+                (direct_call(&name) || method)
+                    && matches!(tokens.get(index + 1), Some(TokenTree::Group(args)) if args.delimiter() == Delimiter::Parenthesis)
+            }
+            _ => false,
+        })
+    }
+
+    #[derive(Default)]
+    struct Calls(bool);
+
+    impl<'ast> Visit<'ast> for Calls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                self.0 |= path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| direct_call(&segment.ident.to_string()));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let name = call.method.to_string();
+            self.0 |= direct_call(&name) || matches!(name.as_str(), "run" | "run_core");
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            self.0 |= macro_calls(mac.tokens.clone());
+        }
+    }
+
+    fn inspect_items(
+        items: &[syn::Item],
+        prefix: &str,
+        offenders: &mut Vec<String>,
+    ) -> Result<(), String> {
+        for item in items {
+            match item {
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        inspect_items(items, &format!("{prefix}::{}", module.ident), offenders)?;
+                    }
+                }
+                syn::Item::Fn(function)
+                    if function.attrs.iter().any(|attr| {
+                        attr.path().is_ident("test")
+                            || (attr.path().segments.len() == 2
+                                && attr.path().segments[0].ident == "tokio"
+                                && attr.path().segments[1].ident == "test")
+                    }) =>
+                {
+                    let mut calls = Calls::default();
+                    calls.visit_block(&function.block);
+                    if !calls.0 {
+                        continue;
+                    }
+                    let name = format!("{prefix}::{}", function.sig.ident);
+                    let mut serial = false;
+                    for attr in &function.attrs {
+                        if attr
+                            .path()
+                            .segments
+                            .last()
+                            .is_some_and(|segment| segment.ident == "serial")
+                        {
+                            let groups = attr.parse_args_with(
+                                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                            ).map_err(|error| format!("{name}: invalid serial attribute: {error}"))?;
+                            serial |= groups
+                                .iter()
+                                .any(|group| group.is_ident("checkpoint_skip_metrics"));
+                        }
+                    }
+                    if !serial {
+                        offenders.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let mut offenders = Vec::new();
+    for &(path, source) in sources {
+        let file = syn::parse_file(source).map_err(|error| format!("{path}: {error}"))?;
+        inspect_items(&file.items, path, &mut offenders)?;
+    }
+    Ok(offenders)
+}
+
+#[test]
+fn checkpoint_census_keeps_file_and_function_boundaries() {
+    let offenders = checkpoint_metrics_offenders(&[
+        (
+            "first.rs",
+            r#"
+            #[tokio::test]
+            async fn innocent() { ordinary_maintenance().await; }
+            fn following_helper() { checkpoint_once(); }
+        "#,
+        ),
+        (
+            "second.rs",
+            r#"
+            pub fn checkpoint_once_core() { checkpoint_once(); }
+            mod nested {
+                #[test]
+                fn real_caller() { checkpoint_once_core(); }
+            }
+        "#,
+        ),
+        (
+            "third.rs",
+            r#"
+            #[test]
+            fn another_caller() { run_checkpoint_task(); }
+        "#,
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        offenders,
+        ["second.rs::nested::real_caller", "third.rs::another_caller"],
+        "only actual test bodies may own checkpoint calls across file and helper boundaries"
+    );
+}
+
+#[test]
+fn checkpoint_census_checks_macros_methods_and_only_own_serial_tags() {
+    let offenders = checkpoint_metrics_offenders(&[(
+        "calls.rs",
+        r#"
+        #[test]
+        fn untagged_macro() {
+            wrapper!({ let work = || checkpoint_once(); work(); });
+        }
+        #[test]
+        fn untagged_method() { task.run(); }
+        #[test]
+        fn untagged_macro_method() { wrapper!(task.run_core()); }
+        #[test]
+        #[serial(
+            another_group,
+            checkpoint_skip_metrics,
+        )]
+        fn tagged() { wrapper!(checkpoint_once_core()); }
+        #[test]
+        #[serial(another_group)]
+        fn wrong_group() { run_checkpoint_task(); }
+        #[test]
+        fn literal_only() {
+            // checkpoint_once(); task.run();
+            let text = "checkpoint_once_core(); task.run_core();";
+            wrapper!("run_checkpoint_task()");
+        }
+    "#,
+    )])
+    .unwrap();
+    assert_eq!(
+        offenders,
+        [
+            "calls.rs::untagged_macro",
+            "calls.rs::untagged_method",
+            "calls.rs::untagged_macro_method",
+            "calls.rs::wrong_group",
+        ],
+        "real macro/method calls need their own serial group; literals and neighboring tags cannot decide"
+    );
+}
+
+#[test]
+fn checkpoint_census_reports_source_parse_failures() {
+    let error = checkpoint_metrics_offenders(&[("broken.rs", "#[test] fn unfinished(")])
+        .expect_err("malformed census input must not be silently skipped");
+    assert!(
+        error.starts_with("broken.rs: "),
+        "parse refusal must identify the failed source: {error}"
     );
 }
 

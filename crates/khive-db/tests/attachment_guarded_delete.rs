@@ -23,26 +23,27 @@ fn attachment(record_uuid: Uuid, role: &str, byte: char) -> Attachment {
 
 fn setup(queued: bool) -> (tempfile::TempDir, Arc<ConnectionPool>, SqlAttachmentStore) {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guarded-delete.db");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE attachments (
+           record_uuid TEXT NOT NULL, substrate TEXT NOT NULL, role TEXT NOT NULL,
+           content_ref TEXT NOT NULL, media_type TEXT, size_bytes INTEGER,
+           created_at INTEGER NOT NULL, PRIMARY KEY(record_uuid, role));",
+            )
+            .unwrap();
+    }
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("guarded-delete.db")),
+            path: Some(path),
             write_queue_enabled: Some(queued),
             write_routing_strict: queued,
             ..PoolConfig::for_test()
         })
         .unwrap(),
     );
-    pool.writer()
-        .unwrap()
-        .autocommit(|conn| {
-            Ok(conn.execute_batch(
-                "CREATE TABLE attachments (
-           record_uuid TEXT NOT NULL, substrate TEXT NOT NULL, role TEXT NOT NULL,
-           content_ref TEXT NOT NULL, media_type TEXT, size_bytes INTEGER,
-           created_at INTEGER NOT NULL, PRIMARY KEY(record_uuid, role));",
-            )?)
-        })
-        .unwrap();
     let store = SqlAttachmentStore::new(pool.clone(), true);
     (dir, pool, store)
 }

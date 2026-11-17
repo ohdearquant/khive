@@ -159,7 +159,8 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
     use AuditErrorClass as C;
     match error {
         StorageError::SqliteWrite { source, .. }
-        | StorageError::WriterTaskRequestFailed { source, .. } => storage_class(source),
+        | StorageError::WriterTaskRequestFailed { source, .. }
+        | StorageError::WriterOwnerUnavailable { source, .. } => storage_class(source),
         StorageError::NotFound { .. } => C::NotFoundOrNotAddressed,
         StorageError::AlreadyExists { .. } | StorageError::Conflict { .. } => C::Conflict,
         StorageError::InvalidInput { .. } | StorageError::BlobTooLarge { .. } => C::InvalidParams,
@@ -170,8 +171,12 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
         StorageError::AdmissionTimeout { .. }
         | StorageError::WriteQueueFull { .. }
         | StorageError::WriterTaskBusy { .. } => C::AdmissionExhausted,
-        StorageError::CapacityFloor { .. } => C::PolicyRefusal,
-        StorageError::WriterTaskNoRuntime => C::Configuration,
+        StorageError::CapacityFloor { .. } | StorageError::SecretDetected { .. } => {
+            C::PolicyRefusal
+        }
+        StorageError::WriterTaskNoRuntime | StorageError::WriterRouteViolation { .. } => {
+            C::Configuration
+        }
         StorageError::Driver { source, .. } => {
             if matches!(
                 source.downcast_ref::<khive_db::SqliteError>(),
@@ -190,6 +195,7 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
         | StorageError::Serialization { .. }
         | StorageError::IndexMaintenance { .. }
         | StorageError::WriterTaskTerminated { .. }
+        | StorageError::WriteOutcomeUnknown { .. }
         | StorageError::Internal(_)
         | StorageError::CapacityUnavailable { .. } => C::Storage,
     }
@@ -200,6 +206,26 @@ mod tests {
     use super::AuditErrorClass;
     use crate::error::{BatchAdmissionReport, BatchRefusal, DomainDisposition, RuntimeError};
     use khive_storage::{StorageError, WriterTaskRequestState};
+
+    #[test]
+    fn incoming_key_secret_is_a_policy_refusal_through_both_storage_routes() {
+        let key = format!("ghp_{}", "A".repeat(40));
+        for converted in [false, true] {
+            let storage =
+                khive_storage::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+                    .expect_err("the incoming key must be refused");
+            let runtime = if converted {
+                RuntimeError::from(storage)
+            } else {
+                RuntimeError::Storage(storage)
+            };
+            assert_eq!(
+                runtime.audit_error_class(),
+                AuditErrorClass::PolicyRefusal,
+                "a typed credential refusal is policy, not storage failure or invalid shape"
+            );
+        }
+    }
 
     #[test]
     fn batch_write_delegates_audit_class_without_changing_settlement() {
@@ -603,5 +629,47 @@ mod tests {
         assert_eq!(value["kind"], "unavailable");
         assert_eq!(value["domain_disposition"], "unknown");
         assert!(value.get("retryable").is_none());
+    }
+    #[test]
+    fn writer_outcomes_retain_audit_class_and_finality() {
+        for (error, class, disposition) in [
+            (
+                StorageError::WriteOutcomeUnknown {
+                    source: Box::new(std::io::Error::other("lost COMMIT reply")),
+                },
+                AuditErrorClass::Storage,
+                DomainDisposition::Unknown,
+            ),
+            (
+                StorageError::WriterOwnerUnavailable {
+                    operation: "write".into(),
+                    source: Box::new(StorageError::WriterTaskNoRuntime),
+                },
+                AuditErrorClass::Configuration,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                StorageError::WriterOwnerUnavailable {
+                    operation: "write".into(),
+                    source: Box::new(StorageError::Pool {
+                        operation: "owner".into(),
+                        message: "stopped".into(),
+                    }),
+                },
+                AuditErrorClass::Storage,
+                DomainDisposition::NotCommitted,
+            ),
+            (
+                StorageError::WriterRouteViolation {
+                    operation: "write".into(),
+                },
+                AuditErrorClass::Configuration,
+                DomainDisposition::NotCommitted,
+            ),
+        ] {
+            let error = RuntimeError::atomic_write_failure(error);
+            assert_eq!(error.audit_error_class(), class);
+            assert_eq!(error.batch_write_disposition(), Some(disposition));
+        }
     }
 }

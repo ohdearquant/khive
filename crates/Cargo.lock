@@ -3041,7 +3041,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "unicode-general-category",
  "uuid",
+]
+
+[[package]]
+name = "khive-subject"
+version = "0.20.0"
+dependencies = [
+ "khive-pack-formal",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

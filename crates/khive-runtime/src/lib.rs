@@ -56,6 +56,7 @@ mod error_projection;
 mod event_actor_scope;
 mod event_cursor_walk;
 mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -200,6 +201,9 @@ pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
     page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
 };
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;

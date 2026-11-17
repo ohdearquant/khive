@@ -90,6 +90,7 @@ CRATES=(
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
+    khive-subject        # runtime, KG and Formal are development dependencies
     khive-vcs            # needs khive-pack-kg (normal dep) + khive-runtime/storage/types (all above)
     khive-pack-agent     # needs khive-runtime/storage/types + dev-dep khive-pack-kg (all above)
     khive-pack-blob      # needs khive-runtime/storage/types (all above); dep of khive-mcp, dev-dep of khive-pack-git/exec

@@ -34,6 +34,7 @@ members = [
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-formal",
+    "khive-subject",
     "khive-pack-code",
     "khive-pack-web",
     "khive-pack-telemetry",
