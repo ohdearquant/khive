@@ -527,6 +527,7 @@ async fn skipped_embedding_remains_empty_but_degraded_model_remains_completed() 
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn stopped_collection_cannot_become_a_healthy_empty_plan() {
     let runtime = KhiveRuntime::memory().unwrap();
     let token = runtime.authorize(Namespace::local()).unwrap();
