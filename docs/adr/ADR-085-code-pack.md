@@ -2791,7 +2791,7 @@ calls.
 
 ## Amendment 17 (2026-11-16): configured production parents resolved once per admission
 
-**Status**: Proposed\
+**Status**: Proposed. Signed off 2026-11-16 (#6735) for implementation.\
 **Amends**: Amendment 12's production-path sampling and parent-resolution rules\
 **Tracking**: #3664\
 **Retains**: Amendment 9's complete configured production set, Amendment 12's
