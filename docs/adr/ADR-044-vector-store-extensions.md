@@ -1362,7 +1362,7 @@ this amendment and native results are separate gates before claiming completion.
 
 ## Amendment 7: Entity-filter pushdown for exact vector search (#3687)
 
-**Status**: Proposed (2026-11-16). The accepted decisions and the separate Proposed status of Amendment 6 remain unchanged.
+**Status**: Accepted 2026-11-16 (#6730). The accepted decisions and the separate Proposed status of Amendment 6 remain unchanged.
 
 ### Scope and capability
 
