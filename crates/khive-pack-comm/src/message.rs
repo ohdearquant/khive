@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::{note::Note, StorageError, WriterTaskRequestState};
+#[cfg(test)]
+use khive_storage::StorageError;
+use khive_storage::{note::Note, WriterTaskRequestState};
 use khive_types::{Details, KhiveError};
 
 pub(crate) const COMM_SCHEMA_VERSION: u64 = 1;
@@ -125,13 +127,8 @@ pub(crate) fn short_id(uuid: Uuid) -> String {
 fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError) -> RuntimeError {
     match error {
         RuntimeError::Storage(ref storage)
-            if matches!(
-                storage.without_sqlite_write_stage(),
-                StorageError::WriterTaskTerminated {
-                    request_state: WriterTaskRequestState::SideEffectsUnknown,
-                    ..
-                }
-            ) =>
+            if storage.writer_request_state()
+                == Some(WriterTaskRequestState::SideEffectsUnknown) =>
         {
             RuntimeError::Khive(
                 KhiveError::conflict(format!(

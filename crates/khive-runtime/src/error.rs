@@ -188,6 +188,13 @@ pub const WRITER_TASK_REQUEST_FAILED_STAGE: &str = "writer_task_request_failed";
 /// writer seam.
 pub const WRITER_TASK_TERMINATED_STAGE: &str = "writer_task_terminated";
 
+/// COMMIT was issued but its caller cannot establish the outcome (ADR-135 F6).
+pub const WRITE_OUTCOME_UNKNOWN_STAGE: &str = "write_outcome_unknown";
+/// Strict routing could not reach its writer before execution (ADR-135 F6).
+pub const WRITER_OWNER_UNAVAILABLE_STAGE: &str = "writer_owner_unavailable";
+/// Strict routing refused an attempted direct logical write (ADR-135 F6).
+pub const WRITER_ROUTE_VIOLATION_STAGE: &str = "writer_route_violation";
+
 /// Stable wire code/stage for a bounded storage-admission wait (a
 /// reader/writer handle slot or a pooled reader checkout) that elapsed
 /// before anything was acquired. The operation never started, so the
@@ -1079,17 +1086,18 @@ impl RuntimeError {
     /// Preserve a single atomic write's actual typed settlement, never its rendered text.
     pub fn atomic_write_failure(error: khive_storage::StorageError) -> Self {
         use khive_storage::{StorageError, WriterTaskRequestState};
-        let disposition = match error.without_sqlite_write_stage() {
-            StorageError::WriterTaskRequestFailed { request_state, .. }
-            | StorageError::WriterTaskTerminated { request_state, .. } => match request_state {
+        let disposition = match error.writer_request_state() {
+            Some(request_state) => match request_state {
                 WriterTaskRequestState::NotStarted
                 | WriterTaskRequestState::TransactionRolledBack => DomainDisposition::NotCommitted,
                 WriterTaskRequestState::SideEffectsUnknown => DomainDisposition::Unknown,
             },
-            StorageError::WriterTaskBusy { .. }
-            | StorageError::WriteQueueFull { .. }
-            | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
-            _ => DomainDisposition::Unknown,
+            None => match error.without_sqlite_write_stage() {
+                StorageError::WriterTaskBusy { .. }
+                | StorageError::WriteQueueFull { .. }
+                | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
+                _ => DomainDisposition::Unknown,
+            },
         };
         Self::BatchWrite {
             context: Box::new(BatchWriteContext {
@@ -1341,6 +1349,30 @@ impl RuntimeError {
             return None;
         };
         match error.without_sqlite_write_stage() {
+            khive_storage::StorageError::WriteOutcomeUnknown { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITE_OUTCOME_UNKNOWN_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
+            khive_storage::StorageError::WriterOwnerUnavailable { source, .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: source.is_retryable(),
+                })
+            }
+            khive_storage::StorageError::WriterRouteViolation { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_ROUTE_VIOLATION_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
             khive_storage::StorageError::WriterTaskRequestFailed {
                 request_state,
                 source,
@@ -1382,6 +1414,21 @@ impl RuntimeError {
             return Some(context.into());
         }
         if let Self::Storage(error) = source {
+            if let khive_storage::StorageError::WriterOwnerUnavailable { operation, source } =
+                error.without_sqlite_write_stage()
+            {
+                if source.is_retryable() {
+                    return Some(RetryableFailureContext {
+                        stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                        timeout: Duration::ZERO,
+                        capability: source.capability(),
+                        operation: Some(operation.to_string()),
+                        pool_identity: None,
+                        scope: None,
+                        retry_after_ms: None,
+                    });
+                }
+            }
             if let khive_storage::StorageError::WriterTaskBusy { timeout_ms } =
                 error.without_sqlite_write_stage()
             {

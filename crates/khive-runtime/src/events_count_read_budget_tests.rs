@@ -472,6 +472,7 @@ fn contradictory_read_failure_retry_message_or_writer_evidence_is_rejected() {
             "message" => serde_json::json!("a contradictory diagnostic"),
             _ => serde_json::to_value(WireWriterTaskFailure::RequestFailed {
                 request_state: WireWriterTaskState::NotStarted,
+                evidence: None,
             })
             .unwrap(),
         };

@@ -37,6 +37,89 @@ fn writer_task_request_state_display_is_stable() {
 }
 
 #[test]
+fn issued_commit_unknown_keeps_reply_source_and_never_implies_retry() {
+    let error = StorageError::WriteOutcomeUnknown {
+        source: Box::new(FakeSource("reply was lost".into())),
+    };
+    assert!(StdError::source(&error).unwrap().is::<FakeSource>());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::SideEffectsUnknown)
+    );
+    assert!(error.is_write_outcome_unknown());
+    assert!(!error.is_retryable());
+    assert_eq!(error.capability(), None);
+
+    let error = error.with_sqlite_write_failure(SqliteWriteFailure {
+        stage: SqliteWriteStage::Commit,
+        primary_code: 10,
+        extended_code: 10,
+        settlement_unknown: true,
+    });
+    assert!(error.is_write_outcome_unknown());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::SideEffectsUnknown)
+    );
+    assert!(!error.is_retryable());
+    let rolled_back = StorageError::WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState::TransactionRolledBack,
+        source: Box::new(error),
+    };
+    assert_eq!(
+        rolled_back.writer_request_state(),
+        Some(WriterTaskRequestState::TransactionRolledBack)
+    );
+    assert!(
+        !rolled_back.is_write_outcome_unknown(),
+        "outer rollback proof owns finality"
+    );
+}
+
+#[test]
+fn strict_routing_refusals_preserve_owner_source_and_retry_policy() {
+    for (source, retryable) in [
+        (
+            StorageError::Pool {
+                operation: "open".into(),
+                message: "unavailable".into(),
+            },
+            true,
+        ),
+        (StorageError::WriterTaskNoRuntime, false),
+    ] {
+        let error = StorageError::WriterOwnerUnavailable {
+            operation: "create".into(),
+            source: Box::new(source),
+        };
+        let cause = StdError::source(&error)
+            .unwrap()
+            .downcast_ref::<StorageError>()
+            .unwrap();
+        assert_eq!(cause.is_retryable(), retryable);
+        assert_eq!(error.is_retryable(), retryable);
+        assert_eq!(
+            error.writer_request_state(),
+            Some(WriterTaskRequestState::NotStarted)
+        );
+        assert!(!error.is_write_outcome_unknown());
+        assert_eq!(
+            matches!(cause, StorageError::WriterTaskNoRuntime),
+            !retryable
+        );
+    }
+    let error = StorageError::WriterRouteViolation {
+        operation: "transaction".into(),
+    };
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::NotStarted)
+    );
+    assert!(!error.is_retryable());
+    assert!(StdError::source(&error).is_none());
+}
+
+#[test]
 fn writer_task_busy_is_retryable_without_claiming_queue_rejection() {
     let error = StorageError::WriterTaskBusy { timeout_ms: 175 };
     assert!(error.is_retryable());

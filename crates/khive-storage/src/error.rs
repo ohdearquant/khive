@@ -310,6 +310,26 @@ pub enum StorageError {
         sqlite_full_codes: Option<(i32, i32)>,
     },
 
+    /// COMMIT was issued, but this request lost its reply without a known failure.
+    /// This does not establish that the writer task itself terminated.
+    #[error("write outcome unknown after COMMIT: {source}")]
+    WriteOutcomeUnknown {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+
+    /// Strict routing refused before execution; the original owner failure keeps its policy.
+    #[error("writer owner unavailable during {operation}: {source}")]
+    WriterOwnerUnavailable {
+        operation: Cow<'static, str>,
+        #[source]
+        source: Box<StorageError>,
+    },
+
+    /// A logical write attempted to bypass the owner under strict routing.
+    #[error("strict writer routing refused a direct write during {operation}")]
+    WriterRouteViolation { operation: Cow<'static, str> },
+
     /// An internal storage failure not attributable to a specific storage
     /// capability.
     #[error("internal storage error: {0}")]
@@ -354,7 +374,8 @@ impl StorageError {
     pub fn sqlite_write_failure(&self) -> Option<SqliteWriteFailure> {
         match self {
             Self::SqliteWrite { failure, .. } => Some(*failure),
-            Self::WriterTaskRequestFailed { source, .. } => source.sqlite_write_failure(),
+            Self::WriterTaskRequestFailed { source, .. }
+            | Self::WriterOwnerUnavailable { source, .. } => source.sqlite_write_failure(),
             _ => None,
         }
     }
@@ -365,6 +386,27 @@ impl StorageError {
             Self::SqliteWrite { source, .. } => source.without_sqlite_write_stage(),
             _ => self,
         }
+    }
+
+    /// The outer write boundary's finality; an inner cause cannot override it.
+    pub fn writer_request_state(&self) -> Option<WriterTaskRequestState> {
+        match self.without_sqlite_write_stage() {
+            Self::WriterTaskRequestFailed { request_state, .. }
+            | Self::WriterTaskTerminated { request_state, .. } => Some(*request_state),
+            Self::WriteOutcomeUnknown { .. } => Some(WriterTaskRequestState::SideEffectsUnknown),
+            Self::WriterOwnerUnavailable { .. } | Self::WriterRouteViolation { .. } => {
+                Some(WriterTaskRequestState::NotStarted)
+            }
+            _ => None,
+        }
+    }
+
+    /// Distinguish issued-COMMIT reply loss from other unknown request outcomes.
+    pub fn is_write_outcome_unknown(&self) -> bool {
+        matches!(
+            self.without_sqlite_write_stage(),
+            Self::WriteOutcomeUnknown { .. }
+        )
     }
 
     /// Attach native evidence once; the original error still owns Display and retry policy.
@@ -417,9 +459,9 @@ impl StorageError {
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
-            Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } => {
-                source.capability()
-            }
+            Self::WriterTaskRequestFailed { source, .. }
+            | Self::WriterOwnerUnavailable { source, .. }
+            | Self::SqliteWrite { source, .. } => source.capability(),
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::AdmissionTimeout { .. }
@@ -429,6 +471,8 @@ impl StorageError {
             | Self::WriteQueueFull { .. }
             | Self::WriterTaskBusy { .. }
             | Self::WriterTaskTerminated { .. }
+            | Self::WriteOutcomeUnknown { .. }
+            | Self::WriterRouteViolation { .. }
             | Self::Internal(..)
             | Self::WriterTaskNoRuntime => None,
         }
@@ -436,8 +480,9 @@ impl StorageError {
 
     /// Whether this error is transient and the operation may succeed on retry.
     pub fn is_retryable(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
-            self
+        if let Self::WriterTaskRequestFailed { source, .. }
+        | Self::WriterOwnerUnavailable { source, .. }
+        | Self::SqliteWrite { source, .. } = self
         {
             return source.is_retryable();
         }

@@ -303,6 +303,15 @@ impl WriteAdmission {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum LogicalWriteOwner {
+    Request,
+    CoreMigration,
+    Schema,
+    AttachmentCutover,
+    Checkpoint,
+}
+
 /// A writer connection checked out from the pool.
 /// The Mutex ensures only one writer at a time.
 ///
@@ -338,6 +347,7 @@ impl WriteAdmission {
 /// pool is poisoned so every later write is refused with
 /// [`SqliteError::WriterPoisoned`] before it starts, and the lease is then
 /// released.
+
 pub struct WriterGuard<'pool> {
     pub(super) guard: parking_lot::MutexGuard<'pool, ProgressConn>,
     /// The origin (ADR-091 backend-scoped attribution) of the pool this
@@ -346,6 +356,7 @@ pub struct WriterGuard<'pool> {
     pub(super) origin: TxOrigin,
     pub(super) pool: &'pool ConnectionPool,
     pub(super) admission: &'pool WriteAdmission,
+    pub(super) logical_owner: LogicalWriteOwner,
     /// Normal writer checkout acquires this before taking the writer mutex.
     /// Maintenance-only nowait checkout leaves it absent to bypass the floor.
     pub(super) _volume_lease: Option<VolumeLease>,
@@ -592,6 +603,12 @@ impl<'pool> WriterGuard<'pool> {
     }
 
     fn ensure_logical_write_checkout(&self, message: &'static str) -> Result<(), SqliteError> {
+        if matches!(self.logical_owner, LogicalWriteOwner::Checkpoint) {
+            return Err(SqliteError::InvalidData(message.to_string()));
+        }
+        if matches!(self.logical_owner, LogicalWriteOwner::Request) {
+            self.pool.ensure_request_write_route("pooled_write")?;
+        }
         if self._volume_lease.is_none()
             && self.pool.canonical_path().is_some()
             && !self.pool.config.read_only
@@ -731,6 +748,7 @@ impl<'pool> WriterGuard<'pool> {
 
     /// Acquire SQLite's writer slot before sampling logical-write capacity.
     fn begin_admitted_transaction(&mut self) -> Result<(), SqliteError> {
+        self.ensure_logical_write_checkout("checkpoint writer cannot begin a logical transaction")?;
         if !self.guard.is_autocommit() {
             self.pool.retire_pooled_writer(&mut self.guard);
             return Err(SqliteError::InheritedWriterTransaction);
@@ -778,7 +796,7 @@ impl crate::migrations::MigrationTransactions for PooledMigrationTransactions<'_
         let mut writer = {
             let _class =
                 crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
-            self.pool.writer()?
+            self.pool.writer_for_core_migration()?
         };
         let result = writer.conn_mut().with_mut(operation);
         if writer.guard.is_autocommit() {
@@ -812,6 +830,17 @@ impl Drop for WriterGuard<'_> {
 }
 
 impl ConnectionPool {
+    pub(crate) fn ensure_request_write_route(
+        &self,
+        operation: &'static str,
+    ) -> Result<(), SqliteError> {
+        if self.config.write_routing_strict {
+            Err(SqliteError::WriterRouteViolation { operation })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Run one standalone autocommit operation or complete SQL script.
     ///
     /// The connection and volume lease remain owned by this call. Capacity
@@ -1096,3 +1125,36 @@ mod standalone_write_tests;
 #[cfg(test)]
 #[path = "pooled_write_tests.rs"]
 mod pooled_write_tests;
+
+#[cfg(test)]
+mod routing_authority_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_owner_never_grants_memory_logical_write_authority() {
+        for strict in [false, true] {
+            let pool = ConnectionPool::new(PoolConfig {
+                write_routing_strict: strict,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap();
+            let called = std::cell::Cell::new(false);
+            let result = pool
+                .writer_for_checkpoint_operation()
+                .unwrap()
+                .autocommit(|_| {
+                    called.set(true);
+                    Ok(())
+                });
+            assert!(
+                matches!(result, Err(SqliteError::InvalidData(_))),
+                "checkpoint authority cannot admit a logical write on a memory pool: {result:?}"
+            );
+            assert!(
+                !called.get(),
+                "checkpoint refusal must precede the write callback"
+            );
+        }
+    }
+}
