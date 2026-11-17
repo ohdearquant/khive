@@ -208,10 +208,13 @@ single task. Every SQLite-backed store resolves through
 batch entry points, so a construction-time `None` is never a permanent routing
 decision.
 
-When `write_routing_strict` is enabled, a missing handle fails closed: a
-missing runtime preserves `StorageError::WriterTaskNoRuntime`, while an
-explicitly disabled or degraded queue returns a typed `StorageError::Pool`
-naming the operation. In compatibility mode, a caller may use its legacy
+When `write_routing_strict` is enabled, a missing or stopped handle fails closed
+with `StorageError::WriterOwnerUnavailable`. Its typed `source` preserves
+`WriterTaskNoRuntime` (not retryable) or `Pool` (retryable), and the wrapper names
+the attempted operation. The queue also checks closure at admission, covering an
+owner that stops after lookup. These refusals report `writer_owner_unavailable`
+with `request_state: not_started` and no requested write committed.
+In compatibility mode, a caller may use its legacy
 standalone/pool-mutex writer only after this lookup returns `None`; that exact
 fallback emits a store-specific `direct_route_violation` when the file-backed
 queue is enabled.
@@ -220,6 +223,47 @@ This routing hardening does **not** flip the strict-mode default. ADR-135 F2
 and ADR-136 D2 still require production A/B evidence and a release gate before
 `write_routing_strict` can become the default; until that evidence is accepted,
 `KHIVE_WRITE_ROUTING=strict` remains opt-in.
+
+### Closed lifecycle ownership under strict routing
+
+Strict mode also refuses raw pooled transaction/autocommit and standalone
+logical-write entrypoints before their callbacks or SQL execute. They report
+`writer_route_violation`, `request_state: not_started`, and `retryable: false`.
+Read-capable handles retain their read behavior. The common resolver, SQL writer,
+and atomic-unit resolver enforce the same strict owner requirement for files and
+explicit strict memory configurations. Default memory and explicit compatibility
+queue opt-out retain their existing routes.
+
+The allowed lifecycle owners are closed inside `khive-db`:
+
+| Owner                  | Permitted work                                                                                                    | Authority                                                                                      |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Core/service migration | Versioned startup or service schema migration with its existing settlement rules                                  | Crate-private core-migration checkout retained by `PooledMigrationTransactions`                |
+| Schema                 | Registered pack/service schema, model/table registration, constructor schema setup, and lazy missing-index repair | Crate-private schema checkout at the existing schema-application boundary                      |
+| Attachment cutover     | Staging, authenticated completion, and finalization under the existing canonical GC-owner checks                  | Crate-private attachment-cutover checkout                                                      |
+| Checkpoint/recovery    | Checkpoint policy and dedicated PASSIVE/TRUNCATE operations                                                       | Restricted checkpoint checkout/connection; no general logical-write authority                  |
+| Queue infrastructure   | Opening and retaining the single writer's lifetime connection                                                     | Existing private writer-task connection factory; each queued operation keeps its own admission |
+
+The pooled owner discriminant is crate-private. Public writer handles receive
+request ownership, and neither a caller's operation label nor a volume-lease
+class can turn that into lifecycle ownership. Schema SQL remains supplied by
+trusted Rust schema registrars through the existing schema-application APIs;
+those APIs retain their schema contract and authority. Request SQL uses the
+ordinary writer route. Lazy schema repair can run during a request and still
+retains its cancellation and capacity checks.
+
+VACUUM remains ordered on the writer queue; skipping an enclosing BEGIN does not
+give it direct-write authority. Strict-mode FTS maintenance also uses the queue
+because its merge INSERTs are logical writes. The default maintenance route stays
+unchanged. Diagnostic reads and file-only recovery bookkeeping do not acquire
+logical-write authority. Disk reserve, volume-lease, deadline and settlement
+requirements remain independent of routing permission.
+
+Each lifecycle class has a strict-mode positive beside a non-listed raw pooled
+write refusal. The tests also pair default and strict request routes. A stopped
+owner before admission is distinct from a lost reply after COMMIT: only the latter
+receives `write_outcome_unknown`. A retained typed failure or proven rollback
+still takes precedence; see the storage error taxonomy for that receipt contract.
 
 ## `ConnectionPool::writer_task_for_runtime_write`
 

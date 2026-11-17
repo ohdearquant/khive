@@ -27,9 +27,117 @@ pub(crate) struct Slots {
     authorizer: Mutex<Option<AuthorizerDelegate>>,
     progress: Mutex<Option<ProgressDelegate>>,
     update: Mutex<Option<UpdateDelegate>>,
+    suppression: Mutex<Option<SuppressionArm>>,
+    active_reply: Mutex<Weak<CommitReplyRequest>>,
     // Set while `test_authorizer` checks that the delegating authorizer is still installed.
     probing: AtomicBool,
     probed: AtomicBool,
+}
+
+/// Observations from one matched writer request; no serialized error is injected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitReplySuppressionSnapshot {
+    pub matched_requests: usize,
+    pub commit_issued: bool,
+    pub commit_succeeded: bool,
+    pub autocommit: bool,
+    pub reply_suppressed: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct CommitReplySuppressionProbe(Arc<Mutex<CommitReplySuppressionSnapshot>>);
+
+impl CommitReplySuppressionProbe {
+    pub fn snapshot(&self) -> CommitReplySuppressionSnapshot {
+        *self.0.lock()
+    }
+}
+
+struct SuppressionArm {
+    table: String,
+    rowid: i64,
+    probe: CommitReplySuppressionProbe,
+}
+
+#[derive(Default)]
+struct CommitReplyRequest {
+    probe: Mutex<Option<CommitReplySuppressionProbe>>,
+}
+
+pub(crate) struct CommitReplyRequestGuard {
+    slots: Arc<Slots>,
+    request: Arc<CommitReplyRequest>,
+}
+
+impl CommitReplyRequestGuard {
+    pub(crate) fn suppress_successful_reply(&self) -> bool {
+        let probe = self.request.probe.lock();
+        let Some(probe) = probe.as_ref() else {
+            return false;
+        };
+        let mut snapshot = probe.0.lock();
+        if snapshot.commit_issued && snapshot.commit_succeeded && snapshot.autocommit {
+            snapshot.reply_suppressed += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for CommitReplyRequestGuard {
+    fn drop(&mut self) {
+        let mut active = self.slots.active_reply.lock();
+        if active.ptr_eq(&Arc::downgrade(&self.request)) {
+            *active = Weak::new();
+        }
+    }
+}
+
+pub(crate) fn begin_commit_reply_request(conn: &Connection) -> Option<CommitReplyRequestGuard> {
+    let slots = slots_of(conn)?;
+    let request = Arc::new(CommitReplyRequest::default());
+    *slots.active_reply.lock() = Arc::downgrade(&request);
+    Some(CommitReplyRequestGuard { slots, request })
+}
+
+fn active_commit_probe(conn: &Connection) -> Option<CommitReplySuppressionProbe> {
+    let slots = slots_of(conn)?;
+    let request = slots.active_reply.lock().upgrade()?;
+    let probe = request.probe.lock().clone();
+    probe
+}
+
+pub(crate) fn commit_reply_issued(conn: &Connection) {
+    if let Some(probe) = active_commit_probe(conn) {
+        probe.0.lock().commit_issued = true;
+    }
+}
+
+pub(crate) fn commit_reply_completed(conn: &Connection, succeeded: bool, autocommit: bool) {
+    if let Some(probe) = active_commit_probe(conn) {
+        let mut snapshot = probe.0.lock();
+        snapshot.commit_succeeded = succeeded;
+        snapshot.autocommit = autocommit;
+    }
+}
+
+fn match_commit_reply(slots: &Slots, action: Action, database: &str, table: &str, rowid: i64) {
+    if !matches!(action, Action::SQLITE_INSERT) || database != "main" {
+        return;
+    }
+    let Some(request) = slots.active_reply.lock().upgrade() else {
+        return;
+    };
+    let mut arm = slots.suppression.lock();
+    if arm
+        .as_ref()
+        .is_some_and(|arm| arm.table == table && arm.rowid == rowid)
+    {
+        let arm = arm.take().expect("matched suppression arm");
+        arm.probe.0.lock().matched_requests += 1;
+        *request.probe.lock() = Some(arm.probe);
+    }
 }
 
 // Weak, so a connection's delegates are dropped with the connection's own hook closures.
@@ -74,6 +182,7 @@ fn install(conn: &mut Connection, slots: Arc<Slots>) -> rusqlite::Result<()> {
     let update_slots = Arc::clone(&slots);
     conn.update_hook(Some(
         move |action: Action, database: &str, table: &str, rowid: i64| {
+            match_commit_reply(&update_slots, action, database, table, rowid);
             if let Some(delegate) = update_slots.update.lock().as_mut() {
                 delegate(action, database, table, rowid);
             }
@@ -123,6 +232,14 @@ pub(crate) fn progress(slots: &Slots) -> bool {
 
 /// Hook installation for tests, through a shared borrow of a registered connection.
 pub trait TestHooks {
+    /// Suppress only the successful COMMIT reply of the request that inserts this
+    /// exact row in `main`. Other requests and failed settlements keep their replies.
+    fn test_suppress_commit_reply_after_update(
+        &self,
+        table: &str,
+        rowid: i64,
+    ) -> CommitReplySuppressionProbe;
+
     /// Replaces the test authorizer delegate (`None` removes it). Setting one fails when a raw
     /// `Connection::authorizer` call has replaced the delegating authorizer, which would never
     /// consult it.
@@ -143,6 +260,20 @@ pub trait TestHooks {
 }
 
 impl TestHooks for Connection {
+    fn test_suppress_commit_reply_after_update(
+        &self,
+        table: &str,
+        rowid: i64,
+    ) -> CommitReplySuppressionProbe {
+        let probe = CommitReplySuppressionProbe::default();
+        *slots(self).suppression.lock() = Some(SuppressionArm {
+            table: table.into(),
+            rowid,
+            probe: probe.clone(),
+        });
+        probe
+    }
+
     fn test_authorizer<F>(&self, hook: Option<F>) -> rusqlite::Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
