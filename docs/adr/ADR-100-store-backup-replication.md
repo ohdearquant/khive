@@ -78,11 +78,11 @@ Consequences.
   index rebuilds from them (ADR-079). Backing up the database alone is sufficient; the
   restore procedure includes the rebuild step. Backing up the index files would couple
   the backup to index-format versions for no recovery benefit.
-- **Governed code-map databases**: they are derived artifacts rebuilt from source
-  repositories by `code.ingest`. The
+- **Governed code-map databases**: they are rebuilt from source repositories by
+  `code.ingest`, which does not restore their history rows, sweep times or run ids. The
   [governed-map amendment](#amendment-2026-11-16-governed-code-map-backup-exclusion)
-  below excludes them, requires a typed refusal when a backup unit for one is
-  configured, and retains coverage for every other configured store.
+  below excludes them, accepts that loss, requires a typed refusal when a backup unit
+  for one is configured, and retains coverage for every other configured store.
 
 ## Options considered
 
@@ -543,9 +543,16 @@ revised scope.
 
 A governed code-map database is a code-map target subject to
 [ADR-085 Amendment 12's native opened-handle contract](ADR-085-code-pack.md#amendment-12-2026-09-28-native-opened-handle-proof-for-code-map-databases).
-It is derived from source repositories and can be rebuilt by `code.ingest`, just as the
-ANN index can be rebuilt from persisted vectors. A configured ordinary store does not
-become a governed map merely because it contains code-related records.
+It is derived from source repositories and is rebuilt by `code.ingest`. Unlike the ANN
+index, it is not wholly derived. A fresh ingest of the current source restores
+everything that source produces, with the same declaration and finding ids, so
+references held in other stores still resolve. It does not restore what a map
+accumulates across sweeps: symbol rows kept only as history after a file's parse
+failed, `last_seen_at` and sweep-clock times, and L2 run ids. This exclusion accepts
+that loss. Nothing in a governed map is typed or imported by a user: `code.ingest` is
+the only writer of a governed map, and audit findings imported by `kkernel code-ingest`
+are written to the configured store, which stays covered. A configured ordinary store
+does not become a governed map merely because it contains code-related records.
 
 Amendment 12 requires code-map connections to use the guarded native VFS; opening the
 source through an unguarded VFS is not an acceptable way to obtain a copy. SQLite's
@@ -563,7 +570,8 @@ substitute for the backup registry's own configuration check below.
 ### Decision
 
 1. Add governed code-map databases to the documented out-of-scope artifacts alongside
-   the ANN index. Recovery for a map is rebuilding it from its source repositories.
+   the ANN index. Recovery for a map is rebuilding it from its source repositories,
+   with the loss stated in the Rationale.
    Every configured khive SQLite store that is not a governed code map remains covered,
    including the primary, session and graph stores and other configured stores.
 2. The backup registry refuses a backup unit whose target is a governed code-map
