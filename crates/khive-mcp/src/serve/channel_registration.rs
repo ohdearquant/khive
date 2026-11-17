@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use khive_channel::{Channel, ChannelRegistry};
+use khive_runtime::channel_section::{ChannelConfigValidator, ChannelConfigValidators};
+use khive_runtime::RuntimeConfig;
 
 /// Caller-owned channels to compose with the host's configured builtin channels.
 ///
@@ -14,12 +16,73 @@ use khive_channel::{Channel, ChannelRegistry};
 pub struct ServeRegistrations {
     channels: Vec<Arc<dyn Channel>>,
     residents: Vec<crate::components::ResidentComponentRegistration>,
+    config_validators: Vec<(String, ChannelConfigValidator)>,
 }
 
 impl ServeRegistrations {
     /// Create an empty per-boot registration bundle.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a component's pure, idempotent configuration check.
+    ///
+    /// The callback receives its exact opaque value, or `None`, before runtime
+    /// construction, even when comm is not loaded. Pack activation may validate
+    /// again; callbacks must not start work or depend on exactly one invocation.
+    pub fn register_config_validator(
+        &mut self,
+        name: impl Into<String>,
+        validator: ChannelConfigValidator,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        let mut proposed = ChannelConfigValidators::default();
+        for (existing_name, existing) in &self.config_validators {
+            proposed.register(existing_name.clone(), existing.clone())?;
+        }
+        proposed.register(name.clone(), validator.clone())?;
+        self.config_validators.push((name, validator));
+        Ok(())
+    }
+
+    pub(super) fn install_runtime_config(&self, config: &mut RuntimeConfig) -> anyhow::Result<()> {
+        let mut proposed = config.channel_config_validators.clone();
+        for (name, validator) in &self.config_validators {
+            proposed.register(name.clone(), validator.clone())?;
+        }
+        proposed.validate(&config.channel)?;
+        config.channel_config_validators = proposed;
+        Ok(())
+    }
+
+    pub(super) fn require_prebuilt_compatible(&self) -> anyhow::Result<()> {
+        if !self.config_validators.is_empty() {
+            anyhow::bail!(
+                "configuration validators must be installed before server construction; \
+                 use run_with_registrations, or configure RuntimeConfig before building \
+                 and pass only channels/residents to serve_server_with_registrations"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn require_local_dispatch(
+        &self,
+        args: &crate::args::Args,
+        daemon_disabled: bool,
+    ) -> anyhow::Result<()> {
+        if !self.config_validators.is_empty()
+            && !args.daemon
+            && args.transport.as_deref().unwrap_or("stdio") == "stdio"
+            && !daemon_disabled
+        {
+            anyhow::bail!(
+                "caller configuration validators cannot be forwarded over stdio to a daemon; \
+                 use a daemon host or set KHIVE_NO_DAEMON=1 for local dispatch"
+            );
+        }
+        Ok(())
     }
 
     /// Add one channel, refusing a duplicate caller identity rather than replacing it.

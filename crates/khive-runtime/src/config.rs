@@ -358,6 +358,11 @@ pub struct RuntimeConfig {
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
+    /// Opaque values retained from `[channel.*]` without interpretation.
+    pub channel: crate::channel_section::ChannelSectionConfig,
+    /// Host-supplied validators installed before pack registry construction.
+    pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Production boot passes this value to the async khive-mcp/kkernel host
@@ -657,6 +662,8 @@ impl Default for RuntimeConfig {
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
+            channel: crate::channel_section::ChannelSectionConfig::default(),
+            channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),
@@ -1094,6 +1101,7 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let channel = khive_cfg.channel.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
     let code_map_root = khive_cfg.code_map_root.clone();
@@ -1264,6 +1272,7 @@ pub fn runtime_config_from_khive_config(
             exec,
             telemetry,
             mounts,
+            channel,
             code_map_root,
             code_maps,
             code_map_protected_database_paths,
@@ -1306,6 +1315,7 @@ pub fn runtime_config_from_khive_config(
         exec,
         telemetry,
         mounts,
+        channel,
         code_map_root,
         code_maps,
         code_map_protected_database_paths,

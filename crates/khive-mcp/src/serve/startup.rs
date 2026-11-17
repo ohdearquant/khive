@@ -136,11 +136,17 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 ///
 /// Builtin loops retain their own selected channel identities. Registering a channel
 /// does not opt it into email or Telegram polling.
+/// Component validators run before runtime construction, regardless of loaded packs.
+/// On Unix, validator-bearing stdio hosts must be the daemon or explicitly select
+/// local dispatch with `KHIVE_NO_DAEMON=1`. Custom transports own local dispatch.
 pub async fn run_with_registrations(
     args: Args,
     registry: &TransportRegistry,
     registrations: ServeRegistrations,
 ) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    registrations
+        .require_local_dispatch(&args, khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON"))?;
     #[cfg(unix)]
     if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
         crate::daemon::capture_bridge_executable();
@@ -162,6 +168,7 @@ pub async fn run_with_registrations(
     let (cli_ns_explicit, cli_ns) =
         resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;
+    registrations.install_runtime_config(&mut prepared.config)?;
     #[cfg(unix)]
     let store_plan = if args.daemon {
         Some(prepare_preflighted_daemon_store_plan(

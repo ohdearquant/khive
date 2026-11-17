@@ -5,6 +5,365 @@ use khive_channel::{Channel, ChannelEnvelope, ChannelError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+fn config_args(
+    path: &std::path::Path,
+    database: Option<&std::path::Path>,
+    comm: bool,
+) -> crate::args::Args {
+    use clap::Parser;
+    let mut args = crate::args::Args::parse_from([
+        "mcp",
+        "--no-embed",
+        "--actor",
+        "channel-config-test",
+        "--transport",
+        "config-capture",
+    ]);
+    args.config = Some(path.to_path_buf());
+    args.db = database.map(|path| path.to_string_lossy().into_owned());
+    args.pack = if comm {
+        vec!["kg".into(), "comm".into()]
+    } else {
+        vec!["kg".into()]
+    };
+    args
+}
+
+struct ConfigCaptureTransport {
+    served: Arc<AtomicUsize>,
+    observed: Arc<std::sync::Mutex<Vec<Option<toml::Value>>>>,
+}
+
+#[async_trait]
+impl crate::transport::Transport for ConfigCaptureTransport {
+    fn name(&self) -> &'static str {
+        "config-capture"
+    }
+    fn about(&self) -> &'static str {
+        "Local configuration fixture"
+    }
+    async fn serve(
+        &self,
+        server: crate::server::KhiveMcpServer,
+        _: &crate::transport::ServeOptions,
+    ) -> anyhow::Result<()> {
+        assert_eq!(server.actor_id(), Some("channel-config-test"));
+        let observed = self.observed.lock().unwrap();
+        assert!(
+            observed.len() >= 2,
+            "host preparation and activated comm both validate before transport serving"
+        );
+        assert!(
+            observed.iter().all(|value| value
+                .as_ref()
+                .and_then(|value| value.get("marker"))
+                .and_then(toml::Value::as_integer)
+                == Some(41)),
+            "every validation boundary receives the literal component value"
+        );
+        self.served.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn registered_config_reaches_real_single_and_multi_server_builds() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    for multi in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let topology = if multi {
+            "[[backends]]\nname='main'\nkind='memory'\n[[backends]]\nname='secondary'\nkind='memory'\n[packs.comm]\nbackend='secondary'\nno_embed=true\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!("{topology}[channel]\nunknown=17\n[channel.stand_in]\nmarker=41\n"),
+        )
+        .unwrap();
+        let memory = std::path::Path::new(":memory:");
+        let args = config_args(&path, (!multi).then_some(memory), true);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = observed.clone();
+        let mut registrations = ServeRegistrations::new();
+        registrations
+            .register_config_validator(
+                "stand_in",
+                Arc::new(move |value| {
+                    recorded.lock().unwrap().push(value.cloned());
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let mut transports = crate::transport::TransportRegistry::new();
+        transports.register(Box::new(ConfigCaptureTransport {
+            served: served.clone(),
+            observed,
+        }));
+        super::run_with_registrations(args, &transports, registrations)
+            .await
+            .unwrap();
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "actual run reaches the local capture transport"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn invalid_registered_config_refuses_without_comm_before_database_or_resident_work() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    for multi in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let main = directory.path().join("main.db");
+        let secondary = directory.path().join("secondary.db");
+        let topology = if multi {
+            format!("[[backends]]\nname='main'\npath={main:?}\n[[backends]]\nname='secondary'\npath={secondary:?}\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(&path, format!("{topology}[channel]\nstand_in=41\n")).unwrap();
+        let args = config_args(&path, (!multi).then_some(main.as_path()), false);
+        assert_eq!(
+            args.pack,
+            ["kg"],
+            "this refusal cannot depend on comm activation"
+        );
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = observed.clone();
+        let mut registrations = ServeRegistrations::new();
+        registrations
+            .register_config_validator(
+                "stand_in",
+                Arc::new(move |value| {
+                    recorded.lock().unwrap().push(value.cloned());
+                    Err(khive_runtime::RuntimeError::InvalidInput(
+                        "stand-in requires a table".into(),
+                    ))
+                }),
+            )
+            .unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let started = starts.clone();
+        registrations
+            .register_resident(crate::components::ResidentComponentRegistration::new(
+                "invalid-config-resident",
+                move |_, _| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                },
+            ))
+            .unwrap();
+        let channel = ProbeChannel::new("fixture", "invalid-config");
+        registrations.register_channel(channel.clone()).unwrap();
+        let result = super::run_with_registrations(
+            args,
+            &crate::transport::TransportRegistry::new(),
+            registrations,
+        )
+        .await;
+        assert!(
+            matches!(result.as_ref().err().and_then(|error| error.downcast_ref::<khive_runtime::RuntimeError>()), Some(khive_runtime::RuntimeError::InvalidInput(message)) if message == "stand-in requires a table"),
+            "registered validation must refuse through the real run path without comm"
+        );
+        assert_eq!(*observed.lock().unwrap(), [Some(toml::Value::Integer(41))]);
+        assert!(
+            !main.exists() && !secondary.exists(),
+            "invalid component config must refuse before database construction"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(channel.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn config_installation_refuses_duplicates_and_validation_without_partial_assignment() {
+    let mut config = khive_runtime::RuntimeConfig::no_embeddings();
+    config
+        .channel
+        .insert("existing".into(), toml::Value::Integer(7));
+    let originals = Arc::new(AtomicUsize::new(0));
+    let original_calls = originals.clone();
+    config
+        .channel_config_validators
+        .register(
+            "existing",
+            Arc::new(move |value| {
+                assert_eq!(value.and_then(toml::Value::as_integer), Some(7));
+                original_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let proposed = Arc::new(AtomicUsize::new(0));
+    let proposed_calls = proposed.clone();
+    let mut duplicate = ServeRegistrations::new();
+    duplicate
+        .register_config_validator(
+            "new",
+            Arc::new(move |_| {
+                proposed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    duplicate
+        .register_config_validator("existing", Arc::new(|_| Ok(())))
+        .unwrap();
+    assert!(
+        duplicate.install_runtime_config(&mut config).is_err(),
+        "existing validators cannot be replaced"
+    );
+    config
+        .channel_config_validators
+        .validate(&config.channel)
+        .unwrap();
+    assert_eq!(originals.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        proposed.load(Ordering::SeqCst),
+        0,
+        "duplicate refusal installs none of the proposed callbacks"
+    );
+
+    let mut invalid = ServeRegistrations::new();
+    invalid
+        .register_config_validator(
+            "new",
+            Arc::new(|value| {
+                assert!(value.is_none(), "absent component value remains absent");
+                Err(khive_runtime::RuntimeError::InvalidInput(
+                    "invalid absent component".into(),
+                ))
+            }),
+        )
+        .unwrap();
+    assert!(
+        invalid
+            .register_config_validator("new", Arc::new(|_| Ok(())))
+            .is_err(),
+        "duplicate registration retains the first callback"
+    );
+    assert!(invalid
+        .register_config_validator("", Arc::new(|_| Ok(())))
+        .is_err());
+    assert!(
+        matches!(invalid.install_runtime_config(&mut config).unwrap_err().downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::InvalidInput(message)) if message == "invalid absent component")
+    );
+    config
+        .channel_config_validators
+        .validate(&config.channel)
+        .unwrap();
+    assert_eq!(
+        config.channel.get("existing"),
+        Some(&toml::Value::Integer(7))
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn prebuilt_server_refuses_validator_bundle_before_validation_or_startup() {
+    use clap::Parser;
+    let server =
+        crate::server::KhiveMcpServer::new(khive_runtime::KhiveRuntime::memory().unwrap()).unwrap();
+    let args = crate::args::Args::parse_from(["mcp"]);
+    let validations = Arc::new(AtomicUsize::new(0));
+    let captured = validations.clone();
+    let mut registrations = ServeRegistrations::new();
+    registrations
+        .register_config_validator(
+            "stand_in",
+            Arc::new(move |_| {
+                captured.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let started = starts.clone();
+    registrations
+        .register_resident(crate::components::ResidentComponentRegistration::new(
+            "prebuilt-resident",
+            move |_, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            },
+        ))
+        .unwrap();
+    let channel = ProbeChannel::new("fixture", "prebuilt");
+    registrations.register_channel(channel.clone()).unwrap();
+    let result = super::serve_server_with_registrations(
+        server,
+        &args,
+        &crate::transport::TransportRegistry::new(),
+        None,
+        None,
+        registrations,
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.to_string().contains("use run_with_registrations")),
+        "prebuilt serving must refuse build-time callbacks with an actionable error"
+    );
+    assert_eq!(
+        validations.load(Ordering::SeqCst),
+        0,
+        "prebuilt refusal must not retroactively validate"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(channel.polls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_callbacks_require_a_local_stdio_host_without_changing_environment() {
+    use clap::Parser;
+    let mut registrations = ServeRegistrations::new();
+    registrations
+        .register_config_validator("stand_in", Arc::new(|_| Ok(())))
+        .unwrap();
+    for argv in [vec!["mcp"], vec!["mcp", "--transport", "stdio"]] {
+        let args = crate::args::Args::parse_from(argv);
+        let result = registrations.require_local_dispatch(&args, false);
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("KHIVE_NO_DAEMON=1")),
+            "forwarding stdio cannot carry process-local validators"
+        );
+        assert!(registrations.require_local_dispatch(&args, true).is_ok());
+        assert!(
+            ServeRegistrations::new()
+                .require_local_dispatch(&args, false)
+                .is_ok(),
+            "empty registration preserves existing forwarding behavior"
+        );
+    }
+    for argv in [
+        vec!["mcp", "--daemon"],
+        vec!["mcp", "--transport", "config-capture"],
+    ] {
+        assert!(registrations
+            .require_local_dispatch(&crate::args::Args::parse_from(argv), false)
+            .is_ok());
+    }
+}
+
 struct ProbeChannel {
     kind: &'static str,
     slug: &'static str,
