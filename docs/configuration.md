@@ -570,10 +570,16 @@ Library hosts use `ServeRegistrations::register_config_validator` and
 when comm is not loaded. The same callbacks remain installed for pack activation;
 checks must be pure and idempotent because validation may run more than once.
 
-On Unix, a stdio host carrying validators must run as the daemon or select local
+Hosts install custom address policies with `ServeRegistrations::register_send_route`.
+Each route receives the authorized runtime, namespace token, and original validated
+send parameters. The route owns persistence, replay handling, and transport submission;
+the core returns its result without adding a message or falling back to another route.
+Built-in transport and local actor address kinds cannot be overridden.
+
+On Unix, a stdio host carrying validators or send routes must run as the daemon or select local
 dispatch with `KHIVE_NO_DAEMON=1`; callbacks cannot be forwarded to another process.
 A custom transport is responsible for dispatching locally. The prebuilt
-`serve_server_with_registrations` API refuses validator-bearing bundles. A host
+`serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
 that configures `RuntimeConfig` before constructing its server can pass only its
 channels and residents to that prebuilt entrypoint.
 

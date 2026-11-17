@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use khive_channel::{Channel, ChannelRegistry};
 use khive_runtime::channel_section::{ChannelConfigValidator, ChannelConfigValidators};
+use khive_runtime::channel_send::{ChannelSendRoute, ChannelSendRoutes};
 use khive_runtime::RuntimeConfig;
 
 /// Caller-owned channels to compose with the host's configured builtin channels.
@@ -17,6 +18,7 @@ pub struct ServeRegistrations {
     channels: Vec<Arc<dyn Channel>>,
     residents: Vec<crate::components::ResidentComponentRegistration>,
     config_validators: Vec<(String, ChannelConfigValidator)>,
+    send_routes: Vec<(String, Arc<dyn ChannelSendRoute>)>,
 }
 
 impl ServeRegistrations {
@@ -45,20 +47,46 @@ impl ServeRegistrations {
         Ok(())
     }
 
+    /// Install a trusted component's complete send policy for a custom address kind.
+    ///
+    /// The callback owns persistence, replay handling, and transport submission.
+    /// Built-in transport and local actor address kinds cannot be overridden.
+    /// Use [`super::run_with_registrations`] so routes reach the runtime before
+    /// pack construction. Registration itself does not call or start the route.
+    pub fn register_send_route(
+        &mut self,
+        kind: impl Into<String>,
+        route: Arc<dyn ChannelSendRoute>,
+    ) -> anyhow::Result<()> {
+        let kind = kind.into();
+        let mut proposed = ChannelSendRoutes::default();
+        for (existing_kind, existing) in &self.send_routes {
+            proposed.register(existing_kind.clone(), existing.clone())?;
+        }
+        proposed.register(kind.clone(), route.clone())?;
+        self.send_routes.push((kind, route));
+        Ok(())
+    }
+
     pub(super) fn install_runtime_config(&self, config: &mut RuntimeConfig) -> anyhow::Result<()> {
         let mut proposed = config.channel_config_validators.clone();
         for (name, validator) in &self.config_validators {
             proposed.register(name.clone(), validator.clone())?;
         }
+        let mut routes = config.channel_send_routes.clone();
+        for (kind, route) in &self.send_routes {
+            routes.register(kind.clone(), route.clone())?;
+        }
         proposed.validate(&config.channel)?;
         config.channel_config_validators = proposed;
+        config.channel_send_routes = routes;
         Ok(())
     }
 
     pub(super) fn require_prebuilt_compatible(&self) -> anyhow::Result<()> {
-        if !self.config_validators.is_empty() {
+        if !self.config_validators.is_empty() || !self.send_routes.is_empty() {
             anyhow::bail!(
-                "configuration validators must be installed before server construction; \
+                "configuration validators and send routes must be installed before server construction; \
                  use run_with_registrations, or configure RuntimeConfig before building \
                  and pass only channels/residents to serve_server_with_registrations"
             );
@@ -72,13 +100,13 @@ impl ServeRegistrations {
         args: &crate::args::Args,
         daemon_disabled: bool,
     ) -> anyhow::Result<()> {
-        if !self.config_validators.is_empty()
+        if (!self.config_validators.is_empty() || !self.send_routes.is_empty())
             && !args.daemon
             && args.transport.as_deref().unwrap_or("stdio") == "stdio"
             && !daemon_disabled
         {
             anyhow::bail!(
-                "caller configuration validators cannot be forwarded over stdio to a daemon; \
+                "caller configuration validators and send routes cannot be forwarded over stdio to a daemon; \
                  use a daemon host or set KHIVE_NO_DAEMON=1 for local dispatch"
             );
         }

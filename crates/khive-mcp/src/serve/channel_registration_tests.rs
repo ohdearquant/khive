@@ -827,3 +827,387 @@ async fn real_persistent_startup_drives_captured_resident_with_shared_channels_a
         "supervisor must join the cancelled resident and record stopped"
     );
 }
+
+#[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+struct CombinedProofRoute {
+    channel: Arc<dyn Channel>,
+    seen: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+#[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+#[test]
+#[serial_test::serial(config_ledger)]
+fn route_registration_preserves_existing_bindings_and_requires_local_construction() {
+    let channel = ProbeChannel::new("fixture", "route-owner");
+    let route: Arc<dyn khive_runtime::channel_send::ChannelSendRoute> =
+        Arc::new(CombinedProofRoute {
+            channel,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+    let mut registrations = ServeRegistrations::new();
+    registrations
+        .register_send_route("fixture", route.clone())
+        .unwrap();
+    assert!(
+        registrations
+            .register_send_route("fixture", route.clone())
+            .is_err(),
+        "public route registration cannot replace an existing kind"
+    );
+    assert!(
+        registrations
+            .register_send_route("actor", route.clone())
+            .is_err(),
+        "public route registration preserves local actor addresses"
+    );
+    assert!(
+        registrations.require_prebuilt_compatible().is_err(),
+        "route-only bundles also require construction before serving"
+    );
+    #[cfg(unix)]
+    {
+        use clap::Parser;
+        let stdio = crate::args::Args::parse_from(["mcp"]);
+        assert!(
+            registrations.require_local_dispatch(&stdio, false).is_err(),
+            "route-only bundles cannot disappear through daemon forwarding"
+        );
+        assert!(registrations.require_local_dispatch(&stdio, true).is_ok());
+        assert!(registrations
+            .require_local_dispatch(&crate::args::Args::parse_from(["mcp", "--daemon"]), false)
+            .is_ok());
+    }
+
+    let mut config = khive_runtime::RuntimeConfig::no_embeddings();
+    config
+        .channel_send_routes
+        .register("fixture", route.clone())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    registrations
+        .register_config_validator(
+            "fixture",
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(
+        registrations.install_runtime_config(&mut config).is_err(),
+        "an installed route collision refuses the whole registration bundle"
+    );
+    assert!(Arc::ptr_eq(
+        &config
+            .channel_send_routes
+            .resolve("fixture:destination")
+            .unwrap()
+            .unwrap(),
+        &route
+    ));
+    config
+        .channel_config_validators
+        .validate(&config.channel)
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "route collision must not install or invoke proposed validators"
+    );
+
+    let mut invalid = ServeRegistrations::new();
+    invalid
+        .register_send_route("fixture", route.clone())
+        .unwrap();
+    invalid
+        .register_config_validator(
+            "fixture",
+            Arc::new(|_| {
+                Err(khive_runtime::RuntimeError::InvalidInput(
+                    "fixture rejected".into(),
+                ))
+            }),
+        )
+        .unwrap();
+    let mut empty = khive_runtime::RuntimeConfig::no_embeddings();
+    assert!(invalid.install_runtime_config(&mut empty).is_err());
+    assert!(
+        empty
+            .channel_send_routes
+            .resolve("fixture:destination")
+            .unwrap()
+            .is_none(),
+        "failed validation must not install the proposed route"
+    );
+    empty
+        .channel_config_validators
+        .validate(&empty.channel)
+        .unwrap();
+
+    registrations.install_runtime_config(&mut empty).unwrap();
+    assert!(
+        Arc::ptr_eq(
+            &empty
+                .channel_send_routes
+                .resolve("fixture:destination")
+                .unwrap()
+                .unwrap(),
+            &route
+        ),
+        "successful construction preserves the exact registered callback"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+impl khive_runtime::channel_send::ChannelSendRoute for CombinedProofRoute {
+    fn send<'a>(
+        &'a self,
+        _runtime: &'a khive_runtime::KhiveRuntime,
+        _token: &'a khive_runtime::NamespaceToken,
+        params: serde_json::Value,
+    ) -> khive_runtime::channel_send::ChannelSendFuture<'a> {
+        Box::pin(async move {
+            self.seen.lock().unwrap().push(params.clone());
+            let to = params["to"].as_str().ok_or_else(|| {
+                khive_runtime::RuntimeError::InvalidInput("stand-in recipient missing".into())
+            })?;
+            let content = params["content"].as_str().ok_or_else(|| {
+                khive_runtime::RuntimeError::InvalidInput("stand-in content missing".into())
+            })?;
+            self.channel
+                .send(ChannelEnvelope::new("fixture:sender", to, content))
+                .await
+                .map_err(|error| khive_runtime::RuntimeError::Internal(error.to_string()))?;
+            // This stand-in's complete send policy is transport-only. It deliberately
+            // makes no persistence/replay guarantee and the outer handler must not
+            // append a legacy message after returning this exact custom result.
+            Ok(serde_json::json!({"fixture": "sent"}))
+        })
+    }
+}
+
+#[cfg(not(any(feature = "channel-email", feature = "channel-telegram")))]
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn configured_resident_uses_shared_channel_and_actual_comm_route_then_stops() {
+    use clap::Parser;
+    use khive_runtime::{KhiveConfig, KhiveRuntime, RuntimeConfig};
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("component.toml");
+    std::fs::write(
+        &path,
+        "[channel.fixture]\nendpoint = 'fixture:destination'\nretries = 3\nlabels = ['one', 'two']\n[channel.fixture.nested]\nenabled = true\n",
+    )
+    .unwrap();
+    let loaded = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+    // Independent typed literal, not parse/serialize of the fixture text.
+    let expected_table = toml::Value::Table(toml::map::Map::from_iter([
+        (
+            "endpoint".into(),
+            toml::Value::String("fixture:destination".into()),
+        ),
+        ("retries".into(), toml::Value::Integer(3)),
+        (
+            "labels".into(),
+            toml::Value::Array(vec![
+                toml::Value::String("one".into()),
+                toml::Value::String("two".into()),
+            ]),
+        ),
+        (
+            "nested".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "enabled".into(),
+                toml::Value::Boolean(true),
+            )])),
+        ),
+    ]));
+    let validated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let validated_in_callback = validated.clone();
+    let channel = ProbeChannel::new("fixture", "resident-owned");
+    let route = Arc::new(CombinedProofRoute {
+        channel: channel.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut registrations = ServeRegistrations::new();
+    registrations.register_channel(channel.clone()).unwrap();
+    registrations
+        .register_config_validator(
+            "fixture",
+            Arc::new(move |raw| {
+                validated_in_callback.lock().unwrap().push(raw.cloned());
+                // Keep the semantic oracle at the named outer assertion below:
+                // dropped config must not fail a generic builder unwrap first.
+                Ok(())
+            }),
+        )
+        .unwrap();
+    registrations
+        .register_send_route("fixture", route.clone())
+        .unwrap();
+
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    registrations
+        .register_resident(crate::components::ResidentComponentRegistration::new(
+            "configured-channel-proof",
+            move |ctx, channels| {
+                let started = started_tx.clone();
+                let observed = observed_tx.clone();
+                let finished = finished_tx.clone();
+                Box::pin(async move {
+                    started
+                        .send((channels.clone(), ctx.cancellation().clone()))
+                        .unwrap();
+                    let selected = channels.get_by_slug("fixture", "resident-owned");
+                    let present = selected.is_some();
+                    let outcome = if let Some(selected) = selected {
+                        match selected.poll(Utc::now()).await {
+                            Ok(_) => Some(
+                                ctx.server()
+                                    .verb_registry_clone()
+                                    .dispatch(
+                                        "comm.send",
+                                        serde_json::json!({
+                                            "to": "fixture:destination",
+                                            "content": "literal component payload"
+                                        }),
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string()),
+                            ),
+                            Err(error) => Some(Err(error.to_string())),
+                        }
+                    } else {
+                        None
+                    };
+                    observed.send((present, outcome)).unwrap();
+                    ctx.cancellation().cancelled().await;
+                    finished.send(()).unwrap();
+                    Ok(())
+                })
+            },
+        ))
+        .unwrap();
+
+    let base = RuntimeConfig {
+        db_path: None,
+        actor_id: Some("actor:channel-proof".into()),
+        packs: vec!["kg".into(), "comm".into()],
+        gate: Arc::new(khive_runtime::AllowAllGate),
+        ..RuntimeConfig::no_embeddings()
+    };
+    let mut config = khive_runtime::runtime_config_from_khive_config(&loaded, base);
+    registrations.install_runtime_config(&mut config).unwrap();
+    let runtime = KhiveRuntime::new(config).unwrap();
+    let built =
+        crate::server::KhiveMcpServer::with_packs(runtime.clone(), &["kg".into(), "comm".into()]);
+    assert!(
+        built.is_ok(),
+        "actual CommPack registry must accept the registered validator"
+    );
+    let server = built.unwrap();
+    let observations = validated.lock().unwrap().clone();
+    assert!(
+        observations.len() >= 2,
+        "host preparation and CommPack activation both validate the component"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|value| value.as_ref() == Some(&expected_table)),
+        "actual CommPack build must receive the exact raw component table"
+    );
+
+    let args = crate::args::Args::parse_from(["mcp", "--daemon"]);
+    let prepared = super::startup::prepare_host_background_tasks_with_registrations(
+        &args,
+        &server,
+        &registrations,
+    )
+    .await
+    .unwrap();
+    let expected_registry = prepared.channels.clone();
+    let report = super::startup::start_host_background_tasks(&args, &server, None, prepared);
+    assert!(!report
+        .skipped_components
+        .iter()
+        .any(|name| name == "configured-channel-proof"));
+    let started = tokio::time::timeout(Duration::from_secs(5), started_rx.recv()).await;
+    assert!(
+        matches!(&started, Ok(Some(_))),
+        "actual startup must invoke the registered resident"
+    );
+    let (actual_registry, child_token) = started.unwrap().unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx.recv()).await;
+    // Always stop and settle the child before checking mutation-sensitive results.
+    // This is a supervisor child token, never the process-global token.
+    child_token.cancel();
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), finished_rx.recv()).await,
+            Ok(Some(()))
+        ),
+        "resident must observe host cancellation"
+    );
+    let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if crate::components::component_health()
+                .status("configured-channel-proof")
+                .is_some_and(|status| status.state == crate::components::ComponentState::Stopped)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "existing supervisor must join and record the resident stopped"
+    );
+    assert!(
+        Arc::ptr_eq(&actual_registry, &expected_registry),
+        "resident must receive the exact merged registry"
+    );
+    assert!(
+        matches!(&observed, Ok(Some((true, _)))),
+        "resident must resolve the caller channel from the shared registry"
+    );
+    let (_, outcome) = observed.unwrap().unwrap();
+    assert!(
+        matches!(&outcome, Some(Ok(value)) if value == &serde_json::json!({"fixture": "sent"})),
+        "actual comm.send must select the registered custom route: {outcome:?}"
+    );
+    assert_eq!(channel.polls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        channel.sends.load(Ordering::SeqCst),
+        1,
+        "custom route must invoke the registered channel send"
+    );
+    assert_eq!(
+        *route.seen.lock().unwrap(),
+        vec![
+            serde_json::json!({"to": "fixture:destination", "content": "literal component payload"})
+        ],
+        "comm route must preserve the original validated request"
+    );
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .count_notes("local", Some("message"))
+            .await
+            .unwrap(),
+        0,
+        "the core must not append a legacy message after the custom transport-only result"
+    );
+}

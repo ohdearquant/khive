@@ -70,6 +70,7 @@ pub use index_repair::IndexRepairReport;
 pub mod channel_section;
 #[cfg(test)]
 mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;

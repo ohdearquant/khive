@@ -362,6 +362,9 @@ pub struct RuntimeConfig {
     pub channel: crate::channel_section::ChannelSectionConfig,
     /// Host-supplied validators installed before pack registry construction.
     pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+    /// Trusted host routes for custom communication address kinds. These
+    /// process-local callbacks must be installed in the dispatching host.
+    pub channel_send_routes: crate::channel_send::ChannelSendRoutes,
 
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
@@ -664,6 +667,7 @@ impl Default for RuntimeConfig {
             mounts: Vec::new(),
             channel: crate::channel_section::ChannelSectionConfig::default(),
             channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
+            channel_send_routes: crate::channel_send::ChannelSendRoutes::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),

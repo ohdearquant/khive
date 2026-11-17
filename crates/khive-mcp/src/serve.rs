@@ -227,8 +227,8 @@ pub async fn serve_server(
 ///
 /// Exact builtin/caller `(kind, slug)` collisions refuse before background tasks start.
 /// Registration does not itself poll a caller channel; its host owns that drive.
-/// Validator-bearing bundles refuse here: use [`run_with_registrations`] to install
-/// them before construction. Independently built hosts may configure `RuntimeConfig`
+/// Bundles with validators or send routes refuse here: use [`run_with_registrations`]
+/// to install them before construction. Independently built hosts may configure `RuntimeConfig`
 /// before building and pass only channels/residents to this entrypoint.
 pub async fn serve_server_with_registrations(
     server: KhiveMcpServer,
