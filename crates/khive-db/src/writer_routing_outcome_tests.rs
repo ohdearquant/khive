@@ -133,7 +133,7 @@ async fn failed_commit_keeps_native_error_and_is_never_suppressed() {
         "native COMMIT refusal is stronger than delivery uncertainty"
     );
     let failure =
-        crate::error::native_write_failure(&error, khive_storage::SqliteWriteStage::Commit)
+        crate::error::native_write_failure(&error, khive_storage::error::SqliteWriteStage::Commit)
             .unwrap();
     assert_eq!(failure.primary_code, rusqlite::ffi::SQLITE_AUTH);
     assert!(

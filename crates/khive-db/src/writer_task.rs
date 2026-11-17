@@ -1867,7 +1867,7 @@ mod reply_evidence_tests {
                 .expect_err("retained failure");
             let failure = crate::error::native_write_failure(
                 &error,
-                khive_storage::SqliteWriteStage::Statement,
+                khive_storage::error::SqliteWriteStage::Statement,
             );
             let expected_code = if fail_commit {
                 rusqlite::ffi::SQLITE_AUTH
