@@ -31,7 +31,8 @@ const ATOM_FIELDS: &[&str] = &[
 /// their order; numbers, booleans and null are unchanged. A non-schema root uses
 /// the same pair representation rather than bypassing masking of unknown keys.
 ///
-/// Each object key and string leaf is scanned independently, as with `check_json`.
+/// Each object key and string leaf is scanned independently; contextual runtime
+/// admission is separate from this fixed v1 masking projection.
 /// Every detected span becomes `<secret:DETECTOR>` without credential characters,
 /// prefix, length or trigger. Unscanned suffixes become the fixed `<unscanned>`
 /// token. Scanner work is divided equally among all keys and string leaves before
@@ -303,10 +304,11 @@ mod tests {
     fn issue2995_digest_scans_properties_like_gate_without_sibling_context() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         let input = json!({"properties": {"password": id}});
-        assert!(super::super::check_json(&input).is_ok());
+        // Keep the v1 digest independent of the runtime's contextual JSON gate.
+        assert!(super::super::check(input["properties"]["password"].as_str().unwrap()).is_ok());
         assert_eq!(projected(&input)["properties"], json!([["password", id]]));
         let blocked = json!({"properties": {"value": format!("password={id}")}});
-        assert!(super::super::check_json(&blocked).is_err());
+        assert!(super::super::check(blocked["properties"]["value"].as_str().unwrap()).is_err());
         assert_eq!(
             projected(&blocked)["properties"],
             json!([["value", "password=<secret:uuid-near-trigger>"]])

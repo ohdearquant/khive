@@ -170,7 +170,9 @@ fn storage_class(error: &StorageError) -> AuditErrorClass {
         StorageError::AdmissionTimeout { .. }
         | StorageError::WriteQueueFull { .. }
         | StorageError::WriterTaskBusy { .. } => C::AdmissionExhausted,
-        StorageError::CapacityFloor { .. } => C::PolicyRefusal,
+        StorageError::CapacityFloor { .. } | StorageError::SecretDetected { .. } => {
+            C::PolicyRefusal
+        }
         StorageError::WriterTaskNoRuntime => C::Configuration,
         StorageError::Driver { source, .. } => {
             if matches!(
@@ -200,6 +202,26 @@ mod tests {
     use super::AuditErrorClass;
     use crate::error::{BatchAdmissionReport, BatchRefusal, DomainDisposition, RuntimeError};
     use khive_storage::{StorageError, WriterTaskRequestState};
+
+    #[test]
+    fn incoming_key_secret_is_a_policy_refusal_through_both_storage_routes() {
+        let key = format!("ghp_{}", "A".repeat(40));
+        for converted in [false, true] {
+            let storage =
+                khive_storage::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+                    .expect_err("the incoming key must be refused");
+            let runtime = if converted {
+                RuntimeError::from(storage)
+            } else {
+                RuntimeError::Storage(storage)
+            };
+            assert_eq!(
+                runtime.audit_error_class(),
+                AuditErrorClass::PolicyRefusal,
+                "a typed credential refusal is policy, not storage failure or invalid shape"
+            );
+        }
+    }
 
     #[test]
     fn batch_write_delegates_audit_class_without_changing_settlement() {
