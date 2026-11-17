@@ -114,13 +114,14 @@ impl Fixture {
 
     fn snapshot(&self, id: Uuid) -> Vec<rusqlite::types::Value> {
         let reader = self.pool.reader().unwrap();
-        let columns: usize = reader
+        let columns: i64 = reader
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('notes')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
+        let columns = usize::try_from(columns).expect("notes column count must fit usize");
         reader
             .query_row(
                 "SELECT rowid, * FROM notes WHERE id = ?1",
