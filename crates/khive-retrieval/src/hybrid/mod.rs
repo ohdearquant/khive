@@ -19,7 +19,9 @@ mod two_stage;
 pub use config::{HybridConfig, Query, DEFAULT_POOL_MULTIPLIER};
 #[cfg(feature = "native-rerank")]
 pub use cross_encoder::{
-    CrossEncoderScorer, NativeCrossEncoderModel, NativeCrossEncoderReranker, RerankDocumentResolver,
+    BertLoraGeometry, CrossEncoderScorer, CrossEncoderScores, LoraHook, LoraProjectionShape,
+    LoraTargetGeometry, NativeCrossEncoderModel, NativeCrossEncoderReranker, NativeRerankResult,
+    NoopLoraHook, RerankDocumentResolver,
 };
 pub use dual_index::{DualIndexConfig, DualIndexRouter, DualIndexStrategy};
 pub use identity::IdentityReranker;
