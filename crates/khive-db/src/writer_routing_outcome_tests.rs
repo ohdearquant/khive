@@ -92,10 +92,32 @@ async fn committed_reply_loss_has_real_row_and_keeps_writer_live() {
             value, "committed",
             "the missing reply must follow a real durable COMMIT"
         );
-        let healthy = writer.send(|conn| Ok(conn.is_autocommit())).await.unwrap();
+        let healthy = writer
+            .send_top_level(|conn| Ok(conn.is_autocommit()))
+            .await
+            .unwrap();
         assert!(
             healthy,
             "loss of one reply must not imply writer termination"
+        );
+        writer
+            .send(|conn| {
+                conn.execute("INSERT INTO outcome_probe VALUES(3,'healthy')", [])
+                    .map_err(|error| {
+                        StorageError::driver(StorageCapability::Sql, "fixture", error)
+                    })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let later: String = independent
+            .query_row("SELECT value FROM outcome_probe WHERE id=3", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            later, "healthy",
+            "the same writer must commit a later ordinary request after reply loss"
         );
     }
 }
