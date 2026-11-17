@@ -102,8 +102,8 @@ pub(super) async fn find_by_number(
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: sql!("notes_by_number_select").into(),
             params: vec![
                 SqlValue::Text(kind.to_string()),
@@ -115,7 +115,18 @@ pub(super) async fn find_by_number(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| r.uuid("id").ok()))
+    if rows.len() > 1 {
+        tracing::warn!(
+            target: "khive_pack_git::ingest",
+            kind,
+            namespace = token.namespace().as_str(),
+            project_id = %project_id,
+            number,
+            matched_at_least = 2_u64,
+            "multiple live notes match GitHub number; selecting first by stored ID"
+        );
+    }
+    Ok(rows.first().and_then(|row| row.uuid("id").ok()))
 }
 
 /// Find an existing `document` entity by exact `properties.source_uri`, then

@@ -67,10 +67,12 @@ use storage_topology::plan_configured_storage_targets;
 mod server_build;
 
 pub use server_build::{
-    build_server, build_server_from_multi_backend_registry, build_server_multi_backend,
-    build_server_multi_backend_with_db_anchor, build_server_with_explicit_namespace,
-    checkpoint_pool_for, enforce_strict_actor_mode, is_forwarding_client, mark_mcp_host_role,
-    mcp_max_readers, WiringSurface,
+    build_server, build_server_from_multi_backend_registry,
+    build_server_from_multi_backend_registry_with_catalog_verbosity, build_server_multi_backend,
+    build_server_multi_backend_with_catalog_verbosity, build_server_multi_backend_with_db_anchor,
+    build_server_multi_backend_with_db_anchor_and_catalog_verbosity,
+    build_server_with_explicit_namespace, checkpoint_pool_for, enforce_strict_actor_mode,
+    is_forwarding_client, mark_mcp_host_role, mcp_max_readers, WiringSurface,
 };
 
 #[cfg(unix)]
@@ -117,7 +119,8 @@ mod runtime_hooks;
 use disk_policy::{open_backend, open_backend_with_wal_ceiling};
 #[cfg(unix)]
 pub use events_socket_preflight::{
-    preflight_events_socket_for_boot, prepare_preflighted_daemon_store_plan,
+    preflight_daemon_configuration, preflight_events_socket_for_boot,
+    prepare_preflighted_daemon_store_plan,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;

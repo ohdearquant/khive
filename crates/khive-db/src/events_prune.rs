@@ -796,11 +796,13 @@ pub fn backup(target: &PruneTarget, plan: &Plan, dest: &Path) -> Result<BackupRe
             "rows by kind differ: source {counted:?}, copy {copied:?}"
         )));
     }
+    // Record where the copied store resolves now, so a receipt names the same file wherever apply runs.
+    let source_path = fs::canonicalize(&target.events_db)?;
     let receipt = BackupReceipt {
         classifier: CLASSIFIER.to_string(),
         digest: plan.digest.clone(),
         cutoff_us: plan.cutoff_us,
-        source: target.events_db.clone(),
+        source: source_path,
         backup_path: dest.to_path_buf(),
         bytes: fs::metadata(dest)?.len(),
         sha256: sha256_file(dest)?,
@@ -966,6 +968,9 @@ pub fn apply(target: &PruneTarget, options: &ApplyOptions) -> Result<ApplyReport
 
 /// Run the delete phase with an explicit start.
 ///
+/// The receipt's source and the target store must resolve to the same canonical path before the store is opened
+/// for writing or apply state is created.
+///
 /// The selection is recomputed against the pinned cutoff; the ids still selected, together with every id this run's
 /// expended-ID file shows in a batch (removed, skipped at delete time, or still present after a killed batch), must
 /// produce the authorized digest, or nothing is deleted. A batched row that no longer qualifies stays out of the
@@ -990,6 +995,37 @@ pub fn apply_at(
         return Err(PruneError::NoBackup(
             "the backup receipt is dated after this run's start".into(),
         ));
+    }
+    if !receipt.source.is_absolute() {
+        return Err(PruneError::NoBackup(format!(
+            "backup receipt source {} is a relative path, which would resolve against this run's \
+             working directory; take a new backup of prune target {}",
+            receipt.source.display(),
+            target.events_db.display()
+        )));
+    }
+    let source = fs::canonicalize(&receipt.source).map_err(|error| {
+        PruneError::NoBackup(format!(
+            "cannot resolve backup receipt source {} for prune target {}: {error}",
+            receipt.source.display(),
+            target.events_db.display()
+        ))
+    })?;
+    let target_path = fs::canonicalize(&target.events_db).map_err(|error| {
+        PruneError::NoBackup(format!(
+            "cannot resolve prune target {} for backup receipt source {}: {error}",
+            target.events_db.display(),
+            receipt.source.display()
+        ))
+    })?;
+    if source != target_path {
+        return Err(PruneError::NoBackup(format!(
+            "backup receipt source {} resolves to {}, not prune target {} ({})",
+            receipt.source.display(),
+            source.display(),
+            target.events_db.display(),
+            target_path.display()
+        )));
     }
 
     let conn = open_read_write(&target.events_db, options.busy_timeout)?;

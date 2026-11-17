@@ -363,7 +363,10 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 8] = [
                        empty result under the default filter does NOT mean the task doesn't \
                        exist; the response carries `filter_excluded` when the default filter \
                        is the reason the result is empty. Inspect legacy records \
-                       through list(kind=\"task\"); they are not silently rewritten.",
+                       through list(kind=\"task\"); they are not silently rewritten. \
+                       If more matching tasks exist, returns {tasks: [...], has_more: true}; \
+                       exhausted pages retain their existing array or metadata-object shape. \
+                       Continuation includes blocked and broken tasks, not only actionable work.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -423,20 +426,20 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 8] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                // khive #744 raised this cap as silent; khive #2679 added the signal.
                 description: "Maximum results (default 50). A `limit` above 200 is capped to \
                               200; when that happens the response becomes an object \
                               carrying `requested_limit`, `effective_limit`, and \
-                              `limit_clamped: true` instead of the usual bare task array \
-                              (the `filter_excluded`/`hint` object wrap carries the same \
-                              three fields too).",
+                              `limit_clamped: true` (including a `filter_excluded`/`hint` object). \
+                              Independently, any page with more matching rows returns an object \
+                              with `tasks` and `has_more: true`, even at or below 200. \
+                              No `has_more` field means no further match in that page's query snapshot.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "offset",
                 param_type: "integer",
                 required: false,
-                description: "Pagination offset (default 0).",
+                description: "Pagination offset (default 0). When `has_more` is true, add the number of returned tasks to this offset and keep the same filters. Separate pages use separate snapshots; concurrent changes can shift later pages.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

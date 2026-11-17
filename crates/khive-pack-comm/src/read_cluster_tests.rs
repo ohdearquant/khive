@@ -1269,3 +1269,454 @@ async fn attachment_page_batch_keeps_readable_siblings_and_owner_diagnostics() {
         );
     }
 }
+
+#[tokio::test]
+async fn nonmarking_read_preserves_stored_note_and_unread_inbox() {
+    let (runtime, token, registry) = fixture();
+    seed(&runtime, vec![message(1), message(2)]).await;
+    let store = runtime.notes(&token).unwrap();
+    let before = store.get_note(id(1)).await.unwrap().unwrap();
+    let inbox_before = registry
+        .dispatch("comm.inbox", json!({"status":"unread"}))
+        .await
+        .unwrap();
+    assert_eq!(inbox_before["messages"].as_array().unwrap().len(), 2);
+    for raw in [id(1).to_string(), short_id(id(1))] {
+        let result = registry
+            .dispatch("comm.read", json!({"id":raw,"mark":false}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_note(id(1)).await.unwrap().unwrap(),
+            before,
+            "nonmarking read must preserve the complete stored note and unread inbox membership"
+        );
+        assert_eq!(result["id"], short_id(id(1)));
+        assert_eq!(result["full_id"], id(1).to_string());
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["read"], false);
+        assert_eq!(result["properties"], before.properties.clone().unwrap());
+        assert_eq!(result["subject"], "subject 1");
+        assert_eq!(result["content"], "message 1");
+        assert_eq!(result["from"], "lambda:sender");
+        assert_eq!(result["to"], "lambda:reader");
+        assert_eq!(result["direction"], "inbound");
+        assert_eq!(result["attachments"], json!([]));
+        assert!(result.get("results").is_none());
+        let inbox_after = registry
+            .dispatch("comm.inbox", json!({"status":"unread"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            inbox_after["messages"], inbox_before["messages"],
+            "nonmarking read must preserve unread inbox rows and order"
+        );
+        assert_eq!(inbox_after["unread_count"], 2);
+    }
+}
+
+#[tokio::test]
+async fn nonmarking_read_reports_actual_read_state_and_body_opt_out() {
+    for (stored_read, expected_read) in [
+        (Some(json!(true)), true),
+        (Some(json!(false)), false),
+        (None, false),
+        (Some(Value::Null), false),
+        (Some(json!("true")), false),
+    ] {
+        let (runtime, token, registry) = fixture();
+        let mut note = message(1);
+        let props = note.properties.as_mut().unwrap().as_object_mut().unwrap();
+        if let Some(read) = stored_read {
+            props.insert("read".into(), read);
+        } else {
+            props.remove("read");
+        }
+        props.insert("untouched".into(), json!({"nested": [1, null, "keep"]}));
+        seed(&runtime, vec![note]).await;
+        let store = runtime.notes(&token).unwrap();
+        let before = store.get_note(id(1)).await.unwrap().unwrap();
+        for body in [true, false] {
+            let result = registry
+                .dispatch(
+                    "comm.read",
+                    json!({"id":id(1).to_string(),"mark":false,"body":body}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result["read"], expected_read,
+                "nonmarking fetch must report stored read semantics without rewriting properties"
+            );
+            assert_eq!(result["properties"], before.properties.clone().unwrap());
+            assert_eq!(result["status"], "success");
+            assert_eq!(result["id"], short_id(id(1)));
+            assert_eq!(result["full_id"], id(1).to_string());
+            assert!(result.get("mark_error").is_none());
+            assert!(result.get("marked").is_none());
+            if body {
+                assert_eq!(result["content"], "message 1");
+                assert_eq!(result["subject"], "subject 1");
+            } else {
+                assert_eq!(
+                    result.as_object().unwrap().len(),
+                    5,
+                    "body=false nonmarking fetch must contain only fetched-state metadata"
+                );
+                for field in [
+                    "subject",
+                    "content",
+                    "from",
+                    "to",
+                    "direction",
+                    "created_at",
+                    "attachments",
+                    "attachments_error",
+                ] {
+                    assert!(result.get(field).is_none(), "body=false exposed {field}");
+                }
+            }
+            assert_eq!(store.get_note(id(1)).await.unwrap().unwrap(), before);
+            let inbox = registry
+                .dispatch("comm.inbox", json!({"status":"unread"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                inbox["messages"].as_array().unwrap().len(),
+                usize::from(!expected_read)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_mark_default_true_and_existing_bulk_contract_stay_mutating() {
+    for explicit in [false, true] {
+        for body in [false, true] {
+            let (runtime, token, registry) = fixture();
+            seed(&runtime, vec![message(1), message(2), message(3)]).await;
+            for bulk in [false, true] {
+                let mut params = if bulk {
+                    json!({"ids":[id(3).to_string(),id(2).to_string(),id(3).to_string()],"body":body})
+                } else {
+                    json!({"id":id(1).to_string(),"body":body})
+                };
+                if explicit {
+                    params["mark"] = json!(true);
+                }
+                let result = registry.dispatch("comm.read", params).await.unwrap();
+                assert_eq!(result["status"], "success");
+                let rows: Vec<&Value> = if bulk {
+                    assert_eq!(result["requested_count"], 3);
+                    assert_eq!(result["unique_count"], 2);
+                    assert_eq!(result["marked_count"], 2);
+                    assert_eq!(result["failed_count"], 0);
+                    assert_eq!(
+                        full_ids(&result),
+                        vec![id(3).to_string(), id(2).to_string()]
+                    );
+                    result["results"].as_array().unwrap().iter().collect()
+                } else {
+                    vec![&result]
+                };
+                for row in rows {
+                    let row_id = Uuid::parse_str(row["full_id"].as_str().unwrap()).unwrap();
+                    let stored = runtime
+                        .notes(&token)
+                        .unwrap()
+                        .get_note(row_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        stored.properties.as_ref().unwrap()["read"],
+                        true,
+                        "omitted or true mark must retain the released mutation behavior"
+                    );
+                    assert_eq!(row["read"], true);
+                    if body {
+                        assert_eq!(row["content"], stored.content);
+                    } else {
+                        assert!(row.get("content").is_none());
+                    }
+                }
+            }
+            let inbox = registry
+                .dispatch("comm.inbox", json!({"status":"unread"}))
+                .await
+                .unwrap();
+            assert!(inbox["messages"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn nonmarking_read_rejects_bulk_and_invalid_mark_before_target_retrieval() {
+    let (runtime, token, registry) = fixture();
+    seed(&runtime, vec![message(1)]).await;
+    let before = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(id(1))
+        .await
+        .unwrap()
+        .unwrap();
+    for ids in [
+        json!([]),
+        json!([id(1).to_string()]),
+        json!([id(1).to_string(), id(1).to_string()]),
+    ] {
+        let reads = reader_acquisitions(&runtime);
+        let error = registry
+            .dispatch("comm.read", json!({"ids":ids,"mark":false}))
+            .await
+            .expect_err("nonmarking bulk must refuse");
+        assert!(matches!(error.refusal_source(), RuntimeError::InvalidInput(message)
+            if message == "read: mark=false requires a single `id`; `ids` is not supported"),
+            "mark=false with ids must refuse before target retrieval even when ids is empty: {error:?}");
+        assert_eq!(error.audit_error_class().as_str(), "invalid_params");
+        assert_eq!(reader_acquisitions(&runtime), reads);
+    }
+    for params in [
+        json!({"id":id(1).to_string(),"mark":null}),
+        json!({"id":id(1).to_string(),"mark":"false"}),
+        json!({"id":id(1).to_string(),"mark":0}),
+        json!({"id":id(1).to_string(),"ids":[],"mark":false}),
+        json!({"mark":false}),
+    ] {
+        let reads = reader_acquisitions(&runtime);
+        let error = registry.dispatch("comm.read", params).await.unwrap_err();
+        assert!(matches!(
+            error.refusal_source(),
+            RuntimeError::InvalidInput(_)
+        ));
+        assert_eq!(error.audit_error_class().as_str(), "invalid_params");
+        assert_eq!(reader_acquisitions(&runtime), reads);
+    }
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(id(1))
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn nonmarking_read_reuses_typed_target_admission() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        actor_id: Some("lambda:maintainer".into()),
+        brain_profile: None,
+        packs: vec!["kg".into(), "comm".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(crate::CommPack::new(runtime.clone()));
+    builder.with_actor_id(Some("lambda:reader".into()));
+    let registry = builder.build().unwrap();
+    let mut notes: Vec<Note> = (1..=7).map(message).collect();
+    notes[0].kind = "observation".into();
+    notes[1].namespace = "lambda:foreign".into();
+    notes[2].properties.as_mut().unwrap()["direction"] = json!("outbound");
+    notes[3].properties.as_mut().unwrap()["direction"] = json!("outbound");
+    notes[3].properties.as_mut().unwrap()["to_actor"] = json!("lambda:other");
+    notes[4].properties.as_mut().unwrap()["to_actor"] = json!("lambda:other");
+    notes[5]
+        .properties
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("to_actor");
+    notes[6].properties.as_mut().unwrap()["to_actor"] = json!("lambda:other");
+    notes[6].properties.as_mut().unwrap()["quarantined"] = json!(true);
+    seed(&runtime, notes.clone()).await;
+    for index in 1..=9 {
+        if index == 8 {
+            continue;
+        }
+        for mark in [false, true] {
+            let error = registry
+                .dispatch("comm.read", json!({"id":id(index).to_string(),"mark":mark}))
+                .await
+                .expect_err("unauthorized or invalid target must not expose a message");
+            let source = error.refusal_source();
+            if matches!(index, 2 | 9) {
+                assert!(matches!(source, RuntimeError::NotFound(_)),
+                    "nonmarking read must use the same target admission and preserve typed refusal: {error:?}");
+            } else {
+                assert!(matches!(source, RuntimeError::InvalidInput(_)),
+                    "nonmarking read must use the same target admission and preserve typed refusal: {error:?}");
+                let expected = match index {
+                    1 => format!("read: note {} is kind \"observation\", expected \"message\"", id(1)),
+                    3 => format!("read: message {} is outbound; only received (inbound) messages can be marked as read", id(3)),
+                    _ => "read: that message is not addressed to caller actor \"lambda:reader\"".into(),
+                };
+                assert!(
+                    matches!(source, RuntimeError::InvalidInput(message) if message == &expected)
+                );
+            }
+        }
+    }
+    for note in notes {
+        assert_eq!(
+            runtime
+                .backend()
+                .notes()
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            note
+        );
+    }
+}
+
+#[tokio::test]
+async fn nonmarking_read_preserves_typed_reader_timeout_and_recovers_without_marking() {
+    use std::time::Duration;
+    let (runtime, token, registry) = fixture();
+    seed(&runtime, vec![message(1)]).await;
+    let store = runtime.notes(&token).unwrap();
+    let before = store.get_note(id(1)).await.unwrap().unwrap();
+    let pool = runtime.backend().pool();
+    let checkout_timeout = pool.config().checkout_timeout;
+    let held_reader = pool.reader().expect("hold real reader permit");
+    assert_eq!(
+        pool.reader_acquisition_snapshot()
+            .available_reader_admission_slots,
+        0
+    );
+    tokio::time::pause();
+    let params = json!({"id":id(1).to_string(),"mark":false,"body":false});
+    let error = tokio::time::timeout(
+        checkout_timeout.saturating_mul(3) + Duration::from_secs(1),
+        registry.dispatch("comm.read", params.clone()),
+    )
+    .await
+    .expect("bounded admission wait")
+    .expect_err("real reader exhausted");
+    let RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+        operation,
+        timeout_ms,
+        pool_identity,
+    }) = error.refusal_source()
+    else {
+        panic!("nonmarking read erased the typed reader admission failure: {error:?}");
+    };
+    assert_eq!(operation.as_ref(), "get_note");
+    assert_eq!(
+        *timeout_ms,
+        u64::try_from(checkout_timeout.as_millis()).unwrap()
+    );
+    assert_eq!(pool_identity.as_deref(), Some(":memory:"));
+    let retry = error.retryable_failure_context().unwrap();
+    assert_eq!(retry.stage, "storage_admission_timeout");
+    assert_eq!(retry.operation.as_deref(), Some("get_note"));
+    let wire = khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+    assert_eq!(wire["kind"], "unavailable");
+    assert_eq!(wire["code"], "storage_admission_timeout");
+    assert_eq!(wire["retryable"], true);
+    assert_eq!(wire["operation"], "get_note");
+    drop(held_reader);
+    tokio::time::resume();
+    let result = registry.dispatch("comm.read", params).await.unwrap();
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["read"], false);
+    assert_eq!(store.get_note(id(1)).await.unwrap().unwrap(), before);
+}
+
+#[tokio::test]
+async fn nonmarking_read_rejects_nonempty_bulk_before_target_retrieval() {
+    let (runtime, token, registry) = fixture();
+    seed(&runtime, vec![message(1)]).await;
+    let store = runtime.notes(&token).unwrap();
+    let before = store.get_note(id(1)).await.unwrap().unwrap();
+    let reads = reader_acquisitions(&runtime);
+    let error = registry
+        .dispatch("comm.read", json!({"ids":[id(1).to_string()],"mark":false}))
+        .await
+        .expect_err("nonempty nonmarking bulk must refuse rather than mark its target");
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::InvalidInput(message)
+        if message == "read: mark=false requires a single `id`; `ids` is not supported")
+    );
+    assert_eq!(reader_acquisitions(&runtime), reads);
+    assert_eq!(store.get_note(id(1)).await.unwrap().unwrap(), before);
+}
+
+#[tokio::test]
+async fn nonmarking_read_rejects_null_ids_without_changing_default_marking() {
+    let (runtime, token, registry) = fixture();
+    seed(&runtime, vec![message(1), message(2), message(3)]).await;
+    let store = runtime.notes(&token).unwrap();
+    let before = store.get_note(id(1)).await.unwrap().unwrap();
+    let inbox_before = registry
+        .dispatch("comm.inbox", json!({"status":"unread"}))
+        .await
+        .unwrap();
+    assert_eq!(inbox_before["messages"].as_array().unwrap().len(), 3);
+    for params in [
+        json!({"id":id(1).to_string(),"ids":null,"mark":false}),
+        json!({"ids":null,"mark":false}),
+    ] {
+        let reads = reader_acquisitions(&runtime);
+        let error = registry
+            .dispatch("comm.read", params)
+            .await
+            .expect_err("supplied null ids must refuse a nonmarking fetch");
+        assert!(
+            matches!(error.refusal_source(), RuntimeError::InvalidInput(message)
+            if message == "read: mark=false requires a single `id`; `ids` is not supported"),
+            "supplied null ids must use the nonmarking bulk refusal even without id: {error:?}"
+        );
+        assert_eq!(error.audit_error_class().as_str(), "invalid_params");
+        assert_eq!(
+            reader_acquisitions(&runtime),
+            reads,
+            "null ids refusal must precede target retrieval"
+        );
+        assert_eq!(store.get_note(id(1)).await.unwrap().unwrap(), before);
+        let inbox_after = registry
+            .dispatch("comm.inbox", json!({"status":"unread"}))
+            .await
+            .unwrap();
+        assert_eq!(inbox_after["messages"], inbox_before["messages"]);
+        assert_eq!(inbox_after["unread_count"], 3);
+    }
+    for (index, explicit) in [(2, false), (3, true)] {
+        let mut params = json!({"id":id(index).to_string(),"ids":null});
+        if explicit {
+            params["mark"] = json!(true);
+        }
+        let response = registry.dispatch("comm.read", params).await.unwrap();
+        assert_eq!(
+            response["read"], true,
+            "default and true mark must keep null ids compatibility"
+        );
+        assert_eq!(
+            store
+                .get_note(id(index))
+                .await
+                .unwrap()
+                .unwrap()
+                .properties
+                .unwrap()["read"],
+            true
+        );
+    }
+    assert_eq!(store.get_note(id(1)).await.unwrap().unwrap(), before);
+    let inbox_after = registry
+        .dispatch("comm.inbox", json!({"status":"unread"}))
+        .await
+        .unwrap();
+    assert_eq!(inbox_after["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox_after["messages"][0]["full_id"], id(1).to_string());
+}
