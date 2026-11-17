@@ -529,22 +529,25 @@ impl ConnectionPool {
         cached: Option<&WriterTaskHandle>,
         operation: &'static str,
     ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        let unavailable = |source| StorageError::WriterOwnerUnavailable {
+            operation: operation.into(),
+            source: Box::new(source),
+        };
         let handle = match cached {
             Some(handle) => Some(handle.clone()),
             None => match self.writer_task_handle() {
                 Ok(handle) => handle,
-                Err(error) if self.config.write_routing_strict => return Err(error),
+                Err(error) if self.config.write_routing_strict => return Err(unavailable(error)),
                 Err(_) => None,
             },
         };
-
-        if handle.is_none() && self.config.write_routing_strict {
-            return Err(StorageError::Pool {
+        if self.config.write_routing_strict
+            && handle.as_ref().is_none_or(WriterTaskHandle::is_closed)
+        {
+            return Err(unavailable(StorageError::Pool {
                 operation: operation.into(),
-                message: "strict write routing requires a writer-task handle; no handle is \
-                          available, so the direct writer fallback was refused"
-                    .into(),
-            });
+                message: "strict write routing requires a live writer owner".into(),
+            }));
         }
         Ok(handle)
     }
@@ -678,6 +681,7 @@ impl ConnectionPool {
     /// this module. The native opener below is private to these factories.
     #[track_caller]
     pub(super) fn standalone_write_unit(&self) -> Result<StandaloneWriteUnit, SqliteError> {
+        self.ensure_request_write_route("standalone_write")?;
         if self.config.read_only {
             return Err(SqliteError::InvalidData(
                 "database is read-only: standalone write transactions are not permitted".into(),
@@ -722,6 +726,8 @@ impl ConnectionPool {
         self: Arc<Self>,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Box<dyn khive_storage::SqlWriter>, StorageError> {
+        self.ensure_request_write_route("sql_bridge_writer")
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;
         let conn = self
             .open_standalone_connection()
             .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;

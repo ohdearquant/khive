@@ -51,6 +51,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -252,6 +253,70 @@ impl WriteTelemetry {
     }
 }
 
+struct ReplyReceipt<R> {
+    commit_issued: AtomicBool,
+    completed: Mutex<Option<Result<R, StorageError>>>,
+}
+
+impl<R> Default for ReplyReceipt<R> {
+    fn default() -> Self {
+        Self {
+            commit_issued: AtomicBool::new(false),
+            completed: Mutex::new(None),
+        }
+    }
+}
+
+impl<R> ReplyReceipt<R> {
+    fn completed(&self) -> std::sync::MutexGuard<'_, Option<Result<R, StorageError>>> {
+        self.completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct PendingWrite<R> {
+    reply_rx: oneshot::Receiver<Result<R, StorageError>>,
+    receipt: Arc<ReplyReceipt<R>>,
+}
+
+impl<R> PendingWrite<R> {
+    async fn wait(self) -> Result<R, StorageError> {
+        match self.reply_rx.await {
+            Ok(result) => result,
+            Err(source) => {
+                // A computed error is stronger evidence than a missing delivery, including
+                // a known rollback or a native SQLite failure before COMMIT.
+                if let Some(Err(error)) = self.receipt.completed().take() {
+                    return Err(error);
+                }
+                if self.receipt.commit_issued.load(Ordering::Acquire) {
+                    Err(StorageError::WriteOutcomeUnknown {
+                        source: Box::new(source),
+                    })
+                } else {
+                    Err(writer_task_terminated(
+                        WriterTaskRequestState::SideEffectsUnknown,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+// Private drain tests also await the raw typed reply, without changing their assertions.
+#[cfg(test)]
+impl<R> std::future::Future for PendingWrite<R> {
+    type Output = Result<Result<R, StorageError>, oneshot::error::RecvError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::future::Future::poll(std::pin::Pin::new(&mut self.get_mut().reply_rx), cx)
+    }
+}
+
 /// One write request awaiting execution by the writer task.
 ///
 /// Carries a typed closure and a typed oneshot reply so that the concrete
@@ -269,6 +334,7 @@ impl WriteTelemetry {
 pub struct WriteRequest<R: Send + 'static> {
     op: WriteOp<R>,
     reply: oneshot::Sender<Result<R, StorageError>>,
+    receipt: Arc<ReplyReceipt<R>>,
     top_level: bool,
     /// Only the typed checkpoint entry point may bypass disk admission.
     checkpoint_bypass: bool,
@@ -422,6 +488,7 @@ where
         commit_operation,
         None,
         false,
+        None,
         operation,
         #[cfg(test)]
         None,
@@ -445,6 +512,7 @@ where
         commit_operation,
         Some(db),
         true,
+        None,
         operation,
         #[cfg(test)]
         None,
@@ -464,6 +532,7 @@ fn execute_wrapped_transaction_profiled<R, F>(
     commit_operation: &'static str,
     db: Option<&str>,
     direct_sql_bridge: bool,
+    commit_issued: Option<&AtomicBool>,
     operation: F,
     #[cfg(test)] test_clock: Option<&dyn TestWriterStageClock>,
 ) -> ProfiledWrappedTransaction<R>
@@ -495,7 +564,18 @@ where
             if let Some(clock) = test_clock {
                 clock.at_commit();
             }
+            if let Some(issued) = commit_issued {
+                issued.store(true, Ordering::Release);
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_hooks::commit_reply_issued(conn);
             let commit_outcome = conn.execute_batch("COMMIT");
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_hooks::commit_reply_completed(
+                conn,
+                commit_outcome.is_ok(),
+                conn.is_autocommit(),
+            );
             #[cfg(not(test))]
             let commit = commit_started.elapsed();
             #[cfg(test)]
@@ -635,11 +715,17 @@ where
 fn reply_with_admission<R>(
     reply: oneshot::Sender<Result<R, StorageError>>,
     mut admission: Option<AdmissionObservation>,
-    result: Result<R, StorageError>,
+    receipt: &ReplyReceipt<R>,
+    suppress: bool,
 ) {
     if let Some(observation) = admission.as_mut() {
         observation.reply_attempt();
     }
+    if suppress {
+        drop(reply);
+        return;
+    }
+    let result = receipt.completed().take().expect("completed writer result");
     let _ = reply.send(result);
 }
 
@@ -663,20 +749,25 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         let WriteRequest {
             op,
             reply,
+            receipt,
             telemetry,
             admission,
             ..
         } = *self;
+        #[cfg(any(test, feature = "test-support"))]
+        let reply_probe = crate::test_hooks::begin_commit_reply_request(conn);
         let profiled = execute_wrapped_transaction_profiled(
             conn,
             "writer_task_commit",
             Some(&telemetry.db),
             false,
+            Some(&receipt.commit_issued),
             op,
             #[cfg(test)]
             telemetry.test_clock.as_deref(),
         );
-        if let Err(error) = &profiled.result {
+        *receipt.completed() = Some(profiled.result);
+        if let Some(Err(error)) = receipt.completed().as_ref() {
             crate::timeout_sink::maybe_emit_sqlite_full(&telemetry.db, error);
         }
         // The reply wake can make the caller immediately observe the
@@ -692,7 +783,13 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         );
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
-        reply_with_admission(reply, admission, profiled.result);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let suppress = false;
+        #[cfg(any(test, feature = "test-support"))]
+        let suppress = reply_probe
+            .as_ref()
+            .is_some_and(|probe| probe.suppress_successful_reply());
+        reply_with_admission(reply, admission, &receipt, suppress);
         profiled.terminal_state
     }
 
@@ -704,6 +801,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         let WriteRequest {
             op,
             reply,
+            receipt,
             telemetry,
             admission,
             ..
@@ -713,23 +811,9 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             op(conn).map_err(crate::error::statement_failure)
         }));
         let body = body_started.elapsed();
-        let telemetry_db = telemetry.db.clone();
-        telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
-        match outcome {
-            Ok(outcome) if conn.is_autocommit() => {
-                // No COMMIT/ROLLBACK here: this request explicitly did not
-                // open a transaction, so there is nothing to close.
-                if let Err(error) = &outcome {
-                    crate::timeout_sink::maybe_emit_sqlite_full(&telemetry_db, error);
-                }
-                reply_with_admission(reply, admission, outcome);
-                None
-            }
+        let (result, terminal_state, open_transaction) = match outcome {
+            Ok(outcome) if conn.is_autocommit() => (outcome, None, false),
             Ok(outcome) => {
-                tracing::error!(
-                    "writer task: top-level request returned with an open transaction; request \
-                     side effects are unknown"
-                );
                 let request_state = WriterTaskRequestState::SideEffectsUnknown;
                 let error = match outcome {
                     Err(error) => writer_task_terminated_with_cause(
@@ -739,18 +823,28 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                     ),
                     Ok(_) => writer_task_terminated(request_state),
                 };
-                reply_with_admission(reply, admission, Err(error));
-                Some(request_state)
+                (Err(error), Some(request_state), true)
             }
             Err(_panic_payload) => {
-                // Statements completed before a top-level panic may already
-                // have autocommitted. Report the ambiguity; never invent a
-                // rollback for a request that opened no transaction.
-                let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                reply_with_admission(reply, admission, Err(writer_task_terminated(request_state)));
-                Some(request_state)
+                let state = WriterTaskRequestState::SideEffectsUnknown;
+                (Err(writer_task_terminated(state)), Some(state), false)
+            }
+        };
+        *receipt.completed() = Some(result);
+        let telemetry_db = telemetry.db.clone();
+        telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
+        if open_transaction {
+            tracing::error!(
+                "writer task: top-level request returned with an open transaction; request \
+                 side effects are unknown"
+            );
+        } else if terminal_state.is_none() {
+            if let Some(Err(error)) = receipt.completed().as_ref() {
+                crate::timeout_sink::maybe_emit_sqlite_full(&telemetry_db, error);
             }
         }
+        reply_with_admission(reply, admission, &receipt, false);
+        terminal_state
     }
 
     fn reply_error_after_begin(
@@ -761,17 +855,19 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
     ) {
         let WriteRequest {
             reply,
+            receipt,
             telemetry,
             admission,
             ..
         } = *self;
+        *receipt.completed() = Some(Err(err));
         telemetry.finish(
             queue_wait,
             transaction_acquire,
             Duration::ZERO,
             Duration::ZERO,
         );
-        reply_with_admission(reply, admission, Err(err));
+        reply_with_admission(reply, admission, &receipt, false);
     }
 }
 
@@ -920,9 +1016,28 @@ pub struct WriterTaskHandle {
     /// nonexistent budget.
     enqueue_timeout: std::time::Duration,
     admission_metrics: Arc<WriterAdmissionMetrics>,
+    strict_routing: bool,
 }
 
 impl WriterTaskHandle {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    fn unavailable_before_acceptance(&self) -> StorageError {
+        if self.strict_routing {
+            StorageError::WriterOwnerUnavailable {
+                operation: "writer_task_enqueue".into(),
+                source: Box::new(StorageError::Pool {
+                    operation: "writer_task_enqueue".into(),
+                    message: "writer owner is stopped".into(),
+                }),
+            }
+        } else {
+            writer_task_terminated(WriterTaskRequestState::NotStarted)
+        }
+    }
+
     /// Enqueue a write operation and return the oneshot receiver its reply
     /// will arrive on, once the request has actually been accepted onto the
     /// channel.
@@ -936,10 +1051,7 @@ impl WriterTaskHandle {
     /// returned receiver must be awaited without a timeout; abandoning it
     /// here would silently drop the request's eventual result, not cancel the
     /// request itself.
-    async fn enqueue<R, F>(
-        &self,
-        op: F,
-    ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
+    async fn enqueue<R, F>(&self, op: F) -> Result<PendingWrite<R>, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
@@ -960,12 +1072,13 @@ impl WriterTaskHandle {
         checkpoint_bypass: bool,
         vacuum_copy_headroom: bool,
         labels: SubmitLabels,
-    ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
+    ) -> Result<PendingWrite<R>, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let receipt = Arc::new(ReplyReceipt::default());
         // Normalize here (once per request) so every submit path — including
         // the public `send_labelled` entry points a caller can hand a raw
         // list — records distinct labels in first-seen order. Bounding stays
@@ -986,6 +1099,7 @@ impl WriterTaskHandle {
         let mut request = Box::new(WriteRequest {
             op: Box::new(op),
             reply: reply_tx,
+            receipt: Arc::clone(&receipt),
             top_level,
             checkpoint_bypass,
             vacuum_copy_headroom,
@@ -998,13 +1112,13 @@ impl WriterTaskHandle {
             .tx
             .reserve()
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::NotStarted))?;
+            .map_err(|_| self.unavailable_before_acceptance())?;
         if let Some(observation) = request.admission.as_mut() {
             observation.accepted();
         }
         permit.send(request);
 
-        Ok(reply_rx)
+        Ok(PendingWrite { reply_rx, receipt })
     }
 
     /// Send a write operation to the writer task and await its typed reply.
@@ -1019,9 +1133,7 @@ impl WriterTaskHandle {
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let reply_rx = self.enqueue(op).await?;
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -1080,9 +1192,7 @@ impl WriterTaskHandle {
             }
         };
 
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Like [`Self::send`], but bounds the enqueue-capacity wait with this
@@ -1122,9 +1232,7 @@ impl WriterTaskHandle {
         let reply_rx = self
             .enqueue_inner(op, true, false, false, SubmitLabels::None)
             .await?;
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Like [`Self::send_top_level`], but bounds the enqueue-capacity wait
@@ -1188,9 +1296,7 @@ impl WriterTaskHandle {
             }
         };
 
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -1288,6 +1394,7 @@ pub(crate) fn spawn_with_connection(
             pool.config().write_admission_deadline_ms,
         ),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: pool.config().write_routing_strict,
     })
 }
 
@@ -1699,3 +1806,85 @@ mod slow_write_label_tests;
 #[cfg(all(test, any(unix, windows)))]
 #[path = "writer_task_identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "writer_routing_outcome_tests.rs"]
+mod writer_routing_outcome_tests;
+
+#[cfg(test)]
+mod reply_evidence_tests {
+    use super::*;
+    use crate::test_hooks::TestHooks;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+    #[tokio::test]
+    async fn lost_delivery_retains_real_statement_and_commit_failures() {
+        for fail_commit in [false, true] {
+            let conn = crate::test_hooks::registered(Connection::open_in_memory().unwrap());
+            conn.execute_batch("CREATE TABLE receipt_probe(id INTEGER PRIMARY KEY); INSERT INTO receipt_probe VALUES(1); BEGIN IMMEDIATE").unwrap();
+            if fail_commit {
+                conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Unknown,
+                    } => Authorization::Deny,
+                    _ => Authorization::Allow,
+                }))
+                .unwrap();
+            }
+            let receipt = Arc::new(ReplyReceipt::default());
+            let profiled = execute_wrapped_transaction_profiled(
+                &conn,
+                "receipt_commit",
+                None,
+                false,
+                Some(&receipt.commit_issued),
+                |conn| {
+                    conn.execute(
+                        "INSERT INTO receipt_probe VALUES(?1)",
+                        [if fail_commit { 2 } else { 1 }],
+                    )
+                    .map_err(|error| {
+                        StorageError::driver(
+                            khive_storage::StorageCapability::Sql,
+                            "receipt_statement",
+                            error,
+                        )
+                    })
+                },
+                None,
+            );
+            assert!(
+                conn.is_autocommit(),
+                "both real failures must prove rollback before lost delivery"
+            );
+            assert_eq!(receipt.commit_issued.load(Ordering::Acquire), fail_commit);
+            *receipt.completed() = Some(profiled.result);
+            let (reply, reply_rx) = oneshot::channel();
+            drop(reply);
+            let error = PendingWrite { reply_rx, receipt }
+                .wait()
+                .await
+                .expect_err("retained failure");
+            let failure = crate::error::native_write_failure(
+                &error,
+                khive_storage::error::SqliteWriteStage::Statement,
+            );
+            let expected_code = if fail_commit {
+                rusqlite::ffi::SQLITE_AUTH
+            } else {
+                rusqlite::ffi::SQLITE_CONSTRAINT
+            };
+            assert!(
+                failure
+                    .is_some_and(|failure| failure.primary_code == expected_code
+                        && !failure.settlement_unknown),
+                "lost delivery must retain the real native code and known rollback: {error:?}"
+            );
+            assert!(!error.is_write_outcome_unknown());
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM receipt_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "real rollback preserves the original stored row");
+        }
+    }
+}
