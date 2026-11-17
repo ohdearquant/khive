@@ -2,7 +2,7 @@
 
 - Status: accepted (2026-08-01)
 - Date: 2026-07-30
-- Requirement (2026-08-09): the writer architecture is delegated to the maintainers, with one requirement: hundreds of processes must be able to run together against one store without problems. F6's outcome-unknown results serve it: many processes share one writer path, and none of them may repeat a write that may already have committed.
+- Requirement (2026-08-09): the writer architecture is delegated to the maintainers, with one requirement: hundreds of processes must be able to run together against one store without problems. What this ADR gives against it: the number of connected processes is not the limit, writer demand is. Hundreds of processes are inside the design envelope while aggregate writer utilization stays under the F7 thresholds; past them, a write that cannot be admitted gets a typed refusal after a bounded wait (F5), and a write whose commit cannot be confirmed reports an outcome-unknown result (F6) instead of being silently repeated. Whether a given deployment's hundreds of processes fit is decided by the F7 measurement, not by this text.
 
 ## Context
 
