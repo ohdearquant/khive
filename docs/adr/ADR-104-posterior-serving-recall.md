@@ -84,7 +84,8 @@ rank_score *= clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)
 
 This is the component that closes the visible loop: one `useful` signal on a recalled
 memory measurably lifts that memory's rank on the next equivalent query, under that
-profile, and nowhere else.
+profile, and nowhere else. Superseded by Amendment 6: the term is scaled by the evidence
+mass its posterior holds, so a single judgment no longer measurably lifts a memory.
 
 ### 3. Score breakdown exposure
 
@@ -141,11 +142,11 @@ extraction, and `entity_names: []` remains a full opt-out (#738 semantics unchan
 
 ## Staged landing
 
-| Stage | Contents                                                                     | Gate                                                                                        |
-| ----- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| A     | Serve-time projection (1) + `profile_id` override (4) + breakdown fields (3) | Unit tests proving profile-differentiated ranking; eval-set A/B run demonstrating the diff  |
-| B     | Per-entity posterior term (2)                                                | Feedback-lift test: one explicit `useful` signal changes next-query rank under that profile |
-| C     | Entity-anchored extraction (5)                                               | Eval rows for lowercase and CJK queries move as predicted; no regression on #738 tests      |
+| Stage | Contents                                                                     | Gate                                                                                                                                     |
+| ----- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| A     | Serve-time projection (1) + `profile_id` override (4) + breakdown fields (3) | Unit tests proving profile-differentiated ranking; eval-set A/B run demonstrating the diff                                               |
+| B     | Per-entity posterior term (2)                                                | Feedback-lift test: one explicit `useful` signal changes next-query rank under that profile (replaced by Amendment 6's Validation tests) |
+| C     | Entity-anchored extraction (5)                                               | Eval rows for lowercase and CJK queries move as predicted; no regression on #738 tests                                                   |
 
 Stages land as separate PRs in order; A carries the request/response shape changes, so
 B and C are additive behind already-shipped surface.
@@ -191,7 +192,8 @@ Two riders bind the stage gates (sign-off conditions, 2026-07-08):
    floor at Stage B.** Component 2 treats any posterior beyond the uninformative prior as
    informative; single-signal responsiveness is the point of the feedback-lift gate. If
    eval noise later proves visible, a minimum-evidence floor is a one-line adjustment —
-   revisit only with eval evidence.
+   revisit only with eval evidence. Revisited by Amendment 6, which scales the term by
+   evidence mass instead of adding a floor.
 3. **Bigram window for entity anchoring.** Component 5 starts with unigrams and
    adjacent-token bigrams. Longer entity names (3+ tokens) fall back to capitalized
    extraction or explicit `entity_names`; extending the window is a measured decision.
@@ -1184,3 +1186,165 @@ returned `score` unchanged by the factor; `min_score` applied to the adjusted sc
 `rank_score` equal to the five-term expression from its breakdown, with and without a duplicate pair present. The gate
 harness records `outside_factor` among the per-hit terms and refuses a response missing it, and its replay reports as
 uncertified any recall that returned fewer hits than requested or was cut by the character budget.
+
+## Amendment 6 (2026-11-18): Scale the per-entity term by its evidence
+
+**Status**: Accepted 2026-11-18 (#6763). Amends Section 2 (bounded per-entity posterior term). The term is scaled toward neutral by the
+evidence mass its posterior holds, in both directions. The bounds and the neutral value stay. Replaces Section 2's
+last paragraph (one `useful` signal measurably lifting the memory's rank), which no longer holds for a single
+judgment. It also revisits open question 2 (no evidence floor for the per-entity term), which sign-off resolved as no
+floor at Stage B, to be revisited only with eval evidence; the reading below is that evidence. Stage B's gate (one
+explicit `useful` changes the next query's rank) is replaced by the tests under Validation. Amendment 1's recovery
+magnitudes and its Stage D gate are read on `t0`, as stated under Change. Every other part of Section 2 and of
+Amendments 1 to 5 stands.
+
+### Problem, measured
+
+The measurement is a recall reading within one run on a frozen copy of the store at release 0.20.0: three question
+banks, 90 questions, each with its answer memories named, served once with no profile and once under each of four
+profiles.
+
+1. No profile beats the no-profile ranking on these banks. Two of the four profiles lose cases (two and one); the
+   other two tie it.
+2. Each lost case has the same shape. The answer sits at rank 10 with no posterior (term exactly 1.0). A memory from
+   rank 11 is lifted past it by a boost of 1.05 to 1.1008, from a posterior holding 1.0, 2.1 and 4.1 units of evidence
+   mass (two of the three carry weighted signals). Under the Beta(1, 1) prior the first judgment on a memory with no
+   other evidence is the largest single step the term takes: under the shipped mass one `useful` moves it by 5%, a
+   third of the bound, and a second adds 2.5%; under Amendment 2's table, 6.4% and then 2.6%.
+3. Most posteriors are thin, and they rarely meet the memory being asked for. Of the judged recalls after a cutoff
+   that leaves two thirds of each profile's judgments before it, 163 of 1,887 across the four profiles land on a
+   memory that profile had judged before the cutoff (204 counting any signal). On the banks, 12 of 90 questions have
+   an answer memory carrying a posterior under any of the 22 profiles in the store; under the four profiles read, 2,
+   7, 1 and 3.
+4. No global candidate-stage setting helps either. Fusion weights at four vector to keyword ratios, vector-only and
+   keyword-only fusion and two larger candidate depths were each read with no profile against today's ranking, under
+   a rule fixed before the run (a gain of at least one case in both halves of the banks, no bank worse by more than
+   one); none qualified. A zero temporal boost was read too and did not qualify (the first arm set a report-only knob
+   and was re-run on the ranking weight); a zero episodic boost cannot act on a store frozen weeks before the reading
+   and was void. Per-profile candidate settings were not measured. This amendment changes the profile's action where
+   it acts today, on the rank term.
+
+### Change
+
+```text
+t0          = clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)     (Section 2, unchanged)
+n           = the posterior's evidence mass (defined below)
+entity_term = 1 + (t0 - 1) * n / (n + k),   k = 16
+```
+
+- `n` is the posterior's evidence mass, defined once so it reads the same before and after Amendment 1: under
+  Amendment 1's decomposition it is `alpha_ev + beta_ev` after decay; in the shipped store, which keeps the prior
+  inside `(alpha, beta)`, it is `max(0, alpha + beta - 2)`. With no posterior the term stays exactly 1.0, as today.
+  The `max` keeps `n` from going negative on the shipped representation; under Amendment 1 evidence mass is never
+  negative by construction. Until Amendment 1 lands, the shipped form is the one in force.
+- The mass one judgment adds is set elsewhere and this amendment does not change it. In the shipped store an explicit
+  `useful`, `not_useful` or `wrong` adds 1.0 and weighted signals add their weight. Amendment 2's normative table,
+  effective at Stage D, gives `useful` and `not_useful` 1.5 and `wrong` 2.0.
+- Both halves scale. The defect is a thin posterior moving a memory across the rank 10 line, and that is the same
+  defect downward. The gate cannot show it, because an answer must carry a posterior to be demoted and 12 of 90
+  carry any, so no lost case from a demotion is an absence on an instrument blind to it. And the lower half is not
+  rare: `wrong` is 9 of the 1,887 judged recalls after the cutoff, but `not_useful` is 314 of them, a judgment about
+  one query that today demotes the memory for every later query.
+- The term reaches half of `t0 - 1` at an evidence mass of 16 (16 judgments under the shipped mass, about 11 `useful`
+  under Amendment 2's table) and approaches `t0` as evidence grows. The bounds do not change: the term stays within
+  [0.85, 1.15] and never moves past `t0`. Section 2's bounds were already reached only in the limit: under the
+  Beta(1, 1) prior and `w_ent = 0.3`, `|t0 - 1| = 0.15 * |S - F| / (n + 2)` for positive mass `S` and negative mass
+  `F`.
+- Under the prior, `t0 - 1` already carries a factor `n / (n + 2)` for unanimous evidence, so the scaled term is
+  small quadratically at small `n` (1/51 of the bound for one judgment at the shipped mass). That is the intent: a
+  single judgment should barely move a memory. A noisy posterior gets little from the scaling because `t0` is near 1.
+- Amendment 1's decay paragraph and its Stage D gate state recovery magnitudes for the multiplier computed from the
+  mean, `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)`, which this amendment calls `t0`. Those statements and the gate's
+  assertions are read on `t0` and stand as written. The served term is never further from neutral than `t0`, and under
+  Amendment 1 its `n` decays too, so it returns to the 0.02 band no later than `t0` does: a single correction
+  (`B = 2.0`) is within 0.02 of neutral as soon as it lands (0.83%). Stage D's tests assert the pinned magnitudes on
+  `t0` and add one assertion that the served term is within the band no later.
+- `k` is a fixed constant of the memory pack, like `w_ent`. A profile does not carry it.
+- The term now needs the posterior's evidence mass, not only its mean, so the scorer receives the posterior. The score
+  breakdown already reports `entity_posterior_mean`; it gains `n` so the term can be recomputed from the breakdown
+  alone.
+
+Worked numbers, the term's move from neutral:
+
+| evidence on one memory         | today, shipped mass | amended, shipped mass | today, Amendment 2 mass | amended, Amendment 2 mass |
+| ------------------------------ | ------------------- | --------------------- | ----------------------- | ------------------------- |
+| one `useful`                   | +5.00%              | +0.29%                | +6.43%                  | +0.55%                    |
+| one `not_useful`               | -5.00%              | -0.29%                | -6.43%                  | -0.55%                    |
+| one `wrong`                    | -5.00%              | -0.29%                | -7.50%                  | -0.83%                    |
+| 16 `useful`                    | +13.33%             | +6.67%                | +13.85%                 | +8.31%                    |
+| 10 `useful` and 8 `not_useful` | +1.50%              | +0.79%                | +1.55%                  | +0.97%                    |
+
+### Why k = 16
+
+An offline projection on the same reading's recorded hits, at the shipped mass. Each hit's score without the term is
+its `rank_score` divided by its recorded term and local factor (1.0 on every hit of this reading); a candidate rule
+gives each hit a new term from its posterior; each profile's 50 recorded hits are re-sorted, with the local factor
+multiplied back, and the top ten read. Three controls held before any rule was read: the recorded term equals today's
+formula on the stored posterior for all 18,000 hits; re-sorting with today's term reproduces every served profile top
+ten (360 of 360); re-sorting with no term reproduces the no-profile top ten in 357 of 360. In the three others the
+same ten memories come back in a different order, with scores differing by at most 2.3e-7 relative, at
+single-precision rounding; the cause was not separated between rounding and the clock. None of the three is a lost or
+won case under any rule. They are read as unresolved and excluded, which changes no count below. No rule produced a
+tie at the tenth place. The projection ignores any duplicate penalty; the second control shows that this reproduces
+the served order on this reading.
+
+| rule                                          | cases lost, four profiles | cases won | top-ten lists reordered (of 360) |
+| --------------------------------------------- | ------------------------- | --------- | -------------------------------- |
+| today                                         | 3                         | 0         | 129                              |
+| boost only, term clamped to [1, 1.15]         | 3                         | 0         | 124                              |
+| scaled, k = 1 / 2 / 4                         | 3 / 1 / 1                 | 0         | 110 / 96 / 84                    |
+| **scaled, k = 8 / 16**                        | 0 / 0                     | 0         | 59 / **35**                      |
+| boosts scaled, demotions as today, k = 2 / 4  | 1 / 1                     | 0         | 96 / 87                          |
+| boosts scaled, demotions as today, k = 8 / 16 | 0 / 0                     | 0         | 62 / 40                          |
+| stronger prior worth m judgments, m = 4 / 8   | 3 / 1                     | 0         | 113 / 91                         |
+| stronger prior worth m judgments, m = 16 / 32 | 0 / 0                     | 0         | 63 / 37                          |
+| stronger prior on boosts only, m = 16 / 32    | 0 / 0                     | 0         | 66 / 41                          |
+| minimum evidence n >= 2 / 3                   | 2 / 1                     | 0         | 82 / 60                          |
+| minimum evidence n >= 5 / 10                  | 0 / 0                     | 0         | 39 / 18                          |
+
+At `k = 2` and `k = 4` the one remaining loss is a single question under one profile, lifted past by a boost from a
+posterior of 4.1 units. The smallest tested `k` with no lost case is 8. The plan written before the projection
+proposed, among the scaled rules, the accepted one with the most reorders, which is `k = 8`. This amendment takes
+`k = 16` instead, one step past the smallest that passes, because `k = 8` is read off the same banks it is judged on,
+`k = 4` still loses a case, and a one-step margin is the least that does not rest on that one question. The price of
+the margin is 24 fewer reordered lists (59 to 35), that is, less profile effect, taken on purpose.
+
+### What this gives up
+
+- The visible loop of Section 2 weakens. A single `useful` no longer lifts a memory on the next equivalent query
+  except past a near tie; the lift becomes noticeable after several judgments on the same memory and reaches half
+  strength at an evidence mass of 16. Few memories collect that much: after the cutoff, 1,887 judged recalls fell on
+  1,476 distinct memories (counted per profile). Per-memory boosting becomes close to inactive in today's store; this
+  is a deliberate trade for not losing answers.
+- A single `wrong` no longer demotes a memory by 5%, only by about 0.3% (0.8% under Amendment 2's mass). A wrong
+  memory is corrected or superseded at the memory; the ranking term is not the remedy.
+- The change makes a profile harmless on the banks. It does not make one helpful: no rule above wins a case, because
+  the term can only help an answer that already carries evidence, and few do (Problem 3).
+
+### Alternatives considered
+
+| Alternative                                                                                                | Disposition                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Boost only: clamp the term to [1, 1.15]                                                                    | Rejected: every measured loss comes from a boost; it keeps all three.                                                                                                                                                                                                                                                                                      |
+| Scale boosts only, leave demotions at today's strength                                                     | Not chosen: it passes at the same `k` and reorders 40 lists against 35, but it leaves the same defect downward, where the gate cannot see it (few answers carry a posterior), and `not_useful`, 314 of 1,887 judged recalls after the cutoff, would keep demoting a memory for every query on one query's judgment.                                        |
+| A stronger prior in place of the second factor (the term reads the mean under a prior worth `m` judgments) | Not chosen: passes at `m = 16`, and at `m = 32` reorders like the chosen form within two lists. It changes what the reported mean means; the chosen form keeps Section 2's mean as reported and adds one factor.                                                                                                                                           |
+| Count only explicit judgments in `n`                                                                       | Not projected: the stored posterior does not separate explicit judgments from weighted signals, and Amendment 2 treats both as evidence.                                                                                                                                                                                                                   |
+| Minimum evidence: today's term only once `n` reaches a threshold                                           | Not chosen: `n >= 5` also loses nothing, but the term then jumps from 1.0 to its full value on one judgment; the scaled form moves continuously.                                                                                                                                                                                                           |
+| Margin: a boost may not pass an unevidenced neighbour by less than a set amount                            | Not projected: it is a pairwise rule with no per-hit form; not needed once a per-hit rule passes.                                                                                                                                                                                                                                                          |
+| A wider ceiling so evidence can lift an answer from ranks 11 to 50                                         | Deferred: with only the answer boosted, 1.15 lifts none of the 15 answers at ranks 11 to 50 into the top ten, 1.35 lifts 8 and 1.5 lifts 11, but 3 of those 15 carry any posterior, and a wider ceiling widens the boost on everything else too.                                                                                                           |
+| Per-profile fusion weights, candidate depth or age handling                                                | Not taken up: not measured per profile. The global readings in Problem 4 differ by question bank (for example a 2:1 fusion ratio gains one case on one bank and loses one on another), which is a property of the questions, not of a profile.                                                                                                             |
+| Learned per-profile priors over memory attributes                                                          | Rejected for now: memory age at judgment predicts later judgments strongly, and a fit pooled across profiles predicts as well as a per-profile one, which makes it a global ranking question. Of 44 per-profile attribute tests, 5 pass a per-profile rule; against a pooled age fit 2 of those add a little, neither surviving a correction for 44 tests. |
+
+### Validation
+
+Unit tests in the implementing change, each naming the mass it asserts (shipped unweighted, or Amendment 2's table):
+no posterior gives exactly 1.0; a posterior at the prior (`n = 0`) gives exactly 1.0; on the shipped representation a
+posterior below the prior's mass (`alpha + beta < 2`) gives `n = 0`; the term equals `1 + (t0 - 1) * n / (n + 16)`
+computed explicitly for one `useful`, one `not_useful`, one `wrong`, 16 `useful` and a weighted signal, at the shipped
+mass and at Amendment 2's; the term never leaves [0.85, 1.15] and never moves past `t0`; the breakdown carries `n` and
+the term recomputes from it; and the Section 2 tests that assert one `useful` lifts a memory past a neighbour are
+replaced by ones that assert the lift past a near tie and after an evidence mass of 16.
+
+Acceptance is a real run after the change, not the projection: the same reading within one run, no profile and all
+four profiles, with zero lost cases for every profile against the no-profile ranking and the count of reordered top-ten
+lists reported beside it (the projection's figure is 35).
