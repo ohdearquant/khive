@@ -84,7 +84,8 @@ rank_score *= clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)
 
 This is the component that closes the visible loop: one `useful` signal on a recalled
 memory measurably lifts that memory's rank on the next equivalent query, under that
-profile, and nowhere else.
+profile, and nowhere else. Superseded by Amendment 6: the term is scaled by the evidence
+mass its posterior holds, so a single judgment no longer measurably lifts a memory.
 
 ### 3. Score breakdown exposure
 
@@ -141,11 +142,11 @@ extraction, and `entity_names: []` remains a full opt-out (#738 semantics unchan
 
 ## Staged landing
 
-| Stage | Contents                                                                     | Gate                                                                                        |
-| ----- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| A     | Serve-time projection (1) + `profile_id` override (4) + breakdown fields (3) | Unit tests proving profile-differentiated ranking; eval-set A/B run demonstrating the diff  |
-| B     | Per-entity posterior term (2)                                                | Feedback-lift test: one explicit `useful` signal changes next-query rank under that profile |
-| C     | Entity-anchored extraction (5)                                               | Eval rows for lowercase and CJK queries move as predicted; no regression on #738 tests      |
+| Stage | Contents                                                                     | Gate                                                                                                                                     |
+| ----- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| A     | Serve-time projection (1) + `profile_id` override (4) + breakdown fields (3) | Unit tests proving profile-differentiated ranking; eval-set A/B run demonstrating the diff                                               |
+| B     | Per-entity posterior term (2)                                                | Feedback-lift test: one explicit `useful` signal changes next-query rank under that profile (replaced by Amendment 6's Validation tests) |
+| C     | Entity-anchored extraction (5)                                               | Eval rows for lowercase and CJK queries move as predicted; no regression on #738 tests                                                   |
 
 Stages land as separate PRs in order; A carries the request/response shape changes, so
 B and C are additive behind already-shipped surface.
@@ -191,7 +192,8 @@ Two riders bind the stage gates (sign-off conditions, 2026-07-08):
    floor at Stage B.** Component 2 treats any posterior beyond the uninformative prior as
    informative; single-signal responsiveness is the point of the feedback-lift gate. If
    eval noise later proves visible, a minimum-evidence floor is a one-line adjustment —
-   revisit only with eval evidence.
+   revisit only with eval evidence. Revisited by Amendment 6, which scales the term by
+   evidence mass instead of adding a floor.
 3. **Bigram window for entity anchoring.** Component 5 starts with unigrams and
    adjacent-token bigrams. Longer entity names (3+ tokens) fall back to capitalized
    extraction or explicit `entity_names`; extending the window is a measured decision.
@@ -1192,8 +1194,9 @@ evidence mass its posterior holds, in both directions. The bounds and the neutra
 last paragraph (one `useful` signal measurably lifting the memory's rank), which no longer holds for a single
 judgment. It also revisits open question 2 (no evidence floor for the per-entity term), which sign-off resolved as no
 floor at Stage B, to be revisited only with eval evidence; the reading below is that evidence. Stage B's gate (one
-explicit `useful` changes the next query's rank) is replaced by the tests under Validation. Every other part of
-Section 2 and of Amendments 1 to 5 stands.
+explicit `useful` changes the next query's rank) is replaced by the tests under Validation. Amendment 1's recovery
+magnitudes and its Stage D gate are read on `t0`, as stated under Change. Every other part of Section 2 and of
+Amendments 1 to 5 stands.
 
 ### Problem, measured
 
@@ -1233,7 +1236,7 @@ entity_term = 1 + (t0 - 1) * n / (n + k),   k = 16
   Amendment 1's decomposition it is `alpha_ev + beta_ev` after decay; in the shipped store, which keeps the prior
   inside `(alpha, beta)`, it is `max(0, alpha + beta - 2)`. With no posterior the term stays exactly 1.0, as today.
   The `max` keeps `n` from going negative on the shipped representation; under Amendment 1 evidence mass is never
-  negative by construction.
+  negative by construction. Until Amendment 1 lands, the shipped form is the one in force.
 - The mass one judgment adds is set elsewhere and this amendment does not change it. In the shipped store an explicit
   `useful`, `not_useful` or `wrong` adds 1.0 and weighted signals add their weight. Amendment 2's normative table,
   effective at Stage D, gives `useful` and `not_useful` 1.5 and `wrong` 2.0.
@@ -1250,6 +1253,12 @@ entity_term = 1 + (t0 - 1) * n / (n + k),   k = 16
 - Under the prior, `t0 - 1` already carries a factor `n / (n + 2)` for unanimous evidence, so the scaled term is
   small quadratically at small `n` (1/51 of the bound for one judgment at the shipped mass). That is the intent: a
   single judgment should barely move a memory. A noisy posterior gets little from the scaling because `t0` is near 1.
+- Amendment 1's decay paragraph and its Stage D gate state recovery magnitudes for the multiplier computed from the
+  mean, `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)`, which this amendment calls `t0`. Those statements and the gate's
+  assertions are read on `t0` and stand as written. The served term is never further from neutral than `t0`, and under
+  Amendment 1 its `n` decays too, so it returns to the 0.02 band no later than `t0` does: a single correction
+  (`B = 2.0`) is within 0.02 of neutral as soon as it lands (0.83%). Stage D's tests assert the pinned magnitudes on
+  `t0` and add one assertion that the served term is within the band no later.
 - `k` is a fixed constant of the memory pack, like `w_ent`. A profile does not carry it.
 - The term now needs the posterior's evidence mass, not only its mean, so the scorer receives the posterior. The score
   breakdown already reports `entity_posterior_mean`; it gains `n` so the term can be recomputed from the breakdown
@@ -1294,10 +1303,11 @@ the served order on this reading.
 | minimum evidence n >= 5 / 10                  | 0 / 0                     | 0         | 39 / 18                          |
 
 At `k = 2` and `k = 4` the one remaining loss is a single question under one profile, lifted past by a boost from a
-posterior of 4.1 units. The smallest `k` with no lost case is 8. The plan written before the projection proposed the
-accepted rule with the most reorders, which is `k = 8`. This amendment takes `k = 16` instead, one step past the
-smallest that passes, because `k = 8` is read off the same banks it is judged on, `k = 4` still loses a case, and a
-one-step margin is the least that does not rest on that one question. The cost is 24 reorders (59 to 35).
+posterior of 4.1 units. The smallest tested `k` with no lost case is 8. The plan written before the projection
+proposed, among the scaled rules, the accepted one with the most reorders, which is `k = 8`. This amendment takes
+`k = 16` instead, one step past the smallest that passes, because `k = 8` is read off the same banks it is judged on,
+`k = 4` still loses a case, and a one-step margin is the least that does not rest on that one question. The price of
+the margin is 24 fewer reordered lists (59 to 35), that is, less profile effect, taken on purpose.
 
 ### What this gives up
 
