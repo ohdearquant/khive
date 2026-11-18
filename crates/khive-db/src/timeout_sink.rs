@@ -173,6 +173,28 @@ pub(crate) fn slow_write_threshold() -> Option<Duration> {
     }
 }
 
+/// Opt-in per-attempt mode: when set to a non-zero integer, every completed
+/// writer-task attempt writes one `writer_attempt` row (its four stage
+/// intervals, queue depth at entry, request id, labels, change count and
+/// outcome), not only the writes that cross the slow-write threshold. Read
+/// once per spawned `WriterTask` handle. Meant for load measurement: it turns
+/// the sink into a write log, so it stays off by default.
+const WRITER_ATTEMPT_LOG_ENV: &str = "KHIVE_WRITER_ATTEMPT_LOG";
+
+/// Row kind of a per-attempt record.
+pub(crate) const WRITER_ATTEMPT_KIND: &str = "writer_attempt";
+
+/// Sequence of `writer_attempt` rows this process has offered to the sink.
+/// Taken before the enqueue, so a row dropped on a full channel still uses
+/// its number and leaves a gap a reader can count.
+static WRITER_ATTEMPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the per-attempt mode: on when [`WRITER_ATTEMPT_LOG_ENV`] parses to
+/// a non-zero integer.
+pub(crate) fn writer_attempt_log_enabled() -> bool {
+    crate::env::env_parse_or(WRITER_ATTEMPT_LOG_ENV, 0u64) != 0
+}
+
 /// Per-process NDJSON file name — see the module docs' "FILES ARE
 /// PER-PROCESS" section for why this is not a single shared file.
 fn ndjson_file_name() -> String {
@@ -356,6 +378,7 @@ struct QueuedEvent {
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
     labels: Option<SlowWriteLabels>,
+    attempt: Option<WriterAttemptFields>,
 }
 
 /// Bounded labels carried on a `"slow_write"` row: at most
@@ -366,6 +389,22 @@ pub(crate) struct SlowWriteLabels {
     pub(crate) labels: Box<[String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) labels_truncated: Option<u64>,
+}
+
+/// The fields a `writer_attempt` row adds beside the stage intervals and
+/// labels. `attempt_seq` counts every attempt this process offered to the
+/// sink, in order, so a reader finds rows lost to a full channel as gaps in
+/// the sequence. `rows_changed` is SQLite's change count over the attempt,
+/// which still counts rows a rolled-back attempt touched; `outcome` says
+/// whether the caller received success.
+#[derive(Clone, serde::Serialize)]
+struct WriterAttemptFields {
+    attempt_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<u64>,
+    outcome: &'static str,
+    rows_changed: u64,
+    top_level: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -420,6 +459,8 @@ struct EventRecord<'a> {
     writer_stages: Option<WriterStageFields>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     labels: Option<SlowWriteLabels>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    attempt: Option<WriterAttemptFields>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -439,6 +480,7 @@ fn build_line(
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
     labels: Option<SlowWriteLabels>,
+    attempt: Option<WriterAttemptFields>,
     pid: Option<u32>,
     version: Option<&str>,
 ) -> String {
@@ -454,6 +496,7 @@ fn build_line(
         queue_depth,
         writer_stages,
         labels,
+        attempt,
         pid,
         version,
     };
@@ -483,6 +526,7 @@ fn build_line_now(
         None,
         error,
         timeout_ms,
+        None,
         None,
         None,
         None,
@@ -724,11 +768,18 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.queue_depth,
         event.writer_stages,
         event.labels,
+        event.attempt,
         None,
         None,
     );
     if sink.write_line(&line) {
-        sink.sync();
+        // A per-attempt row is one of many per second under load and is
+        // measurement, not an alarm: it is appended without the fsync the
+        // failure-shaped rows pay. A crash can lose the tail, which the
+        // sequence gap then shows.
+        if event.kind != WRITER_ATTEMPT_KIND {
+            sink.sync();
+        }
     } else {
         dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -1000,6 +1051,7 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1024,6 +1076,7 @@ pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1075,6 +1128,7 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     }
 }
 
@@ -1099,6 +1153,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1123,6 +1178,7 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1146,6 +1202,7 @@ pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1279,6 +1336,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1312,6 +1370,57 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
             total_micros: stages.total_micros,
         }),
         labels: Some(slow_write_labels_from(stages)),
+        attempt: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// What one writer attempt did, beside its stage intervals.
+pub(crate) struct WriterAttempt {
+    pub(crate) request_id: Option<u64>,
+    pub(crate) succeeded: bool,
+    pub(crate) rows_changed: u64,
+    pub(crate) top_level: bool,
+}
+
+/// Record a `writer_attempt` row for one completed writer-task attempt, in
+/// per-attempt mode. Same non-blocking enqueue as every other row: a full
+/// channel drops the row and counts it, and the sequence number it already
+/// took leaves a gap.
+pub(crate) fn emit_writer_attempt(
+    db: &str,
+    stages: &crate::writer_task::WriterStageObservation,
+    attempt: WriterAttempt,
+) {
+    let attempt_seq = WRITER_ATTEMPT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(handle) = lifecycle::route(db) else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: WRITER_ATTEMPT_KIND,
+        db: db.to_string(),
+        site: None,
+        phase: None,
+        error: None,
+        timeout_ms: None,
+        elapsed_ms: Some(stages.total_micros / 1_000),
+        queue_depth: Some(stages.queue_depth_at_entry),
+        writer_stages: Some(WriterStageFields {
+            queue_wait_micros: stages.queue_wait_micros,
+            transaction_acquire_micros: stages.transaction_acquire_micros,
+            body_micros: stages.body_micros,
+            commit_micros: stages.commit_micros,
+            total_micros: stages.total_micros,
+        }),
+        labels: Some(slow_write_labels_from(stages)),
+        attempt: Some(WriterAttemptFields {
+            attempt_seq,
+            request_id: attempt.request_id,
+            outcome: if attempt.succeeded { "ok" } else { "error" },
+            rows_changed: attempt.rows_changed,
+            top_level: attempt.top_level,
+        }),
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }

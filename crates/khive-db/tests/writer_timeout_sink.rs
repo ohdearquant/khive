@@ -839,4 +839,149 @@ async fn slow_write_disabled_by_zero_threshold_emits_nothing() {
             .any(|l| l.contains("\"kind\":\"slow_write\"") && l.contains(&db_marker)),
         "threshold 0 must disable slow_write rows for this db, got: {contents}"
     );
+    assert!(
+        !contents
+            .lines()
+            .any(|l| l.contains("\"kind\":\"writer_attempt\"") && l.contains(&db_marker)),
+        "a handle spawned without KHIVE_WRITER_ATTEMPT_LOG must write no writer_attempt rows, \
+         got: {contents}"
+    );
+}
+
+/// Per-attempt mode writes one `writer_attempt` row for every queued write,
+/// fast ones included, each carrying the request id scoped on the submitting
+/// task, its stage intervals, the change count and the outcome. The slow-write
+/// threshold is disabled for this handle, so every row seen here comes from
+/// per-attempt mode and none from the threshold.
+#[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
+async fn per_attempt_mode_writes_one_row_per_attempt_joined_by_request_id() {
+    ensure_sink_dir();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("writer_attempt_rows_test.db");
+    let handle = {
+        let _guard = SLOW_ENV_LOCK.lock().unwrap();
+        std::env::set_var("KHIVE_SLOW_WRITE_THRESHOLD_MS", "0");
+        std::env::set_var("KHIVE_WRITER_ATTEMPT_LOG", "1");
+        let cfg = PoolConfig {
+            path: Some(db_path.clone()),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::for_test()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+        let handle = pool
+            .writer_task_handle()
+            .expect("runtime is present")
+            .expect("write queue enabled must spawn a writer task");
+        std::env::remove_var("KHIVE_WRITER_ATTEMPT_LOG");
+        std::env::remove_var("KHIVE_SLOW_WRITE_THRESHOLD_MS");
+        handle
+    };
+
+    handle
+        .send(|conn| {
+            conn.execute_batch("CREATE TABLE attempt_rows(id INTEGER PRIMARY KEY)")
+                .map_err(|e| khive_storage::StorageError::Pool {
+                    operation: "attempt_rows_setup".into(),
+                    message: e.to_string(),
+                })
+        })
+        .await
+        .expect("setup write should succeed");
+
+    let inserted = khive_storage::scope_request_correlation(
+        Some(770_001),
+        handle.send(|conn| {
+            conn.execute_batch(
+                "INSERT INTO attempt_rows VALUES (1); \
+                 INSERT INTO attempt_rows VALUES (2); \
+                 INSERT INTO attempt_rows VALUES (3);",
+            )
+            .map_err(|e| khive_storage::StorageError::Pool {
+                operation: "attempt_rows_insert".into(),
+                message: e.to_string(),
+            })
+        }),
+    )
+    .await;
+    inserted.expect("three-row write should succeed");
+
+    let refused: Result<(), _> = khive_storage::scope_request_correlation(
+        Some(770_002),
+        handle.send(|conn| {
+            conn.execute_batch("INSERT INTO attempt_rows VALUES (4)")
+                .map_err(|e| khive_storage::StorageError::Pool {
+                    operation: "attempt_rows_refused".into(),
+                    message: e.to_string(),
+                })?;
+            Err(khive_storage::StorageError::Pool {
+                operation: "attempt_rows_refused".into(),
+                message: "refused after one insert".into(),
+            })
+        }),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "the refusing write must reach its caller as an error"
+    );
+
+    let canonical_db: PathBuf = db_path.canonicalize().unwrap_or(db_path);
+    let db_marker = canonical_db.display().to_string();
+    let rows_for_db = |contents: &str| -> Vec<serde_json::Value> {
+        contents
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"writer_attempt\"") && l.contains(&db_marker))
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let contents = wait_for_ndjson_line(
+        |line| {
+            line.contains("\"kind\":\"writer_attempt\"")
+                && line.contains(&db_marker)
+                && line.contains("\"request_id\":770002")
+        },
+        Duration::from_secs(5),
+    );
+    let rows = rows_for_db(&contents);
+    for id in [770_001u64, 770_002] {
+        assert_eq!(
+            rows.iter().filter(|row| row["request_id"] == id).count(),
+            1,
+            "exactly one writer_attempt row for request {id}, got: {contents}"
+        );
+    }
+    let by_request = |id: u64| {
+        rows.iter()
+            .find(|row| row["request_id"] == id)
+            .unwrap_or_else(|| panic!("no writer_attempt row for request {id}: {contents}"))
+    };
+    let insert = by_request(770_001);
+    assert_eq!(insert["outcome"], "ok", "{insert}");
+    assert_eq!(insert["rows_changed"], 3, "{insert}");
+    assert_eq!(insert["top_level"], false, "{insert}");
+    for key in [
+        "queue_wait_micros",
+        "transaction_acquire_micros",
+        "body_micros",
+        "commit_micros",
+        "total_micros",
+        "queue_depth",
+        "attempt_seq",
+    ] {
+        assert!(insert[key].is_u64(), "{key} missing on {insert}");
+    }
+    let refused_row = by_request(770_002);
+    assert_eq!(refused_row["outcome"], "error", "{refused_row}");
+    assert_eq!(refused_row["rows_changed"], 1, "{refused_row}");
+    assert!(
+        refused_row["attempt_seq"].as_u64() > insert["attempt_seq"].as_u64(),
+        "attempt_seq must increase in completion order: {insert} then {refused_row}"
+    );
+    let setup = rows
+        .iter()
+        .find(|row| row.get("request_id").is_none())
+        .unwrap_or_else(|| panic!("the unscoped setup write must carry no request_id: {contents}"));
+    assert_eq!(setup["outcome"], "ok", "{setup}");
 }
