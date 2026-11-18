@@ -68,6 +68,10 @@ mod index_repair;
 #[cfg(feature = "native-rerank")]
 pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
@@ -77,9 +81,6 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
-pub mod node_config;
-#[cfg(test)]
-mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;

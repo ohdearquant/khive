@@ -14,6 +14,8 @@ pub use handlers::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
 pub use pack::CommPack;
 
 #[cfg(test)]
+mod channel_route_tests;
+#[cfg(test)]
 mod email_admission_tests;
 #[cfg(test)]
 mod idempotency_tests;

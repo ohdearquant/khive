@@ -138,7 +138,7 @@ pub(crate) async fn handle_send_with_route(
     params: Value,
     route: Option<&dyn crate::node_route::NodeSendRoute>,
 ) -> Result<Value, RuntimeError> {
-    let p: SendParams = deser(params)?;
+    let p: SendParams = deser(params.clone())?;
     // Classify the recipient exactly as written, before anything can read or write. A node
     // address with no route installed is refused as disabled here and never falls through to the
     // local actor-label path; a padded node address is refused rather than trimmed.
@@ -195,6 +195,13 @@ pub(crate) async fn handle_send_with_route(
              reply-thread routing in multi-actor deployments. \
              Set [actor] id in khive.toml to fix (issue #200)."
         );
+    }
+
+    if let Some(channel_route) = runtime.config().channel_send_routes.resolve(&p.to)? {
+        if let Some(key) = p.idempotency_key.as_deref() {
+            khive_runtime::keyed_memory::validate_memory_key(key)?;
+        }
+        return channel_route.send(runtime, token, params).await;
     }
 
     let sent_at = Utc::now().to_rfc3339();
