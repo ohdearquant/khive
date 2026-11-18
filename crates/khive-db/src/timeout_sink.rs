@@ -465,6 +465,78 @@ struct EventRecord<'a> {
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sqlite: Option<SqliteIdentity>,
+}
+
+/// The SQLite library this process links, as that library reports itself:
+/// `sqlite_version()`, `sqlite_source_id()` and `PRAGMA compile_options`.
+/// Carried on the `startup` row so a measurement read from this sink names
+/// the exact SQLite build that produced it. `error` replaces the fields when
+/// the probe connection could not be opened or queried.
+#[derive(serde::Serialize)]
+struct SqliteIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compile_options: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn sqlite_identity() -> SqliteIdentity {
+    let probe = || -> rusqlite::Result<(String, String, Vec<String>)> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let (version, source_id) =
+            conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let mut statement = conn.prepare("PRAGMA compile_options")?;
+        let options = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok((version, source_id, options))
+    };
+    match probe() {
+        Ok((version, source_id, options)) => SqliteIdentity {
+            version: Some(version),
+            source_id: Some(source_id),
+            compile_options: Some(options),
+            error: None,
+        },
+        Err(error) => SqliteIdentity {
+            version: None,
+            source_id: None,
+            compile_options: None,
+            error: Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES)),
+        },
+    }
+}
+
+/// The `startup` row: process id, crate version and the linked SQLite build.
+fn startup_line(db_identity: &str) -> String {
+    let record = EventRecord {
+        ts_utc: now_rfc3339(),
+        kind: "startup",
+        db: db_identity,
+        site: None,
+        phase: None,
+        error: None,
+        timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+        labels: None,
+        attempt: None,
+        pid: Some(std::process::id()),
+        version: Some(env!("CARGO_PKG_VERSION")),
+        sqlite: Some(sqlite_identity()),
+    };
+    let mut line = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
+    line.push('\n');
+    line
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -499,6 +571,7 @@ fn build_line(
         attempt,
         pid,
         version,
+        sqlite: None,
     };
     let mut line = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
     line.push('\n');
@@ -869,16 +942,7 @@ fn writer_thread_loop(
 
     sink.ensure_open(&dir);
     if sink.is_open() {
-        let startup = build_line_now(
-            "startup",
-            &db_identity,
-            None,
-            None,
-            None,
-            Some(std::process::id()),
-            Some(env!("CARGO_PKG_VERSION")),
-        );
-        sink.write_line(&startup);
+        sink.write_line(&startup_line(&db_identity));
     }
 
     loop {

@@ -985,3 +985,50 @@ async fn per_attempt_mode_writes_one_row_per_attempt_joined_by_request_id() {
         .unwrap_or_else(|| panic!("the unscoped setup write must carry no request_id: {contents}"));
     assert_eq!(setup["outcome"], "ok", "{setup}");
 }
+
+/// The `startup` row names the SQLite build this process links: the version
+/// the library reports through the C API, its source id and its compile
+/// options, so a measurement read from the sink carries the build behind it.
+#[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
+async fn startup_row_names_the_linked_sqlite_build() {
+    ensure_sink_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let _pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("startup_identity_test.db")),
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .expect("file-backed pool should open");
+
+    let is_startup = |line: &str| line.contains("\"kind\":\"startup\"");
+    let contents = wait_for_ndjson_line(is_startup, Duration::from_secs(5));
+    let startup: serde_json::Value = contents
+        .lines()
+        .find(|line| is_startup(line))
+        .and_then(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no parseable startup row: {contents}"));
+    let sqlite = &startup["sqlite"];
+    assert_eq!(
+        sqlite["version"],
+        rusqlite::version(),
+        "startup row must carry the linked library's version: {startup}"
+    );
+    let source_id = sqlite["source_id"].as_str().unwrap_or_default();
+    // sqlite_source_id() is "<date> <time> <check-in hash>".
+    let parts: Vec<&str> = source_id.split_whitespace().collect();
+    assert!(
+        parts.len() >= 3 && parts[2].len() >= 40 && parts[0].len() == 10,
+        "startup row must carry sqlite_source_id(): {startup}"
+    );
+    let options = sqlite["compile_options"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        options.iter().any(|option| option
+            .as_str()
+            .is_some_and(|o| o.starts_with("THREADSAFE="))),
+        "startup row must carry PRAGMA compile_options: {startup}"
+    );
+}
