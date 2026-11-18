@@ -974,12 +974,17 @@ impl MemoryPack {
 
             // Read profile state once per recall. Apply the entity term LAST and exactly once
             // to whichever composite (default or weighted rerank) actually reaches ranking.
-            let entity_posterior_mean: Option<f64> = profile_state
+            let entity_posterior: Option<(f64, f64)> = profile_state
                 .as_ref()
                 .and_then(|s| s.entity_posteriors.get(&id))
-                .map(khive_brain_core::BetaPosterior::mean);
+                .map(|p| {
+                    (
+                        p.mean(),
+                        crate::scoring::entity_evidence_mass(p.alpha(), p.beta()),
+                    )
+                });
             let entity_term = crate::scoring::entity_posterior_term(
-                entity_posterior_mean,
+                entity_posterior,
                 crate::scoring::ENTITY_POSTERIOR_WEIGHT,
             );
 
@@ -1002,7 +1007,8 @@ impl MemoryPack {
                 adjustment_factor: score_factors.adjustment_factor(),
             });
             breakdown.profile_component = profile_component;
-            breakdown.entity_posterior_mean = entity_posterior_mean;
+            breakdown.entity_posterior_mean = entity_posterior.map(|(mean, _)| mean);
+            breakdown.entity_evidence_mass = entity_posterior.map(|(_, mass)| mass);
 
             let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
             let pre_entity_term_score = if !cfg.reranker_weights.is_empty() {
