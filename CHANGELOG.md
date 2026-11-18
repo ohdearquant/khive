@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering and paging; null zero-hop edges contribute zero to counts (#6687, #6689).
 - GQL supports correlated fixed canonical `NOT EXISTS` paths, including intermediate-node
   correlations in mixed paths, with visibility filtering before grouping and paging (#6688).
+- Hosts can register caller-owned channels, resident components, `[channel.<name>]` configuration
+  validators and `comm.send` routes for custom address kinds before serving, through
+  `ServeRegistrations` and `run_with_registrations`. Built-in loops read the same channel registry;
+  duplicate and reserved registrations refuse before startup. On Unix, a host carrying validators
+  or send routes must be the daemon or set `KHIVE_NO_DAEMON=1`, since a non-daemon host forwards
+  its requests to the daemon (#6739).
+- With the `native-rerank` feature, `NativeCrossEncoderReranker::rerank_with_hook` and
+  `CrossEncoderScorer::score_batch_with_hook` take a borrowed adaptation hook for one call, and
+  `NativeRerankResult` reports whether the hook's `apply` ran. Scorers without hook support refuse
+  a supplied hook; the existing methods are unchanged (#6741).
 
 ### Changed
 
@@ -30,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules remain unchanged (#6691).
 - Zero-hop query matches retain the same substrate and UUID at both endpoints, zero traversal
   metrics and null final-edge fields, including isolated visible nodes (#6690).
+- A `[channel]` key other than `node` is no longer refused at load. Each `[channel.<name>]` table
+  is kept and passed to the component registered under that name; a table with no registered
+  component, including a misspelt name, is kept with no error (#6739).
 
 ### Breaking (Rust crates)
 
@@ -55,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (strict routing found no writer owner; not started) and `WriterRouteViolation` (strict routing
   refused a write that bypassed the owner; not started). Downstream exhaustive matches must
   handle all three (#6740).
+
+- `khive_runtime::node_config` is renamed `channel_section`; `ChannelSectionConfig` holds opaque
+  per-component values (`get`, `iter`) in place of the `node` field, and
+  `ConfigError::InvalidNodeConfig` becomes `InvalidChannelConfig` (#6739).
 
 ### Fixed
 
