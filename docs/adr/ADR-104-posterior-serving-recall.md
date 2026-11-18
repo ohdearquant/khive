@@ -1187,7 +1187,7 @@ uncertified any recall that returned fewer hits than requested or was cut by the
 
 ## Amendment 6 (2026-11-18): Scale the per-entity term by its evidence
 
-**Status**: Proposed. Amends Section 2 (bounded per-entity posterior term). The term is scaled toward neutral by the
+**Status**: Accepted 2026-11-18 (#6763). Amends Section 2 (bounded per-entity posterior term). The term is scaled toward neutral by the
 evidence mass its posterior holds, in both directions. The bounds and the neutral value stay. Replaces Section 2's
 last paragraph (one `useful` signal measurably lifting the memory's rank), which no longer holds for a single
 judgment. It also revisits open question 2 (no evidence floor for the per-entity term), which sign-off resolved as no
