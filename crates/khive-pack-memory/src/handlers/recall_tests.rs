@@ -4756,6 +4756,7 @@ const ADR104_TIE_QUERY: &str = "near tie probe query";
 const ADR104_TIE_FILLER: &str = "filler near tie content";
 const ADR104_TIE_FIRST: &str = "first near tie candidate";
 const ADR104_TIE_SECOND: &str = "second near tie candidate";
+const ADR104_TIE_NEIGHBOUR: &str = "neighbour near tie candidate";
 
 /// Recall of the near-tie corpus under `profile_id`: `(id, rank_score, breakdown)` per hit.
 async fn adr104_tie_recall(
@@ -4806,10 +4807,17 @@ fn adr104_send_useful(target_id: Uuid, profile_id: &str) -> serde_json::Value {
     })
 }
 
+/// The amendment's term written out independently of the code under test.
+fn adr104_expected_term(mean: f64, mass: f64) -> f64 {
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    1.0 + (t0 - 1.0) * mass / (mass + 16.0)
+}
+
 /// ADR-104 Amendment 6 at the shipped mass (1.0 per explicit judgment): one `useful` moves the
 /// candidate's score by exactly the evidence-scaled term, which lifts it past a near tie under
-/// the profile that received the signal and nowhere else; after an evidence mass of 16 the term
-/// has moved half of `t0 - 1`.
+/// the profile that received the signal and nowhere else, but not past a neighbour about 1% ahead
+/// (the unscaled term, +5%, would); after an evidence mass of 16 the term has moved half of
+/// `t0 - 1` and lifts it past that neighbour.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
@@ -4827,7 +4835,7 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
         vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     );
     // Identical vectors give both candidates the same relevance; only salience separates them.
-    for content in [ADR104_TIE_FIRST, ADR104_TIE_SECOND] {
+    for content in [ADR104_TIE_FIRST, ADR104_TIE_SECOND, ADR104_TIE_NEIGHBOUR] {
         vectors.insert(
             content.to_string(),
             vec![0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -4876,6 +4884,20 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
         .await
         .expect("second candidate")
         .id;
+    // Salience boost 1 + 0.2 * s: 0.56 against 0.499 puts the neighbour about 1% ahead.
+    let neighbour_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_TIE_NEIGHBOUR,
+            Some(0.56),
+            None,
+            vec![],
+        )
+        .await
+        .expect("neighbour candidate")
+        .id;
 
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
@@ -4918,6 +4940,13 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
         second_breakdown["entity_evidence_mass"].is_null(),
         "no feedback yet => entity_evidence_mass must be absent: {second_breakdown:?}"
     );
+    let (neighbour_pos, neighbour_score, _) = adr104_tie_hit(&a_before, neighbour_id);
+    let neighbour_gap = neighbour_score / second_before - 1.0;
+    assert!(
+        neighbour_pos < second_pos && neighbour_gap > 0.003 && neighbour_gap < 0.05,
+        "the neighbour must lead the second candidate by more than one scaled useful (+0.29%) \
+         and less than the unscaled term (+5%), got {neighbour_gap}: {a_before:?}"
+    );
 
     registry
         .dispatch(
@@ -4953,8 +4982,13 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
         "the term recomputes from the breakdown's mean and evidence mass"
     );
     assert!(
-        term > 1.0 && term < 1.01,
-        "one useful at the shipped mass barely moves the memory, got {term}"
+        (term as f64 - adr104_expected_term(mean, mass)).abs() < 1e-6,
+        "one useful: term {term} != 1 + (t0 - 1) * n / (n + 16) = {}",
+        adr104_expected_term(mean, mass)
+    );
+    assert!(
+        (term as f64 - (1.0 + 0.05 / 17.0)).abs() < 1e-6,
+        "one useful at the shipped mass: mean 2/3, t0 1.05, term 1 + 0.05 / 17, got {term}"
     );
     assert!(
         (second_after / second_before - term as f64).abs() < 1e-5,
@@ -4968,6 +5002,11 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
     assert!(
         second_pos_after < first_pos_after,
         "one useful lifts the second candidate past the near tie under profile A: {a_after:?}"
+    );
+    let (neighbour_pos_after, _, _) = adr104_tie_hit(&a_after, neighbour_id);
+    assert!(
+        neighbour_pos_after < second_pos_after,
+        "one scaled useful does not lift the second candidate past the neighbour: {a_after:?}"
     );
 
     for (label, before, after) in [
@@ -4995,7 +5034,8 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
             .expect("further useful signals under profile A");
     }
     let a_sixteen = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
-    let (_, second_sixteen, breakdown) = adr104_tie_hit(&a_sixteen, second_id);
+    let (second_pos_sixteen, second_sixteen, breakdown) = adr104_tie_hit(&a_sixteen, second_id);
+    let (neighbour_pos_sixteen, _, _) = adr104_tie_hit(&a_sixteen, neighbour_id);
     let mean = breakdown["entity_posterior_mean"]
         .as_f64()
         .expect("entity_posterior_mean present");
@@ -5006,16 +5046,24 @@ async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile()
         (mass - 16.0).abs() < 1e-9,
         "shipped mass: 16 useful judgments hold 16.0 of evidence, got {mass}"
     );
-    let t0 = crate::scoring::entity_posterior_t0(mean, crate::scoring::ENTITY_POSTERIOR_WEIGHT);
-    let term = breakdown_f32(&breakdown["entity_term"]);
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    let term = breakdown_f32(&breakdown["entity_term"]) as f64;
     assert!(
         ((term - 1.0) - (t0 - 1.0) / 2.0).abs() < 1e-6,
         "at an evidence mass of 16 the term moves half of t0 - 1: term={term} t0={t0}"
     );
     assert!(
-        (second_sixteen / second_before - term as f64).abs() < 1e-5,
+        (term - (1.0 + 0.3 * (17.0 / 18.0 - 0.5) / 2.0)).abs() < 1e-6,
+        "16 useful at the shipped mass: mean 17/18, term 1 + (t0 - 1) / 2, got {term}"
+    );
+    assert!(
+        (second_sixteen / second_before - term).abs() < 1e-5,
         "the served score moves by exactly the term: before={second_before} \
          after={second_sixteen} term={term}"
+    );
+    assert!(
+        second_pos_sixteen < neighbour_pos_sixteen,
+        "an evidence mass of 16 lifts the second candidate past the neighbour: {a_sixteen:?}"
     );
 }
 

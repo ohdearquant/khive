@@ -551,6 +551,23 @@ fn entity_evidence_mass_rejects_non_finite_input() {
     );
 }
 
+#[test]
+fn entity_posterior_term_is_neutral_for_a_non_finite_mean_or_weight() {
+    for mean in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let term = entity_posterior_term(Some((mean, 4.0)), ENTITY_POSTERIOR_WEIGHT);
+        assert!(
+            term == 1.0
+                || (ENTITY_POSTERIOR_CLAMP_MIN..=ENTITY_POSTERIOR_CLAMP_MAX).contains(&term),
+            "mean {mean}: term {term} must be neutral or inside the bounds"
+        );
+    }
+    assert_eq!(
+        entity_posterior_term(Some((f64::NAN, 4.0)), ENTITY_POSTERIOR_WEIGHT),
+        1.0
+    );
+    assert_eq!(entity_posterior_term(Some((0.9, 4.0)), f32::NAN), 1.0);
+}
+
 /// The amendment's formula written out independently of the code under test:
 /// `1 + (t0 - 1) * n / (n + 16)` with `t0` and `n` from the stored `(alpha, beta)`.
 fn expected_term(alpha: f64, beta: f64) -> f64 {
@@ -589,15 +606,22 @@ fn entity_posterior_term_matches_formula_at_shipped_mass() {
     assert_term("one not_useful, shipped mass", 1.0, 2.0, -0.0029);
     assert_term("one wrong, shipped mass", 1.0, 2.0, -0.0029);
     assert_term("16 useful, shipped mass", 17.0, 1.0, 0.0667);
-    // A weighted signal adds its weight: 0.1 of evidence moves the term by about 0.0044%.
-    let weighted = served_term(1.1, 1.0) as f64;
+    // A weighted signal adds its weight: 0.1 of evidence moves the term by
+    // 0.3 * (1.1 / 2.1 - 0.5) * 0.1 / 16.1 = 4.437e-5 (8.83e-5 at k = 8).
+    assert_weighted_term("weighted signal 0.1, shipped mass");
+}
+
+fn assert_weighted_term(label: &str) {
+    let got = served_term(1.1, 1.0) as f64;
     assert!(
-        (weighted - expected_term(1.1, 1.0)).abs() < 1e-6,
-        "weighted signal: {weighted}"
+        (got - expected_term(1.1, 1.0)).abs() < 1e-6,
+        "{label}: term {got} != formula {}",
+        expected_term(1.1, 1.0)
     );
     assert!(
-        weighted > 1.0 && weighted < 1.0001,
-        "weighted signal: {weighted}"
+        (got - 1.0 - 4.437e-5).abs() < 5e-7,
+        "{label}: move {} != 4.437e-5",
+        got - 1.0
     );
 }
 
@@ -608,6 +632,8 @@ fn entity_posterior_term_matches_formula_at_amendment_2_mass() {
     assert_term("one not_useful, Amendment 2 mass", 1.0, 2.5, -0.0055);
     assert_term("one wrong, Amendment 2 mass", 1.0, 3.0, -0.0083);
     assert_term("16 useful, Amendment 2 mass", 25.0, 1.0, 0.0831);
+    // Amendment 2's weighted row: implicit_positive carries 0.1 of evidence.
+    assert_weighted_term("implicit_positive 0.1, Amendment 2 mass");
 }
 
 #[test]
@@ -644,6 +670,22 @@ fn entity_posterior_term_stays_in_bounds_and_never_passes_t0() {
             assert!(
                 (term - 1.0) * (t0 - 1.0) >= 0.0,
                 "alpha={alpha} beta={beta}: term {term} on the other side of neutral from t0 {t0}"
+            );
+        }
+    }
+    // Means outside [0, 1] put t0 on the clamp endpoints; the scaled term stays inside them.
+    // The 1e-7 slack above and here is one f32 rounding step at 1.0, not a looser bound.
+    for &mean in &[-1.0, 0.0, 1.0, 2.0] {
+        for &n in &[0.5, 16.0, 1.0e6] {
+            let t0 = entity_posterior_t0(mean, ENTITY_POSTERIOR_WEIGHT);
+            let term = entity_posterior_term(Some((mean, n)), ENTITY_POSTERIOR_WEIGHT);
+            assert!(
+                (ENTITY_POSTERIOR_CLAMP_MIN..=ENTITY_POSTERIOR_CLAMP_MAX).contains(&term),
+                "mean={mean} n={n}: term {term} out of bounds"
+            );
+            assert!(
+                (term - 1.0).abs() <= (t0 - 1.0).abs() + 1e-7,
+                "mean={mean} n={n}: term {term} moved past t0 {t0}"
             );
         }
     }

@@ -520,7 +520,7 @@ pub struct ScoreBreakdown {
     /// profile served the request or the default-weight score is ~0 (div-by-zero guard).
     pub profile_component: f64,
     /// ADR-104 Section 2: the serving profile's per-entity Beta posterior mean for this UUID.
-    /// `None` without a serving profile or a posterior beyond the uninformative prior.
+    /// `None` without a serving profile or without a posterior for this UUID.
     /// With `entity_evidence_mass` it gives `entity_term`:
     /// `t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`, then
     /// `1 + (t0 - 1) * n / (n + 16)` with `n = entity_evidence_mass` (ADR-104 Amendment 6);

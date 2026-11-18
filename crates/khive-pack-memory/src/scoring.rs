@@ -1015,9 +1015,10 @@ pub fn entity_evidence_mass(alpha: f64, beta: f64) -> f64 {
 ///
 /// The term scales `t0` toward neutral by the evidence the posterior holds, in
 /// both directions: it stays within [0.85, 1.15], never moves past `t0`, and is
-/// exactly `1.0` at `n = 0`. `None` (no posterior beyond the uninformative
-/// prior) is exactly `1.0` too, an identity multiplier rather than a value that
-/// happens to fall inside the bounds, so untouched memories are unaffected.
+/// exactly `1.0` at `n = 0`. `None` (no posterior for the memory) is exactly
+/// `1.0` too, an identity multiplier rather than a value that happens to fall
+/// inside the bounds, so untouched memories are unaffected. A non-finite mass,
+/// mean or weight is neutral as well.
 pub fn entity_posterior_term(posterior: Option<(f64, f64)>, w_ent: f32) -> f32 {
     let Some((mean, mass)) = posterior else {
         return 1.0;
@@ -1025,8 +1026,12 @@ pub fn entity_posterior_term(posterior: Option<(f64, f64)>, w_ent: f32) -> f32 {
     if !mass.is_finite() || mass <= 0.0 {
         return 1.0;
     }
+    let t0 = entity_posterior_t0(mean, w_ent);
+    if !t0.is_finite() {
+        return 1.0;
+    }
     let scale = (mass / (mass + ENTITY_EVIDENCE_HALF_MASS)) as f32;
-    1.0 + (entity_posterior_t0(mean, w_ent) - 1.0) * scale
+    1.0 + (t0 - 1.0) * scale
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
