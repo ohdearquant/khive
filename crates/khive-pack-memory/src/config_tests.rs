@@ -304,6 +304,7 @@ fn score_breakdown_total_sums_contributions() {
         composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        entity_evidence_mass: None,
         weights_served: "default".to_string(),
         namespace: "local".to_string(),
         pre_entity_score: 0.5,

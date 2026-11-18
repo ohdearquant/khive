@@ -711,6 +711,7 @@ fn compute_score_inner(
         composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        entity_evidence_mass: None,
         weights_served: if report {
             "default".to_string()
         } else {
