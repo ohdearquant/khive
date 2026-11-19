@@ -31,6 +31,7 @@ import math
 import pathlib
 import re
 import sys
+from collections import Counter
 from datetime import datetime
 
 ATTEMPT_KIND = "writer_attempt"
@@ -250,8 +251,45 @@ def sink_identity(segments):
     return startups[0].get("sqlite") if startups else None
 
 
+def burst_drain(records, deadline_s):
+    """How long each burst of simultaneous arrivals took to clear, read from the client's own arrival records.
+
+    A burst's drain time runs from its scheduled instant to the last finish among its completed arrivals. A burst
+    MISSES when that time is over `deadline_s`, or when any of its arrivals was refused, failed or never finished:
+    a refused arrival finishes at once, so leaving it out of the drain time alone would read an overload as fast.
+    Returns None when no record belongs to a burst.
+    """
+    bursts = {}
+    for row in records:
+        if row.get("burst") is not None:
+            bursts.setdefault(row["burst"], []).append(row)
+    if not bursts:
+        return None
+    if deadline_s is None or not deadline_s > 0:
+        raise ReportError("a burst reading needs a positive drain deadline")
+    per_burst = []
+    for burst_id in sorted(bursts):
+        rows = bursts[burst_id]
+        states = Counter(row.get("state") for row in rows)
+        finished = [row["finished_s"] for row in rows if row.get("state") == "completed"]
+        drain = max(finished) - rows[0]["scheduled_s"] if finished else None
+        unfinished = len(rows) - states["completed"]
+        per_burst.append({"burst": burst_id, "size": len(rows), "completed": states["completed"],
+                          "refused": states["refused"], "unfinished": unfinished, "drain_s": drain,
+                          "missed": bool(unfinished) or drain is None or drain > deadline_s})
+    return {
+        "deadline_s": deadline_s,
+        "bursts": len(per_burst),
+        "sizes": sorted({b["size"] for b in per_burst}),
+        "missed": sum(b["missed"] for b in per_burst),
+        "refused": sum(b["refused"] for b in per_burst),
+        "drain_s": summarize([b["drain_s"] for b in per_burst if b["drain_s"] is not None]),
+        "per_burst": per_burst,
+    }
+
+
 def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, util_limit=0.70,
-                       queue_p99_limit_micros=None):
+                       queue_p99_limit_micros=None, burst_deadline_s=None):
     prefix = arrival_report.get("request_id_prefix")
     bits = arrival_report.get("request_id_sequence_bits")
     if prefix is None or bits is None:
@@ -284,6 +322,7 @@ def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, u
         "loss": total,
         "loss_by_segment": losses,
         **joined,
+        "burst_drain": burst_drain(arrival_report["records"], burst_deadline_s),
         "verdict": verdict,
         "verdict_reason": reason,
         "limits": {"loss": loss_limit, "utilization": util_limit, "queue_wait_p99_micros": queue_p99_limit_micros},
@@ -327,6 +366,8 @@ def main(argv=None):
     ap.add_argument("--loss-limit", type=float, default=0.01)
     ap.add_argument("--util-limit", type=float, default=0.70)
     ap.add_argument("--queue-p99-limit-ms", type=float, default=None)
+    ap.add_argument("--burst-deadline-ms", type=float, default=None,
+                    help="drain deadline for a run with bursts; such a run is BROKEN without one")
     args = ap.parse_args(argv)
     arrival_report = json.loads(pathlib.Path(args.arrivals).read_text())
     files = sorted(pathlib.Path(args.sink_dir).glob("writer_timeouts.*.ndjson"))
@@ -335,6 +376,7 @@ def main(argv=None):
         report = build_point_report(
             arrival_report, sink, loss_limit=args.loss_limit, util_limit=args.util_limit,
             queue_p99_limit_micros=None if args.queue_p99_limit_ms is None else args.queue_p99_limit_ms * 1000,
+            burst_deadline_s=None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000,
         )
     except ReportError as exc:
         print(json.dumps({"verdict": "BROKEN", "reason": str(exc), "sink_files": sorted(sink)}))

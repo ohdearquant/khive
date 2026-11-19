@@ -17,7 +17,7 @@ STARTUP = {"kind": "startup", "ts_utc": "2026-11-18T00:00:00.000Z", "sqlite": {"
 def args(**overrides):
     base = dict(workers=[100, 200], workers_per_tenant=5, rate_per_worker=2.0, seconds=3.0, mix="f7", mode="bench",
                 packs=None, worker_timeout=60.0, loss_limit=0.01, void_retries=1, util_limit=0.70,
-                queue_p99_limit_micros=None)
+                queue_p99_limit_micros=None, burst_every=5.0, burst_deadline_ms=None)
     base.update(overrides)
     return types.SimpleNamespace(**base)
 
@@ -25,8 +25,9 @@ def args(**overrides):
 class FakeHarness:
     """Writes what one harness run would: the report and the daemon's sink file. `drops` per run name."""
 
-    def __init__(self, drops=(), stray_rows=(), latency=None):
+    def __init__(self, drops=(), stray_rows=(), latency=None, burst_finish=None):
         self.drops, self.stray_rows, self.latency = dict(drops), set(stray_rows), latency or {}
+        self.burst_finish = burst_finish or {}
         self.argvs = []
 
     def __call__(self, argv, stdout=None, stderr=None):
@@ -36,7 +37,10 @@ class FakeHarness:
         log_on = "--writer-attempt-log" in argv
         lat = self.latency.get(name, 100)
         records = [{"sequence": i, "request_id": (PREFIX << BITS) | i, "op": "stream.append", "state": "completed",
-                    "latency_us": lat + i} for i in range(4)]
+                    "latency_us": lat + i, "burst": None} for i in range(4)]
+        if "--burst-size" in argv:
+            for row in records[2:]:
+                row.update(burst=1, scheduled_s=1.0, finished_s=1.0 + self.burst_finish.get(name, 0.01))
         report = {"smoke_result": "PASS", "arrival": {
             "request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
             "observed_duration_s": 1.0, "counts": {"submitted": 4, "completed": 4},
@@ -78,6 +82,37 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("--writer-attempt-log", off)
         with self.assertRaisesRegex(ValueError, "do not split"):
             sweep.harness_argv({"workers": 101, "attempt_log": True}, run_dir, args(), python="py")
+
+
+class BurstTests(unittest.TestCase):
+    def test_burst_runs_close_the_plan_and_carry_their_size(self):
+        runs = sweep.plan_runs([100], aa=False, paired_workers=50, paired_rounds=0, burst_sizes=[10, 40])
+        self.assertEqual([(r["name"], r["workers"]) for r in runs[-2:]], [("burst-10", 50), ("burst-40", 50)])
+        argv = sweep.harness_argv(runs[-1], pathlib.Path("/x/burst-40"), args(), python="py")
+        self.assertEqual(argv[argv.index("--burst-size") + 1:argv.index("--burst-size") + 4],
+                         ["40", "--burst-every", "5.0"])
+        self.assertNotIn("--burst-size", sweep.harness_argv(runs[0], pathlib.Path("/x/s"), args(), python="py"))
+
+    def test_knee_is_the_first_size_with_a_missed_burst(self):
+        fake = FakeHarness(burst_finish={"burst-10": 0.01, "burst-40": 0.5, "burst-80": 0.7})
+        lines = []
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=0, burst_sizes=[10, 40, 80])
+            summary, rc = sweep.execute(runs, pathlib.Path(tmp), args(burst_deadline_ms=100.0), spawn=fake,
+                                        emit=lines.append)
+        self.assertEqual(rc, 0)
+        self.assertIn("bursts=1 missed=1 refused=0 drain_p99_ms=500.0 deadline_ms=100", lines[2])
+        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 (first size with a missed burst)")
+
+    def test_burst_run_without_burst_rows_is_broken(self):
+        class NoBurst(FakeHarness):
+            def __call__(self, argv, stdout=None, stderr=None):
+                return super().__call__([a for a in argv if a != "--burst-size"], stdout, stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=0, burst_sizes=[10])[1:]
+            _, rc = sweep.execute(runs, pathlib.Path(tmp), args(burst_deadline_ms=100.0), spawn=NoBurst(),
+                                  emit=lambda _: None)
+        self.assertEqual(rc, 2)
 
 
 class ExecuteTests(unittest.TestCase):

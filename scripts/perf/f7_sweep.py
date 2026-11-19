@@ -9,6 +9,11 @@ The run order is fixed before the first run and written to plan.json in the outp
   3. Paired arm at --paired-workers: --paired-rounds rounds of one run with the attempt log off and one with it on,
      adjacent in time. The order flips each round (off-on, on-off, ...) so drift does not land on one arm. Client
      latency is pooled per arm over the rounds, and the cost line states on minus off at p50 and p99 per op class.
+  4. Burst points, when --burst-sizes is given: one run per size at --paired-workers, attempt log on, with that many
+     extra arrivals at one instant every --burst-every seconds on top of the steady rate. Each run states how many
+     bursts missed the --burst-deadline-ms drain deadline (late, or any arrival refused, failed or unfinished), and
+     the knee line names the smallest size with a missed burst. Bursts add arrivals to a run of fixed length, so a
+     burst run offers fewer seconds than a sweep run at the same rate.
 
 Each run gets its own directory under --out with the harness report (harness.json), the harness log and the sink
 directory the daemon wrote (sink/), which is kept. Every attempt-log run prints the attempts expected, rows written,
@@ -36,8 +41,8 @@ import writer_attempt_report as war  # noqa: E402
 HARNESS = pathlib.Path(__file__).parent / "bench_load_harness.py"
 
 
-def plan_runs(workers, *, aa, paired_workers, paired_rounds):
-    """The ordered list of runs: A/A pair at the first count, the sweep, then the alternating paired arm."""
+def plan_runs(workers, *, aa, paired_workers, paired_rounds, burst_sizes=()):
+    """The ordered list of runs: A/A pair at the first count, the sweep, the alternating paired arm, the bursts."""
     if not workers:
         raise ValueError("at least one process count is needed")
     runs = []
@@ -50,6 +55,8 @@ def plan_runs(workers, *, aa, paired_workers, paired_rounds):
         for log_on in order:
             runs.append({"name": f"pair-{r + 1}-{'on' if log_on else 'off'}", "workers": paired_workers,
                          "attempt_log": log_on, "role": "pair", "round": r + 1})
+    runs += [{"name": f"burst-{b}", "workers": paired_workers, "attempt_log": True, "role": "burst", "burst_size": b}
+             for b in burst_sizes]
     return runs
 
 
@@ -67,6 +74,8 @@ def harness_argv(run, run_dir, args, python=sys.executable):
         argv += ["--packs", args.packs]
     if run["attempt_log"]:
         argv.append("--writer-attempt-log")
+    if run.get("burst_size"):
+        argv += ["--burst-size", str(run["burst_size"]), "--burst-every", repr(args.burst_every)]
     return argv
 
 
@@ -79,7 +88,7 @@ def attempt_rows(sink):
     return sum(len(segment["attempts"]) for lines in sink.values() for segment in war.parse_sink_lines(lines))
 
 
-def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros):
+def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None):
     """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run."""
     harness = json.loads((run_dir / "harness.json").read_text())
     arrival = harness.get("arrival") or {}
@@ -93,7 +102,9 @@ def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros):
             raise war.ReportError(f"{run['name']}: attempt log off, but the sink holds {rows} writer_attempt rows")
         return {"verdict": "OFF", "arrival": arrival, "sink_files": sorted(sink)}
     point = war.build_point_report(arrival, sink, loss_limit=loss_limit, util_limit=util_limit,
-                                   queue_p99_limit_micros=queue_p99_limit_micros)
+                                   queue_p99_limit_micros=queue_p99_limit_micros, burst_deadline_s=burst_deadline_s)
+    if run.get("burst_size") and not point["burst_drain"]:
+        raise war.ReportError(f"{run['name']}: a burst run whose arrival records carry no burst")
     return {"verdict": point["verdict"], "arrival": arrival, "point": point}
 
 
@@ -107,7 +118,23 @@ def run_line(run, reading):
     return (f"{head} attempts expected={loss['expected']} written={loss['written']} gaps={loss['gaps']} "
             f"dropped={loss['dropped']} loss_upper={loss['loss_upper']:.4f} utilization={point['utilization']:.3f} "
             f"queue_wait_p99_us={point['queue_wait_micros'].get('p99')} verdict={point['verdict']}"
-            + (f" ({point['verdict_reason']})" if point["verdict_reason"] else ""))
+            + (f" ({point['verdict_reason']})" if point["verdict_reason"] else "")
+            + (burst_text(point["burst_drain"]) if point.get("burst_drain") else ""))
+
+
+def burst_text(drain):
+    p99 = drain["drain_s"].get("p99")
+    return (f"; bursts={drain['bursts']} missed={drain['missed']} refused={drain['refused']} "
+            f"drain_p99_ms={'none' if p99 is None else round(p99 * 1000, 3)} deadline_ms={drain['deadline_s'] * 1000:g}")
+
+
+def knee_line(burst_points, deadline_s):
+    """The smallest burst size with a missed burst, or the largest size tried when none missed."""
+    missed = sorted(size for size, drain in burst_points if drain["missed"])
+    tried = sorted(size for size, _ in burst_points)
+    if missed:
+        return f"burst-drain knee at deadline {deadline_s * 1000:g} ms: size {missed[0]} (first size with a missed burst)"
+    return f"burst-drain knee at deadline {deadline_s * 1000:g} ms: none up to size {tried[-1]}"
 
 
 def cost_line(cost):
@@ -120,7 +147,8 @@ def cost_line(cost):
 
 def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests."""
-    record, pairs, rc = [], {"off": [], "on": []}, 0
+    record, pairs, bursts, rc = [], {"off": [], "on": []}, [], 0
+    deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
     for run in runs:
         tries = 0
         while True:
@@ -132,7 +160,8 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
                 harness_rc = spawn(argv, stdout=log, stderr=subprocess.STDOUT).returncode
             try:
                 reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit,
-                                   util_limit=args.util_limit, queue_p99_limit_micros=args.queue_p99_limit_micros)
+                                   util_limit=args.util_limit, queue_p99_limit_micros=args.queue_p99_limit_micros,
+                                   burst_deadline_s=deadline_s)
             except war.ReportError as exc:
                 emit(f"[{name}] BROKEN: {exc}")
                 record.append({**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc,
@@ -150,6 +179,8 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
                 break
         if run["role"] == "pair" and reading["verdict"] != "VOID":
             pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
+        if run["role"] == "burst" and reading["verdict"] != "VOID":
+            bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
     cost = None
     if pairs["off"] or pairs["on"]:
         try:
@@ -158,6 +189,8 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
         except war.ReportError as exc:
             emit(f"paired arm BROKEN: {exc}")
             rc = 2
+    if bursts:
+        emit(knee_line(bursts, deadline_s))
     return {"runs": record, "paired_cost": cost}, rc
 
 
@@ -175,12 +208,19 @@ def parse_args(argv=None):
     ap.add_argument("--no-aa", action="store_true", help="skip the A/A pair")
     ap.add_argument("--paired-workers", type=int, default=100)
     ap.add_argument("--paired-rounds", type=int, default=3)
+    ap.add_argument("--burst-sizes", default="", help="comma-separated burst sizes; empty runs no burst points")
+    ap.add_argument("--burst-every", type=float, default=5.0, help="seconds between bursts")
+    ap.add_argument("--burst-deadline-ms", type=float, default=None, help="drain deadline; required with bursts")
     ap.add_argument("--loss-limit", type=float, default=0.01)
     ap.add_argument("--void-retries", type=int, default=2)
     ap.add_argument("--util-limit", type=float, default=0.70)
     ap.add_argument("--queue-p99-limit-ms", type=float, default=None)
     args = ap.parse_args(argv)
     args.workers = [int(w) for w in args.workers.split(",") if w.strip()]
+    args.burst_sizes = [int(b) for b in args.burst_sizes.split(",") if b.strip()]
+    if args.burst_sizes and (min(args.burst_sizes) <= 0 or not math.isfinite(args.burst_every)
+                             or args.burst_every <= 0 or not (args.burst_deadline_ms or 0) > 0):
+        ap.error("--burst-sizes needs positive sizes, a positive --burst-every and a positive --burst-deadline-ms")
     args.queue_p99_limit_micros = None if args.queue_p99_limit_ms is None else args.queue_p99_limit_ms * 1000
     if not math.isfinite(args.rate_per_worker) or args.rate_per_worker <= 0 or args.seconds <= 0:
         ap.error("--rate-per-worker and --seconds must be positive")
@@ -194,7 +234,7 @@ def main(argv=None):
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     runs = plan_runs(args.workers, aa=not args.no_aa, paired_workers=args.paired_workers,
-                     paired_rounds=args.paired_rounds)
+                     paired_rounds=args.paired_rounds, burst_sizes=args.burst_sizes)
     (out / "plan.json").write_text(json.dumps({"argv": sys.argv, "runs": runs}, indent=1))
     summary, rc = execute(runs, out, args)
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))

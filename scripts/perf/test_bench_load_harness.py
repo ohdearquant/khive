@@ -83,7 +83,8 @@ class ImmediatePool:
 
 
 class OpenLoopArrivalTests(unittest.TestCase):
-    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=(), request_id_prefix=None):
+    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=(), request_id_prefix=None,
+              schedule=None):
         clock = VirtualClock()
         pool = SlowServicePool(clock, delays)
         connections = [(None, harness.WorkerResult(0, idx)) for idx in range(workers)]
@@ -98,9 +99,29 @@ class OpenLoopArrivalTests(unittest.TestCase):
             report = harness._drive_open_loop(
                 connections, pool, 10.0, operations, drain_timeout,
                 pick_op=lambda: service, clock=clock, sleep=clock.sleep,
-                request_id_prefix=request_id_prefix,
+                request_id_prefix=request_id_prefix, schedule=schedule,
             )
         return report
+
+    def test_burst_schedule_sets_each_arrival_time_and_labels_its_burst(self):
+        schedule = harness.arrival_schedule(5, 10.0, burst_size=2, burst_every_s=0.15)
+        self.assertEqual(schedule, [(0.0, None), (0.1, None), (0.15, 1), (0.15, 1), (0.2, None)])
+        report = self.drive([0.01] * 5, 5, workers=3, schedule=schedule)
+        self.assertEqual([(round(r["scheduled_s"], 6), r["burst"]) for r in report["records"]],
+                         [(0.0, None), (0.1, None), (0.15, 1), (0.15, 1), (0.2, None)])
+        self.assertAlmostEqual(report["offered_duration_s"], 0.3)
+        plain = self.drive([0.01] * 2, 2)
+        self.assertEqual([r["burst"] for r in plain["records"]], [None, None])
+        with self.assertRaisesRegex(ValueError, "one entry per operation"):
+            self.drive([0.01] * 2, 2, schedule=schedule)
+
+    def test_arrival_schedule_caps_the_last_burst_and_refuses_a_burst_without_an_interval(self):
+        self.assertEqual(harness.arrival_schedule(3, 1.0, burst_size=5, burst_every_s=0.5),
+                         [(0.0, None), (0.5, 1), (0.5, 1)])
+        self.assertEqual(harness.arrival_schedule(2, 4.0), [(0.0, None), (0.25, None)])
+        for size, every in ((3, 0.0), (3, float("nan")), (-1, 1.0)):
+            with self.assertRaisesRegex(ValueError, "positive size"):
+                harness.arrival_schedule(4, 1.0, burst_size=size, burst_every_s=every)
 
     def test_each_arrival_carries_its_run_unique_request_id_to_the_service(self):
         report = self.drive([0.01] * 3, 3, request_id_prefix=0xABC)
@@ -172,7 +193,8 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             events.append("attribution")
             return {"status": "consistent", "attributed_actor": "tenant_0"}
 
-        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None, pick_op=None, menu=None):
+        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None, pick_op=None, menu=None,
+                  schedule=None):
             self.assertIs(menu, harness._OP_MENU)
             self.assertEqual(len([pick_op() for _ in range(operations)]), operations)
             self.assertIsInstance(request_id_prefix, int)

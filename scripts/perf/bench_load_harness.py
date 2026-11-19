@@ -544,6 +544,26 @@ def arrival_request_id(prefix, sequence):
     return (prefix << REQUEST_ID_SEQUENCE_BITS) | sequence
 
 
+def arrival_schedule(operations, rate, burst_size=0, burst_every_s=0.0):
+    """Offsets from arrival zero for every arrival, each with the burst it belongs to (None for a steady arrival).
+
+    Steady arrivals keep `rate`; every `burst_every_s` seconds `burst_size` more arrive at the same instant, ahead of
+    the steady arrival due then. The schedule ends at `operations` arrivals, so bursts shorten the run.
+    """
+    if burst_size < 0 or (burst_size and not (math.isfinite(burst_every_s) and burst_every_s > 0)):
+        raise ValueError("a burst needs a positive size and a positive interval")
+    out, steady, burst = [], 0, 1
+    while len(out) < operations:
+        due = steady / rate
+        if burst_size and burst * burst_every_s <= due:
+            out.extend([(burst * burst_every_s, burst)] * min(burst_size, operations - len(out)))
+            burst += 1
+            continue
+        out.append((due, None))
+        steady += 1
+    return out
+
+
 def _execute_arrival(worker, fn, sequence, clock, request_id=None):
     proc, result = worker
     started = clock()
@@ -563,7 +583,7 @@ def _utc_text(seconds):
 
 def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
                      pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep, request_id_prefix=None,
-                     menu=_OP_MENU, wall_clock=time.time):
+                     menu=_OP_MENU, wall_clock=time.time, schedule=None):
     if (not math.isfinite(rate) or rate <= 0 or operations < 0
             or not math.isfinite(drain_timeout) or drain_timeout < 0):
         raise ValueError("arrival rate must be finite and positive; operation count and drain timeout nonnegative")
@@ -571,7 +591,12 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
         raise ValueError(f"at most {1 << REQUEST_ID_SEQUENCE_BITS} arrivals carry request ids in one run")
     started = clock()
     started_wall = wall_clock()
-    offered_duration = operations / rate
+    if schedule is None:
+        offered_duration = operations / rate
+    else:
+        if len(schedule) != operations:
+            raise ValueError("the arrival schedule must hold one entry per operation")
+        offered_duration = schedule[-1][0] + 1 / rate if schedule else 0.0
     records = []
     pending = {}
     idle = list(range(len(workers)))
@@ -592,12 +617,14 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
             del pending[future]
 
     for sequence in range(operations):
-        scheduled = started + sequence / rate
+        offset, burst = (sequence / rate, None) if schedule is None else schedule[sequence]
+        scheduled = started + offset
         sleep(max(0.0, scheduled - clock()))
         reap()
         fn = pick_op()
         request_id = arrival_request_id(request_id_prefix, sequence)
-        record = dict(sequence=sequence, request_id=request_id, op=_OP_NAMES[fn], scheduled_s=scheduled - started,
+        record = dict(sequence=sequence, request_id=request_id, op=_OP_NAMES[fn], burst=burst,
+                      scheduled_s=scheduled - started,
                       offered_s=clock() - started, started_s=None, finished_s=None,
                       tenant=None, worker=None, latency_us=None, state="outstanding", error=None)
         records.append(record)
@@ -695,7 +722,7 @@ def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_
 
 
 def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
-                      operations, rate, worker_timeout, menu=_OP_MENU):
+                      operations, rate, worker_timeout, menu=_OP_MENU, schedule=None):
     plan = plan_arrivals(menu, operations)
     planned = Counter(_OP_NAMES[fn] for fn in plan)
     receipt_pools = {tenant: deque() for tenant, _ in jobs}
@@ -711,7 +738,7 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
             workers.append(future.result(timeout=max(0.0, setup_deadline - time.monotonic())))
         arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout,
                                    request_id_prefix=new_request_id_prefix(),
-                                   pick_op=iter(plan).__next__, menu=menu)
+                                   pick_op=iter(plan).__next__, menu=menu, schedule=schedule)
         if arrival["counts"]["outstanding"]:
             # Kill pipes before joining threads so a wedged MCP read can finish.
             outstanding = {(row["tenant"], row["worker"]) for row in arrival["records"]
@@ -789,6 +816,9 @@ def main() -> int:
     ap.add_argument("--mix", choices=sorted(MIXES), default="read-heavy",
                     help="named op mix; every mix but read-heavy needs --arrival-rate (fixtures are sized to the "
                          "open-loop plan)")
+    ap.add_argument("--burst-size", type=int, default=0,
+                    help="open loop: this many extra arrivals at the same instant every --burst-every seconds")
+    ap.add_argument("--burst-every", type=float, default=0.0)
     ap.add_argument("--sink-dir", default=None,
                     help="directory for the daemon's writer sink files (KHIVE_WRITER_TIMEOUT_SINK_DIR); kept after the run")
     ap.add_argument("--writer-attempt-log", action="store_true",
@@ -815,6 +845,9 @@ def main() -> int:
         or not math.isfinite(args.worker_timeout) or args.worker_timeout <= 0
     ):
         ap.error("open-loop rate, workers, tenants and timeout must be finite/positive; ops-per-worker nonnegative")
+    if args.burst_size and (args.arrival_rate is None or args.burst_size < 0
+                            or not math.isfinite(args.burst_every) or args.burst_every <= 0):
+        ap.error("--burst-size needs --arrival-rate and a positive --burst-every")
     if args.writer_attempt_log and not args.sink_dir:
         ap.error("--writer-attempt-log needs --sink-dir, so the attempt rows land where the report reads them")
     if args.mix != "read-heavy" and args.arrival_rate is None:
@@ -953,7 +986,11 @@ def main() -> int:
                 binary, jobs, base_env, args.log_level, tmpdir, worker_procs,
                 args.workers * args.ops_per_worker, args.arrival_rate, args.worker_timeout,
                 menu=MIXES[args.mix],
+                schedule=arrival_schedule(args.workers * args.ops_per_worker, args.arrival_rate,
+                                          args.burst_size, args.burst_every) if args.burst_size else None,
             )
+            if args.burst_size:
+                report["arrival"]["burst"] = {"size": args.burst_size, "every_s": args.burst_every}
             report["arrival"]["mix"] = args.mix
             report["arrival"]["writer_attempt_log"] = args.writer_attempt_log
             report["arrival"]["sink_dir"] = base_env.get("KHIVE_WRITER_TIMEOUT_SINK_DIR")

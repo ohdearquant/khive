@@ -108,6 +108,35 @@ class CostSplitTests(unittest.TestCase):
         self.assertIn("1 distinct rows_changed value", out["reason"])
 
 
+class BurstDrainTests(unittest.TestCase):
+    def row(self, burst, state="completed", scheduled=1.0, finished=1.1):
+        return {"burst": burst, "state": state, "scheduled_s": scheduled,
+                "finished_s": finished if state != "outstanding" else None}
+
+    def test_drain_runs_to_the_last_completed_finish_and_misses_name_their_cause(self):
+        records = [self.row(None, finished=0.2),
+                   self.row(1, finished=1.05), self.row(1, finished=1.08),
+                   self.row(2, scheduled=2.0, finished=2.5), self.row(2, scheduled=2.0, finished=2.01),
+                   self.row(3, scheduled=3.0, finished=3.02), self.row(3, state="refused", scheduled=3.0, finished=3.0),
+                   self.row(4, state="outstanding", scheduled=4.0)]
+        out = war.burst_drain(records, 0.1)
+        by_id = {b["burst"]: b for b in out["per_burst"]}
+        self.assertAlmostEqual(by_id[1]["drain_s"], 0.08)
+        self.assertFalse(by_id[1]["missed"])
+        self.assertAlmostEqual(by_id[2]["drain_s"], 0.5)
+        self.assertTrue(by_id[2]["missed"])
+        self.assertTrue(by_id[3]["missed"])
+        self.assertEqual((by_id[3]["refused"], by_id[3]["unfinished"]), (1, 1))
+        self.assertIsNone(by_id[4]["drain_s"])
+        self.assertEqual((out["bursts"], out["missed"], out["refused"], out["sizes"]), (4, 3, 1, [1, 2]))
+        self.assertEqual(out["drain_s"]["n"], 3)
+
+    def test_no_burst_rows_is_no_reading_and_a_burst_without_a_deadline_is_broken(self):
+        self.assertIsNone(war.burst_drain([self.row(None)], None))
+        with self.assertRaisesRegex(war.ReportError, "positive drain deadline"):
+            war.burst_drain([self.row(1)], None)
+
+
 class VerdictTests(unittest.TestCase):
     def report(self, sink_lines, records=None, **limits):
         records = records if records is not None else [arrival(0, "create")]
