@@ -144,6 +144,34 @@ async fn a_target_outside_the_roots_is_refused_before_it_is_created() {
 }
 
 #[tokio::test]
+async fn an_existing_target_linked_from_inside_a_root_is_judged_by_where_it_points() {
+    use std::os::unix::fs::symlink;
+
+    let allowed = physical_tempdir();
+    let denied = physical_tempdir();
+    let source = allowed.path().join("source");
+    source_tree(&source);
+    let outside = denied.path().join("map.db");
+    std::fs::File::create(&outside).expect("pre-create the outside target");
+    let link = allowed.path().join("map.db");
+    symlink(&outside, &link).expect("file symlink");
+    let registry = registry(vec![allowed.path().to_path_buf()]);
+
+    let raw = path_str(&link);
+    let error = ingest(&registry, &path_str(&source), Some(&raw))
+        .await
+        .expect_err("a target resolving outside every root is refused");
+    assert_eq!(error.to_string(), refusal("db", &raw));
+    assert_eq!(
+        std::fs::metadata(&outside)
+            .expect("outside target metadata")
+            .len(),
+        0,
+        "the target outside the roots was not written"
+    );
+}
+
+#[tokio::test]
 async fn an_empty_policy_refuses_every_source() {
     let dir = physical_tempdir();
     let source = dir.path().join("source");

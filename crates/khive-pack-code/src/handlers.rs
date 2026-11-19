@@ -137,12 +137,13 @@ impl CodePack {
         let roots = &self.runtime.config().code_ingest.roots;
         admit_under_roots(&path, roots, "path", &path_raw)?;
         if let Some(db) = db.as_deref() {
-            // The target may not exist yet; its nearest existing ancestor decides
-            // where a write would land, and the target preflight below keeps its
-            // own refusals for the rest.
+            // An existing target is resolved itself, so a symlink inside a root
+            // that points outside every root is refused. A target that does not
+            // exist yet is judged by its nearest existing ancestor, which decides
+            // where a write would land; the target preflight below keeps its own
+            // refusals for the rest.
             let existing = Path::new(db)
                 .ancestors()
-                .skip(1)
                 .find(|ancestor| ancestor.exists())
                 .unwrap_or(Path::new(db));
             admit_under_roots(existing, roots, "db", db)?;
