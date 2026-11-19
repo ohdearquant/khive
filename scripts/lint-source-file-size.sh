@@ -7,8 +7,10 @@
 #
 # Rules (the cap is the CAP constant below):
 #   1. A counted file over the cap that is not on the allow-list fails.
-#   2. A listed file over its ceiling fails. A listed file at or under the cap,
-#      or no longer a counted source file, fails as a stale row: delete it.
+#   2. A listed file over or under its ceiling fails: a ceiling equals the
+#      file's line count, so a file that shrank cannot grow back. A listed
+#      file at or under the cap, or no longer a counted source file, fails as
+#      a stale row: delete it.
 #   3. In a pull request a row may be lowered or deleted but not raised or
 #      added, judged against the base branch copy of the allow-list. Outside a
 #      pull request (GITHUB_EVENT_NAME is not pull_request) this arm is skipped.
@@ -154,6 +156,8 @@ compare_rows() {
                 issue(sprintf("%s: stale row, %d lines is at or under the %d-line cap; delete it from %s", safe(p), count[p], cap, allowrel))
             } else if (count[p] > ceiling[p]) {
                 issue(sprintf("%s: %d lines is over its allow-list ceiling of %d; split the file (a ceiling cannot be raised)", safe(p), count[p], ceiling[p]))
+            } else if (count[p] < ceiling[p]) {
+                issue(sprintf("%s: %d lines is under its allow-list ceiling of %d; lower the row to %d so the file cannot grow back", safe(p), count[p], ceiling[p], count[p]))
             }
             if (basefile != "") {
                 if (!(p in baseceiling)) {
