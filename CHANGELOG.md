@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
   `RuntimeError` needs an arm for it.
+- `khive_runtime::engine_config::EmbedSectionConfig` gains the public fields `auto_embed`, `fields`,
+  `model`, `dimensions` and `device`; a struct literal must supply them or end with
+  `..Default::default()`.
 
 ## [0.19.0] - 2026-11-11
 ### Added

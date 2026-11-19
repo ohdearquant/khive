@@ -148,6 +148,7 @@ fn legacy_comparison_uses_declared_dimensions_and_exact_default_name() {
         ("[embed]\nmodel = 'default'\n[[engines]]\nname = 'default'\n", vec![]),
         ("engines = []\n[embed]\nmodel = 'custom-peer'\ndimensions = 384\n", vec!["embed.model"]),
         ("[embed]\ndevice = 'cpu'\n[[engines]]\nname = 'custom-peer'\n", vec!["embed.device"]),
+        ("[embed]\ndimensions = 768\n[[engines]]\nname = 'custom-peer'\ndims = 384\n", vec!["embed.dimensions"]),
         ("[embed]\n[[engines]]\nname = 'custom-peer'\n", vec![]),
         ("[embed]\nauto_embed = false\n[[engines]]\nname = 'custom-peer'\n", vec!["embed.auto_embed"]),
         ("[embed]\nauto_embed = true\n[[engines]]\nname = 'custom-peer'\n", vec![]),
