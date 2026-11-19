@@ -376,9 +376,10 @@ struct QueuedEvent {
     attempt: Option<WriterAttemptFields>,
 }
 
-/// Bounded labels carried on a `"slow_write"` row: at most
-/// [`crate::writer_task::MAX_WRITE_LABELS`] distinct labels in first-seen
-/// order, plus the count of further distinct labels that were dropped.
+/// Bounded labels carried on a `"slow_write"` row and on every
+/// `"writer_attempt"` row: at most [`crate::writer_task::MAX_WRITE_LABELS`]
+/// distinct labels in first-seen order, plus the count of further distinct
+/// labels that were dropped.
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct SlowWriteLabels {
     pub(crate) labels: Box<[String]>,
@@ -435,10 +436,13 @@ pub(crate) fn capture_sqlite_full_for_test(sender: Option<mpsc::Sender<String>>)
     *SQLITE_FULL_CAPTURE.lock().unwrap() = sender;
 }
 
-/// One JSON line: `{ts_utc, kind, db, site, phase?, error, timeout_ms?}`.
-/// `site`/`error`/`timeout_ms`/`pid`/`version` are omitted (not null) when
-/// not applicable to `kind` — `startup` rows carry `pid`/`version` and no
-/// `site`/`error`; `timeout`/`sink_error_summary` rows are the reverse.
+/// One JSON line: `{ts_utc, kind, db}` plus the optional fields that apply
+/// to `kind`; a field that does not apply is omitted, never null. `startup`
+/// rows carry `pid`, `version` and `sqlite` and no `site`/`error`;
+/// `timeout`/`sink_error_summary` rows are the reverse. `slow_write` rows add
+/// `elapsed_ms`, the writer stage intervals, `queue_depth` and labels; `writer_attempt`
+/// rows add those and the attempt fields (`attempt_seq`, `request_id`,
+/// `outcome`, `rows_changed`, `top_level`).
 #[derive(serde::Serialize)]
 struct EventRecord<'a> {
     ts_utc: String,
