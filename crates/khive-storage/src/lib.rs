@@ -15,6 +15,7 @@ pub mod graph;
 pub mod note;
 pub mod operation_context;
 pub mod request_context;
+pub mod secret_scan;
 pub mod sparse;
 pub mod sql;
 pub mod telemetry;

@@ -52,6 +52,10 @@ alongside the (capped) results. If more than 20,000 actionable tasks match,
 it returns an error; narrow the query (for example with the exact `assignee`
 filter) and retry.
 
+`gtd.next` truncates at the effective limit without reporting `has_more`.
+A full result is a bounded selection of work, not proof that the queue ends
+there. Use paged `gtd.tasks` for a broader inventory.
+
 By default it omits tasks with unfinished or structurally broken dependencies.
 Pass `include_blocked=true` to include those candidates after ready work for
 triage. Both `gtd.next` and `gtd.tasks` annotate tasks with `dependency_state`,
@@ -68,6 +72,25 @@ completed or cancelled tasks. It defaults to `limit=50, offset=0`, and
 clamps `limit` to 1–200 the same way `gtd.next` does — a request above 200
 gets the `requested_limit`/`effective_limit`/`limit_clamped` object wrap
 (alongside `filter_excluded`/`hint` when that also applies).
+
+An incomplete `gtd.tasks` page is an object with a `tasks` array and
+`has_more: true`. An exhausted page keeps its existing shape: normally a
+bare array, or an object when clamp or excluded-status metadata applies.
+Read rows from either the array itself or the object's `tasks` field.
+When `has_more` is true, repeat the same filters and increase `offset` by
+the number of returned tasks. Absence of that marker means the page is
+exhausted, even when it is exactly full. A short-page loop must accept both
+shapes and compare against the effective limit, not the requested limit.
+
+Collect the pages before changing statuses that determine their membership.
+Separate calls do not share a snapshot, so concurrent changes can still
+shift page boundaries. A page length is not an exact total.
+
+A known nonempty object page uses `$prev.tasks[0].id` in a chain; a known
+nonempty bare array uses `$prev[0].id`. If the shape or presence of a row is
+unknown, inspect the response first and pass the selected identifier in a
+separate call. See the [page contract](../../crates/khive-pack-gtd/docs/api/task-query.md#gtdtasks-page-continuation-6549)
+for examples and the wrong-shape diagnostic.
 
 ## Start and finish work
 

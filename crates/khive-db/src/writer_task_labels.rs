@@ -3,11 +3,11 @@
 //! deduplication, and the labelled submit entry points on
 //! [`WriterTaskHandle`].
 
-use khive_storage::error::{StorageError, WriterTaskRequestState};
+use khive_storage::error::StorageError;
 use khive_storage::types::SqlStatement;
 use rusqlite::Connection;
 
-use super::{writer_task_terminated, WriterTaskHandle};
+use super::WriterTaskHandle;
 
 /// Upper bound on distinct statement labels carried on one request. A
 /// request whose statements name more than this contributes its first
@@ -87,9 +87,7 @@ impl WriterTaskHandle {
         let reply_rx = self
             .enqueue_inner(op, false, false, false, SubmitLabels::Statements(labels))
             .await?;
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Like [`Self::send`], but carries the submit site's operation name
@@ -105,9 +103,7 @@ impl WriterTaskHandle {
         let reply_rx = self
             .enqueue_inner(op, false, false, false, SubmitLabels::Site(site))
             .await?;
-        reply_rx
-            .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+        reply_rx.wait().await
     }
 
     /// Like [`Self::send_bounded`], but carries `labels` (the submit site's

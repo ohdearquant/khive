@@ -461,15 +461,22 @@ fn with_refusal(error: crate::error::SqliteError, vfs_name: &str) -> crate::erro
         }
         // A migration renders its failure as text; only an open failure can
         // have a guard refusal behind it.
-        SqliteError::Migration { version, error } if error.contains(CANTOPEN_MESSAGE) => {
-            match vfs::take_refusal(vfs_name) {
-                Some(reason) => SqliteError::Migration {
-                    version,
-                    error: format!("{error}; {reason}"),
-                },
-                None => SqliteError::Migration { version, error },
-            }
-        }
+        SqliteError::Migration {
+            version,
+            error,
+            source,
+        } if error.contains(CANTOPEN_MESSAGE) => match vfs::take_refusal(vfs_name) {
+            Some(reason) => SqliteError::Migration {
+                version,
+                error: format!("{error}; {reason}"),
+                source,
+            },
+            None => SqliteError::Migration {
+                version,
+                error,
+                source,
+            },
+        },
         other => other,
     }
 }

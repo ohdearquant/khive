@@ -68,6 +68,7 @@ pub mod pool;
 mod progress_conn;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_hooks;
+#[doc(hidden)]
 pub use progress_conn::ProgressConn;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.

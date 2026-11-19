@@ -8,6 +8,16 @@ use std::path::PathBuf;
 use clap::Parser;
 use khive_runtime::Namespace;
 
+/// Detail included in the request tool's advertised verb catalog.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogVerbosity {
+    /// Include every verb's complete description.
+    #[default]
+    Full,
+    /// Include a bounded first-line summary and full-help pointer per verb.
+    Compact,
+}
+
 /// The immutable process lifetime selected by the daemon's launcher.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifetimeMode {
@@ -72,6 +82,10 @@ pub struct Args {
     /// config file, then the built-in production set.
     #[arg(long = "pack")]
     pub pack: Vec<String>,
+
+    /// Detail in the advertised verb catalog; full help remains available in either mode.
+    #[arg(long, value_enum, default_value = "full")]
+    pub catalog_verbosity: CatalogVerbosity,
 
     /// Path to a khive TOML config file.
     ///
@@ -200,5 +214,36 @@ mod lifetime_tests {
         assert_eq!(demand.daemon_options().idle_interval.as_secs(), 7);
         assert!(Args::try_parse_from(["mcp", "--lifetime", "demand"]).is_err());
         assert!(Args::try_parse_from(["mcp", "--daemon", "--idle-timeout-secs", "0"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod catalog_verbosity_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_verbosity_defaults_to_full_and_accepts_only_declared_values() {
+        assert_eq!(CatalogVerbosity::default(), CatalogVerbosity::Full);
+        assert_eq!(
+            Args::try_parse_from(["mcp"]).unwrap().catalog_verbosity,
+            CatalogVerbosity::Full
+        );
+        for (value, expected) in [
+            ("full", CatalogVerbosity::Full),
+            ("compact", CatalogVerbosity::Compact),
+        ] {
+            assert_eq!(
+                Args::try_parse_from(["mcp", "--catalog-verbosity", value])
+                    .unwrap()
+                    .catalog_verbosity,
+                expected
+            );
+        }
+        for invalid in ["brief", "", "FULL", "Compact"] {
+            let error = Args::try_parse_from(["mcp", "--catalog-verbosity", invalid])
+                .expect_err("undeclared catalog mode must refuse");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+        assert!(Args::try_parse_from(["mcp", "--catalog-verbosity"]).is_err());
     }
 }

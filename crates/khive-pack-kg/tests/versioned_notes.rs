@@ -876,3 +876,163 @@ async fn keyed_create_c12_stream_batch_atomic_equal_conflict_matches_todays_key_
         "an allowed-disclosure atomic key_conflict carries exactly today's fields, no equal: {error}"
     );
 }
+
+async fn key_admission_domain_snapshot(runtime: &KhiveRuntime) -> Vec<(String, String)> {
+    let mut reader = runtime.sql().reader().await.unwrap();
+    let mut result = Vec::new();
+    for table in [
+        "notes",
+        "graph_edges",
+        "fts_notes",
+        "ann_write_log",
+        "note_streams",
+    ] {
+        let rows = reader
+            .query_all(khive_storage::SqlStatement {
+                sql: format!("SELECT * FROM {table} ORDER BY rowid"),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        result.push((table.to_owned(), format!("{rows:?}")));
+    }
+    result
+}
+
+#[tokio::test]
+async fn incoming_key_refusal_precedes_new_create_and_exact_legacy_replay() {
+    let (runtime, token, registry) = fixture(true);
+    registry
+        .dispatch(
+            "create",
+            json!({"kind":"observation", "key":"retained-safe",
+        "content":"populated index fixture", "embed":false}),
+        )
+        .await
+        .unwrap();
+    let key = format!("ghp_{}", "A".repeat(40));
+    let mut legacy = Note::new("local", "observation", "exact retained body");
+    legacy.key = Some(key.clone());
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(legacy.clone())
+        .await
+        .unwrap();
+    let before = key_admission_domain_snapshot(&runtime).await;
+    for (incoming, content) in [
+        (format!("ghp_{}", "B".repeat(40)), "new body"),
+        (key.clone(), "exact retained body"),
+    ] {
+        let result = registry
+            .dispatch(
+                "create",
+                json!({"kind":"observation", "key":incoming,
+            "content":content, "embed":false}),
+            )
+            .await;
+        assert!(matches!(&result, Err(RuntimeError::SecretDetected(matched))
+            if matched.detector == "github-token" && matched.location.as_deref() == Some("note.key")),
+            "incoming credential key must refuse even when an exact legacy replay exists: {result:?}");
+        assert!(!format!("{result:?}").contains(&incoming));
+        assert_eq!(
+            key_admission_domain_snapshot(&runtime).await,
+            before,
+            "key refusal must preserve complete note/index/edge/stream rows"
+        );
+    }
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap(),
+        Some(legacy)
+    );
+}
+
+#[tokio::test]
+async fn atomic_stream_key_refusal_preserves_the_entire_populated_unit() {
+    let (runtime, _, registry) = fixture(true);
+    registry
+        .dispatch(
+            "stream.append",
+            json!({"stream":"key-admission", "record":{"retained":1}}),
+        )
+        .await
+        .unwrap();
+    registry
+        .dispatch(
+            "create",
+            json!({"kind":"observation", "key":"kept-note",
+        "content":"retained keyed body", "embed":false}),
+        )
+        .await
+        .unwrap();
+    let before = key_admission_domain_snapshot(&runtime).await;
+    let key = format!("ghp_{}", "A".repeat(40));
+    let result = registry.dispatch("stream.batch", json!({"atomic":true, "ops":[
+        {"op":"append", "stream":"key-admission", "record":{"must_not_survive":2}},
+        {"op":"write", "kind":"observation", "key":key, "doc":{"ordinary":true}, "embed":false}
+    ]})).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::SecretDetected(matched))
+        if matched.detector == "github-token" && matched.location.as_deref().is_some_and(|p| p.ends_with(".key"))),
+        "an atomic stream new-key member must produce the key's own typed refusal: {result:?}"
+    );
+    assert_eq!(
+        key_admission_domain_snapshot(&runtime).await,
+        before,
+        "the preceding stream append and every note/index mutation must remain absent"
+    );
+    assert_eq!(
+        registry
+            .dispatch("stream.stat", json!({"stream":"key-admission"}))
+            .await
+            .unwrap()["count"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn legacy_credential_keys_remain_usable_for_reads_and_fences() {
+    let (runtime, token, registry) = fixture(true);
+    let key = format!("ghp_{}", "A".repeat(40));
+    let mut legacy = Note::new("local", "observation", "retained read target");
+    legacy.key = Some(key.clone());
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(legacy.clone())
+        .await
+        .unwrap();
+    let read = registry
+        .dispatch("get", json!({"key":key,"note_kind":"observation"}))
+        .await
+        .unwrap();
+    assert_eq!(read["id"], legacy.id.to_string());
+    let created = registry
+        .dispatch(
+            "create",
+            json!({"kind":"observation", "key":"fenced-safe",
+            "content":"new lawful body", "embed":false, "fence":{
+                "key":key, "kind":"observation", "expected_version":legacy.version, "id":legacy.id
+            }}),
+        )
+        .await;
+    assert!(
+        created.is_ok(),
+        "a retained key is a read assertion, not an incoming assignment: {created:?}"
+    );
+    assert_eq!(
+        runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap(),
+        Some(legacy)
+    );
+}

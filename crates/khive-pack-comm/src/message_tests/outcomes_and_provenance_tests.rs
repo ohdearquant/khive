@@ -165,3 +165,52 @@ async fn dual_write_versions_both_copies_and_stamps_optional_process_provenance(
         assert_eq!(directions, ["inbound", "outbound"]);
     }
 }
+
+#[test]
+fn commit_reply_loss_requires_outbound_confirmation_without_retry() {
+    for with_evidence in [false, true] {
+        let outbound_id = Uuid::new_v4();
+        let error = StorageError::WriteOutcomeUnknown {
+            source: Box::new(std::io::Error::other("lost COMMIT reply")),
+        };
+        let error = if with_evidence {
+            error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
+                stage: khive_storage::error::SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            })
+        } else {
+            error
+        };
+        let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error.into());
+        let RuntimeError::Khive(error) = annotated else {
+            panic!("COMMIT reply loss must carry the outbound confirmation envelope");
+        };
+        assert_eq!(error.kind(), khive_types::ErrorKind::Conflict);
+        assert_eq!(error.retry_hint(), khive_types::RetryHint::NoRetry);
+        assert_eq!(
+            error.details().and_then(|d| d.get("outbound_id")),
+            Some(outbound_id.to_string().as_str())
+        );
+        assert!(error
+            .message()
+            .contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+    }
+    for state in [
+        WriterTaskRequestState::NotStarted,
+        WriterTaskRequestState::TransactionRolledBack,
+    ] {
+        let error = StorageError::WriterTaskRequestFailed {
+            request_state: state,
+            source: Box::new(StorageError::WriteOutcomeUnknown {
+                source: Box::new(std::io::Error::other("known outer finality")),
+            }),
+        };
+        let annotated = attach_outbound_id_to_ambiguous_write(Uuid::new_v4(), error.into());
+        assert!(
+            matches!(annotated, RuntimeError::Storage(_)),
+            "known finality must not demand outbound confirmation"
+        );
+    }
+}

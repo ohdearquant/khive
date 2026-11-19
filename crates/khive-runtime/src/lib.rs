@@ -56,6 +56,7 @@ mod error_projection;
 mod event_actor_scope;
 mod event_cursor_walk;
 mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -64,7 +65,13 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
@@ -74,9 +81,6 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
-pub mod node_config;
-#[cfg(test)]
-mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -197,6 +201,9 @@ pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
     page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
 };
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -216,6 +223,8 @@ pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,

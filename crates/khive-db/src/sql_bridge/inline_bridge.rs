@@ -300,6 +300,11 @@ impl khive_storage::SqlAccess for SqlBridge {
     async fn writer(
         &self,
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlWriter>> {
+        let strict_handle = if self.pool.config().write_routing_strict {
+            self.pool.writer_task_for_write(None, "writer")?
+        } else {
+            None
+        };
         if self.is_file_backed {
             if self.pool.config().read_only {
                 return Err(StorageError::Pool {
@@ -313,28 +318,21 @@ impl khive_storage::SqlAccess for SqlBridge {
             // propagated (never silently degraded) when strict routing is
             // on. Only the flag-off/degraded case still opens a standalone
             // connection.
-            let writer_task = match self.pool.writer_task_handle() {
-                Ok(handle) => handle,
-                Err(e) => {
-                    if self.pool.config().write_routing_strict {
-                        return Err(e);
+            let writer_task = if self.pool.config().write_routing_strict {
+                strict_handle
+            } else {
+                match self.pool.writer_task_handle() {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        tracing::warn!(target: "khive_db::sql_bridge",
+                            error = %e,
+                            "KHIVE_WRITE_ROUTING is not strict; writer() degrades to the \
+                             standalone-connection path"
+                        );
+                        None
                     }
-                    tracing::warn!(target: "khive_db::sql_bridge",
-                        error = %e,
-                        "KHIVE_WRITE_ROUTING is not strict; writer() degrades to the \
-                         standalone-connection path"
-                    );
-                    None
                 }
             };
-            if writer_task.is_none() && self.pool.config().write_routing_strict {
-                return Err(StorageError::Pool {
-                    operation: "writer".into(),
-                    message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
-                              available; refusing to fall back to a direct connection"
-                        .into(),
-                });
-            }
             if writer_task.is_none() && self.pool.write_queue_active() {
                 // The queue is enabled but this call didn't get a handle
                 // (spawn/runtime degrade) — a direct-route violation in the
@@ -401,6 +399,11 @@ impl khive_storage::SqlAccess for SqlBridge {
         &self,
         op: AtomicUnitOp,
     ) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
+        let strict_handle = if self.pool.config().write_routing_strict {
+            self.pool.writer_task_for_write(None, "atomic_unit")?
+        } else {
+            None
+        };
         let event_rows = Arc::new(AtomicEventRows::default());
         let result = async {
             if self.is_file_backed {
@@ -415,15 +418,11 @@ impl khive_storage::SqlAccess for SqlBridge {
                 // falling back to a competing connection from a sync caller. ADR-136
                 // D1 gate 3: `Ok(None)` under strict routing is ALSO a fail-closed
                 // error (queue was requested but unavailable), not just a degrade.
-                let handle = self.pool.writer_task_handle()?;
-                if handle.is_none() && self.pool.config().write_routing_strict {
-                    return Err(StorageError::Pool {
-                        operation: "atomic_unit".into(),
-                        message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
-                              available; refusing to fall back to a direct connection"
-                            .into(),
-                    });
-                }
+                let handle = if self.pool.config().write_routing_strict {
+                    strict_handle
+                } else {
+                    self.pool.writer_task_handle()?
+                };
                 if handle.is_none() && self.pool.write_queue_active() {
                     crate::timeout_sink::emit_direct_route_violation(
                         &crate::timeout_sink::db_label(&self.pool),

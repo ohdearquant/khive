@@ -162,6 +162,46 @@ fn no_explicit_limit_requests_sentinel_row() {
 }
 
 #[test]
+fn explicit_limit_counts_rows_after_skip_in_fixed_and_recursive_queries() {
+    let opts = CompileOptions {
+        scopes: vec![],
+        max_limit: 5,
+    };
+    for source in [
+        "MATCH (a:concept) RETURN a.id",
+        "MATCH (a)-[:extends*1..3]->(b) RETURN b.id",
+    ] {
+        for offset in [0, 3, 10, 500] {
+            for (limit, sql_limit, sentinel) in
+                [(0, 0, false), (3, 3, false), (5, 5, false), (8, 6, true)]
+            {
+                let text = format!("{source} SKIP {offset} LIMIT {limit}");
+                let query = gql::parse(&text).unwrap();
+                let compiled = compile(&query, &opts).unwrap();
+                assert!(
+                    matches!(compiled.params.last(), Some(QueryValue::Integer(value)) if *value == sql_limit),
+                    "{text}: {:?}",
+                    compiled.params
+                );
+                assert!(
+                    matches!(compiled.params.get(compiled.params.len() - 2), Some(QueryValue::Integer(value)) if *value == offset),
+                    "{text}: {:?}",
+                    compiled.params
+                );
+                assert_eq!(
+                    compiled.truncation_check,
+                    sentinel.then_some(TruncationCheck {
+                        max_limit: 5,
+                        requested_limit: Some(limit),
+                    }),
+                    "{text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fixed_length_skip_is_bound_after_a_total_identity_order() {
     let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a SKIP 500").unwrap();
     let compiled = compile(&q, &opts()).unwrap();
