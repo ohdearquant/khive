@@ -149,6 +149,9 @@ fn legacy_comparison_uses_declared_dimensions_and_exact_default_name() {
         ("engines = []\n[embed]\nmodel = 'custom-peer'\ndimensions = 384\n", vec!["embed.model"]),
         ("[embed]\ndevice = 'cpu'\n[[engines]]\nname = 'custom-peer'\n", vec!["embed.device"]),
         ("[embed]\n[[engines]]\nname = 'custom-peer'\n", vec![]),
+        ("[embed]\nauto_embed = false\n[[engines]]\nname = 'custom-peer'\n", vec!["embed.auto_embed"]),
+        ("[embed]\nauto_embed = true\n[[engines]]\nname = 'custom-peer'\n", vec![]),
+        ("[embed.fields]\ninclude = ['name']\n[[engines]]\nname = 'custom-peer'\n", vec!["embed.fields.include"]),
     ];
     for (raw, expected) in cases {
         std::fs::write(&path, raw).unwrap();
@@ -168,7 +171,13 @@ fn legacy_comparison_uses_declared_dimensions_and_exact_default_name() {
                 usize::from(!expected.is_empty()),
                 "{raw}: {warnings:?}"
             );
-            for key in ["embed.model", "embed.dimensions", "embed.device"] {
+            for key in [
+                "embed.model",
+                "embed.dimensions",
+                "embed.device",
+                "embed.auto_embed",
+                "embed.fields.include",
+            ] {
                 assert_eq!(
                     warnings.iter().any(|warning| warning.contains(key)),
                     expected.contains(&key),
@@ -205,7 +214,7 @@ fn no_embed_implicit_peer_comparison_preserves_returned_model_shape() {
         std::fs::write(
             &path,
             format!(
-                "[embed]\nauto_embed = false\nmodel = {:?}\ndimensions = 5000000000\n",
+                "[embed]\nmodel = {:?}\ndimensions = 5000000000\n",
                 primary.name
             ),
         )

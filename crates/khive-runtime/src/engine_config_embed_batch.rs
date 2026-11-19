@@ -64,6 +64,15 @@ impl EmbedSectionConfig {
         if self.device.is_some() {
             reasons.push("embed.device is ignored");
         }
+        if !self.auto_embed {
+            reasons
+                .push("embed.auto_embed = false is not applied yet; write-time embedding stays on");
+        }
+        if self.fields != EntityEmbeddingFields::default() {
+            reasons.push(
+                "embed.fields.include is not applied yet; entity vectors keep their current input",
+            );
+        }
         reasons
     }
 }
