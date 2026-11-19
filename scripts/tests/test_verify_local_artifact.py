@@ -1102,15 +1102,15 @@ class MakefileGateContractTests(unittest.TestCase):
             reaper: threading.Thread | None = None
             if live_daemon:
                 # The recipe stops only a process whose executable name is the
-                # installed binary's, so the stand-in runs as `kkernel`. It is a
-                # symlink to `sleep` because macOS refuses to run a copied
-                # system binary.
-                sleep_bin = shutil.which("sleep")
-                self.assertIsNotNone(sleep_bin, "no sleep binary on PATH")
+                # installed binary's, so the stand-in runs as `kkernel`: a symlink
+                # to this interpreter, since a multicall coreutils `sleep` (uutils)
+                # refuses to run under a name that is not its own.
                 stand_in = root / "outgoing" / "kkernel"
                 stand_in.parent.mkdir()
-                stand_in.symlink_to(sleep_bin)
-                daemon = subprocess.Popen([str(stand_in), "300"])
+                stand_in.symlink_to(sys.executable)
+                daemon = subprocess.Popen(
+                    [str(stand_in), "-c", "import time; time.sleep(300)"]
+                )
                 self.addCleanup(daemon.kill)
                 # Reap it the moment it exits: the recipe polls `ps -p`, which
                 # still lists an unreaped child, and would escalate to SIGKILL.
