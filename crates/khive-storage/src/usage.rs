@@ -13,6 +13,8 @@
 //! spawn and re-enter it with [`scope`] inside the child, because Tokio
 //! task-locals do not cross `tokio::spawn`. Detached background work receives
 //! no context and is attributed via phase-span events instead.
+//! Nested dispatches with their own audit snapshot use [`scope_child`], so
+//! freezing a nested audit cannot freeze its caller's still-running work.
 //!
 //! Reporting is best-effort and can never fail a verb: every increment path
 //! is a no-op when no context is armed, and a dispatch whose counters cannot
@@ -167,6 +169,58 @@ tokio::task_local! {
 /// Run `fut` with `ctx` armed as the current dispatch-accounting context.
 pub async fn scope<F: std::future::Future>(ctx: UsageContext, fut: F) -> F::Output {
     CURRENT.scope(ctx, fut).await
+}
+
+/// Account for a nested dispatch without sharing its audit freeze point.
+///
+/// An armed caller receives the child's complete shipping counters once the
+/// child returns, including on error. Frozen counters exclude later audit/hook
+/// work. Unknown completeness or an interrupted child suppresses the caller's
+/// shipping snapshot. An unarmed caller stays unarmed; the output is unchanged.
+pub async fn scope_child<F: std::future::Future>(fut: F) -> F::Output {
+    let Some(parent) = current() else {
+        return fut.await;
+    };
+    let child = UsageContext::new();
+    let mut completion = ChildCompletion(Some(parent));
+    let output = scope(child.clone(), fut).await;
+    completion.finish(&child);
+    output
+}
+
+struct ChildCompletion(Option<UsageContext>);
+
+impl ChildCompletion {
+    fn finish(&mut self, child: &UsageContext) {
+        if let Some(parent) = &self.0 {
+            if let Some(snapshot) = child.shipping_snapshot() {
+                for (key, unit) in [
+                    ("embed_calls", UsageUnit::EmbedCalls),
+                    ("fts_passes", UsageUnit::FtsPasses),
+                    ("vector_passes", UsageUnit::VectorPasses),
+                    ("graph_hops", UsageUnit::GraphHops),
+                    ("db_round_trips", UsageUnit::DbRoundTrips),
+                    ("ann_jobs_consumed", UsageUnit::AnnJobsConsumed),
+                    ("event_rows", UsageUnit::EventRows),
+                ] {
+                    if let Some(count) = snapshot.get(key).and_then(Value::as_u64) {
+                        parent.add(unit, count);
+                    }
+                }
+            } else {
+                parent.mark_unmeasured();
+            }
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildCompletion {
+    fn drop(&mut self) {
+        if let Some(parent) = &self.0 {
+            parent.mark_unmeasured();
+        }
+    }
 }
 
 /// The currently armed context, if any. Request-owned spawned children

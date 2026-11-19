@@ -156,13 +156,12 @@ pub async fn resolve_consumer_profile(
         "namespace": namespace,
         "consumer_kind": consumer_kind.as_str(),
     });
-    match registry
-        .dispatch_with_identity(
-            "brain.resolve",
-            resolve_params,
-            Some(khive_runtime::RequestIdentity::from_token(token)),
-        )
-        .await
+    match khive_runtime::usage::scope_child(registry.dispatch_with_identity(
+        "brain.resolve",
+        resolve_params,
+        Some(khive_runtime::RequestIdentity::from_token(token)),
+    ))
+    .await
     {
         Ok(v) => {
             let matched_binding = v
