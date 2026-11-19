@@ -104,15 +104,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validates the plan before the empty-namespace early return, so a caller with no namespaces
   and an invalid plan gets an error where it used to get an empty outcome (#6737).
 
+- In `khive_retrieval`, the exhaustive `FuseStrategy` enum gains `WeightedRrf`, `VectorOnly`,
+  `KeywordOnly` and `Custom`, `QueryNode` gains `Collect`, and `ExecutorError` gains
+  `MissingVectorPreparer`, `StrategyValidation`, `RerankResolution`, `Metadata` and `Rerank`.
+  Downstream exhaustive matches must handle them. `WeightedRrf` is declared before `Union` and
+  `Collect` before `Filter`, so casting `FuseStrategy::Union`, `QueryNode::Filter`, `Rerank` or
+  `Empty` to an integer gives a value one higher than before. `ExecutorOutcome` gains a public
+  `plan` field, the candidate tree the executor consumed, which a struct literal must set (#6737).
+
 - The exhaustive `khive_storage::StorageError` enum gains `WriteOutcomeUnknown` (COMMIT was
   issued and the reply was lost; side effects unknown, not retryable), `WriterOwnerUnavailable`
   (strict routing found no writer owner; not started) and `WriterRouteViolation` (strict routing
   refused a write that bypassed the owner; not started). Downstream exhaustive matches must
   handle all three (#6740).
 
+- The exhaustive `khive_db::SqliteError` enum gains `WriterRouteViolation`.
+  `khive_runtime`'s `WireWriterTaskFailure` no longer derives `Copy`, and its `RequestFailed`
+  variant gains an `evidence` field. With the `test-support` feature, the
+  `khive_db::test_hooks::TestHooks` trait gains the required method
+  `test_suppress_commit_reply_after_update` (#6740).
+
 - `khive_runtime::node_config` is renamed `channel_section`; `ChannelSectionConfig` holds opaque
   per-component values (`get`, `iter`) in place of the `node` field, and
   `ConfigError::InvalidNodeConfig` becomes `InvalidChannelConfig` (#6739).
+
+- `khive_runtime::RuntimeConfig` gains the public fields `channel`, `channel_config_validators` and
+  `channel_send_routes`; a struct literal must set them or take them from
+  `RuntimeConfig::default()`. `khive-mcp` no longer has a `khive-channel` feature: the channel
+  crate is always linked, and `channel-email` and `channel-telegram` no longer name it (#6739).
+
+- `khive_pack_memory::config::ScoreBreakdown` gains the public field `entity_evidence_mass`; a
+  struct literal must set it (#6764).
 
 ## [0.20.0] - 2026-11-16
 
