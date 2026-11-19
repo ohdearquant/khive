@@ -568,6 +568,10 @@ impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for B
         self.0.input_schema(verb)
     }
 
+    fn audit_subject_arg(&self, verb: &str) -> Option<&'static str> {
+        self.0.audit_subject_arg(verb)
+    }
+
     fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
         self.0.accept_channel_ingest_capability(capability)
     }

@@ -133,6 +133,14 @@ pub trait PackRuntime: Send + Sync {
         None
     }
 
+    /// Declare the argument naming a registered verb's record subject for dispatch audits.
+    /// Only a complete UUID is copied from this argument; prefixes, names and keys are not.
+    /// On success, the canonical result's `id` and `kind` identify the record actually returned,
+    /// including key lookups and redirects. The default leaves arbitrary `id` fields unclassified.
+    fn audit_subject_arg(&self, _verb: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
     /// can ignore it.

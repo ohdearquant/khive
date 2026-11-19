@@ -236,6 +236,14 @@ impl PackRuntime for Probe<'_> {
         self.hit("input_schema");
         Some(json!({"verb": verb}))
     }
+    fn audit_subject_arg(&self, verb: &str) -> Option<&'static str> {
+        self.hit("audit_subject_arg");
+        match verb {
+            "probe.subject" => Some("record"),
+            "probe.alternate" => Some("other_record"),
+            _ => None,
+        }
+    }
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn khive_runtime::KindHook>> {
         self.hit("kind_hook");
         assert_eq!(kind, "probe-kind");
@@ -436,6 +444,16 @@ async fn forwards_every_runtime_method_to_the_same_inner_instance() {
         called!(input_schema, wrapper.input_schema("probe.input")),
         Some(json!({"verb": "probe.input"}))
     );
+    for (verb, subject) in [
+        ("probe.subject", Some("record")),
+        ("probe.alternate", Some("other_record")),
+        ("probe.unclassified", None),
+    ] {
+        assert_eq!(
+            called!(audit_subject_arg, wrapper.audit_subject_arg(verb)),
+            subject
+        );
+    }
     assert!(called!(edge_rules, wrapper.edge_rules()).is_empty());
     assert!(called!(entity_types, wrapper.entity_types()).is_empty());
     assert_eq!(called!(requires, wrapper.requires()), &["probe-required"]);
