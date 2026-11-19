@@ -849,7 +849,15 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -903,7 +911,15 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -1064,7 +1080,15 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -1116,7 +1140,15 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -1391,6 +1423,7 @@ async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
         strict_routing: false,
@@ -1420,6 +1453,7 @@ async fn accepted_request_lost_reply_is_side_effects_unknown() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
         strict_routing: false,
@@ -1499,8 +1533,15 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
         micros: std::sync::atomic::AtomicU64::new(0),
     });
     let body_clock = Arc::clone(&clock);
-    let mut telemetry =
-        WriteTelemetry::new(key.clone(), "test".into(), 0, None, SubmitLabels::None);
+    let mut telemetry = WriteTelemetry::new(
+        key.clone(),
+        "test".into(),
+        0,
+        None,
+        SubmitLabels::None,
+        false,
+        false,
+    );
     telemetry.test_clock = Some(clock);
     let (reply_tx, mut reply_rx) = oneshot::channel();
     let request = WriteRequest {
