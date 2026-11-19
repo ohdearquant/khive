@@ -583,7 +583,11 @@ impl KhiveMcpServer {
                     // oversized frame, ambiguous post-write outcome) is
                     // untagged and passes through unchanged.
                     Err(e) => match strict_fallback_reason(&e) {
-                        Some(reason) => strict_fallback_envelope_response(&p, reason),
+                        Some(reason) => strict_fallback_envelope_response_with_pid(
+                            &p,
+                            reason,
+                            crate::daemon::daemon_reported_pid(e.data.as_ref()),
+                        ),
                         None => Err(e),
                     },
                 };
@@ -720,17 +724,31 @@ fn strict_fallback_reason(e: &McpError) -> Option<String> {
 /// each op's `error`, not an RPC-level `McpError`. Chain mode aborts after the
 /// first op, matching `run_parsed`'s `Chain` arm and the wire contract's
 /// documented abort-on-failure behavior for `|`-chained ops.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) fn strict_fallback_envelope_response(
     p: &RequestParams,
     reason: String,
 ) -> Result<String, McpError> {
+    strict_fallback_envelope_response_with_pid(p, reason, None)
+}
+
+#[cfg(unix)]
+fn strict_fallback_envelope_response_with_pid(
+    p: &RequestParams,
+    reason: String,
+    daemon_pid: Option<u32>,
+) -> Result<String, McpError> {
     let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
     let total = parsed.ops.len();
+    let remedy = if reason == "config_mismatch" {
+        crate::daemon::config_mismatch_remedy(daemon_pid)
+    } else {
+        "rebuild with `make local` and retry".to_owned()
+    };
     let error_msg = format!(
         "daemon fallback rejected in strict mode (KHIVE_DAEMON_STRICT, or a daemon \
          socket or PID file on disk): reason={reason}; refusing to complete the request \
-         via local dispatch; rebuild with `make local` and retry"
+         via local dispatch; {remedy}"
     );
 
     let results: Vec<Value> = match parsed.mode {
