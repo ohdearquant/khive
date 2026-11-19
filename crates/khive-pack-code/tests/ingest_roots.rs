@@ -172,6 +172,31 @@ async fn an_existing_target_linked_from_inside_a_root_is_judged_by_where_it_poin
 }
 
 #[tokio::test]
+async fn a_default_target_whose_khive_directory_links_outside_the_roots_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let allowed = physical_tempdir();
+    let denied = physical_tempdir();
+    let source = allowed.path().join("source");
+    source_tree(&source);
+    symlink(denied.path(), source.join(".khive")).expect("directory symlink");
+    let registry = registry(vec![allowed.path().to_path_buf()]);
+
+    let error = ingest(&registry, &path_str(&source), None)
+        .await
+        .expect_err("a default target resolving outside every root is refused");
+    let target = source.join(".khive").join("code-map.db");
+    assert_eq!(error.to_string(), refusal("db", &path_str(&target)));
+    assert_eq!(
+        std::fs::read_dir(denied.path())
+            .expect("outside directory listing")
+            .count(),
+        0,
+        "nothing was created outside the roots"
+    );
+}
+
+#[tokio::test]
 async fn an_empty_policy_refuses_every_source() {
     let dir = physical_tempdir();
     let source = dir.path().join("source");

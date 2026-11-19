@@ -123,6 +123,21 @@ fn admit_under_roots(
     }
 }
 
+/// An existing target is resolved itself, so a link inside a root that points
+/// outside every root is refused. A target that does not exist yet is judged by
+/// its nearest existing ancestor, which decides where a write would land.
+fn admit_target_under_roots(
+    target: &Path,
+    roots: &[PathBuf],
+    raw: &str,
+) -> Result<(), RuntimeError> {
+    let existing = target
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .unwrap_or(target);
+    admit_under_roots(existing, roots, "db", raw)
+}
+
 impl CodePack {
     pub(crate) async fn handle_ingest(&self, params: Value) -> Result<Value, RuntimeError> {
         let CodeIngestParams {
@@ -137,16 +152,7 @@ impl CodePack {
         let roots = &self.runtime.config().code_ingest.roots;
         admit_under_roots(&path, roots, "path", &path_raw)?;
         if let Some(db) = db.as_deref() {
-            // An existing target is resolved itself, so a symlink inside a root
-            // that points outside every root is refused. A target that does not
-            // exist yet is judged by its nearest existing ancestor, which decides
-            // where a write would land; the target preflight below keeps its own
-            // refusals for the rest.
-            let existing = Path::new(db)
-                .ancestors()
-                .find(|ancestor| ancestor.exists())
-                .unwrap_or(Path::new(db));
-            admit_under_roots(existing, roots, "db", db)?;
+            admit_target_under_roots(Path::new(db), roots, db)?;
         }
         if !path.is_dir() {
             return Err(RuntimeError::InvalidInput(format!(
@@ -163,6 +169,8 @@ impl CodePack {
         )
         .map_err(RuntimeError::InvalidInput)?;
         if db.is_none() {
+            // `<path>/.khive` may already exist as a link that leaves every root.
+            admit_target_under_roots(&db_path, roots, &db_path.display().to_string())?;
             let parent = db_path.parent().ok_or_else(|| {
                 RuntimeError::InvalidInput("default code-map target has no parent".into())
             })?;
