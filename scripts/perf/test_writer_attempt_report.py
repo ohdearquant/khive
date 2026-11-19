@@ -35,6 +35,8 @@ def line(row):
 
 
 STARTUP = {"kind": "startup", "sqlite": {"version": "3.50.0", "source_id": "x", "compile_options": []}}
+# The daemon's heartbeat after the run window: it closes the segment's drop counter.
+CLOSING_BEAT = {"kind": "heartbeat", "ts_utc": "2026-11-18T00:00:05.000Z"}
 
 
 def arrival(sequence, op, state="completed", latency_us=1000):
@@ -138,9 +140,23 @@ class BurstDrainTests(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    def report(self, sink_lines, records=None, **limits):
+    def report(self, sink_lines, records=None, closed=True, **limits):
         records = records if records is not None else [arrival(0, "create")]
+        if closed:
+            sink_lines = list(sink_lines) + [line(CLOSING_BEAT)]
         return war.build_point_report(arrival_report(records), {"writer_timeouts.1.ndjson": sink_lines}, **limits)
+
+    def test_a_segment_with_no_heartbeat_after_the_window_is_broken(self):
+        sink = [line(STARTUP), line(attempt(1, rid(0)))]
+        with self.assertRaisesRegex(war.ReportError, "no heartbeat after the run window ends"):
+            self.report(sink, closed=False)
+        early = [line(STARTUP), line({"kind": "heartbeat", "ts_utc": INSIDE}), line(attempt(1, rid(0)))]
+        with self.assertRaisesRegex(war.ReportError, "no heartbeat after the run window ends"):
+            self.report(early, closed=False)
+        # A drop counted by the closing heartbeat's summary still voids the point.
+        late_drop = sink + [line(CLOSING_BEAT),
+                            line({"kind": "sink_error_summary", "error": "sink drops since last summary: 1"})]
+        self.assertEqual(self.report(late_drop, closed=False)["verdict"], "VOID")
 
     def test_loss_over_the_limit_voids_the_point(self):
         sink = [line(STARTUP), line(attempt(1, rid(0))),

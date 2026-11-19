@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -54,6 +56,7 @@ class FakeHarness:
                 lines.append({"kind": "writer_attempt", "ts_utc": "2026-11-18T00:00:00.500Z", "attempt_seq": i + 1,
                               "request_id": (PREFIX << BITS) | i, "outcome": "ok", "queue_wait_micros": 5,
                               "transaction_acquire_micros": 1, "body_micros": 10, "commit_micros": 4})
+        lines.append({"kind": "heartbeat", "ts_utc": "2026-11-18T00:00:05.000Z"})
         if self.drops.get(name):
             lines.append({"kind": "sink_error_summary", "error": f"sink drops since last summary: {self.drops[name]}"})
         (sink / "writer_timeouts.1.ndjson").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
@@ -102,7 +105,25 @@ class BurstTests(unittest.TestCase):
                                         emit=lines.append)
         self.assertEqual(rc, 0)
         self.assertIn("bursts=1 missed=1 refused=0 drain_p99_ms=500.0 deadline_ms=100", lines[2])
-        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 (first size with a missed burst)")
+        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 "
+                                    "(first size with a burst missed and no arrival refused)")
+
+    def test_refused_bursts_are_named_apart_from_the_knee(self):
+        drain = lambda missed, refused: {"missed": missed, "refused": refused, "drain_missed": missed and not refused}
+        line_ = sweep.knee_line([(10, drain(0, 0)), (40, drain(1, 3)), (80, drain(1, 0))], 0.1)
+        self.assertEqual(line_, "burst-drain knee at deadline 100 ms: size 80 (first size with a burst missed and no "
+                                "arrival refused); client pool refused burst arrivals from size 40 "
+                                "(a capacity reading, not a drain one)")
+        only_refused = sweep.knee_line([(10, drain(0, 0)), (40, drain(1, 2))], 0.1)
+        self.assertTrue(only_refused.startswith("burst-drain knee at deadline 100 ms: none up to size 40; client pool"))
+
+    def test_burst_sizes_at_or_over_the_worker_pool_are_refused(self):
+        base = ["--out", "/x/o", "--rate-per-worker", "1", "--burst-deadline-ms", "100", "--paired-workers", "50"]
+        self.assertEqual(sweep.parse_args(base + ["--burst-sizes", "10,49"]).burst_sizes, [10, 49])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            sweep.parse_args(base + ["--burst-sizes", "10,50"])
+        self.assertIn("--burst-sizes must stay below --paired-workers", err.getvalue())
 
     def test_burst_run_without_burst_rows_is_broken(self):
         class NoBurst(FakeHarness):

@@ -48,6 +48,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
+import inspect
 import json
 import math
 import os
@@ -273,6 +275,11 @@ def _op_create_entity(proc, tenant, i, request_id=None):
         request_id,
     )
 
+
+# The writer sink reports drops only in its heartbeat (default every 5 minutes). A kept sink directory shortens it and
+# the run waits two heartbeats after the last arrival, so the drop counter covers every row the run enqueued.
+SINK_HEARTBEAT_MS = 1000
+SINK_SETTLE_S = 3.0
 
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
 BULK_INGEST_MEMBERS = 100
@@ -564,11 +571,18 @@ def arrival_schedule(operations, rate, burst_size=0, burst_every_s=0.0):
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _takes_fixtures(fn):
+    params = inspect.signature(fn).parameters
+    return "fixtures" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _execute_arrival(worker, fn, sequence, clock, request_id=None):
     proc, result = worker
     started = clock()
     kwargs = {"request_id": request_id}
-    if result.fixtures is not None:
+    # A worker holds fixtures for the whole mix; only the ops that declare the parameter are handed them.
+    if result.fixtures is not None and _takes_fixtures(fn):
         kwargs["fixtures"] = result.fixtures
     try:
         outcome = fn(proc, result.tenant, sequence, **kwargs)
@@ -904,6 +918,7 @@ def main() -> int:
     if args.sink_dir:
         pathlib.Path(args.sink_dir).mkdir(parents=True, exist_ok=True)
         base_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"] = str(pathlib.Path(args.sink_dir).resolve())
+        base_env["KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"] = str(SINK_HEARTBEAT_MS)
     if args.writer_attempt_log:
         base_env["KHIVE_WRITER_ATTEMPT_LOG"] = "1"
 
@@ -994,6 +1009,10 @@ def main() -> int:
             report["arrival"]["mix"] = args.mix
             report["arrival"]["writer_attempt_log"] = args.writer_attempt_log
             report["arrival"]["sink_dir"] = base_env.get("KHIVE_WRITER_TIMEOUT_SINK_DIR")
+            if args.sink_dir:
+                time.sleep(SINK_SETTLE_S)
+                report["arrival"]["sink_heartbeat_ms"] = SINK_HEARTBEAT_MS
+                report["arrival"]["sink_settled_at"] = _utc_text(time.time())
         else:
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = {

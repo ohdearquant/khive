@@ -388,6 +388,23 @@ class FixtureTests(unittest.TestCase):
         harness._execute_arrival((None, fitted), op, 1, clock, request_id=6)
         self.assertEqual(seen, [{}, {"fixtures": {"entity_id": "e"}}])
 
+    def test_every_f7_shape_runs_on_a_worker_that_holds_fixtures(self):
+        verbs = []
+
+        def call(proc, verb, args, request_id=None):
+            verbs.append(verb)
+            return {"id": "x", "marked_count": 1}
+
+        fitted = harness.WorkerResult(0, 0)
+        fitted.fixtures = {"entity_id": "e", "receipts": harness.deque(["m%d" % i for i in range(9)])}
+        clock = VirtualClock()
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            for fn in harness._F7_SHAPES:
+                before = len(verbs)
+                outcome, _, _ = harness._execute_arrival((None, fitted), fn, 0, clock, request_id=1)
+                self.assertNotIn("unexpected keyword", outcome.error or "", fn.__name__)
+                self.assertGreater(len(verbs), before, f"{fn.__name__} sent no verb")
+
 
 # Fixed synthetic values, with the complete legacy report shape and field order.
 # This is a serializer compatibility fixture, not a measured benchmark result.
@@ -561,6 +578,7 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
             _, off_env, _ = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink])
             self.assertNotIn("KHIVE_WRITER_ATTEMPT_LOG", off_env)
             self.assertEqual(off_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"], os.path.realpath(sink))
+            self.assertEqual(off_env["KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"], str(harness.SINK_HEARTBEAT_MS))
             self.assertTrue(os.path.isdir(sink))
             _, on_env, worker_envs = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink, "--writer-attempt-log"])
             self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")

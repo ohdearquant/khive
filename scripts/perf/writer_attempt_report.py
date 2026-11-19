@@ -13,7 +13,10 @@ Loss accounting, per sink file (one file per process and sink directory, sequenc
   dropped      the sum of `sink_error_summary` drop counts in the segment; it counts every dropped row of any kind
                and every unrouted row, so it bounds the lost attempt rows from above
   loss_upper   dropped / (written + dropped), the share of attempt rows that may be missing
-A segment whose gaps exceed its drop counter is inconsistent and makes the run BROKEN. A point whose loss_upper is
+The daemon writes its drop counter only beside a heartbeat, so a segment holding attempt rows must carry a heartbeat
+after the run window ends, or its counter does not cover the run's tail and the run is BROKEN (the harness shortens
+the heartbeat and waits for one when it keeps a sink directory). A segment whose gaps exceed its drop counter is
+inconsistent and makes the run BROKEN. A point whose loss_upper is
 over the loss limit (default 1 percent) is VOID: rows and alarm rows share one bounded channel, so loss is likeliest
 exactly at the load where the measurement matters, and a void point is re-run, never read.
 
@@ -103,7 +106,7 @@ def parse_sink_lines(lines):
     Returns a list of segments: {startup, attempts, dropped, unparsed}. Rows before the first startup row form a
     segment with startup None, so nothing is silently discarded.
     """
-    segments = [{"startup": None, "attempts": [], "dropped": 0, "unparsed": 0}]
+    segments = [{"startup": None, "attempts": [], "dropped": 0, "unparsed": 0, "heartbeat": None}]
     for line in lines:
         if not line.strip():
             continue
@@ -114,7 +117,9 @@ def parse_sink_lines(lines):
             continue
         kind = row.get("kind")
         if kind == "startup":
-            segments.append({"startup": row, "attempts": [], "dropped": 0, "unparsed": 0})
+            segments.append({"startup": row, "attempts": [], "dropped": 0, "unparsed": 0, "heartbeat": None})
+        elif kind == "heartbeat":
+            segments[-1]["heartbeat"] = row.get("ts_utc")
         elif kind == ATTEMPT_KIND:
             segments[-1]["attempts"].append(row)
         elif kind == "sink_error_summary":
@@ -257,6 +262,7 @@ def burst_drain(records, deadline_s):
     A burst's drain time runs from its scheduled instant to the last finish among its completed arrivals. A burst
     MISSES when that time is over `deadline_s`, or when any of its arrivals was refused, failed or never finished:
     a refused arrival finishes at once, so leaving it out of the drain time alone would read an overload as fast.
+    A refusal is the client's worker pool, not the writer, so `drain_missed` counts only misses with no refusal.
     Returns None when no record belongs to a burst.
     """
     bursts = {}
@@ -283,6 +289,7 @@ def burst_drain(records, deadline_s):
         "sizes": sorted({b["size"] for b in per_burst}),
         "missed": sum(b["missed"] for b in per_burst),
         "refused": sum(b["refused"] for b in per_burst),
+        "drain_missed": sum(b["missed"] and not b["refused"] for b in per_burst),
         "drain_s": summarize([b["drain_s"] for b in per_burst if b["drain_s"] is not None]),
         "per_burst": per_burst,
     }
@@ -305,6 +312,11 @@ def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, u
         for segment in parse_sink_lines(lines):
             segment["file"] = name
             segments.append(segment)
+    for segment in segments:
+        beat = segment["heartbeat"]
+        if segment["attempts"] and (beat is None or parse_utc(beat) <= window[1]):
+            raise ReportError(f"sink segment in {segment['file']} has no heartbeat after the run window ends, so its "
+                              "drop counter does not cover the run")
     losses = [dict(segment_loss(s), file=s["file"]) for s in segments]
     total = {key: sum(l[key] for l in losses) for key in ("expected", "written", "gaps", "dropped")}
     denominator = total["written"] + total["dropped"]

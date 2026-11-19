@@ -129,12 +129,17 @@ def burst_text(drain):
 
 
 def knee_line(burst_points, deadline_s):
-    """The smallest burst size with a missed burst, or the largest size tried when none missed."""
-    missed = sorted(size for size, drain in burst_points if drain["missed"])
+    """The smallest size with a burst missed with no refusal, or the largest size tried when none missed. Sizes whose
+    bursts had arrivals refused by the client's worker pool are named apart: they measure the pool, not the writer."""
+    missed = sorted(size for size, drain in burst_points if drain["drain_missed"])
+    refused = sorted(size for size, drain in burst_points if drain["refused"])
     tried = sorted(size for size, _ in burst_points)
-    if missed:
-        return f"burst-drain knee at deadline {deadline_s * 1000:g} ms: size {missed[0]} (first size with a missed burst)"
-    return f"burst-drain knee at deadline {deadline_s * 1000:g} ms: none up to size {tried[-1]}"
+    head = f"burst-drain knee at deadline {deadline_s * 1000:g} ms: "
+    line = head + (f"size {missed[0]} (first size with a burst missed and no arrival refused)" if missed
+                   else f"none up to size {tried[-1]}")
+    if refused:
+        line += f"; client pool refused burst arrivals from size {refused[0]} (a capacity reading, not a drain one)"
+    return line
 
 
 def cost_line(cost):
@@ -221,6 +226,9 @@ def parse_args(argv=None):
     if args.burst_sizes and (min(args.burst_sizes) <= 0 or not math.isfinite(args.burst_every)
                              or args.burst_every <= 0 or not (args.burst_deadline_ms or 0) > 0):
         ap.error("--burst-sizes needs positive sizes, a positive --burst-every and a positive --burst-deadline-ms")
+    if args.burst_sizes and max(args.burst_sizes) >= args.paired_workers:
+        ap.error("--burst-sizes must stay below --paired-workers: a burst larger than the worker pool is refused by "
+                 "the client, which measures the pool rather than the writer")
     args.queue_p99_limit_micros = None if args.queue_p99_limit_ms is None else args.queue_p99_limit_ms * 1000
     if not math.isfinite(args.rate_per_worker) or args.rate_per_worker <= 0 or args.seconds <= 0:
         ap.error("--rate-per-worker and --seconds must be positive")
