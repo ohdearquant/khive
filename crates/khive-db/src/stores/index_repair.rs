@@ -137,7 +137,7 @@ impl IndexRepairContext {
                 gate.ready.store(false, Ordering::Release);
                 let writer = self
                     .pool
-                    .writer_until_for_admitted_operation(|| {
+                    .schema_writer_until_for_admitted_operation(|| {
                         context.blocking_stop_reason().is_some()
                     })
                     .map_err(|error| error.into_storage_error(capability, operation))?

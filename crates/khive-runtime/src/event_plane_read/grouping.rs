@@ -1,24 +1,23 @@
 use std::collections::BTreeMap;
 
-use khive_runtime::audit_error::AuditErrorClass;
+use crate::audit_error::AuditErrorClass;
 use khive_storage::Event;
 use khive_types::{EventKind, EventOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::handlers::{event_cost_unit, event_work_class};
-use crate::BrainPack;
+use super::counts::{event_cost_unit, event_work_class, truncatable_total_key};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum EventCountDimension {
+pub enum EventCountDimension {
     Verb,
     Actor,
 }
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(try_from = "[EventCountDimension; 2]")]
-pub(crate) enum EventCountGroupBy {
+pub enum EventCountGroupBy {
     VerbActor,
 }
 
@@ -34,8 +33,8 @@ impl TryFrom<[EventCountDimension; 2]> for EventCountGroupBy {
 }
 
 impl EventCountGroupBy {
-    #[cfg(test)]
-    pub(crate) fn add_to_result(
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn add_to_result(
         self,
         result: &mut Value,
         items: &[Event],
@@ -67,16 +66,15 @@ impl EventCountCross {
     }
 
     pub(crate) fn add_to_result(self, result: &mut Value, truncated: bool) {
-        result[BrainPack::truncatable_total_key("counts_by_verb_and_actor", truncated)] =
-            json!(self.counts);
+        result[truncatable_total_key("counts_by_verb_and_actor", truncated)] = json!(self.counts);
     }
 }
 
 /// Counts own only output keys and scalar aggregates, never event payloads.
 #[derive(Default)]
-pub(crate) struct EventCountsAccumulator {
+pub struct EventCountsAccumulator {
     default_actor: Option<String>,
-    group_counts: Option<crate::event_counts_grouping::EventCountCross>,
+    group_counts: Option<EventCountCross>,
     counts_by_kind: std::collections::BTreeMap<String, u64>,
     counts_by_actor: std::collections::BTreeMap<String, u64>,
     counts_by_verb: std::collections::BTreeMap<String, u64>,
@@ -96,10 +94,7 @@ pub(crate) struct EventCountsAccumulator {
 }
 
 impl EventCountsAccumulator {
-    pub(crate) fn new(
-        default_actor: Option<&str>,
-        group_by: Option<crate::event_counts_grouping::EventCountGroupBy>,
-    ) -> Self {
+    pub fn new(default_actor: Option<&str>, group_by: Option<EventCountGroupBy>) -> Self {
         Self {
             default_actor: default_actor.map(str::to_owned),
             group_counts: group_by.map(|_| Default::default()),
@@ -107,7 +102,7 @@ impl EventCountsAccumulator {
         }
     }
 
-    pub(crate) fn observe(&mut self, event: &Event) {
+    pub fn observe(&mut self, event: &Event) {
         *self
             .counts_by_kind
             .entry(event.kind.name().to_string())
@@ -199,8 +194,8 @@ impl EventCountsAccumulator {
         }
     }
 
-    pub(crate) fn add_to_result(self, result: &mut Value, truncated: bool) {
-        result[BrainPack::truncatable_total_key("sampled_success_rows", truncated)] =
+    pub fn add_to_result(self, result: &mut Value, truncated: bool) {
+        result[truncatable_total_key("sampled_success_rows", truncated)] =
             json!(self.sampled_success_rows);
         result["counts_by_kind"] = json!(self.counts_by_kind);
         result["counts_by_actor"] = json!(self.counts_by_actor);
@@ -208,9 +203,9 @@ impl EventCountsAccumulator {
         // Unknown and historical classes are counted without inventing a class
         // or changing stored payloads. Omit both keys if no failed audit was read.
         if !self.counts_by_error_class.is_empty() || self.unclassified_error_count != 0 {
-            result[BrainPack::truncatable_total_key("counts_by_error_class", truncated)] =
+            result[truncatable_total_key("counts_by_error_class", truncated)] =
                 json!(self.counts_by_error_class);
-            result[BrainPack::truncatable_total_key("unclassified_error_count", truncated)] =
+            result[truncatable_total_key("unclassified_error_count", truncated)] =
                 json!(self.unclassified_error_count);
         }
         if let Some(cross) = self.group_counts {
@@ -232,7 +227,7 @@ impl EventCountsAccumulator {
             result["counts_by_work_class"] = json!(self.counts_by_work_class);
         }
         if !self.cost_unit_by_verb.is_empty() {
-            result[BrainPack::truncatable_total_key("total_cost_unit", truncated)] =
+            result[truncatable_total_key("total_cost_unit", truncated)] =
                 json!(self.total_cost_unit);
             result["cost_unit_by_verb"] = json!(self.cost_unit_by_verb);
         }

@@ -4,7 +4,7 @@ use chrono::Datelike;
 use khive_types::{base_entity_rule_allows, endpoint_matches, EdgeEndpointRule, EdgeRelation};
 
 use crate::config::*;
-use crate::{EvaluationContext, EvaluationMode, NdjsonState, RuleResult, Violation};
+use crate::{EvaluationContext, EvaluationMode, NdjsonSource, NdjsonState, RuleResult, Violation};
 
 /// Read an edge record's source endpoint id, accepting either canonical
 /// serialization spelling: `source` (khive-vcs sync, kkernel archive, and
@@ -90,6 +90,7 @@ fn validate_severity(rule_id: &str, s: &str) -> Option<RuleResult> {
             severity: "error",
             passed: false,
             violations: vec![Violation {
+                source: None,
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -131,6 +132,7 @@ pub fn evaluate(
                     severity: "error",
                     passed: false,
                     violations: vec![Violation {
+                        source: None,
                         entity_id: None,
                         entity_name: None,
                         entity_kind: None,
@@ -248,6 +250,11 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
 
     let sev = severity_static(&rule.severity);
     let is_edge_rule = rule.kind == "edge";
+    let source = Some(if is_edge_rule {
+        NdjsonSource::Edges
+    } else {
+        NdjsonSource::Entities
+    });
     let mut violations = Vec::new();
 
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -267,6 +274,7 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                         Some(src)
                     };
                     violations.push(Violation {
+                        source,
                         entity_id: id.map(str::to_owned),
                         entity_name: None,
                         entity_kind: v
@@ -298,6 +306,7 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                 }
                 .filter(|id| !id.is_empty());
                 violations.push(Violation {
+                    source,
                     entity_id: id.map(str::to_owned),
                     entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_owned),
                     entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_owned),
@@ -523,6 +532,7 @@ pub fn check_edge_endpoint_types(
 
             if !allowed {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Edges),
                     entity_id: Some(src_id.to_string()),
                     entity_name: None,
                     entity_kind: Some(src.kind.clone()),
@@ -607,6 +617,7 @@ pub fn check_edge_direction_conventions(
                     && rule.forward_target_kinds.iter().any(|k| k == &src.kind);
                 if reversed {
                     violations.push(Violation {
+                        source: Some(NdjsonSource::Edges),
                         entity_id: Some(src_id.to_string()),
                         entity_name: None,
                         entity_kind: Some(src.kind.clone()),
@@ -671,6 +682,7 @@ pub fn check_dangling_refs(
                     if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
+                                source: Some(NdjsonSource::Edges),
                                 entity_id: Some(id.to_string()),
                                 entity_name: None,
                                 entity_kind: None,
@@ -743,6 +755,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
 
             if name.trim().is_empty() {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -755,6 +768,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if no_ws && name != name.trim() {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -766,6 +780,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if no_paren && has_parenthetical_suffix(name) {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -780,6 +795,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if name.chars().count() > max_length {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -865,7 +881,10 @@ pub fn check_citation_date_lint(
     let sev = severity_static(&cfg.severity);
     let mut violations = Vec::new();
 
-    for path in [entities_path, notes_path] {
+    for (path, source) in [
+        (entities_path, NdjsonSource::Entities),
+        (notes_path, NdjsonSource::Notes),
+    ] {
         {
             let content = path;
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -886,6 +905,7 @@ pub fn check_citation_date_lint(
                     };
                     if let Some(desc) = future_date_description(value, &now) {
                         violations.push(Violation {
+                            source: Some(source),
                             entity_id: id.clone(),
                             entity_name: name.clone(),
                             entity_kind: kind.clone(),

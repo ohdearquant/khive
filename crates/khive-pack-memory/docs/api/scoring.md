@@ -68,13 +68,16 @@ Both functions discard non-finite values, values below `min_rrf_relevance`, and 
 
 ## Per-entity posterior term
 
-`entity_posterior_term(mean, weight)` calculates:
+`entity_posterior_term(Some((mean, n)), weight)` calculates, with `n` the posterior's evidence mass and `k = 16` (`ENTITY_EVIDENCE_HALF_MASS`):
 
 ```text
-clamp(1 + weight * (mean - 0.5), 0.85, 1.15)
+t0   = clamp(1 + weight * (mean - 0.5), 0.85, 1.15)
+term = 1 + (t0 - 1) * n / (n + k)
 ```
 
-The default weight is `0.3`, making both clamp endpoints reachable at posterior means zero and one. `None` returns exactly `1.0`; an untouched memory must receive the identity multiplier rather than merely some value inside the band. The term can never move a candidate by more than ±15%.
+`entity_posterior_t0(mean, weight)` computes `t0` alone. The default weight is `0.3`, so `t0` reaches the clamp endpoints at posterior means zero and one. `entity_evidence_mass(alpha, beta)` gives `n = max(0, alpha + beta - 2)` for a posterior stored with the Beta(1, 1) prior inside `alpha` and `beta`; one explicit judgment adds 1.0 and a weighted signal adds its weight. `None` and `n = 0` return exactly `1.0`; an untouched memory must receive the identity multiplier rather than merely some value inside the band.
+
+The term scales `t0` toward neutral in both directions: it reaches half of `t0 - 1` at an evidence mass of 16 and approaches `t0` as evidence grows. It stays within [0.85, 1.15] and never moves past `t0`, so it can never move a candidate by more than ±15%. One `useful` judgment moves a memory by about +0.29%, 16 by about +6.67% (ADR-104 Amendment 6).
 
 ## `weighted_rerank`
 

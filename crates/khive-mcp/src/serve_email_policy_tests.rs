@@ -91,6 +91,52 @@ fn startup_external_enabled_requires_actor_in_both_host_entrypoints() {
 
 #[cfg(feature = "channel-email")]
 #[test]
+fn a_server_without_comm_boots_unless_it_polls_external_email() {
+    isolated_case(
+        "a_server_without_comm_boots_unless_it_polls_external_email",
+        async {
+            use clap::Parser as _;
+            let footer = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(footer.path(), "Reply to unsubscribe: {unsubscribe}").unwrap();
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_SENDERS", "actor:sender");
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_DAILY_CAP", "5");
+            std::env::set_var("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY", "cc".repeat(32));
+            std::env::set_var(
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+                format!("0:{}", "11".repeat(32)),
+            );
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE", footer.path());
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            // A registry built without the comm pack holds no comm-routed runtime.
+            let server =
+                KhiveMcpServer::with_packs(KhiveRuntime::memory().unwrap(), &["kg".into()])
+                    .unwrap()
+                    .with_channel_outbox_runtime(None);
+
+            let args = Args::parse_from(["mcp", "--db", ":memory:", "--no-embed", "--pack", "kg"]);
+            assert!(
+                prepare_host_background_tasks(&args, &server)
+                    .await
+                    .unwrap()
+                    .email
+                    .is_none(),
+                "a stdio server without comm starts and prepares no email loop"
+            );
+            assert!(prepare_email_channel_loops(&server, false)
+                .unwrap()
+                .is_none());
+
+            // A polling host without comm still refuses: its loop could not route or commit opt-outs.
+            let error = prepare_email_channel_loops(&server, true)
+                .err()
+                .expect("a polling host without comm refuses external email");
+            assert!(error.to_string().contains("comm-routed runtime"), "{error}");
+        },
+    );
+}
+
+#[cfg(feature = "channel-email")]
+#[test]
 fn startup_disabled_external_does_not_require_actor_or_parse_routes() {
     isolated_case(
         "startup_disabled_external_does_not_require_actor_or_parse_routes",

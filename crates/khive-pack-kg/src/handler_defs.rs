@@ -15,6 +15,20 @@ use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
     ParamDef {
+        name: "created_after",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 lower bound on entity/note created_at (at most 9 fractional-second digits). Metadata filter before the final limit over returned candidates: limit × 50, capped at 500 per backend. Can underfill; does not scan the full time range or use the larger property/tag pushdown window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "created_before",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 upper bound on entity/note created_at (at most 9 fractional-second digits). Must not precede created_after. Omitted/null bounds are unrestricted; compared as instants before ordering and the final limit within the returned candidate window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
         name: "kind",
         param_type: "string",
         required: true,
@@ -1424,7 +1438,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
