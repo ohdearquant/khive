@@ -160,6 +160,7 @@ fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
         }),
         None,
         None,
+        None,
     );
     let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(parsed["kind"], "slow_write");
@@ -225,6 +226,7 @@ fn enqueue_drops_and_counts_on_full_channel() {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
 
     enqueue(&sender, &dropped, make_event());
@@ -407,6 +409,7 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
                     queue_depth: None,
                     writer_stages: None,
                     labels: None,
+                    attempt: None,
                 };
                 enqueue(&sender, &dropped, event);
             })
@@ -433,6 +436,7 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
             event.queue_depth,
             event.writer_stages,
             event.labels,
+            event.attempt,
             None,
             None,
         );
