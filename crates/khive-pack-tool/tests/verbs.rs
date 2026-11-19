@@ -38,6 +38,215 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_policy_matches_registry_name_folding() {
+    for (stored_name, policy_name) in [("fold-shell", "FOLD-SHELL"), ("FOLD-SHELL", "fold-shell")] {
+        let f = fixture();
+        let registered = f
+            .call(
+                "tool.register",
+                json!({"name":stored_name,"side_effect":"read"}),
+            )
+            .await;
+        let id = s(&registered["tool"], "full_id");
+        let policy = f
+            .call(
+                "tool.policy",
+                json!({"actor":"agent:fold","tool":policy_name,"decision":"deny"}),
+            )
+            .await;
+        for reference in [stored_name, policy_name, id.as_str()] {
+            let checked = f
+                .call("tool.check", json!({"actor":"agent:fold","tool":reference}))
+                .await;
+            assert_eq!(checked["registered"], true);
+            assert_eq!(checked["tool"], stored_name);
+            assert_eq!(checked["decision"], "deny");
+            assert_eq!(checked["source"], "policy");
+            assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+        }
+        let different_actor = f
+            .call(
+                "tool.check",
+                json!({"actor":"Agent:fold","tool":stored_name}),
+            )
+            .await;
+        assert_eq!(different_actor["source"], "default");
+        assert_eq!(different_actor["decision"], "allow");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_prefix_policy_matches_registry_name_folding() {
+    let f = fixture();
+    for name in ["Exec.Shell", "Exec.Other"] {
+        f.call("tool.register", json!({"name":name,"side_effect":"read"}))
+            .await;
+    }
+    let policy = f
+        .call(
+            "tool.policy",
+            json!({"actor":"agent:prefix","tool":"eXeC.sh*","decision":"deny"}),
+        )
+        .await;
+    let checked = f
+        .call(
+            "tool.check",
+            json!({"actor":"agent:prefix","tool":"EXEC.SHELL"}),
+        )
+        .await;
+    assert_eq!(checked["decision"], "deny");
+    assert_eq!(checked["source"], "policy");
+    assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+    for (actor, name) in [
+        ("agent:prefix", "Exec.Other"),
+        ("Agent:prefix", "Exec.Shell"),
+    ] {
+        let checked = f
+            .call("tool.check", json!({"actor":actor,"tool":name}))
+            .await;
+        assert_eq!(checked["source"], "default");
+        assert_eq!(checked["decision"], "allow");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_policy_name_folding_keeps_decision_order() {
+    for reverse in [false, true] {
+        let f = fixture();
+        f.call(
+            "tool.register",
+            json!({"name":"fOlDsHeLl","side_effect":"read"}),
+        )
+        .await;
+        let mut definitions = [
+            ("FoldShell", "allow"),
+            ("foldshell", "ask"),
+            ("FOLDSHELL", "deny"),
+        ];
+        if reverse {
+            definitions.reverse();
+        }
+        let mut rows = std::collections::BTreeMap::new();
+        for (name, decision) in definitions {
+            let row = f
+                .call(
+                    "tool.policy",
+                    json!({"actor":"agent:tie","tool":name,"decision":decision,"note":"original"}),
+                )
+                .await["policy"]
+                .clone();
+            rows.insert(decision, row);
+        }
+        let ids: std::collections::BTreeSet<_> = rows.values().map(|row| s(row, "id")).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "case-distinct policy rows retain their identities"
+        );
+        let checked = f
+            .call(
+                "tool.check",
+                json!({"actor":"agent:tie","tool":"fOlDsHeLl"}),
+            )
+            .await;
+        assert_eq!(checked["decision"], "deny");
+        assert_eq!(checked["policy_id"], rows["deny"]["id"]);
+
+        let corrected = f
+            .call(
+                "tool.policy",
+                json!({"actor":"agent:tie","tool":"FoldShell","decision":"allow","note":"revised"}),
+            )
+            .await["policy"]
+            .clone();
+        assert_eq!(corrected["id"], rows["allow"]["id"]);
+        assert_eq!(corrected["created_at"], rows["allow"]["created_at"]);
+        assert_eq!(corrected["history"].as_array().unwrap().len(), 1);
+        assert_eq!(corrected["history"][0]["decision"], "allow");
+        assert_eq!(corrected["history"][0]["note"], "original");
+        let policies = f
+            .call("tool.policies", json!({"actor":"agent:tie","limit":10}))
+            .await;
+        let policies = policies["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 3);
+        assert!(policies.iter().any(|row| row == &rows["deny"]));
+        assert!(policies.iter().any(|row| row == &rows["ask"]));
+
+        for (removed, expected) in [("deny", "ask"), ("ask", "allow")] {
+            f.call(
+                "tool.policy_delete",
+                json!({"actor":"agent:tie","tool":rows[removed]["tool"]}),
+            )
+            .await;
+            let checked = f
+                .call(
+                    "tool.check",
+                    json!({"actor":"agent:tie","tool":"fOlDsHeLl"}),
+                )
+                .await;
+            assert_eq!(checked["source"], "policy");
+            assert_eq!(checked["decision"], expected);
+            assert_eq!(checked["policy_id"], rows[expected]["id"]);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_name_folding_preserves_nul_suffixes() {
+    let f = fixture();
+    let mut ids = std::collections::BTreeSet::new();
+    for name in ["Exec\0Shell", "Exec\0Other", "Exec", "éTool"] {
+        let registered = f
+            .call("tool.register", json!({"name":name,"side_effect":"read"}))
+            .await;
+        ids.insert(s(&registered["tool"], "full_id"));
+    }
+    assert_eq!(ids.len(), 4);
+    for (actor, pattern) in [
+        ("agent:exact", "eXEC\0sHELL"),
+        ("agent:prefix", "eXEC\0sH*"),
+    ] {
+        let policy = f
+            .call(
+                "tool.policy",
+                json!({"actor":actor,"tool":pattern,"decision":"deny"}),
+            )
+            .await;
+        let checked = f
+            .call("tool.check", json!({"actor":actor,"tool":"exec\0shell"}))
+            .await;
+        assert_eq!(checked["tool"], "Exec\0Shell");
+        assert_eq!(checked["source"], "policy");
+        assert_eq!(checked["decision"], "deny");
+        assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+        for name in ["Exec\0Other", "Exec"] {
+            let checked = f
+                .call("tool.check", json!({"actor":actor,"tool":name}))
+                .await;
+            assert_eq!(checked["source"], "default");
+            assert_eq!(checked["decision"], "allow");
+        }
+    }
+    f.call(
+        "tool.policy",
+        json!({"actor":"agent:unicode","tool":"Étool","decision":"deny"}),
+    )
+    .await;
+    let checked = f
+        .call(
+            "tool.check",
+            json!({"actor":"agent:unicode","tool":"éTool"}),
+        )
+        .await;
+    assert_eq!(checked["source"], "default");
+    assert_eq!(checked["decision"], "allow");
+}
+
 fn s(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(Value::as_str)

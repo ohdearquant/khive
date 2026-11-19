@@ -4349,6 +4349,10 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
             breakdown["entity_posterior_mean"].is_null(),
             "no profile served the request => entity_posterior_mean must be absent"
         );
+        assert!(
+            breakdown["entity_evidence_mass"].is_null(),
+            "no profile served the request => entity_evidence_mass must be absent"
+        );
         assert_eq!(breakdown["weights_served"].as_str(), Some("default"));
         assert_eq!(breakdown["namespace"].as_str(), Some("local"));
         assert_eq!(
@@ -4432,11 +4436,30 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
         "H received 30 'useful' signals against an uninformative Beta(1,1) \
              prior; its entity posterior mean must be high, got {h_ent_mean}"
     );
+    let h_mass = hits[h_pos]["breakdown"]["entity_evidence_mass"]
+        .as_f64()
+        .expect("H's posterior reports its evidence mass");
+    assert!(
+        (h_mass - 30.0).abs() < 1e-9,
+        "shipped mass: 30 useful signals hold 30.0 of evidence, got {h_mass}"
+    );
+    assert_eq!(
+        breakdown_f32(&hits[h_pos]["breakdown"]["entity_term"]),
+        crate::scoring::entity_posterior_term(
+            Some((h_ent_mean, h_mass)),
+            crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+        ),
+        "entity_term recomputes from the breakdown's mean and evidence mass"
+    );
 
     assert!(
         hits[l_pos]["breakdown"]["entity_posterior_mean"].is_null(),
         "L never received feedback => entity_posterior_mean must be absent, \
              not a guessed prior mean"
+    );
+    assert!(
+        hits[l_pos]["breakdown"]["entity_evidence_mass"].is_null(),
+        "L never received feedback => entity_evidence_mass must be absent"
     );
 
     for hit in [&hits[h_pos], &hits[l_pos]] {
@@ -4729,41 +4752,163 @@ async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_pro
     );
 }
 
-/// One useful signal lifts only the targeted profile's next equivalent recall.
+const ADR104_TIE_QUERY: &str = "near tie probe query";
+const ADR104_TIE_FILLER: &str = "filler near tie content";
+const ADR104_TIE_FIRST: &str = "first near tie candidate";
+const ADR104_TIE_SECOND: &str = "second near tie candidate";
+const ADR104_TIE_NEIGHBOUR: &str = "neighbour near tie candidate";
+
+/// Recall of the near-tie corpus under `profile_id`: `(id, rank_score, breakdown)` per hit.
+async fn adr104_tie_recall(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    profile_id: Option<&str>,
+) -> Vec<(Uuid, f64, Value)> {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_TIE_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
+        "limit": 10
+    });
+    if let Some(pid) = profile_id {
+        params["profile_id"] = serde_json::json!(pid);
+    }
+    let result = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall");
+    result
+        .as_array()
+        .expect("bare array result")
+        .iter()
+        .map(|hit| {
+            let id = Uuid::parse_str(hit["id"].as_str().expect("hit id")).expect("uuid");
+            let score = hit["rank_score"].as_f64().expect("rank_score");
+            (id, score, hit["breakdown"].clone())
+        })
+        .collect()
+}
+
+fn adr104_tie_hit(hits: &[(Uuid, f64, Value)], id: Uuid) -> (usize, f64, Value) {
+    let pos = hits
+        .iter()
+        .position(|(hit_id, _, _)| *hit_id == id)
+        .unwrap_or_else(|| panic!("{id} missing from hits {hits:?}"));
+    (pos, hits[pos].1, hits[pos].2.clone())
+}
+
+fn adr104_send_useful(target_id: Uuid, profile_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "target_id": target_id.to_string(),
+        "signal": "useful",
+        "served_by_profile_id": profile_id,
+    })
+}
+
+/// The amendment's term written out independently of the code under test.
+fn adr104_expected_term(mean: f64, mass: f64) -> f64 {
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    1.0 + (t0 - 1.0) * mass / (mass + 16.0)
+}
+
+/// ADR-104 Amendment 6 at the shipped mass (1.0 per explicit judgment): one `useful` moves the
+/// candidate's score by exactly the evidence-scaled term, which lifts it past a near tie under
+/// the profile that received the signal and nowhere else, but not past a neighbour about 1% ahead
+/// (the unscaled term, +5%, would); after an evidence mass of 16 the term has moved half of
+/// `t0 - 1` and lifts it past that neighbour.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
-async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
+async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile() {
     use khive_pack_brain::BrainPack;
 
     let rt = build_full_rt_with_brain();
+    let mut vectors = HashMap::new();
+    vectors.insert(
+        ADR104_TIE_QUERY.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    vectors.insert(
+        ADR104_TIE_FILLER.to_string(),
+        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    // Identical vectors give both candidates the same relevance; only salience separates them.
+    for content in [ADR104_TIE_FIRST, ADR104_TIE_SECOND, ADR104_TIE_NEIGHBOUR] {
+        vectors.insert(
+            content.to_string(),
+            vec![0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+    }
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: vectors,
+    });
     let ns = Namespace::parse("local").expect("ns");
     let token = rt.authorize(ns.clone()).expect("token");
-    let note_id = rt
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        ADR104_TIE_FILLER,
+        Some(0.5),
+        None,
+        vec![],
+    )
+    .await
+    .expect("filler note");
+    let first_id = rt
         .create_note(
             &token,
             "memory",
             None,
-            "adr104b feedback lift probe note",
-            Some(0.6),
+            ADR104_TIE_FIRST,
+            Some(0.500),
             None,
             vec![],
         )
         .await
-        .expect("create note")
+        .expect("first candidate")
+        .id;
+    let second_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_TIE_SECOND,
+            Some(0.499),
+            None,
+            vec![],
+        )
+        .await
+        .expect("second candidate")
+        .id;
+    // Salience boost 1 + 0.2 * s: 0.56 against 0.499 puts the neighbour about 1% ahead.
+    let neighbour_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_TIE_NEIGHBOUR,
+            Some(0.56),
+            None,
+            vec![],
+        )
+        .await
+        .expect("neighbour candidate")
         .id;
 
-    let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(MemoryPack::new(
         crate::test_support::with_receipt_credentials(rt.clone()),
     ));
-    builder.register(brain);
+    builder.register(BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
-    for name in ["adr104b-lift-a-v1", "adr104b-lift-b-v1"] {
+    for name in ["adr104-tie-a-v1", "adr104-tie-b-v1"] {
         registry
             .dispatch(
                 "brain.create_profile",
@@ -4777,67 +4922,148 @@ async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
             .expect("create profile");
     }
 
-    async fn recall_score(
-        registry: &khive_runtime::VerbRegistry,
-        ns: &Namespace,
-        profile_id: Option<&str>,
-    ) -> f64 {
-        let mut params = serde_json::json!({
-            "namespace": ns.as_str(),
-            "query": "adr104b feedback lift probe note",
-            "limit": 10
-        });
-        if let Some(pid) = profile_id {
-            params["profile_id"] = serde_json::json!(pid);
-        }
-        let result = registry
-            .dispatch("memory.recall", params)
-            .await
-            .expect("recall");
-        let hits = result.as_array().expect("bare array result");
-        assert_eq!(hits.len(), 1);
-        hits[0]["rank_score"].as_f64().expect("rank_score")
-    }
-
-    let a_before = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
-    let b_before = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
-    let default_before = recall_score(&registry, &ns, None).await;
+    let a_before = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let b_before = adr104_tie_recall(&registry, &ns, Some("adr104-tie-b-v1")).await;
+    let default_before = adr104_tie_recall(&registry, &ns, None).await;
+    let (first_pos, first_score, _) = adr104_tie_hit(&a_before, first_id);
+    let (second_pos, second_before, second_breakdown) = adr104_tie_hit(&a_before, second_id);
     assert!(
-        (a_before - default_before).abs() < 1e-9 && (b_before - default_before).abs() < 1e-9,
-        "both fresh profiles must start identical to defaults: a={a_before} \
-             b={b_before} default={default_before}"
+        first_pos < second_pos && first_score > second_before,
+        "the higher-salience candidate must lead before any feedback: {a_before:?}"
+    );
+    let gap = first_score / second_before - 1.0;
+    assert!(
+        gap > 0.0 && gap < 0.001,
+        "the corpus must be a near tie (relative gap below 0.1%), got {gap}"
+    );
+    assert!(
+        second_breakdown["entity_evidence_mass"].is_null(),
+        "no feedback yet => entity_evidence_mass must be absent: {second_breakdown:?}"
+    );
+    let (neighbour_pos, neighbour_score, _) = adr104_tie_hit(&a_before, neighbour_id);
+    let neighbour_gap = neighbour_score / second_before - 1.0;
+    assert!(
+        neighbour_pos < second_pos && neighbour_gap > 0.003 && neighbour_gap < 0.05,
+        "the neighbour must lead the second candidate by more than one scaled useful (+0.29%) \
+         and less than the unscaled term (+5%), got {neighbour_gap}: {a_before:?}"
     );
 
     registry
         .dispatch(
             "brain.feedback",
-            serde_json::json!({
-                "target_id": note_id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "adr104b-lift-a-v1",
-            }),
+            adr104_send_useful(second_id, "adr104-tie-a-v1"),
         )
         .await
         .expect("one explicit useful signal under profile A");
 
-    let a_after = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
-    let b_after = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
-    let default_after = recall_score(&registry, &ns, None).await;
+    let a_after = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let b_after = adr104_tie_recall(&registry, &ns, Some("adr104-tie-b-v1")).await;
+    let default_after = adr104_tie_recall(&registry, &ns, None).await;
 
+    let (first_pos_after, first_after, _) = adr104_tie_hit(&a_after, first_id);
+    let (second_pos_after, second_after, breakdown) = adr104_tie_hit(&a_after, second_id);
+    let mean = breakdown["entity_posterior_mean"]
+        .as_f64()
+        .expect("one useful => entity_posterior_mean present");
+    let mass = breakdown["entity_evidence_mass"]
+        .as_f64()
+        .expect("one useful => entity_evidence_mass present");
     assert!(
-        a_after > a_before,
-        "one useful signal under profile A must lift the score under \
-             profile A: before={a_before} after={a_after}"
+        (mass - 1.0).abs() < 1e-9,
+        "shipped mass: one useful adds 1.0 of evidence, got {mass}"
+    );
+    let term = crate::scoring::entity_posterior_term(
+        Some((mean, mass)),
+        crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+    );
+    assert_eq!(
+        breakdown_f32(&breakdown["entity_term"]),
+        term,
+        "the term recomputes from the breakdown's mean and evidence mass"
     );
     assert!(
-        (b_after - b_before).abs() < 1e-9,
-        "profile B never received the signal => its score must be \
-             unchanged: before={b_before} after={b_after}"
+        (term as f64 - adr104_expected_term(mean, mass)).abs() < 1e-6,
+        "one useful: term {term} != 1 + (t0 - 1) * n / (n + 16) = {}",
+        adr104_expected_term(mean, mass)
     );
     assert!(
-        (default_after - default_before).abs() < 1e-9,
-        "defaults (no profile) must be unchanged by feedback given under \
-             an explicit profile: before={default_before} after={default_after}"
+        (term as f64 - (1.0 + 0.05 / 17.0)).abs() < 1e-6,
+        "one useful at the shipped mass: mean 2/3, t0 1.05, term 1 + 0.05 / 17, got {term}"
+    );
+    assert!(
+        (second_after / second_before - term as f64).abs() < 1e-5,
+        "the served score moves by exactly the term: before={second_before} \
+         after={second_after} term={term}"
+    );
+    assert!(
+        (first_after - first_score).abs() < 1e-9,
+        "the candidate without feedback is unchanged: before={first_score} after={first_after}"
+    );
+    assert!(
+        second_pos_after < first_pos_after,
+        "one useful lifts the second candidate past the near tie under profile A: {a_after:?}"
+    );
+    let (neighbour_pos_after, _, _) = adr104_tie_hit(&a_after, neighbour_id);
+    assert!(
+        neighbour_pos_after < second_pos_after,
+        "one scaled useful does not lift the second candidate past the neighbour: {a_after:?}"
+    );
+
+    for (label, before, after) in [
+        ("profile B", &b_before, &b_after),
+        ("no profile", &default_before, &default_after),
+    ] {
+        for id in [first_id, second_id] {
+            let (pos_before, score_before, _) = adr104_tie_hit(before, id);
+            let (pos_after, score_after, _) = adr104_tie_hit(after, id);
+            assert!(
+                pos_before == pos_after && (score_before - score_after).abs() < 1e-9,
+                "{label} never received the signal => order and score unchanged for {id}: \
+                 before={before:?} after={after:?}"
+            );
+        }
+    }
+
+    for _ in 0..15 {
+        registry
+            .dispatch(
+                "brain.feedback",
+                adr104_send_useful(second_id, "adr104-tie-a-v1"),
+            )
+            .await
+            .expect("further useful signals under profile A");
+    }
+    let a_sixteen = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let (second_pos_sixteen, second_sixteen, breakdown) = adr104_tie_hit(&a_sixteen, second_id);
+    let (neighbour_pos_sixteen, _, _) = adr104_tie_hit(&a_sixteen, neighbour_id);
+    let mean = breakdown["entity_posterior_mean"]
+        .as_f64()
+        .expect("entity_posterior_mean present");
+    let mass = breakdown["entity_evidence_mass"]
+        .as_f64()
+        .expect("entity_evidence_mass present");
+    assert!(
+        (mass - 16.0).abs() < 1e-9,
+        "shipped mass: 16 useful judgments hold 16.0 of evidence, got {mass}"
+    );
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    let term = breakdown_f32(&breakdown["entity_term"]) as f64;
+    assert!(
+        ((term - 1.0) - (t0 - 1.0) / 2.0).abs() < 1e-6,
+        "at an evidence mass of 16 the term moves half of t0 - 1: term={term} t0={t0}"
+    );
+    assert!(
+        (term - (1.0 + 0.3 * (17.0 / 18.0 - 0.5) / 2.0)).abs() < 1e-6,
+        "16 useful at the shipped mass: mean 17/18, term 1 + (t0 - 1) / 2, got {term}"
+    );
+    assert!(
+        (second_sixteen / second_before - term).abs() < 1e-5,
+        "the served score moves by exactly the term: before={second_before} \
+         after={second_sixteen} term={term}"
+    );
+    assert!(
+        second_pos_sixteen < neighbour_pos_sixteen,
+        "an evidence mass of 16 lifts the second candidate past the neighbour: {a_sixteen:?}"
     );
 }
 
@@ -5029,7 +5255,7 @@ async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count()
         ns: &Namespace,
         profile_id: &str,
         target_x_id: Uuid,
-    ) -> (f64, f64, Option<f64>) {
+    ) -> (f64, f64, Option<(f64, f64)>) {
         let result = registry
             .dispatch(
                 "memory.recall",
@@ -5049,8 +5275,15 @@ async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count()
         let profile_component = hits[pos]["breakdown"]["profile_component"]
             .as_f64()
             .expect("profile_component present");
-        let entity_posterior_mean = hits[pos]["breakdown"]["entity_posterior_mean"].as_f64();
-        (rank_score, profile_component, entity_posterior_mean)
+        let breakdown = &hits[pos]["breakdown"];
+        let mean = breakdown["entity_posterior_mean"].as_f64();
+        let mass = breakdown["entity_evidence_mass"].as_f64();
+        assert_eq!(
+            mean.is_some(),
+            mass.is_some(),
+            "entity_evidence_mass is present exactly when entity_posterior_mean is: {breakdown:?}"
+        );
+        (rank_score, profile_component, mean.zip(mass))
     }
 
     let (score_under_x, component_under_x, ent_mean_under_x) =
@@ -5180,6 +5413,9 @@ async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
     let ent_mean_after = after_hits[0]["breakdown"]["entity_posterior_mean"]
         .as_f64()
         .expect("entity_posterior_mean present after feedback");
+    let ent_mass_after = after_hits[0]["breakdown"]["entity_evidence_mass"]
+        .as_f64()
+        .expect("entity_evidence_mass present after feedback");
 
     assert!(
         score_after > score_before,
@@ -5188,7 +5424,7 @@ async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
     );
 
     let expected_ratio = crate::scoring::entity_posterior_term(
-        Some(ent_mean_after),
+        Some((ent_mean_after, ent_mass_after)),
         crate::scoring::ENTITY_POSTERIOR_WEIGHT,
     ) as f64;
     let observed_ratio = score_after / score_before;

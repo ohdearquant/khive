@@ -247,3 +247,88 @@ async fn invalid_locator_bytes_are_refused_without_mutation() {
         NoteKeyAssignOutcome::Assigned
     );
 }
+
+#[tokio::test]
+async fn secret_key_assignment_refuses_before_lookup_and_preserves_complete_rows() {
+    let (pool, store) = fixture();
+    let plain = insert(&store, "local", "observation", None).await;
+    let held = insert(&store, "local", "observation", Some("existing")).await;
+    let before = [stored_row(&pool, plain.id), stored_row(&pool, held.id)];
+    let key = format!("ghp_{}", "A".repeat(40));
+    let escaped = format!(r#""\u0067hp_{}""#, "A".repeat(40));
+    for proposed in [&key, &escaped] {
+        for id in [plain.id, held.id, Uuid::nil()] {
+            let result = store.assign_note_key_if_unset(id, proposed, "local").await;
+            assert!(
+                matches!(&result, Err(StorageError::SecretDetected { matched, .. })
+                if matched.detector == "github-token" && matched.location.as_deref() == Some("note.key")),
+                "direct SQL assignment must refuse credential keys before lookup: {result:?}"
+            );
+            assert!(!format!("{result:?}").contains(&key));
+        }
+    }
+    assert_eq!(
+        [stored_row(&pool, plain.id), stored_row(&pool, held.id)],
+        before,
+        "refusal must preserve every stored column, version and timestamp"
+    );
+}
+
+#[tokio::test]
+async fn generated_and_unlabelled_note_keys_are_admitted_without_rewriting() {
+    let (pool, store) = fixture();
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let id = "11111111-2222-4333-8444-555555555555";
+    let keys = [
+        ("commit", format!("git.commit:{sha}")),
+        ("memory", "review-batch:create:1".into()),
+        ("memory", format!("review-batch:{id}:1")),
+        (
+            "message",
+            r#"comm-v1:["local","lambda:fixture","review-pass"]"#.into(),
+        ),
+        (
+            "observation",
+            format!("outbound-email-external-id-unverifiable:{id}"),
+        ),
+        ("observation", "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1".into()),
+    ];
+    for (kind, key) in keys {
+        let note = insert(&store, "local", kind, None).await;
+        let before = stored_row(&pool, note.id);
+        let result = store.assign_note_key_if_unset(note.id, &key, "local").await;
+        assert!(
+            matches!(result, Ok(NoteKeyAssignOutcome::Assigned)),
+            "generated or unlabelled ordinary key must remain assignable: {result:?}"
+        );
+        let mut expected = before;
+        expected.insert("key".into(), SqliteValue::Text(key.clone()));
+        expected.insert("version".into(), SqliteValue::Integer(note.version + 1));
+        assert_eq!(stored_row(&pool, note.id), expected);
+        assert_eq!(
+            store
+                .get_live_notes_by_key("local", &key, Some(kind))
+                .await
+                .unwrap()
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+            vec![note.id]
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_credential_key_lookup_remains_readable_and_does_not_rewrite() {
+    let (pool, store) = fixture();
+    let key = format!("ghp_{}", "A".repeat(40));
+    let legacy = insert(&store, "local", "observation", Some(&key)).await;
+    let before = stored_row(&pool, legacy.id);
+    let rows = store
+        .get_live_notes_by_key("local", &key, Some("observation"))
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![legacy.clone()]);
+    assert_eq!(store.get_note(legacy.id).await.unwrap(), Some(legacy));
+    assert_eq!(stored_row(&pool, rows[0].id), before);
+}

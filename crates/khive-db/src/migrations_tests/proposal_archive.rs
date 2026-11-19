@@ -272,7 +272,9 @@ fn assert_incompatible_archive_column(declaration: &str, generated: bool) {
     for _ in 0..2 {
         let error = run_migrations(&mut conn).expect_err("incompatible archive column must refuse");
         match error {
-            SqliteError::Migration { version: 58, error } => {
+            SqliteError::Migration {
+                version: 58, error, ..
+            } => {
                 assert!(
                     error.contains("incompatible proposals_open.archived_at"),
                     "{error}"

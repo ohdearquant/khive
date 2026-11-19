@@ -329,7 +329,7 @@ def main():
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
         # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
-        # tool contributes fourteen verbs, including tool.policy_delete, and
+        # tool contributes fifteen verbs, including tool.policy_delete, and
         # exec nine (the tool registry with use policy and sandboxed runs over trees);
         # knowledge contributes knowledge.lint for graph hygiene inspection;
         # comm contributes comm.withheld_body, the recipient's or maintainer's
@@ -367,7 +367,7 @@ def main():
             f"(ADR-174); "
             f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "
-            f"tool contributes fourteen verbs including tool.policy_delete "
+            f"tool contributes fifteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "
             f"knowledge contributes knowledge.lint; "
             f"kg contributes attach, which records a rendition of a record and "

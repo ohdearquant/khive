@@ -56,6 +56,12 @@ on:
         required: false
         default: ""
 
+# A new push to a pull request cancels that pull request's run in progress. Other events keep
+# one group per run, so pushes and manual runs are never cancelled.
+concurrency:
+  group: bench-1m-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

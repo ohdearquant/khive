@@ -117,10 +117,15 @@ async fn snapshot(runtime: &KhiveRuntime, token: &NamespaceToken, ids: &SeedIds)
 
 fn assert_missing_handle(error: RuntimeError, expected_operation: &str) {
     match error {
-        RuntimeError::Storage(StorageError::Pool { operation, message }) => {
+        RuntimeError::Storage(StorageError::WriterOwnerUnavailable { operation, source }) => {
             assert_eq!(operation, expected_operation);
-            assert!(message.contains("strict"));
-            assert!(message.contains("writer-task handle"));
+            match *source {
+                StorageError::Pool { operation, message } => {
+                    assert_eq!(operation, expected_operation);
+                    assert_eq!(message, "strict write routing requires a live writer owner");
+                }
+                other => panic!("expected typed missing-owner Pool cause, got {other:?}"),
+            }
         }
         other => panic!("expected typed missing-handle refusal, got {other:?}"),
     }

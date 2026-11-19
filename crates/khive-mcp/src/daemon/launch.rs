@@ -179,6 +179,20 @@ pub(super) fn daemon_launch_command(
     cmd
 }
 
+pub(super) fn preflight_daemon_launch(
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+) -> anyhow::Result<()> {
+    use clap::Parser;
+
+    // Parse the child's actual argv, including clap's inherited environment
+    // bindings, so validation and launch cannot select different stores.
+    let command = daemon_launch_command(std::path::Path::new("kkernel"), config, db, packs);
+    let args = crate::args::Args::try_parse_from(command.get_args())?;
+    crate::serve::preflight_daemon_configuration(&args)
+}
+
 pub(super) fn spawn_daemon_with_exe_and_config(
     exe: &std::path::Path,
     config: Option<&std::path::Path>,

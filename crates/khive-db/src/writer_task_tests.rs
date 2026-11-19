@@ -844,6 +844,7 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: true,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
@@ -897,6 +898,7 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
             Ok(affected)
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
@@ -1057,6 +1059,7 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
             ))
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
@@ -1108,6 +1111,7 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
             panic!("intentional panic after illicit commit");
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
@@ -1389,6 +1393,7 @@ async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
     assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1417,6 +1422,7 @@ async fn accepted_request_lost_reply_is_side_effects_unknown() {
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let request_ran = Arc::new(AtomicBool::new(false));
     let request_ran_in_op = Arc::clone(&request_ran);
@@ -1507,6 +1513,7 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,

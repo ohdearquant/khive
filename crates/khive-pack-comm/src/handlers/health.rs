@@ -11,6 +11,16 @@ use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 /// The grace avoids flagging a live poller during ordinary tick and I/O jitter.
 const STALLED_AFTER_INTERVALS: u64 = 3;
 
+fn age_secs(value: Option<&Value>, as_of: &DateTime<Utc>) -> Option<u64> {
+    let at = DateTime::parse_from_rfc3339(value?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if at > *as_of {
+        return None;
+    }
+    u64::try_from(as_of.signed_duration_since(at).num_seconds()).ok()
+}
+
 pub(super) fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
     // A known failure enters intentional exponential backoff, so the nominal
     // cadence cannot distinguish an overdue poll from a scheduled retry.
@@ -64,6 +74,7 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
         "poll_interval_secs": poll_interval_secs,
         "stalled": stalled,
         "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
+        "no_success_age_secs": age_secs(props.get("last_success_at"), as_of),
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
         "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
@@ -143,6 +154,13 @@ fn outbox_health_to_json(props: &Value, as_of: &DateTime<Utc>) -> Option<Value> 
         "pending_rows_seen",
         "pending_rows_limit",
         "oldest_pending_created_at",
+        "backlog_observed_at",
+        "undelivered_rows",
+        "backoff_rows",
+        "oldest_undelivered_created_at",
+        "oldest_backoff_created_at",
+        "earliest_backoff_next_attempt_at",
+        "max_backoff_delivery_attempts",
     ] {
         projected.insert(
             field.into(),
@@ -154,6 +172,10 @@ fn outbox_health_to_json(props: &Value, as_of: &DateTime<Utc>) -> Option<Value> 
     projected.insert(
         "oldest_pending_age_secs".into(),
         json!(oldest_pending_age_secs),
+    );
+    projected.insert(
+        "oldest_undelivered_age_secs".into(),
+        json!(age_secs(outbox.get("oldest_undelivered_created_at"), as_of)),
     );
     Some(Value::Object(projected))
 }
@@ -236,6 +258,7 @@ fn quarantine_only_channel_to_json(
         "poll_interval_secs": Value::Null,
         "stalled": Value::Null,
         "last_success_at": Value::Null,
+        "no_success_age_secs": Value::Null,
         "last_poll_attempt_at": Value::Null,
         "last_failure_at": Value::Null,
         "last_error": Value::Null,

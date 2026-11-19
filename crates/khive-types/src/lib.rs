@@ -64,6 +64,7 @@ pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
     EventSink, ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload,
     ProposalWithdrawnPayload, RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
+    ToolRegistrationChangedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
