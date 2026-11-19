@@ -518,10 +518,12 @@ impl Params {
     fn opt_i64(&self, name: &str) -> Result<Option<i64>, RuntimeError> {
         match self.map.get(name) {
             None | Some(Value::Null) => Ok(None),
-            Some(v) => v
-                .as_i64()
-                .map(Some)
-                .ok_or_else(|| self.invalid(format!("{name} must be an integer, got {v}"))),
+            Some(v) => v.as_i64().map(Some).ok_or_else(|| {
+                self.invalid(format!(
+                    "{name} must be an integer, got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &v.to_string())
+                ))
+            }),
         }
     }
 
@@ -601,10 +603,11 @@ fn validate_instrument_args(
         };
         if !valid {
             return Err(params.invalid(format!(
-                "argument_type: {}.{} must be {}, got {value}",
+                "argument_type: {}.{} must be {}, got {}",
                 entry.name,
                 parameter.name,
-                parameter.ty.as_str()
+                parameter.ty.as_str(),
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
             )));
         }
     }

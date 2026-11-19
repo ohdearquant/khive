@@ -164,6 +164,33 @@ async fn wrong_type_charter_operands_mask_credentials_without_mutation() {
         )
         .await;
 
+        if value.as_i64().is_none() {
+            refuse_without_writes(
+                &f,
+                "charter.runs",
+                json!({"limit": value.clone()}),
+                &format!("charter.runs: limit must be an integer, got {shown}"),
+                &secret,
+                masked,
+            )
+            .await;
+
+            refuse_without_writes(
+                &f,
+                "charter.sample",
+                json!({
+                    "subject_kind": "message", "subject_ref": "message-1",
+                    "kind": "inbox.unread_older_than", "args": {"age": value.clone()},
+                }),
+                &format!(
+                    "charter.sample: argument_type: inbox.unread_older_than.age must be duration, got {shown}"
+                ),
+                &secret,
+                masked,
+            )
+            .await;
+        }
+
         let mut claim = claim_params(&run);
         claim["descriptor"]["expected_head"] = value;
         refuse_without_writes(
